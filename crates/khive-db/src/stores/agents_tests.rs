@@ -83,58 +83,7 @@ async fn agent_insert_uses_writer_task_owned_transaction() {
     );
 }
 
-#[tokio::test]
-async fn test_get_missing_returns_none() {
-    let store = setup_memory_store();
-    assert!(store.get("does-not-exist").await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn test_update_state_and_terminal_reason() {
-    let store = setup_memory_store();
-    let record = make_record("agent-2", "actor-a");
-    store.insert(&record).await.unwrap();
-
-    store
-        .update_state("agent-2", AgentState::Running, None, 2_000)
-        .await
-        .unwrap();
-    let fetched = store.get("agent-2").await.unwrap().unwrap();
-    assert_eq!(fetched.state, AgentState::Running);
-    assert_eq!(fetched.state_changed_at, 2_000);
-
-    store
-        .update_state(
-            "agent-2",
-            AgentState::Terminal,
-            Some(TerminalReason::Completed),
-            3_000,
-        )
-        .await
-        .unwrap();
-    let fetched = store.get("agent-2").await.unwrap().unwrap();
-    assert_eq!(fetched.state, AgentState::Terminal);
-    assert_eq!(fetched.terminal_reason, Some(TerminalReason::Completed));
-}
-
-#[tokio::test]
-async fn test_set_checkpoint() {
-    let store = setup_memory_store();
-    let record = make_record("agent-3", "actor-a");
-    store.insert(&record).await.unwrap();
-
-    store
-        .set_checkpoint("agent-3", "session-abc", 42)
-        .await
-        .unwrap();
-
-    let fetched = store.get("agent-3").await.unwrap().unwrap();
-    assert_eq!(
-        fetched.checkpoint_session_id,
-        Some("session-abc".to_string())
-    );
-    assert_eq!(fetched.checkpoint_cursor, Some(42));
-}
+include!("agents_tests/basic_record_state_and_checkpoint_tests.rs");
 
 /// The point of the feature (ADR-142 §1 spawn row): idempotency replay is
 /// keyed on the PAIR (owner_actor, idempotency_key), never the key alone.
@@ -185,7 +134,10 @@ async fn test_insert_rejects_duplicate_actor_key_pair() {
     record_conflict.idempotency_key = Some("dup-key".to_string());
 
     let err = store.insert(&record_conflict).await.unwrap_err();
-    assert!(matches!(err, StorageError::Driver { .. }));
+    assert!(matches!(
+        err.without_sqlite_write_stage(),
+        StorageError::Driver { .. }
+    ));
 }
 
 /// The other property this store exists to hold: at most one non-terminal
@@ -203,7 +155,10 @@ async fn test_rejects_second_non_terminal_for_same_provider_session() {
     conflicting.provider_session_id = Some("session-1".to_string());
 
     let err = store.insert(&conflicting).await.unwrap_err();
-    assert!(matches!(err, StorageError::Driver { .. }));
+    assert!(matches!(
+        err.without_sqlite_write_stage(),
+        StorageError::Driver { .. }
+    ));
 
     let holder = store
         .find_non_terminal_by_provider_session("test-provider", "session-1")
@@ -231,7 +186,10 @@ async fn test_suspended_record_still_holds_provider_session_pair() {
     let mut conflicting = make_record("agent-susp-2", "actor-b");
     conflicting.provider_session_id = Some("session-2".to_string());
     let err = store.insert(&conflicting).await.unwrap_err();
-    assert!(matches!(err, StorageError::Driver { .. }));
+    assert!(matches!(
+        err.without_sqlite_write_stage(),
+        StorageError::Driver { .. }
+    ));
 }
 
 /// Once the holder reaches terminal, the pair frees up: a new spawn against
@@ -306,31 +264,186 @@ async fn test_terminate_all_non_terminal_boot_scan() {
 #[test]
 fn agent_write_strict_routing_fails_closed_without_writer_task() {
     let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agent-strict-routing.db");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(AGENTS_DDL)
+        .unwrap();
     let pool = Arc::new(
         ConnectionPool::new(PoolConfig {
-            path: Some(dir.path().join("agent-strict-routing.db")),
+            path: Some(path.clone()),
             write_queue_enabled: Some(false),
             write_routing_strict: true,
             ..PoolConfig::for_test()
         })
         .unwrap(),
     );
-    {
-        let writer = pool.writer().unwrap();
-        writer.conn().execute_batch(AGENTS_DDL).unwrap();
-    }
     let store = SqlAgentStore::new(pool, true);
 
     let error = tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(store.insert(&make_record("agent-strict", "actor-a")))
         .expect_err("strict routing must refuse the standalone writer fallback");
+    let StorageError::WriterOwnerUnavailable { operation, source } = &error else {
+        panic!("strict routing must return the typed owner refusal, got: {error:?}");
+    };
+    assert_eq!(operation.as_ref(), "agent_insert");
     assert!(
-        matches!(
-            &error,
-            StorageError::Pool { operation, .. } if operation == "agent_insert"
-        ),
-        "strict routing must return the typed operation error, got: {error:?}"
+        matches!(source.as_ref(), StorageError::Pool { operation, message }
+            if operation == "agent_insert" && message.contains("strict")),
+        "owner refusal must retain the typed operation cause: {error:?}"
     );
-    assert!(error.to_string().contains("strict"), "got: {error}");
+    assert!(error.is_retryable());
+    assert_eq!(
+        error.writer_request_state(),
+        Some(khive_storage::WriterTaskRequestState::NotStarted)
+    );
+    assert!(!error.is_write_outcome_unknown());
+    let stored: i64 = rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row("SELECT count(*) FROM agents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(stored, 0, "owner refusal must leave the agent ledger empty");
+}
+
+fn cas_pool(path: &std::path::Path, queued: bool) -> Arc<ConnectionPool> {
+    let config = PoolConfig {
+        path: Some(path.to_path_buf()),
+        volume_lock_dir: Some(path.parent().unwrap().join("volume-locks")),
+        wal_ceiling: Default::default(),
+        disk_guard_config: Some(crate::EffectiveDiskGuardConfig {
+            reserve_bytes: 0,
+            ..Default::default()
+        }),
+        busy_timeout: std::time::Duration::from_secs(5),
+        checkout_timeout: std::time::Duration::from_secs(5),
+        write_queue_enabled: Some(queued),
+        write_queue_capacity: 16,
+        write_routing_strict: queued,
+        write_admission_deadline_ms: 2_000,
+        ..PoolConfig::for_test()
+    };
+    assert_eq!(config.path.as_deref(), Some(path));
+    Arc::new(ConnectionPool::new(config).unwrap())
+}
+
+#[tokio::test]
+async fn state_cas_matches_id_and_expected_state_without_changing_other_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = cas_pool(&dir.path().join("agent-cas.db"), false);
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(AGENTS_DDL).unwrap();
+    }
+    let store = SqlAgentStore::new(pool, true);
+    let mut record = make_record("agent-cas", "actor-a");
+    record.checkpoint_session_id = Some("checkpoint".into());
+    store.insert(&record).await.unwrap();
+    store
+        .insert(&make_record("other-agent", "actor-b"))
+        .await
+        .unwrap();
+    assert!(!store
+        .transition_state(
+            "missing",
+            AgentState::Spawned,
+            AgentState::Running,
+            None,
+            2_000
+        )
+        .await
+        .unwrap());
+    assert!(!store
+        .transition_state(
+            "agent-cas",
+            AgentState::Running,
+            AgentState::Suspended,
+            None,
+            2_000
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        serde_json::to_value(store.get("agent-cas").await.unwrap().unwrap()).unwrap(),
+        serde_json::to_value(&record).unwrap()
+    );
+    assert!(store
+        .transition_state(
+            "agent-cas",
+            AgentState::Spawned,
+            AgentState::Running,
+            None,
+            2_000
+        )
+        .await
+        .unwrap());
+    record.state = AgentState::Running;
+    record.state_changed_at = 2_000;
+    assert_eq!(
+        serde_json::to_value(store.get("agent-cas").await.unwrap().unwrap()).unwrap(),
+        serde_json::to_value(record).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(store.get("other-agent").await.unwrap().unwrap()).unwrap(),
+        serde_json::to_value(make_record("other-agent", "actor-b")).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn independent_pools_reject_stale_suspend_and_resume_after_terminal_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    for (index, initial, requested) in [
+        (0, AgentState::Running, AgentState::Suspended),
+        (1, AgentState::Suspended, AgentState::Running),
+    ] {
+        let path = dir.path().join(format!("agent-race-{index}.db"));
+        let stale_pool = cas_pool(&path, true);
+        {
+            let writer = stale_pool.writer().unwrap();
+            writer.conn().execute_batch(AGENTS_DDL).unwrap();
+        }
+        let terminal_pool = cas_pool(&path, true);
+        assert!(!Arc::ptr_eq(&stale_pool, &terminal_pool));
+        let stale_store = SqlAgentStore::new(stale_pool, true);
+        let terminal_store = SqlAgentStore::new(terminal_pool, true);
+        let mut record = make_record("racing-agent", "actor-a");
+        record.state = initial;
+        stale_store.insert(&record).await.unwrap();
+        let read_done = tokio::sync::Barrier::new(2);
+        let terminal_done = tokio::sync::Barrier::new(2);
+        let stale = async {
+            let observed = stale_store.get("racing-agent").await.unwrap().unwrap();
+            assert_eq!(observed.state, initial);
+            read_done.wait().await;
+            terminal_done.wait().await;
+            assert!(!stale_store
+                .transition_state("racing-agent", observed.state, requested, None, 4_000)
+                .await
+                .unwrap());
+        };
+        let terminal = async {
+            read_done.wait().await;
+            assert!(terminal_store
+                .transition_state(
+                    "racing-agent",
+                    initial,
+                    AgentState::Terminal,
+                    Some(TerminalReason::Killed),
+                    3_000
+                )
+                .await
+                .unwrap());
+            terminal_done.wait().await;
+        };
+        tokio::join!(stale, terminal);
+        record.state = AgentState::Terminal;
+        record.terminal_reason = Some(TerminalReason::Killed);
+        record.state_changed_at = 3_000;
+        for store in [&stale_store, &terminal_store] {
+            assert_eq!(
+                serde_json::to_value(store.get("racing-agent").await.unwrap().unwrap()).unwrap(),
+                serde_json::to_value(&record).unwrap()
+            );
+        }
+    }
 }

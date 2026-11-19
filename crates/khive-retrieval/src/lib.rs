@@ -7,8 +7,11 @@
 
 //! Hybrid search and ranking with deterministic scoring for khive.
 //!
-//! Combines HNSW vector search, BM25 keyword search, and RRF fusion into a unified
-//! retrieval layer. All scores use `DeterministicScore` for cross-platform consistency.
+//! Combines vector search and keyword search behind composable traits, with rank fusion
+//! (RRF by default), into a unified retrieval layer, and holds the checkpoint helpers that
+//! the memory and knowledge packs share for their khive-vamana ANN indexes. The optional
+//! `hnsw` and `bm25` features re-export those standalone index crates.
+//! All scores use `DeterministicScore` for cross-platform consistency.
 //! See `docs/architecture.md` for module layout, design principles, ID bridging
 //! strategies, and trait composition guide.
 
@@ -17,14 +20,20 @@
 
 #[cfg(feature = "storage-adapters")]
 pub mod adapters;
+#[cfg(feature = "ann")]
+#[doc(hidden)]
+pub mod ann;
 pub mod error;
 pub mod eval;
+pub mod hit;
 pub mod hybrid;
+pub mod materialization;
 pub mod metrics;
 #[cfg(feature = "persist")]
 pub mod persist;
 pub mod policy;
 pub mod query_ir;
+pub mod query_variants;
 #[cfg(feature = "persist")]
 pub mod replay;
 pub mod search_config;
@@ -38,29 +47,41 @@ pub use adapters::{StorageKeywordSearch, StorageVectorSearch};
 
 // Re-export core types
 pub use error::{ErrorKind, Result, RetrievalError};
+pub use hit::{HybridSearchOutcome, RankScoreKind, SearchHit, SearchSignals, SearchSource};
 
+#[cfg(feature = "bm25")]
 pub use khive_bm25::{Bm25Config, Bm25Index, Bm25Stats, DocumentId, SearchContext};
 pub use khive_fusion::{
     fuse, normalize_weights, reciprocal_rank_fusion, weighted_fusion, weights_are_normalized,
     FusionStrategy, DEFAULT_RRF_K,
 };
+#[cfg(feature = "hnsw")]
 pub use khive_hnsw::{
     DistanceMetric, HnswCheckpointConfig, HnswConfig, HnswIndex, HnswSearchContext, HnswSnapshot,
     NodeId, RebuildStats, TombstoneStats,
 };
 // Formal proof: khive.Retrieval.HNSW.checkpoint_correctness
 pub use hybrid::{
-    fuse_search_results, fuse_search_results_checked, DualIndexConfig, DualIndexRouter,
-    DualIndexStrategy, HybridConfig, HybridSearcher, IdentityReranker, KeywordSearch, Query,
-    Reranker, VectorSearch,
+    fuse_search_results, fuse_search_results_checked, fuse_two_stage, DualIndexConfig,
+    DualIndexRouter, DualIndexStrategy, HybridConfig, HybridSearcher, IdentityReranker,
+    KeywordSearch, Query, Reranker, VectorSearch,
 };
 #[cfg(feature = "checkpoint")]
 pub use khive_hnsw::{HnswCheckpoint, HnswCheckpointStore};
-// Native cross-encoder scaffold (ADR-042): the scorer trait and reranker are generic
-// and carry no khive-inference dependency, so this seam ships behind `native-rerank`
-// ahead of the model port. TODO(port-rerank): khive-inference model impl still deferred.
+// The native model and its inference dependency are opt-in (ADR-042).
 #[cfg(feature = "native-rerank")]
-pub use hybrid::{CrossEncoderScorer, NativeCrossEncoderReranker, RerankDocumentResolver};
+pub use hybrid::{
+    BertLoraGeometry, CrossEncoderScorer, CrossEncoderScores, LoraHook, LoraProjectionShape,
+    LoraTargetGeometry, NativeCrossEncoderModel, NativeCrossEncoderReranker, NativeRerankResult,
+    NoopLoraHook, RerankDocumentResolver,
+};
+pub use materialization::{
+    materialize_ranked_prefix, DropCounts, DropDiagnostic, DropReason, MaterializationDecision,
+    MaterializationError, MaterializationLimitError, MaterializationLimits, MaterializedItem,
+    MaterializedPrefix, RankedCandidate, MAX_MATERIALIZATION_CANDIDATES,
+    MAX_MATERIALIZATION_DIAGNOSTICS, MAX_MATERIALIZATION_DROP_REASONS,
+    MAX_MATERIALIZATION_LOADER_BATCH, MAX_MATERIALIZATION_OUTPUTS,
+};
 pub use metrics::{MetricEvent, MetricValue, MetricsSink, NoopSink, RecordingSink};
 #[cfg(feature = "persist")]
 pub use persist::{
@@ -68,7 +89,14 @@ pub use persist::{
     ShadowValidationResult,
 };
 pub use policy::{filter_by_policy, filter_by_predicate, ClearanceLevel, SearchPolicy};
-pub use query_ir::{FilterPredicate, FuseStrategy, QueryNode, RerankMethod};
+pub use query_ir::{
+    FilterPredicate, FuseStrategy, QueryNode, RerankMethod, HYBRID_CANDIDATE_MULTIPLIER,
+};
+pub use query_variants::{
+    merge_query_variants, normalize_query_variants, AdmittedVariantHit, QueryVariant,
+    QueryVariantLimits, QueryVariantOrigin, QueryVariantRejection, QueryVariants,
+    VariantAttribution, VariantRankedList, VariantSource,
+};
 pub use search_config::SearchConfig;
 pub use timeout::{
     search_with_cancellation, search_with_deadline, search_with_optional_timeout,

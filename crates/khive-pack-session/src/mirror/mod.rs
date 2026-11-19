@@ -5,6 +5,7 @@
 
 pub mod ingest;
 pub mod parse;
+pub mod raw_codec;
 pub mod service;
 
 pub use ingest::{LineTailSource, MirrorSource, MirrorStats};

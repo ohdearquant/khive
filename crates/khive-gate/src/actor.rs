@@ -8,6 +8,16 @@ use crate::GateValidationError;
 /// This is not a closed taxonomy: [`ActorRef::try_new`] accepts any non-empty kind.
 pub const RUNTIME_STAMPED_ACTOR_KINDS: &[&str] = &["actor", "anonymous", "agent"];
 
+/// Split a `kind:id` label when `kind` is one of [`RUNTIME_STAMPED_ACTOR_KINDS`].
+///
+/// Returns `None` when the label has no `:` or its prefix is not a stamped kind, so an id that
+/// merely contains a colon (such as `svc:build`) is left whole.
+pub fn split_stamped_label(label: &str) -> Option<(&str, &str)> {
+    label
+        .split_once(':')
+        .filter(|(kind, _)| RUNTIME_STAMPED_ACTOR_KINDS.contains(kind))
+}
+
 /// Caller identity with non-empty `kind` and `id`, validated on construction and deserialization.
 ///
 /// See `crates/khive-gate/docs/api/policy-types.md`.
@@ -86,6 +96,16 @@ impl ActorRef {
             None
         } else {
             Some(self.id.as_str())
+        }
+    }
+
+    /// The actor as one label, `kind:id`, except that the plain `actor` kind collapses to its id
+    /// so a configured `lambda:khive` reads back as itself.
+    pub fn label(&self) -> String {
+        if self.kind == "actor" {
+            self.id.clone()
+        } else {
+            format!("{}:{}", self.kind, self.id)
         }
     }
 }

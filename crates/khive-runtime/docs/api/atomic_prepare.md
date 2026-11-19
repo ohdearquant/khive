@@ -49,9 +49,9 @@ this module's own tests, and as defense in depth.
 Mirrors `khive-runtime::operations::KhiveRuntime::update_edge`'s patch semantics exactly:
 `relation`/`weight`/`properties` are the only applicable fields
 (`reject_inapplicable_update_fields`'s `"edge"` arm enforces this before any mutation), a changed
-`relation` is endpoint-validated first, `weight` is range-checked, and `properties` REPLACES
-`metadata` wholesale (no merge — `update_edge` does `edge.metadata = Some(props)`, unlike the
-entity/note branches' `merge_properties`).
+`relation` is endpoint-validated first, `weight` is range-checked, and `properties` merges
+into `metadata` at the top level with the same `merge_properties` helper the entity and note
+branches use: patch fields win, omitted fields are kept, and a `null` value is stored as `null`.
 
 DML shape:
 
@@ -65,7 +65,7 @@ DML shape:
   read and write, and the caller must roll back rather than silently overwrite it.
 - symmetric relation (`competes_with`, `composed_with`): neither side uses the upsert builder here,
   because `upsert_edge` resolves `ON CONFLICT(namespace, id)` first and cannot detect a natural-key
-  collision with a _different_ id. Canonical (`update_edge_symmetric_dml`) runs a conflict probe and
+  collision with a _different_ id. Canonical (`GraphStore::update_symmetric_edge_if_unchanged`) runs a conflict probe and
   branches in Rust inside a single uninterrupted transaction, which is safe there. This atomic path
   cannot do that (see the in-source invariant note on `prepare_update_edge`), so it always emits
   both `edge_symmetric_delete_if_conflict_statement` and
@@ -97,7 +97,15 @@ become stale. A create emits `LinkCreated`; replacement and resurrection emit
 conflicts fail during prepare with guidance to pass `resurrect=true`.
 
 `apply_post_commit_effects_with_report` returns one `PostCommitEmbeddingOutcome` for every reindex
-effect it successfully executes. Each outcome retains the originating effect identity plus its
-typed truncation report, allowing CLI or pack response builders to attach warnings to the exact
-write without rerunning registry prediction. The original `apply_post_commit_effects` remains the
-unit-returning compatibility wrapper.
+effect it successfully executes. Each outcome retains the originating effect identity, its
+typed truncation report, and the eligible-model `failures` (`ReindexModelFailure`: model, stage,
+error) that did not undo the committed note, allowing CLI or pack response builders to attach
+warnings to the exact write without rerunning registry prediction. The original
+`apply_post_commit_effects` remains the unit-returning compatibility wrapper.
+
+When any effect fails, `apply_post_commit_effects_with_report` returns one `Err` and drops the
+outcomes of the effects that completed. `apply_post_commit_effects_with_failures` runs the same
+effects and returns a `PostCommitEffectsReport { outcomes, failures }` instead, so a caller can
+disclose model failures and truncation advisories even when a sibling effect failed closed;
+`PostCommitEffectsReport::failure_error` rebuilds the aggregate error, and
+`apply_post_commit_effects_with_report` is a thin wrapper over it.

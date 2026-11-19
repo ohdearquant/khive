@@ -1,8 +1,10 @@
-//! The five typed change-set operations and their stage-time payloads.
+//! The six typed change-set operations and their stage-time payloads.
 
 use std::collections::BTreeMap;
 
-use khive_types::{EdgeRelation, Entity, EntityKind, Id128, Link, Namespace, Note, PropertyValue};
+use khive_types::{
+    EdgeRelation, Entity, EntityKind, Id128, Link, Namespace, Note, NoteStatus, PropertyValue,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::strict::{StrictEntity, StrictLink, StrictNote};
@@ -17,6 +19,7 @@ pub enum Op {
     Link(LinkOp),
     Update(UpdateOp),
     Delete(DeleteOp),
+    Restore(RestoreOp),
     Merge(MergeOp),
 }
 
@@ -123,7 +126,7 @@ impl TryFrom<LinkOpRaw> for LinkOp {
         if !raw.weight.is_finite() {
             return Err(format!("LinkOp weight must be finite, got {}", raw.weight));
         }
-        if !(0.0..=1.0).contains(&raw.weight) {
+        if !khive_types::validate_edge_weight(raw.weight) {
             return Err(format!(
                 "LinkOp weight must be in [0.0, 1.0], got {}",
                 raw.weight
@@ -169,7 +172,8 @@ impl UpdateOp {
     /// # Errors
     ///
     /// Returns an error for differing substrates or field sets, or for an
-    /// invalid captured salience, decay factor, or edge weight.
+    /// invalid captured salience, decay factor, or edge weight, or an invalid
+    /// new edge weight.
     pub fn new(
         target_id: Id128,
         patch: UpdatePatch,
@@ -292,18 +296,26 @@ impl TryFrom<EdgePatchRaw> for EdgePatch {
     type Error = String;
 
     fn try_from(raw: EdgePatchRaw) -> Result<Self, Self::Error> {
-        if let Some(w) = raw.weight {
+        let patch = EdgePatch {
+            relation: raw.relation,
+            weight: raw.weight,
+        };
+        patch.validate_weight()?;
+        Ok(patch)
+    }
+}
+
+impl EdgePatch {
+    fn validate_weight(&self) -> Result<(), String> {
+        if let Some(w) = self.weight {
             if !w.is_finite() {
                 return Err(format!("EdgePatch weight must be finite, got {w}"));
             }
-            if !(0.0..=1.0).contains(&w) {
+            if !khive_types::validate_edge_weight(w) {
                 return Err(format!("EdgePatch weight must be in [0.0, 1.0], got {w}"));
             }
         }
-        Ok(EdgePatch {
-            relation: raw.relation,
-            weight: raw.weight,
-        })
+        Ok(())
     }
 }
 
@@ -457,12 +469,13 @@ fn validate_update_congruence(
             check_touched("relation", p.relation.is_some(), pre.relation.is_some())?;
             check_touched("weight", p.weight.is_some(), pre.weight.is_some())?;
             if let Some(w) = pre.weight {
-                if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+                if !khive_types::validate_edge_weight(w) {
                     return Err(format!(
                         "UpdateOp edge preimage weight must be finite and in [0.0, 1.0], got {w}"
                     ));
                 }
             }
+            p.validate_weight()?;
             Ok(())
         }
         _ => Err(format!(
@@ -538,6 +551,76 @@ impl<'de> Deserialize<'de> for DeleteOp {
             hard: raw.hard,
             preimage: raw.preimage,
         })
+    }
+}
+
+/// Restores a soft-deleted record to its captured live content.
+///
+/// The full record uses the same strict wire mirrors as [`DeletePreimage`].
+/// See `crates/khive-changeset/docs/api/restore.md` for lifecycle semantics.
+#[derive(Clone, Debug, Serialize)]
+pub struct RestoreOp {
+    target_id: Id128,
+    record: DeletePreimage,
+}
+
+impl RestoreOp {
+    /// Checks target identity, live state, and the embedded numeric invariants.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a mismatched ID, a tombstoned record, a non-active note, or invalid numeric values.
+    pub fn new(target_id: Id128, record: DeletePreimage) -> Result<Self, String> {
+        if target_id != record.record_id() {
+            return Err(format!(
+                "RestoreOp target_id {target_id} does not match record id {}",
+                record.record_id()
+            ));
+        }
+        if let DeletePreimage::Note(row) = &record {
+            if row.status != NoteStatus::Active {
+                return Err("RestoreOp note record must be active; live restore cannot recover another status".into());
+            }
+        }
+        let (live, valid) = match &record {
+            DeletePreimage::Entity(row) => (row.deleted_at.is_none(), true),
+            DeletePreimage::Note(row) => (row.deleted_at.is_none(), row.is_valid()),
+            DeletePreimage::Edge(row) => (row.deleted_at.is_none(), row.is_valid()),
+        };
+        if !live {
+            return Err("RestoreOp record must have no deleted_at tombstone".into());
+        }
+        if !valid {
+            return Err("RestoreOp record has invalid numeric values".into());
+        }
+        Ok(Self { target_id, record })
+    }
+
+    /// The identifier of the existing soft-deleted record.
+    pub fn target_id(&self) -> Id128 {
+        self.target_id
+    }
+
+    /// The full expected live record, including captured lifecycle metadata.
+    pub fn record(&self) -> &DeletePreimage {
+        &self.record
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreOpRaw {
+    target_id: Id128,
+    record: DeletePreimage,
+}
+
+impl<'de> Deserialize<'de> for RestoreOp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RestoreOpRaw::deserialize(deserializer)?;
+        Self::new(raw.target_id, raw.record).map_err(serde::de::Error::custom)
     }
 }
 

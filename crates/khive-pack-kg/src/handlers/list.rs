@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use khive_runtime::{KhiveRuntime, MailboxView, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::note::Note;
-use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
+use khive_storage::types::{Edge, PageRequest, SqlStatement, SqlValue};
 use khive_storage::EntityFilter;
 
 use khive_runtime::EdgeListFilter;
@@ -13,9 +13,10 @@ use super::common::{
     canonical_entity_kind, canonical_note_kind, deser, entity_type_filter_matches,
     event_filter_from_params, normalize_entity_timestamps, normalize_entity_timestamps_array,
     normalize_event_timestamps_array, parse_note_content, parse_relation, reconcile_entity_type,
-    reconcile_specific, remap_note_status, resolve_kind_spec, resolve_uuid_async, tags_match_any,
-    to_json, validate_graph_read_kind, KindSpec, ListParams,
+    reconcile_specific, remap_note_status, resolve_kind_spec, tags_match_any, to_json,
+    validate_graph_read_kind, DoublingWindowIter, KindSpec, ListParams,
 };
+use super::message_scope::{resolve_mailbox_graph_id, EdgeScope};
 use crate::sql::sql;
 use crate::KgPack;
 
@@ -35,10 +36,9 @@ fn validate_list_filter_scope(
             "entity_kind" | "entity_type" => {
                 (matches!(spec, KindSpec::Entity { .. }), "entity lists")
             }
-            "note_kind" | "key_prefix" | "after_key" | "created_after" | "updated_after"
-            | "tag_mode" | "thread_id" | "direction" | "from" | "to" | "read" | "delivered" => {
-                (matches!(spec, KindSpec::Note { .. }), "note lists")
-            }
+            "note_kind" | "note_status" | "key_prefix" | "after_key" | "created_after"
+            | "updated_after" | "tag_mode" | "thread_id" | "direction" | "from" | "to" | "read"
+            | "delivered" => (matches!(spec, KindSpec::Note { .. }), "note lists"),
             "created_by_actor" => (
                 matches!(spec, KindSpec::Note { .. }),
                 "scheduled_event note lists",
@@ -220,10 +220,7 @@ async fn resolve_message_thread_filter(
     let mut case_variant_label: Option<String> = None;
     let mut resolved: Option<uuid::Uuid> = None;
     for row in &rows {
-        let Some(stored) = row.get("thread_id").and_then(|value| match value {
-            SqlValue::Text(value) => Some(value.as_str()),
-            _ => None,
-        }) else {
+        let Some(stored) = row.text_or_none("thread_id") else {
             continue;
         };
         if stored == raw {
@@ -269,6 +266,137 @@ async fn resolve_message_thread_filter(
         "list: no message thread matches prefix {raw:?} in the caller's visible \
          namespaces; a prefix can miss, so use the full thread UUID"
     )))
+}
+
+/// One offset page of the edges the caller's view admits. `offset` counts
+/// admitted edges. An edge with a withheld endpoint is dropped before the page
+/// is cut, so the page, `has_more` and the keys of the response are those of a
+/// store that never held the edge. The scan reads until the page is full or the
+/// store has no more edges. Once a window has held a withheld edge, every later
+/// window is at least twice the one before, up to `EDGE_LIST_MAX_LIMIT`, so the
+/// rows read grow in proportion to the withheld run. For `T` edges passed over,
+/// `C = EDGE_LIST_MAX_LIMIT` and `w` the size of the window that first held a
+/// withheld edge, the scan makes at most
+/// `floor(log2(1 + T / w)) + floor(T / C) + 1` store reads. Returns the page and
+/// `has_more`.
+async fn edge_page_at(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    scope: &mut EdgeScope<'_>,
+    filter: &EdgeListFilter,
+    offset: u32,
+    limit: u32,
+) -> Result<(Vec<Edge>, bool), RuntimeError> {
+    let cap = KhiveRuntime::EDGE_LIST_MAX_LIMIT;
+    let wanted = overfetch_limit(limit) as usize;
+    let mut kept: Vec<Edge> = Vec::new();
+    let mut skipped = 0u32;
+    let mut raw_offset = 0u32;
+    let mut withheld_seen = false;
+    let mut windows =
+        DoublingWindowIter::new(offset.saturating_add(overfetch_limit(limit)).min(cap), cap);
+    while let Some(window) = windows.next() {
+        let page = runtime
+            .list_edges(token, filter.clone(), window, raw_offset)
+            .await?;
+        let fetched = page.len() as u32;
+        for edge in page {
+            if !scope.permits(&edge).await? {
+                withheld_seen = true;
+            } else if skipped < offset {
+                skipped += 1;
+            } else {
+                kept.push(edge);
+                if kept.len() >= wanted {
+                    break;
+                }
+            }
+        }
+        if kept.len() >= wanted || fetched < window {
+            break;
+        }
+        raw_offset = raw_offset.saturating_add(fetched);
+        let missing = (wanted - kept.len()) as u32;
+        let next = offset
+            .saturating_sub(skipped)
+            .saturating_add(missing)
+            .saturating_mul(2);
+        windows.advance(window, next, withheld_seen);
+    }
+    Ok(split_overfetched(kept, limit))
+}
+
+/// One cursor page of the edges the caller's view admits, scanned the way
+/// [`edge_page_at`] scans, so its reads follow the same formula. `next_after` is
+/// the last edge the page returns and is set only when more admitted edges
+/// follow. A cursor naming an edge the caller may not read is answered like
+/// one that names no edge. `limit` is at least one: `list` refuses a cursor at
+/// limit zero before it reads anything.
+async fn edge_page_after(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    scope: &mut EdgeScope<'_>,
+    filter: &EdgeListFilter,
+    after: Option<uuid::Uuid>,
+    limit: u32,
+) -> Result<(Vec<Edge>, Option<uuid::Uuid>), RuntimeError> {
+    if let Some(cursor) = after {
+        if let Some(edge) = runtime.get_edge_including_deleted(token, cursor).await? {
+            if !scope.permits(&edge).await? {
+                return Err(RuntimeError::NotFound(format!("edge cursor {cursor}")));
+            }
+        }
+    }
+    let cap = KhiveRuntime::EDGE_LIST_MAX_LIMIT;
+    let wanted = overfetch_limit(limit) as usize;
+    let mut kept: Vec<Edge> = Vec::new();
+    let mut raw_after = after;
+    let mut withheld_seen = false;
+    let mut windows = DoublingWindowIter::new(overfetch_limit(limit).min(cap), cap);
+    while let Some(window) = windows.next() {
+        let (page, next_raw) = runtime
+            .list_edges_after(token, filter.clone(), raw_after, window)
+            .await?;
+        for edge in page {
+            if !scope.permits(&edge).await? {
+                withheld_seen = true;
+                continue;
+            }
+            kept.push(edge);
+            if kept.len() >= wanted {
+                break;
+            }
+        }
+        if kept.len() >= wanted || next_raw.is_none() {
+            break;
+        }
+        raw_after = next_raw;
+        let next = ((wanted - kept.len()) as u32).saturating_mul(2);
+        windows.advance(window, next, withheld_seen);
+    }
+    let (kept, has_more) = split_overfetched(kept, limit);
+    let next_after = if has_more {
+        kept.last().map(|edge| uuid::Uuid::from(edge.id))
+    } else {
+        None
+    };
+    Ok((kept, next_after))
+}
+
+fn note_list_endpoint<'a>(note: &'a Note, field: &str, actor_field: &str) -> &'a str {
+    let text = |key| {
+        note.properties
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+    };
+    let legacy = text(field);
+    if note.kind == "message" {
+        text(actor_field).or(legacy)
+    } else {
+        legacy
+    }
+    .unwrap_or("")
 }
 
 pub(super) fn note_matches_list_filters(
@@ -332,19 +460,13 @@ pub(super) fn note_matches_list_filters(
         }
     }
     if let Some(wanted) = params.from.as_deref() {
-        let stored = properties
-            .and_then(|value| value.get("from"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let stored = note_list_endpoint(note, "from", "from_actor");
         if stored != wanted {
             return false;
         }
     }
     if let Some(wanted) = params.to.as_deref() {
-        let stored = properties
-            .and_then(|value| value.get("to"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let stored = note_list_endpoint(note, "to", "to_actor");
         if stored != wanted {
             return false;
         }
@@ -482,12 +604,21 @@ impl KgPack {
                 ))
             }
             KindSpec::Edge => {
+                let runtime = &self.runtime;
+                let mailbox_view =
+                    runtime.authorize_mailbox_view(token, "list", None, &original_params)?;
                 let source_id = match p.source_id.as_deref() {
-                    Some(s) => Some(resolve_uuid_async(s, &self.runtime, token).await?),
+                    Some(s) => Some(
+                        resolve_mailbox_graph_id(&self.runtime, registry, token, &mailbox_view, s)
+                            .await?,
+                    ),
                     None => None,
                 };
                 let target_id = match p.target_id.as_deref() {
-                    Some(s) => Some(resolve_uuid_async(s, &self.runtime, token).await?),
+                    Some(s) => Some(
+                        resolve_mailbox_graph_id(&self.runtime, registry, token, &mailbox_view, s)
+                            .await?,
+                    ),
                     None => None,
                 };
                 let relations: Vec<_> = p
@@ -506,14 +637,14 @@ impl KgPack {
                 let requested = p.limit.unwrap_or(100);
                 let cap = KhiveRuntime::EDGE_LIST_MAX_LIMIT;
                 let limit = effective_list_limit(requested, cap);
+                let mut scope = EdgeScope::new(&self.runtime, registry, token, &mailbox_view);
                 if let Some(ref after_str) = p.after {
                     // An empty string opts into cursor-mode pagination while
                     // starting from the beginning of the set (no prior page).
                     let after = parse_after_cursor(after_str)?;
-                    let (edges, next_after) = self
-                        .runtime
-                        .list_edges_after(token, filter, after, limit)
-                        .await?;
+                    let (edges, next_after) =
+                        edge_page_after(&self.runtime, token, &mut scope, &filter, after, limit)
+                            .await?;
                     let mut out = serde_json::json!({
                         "edges": to_json(&edges)?,
                         "next_after": next_after,
@@ -522,11 +653,9 @@ impl KgPack {
                     Ok(out)
                 } else {
                     let offset = p.offset.unwrap_or(0);
-                    let edges = self
-                        .runtime
-                        .list_edges(token, filter, overfetch_limit(limit), offset)
-                        .await?;
-                    let (edges, has_more) = split_overfetched(edges, limit);
+                    let (edges, has_more) =
+                        edge_page_at(&self.runtime, token, &mut scope, &filter, offset, limit)
+                            .await?;
                     Ok(render_list_response(
                         to_json(&edges)?,
                         requested,
@@ -905,224 +1034,5 @@ impl KgPack {
 mod event_target_tests;
 
 #[cfg(test)]
-mod tests {
-    use super::parse_after_cursor;
-    use super::{
-        add_list_limit_metadata, overfetch_limit, render_list_response, split_overfetched,
-    };
-    use crate::handlers::common::{event_filter_from_params, ListParams};
-    use crate::sql::sql;
-
-    /// The defect this field exists for: at `limit == cap` the three older
-    /// disclosure fields are identical for a complete page and a truncated one.
-    #[test]
-    fn a_full_page_at_the_cap_is_distinguishable_from_a_complete_one() {
-        let truncated = render_list_response(serde_json::json!([]), 500, 500, true);
-        let complete = render_list_response(serde_json::json!([]), 500, 500, false);
-
-        for page in [&truncated, &complete] {
-            assert_eq!(page["requested_limit"], 500);
-            assert_eq!(page["effective_limit"], 500);
-            assert_eq!(page["limit_clamped"], false);
-        }
-        assert_ne!(
-            truncated, complete,
-            "a truncated page and a complete one must not serialize identically"
-        );
-        assert_eq!(truncated["has_more"], true);
-        assert_eq!(complete["has_more"], false);
-    }
-
-    /// The two truncation causes are independent: the cap clamp is something a
-    /// caller can act on, the population is something it can only page through.
-    #[test]
-    fn the_cap_clamp_and_the_population_are_reported_separately() {
-        let clamped_and_complete = render_list_response(serde_json::json!([]), 600, 500, false);
-        assert_eq!(clamped_and_complete["limit_clamped"], true);
-        assert_eq!(clamped_and_complete["has_more"], false);
-
-        let unclamped_and_truncated = render_list_response(serde_json::json!([]), 10, 10, true);
-        assert_eq!(unclamped_and_truncated["limit_clamped"], false);
-        assert_eq!(unclamped_and_truncated["has_more"], true);
-    }
-
-    #[test]
-    fn the_added_metadata_form_carries_the_same_pair() {
-        let mut response = serde_json::json!({"entities": [], "next_after": null});
-        add_list_limit_metadata(&mut response, 500, 500, true);
-        assert_eq!(response["limit_clamped"], false);
-        assert_eq!(response["has_more"], true);
-        assert_eq!(response["entities"], serde_json::json!([]));
-    }
-
-    #[test]
-    fn the_over_fetched_row_is_never_returned_and_is_the_whole_signal() {
-        let exactly_full: Vec<u32> = (0..5).collect();
-        let (page, has_more) = split_overfetched(exactly_full, 5);
-        assert_eq!(page.len(), 5);
-        assert!(!has_more, "a page the store could not extend is complete");
-
-        let one_over: Vec<u32> = (0..6).collect();
-        let (page, has_more) = split_overfetched(one_over, 5);
-        assert_eq!(page, vec![0, 1, 2, 3, 4], "the extra row must not escape");
-        assert!(has_more);
-
-        let short: Vec<u32> = (0..2).collect();
-        let (page, has_more) = split_overfetched(short, 5);
-        assert_eq!(page.len(), 2);
-        assert!(!has_more);
-    }
-
-    #[test]
-    fn the_over_fetch_asks_for_exactly_one_more_and_cannot_overflow() {
-        assert_eq!(overfetch_limit(0), 1);
-        assert_eq!(overfetch_limit(500), 501);
-        assert_eq!(overfetch_limit(u32::MAX), u32::MAX);
-    }
-
-    #[test]
-    fn after_cursor_rejects_prefix_with_keyset_consequence() {
-        let error = parse_after_cursor("deadbeef").expect_err("prefix is not an exact cursor");
-        let message = error.to_string();
-        assert!(message.contains("can miss or be ambiguous"), "{message}");
-        assert!(
-            message.contains("exact stable insertion boundary"),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn event_filters_reject_prefixes_with_exact_record_consequence() {
-        for (field, value) in [
-            ("session_id", serde_json::json!("deadbeef")),
-            ("observed", serde_json::json!(["deadbeef"])),
-            ("selected", serde_json::json!(["deadbeef"])),
-        ] {
-            let mut args = serde_json::json!({"kind": "event"});
-            args[field] = value;
-            let params: ListParams = serde_json::from_value(args).expect("list params");
-            let error = event_filter_from_params(&params)
-                .expect_err("prefix is not an exact event-filter identifier");
-            let message = error.to_string();
-            assert!(message.contains(field), "{message}");
-            assert!(message.contains("can miss or be ambiguous"), "{message}");
-            assert!(message.contains("exact stable record"), "{message}");
-        }
-    }
-
-    #[tokio::test]
-    async fn message_thread_scope_matches_a_routing_field_only_as_text() {
-        use khive_runtime::{KhiveRuntime, Namespace};
-        use khive_storage::types::{SqlStatement, SqlValue};
-
-        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-        let namespace = Namespace::parse("scope-one").expect("valid namespace");
-        let token = runtime.authorize(namespace).expect("authorized namespace");
-        for (thread, to_actor) in [
-            (
-                "aaaaaaaa-bbbb-4ccc-8ddd-000000000001",
-                serde_json::json!("x"),
-            ),
-            (
-                "aaaaaaaa-bbbb-4ccc-8ddd-000000000002",
-                serde_json::json!(["x"]),
-            ),
-        ] {
-            runtime
-                .create_note(
-                    &token,
-                    "message",
-                    None,
-                    "routed message",
-                    None,
-                    Some(serde_json::json!({
-                        "thread_id": thread,
-                        "direction": "inbound",
-                        "to_actor": to_actor,
-                    })),
-                    vec![],
-                )
-                .await
-                .expect("create message note");
-        }
-        // An array routing field renders as `["x"]` under json_extract; an
-        // actor id spelling that text must not be admitted to the thread.
-        for (actor, expected) in [
-            ("x", vec!["aaaaaaaa-bbbb-4ccc-8ddd-000000000001"]),
-            (r#"["x"]"#, vec![]),
-        ] {
-            let mut reader = runtime.sql().reader().await.expect("SQL reader");
-            let rows = reader
-                .query_all(SqlStatement {
-                    sql: sql!("message_threads_list").to_string(),
-                    params: vec![
-                        SqlValue::Text(r#"["scope-one"]"#.into()),
-                        SqlValue::Text(actor.into()),
-                        SqlValue::Integer(0),
-                    ],
-                    label: Some("test.message_threads_list".into()),
-                })
-                .await
-                .expect("message thread scope query");
-            let threads: Vec<String> = rows
-                .iter()
-                .map(|row| match row.get("thread_id") {
-                    Some(SqlValue::Text(thread)) => thread.clone(),
-                    other => panic!("thread_id column: {other:?}"),
-                })
-                .collect();
-            assert_eq!(threads, expected, "actor {actor}");
-        }
-    }
-
-    #[tokio::test]
-    async fn message_thread_namespace_json_scope_handles_empty_single_and_past_bind_limit() {
-        use khive_runtime::{KhiveRuntime, Namespace};
-        use khive_storage::types::{SqlStatement, SqlValue};
-
-        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-        let namespace = Namespace::parse("scope-one").expect("valid namespace");
-        let token = runtime.authorize(namespace).expect("authorized namespace");
-        runtime
-            .create_note(
-                &token,
-                "message",
-                None,
-                "threaded message",
-                None,
-                Some(serde_json::json!({
-                    "thread_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
-                })),
-                vec![],
-            )
-            .await
-            .expect("create message note");
-
-        let past_bind_limit = (0..33_000)
-            .map(|index| format!("scope-{index}"))
-            .chain(std::iter::once("scope-one".to_string()))
-            .collect::<Vec<_>>();
-        for (case, namespaces, expected_rows) in [
-            ("empty", Vec::<String>::new(), 0),
-            ("single", vec!["scope-one".to_string()], 1),
-            ("past SQLite bind limit", past_bind_limit, 1),
-        ] {
-            let namespaces_json =
-                serde_json::to_string(&namespaces).expect("serialize namespace scope");
-            let mut reader = runtime.sql().reader().await.expect("SQL reader");
-            let rows = reader
-                .query_all(SqlStatement {
-                    sql: sql!("message_threads_list").to_string(),
-                    params: vec![
-                        SqlValue::Text(namespaces_json),
-                        SqlValue::Text("local".into()),
-                        SqlValue::Integer(1),
-                    ],
-                    label: Some("test.message_threads_list".into()),
-                })
-                .await
-                .expect("message thread scope query");
-            assert_eq!(rows.len(), expected_rows, "{case} namespace scope");
-        }
-    }
-}
+#[path = "list_tests.rs"]
+mod tests;

@@ -1,13 +1,6 @@
-//! SQL lives beside the code as `sql/<name>.sql`: one statement per file,
-//! `?N` binds only, never string-built, loaded at compile time by `sql!`.
+//! Static SQL assets retain their compile-time `sql!` loading. The seven entity
+//! lookups use a closed typed selector with fixed clauses and bound values.
 
-/// The statement text of `sql/<name>.sql`, checked in at compile time.
-macro_rules! sql {
-    ($name:literal) => {
-        const {
-            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/sql/", $name, ".sql"))
-                .trim_ascii_end()
-        }
-    };
-}
-pub(crate) use sql;
+mod entity_rows;
+pub(crate) use entity_rows::EntityRows;
+pub(crate) use khive_runtime::sql;

@@ -1026,14 +1026,28 @@ is returned.
 
 #### Binding workflow
 
-A typical "train and serve per subagent per project" sequence:
+The `namespace` parameter on `brain.bind`, `brain.unbind`, `brain.bindings`, and
+`brain.resolve` selects the profile catalog these calls read or write. When supplied,
+that same namespace is the binding match context. When omitted, the call uses the
+caller's default catalog (the request identity's namespace when one is attached,
+otherwise the runtime's default namespace, `local` unless configured) and the wildcard
+match context `*`: `brain.bind` stores the binding with namespace `*`, so it matches
+every namespace context within that catalog; `brain.resolve` matches only bindings
+stored with `*`; `brain.bindings` and `brain.unbind` apply no namespace filter, so they
+match bindings of every namespace in that catalog, subject to their other filters.
+`brain.unbind` returns `removed_by_namespace`, an object mapping each removed binding's namespace to its count (empty when none match), alongside the unchanged `removed` and `unbound` totals.
+Profile IDs are unique within each catalog. Bindings resolve only in the selected
+catalog; cross-catalog resolution is outside this workflow and needs a separate ADR.
+
+A typical "train and serve per subagent per project" sequence for a profile already
+created in `agent:docs`:
 
 ```
 1. Define profile shape  (Fold + Objective + Selector + state type)
-2. brain.backtest(profile_id=candidate, event_filter=...)
+2. brain.backtest(profile_id=candidate, namespace="agent:docs", event_filter=...)
      → derives state by replaying events through the Fold
      → persists snapshot
-3. brain.activate(profile_id=candidate)
+3. brain.activate(profile_id=candidate, namespace="agent:docs")
      → lifecycle changes to active; no live update loop is started (ADR-104)
 4. brain.bind(profile_id=candidate,
               actor="implementer-α",
@@ -1490,6 +1504,35 @@ target design. When LoRA-class state is built, `ModuleName` lands with its first
 the enum rule above applies from its first snapshot.
 
 ---
+
+## Amendment 6 — Read persisted events in compound pages (2026-10-06, #4118)
+
+**Status**: Accepted (2026-10-06). Acceptance is required before dependent implementation merges.
+
+Add `brain.event_page` as an assertive read with the request, response and live-window
+contract in [ADR-022](ADR-022-events-query-surface.md)'s compound-page amendment.
+`brain.events` remains its fixed-verb debugging read; `brain.event_counts` retains
+its existing output fields, traversal, aggregation order and cost behavior.
+
+Factor only the existing event-count actor selector into a shared private helper.
+Preserve caller aliases (including historical bare/stamped forms), prefixed principal
+separation, anonymous behavior, explicit visible-actor checks, error/validation order,
+and the serving runtime's `brain.fleet_readers` policy. Only the count accumulator's
+existing default-caller coalescing remains count-specific. The page reader preserves
+each stored actor value. Reapply the selector on every continuation; neither cursor
+contents nor client-side configuration grant fleet access or broader namespaces.
+
+Return persisted event payloads as recorded. In particular, a real feedback writer's
+target, signal and profile attribution remain intact. Current and historical GTD
+audit rows do not contain task ID or prior/new status; leave them absent rather than
+infer them. Future typed GTD success-audit enrichment is out of scope and does not
+block this API. No profile fold, event emission or lifecycle-audit producer changes.
+
+Acceptance requires public MCP calls to real feedback and GTD writers followed by
+pages over a fixed window, exact stored-field comparison, and successful untruncated
+count parity under matching selectors. Retain existing count/debug/actor regression
+tests and add page-specific cursor, visibility and serving-fleet controls. The handler
+checks the actual serialized response against 4 MiB and fails explicitly if exceeded.
 
 ## References
 

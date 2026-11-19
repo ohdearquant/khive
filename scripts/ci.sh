@@ -4,16 +4,70 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/../crates"
 
+# TEST_SCOPE selects what a pull-request run builds and tests (ADR-205 D5). Unset or `full` keeps every
+# phase in its workspace form. Otherwise it is the space-separated crate list that
+# scripts/ci-test-scope.py printed: the changed crates and every crate that depends on them.
+scoped() {
+    [ -n "${TEST_SCOPE:-}" ] && [ "$TEST_SCOPE" != "full" ]
+}
+
+# True when the run is not scoped, or the named crate is in the scope.
+in_scope() {
+    scoped || return 0
+    case " $TEST_SCOPE " in
+        *" $1 "*) return 0 ;;
+    esac
+    return 1
+}
+
+# The `-p` arguments for the scoped crates that are workspace members, read from cargo's own member
+# list. A crate outside the workspace (khive-merge) is tested by the forward-deployed phase instead.
+# Fails, rather than printing nothing, when the member list cannot be read, so a broken read never
+# turns into an unfiltered workspace command.
+scope_package_args() {
+    members=$(cargo metadata --no-deps --format-version 1 --locked | python3 -P -c '
+import json, sys
+meta = json.load(sys.stdin)
+ids = set(meta["workspace_members"])
+print("\n".join(sorted(p["name"] for p in meta["packages"] if p["id"] in ids)))
+') || { echo "scope: cannot read the workspace member list" >&2; return 1; }
+    [ -n "$members" ] || { echo "scope: the workspace member list is empty" >&2; return 1; }
+    args=""
+    for crate in $TEST_SCOPE; do
+        if printf '%s\n' "$members" | grep -qxF -e "$crate"; then
+            args="$args -p $crate"
+        fi
+    done
+    printf '%s\n' "$args"
+}
+
+# Prints the skip line and returns 0 when a scoped run has nothing of this phase to run.
+scope_skips() {
+    if scoped && ! in_scope "$1"; then
+        echo "scope: $1 is not under test in this run (TEST_SCOPE=$TEST_SCOPE); phase skipped"
+        return 0
+    fi
+    return 1
+}
+
 phase_lockfile() {
     echo "=== Lockfile Freshness ==="
     # crates/Cargo.lock is committed (#920): dependency pins land as reviewable
     # diffs and CI resolves exactly what was reviewed. --locked fails instead of
     # silently re-resolving if Cargo.lock drifts from what the manifests allow.
-    cargo check --workspace --locked
+    if scoped; then
+        # A -p selection unifies features over the selected packages only, so a target that compiles only
+        # under whole-workspace unification is invisible to the scoped test and clippy phases. Checking
+        # every target of every crate closes that class without code generation for the test targets.
+        cargo check --workspace --all-targets --locked
+    else
+        cargo check --workspace --locked
+    fi
 }
 
 phase_forward_deployed() {
     echo "=== Forward-Deployed Crates Check ==="
+    scope_skips khive-merge && return 0
     # Excluded workspace crates (forward-deployed infrastructure) must still compile,
     # pass clippy under -D warnings across all targets, and pass their test suite.
     # khive-merge declares its own [workspace] table, so it resolves a separate
@@ -32,6 +86,34 @@ phase_lint() {
     sh "$SCRIPT_DIR/lint-sql.sh"
     python3 "$SCRIPT_DIR/tests/test_lint_sql.py"
 
+    phase_adr_lint
+
+    echo "=== Local Build Artifact Verification Tests ==="
+    python3 "$SCRIPT_DIR/tests/test_verify_local_artifact.py"
+
+    echo "=== Writer Census Contract Tests ==="
+    python3 "$SCRIPT_DIR/tests/test_writer_census.py"
+
+    echo "=== CI Workflow Contract Tests ==="
+    python3 "$SCRIPT_DIR/tests/test_ci_workflows.py"
+    python3 "$SCRIPT_DIR/tests/test_ci_clippy.py"
+    python3 "$SCRIPT_DIR/tests/test_ci_infra_retry.py"
+
+    echo "=== CI Empty-HOME Sentinel Tests ==="
+    python3 "$SCRIPT_DIR/tests/test_ci_home_sentinel.py"
+    python3 "$SCRIPT_DIR/tests/test_kkernel_test_isolation.py"
+
+    echo "=== Binary Resolution Harness Tests ==="
+    python3 "$SCRIPT_DIR/tests/test_binary_resolution.py"
+
+    echo "=== Contract Harness Tests ==="
+    python3 "$SCRIPT_DIR/tests/test_ci_contract_harness.py"
+    sh "$SCRIPT_DIR/ci-contract-harness.sh" python "$SCRIPT_DIR/tests/test_contract_harness.py"
+}
+
+# The hosted docs job runs this phase too, so a change that touches only Markdown, which skips the Rust
+# jobs, still has its ADR references and status lines checked.
+phase_adr_lint() {
     echo "=== ADR Reference Lint ==="
     sh "$SCRIPT_DIR/lint-adr-refs.sh"
 
@@ -43,25 +125,6 @@ phase_lint() {
 
     echo "=== ADR Status Lint Self-Test ==="
     python3 "$SCRIPT_DIR/lint-adr-status.py" --self-test
-
-    echo "=== Local Build Artifact Verification Tests ==="
-    python3 "$SCRIPT_DIR/tests/test_verify_local_artifact.py"
-
-    echo "=== Writer Census Contract Tests ==="
-    python3 "$SCRIPT_DIR/tests/test_writer_census.py"
-
-    echo "=== CI Workflow Contract Tests ==="
-    python3 "$SCRIPT_DIR/tests/test_ci_workflows.py"
-
-    echo "=== CI Empty-HOME Sentinel Tests ==="
-    python3 "$SCRIPT_DIR/tests/test_ci_home_sentinel.py"
-    python3 "$SCRIPT_DIR/tests/test_kkernel_test_isolation.py"
-
-    echo "=== Binary Resolution Harness Tests ==="
-    python3 "$SCRIPT_DIR/tests/test_binary_resolution.py"
-
-    echo "=== Contract Harness Tests ==="
-    uv run --project "$SCRIPT_DIR/../tests/khive-contract" python "$SCRIPT_DIR/tests/test_contract_harness.py"
 }
 
 phase_docs_fmt() {
@@ -138,8 +201,23 @@ phase_no_stubs() {
 }
 
 phase_clippy() {
-    echo "=== Clippy ==="
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    if scoped; then
+        packages=$(scope_package_args) || return 1
+        if [ -z "$packages" ]; then
+            echo "scope: no workspace member is under test; clippy skipped"
+            return 0
+        fi
+    else
+        packages="--workspace"
+    fi
+    # Optional features can hide warnings in the default configuration. Keep
+    # both checks on the same affected-package closure, with default first.
+    echo "=== Clippy (default features) ==="
+    # shellcheck disable=SC2086
+    cargo clippy $packages --all-targets -- -D warnings || return $?
+    echo "=== Clippy (all features) ==="
+    # shellcheck disable=SC2086
+    cargo clippy $packages --all-targets --all-features -- -D warnings
 }
 
 phase_docs() {
@@ -254,6 +332,22 @@ phase_tests() {
     # so CI can shard the workspace test suite across parallel jobs. Unset
     # (the default, including every local/non-sharded invocation) keeps the
     # plain `cargo test --workspace` path unchanged.
+    if scoped; then
+        packages=$(scope_package_args) || return 1
+        if [ -z "$packages" ]; then
+            echo "scope: no workspace member is under test; tests skipped"
+            return 0
+        fi
+        echo "scope: testing$packages"
+        if [ -n "${NEXTEST_PARTITION:-}" ]; then
+            # shellcheck disable=SC2086
+            run_with_store_sentinel cargo nextest run $packages --no-fail-fast --partition "count:${NEXTEST_PARTITION}"
+        else
+            # shellcheck disable=SC2086
+            run_with_store_sentinel cargo test $packages
+        fi
+        return
+    fi
     if [ -n "${NEXTEST_PARTITION:-}" ]; then
         # --no-fail-fast: one red test must not cancel the rest of the shard, so a
         # head reports every failure it has.
@@ -271,11 +365,21 @@ phase_tests_doc() {
     # so this phase only needs to run alongside the sharded nextest path.
     # Doctests execute arbitrary workspace code, so they carry the same #1204
     # sentinel guard as every other test-execution path.
+    if scoped; then
+        packages=$(scope_package_args) || return 1
+        if [ -z "$packages" ]; then
+            echo "scope: no workspace member is under test; doctests skipped"
+            return 0
+        fi
+        # shellcheck disable=SC2086
+        run_with_store_sentinel cargo test --doc $packages
+        return
+    fi
     run_with_store_sentinel cargo test --doc --workspace
 }
 
 phase_channel_email() {
-    echo "=== Channel Feature Tests (email + Telegram features) ==="
+    echo "=== Feature Tests (email + Telegram channels, retrieval executor) ==="
     # `--workspace` alone never runs any of the several `#[cfg(feature =
     # "channel-email")]` test modules in khive-mcp (ADR-094 channel lifecycle
     # sequencing, issue #449 cursor_commit gating, bootstrap-floor regressions,
@@ -287,7 +391,19 @@ phase_channel_email() {
     # the same feature job: its poll/outbox admission is equally capable of
     # external side effects and must execute tests, not merely type-check in
     # the all-features clippy pass.
-    cargo test -p khive-mcp --features channel-email,channel-telegram
+    if in_scope khive-mcp; then
+        cargo test -p khive-mcp --features channel-email,channel-telegram
+    else
+        echo "scope: khive-mcp is not under test; channel feature tests skipped"
+    fi
+    # The shared retrieval executor is opt-in and has no caller in the
+    # workspace yet, so no build enables its feature and `--workspace` compiles
+    # neither the executor nor its tests. Run them under the feature here.
+    if in_scope khive-retrieval; then
+        cargo test -p khive-retrieval --features executor
+    else
+        echo "scope: khive-retrieval is not under test; executor feature tests skipped"
+    fi
 }
 
 run_daemon_recovery_repeats() {
@@ -338,18 +454,29 @@ run_daemon_recovery_repeats() {
 
 phase_daemon_recovery_flake() {
     echo "=== Daemon Recovery Flake Gate (25 repeats) ==="
+    scope_skips khive-mcp && return 0
     # One guard around the complete repeat batch detects any default-store
     # mutation without re-hashing a potentially large operator store 50 times.
     run_with_store_sentinel run_daemon_recovery_repeats
 }
 
 phase_no_default_features() {
-    echo "=== No-Default-Features Check ==="
-    # Check the package alone: workspace feature unification enables fold's
+    echo "=== No-Default-Features Clippy ==="
+    # Lint the package alone: workspace feature unification enables fold's
     # default serde feature through its runtime/pack dependents (#3341).
-    cargo check --locked -p khive-fold --no-default-features --lib
-    cargo test --locked -p khive-fold --no-default-features --test no_default_checkpoint
-    cargo check --workspace --no-default-features
+    if in_scope khive-fold; then
+        cargo clippy --locked -p khive-fold --no-default-features --lib -- -D warnings
+        cargo test --locked -p khive-fold --no-default-features --test no_default_checkpoint
+    else
+        echo "scope: khive-fold is not under test; its no-default-features checks skipped"
+    fi
+    # Workspace dependents also enable khive-types features, hiding no-default test warnings.
+    if in_scope khive-types; then
+        cargo clippy --locked -p khive-types --no-default-features --all-targets -- -D warnings
+    else
+        echo "scope: khive-types is not under test; its no-default-features checks skipped"
+    fi
+    cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
 }
 
 # Single source of truth for where the built kkernel binary lives: KKERNEL_BINARY
@@ -374,6 +501,7 @@ kkernel_binary_path() {
 
 phase_release() {
     echo "=== Build (release) ==="
+    scope_skips kkernel && return 0
     KKERNEL_BINARY="$(kkernel_binary_path)"
     export KKERNEL_BINARY
     # pack-formal is an optional dependency, so a default build does not link it.
@@ -388,16 +516,19 @@ phase_release() {
 
 phase_contract_tests() {
     echo "=== Contract Tests ==="
+    scope_skips kkernel && return 0
     python3 "$SCRIPT_DIR/../tests/contract_test.py"
 }
 
 phase_deno_tests() {
     echo "=== Deno Tests ==="
+    scope_skips kkernel && return 0
     (cd "$SCRIPT_DIR/../cli" && deno test --allow-all .)
 }
 
 phase_smoke_tests() {
     echo "=== Smoke Test ==="
+    scope_skips kkernel && return 0
     python3 "$SCRIPT_DIR/../tests/test_documented_verb_counts.py"
     python3 "$SCRIPT_DIR/../tests/smoke_test.py"
     python3 "$SCRIPT_DIR/../tests/smoke_brain.py"
@@ -408,6 +539,7 @@ phase_smoke_tests() {
 
 phase_vector_smoke() {
     echo "=== Vector Smoke (embed/recall path gate) ==="
+    scope_skips kkernel && return 0
     # smoke_vector.py self-guards empirically: it spawns kkernel, attempts one
     # memory.remember, and prints "SKIP: ..." + exits 0 when the embedder is not
     # usable (model weights absent or no engine resolves). GitHub Actions runners
@@ -417,7 +549,26 @@ phase_vector_smoke() {
 
 phase_contract_suite() {
     echo "=== Contract Suite (khive-contract) ==="
-    (cd "$SCRIPT_DIR/../tests/khive-contract" && uv run pytest -q)
+    scope_skips kkernel && return 0
+    sh "$SCRIPT_DIR/ci-contract-harness.sh" pytest -q
+}
+
+# The documentation lane skips the contract suite, but one of its tests reads every file in the repository,
+# Markdown included, so the hosted docs job runs that test here. It needs ripgrep: under CI it fails rather
+# than skips when rg is absent, and a renamed test fails collection rather than selecting nothing.
+phase_content_sweeps() {
+    echo "=== Repository Identifier Ban (khive-contract) ==="
+    sh "$SCRIPT_DIR/ci-contract-harness.sh" pytest -q \
+        tests/test_no_importance_in_manifest.py::test_no_importance_identifiers_in_repo
+    echo "=== Shipping Pack-Set Copy Check ==="
+    # Reads Markdown under docs/, crates/ and scripts/ by content, so the documentation lane must run it.
+    # Named by test id: a renamed test is an error, not an empty selection.
+    python3 "$SCRIPT_DIR/tests/test_ci_workflows.py" \
+        HarnessEnvironmentTests.test_no_new_hand_typed_copy_of_the_shipping_pack_set
+    echo "=== Developer Guide Table Checks ==="
+    # The directory map is compared with crates/*/Cargo.toml here, where every change runs it; the
+    # verb tables need a verbs() result and are compared inside smoke_test.py.
+    python3 "$SCRIPT_DIR/../tests/test_documented_guide_tables.py"
 }
 
 phase_macos_pr_check() {
@@ -435,10 +586,10 @@ phase_macos_pr_tests() {
     # OS, not from which crates sound platform-shaped. `cfg(unix)` is true on
     # Linux as well, so it selects nothing here; the discriminator is a
     # `target_os` arm, and every one of them in the workspace lives in
-    # khive-db (walpin, blob store), khive-runtime (daemon, engine config,
-    # resource), khive-pack-exec (sandbox and rlimits), khive-pack-moodboard
-    # (resolving an open file descriptor back to a path) or khive-pack-git
-    # (local remote handling).
+    # khive-fs (the thread errno accessor), khive-db (walpin, blob store),
+    # khive-runtime (daemon, engine config, resource), khive-pack-exec (sandbox
+    # and rlimits), khive-pack-moodboard (resolving an open file descriptor back
+    # to a path) or khive-pack-git (local remote handling).
     #
     # Everything dropped from this list still runs, on the Linux shards, which
     # partition `cargo nextest run --workspace`. What is given up is a second
@@ -465,7 +616,7 @@ phase_macos_pr_tests() {
     # compile everywhere, the result guards a symlink escape out of the model
     # directory, and only running the test decides whether the macOS one is
     # right.
-    cargo test -p khive-db -p khive-runtime -p khive-pack-exec -p khive-pack-moodboard
+    cargo test -p khive-fs -p khive-db -p khive-runtime -p khive-pack-exec -p khive-pack-moodboard
     # khive-pack-git's platform arms are in its unit tests; its integration
     # targets are git plumbing that behaves the same on both systems. khive-mcp
     # is `--lib` for the run-time reason given above.
@@ -487,6 +638,7 @@ run_phase() {
         lockfile) phase_lockfile ;;
         forward-deployed) phase_forward_deployed ;;
         lint) phase_lint ;;
+        adr-lint) phase_adr_lint ;;
         no-stubs) phase_no_stubs ;;
         clippy) phase_clippy ;;
         docs) phase_docs ;;
@@ -501,11 +653,12 @@ run_phase() {
         smoke-tests) phase_smoke_tests ;;
         vector-smoke) phase_vector_smoke ;;
         contract-suite) phase_contract_suite ;;
+        content-sweeps) phase_content_sweeps ;;
         macos-pr-check) phase_macos_pr_check ;;
         macos-pr-tests) phase_macos_pr_tests ;;
         *)
             echo "Unknown CI phase: $1" >&2
-            echo "Valid phases: no-stubs-scan docs-fmt lockfile forward-deployed lint no-stubs clippy docs tests tests-doc channel-email daemon-recovery-flake no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite macos-pr-check macos-pr-tests" >&2
+            echo "Valid phases: no-stubs-scan docs-fmt lockfile forward-deployed lint adr-lint no-stubs clippy docs tests tests-doc channel-email daemon-recovery-flake no-default-features release contract-tests deno-tests smoke-tests vector-smoke contract-suite content-sweeps macos-pr-check macos-pr-tests" >&2
             exit 2
             ;;
     esac

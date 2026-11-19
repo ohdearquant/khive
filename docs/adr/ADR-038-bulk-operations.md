@@ -163,41 +163,18 @@ entity:<uuid>
 edge-natural:<source_uuid>:<target_uuid>:<relation>
 ```
 
-Known implementation gap: the intended stable error shape includes `conflict_ops`, and bulk
-`link(links=[...])` should contribute every contained natural edge key. The current shipped
-implementation omits `conflict_ops` and only extracts singleton `link(source_id, target_id,
-relation)` keys. Keep those as code-side follow-ups; do not change this ADR to claim bulk
-array conflict protection is complete.
+Bulk `link(links=[...])` contributes every statically known contained natural edge
+key, using the same relation and symmetric-endpoint canonicalization as singleton
+links. `conflict_ops` reports all direct participants in each conflicting
+operation's keys, including the reported operation itself (#4797).
 
 #### Preflight algorithm
 
 ```rust
-// crates/khive-mcp/src/server.rs (pseudocode)
-fn preflight_conflict_check(
-    ops: &[ParsedOp],
-    registry: &VerbRegistry,
-    default_ns: &str,
-) -> Result<(), BatchConflictError> {
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut conflicts: Vec<(usize, usize, String)> = Vec::new();
-
-    for (i, op) in ops.iter().enumerate() {
-        let keys = registry.write_keys_for(
-            &op.tool,
-            &Value::Object(op.args.clone()),
-            default_ns,
-        );
-        for key in keys.iter().flatten() {
-            if let Some(&prior) = seen.get(key) {
-                conflicts.push((prior, i, key.clone()));
-            } else {
-                seen.insert(key.clone(), i);
-            }
-        }
-    }
-
-    if conflicts.is_empty() { Ok(()) } else { Err(BatchConflictError { conflicts }) }
-}
+// Flat-batch diagnostic/admission; entries with empty lists dispatch normally.
+let participants = khive_request::write_key_conflict_ops(&ops);
+// Parallel chains preserve their existing whole-unit admission and obtain
+// per-leaf diagnostics from unit_write_key_conflict_ops(&ops, &ranges).
 ```
 
 The preflight runs after parsing and before gate enforcement. If the check detects write-set
@@ -215,22 +192,39 @@ bulk operation:
 - Non-conflicting ops execute normally.
 - `results.length == summary.total == input.ops.length` (ADR-016 contract preserved).
 
-If ordered dependency semantics are required, the caller uses top-level pipe-chain syntax
-(ADR-016 `op1(...) | op2(...)`) which aborts the chain on first failure. Do not wrap pipe
-chains in `[...]`; bracketed form is the parallel batch syntax.
+A top-level pipe chain (`op1(...) | op2(...)`) executes in order and aborts on
+first failure. ADR-016 Amendment 2 also permits parallel units containing chains
+inside `[...]`. A cross-unit conflict refuses the entire affected unit before
+any leaf runs, preserving its first-failure and subsequent-abort entries. Each
+such entry receives its own direct participant list; an innocent collateral
+leaf receives `[]`. Same-unit-only key repetition remains legal.
 
 #### Error shape (per conflicting op)
 
 ```json
 {
   "ok": false,
-  "error": "conflict: writes overlap with op #2",
-  "conflict_ops": [2]
+  "error": {
+    "kind": "runtime_error",
+    "message": "conflict: writes overlap with another op in this batch (op #0)",
+    "domain_disposition": "not_committed"
+  },
+  "domain_disposition": "not_committed",
+  "conflict_ops": [0, 2]
 }
 ```
 
 Each conflicting op receives its own `{ok: false}` entry. Non-conflicting ops receive their
 normal result. The aggregate `summary` reflects the actual executed/failed counts.
+
+Indexes are sorted, unique, zero-based positions in the flattened request. With
+three owners of a key, all three appear. With multiple keys, lists are the union
+of direct shared-key owners, never transitive connected components. Existing
+flat admission also refuses duplicate key occurrences within a single operation;
+its list is `[i]`. For a cross-unit key, every claiming leaf is included, not just
+the first leaf in each unit. Ordinary errors and non-conflict aborts omit the
+field. This diagnostic does not change write-key extraction, atomic transaction
+handling, or parser admission.
 
 #### Read/write classification
 

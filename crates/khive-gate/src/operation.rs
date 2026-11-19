@@ -5,7 +5,7 @@
 
 /// Revision of the reviewed classification contract, included in policy identity.
 /// Bump whenever a classification or the allowed-read contract changes.
-pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v9";
+pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v26";
 
 /// Strongest caller-requested effect of a reviewed operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +25,8 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("agent.resume", OperationAccess::Write),
     ("agent.spawn", OperationAccess::Write),
     ("agent.suspend", OperationAccess::Write),
+    ("apply_changeset", OperationAccess::Write),
+    ("attach", OperationAccess::Write),
     ("authorize", OperationAccess::Write),
     ("authorize.visible", OperationAccess::Read),
     ("blob.abort", OperationAccess::Write),
@@ -46,6 +48,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("brain.deactivate", OperationAccess::Write),
     ("brain.emit", OperationAccess::Write),
     ("brain.event_counts", OperationAccess::Read),
+    ("brain.event_page", OperationAccess::Read),
     ("brain.events", OperationAccess::Read),
     ("brain.feedback", OperationAccess::Write),
     ("brain.mark_turn", OperationAccess::Write),
@@ -57,7 +60,22 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("brain.resolve", OperationAccess::Read),
     ("brain.state", OperationAccess::Read),
     ("brain.unbind", OperationAccess::Write),
+    ("charter.cancel", OperationAccess::Write),
+    ("charter.claim", OperationAccess::Write),
+    ("charter.compile", OperationAccess::Read),
+    ("charter.get", OperationAccess::Read),
+    ("charter.list", OperationAccess::Read),
+    ("charter.observe", OperationAccess::Write),
+    ("charter.publish", OperationAccess::Write),
+    ("charter.runs", OperationAccess::Read),
+    ("charter.sample", OperationAccess::Write),
+    ("charter.start", OperationAccess::Write),
+    ("charter.vocabulary", OperationAccess::Write),
+    ("charter.waiting", OperationAccess::Read),
+    ("code.deps", OperationAccess::Read),
     ("code.ingest", OperationAccess::Write),
+    ("code.list", OperationAccess::Read),
+    ("code.search", OperationAccess::Read),
     ("comm.cleanup_expired_quarantine", OperationAccess::Write),
     ("comm.cursor_commit", OperationAccess::Write),
     ("comm.cursor_get", OperationAccess::Read),
@@ -71,9 +89,15 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("comm.read", OperationAccess::Write),
     ("comm.reply", OperationAccess::Write),
     ("comm.send", OperationAccess::Write),
+    ("comm.suppression_add", OperationAccess::Write),
+    ("comm.suppression_list", OperationAccess::Read),
+    ("comm.suppression_remove", OperationAccess::Write),
     ("comm.thread", OperationAccess::Read),
+    ("comm.transport_status", OperationAccess::Read),
     ("comm.unread", OperationAccess::Read),
+    ("comm.withheld_body", OperationAccess::Write),
     ("context", OperationAccess::Read),
+    ("count", OperationAccess::Read),
     ("create", OperationAccess::Write),
     ("db_diagnostics", OperationAccess::Read),
     ("delete", OperationAccess::Write),
@@ -107,10 +131,12 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("gtd.assign", OperationAccess::Write),
     ("gtd.census", OperationAccess::Read),
     ("gtd.complete", OperationAccess::Write),
+    ("gtd.counts", OperationAccess::Read),
     ("gtd.next", OperationAccess::Read),
     ("gtd.repair", OperationAccess::Write),
     ("gtd.tasks", OperationAccess::Read),
     ("gtd.transition", OperationAccess::Write),
+    ("kg.proposal_cleanup", OperationAccess::Write),
     ("knowledge.adjudicate", OperationAccess::Write),
     ("knowledge.challenge", OperationAccess::Write),
     ("knowledge.cite", OperationAccess::Write),
@@ -118,12 +144,14 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("knowledge.delete_atoms", OperationAccess::Write),
     ("knowledge.edit", OperationAccess::Write),
     ("knowledge.eval_retrieval", OperationAccess::Write),
+    ("knowledge.export", OperationAccess::Read),
     ("knowledge.feedback", OperationAccess::Write),
     ("knowledge.fold", OperationAccess::Read),
     ("knowledge.get", OperationAccess::Read),
     ("knowledge.import", OperationAccess::Write),
     ("knowledge.index", OperationAccess::Write),
     ("knowledge.learn", OperationAccess::Write),
+    ("knowledge.lint", OperationAccess::Write),
     ("knowledge.list", OperationAccess::Read),
     ("knowledge.search", OperationAccess::Read),
     ("knowledge.stats", OperationAccess::Read),
@@ -133,6 +161,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("knowledge.upsert_domains", OperationAccess::Write),
     ("link", OperationAccess::Write),
     ("list", OperationAccess::Read),
+    ("memory.apply_batch", OperationAccess::Write),
     ("memory.feedback", OperationAccess::Write),
     ("memory.prune", OperationAccess::Write),
     ("memory.recall", OperationAccess::Read),
@@ -162,6 +191,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("schedule.cancel", OperationAccess::Write),
     ("schedule.remind", OperationAccess::Write),
     ("schedule.schedule", OperationAccess::Write),
+    ("schema", OperationAccess::Read),
     ("search", OperationAccess::Read),
     ("session.export", OperationAccess::Read),
     ("session.list", OperationAccess::Read),
@@ -175,6 +205,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("stream.batch", OperationAccess::Write),
     ("stream.read", OperationAccess::Read),
     ("stream.stat", OperationAccess::Read),
+    ("stream.truncate", OperationAccess::Write),
     ("telemetry.channels", OperationAccess::Read),
     ("telemetry.counts", OperationAccess::Read),
     ("telemetry.emit", OperationAccess::Write),
@@ -193,6 +224,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("tool.requests", OperationAccess::Read),
     ("tool.revoke", OperationAccess::Write),
     ("tool.suggest", OperationAccess::Read),
+    ("tool.unregister", OperationAccess::Write),
     ("traverse", OperationAccess::Read),
     ("update", OperationAccess::Write),
     ("verbs", OperationAccess::Read),
@@ -213,3 +245,7 @@ pub fn classify_operation(verb: &str) -> Option<OperationAccess> {
         .ok()
         .map(|index| CLASSIFIED_OPERATIONS[index].1)
 }
+
+#[cfg(test)]
+#[path = "operation_lint_tests.rs"]
+mod lint_tests;

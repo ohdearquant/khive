@@ -1,0 +1,34 @@
+charter pr_merge v1
+title "Merge a pull request: validate, approve, merge"
+subject pull_request
+
+roles:
+    merge_recovery "validates the candidate and its evidence"
+    independent_reviewer "reviews the change at its head, independent of every producer"
+    merge_chair "initiates the merge"
+
+triggers:
+    pr_merge.candidate_observed
+
+workflow:
+    phase validate by merge_recovery:
+        await pr_merge.candidate_observed
+        require pr_merge.candidate_supported hard
+        require pr_merge.evidence_complete_trusted hard
+        require pr_merge.required_checks(event=pull_request, tested_revision=integration_commit) hard
+        require pr_merge.floor_check(name="CI gate", producer="APP_AND_WORKFLOW_ID_CONFIGURED") hard
+        require pr_merge.floor_check(name="Secret scan (gitleaks)", producer="APP_AND_WORKFLOW_ID_CONFIGURED") hard
+
+    phase approve by independent_reviewer:
+        require pr_merge.review_at_head hard
+        require pr_merge.family_independent hard
+        require pr_merge.no_self_approval(controller=required) hard
+        require pr_merge.adr_scope_approved hard
+        require pr_merge.scope_and_policy_paths_approved hard
+
+    phase merge by merge_chair:
+        require pr_merge.all_merge_requirements_current hard
+        require pr_merge.exact_action_authorized hard
+        require pr_merge.platform_enforcement_verified hard
+        action pr_merge.git_pr_merge(method=squash, expected_head=candidate_head) by merge_chair
+        complete

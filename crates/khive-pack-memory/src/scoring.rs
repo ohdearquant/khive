@@ -1,6 +1,7 @@
 //! Tunable composite scoring, normalization, adjustments, and language routing.
 //! See `crates/khive-pack-memory/docs/api/scoring.md` for the complete scoring model.
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 pub use khive_text::{contains_cjk_f32 as contains_cjk, is_cjk_char};
 use serde::{Deserialize, Serialize};
@@ -68,14 +69,22 @@ pub struct CandidateContext<'a> {
 
 /// Match a pre-lowercased name at non-alphanumeric outer boundaries.
 /// All-CJK names use substring matching because equivalent word boundaries are absent.
-fn contains_at_word_boundary(haystack: &str, needle: &str) -> bool {
+fn contains_at_word_boundary_cached(
+    haystack: &str,
+    cached_chars: &mut Option<Vec<char>>,
+    needle: &str,
+) -> bool {
     if needle.is_empty() {
         return false;
     }
     if needle.chars().all(is_cjk_char) {
         return haystack.contains(needle);
     }
-    let haystack_chars: Vec<char> = haystack.chars().collect();
+    let haystack_chars = cached_chars.get_or_insert_with(|| {
+        #[cfg(test)]
+        loop_3711_tests::body_materialized();
+        haystack.chars().collect()
+    });
     let needle_chars: Vec<char> = needle.chars().collect();
     let n = needle_chars.len();
     if n == 0 || haystack_chars.len() < n {
@@ -94,6 +103,19 @@ fn contains_at_word_boundary(haystack: &str, needle: &str) -> bool {
         }
     }
     false
+}
+
+fn matches_any_entity(ctx: &CandidateContext<'_>) -> bool {
+    let lower = ctx.content.to_lowercase();
+    let mut chars = None;
+    ctx.entity_names
+        .iter()
+        .any(|name| contains_at_word_boundary_cached(&lower, &mut chars, name))
+}
+
+#[cfg(test)]
+fn contains_at_word_boundary(haystack: &str, needle: &str) -> bool {
+    contains_at_word_boundary_cached(haystack, &mut None, needle)
 }
 
 impl AdjustmentCondition {
@@ -131,19 +153,13 @@ impl AdjustmentCondition {
                 if ctx.entity_names.is_empty() {
                     return false;
                 }
-                let lower = ctx.content.to_lowercase();
-                ctx.entity_names
-                    .iter()
-                    .any(|e| contains_at_word_boundary(&lower, e))
+                matches_any_entity(ctx)
             }
             Self::EntityMiss => {
                 if ctx.entity_names.is_empty() {
                     return false;
                 }
-                let lower = ctx.content.to_lowercase();
-                !ctx.entity_names
-                    .iter()
-                    .any(|e| contains_at_word_boundary(&lower, e))
+                !matches_any_entity(ctx)
             }
             Self::All { conditions } => conditions.iter().all(|c| c.matches(ctx)),
         }
@@ -506,9 +522,13 @@ pub struct ScoringConfig {
     /// When true, suppress memories whose `properties.supersedes` value matches
     /// the ID of another memory in the result set. Default: true.
     pub enable_supersedes_suppression: bool,
-    /// When true, a CJK-majority query bypasses the FTS5 leg (whose trigram
-    /// tokenizer does not segment CJK well) and relies on the vector leg
-    /// instead. Default: true.
+    /// When true, a query with more than 15% CJK characters (`contains_cjk`) skips
+    /// document-frequency term selection in the FTS gather path and sends its first
+    /// `term_k` terms in query order to the ranked FTS search. The flag is read only
+    /// when FTS gather is enabled (`fts_gather.enabled`, off by default) and
+    /// `cjk_bypass_ranked` is true. Otherwise the plain FTS search runs unchanged. It
+    /// never removes the FTS leg and does not affect vector retrieval or fusion.
+    /// Default: true.
     #[serde(alias = "enable_multilingual_routing")]
     pub enable_cjk_fts_bypass: bool,
 
@@ -567,20 +587,18 @@ impl ScoringConfig {
 
 /// Normalize `min_score`: 0–1 passes through, 1–100 divides by 100, others return Err.
 pub fn normalize_min_score(score: f64) -> Result<f32, crate::config::MinScoreError> {
-    if !score.is_finite() {
-        return Err(crate::config::MinScoreError::NotFinite);
-    }
-    if (0.0..=1.0).contains(&score) {
-        return Ok(score as f32);
-    }
-    if (1.0..=100.0).contains(&score) {
-        return Ok((score / 100.0) as f32);
-    }
-    Err(crate::config::MinScoreError::OutOfRange(score))
+    khive_score::UnitScore::from_fraction_or_percent(score)
+        .map(|score| score.value() as f32)
+        .map_err(|error| match error {
+            khive_score::ArithmeticError::NonFinite { .. } => {
+                crate::config::MinScoreError::NotFinite
+            }
+            _ => crate::config::MinScoreError::OutOfRange(score),
+        })
 }
 
 /// Returns `true` if the query has enough semantic content for meaningful recall.
-pub fn is_meaningful_query(query: &str) -> bool {
+pub fn is_meaningful_recall_query(query: &str) -> bool {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return false;
@@ -623,6 +641,31 @@ pub fn is_meaningful_query(query: &str) -> bool {
     true
 }
 
+/// Deprecated name for [`is_meaningful_recall_query`].
+#[deprecated(note = "use is_meaningful_recall_query")]
+pub fn is_meaningful_query(query: &str) -> bool {
+    is_meaningful_recall_query(query)
+}
+
+/// Returns `true` when CJK characters (`is_cjk_char`) outnumber every other letter in `text`.
+///
+/// Other letters are the alphabetic characters that are not CJK. Digits, whitespace, and
+/// punctuation count for neither side, so a tie, a text with no letters, and a text with no CJK
+/// characters are all `false`. Recall uses this to decide when an English-only embedding model's
+/// vector list is left out of fusion; it is stricter than the 15% share `contains_cjk` tests.
+pub(crate) fn is_cjk_dominant_query(text: &str) -> bool {
+    let (cjk, other) = text.chars().fold((0usize, 0usize), |(cjk, other), c| {
+        if is_cjk_char(c) {
+            (cjk + 1, other)
+        } else if c.is_alphabetic() {
+            (cjk, other + 1)
+        } else {
+            (cjk, other)
+        }
+    });
+    cjk > other
+}
+
 // ── Score normalization ────────────────────────────────────────────────────────
 
 /// Calibrated relevance ceiling for normalized scores.
@@ -640,54 +683,27 @@ pub fn normalize_rank_fusion_scores(
     scores: Vec<(Uuid, f32)>,
     config: &ScoringConfig,
 ) -> HashMap<Uuid, f32> {
-    if scores.is_empty() {
-        return HashMap::new();
-    }
-    let min_rrf = config.min_rrf_relevance;
-    let filtered: Vec<(Uuid, f32)> = scores
-        .into_iter()
-        .filter(|(_, score)| score.is_finite() && *score >= min_rrf)
-        .collect();
-    if filtered.is_empty() {
-        return HashMap::new();
-    }
-    let max_score = filtered
-        .iter()
-        .map(|(_, s)| *s)
-        .fold(f32::NEG_INFINITY, f32::max);
-    if !max_score.is_finite() || max_score <= 0.0 {
-        return HashMap::new();
-    }
-    let min_score_seen = filtered
-        .iter()
-        .map(|(_, s)| *s)
-        .fold(f32::INFINITY, f32::min);
-    let span = max_score - min_score_seen;
-    let floor = config
-        .baseline_relevance
-        .clamp(0.0, NORMALIZED_RELEVANCE_CEILING);
-    let range = NORMALIZED_RELEVANCE_CEILING - floor;
-
-    let signal_strength = (max_score / RRF_SIGNAL_THRESHOLD).min(1.0);
-
-    filtered
-        .into_iter()
-        .map(|(id, score)| {
-            let calibrated = if span <= f32::EPSILON {
-                max_score.clamp(floor, NORMALIZED_RELEVANCE_CEILING)
-            } else {
-                let percentile = ((score - min_score_seen) / span).clamp(0.0, 1.0);
-                floor + percentile * range
-            };
-            (id, calibrated * signal_strength)
-        })
-        .collect()
+    normalize_relevance_scores(scores, config, RelevanceSource::Single)
 }
 
 /// Normalize RRF-fused scores (dual-source) into a calibrated relevance band.
 pub fn normalize_rrf_scores(
     scores: Vec<(Uuid, f32)>,
     config: &ScoringConfig,
+) -> HashMap<Uuid, f32> {
+    normalize_relevance_scores(scores, config, RelevanceSource::Fused)
+}
+
+#[derive(Clone, Copy)]
+enum RelevanceSource {
+    Single,
+    Fused,
+}
+
+fn normalize_relevance_scores(
+    scores: Vec<(Uuid, f32)>,
+    config: &ScoringConfig,
+    source: RelevanceSource,
 ) -> HashMap<Uuid, f32> {
     if scores.is_empty() {
         return HashMap::new();
@@ -717,16 +733,28 @@ pub fn normalize_rrf_scores(
         .clamp(0.0, NORMALIZED_RELEVANCE_CEILING);
     let range = NORMALIZED_RELEVANCE_CEILING - floor;
 
+    let signal_strength = match source {
+        RelevanceSource::Single => Some((max_score / RRF_SIGNAL_THRESHOLD).min(1.0)),
+        RelevanceSource::Fused => None,
+    };
+
     filtered
         .into_iter()
         .map(|(id, score)| {
             let calibrated = if span <= f32::EPSILON {
-                floor + range
+                match source {
+                    RelevanceSource::Single => max_score.clamp(floor, NORMALIZED_RELEVANCE_CEILING),
+                    RelevanceSource::Fused => floor + range,
+                }
             } else {
                 let percentile = ((score - min_score_seen) / span).clamp(0.0, 1.0);
                 floor + percentile * range
             };
-            (id, calibrated)
+            let normalized = match signal_strength {
+                Some(signal) => calibrated * signal,
+                None => calibrated,
+            };
+            (id, normalized)
         })
         .collect()
 }
@@ -746,6 +774,62 @@ pub struct ScoreInput<'a> {
     pub entity_names: &'a [String],
 }
 
+#[derive(Clone, Copy)]
+enum ScoreFallbackReason {
+    TemporalBoost,
+    SalienceBoost,
+    NonfiniteComposite,
+}
+
+impl ScoreFallbackReason {
+    fn bit(self) -> u8 {
+        match self {
+            Self::TemporalBoost => 1,
+            Self::SalienceBoost => 2,
+            Self::NonfiniteComposite => 4,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TemporalBoost => "temporal_boost",
+            Self::SalienceBoost => "salience_boost",
+            Self::NonfiniteComposite => "nonfinite_composite",
+        }
+    }
+}
+
+struct ScoreFallbackWarnings {
+    emitted: AtomicU8,
+}
+
+impl ScoreFallbackWarnings {
+    const fn new() -> Self {
+        Self {
+            emitted: AtomicU8::new(0),
+        }
+    }
+
+    fn record(&self, reason: ScoreFallbackReason) {
+        if !tracing::enabled!(target: "khive.memory.scoring", tracing::Level::WARN) {
+            return;
+        }
+        let bit = reason.bit();
+        if self.emitted.load(Ordering::Relaxed) & bit != 0 {
+            return;
+        }
+        if self.emitted.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+            tracing::warn!(
+                target: "khive.memory.scoring",
+                reason = reason.as_str(),
+                "Memory score arithmetic fallback returned zero"
+            );
+        }
+    }
+}
+
+static SCORE_FALLBACK_WARNINGS: ScoreFallbackWarnings = ScoreFallbackWarnings::new();
+
 /// Composite score for a single memory candidate.
 ///
 /// Formula (semantic-gate model, multiplicative):
@@ -753,7 +837,82 @@ pub struct ScoreInput<'a> {
 ///
 /// Then each `ScoreAdjustment` in `config.adjustments` is evaluated and applied in order.
 /// Non-finite results fall to zero; finite results are clamped to `[0, 1]`.
+/// Arithmetic fallbacks emit at most one WARN per reason per process while WARN
+/// is enabled; genuine finite zero scores do not emit fallback warnings.
 pub fn calculate_score(input: &ScoreInput<'_>, config: &ScoringConfig) -> f32 {
+    calculate_score_with_reporter(input, config, &SCORE_FALLBACK_WARNINGS)
+}
+
+/// The terms of the composite `calculate_score` ranks by.
+///
+/// `relevance_term × temporal_boost × salience_boost` is `base`; the configured adjustments
+/// and the final clamp to `[0, 1]` turn `base` into `score`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ScoreFactors {
+    /// `weights.relevance × relevance_score`.
+    pub(crate) relevance_term: f32,
+    /// `1 + weights.temporal × recency`.
+    pub(crate) temporal_boost: f32,
+    /// `1 + weights.salience × salience`.
+    pub(crate) salience_boost: f32,
+    /// `relevance_term × temporal_boost × salience_boost`, before any adjustment.
+    pub(crate) base: f32,
+    /// The value `calculate_score` returns.
+    pub(crate) score: f32,
+    /// False when the arithmetic fell back to a zero score (a boost or the composite was not a
+    /// finite number): the other fields then do not describe a computed composite.
+    pub(crate) complete: bool,
+}
+
+impl ScoreFactors {
+    /// The terms of a candidate whose boost arithmetic fell back to a zero score: the relevance
+    /// term is kept, no boost was computed, and the result is marked incomplete.
+    fn fallback(relevance_term: f32) -> Self {
+        Self {
+            relevance_term,
+            temporal_boost: 0.0,
+            salience_boost: 0.0,
+            base: 0.0,
+            score: 0.0,
+            complete: false,
+        }
+    }
+
+    /// The net multiplier of the configured adjustments and the final clamp, `score / base`, so
+    /// that `relevance_term × temporal_boost × salience_boost × adjustment_factor` is `score`.
+    ///
+    /// `None` when `base` is not a positive finite number: the adjustments then act on zero, and
+    /// whatever score they leave is not a multiple of `base`.
+    pub(crate) fn adjustment_factor(&self) -> Option<f32> {
+        if self.base.is_finite() && self.base > 0.0 {
+            Some(self.score / self.base)
+        } else {
+            None
+        }
+    }
+}
+
+/// `calculate_score`, returning the terms it multiplied alongside the score.
+pub(crate) fn calculate_score_factors(
+    input: &ScoreInput<'_>,
+    config: &ScoringConfig,
+) -> ScoreFactors {
+    score_factors_with_reporter(input, config, &SCORE_FALLBACK_WARNINGS)
+}
+
+fn calculate_score_with_reporter(
+    input: &ScoreInput<'_>,
+    config: &ScoringConfig,
+    reporter: &ScoreFallbackWarnings,
+) -> f32 {
+    score_factors_with_reporter(input, config, reporter).score
+}
+
+fn score_factors_with_reporter(
+    input: &ScoreInput<'_>,
+    config: &ScoringConfig,
+    reporter: &ScoreFallbackWarnings,
+) -> ScoreFactors {
     let w = &config.weights;
     let semantic_base = w.relevance * input.relevance_score;
 
@@ -764,10 +923,17 @@ pub fn calculate_score(input: &ScoreInput<'_>, config: &ScoringConfig) -> f32 {
     let capped_decay = input.decay_factor.min(config.decay_cap);
     let temporal_recency = (-capped_decay * time_diff_days).exp();
 
-    let temporal_boost = 1.0 + w.temporal * temporal_recency;
-    let salience_boost = 1.0 + w.salience * input.salience;
+    let Ok(temporal_boost) = khive_score::boost_factor_f32(w.temporal, temporal_recency) else {
+        reporter.record(ScoreFallbackReason::TemporalBoost);
+        return ScoreFactors::fallback(semantic_base);
+    };
+    let Ok(salience_boost) = khive_score::boost_factor_f32(w.salience, input.salience) else {
+        reporter.record(ScoreFallbackReason::SalienceBoost);
+        return ScoreFactors::fallback(semantic_base);
+    };
 
-    let mut score = semantic_base * temporal_boost * salience_boost;
+    let base = semantic_base * temporal_boost * salience_boost;
+    let mut score = base;
 
     let ctx = CandidateContext {
         memory_type: input.memory_type_str,
@@ -784,16 +950,32 @@ pub fn calculate_score(input: &ScoreInput<'_>, config: &ScoringConfig) -> f32 {
     // Individually finite adjustments can overflow before a later operation
     // (for example, +Inf * 0) produces NaN. Keep the rank score numeric.
     if !score.is_finite() {
-        return 0.0;
+        reporter.record(ScoreFallbackReason::NonfiniteComposite);
+        return ScoreFactors {
+            relevance_term: semantic_base,
+            temporal_boost,
+            salience_boost,
+            base,
+            score: 0.0,
+            complete: false,
+        };
     }
-    score.clamp(0.0, 1.0)
+    ScoreFactors {
+        relevance_term: semantic_base,
+        temporal_boost,
+        salience_boost,
+        base,
+        score: score.clamp(0.0, 1.0),
+        complete: true,
+    }
 }
 
 // ── ADR-104 §2 (Stage B): bounded per-entity posterior term ───────────────────
 
-/// Default weight for the per-entity posterior term. Chosen so the clamp
-/// bounds below are exactly reachable at posterior means of 0.0 and 1.0
-/// (`1 + 0.3 * (0.0 - 0.5) = 0.85`, `1 + 0.3 * (1.0 - 0.5) = 1.15`).
+/// Default weight for the per-entity posterior term. Chosen so `t0` reaches the
+/// clamp bounds below at posterior means of 0.0 and 1.0
+/// (`1 + 0.3 * (0.0 - 0.5) = 0.85`, `1 + 0.3 * (1.0 - 0.5) = 1.15`); the
+/// served term approaches them only as evidence mass grows.
 pub const ENTITY_POSTERIOR_WEIGHT: f32 = 0.3;
 
 /// Lower bound of the per-entity posterior multiplier — the term can never
@@ -804,558 +986,68 @@ pub const ENTITY_POSTERIOR_CLAMP_MIN: f32 = 0.85;
 /// move a score up by more than 15%.
 pub const ENTITY_POSTERIOR_CLAMP_MAX: f32 = 1.15;
 
-/// `clamp(1 + w_ent * (entity_posterior_mean - 0.5), 0.85, 1.15)`.
-///
-/// `None` (no posterior for this candidate beyond the uninformative prior)
-/// is neutral: exactly `1.0`, not the midpoint of the clamp band. Untouched
-/// memories must be unaffected — the neutral value has to be an identity
-/// multiplier, not a value that happens to fall inside the bounds.
-pub fn entity_posterior_term(entity_posterior_mean: Option<f64>, w_ent: f32) -> f32 {
-    match entity_posterior_mean {
-        Some(mean) => (1.0 + w_ent * (mean as f32 - 0.5))
-            .clamp(ENTITY_POSTERIOR_CLAMP_MIN, ENTITY_POSTERIOR_CLAMP_MAX),
-        None => 1.0,
+/// Evidence mass at which the per-entity term reaches half of `t0 - 1`
+/// (ADR-104 Amendment 6, `k`). A constant of the memory pack, like
+/// [`ENTITY_POSTERIOR_WEIGHT`]; a profile does not carry it.
+pub const ENTITY_EVIDENCE_HALF_MASS: f64 = 16.0;
+
+/// `t0 = clamp(1 + w_ent * (entity_posterior_mean - 0.5), 0.85, 1.15)`, the
+/// multiplier computed from the posterior mean alone (ADR-104 Section 2).
+pub fn entity_posterior_t0(entity_posterior_mean: f64, w_ent: f32) -> f32 {
+    (1.0 + w_ent * (entity_posterior_mean as f32 - 0.5))
+        .clamp(ENTITY_POSTERIOR_CLAMP_MIN, ENTITY_POSTERIOR_CLAMP_MAX)
+}
+
+/// Evidence mass `n` of a posterior stored with the Beta(1, 1) prior inside
+/// `(alpha, beta)`: `max(0, alpha + beta - 2)` (ADR-104 Amendment 6). A
+/// non-finite sum carries no usable evidence and yields `0.0`.
+pub fn entity_evidence_mass(alpha: f64, beta: f64) -> f64 {
+    let mass = alpha + beta - 2.0;
+    if mass.is_finite() {
+        mass.max(0.0)
+    } else {
+        0.0
     }
+}
+
+/// `1 + (t0 - 1) * n / (n + k)` with `k` = [`ENTITY_EVIDENCE_HALF_MASS`]
+/// (ADR-104 Amendment 6), for `posterior = (entity_posterior_mean, n)`.
+///
+/// The term scales `t0` toward neutral by the evidence the posterior holds, in
+/// both directions: it stays within [0.85, 1.15], never moves past `t0`, and is
+/// exactly `1.0` at `n = 0`. `None` (no posterior for the memory) is exactly
+/// `1.0` too, an identity multiplier rather than a value that happens to fall
+/// inside the bounds, so untouched memories are unaffected. A non-finite mass,
+/// mean or weight is neutral as well.
+pub fn entity_posterior_term(posterior: Option<(f64, f64)>, w_ent: f32) -> f32 {
+    let Some((mean, mass)) = posterior else {
+        return 1.0;
+    };
+    if !mass.is_finite() || mass <= 0.0 {
+        return 1.0;
+    }
+    let t0 = entity_posterior_t0(mean, w_ent);
+    if !t0.is_finite() {
+        return 1.0;
+    }
+    let scale = (mass / (mass + ENTITY_EVIDENCE_HALF_MASS)) as f32;
+    1.0 + (t0 - 1.0) * scale
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "entity_loop_3711_tests.rs"]
+mod loop_3711_tests;
 
-    #[test]
-    fn is_meaningful_query_rejects_empty() {
-        assert!(!is_meaningful_query(""));
-        assert!(!is_meaningful_query("   "));
-    }
+#[cfg(test)]
+#[path = "scoring_tests.rs"]
+mod tests;
 
-    #[test]
-    fn is_meaningful_query_rejects_symbols_only() {
-        assert!(!is_meaningful_query("!@#$%"));
-        assert!(!is_meaningful_query("..."));
-    }
+#[cfg(test)]
+#[path = "scoring_normalization_tests.rs"]
+mod normalization_tests;
 
-    #[test]
-    fn is_meaningful_query_rejects_single_latin_char() {
-        assert!(!is_meaningful_query("a"));
-        assert!(!is_meaningful_query("Z"));
-    }
-
-    #[test]
-    fn is_meaningful_query_rejects_repeated_gibberish() {
-        assert!(!is_meaningful_query("aaaa bbbb cccc"));
-    }
-
-    #[test]
-    fn is_meaningful_query_accepts_normal_queries() {
-        assert!(is_meaningful_query("what is the capital of France"));
-        assert!(is_meaningful_query("rust async runtime"));
-        assert!(is_meaningful_query("hello"));
-    }
-
-    #[test]
-    fn contains_cjk_detects_chinese() {
-        // Purely CJK — well above 15% threshold.
-        assert!(contains_cjk("你好世界"));
-        // Mixed string: "世界" = 2 CJK out of 6 chars = 33%, above threshold.
-        assert!(contains_cjk("世界 hi"));
-        // Mostly-Latin with 2 CJK chars out of 15 total = 13% → below threshold.
-        assert!(!contains_cjk("hello 世界 world"));
-    }
-
-    #[test]
-    fn contains_cjk_ignores_latin() {
-        assert!(!contains_cjk("hello world"));
-        assert!(!contains_cjk(""));
-    }
-
-    #[test]
-    fn scoring_config_old_multilingual_routing_key_still_disables_cjk_bypass() {
-        let cfg: ScoringConfig =
-            serde_json::from_value(serde_json::json!({ "enable_multilingual_routing": false }))
-                .expect("old key must still deserialize via the alias");
-        assert!(
-            !cfg.enable_cjk_fts_bypass,
-            "a config that disabled the old enable_multilingual_routing key must still \
-             disable the CJK FTS bypass under its new name"
-        );
-    }
-
-    #[test]
-    fn scoring_config_default_enables_cjk_bypass() {
-        assert!(ScoringConfig::default().enable_cjk_fts_bypass);
-    }
-
-    #[test]
-    fn normalize_min_score_fraction_passthrough() {
-        let v = normalize_min_score(0.5).unwrap();
-        assert!((v - 0.5f32).abs() < 1e-6);
-    }
-
-    #[test]
-    fn normalize_min_score_percent_form() {
-        let v = normalize_min_score(50.0).unwrap();
-        assert!((v - 0.5f32).abs() < 1e-6);
-    }
-
-    #[test]
-    fn normalize_min_score_rejects_out_of_range() {
-        assert!(normalize_min_score(200.0).is_err());
-        assert!(normalize_min_score(-1.0).is_err());
-        assert!(normalize_min_score(f64::NAN).is_err());
-    }
-
-    #[test]
-    fn calculate_score_returns_unit_interval() {
-        let config = ScoringConfig::default();
-        let score = calculate_score(
-            &ScoreInput {
-                salience: 0.9,
-                memory_type_str: "episodic",
-                content: "test content",
-                created_at_millis: 0,
-                decay_factor: 0.01,
-                now_millis: 1000,
-                relevance_score: 0.8,
-                entity_names: &[],
-            },
-            &config,
-        );
-        assert!((0.0..=1.0).contains(&score), "score {score} out of [0,1]");
-    }
-
-    #[test]
-    fn calculate_score_floors_nonfinite_adjustment_chain() {
-        let episodic = AdjustmentCondition::MemoryType {
-            kind: "episodic".to_string(),
-        };
-        let config = ScoringConfig {
-            adjustments: vec![
-                ScoreAdjustment {
-                    condition: episodic.clone(),
-                    operation: AdjustmentOp::Add { value: 3.0e38 },
-                },
-                ScoreAdjustment {
-                    condition: episodic.clone(),
-                    operation: AdjustmentOp::Add { value: 3.0e38 },
-                },
-                ScoreAdjustment {
-                    condition: episodic,
-                    operation: AdjustmentOp::Multiply { factor: 0.0 },
-                },
-            ],
-            ..ScoringConfig::default()
-        };
-        let score = calculate_score(
-            &ScoreInput {
-                salience: 0.8,
-                memory_type_str: "episodic",
-                content: "overflow adjustment chain",
-                created_at_millis: 0,
-                decay_factor: 0.01,
-                now_millis: 1_000,
-                relevance_score: 0.8,
-                entity_names: &[],
-            },
-            &config,
-        );
-        assert_eq!(score, 0.0, "non-finite composite must rank at the floor");
-    }
-
-    #[test]
-    fn calculate_score_high_salience_ranks_higher() {
-        let config = ScoringConfig {
-            adjustments: vec![],
-            ..ScoringConfig::default()
-        };
-        let now_ms = 1_000_000i64;
-        let score_high = calculate_score(
-            &ScoreInput {
-                salience: 0.9,
-                memory_type_str: "episodic",
-                content: "content",
-                created_at_millis: 0,
-                decay_factor: 0.01,
-                now_millis: now_ms,
-                relevance_score: 0.7,
-                entity_names: &[],
-            },
-            &config,
-        );
-        let score_low = calculate_score(
-            &ScoreInput {
-                salience: 0.1,
-                memory_type_str: "episodic",
-                content: "content",
-                created_at_millis: 0,
-                decay_factor: 0.01,
-                now_millis: now_ms,
-                relevance_score: 0.7,
-                entity_names: &[],
-            },
-            &config,
-        );
-        assert!(score_high > score_low, "high salience should rank higher");
-    }
-
-    #[test]
-    fn calculate_score_entity_match_from_auto_extraction_lifts_equal_relevance_candidate() {
-        // Wires `extract_entity_candidates` straight into `calculate_score` with
-        // the default adjustments (EntityMatch ×1.3 included) — everything else
-        // held identical between the two candidates — to isolate exactly what
-        // the entity boost contributes, decoupled from retrieval-stage relevance
-        // differences (which the handler-level tests in recall.rs cover instead).
-        let config = ScoringConfig::default();
-        let now_ms = 1_000_000i64;
-
-        // Capitalized-signal query so extraction yields a single isolated
-        // candidate ("gamma") — that keeps this test's two candidates
-        // differing by exactly one factor (does the content mention the
-        // named entity or not).
-        let query = "sibling transfer to Gamma university";
-        let entity_names = extract_entity_candidates(query);
-        assert_eq!(
-            entity_names,
-            vec!["gamma"],
-            "capitalized-signal query must extract exactly the one proper noun: {entity_names:?}"
-        );
-
-        let matching_score = calculate_score(
-            &ScoreInput {
-                salience: 0.5,
-                memory_type_str: "semantic",
-                content: "sibling transferred to gamma university this fall",
-                created_at_millis: 0,
-                decay_factor: 0.005,
-                now_millis: now_ms,
-                relevance_score: 0.5,
-                entity_names: &entity_names,
-            },
-            &config,
-        );
-        let non_matching_score = calculate_score(
-            &ScoreInput {
-                salience: 0.5,
-                memory_type_str: "semantic",
-                content: "sibling transferred to a different university this fall",
-                created_at_millis: 0,
-                decay_factor: 0.005,
-                now_millis: now_ms,
-                relevance_score: 0.5,
-                entity_names: &entity_names,
-            },
-            &config,
-        );
-
-        assert!(
-            matching_score > non_matching_score,
-            "memory matching an auto-extracted entity name must outrank an \
-             equal-relevance memory that doesn't: matching={matching_score} \
-             non_matching={non_matching_score}"
-        );
-        // The EntityMatch adjustment is a flat ×1.3 multiply applied after the
-        // base formula and the other (inactive, for this age/salience combo)
-        // adjustments — assert the lift is approximately that factor, not just
-        // "higher", so a future change to the adjustment order/weights is caught.
-        let ratio = matching_score / non_matching_score;
-        assert!(
-            (ratio - 1.3).abs() < 0.01,
-            "expected ~1.3x lift from the EntityMatch adjustment, got ratio {ratio}"
-        );
-    }
-
-    #[test]
-    fn dos_caps_enforce_limits() {
-        let mut config = ScoringConfig {
-            max_recall_candidates: 9999,
-            default_token_budget: 99999,
-            default_recall_limit: 9999,
-            ..ScoringConfig::default()
-        };
-        config.apply_dos_caps();
-        assert_eq!(config.max_recall_candidates, MAX_RECALL_CANDIDATES);
-        assert_eq!(config.default_token_budget, MAX_TOKEN_BUDGET);
-        assert_eq!(config.default_recall_limit, MAX_RECALL_LIMIT);
-    }
-
-    #[test]
-    fn normalize_rrf_scores_preserves_ordering() {
-        let config = ScoringConfig::default();
-        let input = vec![
-            (Uuid::new_v4(), 0.030f32),
-            (Uuid::new_v4(), 0.020f32),
-            (Uuid::new_v4(), 0.015f32),
-        ];
-        let ids: Vec<Uuid> = input.iter().map(|(id, _)| *id).collect();
-        let output = normalize_rrf_scores(input, &config);
-        let s0 = output[&ids[0]];
-        let s1 = output[&ids[1]];
-        let s2 = output[&ids[2]];
-        assert!(s0 > s1 && s1 > s2, "ordering must be preserved");
-        assert!(s0 <= 1.0 && s2 >= 0.0, "scores must be in [0,1]");
-    }
-
-    // ── extract_entity_candidates ─────────────────────────────────────────────
-
-    #[test]
-    fn extract_entity_candidates_capitalized_tokens_only() {
-        // Only capitalized tokens qualify; lowercase content words
-        // ("sibling", "college") are excluded even though they're not
-        // stopwords.
-        let out = extract_entity_candidates("Alex sibling college Acme Beta Gamma");
-        assert_eq!(out, vec!["alex", "acme", "beta", "gamma"]);
-    }
-
-    #[test]
-    fn extract_entity_candidates_all_lowercase_query_extracts_nothing() {
-        // DESIGN RULING: the lowercase fallback was removed after review —
-        // it degenerated EntityMatch into a second lexical-overlap reward on
-        // top of retrieval-stage relevance. An all-lowercase query (however
-        // topical) must extract zero candidates.
-        let out = extract_entity_candidates("alex sibling college acme beta gamma");
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn extract_entity_candidates_strips_stopwords() {
-        let out = extract_entity_candidates("what is the capital of France");
-        // "what", "is", "the", "of" are stopwords; "capital" is lowercase (excluded);
-        // "France" is capitalized and not a stopword, so it remains.
-        assert_eq!(out, vec!["france"]);
-    }
-
-    #[test]
-    fn extract_entity_candidates_strips_punctuation() {
-        let out = extract_entity_candidates("Alex's sibling, Acme!");
-        assert_eq!(out, vec!["alex's", "acme"]);
-    }
-
-    #[test]
-    fn extract_entity_candidates_caps_at_max_auto_entity_names() {
-        let query = "Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel India Juliet";
-        let out = extract_entity_candidates(query);
-        assert_eq!(out.len(), MAX_AUTO_ENTITY_NAMES);
-        assert_eq!(
-            out,
-            vec!["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"]
-        );
-    }
-
-    #[test]
-    fn extract_entity_candidates_dedupes_case_insensitively() {
-        let out = extract_entity_candidates("Acme ACME college");
-        // capitalization signal present (Acme, ACME) → only capitalized tokens
-        // qualify; "college" is dropped; Acme and ACME collapse to one entry.
-        assert_eq!(out, vec!["acme"]);
-    }
-
-    #[test]
-    fn extract_entity_candidates_empty_query_returns_empty() {
-        assert!(extract_entity_candidates("").is_empty());
-        assert!(extract_entity_candidates("   ").is_empty());
-    }
-
-    #[test]
-    fn extract_entity_candidates_all_stopwords_returns_empty() {
-        assert!(extract_entity_candidates("is the a of").is_empty());
-    }
-
-    #[test]
-    fn entity_lookup_candidates_is_length_and_position_fair_for_long_cjk_run() {
-        let run: String = (0..65)
-            .map(|offset| char::from_u32(0x4e00 + offset).expect("valid CJK character"))
-            .collect();
-        let candidates = entity_lookup_candidates(&run);
-
-        assert_eq!(candidates.len(), MAX_ENTITY_LOOKUP_CANDIDATES);
-        for len in MIN_CJK_LOOKUP_CHARS..=MAX_CJK_LOOKUP_CHARS {
-            let expected_quota = MAX_ENTITY_LOOKUP_CANDIDATES
-                / (MAX_CJK_LOOKUP_CHARS - MIN_CJK_LOOKUP_CHARS + 1)
-                + usize::from(len == MIN_CJK_LOOKUP_CHARS);
-            assert_eq!(
-                candidates
-                    .iter()
-                    .filter(|candidate| candidate.chars().count() == len)
-                    .count(),
-                expected_quota,
-                "candidate set must reserve the exact quota for length {len}"
-            );
-
-            let chars: Vec<char> = run.chars().collect();
-            let has_late_candidate = (chars.len() - 10..=chars.len() - len).any(|start| {
-                let expected: String = chars[start..start + len].iter().collect();
-                candidates.contains(&expected)
-            });
-            assert!(
-                has_late_candidate,
-                "length {len} must include a candidate starting in the final 10 positions"
-            );
-        }
-    }
-
-    #[test]
-    fn entity_lookup_candidates_retains_final_bigram_independent_of_ascii_case() {
-        let lowercase = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen final entity";
-        let title_case = "One Two Three Four Five Six Seven Eight Nine Ten Eleven Twelve Thirteen Fourteen Fifteen Sixteen Final Entity";
-
-        let lowercase_candidates = entity_lookup_candidates(lowercase);
-        let title_case_candidates = entity_lookup_candidates(title_case);
-        let stored_name_ci = "Final Entity".to_ascii_lowercase();
-
-        assert_eq!(title_case_candidates, lowercase_candidates);
-        assert!(lowercase_candidates.contains(&stored_name_ci));
-        assert!(title_case_candidates.contains(&stored_name_ci));
-        assert!(!title_case_candidates.contains(&"Final Entity".to_string()));
-    }
-
-    // ── EntityMatch word-boundary matching ──────────────────────────────────────
-
-    fn entity_match_ctx<'a>(content: &'a str, entity_names: &'a [String]) -> CandidateContext<'a> {
-        CandidateContext {
-            memory_type: "episodic",
-            age_days: 0.0,
-            salience: 0.5,
-            content,
-            entity_names,
-        }
-    }
-
-    #[test]
-    fn contains_at_word_boundary_rejects_substring_inside_another_word() {
-        assert!(!contains_at_word_boundary("alphabet soup", "beta"));
-        assert!(!contains_at_word_boundary("buy a betamax player", "beta"));
-        assert!(!contains_at_word_boundary(
-            "water scarcity is rising",
-            "car"
-        ));
-    }
-
-    #[test]
-    fn contains_at_word_boundary_accepts_the_word_itself() {
-        assert!(contains_at_word_boundary("beta release notes", "beta"));
-        assert!(contains_at_word_boundary("drove the car home", "car"));
-        // start/end of string edges (no adjacent char to fail the boundary check).
-        assert!(contains_at_word_boundary("beta", "beta"));
-        assert!(contains_at_word_boundary("notes beta", "beta"));
-    }
-
-    #[test]
-    fn contains_at_word_boundary_accepts_multi_word_phrase() {
-        // Internal spaces in a multi-word candidate are themselves
-        // non-alphanumeric, so the phrase's own boundaries (not each word's)
-        // are what the check anchors on.
-        assert!(contains_at_word_boundary(
-            "the knowledge graph shows this",
-            "knowledge graph"
-        ));
-        assert!(!contains_at_word_boundary(
-            "prior knowledge, graphical view",
-            "knowledge graph"
-        ));
-    }
-
-    #[test]
-    fn entity_match_condition_rejects_substring_false_positives() {
-        let entity_names = vec!["beta".to_string()];
-        let ctx = entity_match_ctx("alphabet soup for dinner", &entity_names);
-        assert!(
-            !AdjustmentCondition::EntityMatch.matches(&ctx),
-            "\"beta\" must not match inside \"alphabet\""
-        );
-
-        let entity_names = vec!["car".to_string()];
-        let ctx = entity_match_ctx("water scarcity is rising", &entity_names);
-        assert!(
-            !AdjustmentCondition::EntityMatch.matches(&ctx),
-            "\"car\" must not match inside \"scarcity\""
-        );
-    }
-
-    #[test]
-    fn entity_match_condition_matches_multi_word_explicit_name() {
-        let entity_names = vec!["knowledge graph".to_string()];
-        let ctx = entity_match_ctx("notes on the knowledge graph design", &entity_names);
-        assert!(
-            AdjustmentCondition::EntityMatch.matches(&ctx),
-            "explicit multi-word entity name must still match on its own boundaries"
-        );
-    }
-
-    #[test]
-    fn entity_match_condition_still_matches_real_word_occurrence() {
-        let entity_names = vec!["beta".to_string()];
-        let ctx = entity_match_ctx("the beta release ships tomorrow", &entity_names);
-        assert!(
-            AdjustmentCondition::EntityMatch.matches(&ctx),
-            "boundary anchoring must not break matching the actual word"
-        );
-    }
-
-    #[test]
-    fn entity_match_condition_matches_contiguous_cjk_with_cjk_on_both_sides() {
-        let entity_names = vec!["北京大学".to_string()];
-        let ctx = entity_match_ctx("我在北京大学学习", &entity_names);
-        assert!(AdjustmentCondition::EntityMatch.matches(&ctx));
-    }
-
-    #[test]
-    fn entity_match_condition_keeps_alphabetic_word_boundaries() {
-        let entity_names = vec!["rust".to_string()];
-        let ctx = entity_match_ctx("trust requires evidence", &entity_names);
-        assert!(!AdjustmentCondition::EntityMatch.matches(&ctx));
-    }
-
-    // ── ADR-104 §2 (Stage B): entity_posterior_term ────────────────────────────
-
-    #[test]
-    fn entity_posterior_term_neutral_when_no_posterior() {
-        assert_eq!(entity_posterior_term(None, ENTITY_POSTERIOR_WEIGHT), 1.0);
-    }
-
-    #[test]
-    fn entity_posterior_term_neutral_at_uninformative_prior_mean() {
-        // Beta(1,1) mean = 0.5 — the uninformative prior itself, distinct
-        // from `None`, must also be an identity multiplier.
-        let term = entity_posterior_term(Some(0.5), ENTITY_POSTERIOR_WEIGHT);
-        assert!((term - 1.0).abs() < 1e-6, "got {term}");
-    }
-
-    #[test]
-    fn entity_posterior_term_reaches_low_clamp_bound_at_mean_zero() {
-        let term = entity_posterior_term(Some(0.0), ENTITY_POSTERIOR_WEIGHT);
-        assert!(
-            (term - ENTITY_POSTERIOR_CLAMP_MIN).abs() < 1e-6,
-            "w_ent=0.3 at mean=0.0 must land exactly on the 0.85 clamp bound, got {term}"
-        );
-    }
-
-    #[test]
-    fn entity_posterior_term_reaches_high_clamp_bound_at_mean_one() {
-        let term = entity_posterior_term(Some(1.0), ENTITY_POSTERIOR_WEIGHT);
-        assert!(
-            (term - ENTITY_POSTERIOR_CLAMP_MAX).abs() < 1e-6,
-            "w_ent=0.3 at mean=1.0 must land exactly on the 1.15 clamp bound, got {term}"
-        );
-    }
-
-    #[test]
-    fn entity_posterior_term_never_exceeds_clamp_bounds_for_out_of_range_input() {
-        // A Beta posterior mean is mathematically bounded to [0, 1], but the
-        // clamp must hold defensively regardless — the term is never allowed
-        // to move a score by more than +-15% no matter what value reaches it.
-        let low = entity_posterior_term(Some(-5.0), ENTITY_POSTERIOR_WEIGHT);
-        let high = entity_posterior_term(Some(5.0), ENTITY_POSTERIOR_WEIGHT);
-        assert_eq!(low, ENTITY_POSTERIOR_CLAMP_MIN);
-        assert_eq!(high, ENTITY_POSTERIOR_CLAMP_MAX);
-    }
-
-    #[test]
-    fn entity_posterior_term_moves_monotonically_with_mean() {
-        let low = entity_posterior_term(Some(0.2), ENTITY_POSTERIOR_WEIGHT);
-        let mid = entity_posterior_term(Some(0.5), ENTITY_POSTERIOR_WEIGHT);
-        let high = entity_posterior_term(Some(0.8), ENTITY_POSTERIOR_WEIGHT);
-        assert!(low < mid, "low={low} mid={mid}");
-        assert!(mid < high, "mid={mid} high={high}");
-    }
-}
+#[cfg(test)]
+#[path = "scoring/fallback_warning_tests.rs"]
+mod fallback_warning_tests;

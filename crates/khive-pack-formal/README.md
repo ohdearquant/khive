@@ -8,7 +8,7 @@ Formal-math ontology pack: additive edge endpoint rules for six formal-math
 `HANDLERS` table; its `dispatch` unconditionally returns
 `RuntimeError::InvalidInput` for any verb. Its entire contribution is
 `EDGE_RULES` — 21 `EdgeEndpointRule` entries that widen which
-`(source, relation, target)` triples the closed 19-relation edge ontology
+`(source, relation, target)` triples the closed 20-relation edge ontology
 accepts, without adding a relation or tightening the base contract.
 
 ## Endpoint rules

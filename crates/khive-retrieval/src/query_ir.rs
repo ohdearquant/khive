@@ -3,8 +3,12 @@
 //! Composable IR tree representing how sub-queries are structured, filtered, and fused,
 //! separate from the Query struct which captures what to search.
 
+use khive_fusion::{FusionStrategy, FusionStrategyError};
 use khive_score::DeterministicScore;
 use serde::{Deserialize, Serialize};
+
+/// Candidates requested per hybrid search leaf before fusion.
+pub const HYBRID_CANDIDATE_MULTIPLIER: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // Core IR node
@@ -23,7 +27,8 @@ pub enum QueryNode {
     Vector {
         /// Pre-computed query embedding.
         embedding: Vec<f32>,
-        /// Number of results to return.
+        /// Logical requested limit; raw Collect adapters may retain existing provider overfetch.
+        /// Scalar executors enforce this as a strict returned-row bound.
         top_k: usize,
         /// Optional minimum similarity threshold.
         min_score: Option<DeterministicScore>,
@@ -33,7 +38,8 @@ pub enum QueryNode {
     Keyword {
         /// Query text.
         text: String,
-        /// Number of results to return.
+        /// Logical requested limit; raw Collect adapters may retain existing provider overfetch.
+        /// Scalar executors enforce this as a strict returned-row bound.
         top_k: usize,
         /// Optional minimum relevance threshold.
         min_score: Option<DeterministicScore>,
@@ -47,6 +53,14 @@ pub enum QueryNode {
         strategy: FuseStrategy,
         /// Number of results after fusion.
         top_k: usize,
+    },
+
+    /// Collect ordered raw child streams without fusion, ranking or deduplication.
+    ///
+    /// Only valid at the root of an executed collection plan.
+    Collect {
+        /// Independently executed children in declared slot order.
+        children: Vec<QueryNode>,
     },
 
     /// Filter the results of a sub-query.
@@ -79,7 +93,7 @@ pub enum QueryNode {
 
 /// Fusion strategy for combining sub-query result lists.
 ///
-/// Mirrors [`FusionStrategy`](crate::FusionStrategy) at the IR level
+/// Mirrors [`FusionStrategy`] at the IR level
 /// so that the query plan is self-contained and serialisable without depending
 /// on runtime fusion internals.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,8 +115,60 @@ pub enum FuseStrategy {
         weights: Vec<f64>,
     },
 
+    /// Weighted Reciprocal Rank Fusion over ordered children, without weight normalization.
+    WeightedRrf {
+        /// Smoothing constant (must be at least one at execution).
+        k: usize,
+        /// One finite, strictly positive weight per ordered child.
+        weights: Vec<f64>,
+    },
+
     /// Union with max-score-per-document semantics.
     Union,
+
+    /// Return only vector results.
+    VectorOnly,
+
+    /// Return only keyword results.
+    KeywordOnly,
+
+    /// A named custom strategy resolved by the executor.
+    Custom {
+        /// Strategy identifier.
+        name: String,
+        /// Opaque parameters preserved for the executor.
+        params: serde_json::Value,
+    },
+}
+
+impl From<FusionStrategy> for FuseStrategy {
+    fn from(strategy: FusionStrategy) -> Self {
+        match strategy {
+            FusionStrategy::Rrf { k } => Self::Rrf { k },
+            FusionStrategy::Weighted { weights } => Self::Weighted { weights },
+            FusionStrategy::WeightedRrf { k, weights } => Self::WeightedRrf { k, weights },
+            FusionStrategy::Union => Self::Union,
+            FusionStrategy::VectorOnly => Self::VectorOnly,
+            FusionStrategy::KeywordOnly => Self::KeywordOnly,
+            FusionStrategy::Custom { name, params } => Self::Custom { name, params },
+        }
+    }
+}
+
+impl TryFrom<FuseStrategy> for FusionStrategy {
+    type Error = FusionStrategyError;
+
+    fn try_from(strategy: FuseStrategy) -> Result<Self, Self::Error> {
+        match strategy {
+            FuseStrategy::Rrf { k } => Self::try_rrf(k),
+            FuseStrategy::Weighted { weights } => Self::try_weighted(weights),
+            FuseStrategy::WeightedRrf { k, weights } => Self::try_weighted_rrf(k, weights),
+            FuseStrategy::Union => Ok(Self::Union),
+            FuseStrategy::VectorOnly => Ok(Self::VectorOnly),
+            FuseStrategy::KeywordOnly => Ok(Self::KeywordOnly),
+            FuseStrategy::Custom { name, params } => Self::try_custom(name, params),
+        }
+    }
 }
 
 /// Predicate for post-retrieval filtering.
@@ -170,9 +236,9 @@ impl QueryNode {
         }
     }
 
-    /// Create a hybrid query (vector + keyword with RRF fusion, `top_k * 3` candidates each).
+    /// Create a hybrid query (vector + keyword with RRF fusion, `top_k * 4` candidates each).
     pub fn hybrid(embedding: Vec<f32>, text: impl Into<String>, top_k: usize) -> Self {
-        let candidate_k = top_k.saturating_mul(3);
+        let candidate_k = top_k.saturating_mul(HYBRID_CANDIDATE_MULTIPLIER as usize);
         QueryNode::Fuse {
             children: vec![
                 QueryNode::vector(embedding, candidate_k),
@@ -220,6 +286,7 @@ impl QueryNode {
             QueryNode::Keyword { top_k: 0, .. } => true,
             QueryNode::Keyword { text, .. } if text.is_empty() => true,
             QueryNode::Fuse { children, .. } if children.is_empty() => true,
+            QueryNode::Collect { children } => children.iter().all(Self::is_empty),
             QueryNode::Filter { child, .. } => child.is_empty(),
             QueryNode::Rerank { child, .. } => child.is_empty(),
             _ => false,
@@ -233,7 +300,9 @@ impl QueryNode {
     pub fn leaf_count(&self) -> usize {
         match self {
             QueryNode::Vector { .. } | QueryNode::Keyword { .. } => 1,
-            QueryNode::Fuse { children, .. } => children.iter().map(|c| c.leaf_count()).sum(),
+            QueryNode::Fuse { children, .. } | QueryNode::Collect { children } => {
+                children.iter().map(|c| c.leaf_count()).sum()
+            }
             QueryNode::Filter { child, .. } | QueryNode::Rerank { child, .. } => child.leaf_count(),
             QueryNode::Empty => 0,
         }
@@ -248,6 +317,9 @@ impl QueryNode {
             QueryNode::Vector { top_k, .. } => *top_k,
             QueryNode::Keyword { top_k, .. } => *top_k,
             QueryNode::Fuse { top_k, .. } => *top_k,
+            QueryNode::Collect { children } => children
+                .iter()
+                .fold(0usize, |total, child| total.saturating_add(child.top_k())),
             QueryNode::Filter { child, predicate } => match predicate {
                 FilterPredicate::TopK(k) => *k,
                 _ => child.top_k(),
@@ -264,7 +336,7 @@ impl QueryNode {
         match self {
             QueryNode::Empty => 0,
             QueryNode::Vector { .. } | QueryNode::Keyword { .. } => 1,
-            QueryNode::Fuse { children, .. } => {
+            QueryNode::Fuse { children, .. } | QueryNode::Collect { children } => {
                 1 + children.iter().map(|c| c.depth()).max().unwrap_or(0)
             }
             QueryNode::Filter { child, .. } | QueryNode::Rerank { child, .. } => 1 + child.depth(),
@@ -278,316 +350,5 @@ impl QueryNode {
 
 #[cfg(test)]
 #[allow(clippy::uninlined_format_args)]
-mod tests {
-    use super::*;
-
-    // -- Construction -------------------------------------------------------
-
-    #[test]
-    fn test_vector_construction() {
-        let emb = vec![0.1, 0.2, 0.3];
-        let node = QueryNode::vector(emb.clone(), 10);
-        match &node {
-            QueryNode::Vector {
-                embedding,
-                top_k,
-                min_score,
-            } => {
-                assert_eq!(embedding, &emb);
-                assert_eq!(*top_k, 10);
-                assert!(min_score.is_none());
-            }
-            other => panic!("expected Vector, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_keyword_construction() {
-        let node = QueryNode::keyword("hello world", 5);
-        match &node {
-            QueryNode::Keyword {
-                text,
-                top_k,
-                min_score,
-            } => {
-                assert_eq!(text, "hello world");
-                assert_eq!(*top_k, 5);
-                assert!(min_score.is_none());
-            }
-            other => panic!("expected Keyword, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_hybrid_construction() {
-        let emb = vec![0.1_f32; 128];
-        let node = QueryNode::hybrid(emb, "distributed consensus", 10);
-        match &node {
-            QueryNode::Fuse {
-                children,
-                strategy,
-                top_k,
-            } => {
-                assert_eq!(children.len(), 2);
-                assert_eq!(*top_k, 10);
-                // Sub-queries should request 3x candidates.
-                assert_eq!(children[0].top_k(), 30);
-                assert_eq!(children[1].top_k(), 30);
-                assert!(matches!(strategy, FuseStrategy::Rrf { k: 60 }));
-            }
-            other => panic!("expected Fuse, got {:?}", other),
-        }
-    }
-
-    // -- is_empty -----------------------------------------------------------
-
-    #[test]
-    fn test_empty_variant() {
-        assert!(QueryNode::Empty.is_empty());
-        assert_eq!(QueryNode::Empty.leaf_count(), 0);
-        assert_eq!(QueryNode::Empty.top_k(), 0);
-        assert_eq!(QueryNode::Empty.depth(), 0);
-    }
-
-    #[test]
-    fn test_vector_top_k_zero_is_empty() {
-        let node = QueryNode::vector(vec![1.0], 0);
-        assert!(node.is_empty());
-    }
-
-    #[test]
-    fn test_keyword_top_k_zero_is_empty() {
-        let node = QueryNode::keyword("hello", 0);
-        assert!(node.is_empty());
-    }
-
-    #[test]
-    fn test_keyword_empty_text_is_empty() {
-        let node = QueryNode::keyword("", 10);
-        assert!(node.is_empty());
-    }
-
-    #[test]
-    fn test_fuse_no_children_is_empty() {
-        let node = QueryNode::Fuse {
-            children: vec![],
-            strategy: FuseStrategy::Rrf { k: 60 },
-            top_k: 10,
-        };
-        assert!(node.is_empty());
-    }
-
-    #[test]
-    fn test_filter_of_empty_is_empty() {
-        let node = QueryNode::Empty.with_min_score(DeterministicScore::from_f64(0.5));
-        assert!(node.is_empty());
-    }
-
-    #[test]
-    fn test_rerank_of_empty_is_empty() {
-        let node = QueryNode::Rerank {
-            child: Box::new(QueryNode::Empty),
-            method: RerankMethod::ScoreWeighted { weights: vec![1.0] },
-            top_k: 10,
-        };
-        assert!(node.is_empty());
-    }
-
-    #[test]
-    fn test_non_empty_query() {
-        let node = QueryNode::keyword("hello", 5);
-        assert!(!node.is_empty());
-    }
-
-    // -- leaf_count ---------------------------------------------------------
-
-    #[test]
-    fn test_leaf_count_single() {
-        assert_eq!(QueryNode::vector(vec![1.0], 5).leaf_count(), 1);
-        assert_eq!(QueryNode::keyword("q", 5).leaf_count(), 1);
-    }
-
-    #[test]
-    fn test_leaf_count_hybrid() {
-        let q = QueryNode::hybrid(vec![1.0], "q", 10);
-        assert_eq!(q.leaf_count(), 2);
-    }
-
-    #[test]
-    fn test_leaf_count_nested() {
-        // Fuse(Fuse(vec, kw), kw) = 3 leaves
-        let inner = QueryNode::hybrid(vec![1.0], "inner", 10);
-        let outer = QueryNode::Fuse {
-            children: vec![inner, QueryNode::keyword("outer", 10)],
-            strategy: FuseStrategy::Union,
-            top_k: 10,
-        };
-        assert_eq!(outer.leaf_count(), 3);
-    }
-
-    // -- top_k --------------------------------------------------------------
-
-    #[test]
-    fn test_top_k_leaf() {
-        assert_eq!(QueryNode::vector(vec![], 7).top_k(), 7);
-        assert_eq!(QueryNode::keyword("q", 3).top_k(), 3);
-    }
-
-    #[test]
-    fn test_top_k_fuse() {
-        let q = QueryNode::hybrid(vec![1.0], "q", 15);
-        assert_eq!(q.top_k(), 15);
-    }
-
-    #[test]
-    fn test_top_k_filter_topk_predicate() {
-        let node = QueryNode::keyword("q", 100).with_top_k(5);
-        assert_eq!(node.top_k(), 5);
-    }
-
-    #[test]
-    fn test_top_k_filter_non_topk_predicate() {
-        let node = QueryNode::keyword("q", 20).with_min_score(DeterministicScore::from_f64(0.5));
-        // min_score filter doesn't change top_k -- falls through to child.
-        assert_eq!(node.top_k(), 20);
-    }
-
-    // -- depth --------------------------------------------------------------
-
-    #[test]
-    fn test_depth_leaf() {
-        assert_eq!(QueryNode::vector(vec![1.0], 5).depth(), 1);
-        assert_eq!(QueryNode::keyword("q", 5).depth(), 1);
-    }
-
-    #[test]
-    fn test_depth_hybrid() {
-        let q = QueryNode::hybrid(vec![1.0], "q", 10);
-        // Fuse -> leaf = depth 2
-        assert_eq!(q.depth(), 2);
-    }
-
-    #[test]
-    fn test_depth_chained_filters() {
-        let q = QueryNode::keyword("q", 10)
-            .with_min_score(DeterministicScore::from_f64(0.5))
-            .with_top_k(5);
-        // TopK(Filter(MinScore(Keyword))) = 3 wrappers + 1 leaf = depth 3
-        assert_eq!(q.depth(), 3);
-    }
-
-    // -- with_min_score / with_top_k chaining -------------------------------
-
-    #[test]
-    fn test_builder_chaining() {
-        let node = QueryNode::keyword("rust async patterns", 20)
-            .with_min_score(DeterministicScore::from_f64(0.3))
-            .with_top_k(10);
-
-        assert_eq!(node.top_k(), 10);
-        assert_eq!(node.leaf_count(), 1);
-        assert!(!node.is_empty());
-    }
-
-    // -- Serde round-trip ---------------------------------------------------
-
-    #[test]
-    fn test_serde_roundtrip_vector() {
-        let node = QueryNode::vector(vec![0.1, 0.2, 0.3], 10);
-        let json = serde_json::to_string(&node).expect("serialize");
-        let back: QueryNode = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.top_k(), 10);
-        assert_eq!(back.leaf_count(), 1);
-    }
-
-    #[test]
-    fn test_serde_roundtrip_keyword() {
-        let node = QueryNode::keyword("hello world", 5);
-        let json = serde_json::to_string(&node).expect("serialize");
-        let back: QueryNode = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.top_k(), 5);
-    }
-
-    #[test]
-    fn test_serde_roundtrip_hybrid() {
-        let node = QueryNode::hybrid(vec![1.0, 2.0], "search query", 10);
-        let json = serde_json::to_string(&node).expect("serialize");
-        let back: QueryNode = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.top_k(), 10);
-        assert_eq!(back.leaf_count(), 2);
-    }
-
-    #[test]
-    fn test_serde_roundtrip_complex() {
-        let node = QueryNode::hybrid(vec![0.5; 4], "complex query", 10)
-            .with_min_score(DeterministicScore::from_f64(0.2))
-            .with_top_k(5);
-
-        let json = serde_json::to_string_pretty(&node).expect("serialize");
-        let back: QueryNode = serde_json::from_str(&json).expect("deserialize");
-
-        assert_eq!(back.top_k(), 5);
-        assert_eq!(back.leaf_count(), 2);
-        assert!(!back.is_empty());
-    }
-
-    #[test]
-    fn test_serde_roundtrip_empty() {
-        let node = QueryNode::Empty;
-        let json = serde_json::to_string(&node).expect("serialize");
-        let back: QueryNode = serde_json::from_str(&json).expect("deserialize");
-        assert!(back.is_empty());
-    }
-
-    #[test]
-    fn test_serde_roundtrip_filter_metadata() {
-        let node = QueryNode::Filter {
-            child: Box::new(QueryNode::keyword("docs", 10)),
-            predicate: FilterPredicate::MetadataEquals {
-                field: "type".to_string(),
-                value: serde_json::json!("memory"),
-            },
-        };
-        let json = serde_json::to_string(&node).expect("serialize");
-        let back: QueryNode = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.leaf_count(), 1);
-    }
-
-    #[test]
-    fn test_serde_roundtrip_rerank() {
-        let node = QueryNode::Rerank {
-            child: Box::new(QueryNode::keyword("rerank me", 20)),
-            method: RerankMethod::CrossEncoder {
-                model: "ms-marco-MiniLM".to_string(),
-            },
-            top_k: 10,
-        };
-        let json = serde_json::to_string(&node).expect("serialize");
-        let back: QueryNode = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.top_k(), 10);
-    }
-
-    #[test]
-    fn test_serde_roundtrip_compound_predicate() {
-        let pred = FilterPredicate::And(vec![
-            FilterPredicate::MinScore(DeterministicScore::from_f64(0.3)),
-            FilterPredicate::Or(vec![
-                FilterPredicate::MetadataEquals {
-                    field: "lang".to_string(),
-                    value: serde_json::json!("en"),
-                },
-                FilterPredicate::MetadataEquals {
-                    field: "lang".to_string(),
-                    value: serde_json::json!("zh"),
-                },
-            ]),
-        ]);
-        let node = QueryNode::Filter {
-            child: Box::new(QueryNode::keyword("test", 10)),
-            predicate: pred,
-        };
-        let json = serde_json::to_string(&node).expect("serialize");
-        let back: QueryNode = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.leaf_count(), 1);
-    }
-}
+#[path = "query_ir/tests.rs"]
+mod tests;

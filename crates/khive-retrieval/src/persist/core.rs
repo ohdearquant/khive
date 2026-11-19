@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
-use rusqlite::Connection;
+use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::{SqlAccess, StorageError};
 use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
-use tokio::sync::Mutex;
 
 /// Errors that can occur during retrieval persistence operations.
 #[derive(Error, Debug)]
@@ -13,6 +13,10 @@ pub enum PersistError {
     /// SQLite operation failed.
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+
+    /// Routed storage operation failed, including read-only admission refusal.
+    #[error("Storage error: {0}")]
+    Storage(#[from] khive_storage::StorageError),
 
     /// Serialization failed.
     #[error("Serialization error: {0}")]
@@ -55,52 +59,36 @@ pub enum PersistError {
     Retrieval(String),
 }
 
-/// Retrieval index persistence using SQLite.
+/// Retrieval index persistence through a shared storage capability.
 ///
-/// Provides methods to persist and restore HNSW and BM25 index snapshots
-/// to/from SQLite. Uses the write-through pattern from khive-engine.
+/// Provides methods to persist and restore HNSW and BM25 index snapshots.
+/// Managed backends create the snapshot schema through core migrations.
 pub struct RetrievalPersistence {
-    /// SQLite connection (thread-safe via async mutex).
-    pub(crate) conn: Arc<Mutex<Connection>>,
+    /// Shared SQL capability; the backend owns reader and writer admission.
+    pub(crate) sql: Arc<dyn SqlAccess>,
     /// Namespace for multi-tenancy.
-    /// Uses `Arc<str>` for O(1) cloning in async spawn contexts.
     pub(crate) namespace: Arc<str>,
 }
 
 impl RetrievalPersistence {
-    /// Create a new persistence layer.
-    pub fn new(conn: Arc<Mutex<Connection>>, namespace: impl Into<String>) -> Self {
+    /// Create a persistence layer using the backend's shared SQL capability.
+    pub fn new(sql: Arc<dyn SqlAccess>, namespace: impl Into<String>) -> Self {
         Self {
-            conn,
+            sql,
             namespace: Arc::from(namespace.into()),
         }
     }
 
-    /// Initialize the persistence schema.
+    /// Initialize the persistence schema through an admitted writer.
     ///
-    /// Creates tables for index snapshots if they don't exist.
+    /// This compatibility bootstrap creates the snapshot table and index if
+    /// absent. Normal managed backends already create them in core migrations.
     pub async fn init_schema(&self) -> Result<(), PersistError> {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            conn.execute_batch(
-                r#"
-                CREATE TABLE IF NOT EXISTS retrieval_snapshots (
-                    namespace   TEXT NOT NULL,
-                    index_type  TEXT NOT NULL,
-                    snapshot    BLOB NOT NULL,
-                    created_at  INTEGER NOT NULL,
-                    PRIMARY KEY (namespace, index_type)
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_retrieval_snapshots_namespace
-                    ON retrieval_snapshots(namespace);
-                "#,
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| PersistError::TaskJoin(e.to_string()))?
+        let mut writer = self.sql.writer().await?;
+        writer
+            .execute_script(include_str!("../../sql/retrieval_snapshots_create.sql").to_owned())
+            .await?;
+        Ok(())
     }
 
     /// Generic snapshot persistence.
@@ -111,31 +99,17 @@ impl RetrievalPersistence {
     ) -> Result<(), PersistError> {
         let data =
             serde_json::to_vec(snapshot).map_err(|e| PersistError::Serialize(e.to_string()))?;
-
-        let conn = self.conn.clone();
-        let namespace = self.namespace.clone();
-        let index_type = index_type.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            conn.execute(
-                r#"
-                INSERT OR REPLACE INTO retrieval_snapshots
-                    (namespace, index_type, snapshot, created_at)
-                VALUES
-                    (?1, ?2, ?3, ?4)
-                "#,
-                rusqlite::params![
-                    &*namespace,
-                    index_type,
-                    data,
-                    chrono::Utc::now().timestamp_micros()
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| PersistError::TaskJoin(e.to_string()))?
+        let statement = SqlStatement::new(
+            include_str!("../../sql/retrieval_snapshots_upsert.sql"),
+            vec![
+                SqlValue::Text(self.namespace.to_string()),
+                SqlValue::Text(index_type.to_owned()),
+                SqlValue::Blob(data),
+                SqlValue::Integer(chrono::Utc::now().timestamp_micros()),
+            ],
+        );
+        self.sql.writer().await?.execute(statement).await?;
+        Ok(())
     }
 
     /// Generic snapshot loading.
@@ -143,35 +117,40 @@ impl RetrievalPersistence {
         &self,
         index_type: &str,
     ) -> Result<Option<T>, PersistError> {
-        let conn = self.conn.clone();
-        let namespace = self.namespace.clone();
-        let index_type = index_type.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            let mut stmt = conn.prepare(
-                r#"
-                SELECT snapshot FROM retrieval_snapshots
-                WHERE namespace = ?1 AND index_type = ?2
-                "#,
-            )?;
-
-            let result: Option<Vec<u8>> = match stmt
-                .query_row(rusqlite::params![&*namespace, index_type], |row| row.get(0))
-            {
-                Ok(data) => Some(data),
-                Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                Err(e) => return Err(PersistError::Sqlite(e)),
-            };
-
-            match result {
-                Some(data) => {
-                    let snapshot: T = serde_json::from_slice(&data)
-                        .map_err(|e| PersistError::Deserialize(e.to_string()))?;
-                    Ok(Some(snapshot))
-                }
-                None => Ok(None),
+        let row = {
+            let mut reader = self.sql.reader().await?;
+            reader
+                .query_row(SqlStatement::new(
+                    include_str!("../../sql/retrieval_snapshots_select_snapshot.sql"),
+                    vec![
+                        SqlValue::Text(self.namespace.to_string()),
+                        SqlValue::Text(index_type.to_owned()),
+                    ],
+                ))
+                .await?
+        };
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let data = match row
+            .columns
+            .into_iter()
+            .find(|column| column.name == "snapshot")
+            .map(|column| column.value)
+        {
+            Some(SqlValue::Blob(data)) => data,
+            _ => {
+                return Err(StorageError::Internal(
+                    "retrieval snapshot column must contain a blob".into(),
+                )
+                .into())
             }
+        };
+        // Keep CPU-heavy decoding off the async worker, after releasing the reader.
+        tokio::task::spawn_blocking(move || {
+            serde_json::from_slice(&data)
+                .map(Some)
+                .map_err(|e| PersistError::Deserialize(e.to_string()))
         })
         .await
         .map_err(|e| PersistError::TaskJoin(e.to_string()))?
@@ -179,61 +158,49 @@ impl RetrievalPersistence {
 
     /// Delete all snapshots for this namespace.
     pub async fn clear(&self) -> Result<(), PersistError> {
-        let conn = self.conn.clone();
-        let namespace = self.namespace.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            conn.execute(
-                "DELETE FROM retrieval_snapshots WHERE namespace = ?1",
-                rusqlite::params![&*namespace],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| PersistError::TaskJoin(e.to_string()))?
+        let statement = SqlStatement::new(
+            include_str!("../../sql/retrieval_snapshots_delete_namespace.sql"),
+            vec![SqlValue::Text(self.namespace.to_string())],
+        );
+        self.sql.writer().await?.execute(statement).await?;
+        Ok(())
     }
 
     /// Get persistence statistics.
     pub async fn stats(&self) -> Result<PersistenceStats, PersistError> {
-        let conn = self.conn.clone();
-        let namespace = self.namespace.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            let mut stmt = conn.prepare(
-                r#"
-                SELECT index_type, length(snapshot), created_at
-                FROM retrieval_snapshots
-                WHERE namespace = ?1
-                "#,
-            )?;
-
-            let mut stats = PersistenceStats::default();
-            let mut rows = stmt.query(rusqlite::params![&*namespace])?;
-
-            while let Some(row) = rows.next()? {
-                let index_type: String = row.get(0)?;
-                let size: i64 = row.get(1)?;
-                let created_at: i64 = row.get(2)?;
-
-                match index_type.as_str() {
-                    "hnsw" => {
-                        stats.hnsw_snapshot_size = size as usize;
-                        stats.hnsw_snapshot_at = Some(created_at);
-                    }
-                    "bm25" => {
-                        stats.bm25_snapshot_size = size as usize;
-                        stats.bm25_snapshot_at = Some(created_at);
-                    }
-                    _ => {}
+        let rows = {
+            let mut reader = self.sql.reader().await?;
+            reader
+                .query_all(SqlStatement::new(
+                    include_str!("../../sql/retrieval_snapshots_list_namespace.sql"),
+                    vec![SqlValue::Text(self.namespace.to_string())],
+                ))
+                .await?
+        };
+        let mut stats = PersistenceStats::default();
+        for row in rows {
+            let index_type = row
+                .text("index_type")
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let size = row
+                .i64("snapshot_size")
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let created_at = row
+                .i64("created_at")
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            match index_type {
+                "hnsw" => {
+                    stats.hnsw_snapshot_size = size as usize;
+                    stats.hnsw_snapshot_at = Some(created_at);
                 }
+                "bm25" => {
+                    stats.bm25_snapshot_size = size as usize;
+                    stats.bm25_snapshot_at = Some(created_at);
+                }
+                _ => {}
             }
-
-            Ok(stats)
-        })
-        .await
-        .map_err(|e| PersistError::TaskJoin(e.to_string()))?
+        }
+        Ok(stats)
     }
 }
 
@@ -242,10 +209,10 @@ impl RetrievalPersistence {
 pub struct PersistenceStats {
     /// Size of HNSW snapshot in bytes.
     pub hnsw_snapshot_size: usize,
-    /// Timestamp when HNSW snapshot was created (Unix seconds).
+    /// Timestamp when HNSW snapshot was created (Unix microseconds).
     pub hnsw_snapshot_at: Option<i64>,
     /// Size of BM25 snapshot in bytes.
     pub bm25_snapshot_size: usize,
-    /// Timestamp when BM25 snapshot was created (Unix seconds).
+    /// Timestamp when BM25 snapshot was created (Unix microseconds).
     pub bm25_snapshot_at: Option<i64>,
 }

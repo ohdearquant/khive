@@ -149,7 +149,7 @@ fn sqlite_vec_capabilities(engine_name: String) -> CapabilitiesReport {
     CapabilitiesReport {
         engine_name,
         supports_filter: false,
-        supports_batch_search: false,
+        supports_batch_search: true,
         supports_quantization: false,
         supports_update: false,
         supports_orphan_sweep: true,
@@ -268,10 +268,12 @@ fn selected_models(
     requested: Option<&str>,
 ) -> Result<BTreeMap<String, Vec<String>>> {
     let mut engines = Vec::new();
-    if let Some(config) = config.filter(|config| !config.engines.is_empty()) {
+    if let Some(config) =
+        config.filter(|config| config.engines_declared || !config.engines.is_empty())
+    {
         for engine in &config.engines {
             let model = rt
-                .resolve_embedding_model(Some(&engine.model))
+                .resolve_embedding_model(Some(&engine.name))
                 .map_err(|error| anyhow!("{error}"))?
                 .to_string();
             engines.push((engine.name.clone(), model));

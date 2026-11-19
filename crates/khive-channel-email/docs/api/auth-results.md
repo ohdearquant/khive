@@ -52,7 +52,7 @@ never be reinterpreted as additional tokens — see
 
 ## `contains_unquoted`
 
-Returns true if `target` occurs anywhere in `token` *outside* of a quoted-string span,
+Returns true if `target` occurs anywhere in `token` _outside_ of a quoted-string span,
 using the same quoted-pair (`\`) escaping semantics as `split_top_level_ws`. A plain
 `str::contains` would treat a `=` inside a quoted value (e.g. a quoted `authserv-id` like
 `"id=foo"`, which RFC 8601 §2.2 permits as a valid `value`) the same as an unquoted `=`,
@@ -70,7 +70,7 @@ Detects two shapes for the first `resinfo`-or-authserv-id segment:
   whitespace token of the first segment itself contains an unquoted `=`, which is
   impossible for a valid authserv-id and unambiguous for a `resinfo`
   (`method[/version]=result`). In this case `authserv_id` is set to `None` and segment 0
-  is parsed as a `resinfo` entry through the *same* loop as every other segment — it is
+  is parsed as a `resinfo` entry through the _same_ loop as every other segment — it is
   never discarded as a (nonexistent) authserv-id.
 
 Returns `None` when no signal can be extracted at all: an empty/whitespace header (no
@@ -105,10 +105,70 @@ Selects the trusted `Authentication-Results` header per the configured `TrustAnc
   its stamp. That stripping is an operational precondition of the receiving MTA, verified
   by deployment configuration, not re-derived from message content here.
 - `TrustAnchor::TopmostNoAuthservId`: the boundary emits no authserv-id at all (e.g.
-  Exchange Online's internal-hop stamp), so position is the *sole* discriminator. Only the
+  Exchange Online's internal-hop stamp), so position is the _sole_ discriminator. Only the
   literal topmost `Authentication-Results` header (`raw_headers[0]`) is ever considered —
   never a later one, even if the topmost fails to parse. It is trusted only if it parses
   AND is itself in the no-authserv-id form (`authserv_id.is_none()`); if the topmost
   carries any authserv-id, or fails to parse, that violates the invariant that this
   boundary's own stamp is topmost and unadorned, so the message quarantines (fails closed)
   rather than falling through to a lower header.
+- `TrustAnchor::TopmostWithAuthservId` (ADR-056 Amendment 2026-10-15, configured as
+  `!topmost:<authserv-id>`): the boundary stamps its own topmost header with an
+  authserv-id that other boundaries share (Exchange Online writes `mx.microsoft.com 1`
+  for some senders and no authserv-id for others), so the id cannot identify this
+  boundary and position stays the discriminator. Only `raw_headers[0]` is considered,
+  exactly as in the no-authserv-id mode; it is trusted if it parses AND carries either no
+  authserv-id or the configured one (case-insensitive). Any other authserv-id on it, or a
+  parse failure, quarantines rather than falling through to a lower header, so a forged
+  header carrying the shared id below the boundary's stamp is never selected.
+
+## Untrusted-header quarantine diagnostics
+
+When no plain `Authentication-Results` header is selected, the gate distinguishes
+two quarantine reasons:
+
+- `auth-absent`: neither a plain nor an `ARC-Authentication-Results` header is present.
+- `auth-untrusted`: at least one of those headers is present, but no plain header
+  is selected by the configured anchor. This includes an empty or unparseable
+  header. An ARC header remains untrusted even when it reports passing methods.
+
+An `auth-untrusted` quarantine records the configured anchor **mode**, the observed
+header family and identifier status. It prefers the topmost plain header; only
+when no plain header is present does it describe the topmost ARC header. It does
+not infer ordering between those families. ARC's `i=` instance prefix is removed
+only to observe the following identifier, never to authenticate the message.
+
+The observed identifier is an escaped, printable rendition limited to 128 bytes;
+truncation is disclosed. A missing identifier and an unparseable header are
+distinct states. No method verdict, alignment property or raw header is copied
+into these diagnostics. The observed value is untrusted data and is never used
+to choose or update the configured anchor. See the
+[quarantine metadata fields](imap-connector.md#authentication-quarantine-metadata).
+
+Trusted-header selection, alignment checks, maintainer attribution and quarantine
+custody are unchanged. Receiving-boundary header scrubbing remains an operational
+precondition; diagnostic observations do not prove that a header is authentic.
+
+## Exchange Online intra-tenant anchor
+
+`KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL` defaults to `false`. Enable it only when the
+configured mailbox is hosted by Exchange Online and the deployment has confirmed
+that its receiving boundary strips sender-supplied
+`X-MS-Exchange-Organization-AuthAs` headers. Both are operator preconditions: khive
+does not verify the mailbox provider or the boundary's header handling from the
+IMAP host or authentication-results trust anchor. With the option enabled on a
+non-Exchange mailbox, a same-domain message carrying the stamp is still attributed
+to the maintainer when the checks below pass. Such deployments must leave the
+option disabled. It applies only when
+normal authentication evaluation returns `auth-absent`; messages with plain or ARC
+authentication headers follow the existing rules.
+
+The message is attributed to a maintainer only when it has exactly one From address,
+that address's domain exactly matches the mailbox domain without regard to ASCII
+case, the raw header block contains exactly one
+`X-MS-Exchange-Organization-AuthAs` field whose unfolded trimmed value is
+`Internal` without regard to ASCII case, and the existing From and Sender
+maintainer checks pass. Missing or duplicate stamp fields fail closed. This path
+never attributes external senders and never reaches inbound suppression handling.
+The stamp is meaningful only at an Exchange Online mailbox boundary because other
+mail systems may preserve a sender supplied value.

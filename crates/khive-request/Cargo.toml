@@ -15,8 +15,7 @@ description = "Request DSL — parses verb-dispatch strings (function-call, JSON
 bench = false
 
 [dependencies]
-khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde"] }
-serde = { workspace = true }
+khive-types = { version = "0.20.0", path = "../khive-types", features = ["serde"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]
@@ -25,4 +24,8 @@ syn = { workspace = true }
 
 [[bench]]
 name = "request_bench"
+harness = false
+
+[[bench]]
+name = "request_pipeline"
 harness = false

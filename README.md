@@ -13,8 +13,43 @@ contradictions, gaps. khive gives your research agent a typed, queryable graph t
 works. Read a paper and entities and edges fall out. Make a connection and it's traversable
 immediately. Come back next session and the graph remembers what you built.
 
-There's no Neo4j to run and no separate SPARQL endpoint to deploy. It's SQLite on disk, MCP over
-stdio, and `cargo test` finishes in 4 seconds.
+There's no Neo4j to run and no separate SPARQL endpoint to deploy. It's SQLite on disk and MCP over
+stdio.
+
+khive also runs hosted, as memory and a knowledge graph your agents reach over MCP:
+https://khive.ai/?utm_source=github&utm_campaign=khive-readme
+
+## Install
+
+With a Rust toolchain ([rustup](https://rustup.rs)), install the `kkernel` binary from crates.io:
+
+```bash
+cargo install kkernel --locked
+```
+
+The first build compiles about 330 crates, so expect it to take several minutes.
+
+Add khive to `.mcp.json` in your project:
+
+```json
+{ "mcpServers": { "khive": { "command": "kkernel", "args": ["mcp"] } } }
+```
+
+Or, to make it available in every project with Claude Code:
+
+```bash
+claude mcp add khive --scope user -- kkernel mcp
+```
+
+A user-scope registration gives every project the full default pack set, including the `exec` verbs and the git write verbs (for example `git.commit`, `git.push` and `git.pr_merge`). For less exposure, register per project, or pick packs with `--pack` (repeatable, for example `kkernel mcp --pack kg --pack memory`) or `KHIVE_PACKS`.
+
+Check the binary:
+
+```bash
+kkernel --version
+```
+
+To build from a source checkout instead, see [Quick start](#quick-start).
 
 ---
 
@@ -22,9 +57,9 @@ stdio, and `cargo test` finishes in 4 seconds.
 
 | Capability                  | How                                                                                                                                                      |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **144 verbs, 14 packs**     | KG, GTD, memory, brain, comm, schedule, knowledge, session, tool, exec, git, code, workspace, blob: all load by default                                  |
+| **163 verbs, 14 packs**     | KG, GTD, memory, brain, comm, schedule, knowledge, session, tool, exec, git, code, workspace, blob: all load by default                                  |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
-| **Typed edges**             | 19 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic)                      |
+| **Typed edges**             | 20 closed relations in 10 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic, ownership)          |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
 | **Hybrid retrieval**        | FTS5 + vector RRF with embedding rerank; shipped BM25, HNSW, Vamana, and fusion crates for pack-specific retrieval paths                                 |
 | **Graph traversal**         | BFS with depth/direction/relation filters, bidirectional shortest path                                                                                   |
@@ -60,24 +95,24 @@ request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
-All 14 packs load by default, giving **144 verbs** out of the box (updated from the
+All 14 packs load by default, giving **163 verbs** out of the box (updated from the
 current handler declarations; verify again with `request(ops="verbs()")`
 before editing this table):
 
 | Pack          | Prefix       | Verbs | What it does                                                                                                                                                                     |
 | ------------- | ------------ | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **kg**        | _(bare)_     | 26    | Entities, edges, notes, graph queries, reference resolution, caller identity, WAL diagnostics                                                                                    |
-| **gtd**       | `gtd.`       | 7     | Task lifecycle, timestamp census, and explicit historical repair                                                                                                                 |
-| **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall                                                                                                                                 |
-| **brain**     | `brain.`     | 16    | Bayesian user profiles + feedback loop                                                                                                                                           |
-| **comm**      | `comm.`      | 10    | Threaded messaging with sender-side internal delivery confirmation                                                                                                               |
+| **kg**        | _(bare)_     | 31    | Entities, edges, notes, graph queries, reference resolution, caller identity, WAL diagnostics                                                                                    |
+| **gtd**       | `gtd.`       | 8     | Task lifecycle, per-assignee counts, timestamp census, and explicit historical repair                                                                                            |
+| **memory**    | `memory.`    | 6     | Salience-weighted remember / decay-ranked recall                                                                                                                                 |
+| **brain**     | `brain.`     | 17    | Bayesian user profiles + feedback loop                                                                                                                                           |
+| **comm**      | `comm.`      | 15    | Threaded messaging with sender-side internal delivery confirmation                                                                                                               |
 | **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution                                                                                                                                           |
-| **knowledge** | `knowledge.` | 19    | Atom-based KB with embedding rerank search                                                                                                                                       |
+| **knowledge** | `knowledge.` | 21    | Atom-based KB with embedding rerank search                                                                                                                                       |
 | **session**   | `session.`   | 7     | Session records, dependency-gated mirror search, store stats, and compaction (store/list/resume/export/search/stats/vacuum)                                                      |
-| **tool**      | `tool.`      | 14    | Capability registry, discovery by capability, and use policy: check/request/grant (ADR-180)                                                                                      |
+| **tool**      | `tool.`      | 15    | Capability registry, discovery by capability, and use policy: check/request/grant (ADR-180)                                                                                      |
 | **exec**      | `exec.`      | 9     | One declared command in a sandbox over a materialized tree, receipts for every run (ADR-181)                                                                                     |
 | **git**       | `git.`       | 17    | Provenance ingest, branch/commit/update_ref/push writes (ADR-108), dev-loop verbs: checkout, diff, gates, receipts, reconcile, status, log, init, PR open/review/merge (ADR-182) |
-| **code**      | _(none)_     | 1     | `code.ingest`: L1 manifest + L1.5 import-scan source ingest (ADR-085 Amendment 2)                                                                                                |
+| **code**      | `code.`      | 4     | Source ingest and registered-map list, search, dependency reads (ADR-085, ADR-139)                                                                                               |
 | **workspace** | _(none)_     | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873)                                                                                     |
 | **blob**      | `blob.`      | 9     | Content-addressed `put`/`get`/`stat`, staged `begin`/`put_part`/`commit`/`abort`, and opt-in `blob.import`/`blob.export` file transfers over `BlobStore` (ADR-111, ADR-173)      |
 
@@ -95,12 +130,12 @@ concept A, that concept C is a variant of concept A, or that concept D was super
 E last month. Cosine distance carries no direction and no type. It can't tell you what a
 relationship _is_, only that something is nearby.
 
-khive's graph carries both signals. Every edge is one of 19 closed relations across 9
+khive's graph carries both signals. Every edge is one of 20 closed relations across 10
 categories: structure (`contains`, `part_of`, `instance_of`, `links_to`, `located_in`), derivation (`extends`,
 `variant_of`, `introduced_by`, `supersedes`), provenance (`derived_from`), temporal
 (`precedes`), dependency (`depends_on`, `enables`), implementation (`implements`), lateral
-(`competes_with`, `composed_with`), annotation (`annotates`), and epistemic (`supports`,
-`refutes`).
+(`competes_with`, `composed_with`), annotation (`annotates`), epistemic (`supports`,
+`refutes`), and ownership (`owns`, owner → owned).
 
 The following example, run against a scratch database, shows the difference in practice
 (full transcript in [`demos/research-ingest.md`](demos/research-ingest.md)):
@@ -136,23 +171,23 @@ records what's connected, in which direction, and why.
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-pack-kg:        KG vocabulary + 26 verb handlers       │
-│  khive-pack-gtd:       task lifecycle (7 verbs)               │
-│  khive-pack-memory:    salience + decay recall (5 verbs)      │
-│  khive-pack-brain:     Bayesian profiles (16 verbs)           │
-│  khive-pack-comm:      threaded messaging (10 verbs)          │
+│  khive-pack-kg:        KG vocabulary + 31 public verbs        │
+│  khive-pack-gtd:       task lifecycle (8 verbs)               │
+│  khive-pack-memory:    salience + decay recall (6 verbs)      │
+│  khive-pack-brain:     Bayesian profiles (17 verbs)           │
+│  khive-pack-comm:      threaded messaging (15 verbs)          │
 │  khive-pack-schedule:  reminders + scheduled ops (4 verbs)    │
-│  khive-pack-knowledge: atom KB + embedding rerank (19 verbs)  │
+│  khive-pack-knowledge: atom KB + embedding rerank (21 verbs)  │
 │  khive-pack-session:   session records, search, stats, vacuum (7 verbs)    │
 │  khive-pack-git:       provenance ingest + writes (17 verbs)  │
 │  khive-pack-code:      source ingest (L1 manifest + L1.5      │
-│                        import-scan; 1 verb)                   │
+│                        import-scan) + map reads (4 verbs)                   │
 │  khive-pack-workspace: workspace entity + contains endpoint   │
 │                        rules (0 verbs)                        │
 │  khive-pack-blob:      content-addressed object storage       │
 │                        (9 verbs)                              │
 │  khive-pack-tool:      tool/skill/plugin registry, capability │
-│                        discovery, use policy (14 verbs)       │
+│                        discovery, use policy (15 verbs)       │
 │  khive-pack-exec:      sandboxed run over a materialized tree │
 │                        (9 verbs)                              │
 └──────────────────────────────────────────────────────────────┘
@@ -246,53 +281,36 @@ touching consumers.
 
 ## Quick start
 
-**1. Install** (from [crates.io](https://crates.io/crates/khive-mcp); this repository's workspace release is `0.7.0`):
+Use [khive cloud](https://khive.ai) for the hosted service.
+
+### Run it locally from source
+
+For local development, install Rust via [rustup](https://rustup.rs) if needed, then install
+`kkernel` from a source checkout:
 
 ```bash
-cargo install kkernel
+git clone https://github.com/ohdearquant/khive.git && cd khive
+cargo install --path crates/kkernel --locked
 ```
 
-`kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request` surface. If you
-don't have Rust, install it first via [rustup](https://rustup.rs).
+`kkernel` is the single shipped binary; `kkernel mcp` serves the MCP `request` surface.
 
-**2. Add to your MCP config** (`.mcp.json` in your project, or `~/.claude/mcp.json` for
-global):
+**Add to your MCP config** (`.mcp.json` in your project):
 
 ```json
 { "mcpServers": { "khive": { "command": "kkernel", "args": ["mcp"] } } }
 ```
 
-**3. Verify:**
+For every project with Claude Code, use `claude mcp add khive --scope user -- kkernel mcp` instead. That gives every project the full default pack set, including `exec` and the git write verbs; narrow it with `--pack` or `KHIVE_PACKS`.
+
+**Verify:**
 
 ```bash
 kkernel --version   # confirms the binary and version you just installed
 ```
 
 All 14 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
-MCP client discovers the `request` tool with the full 144-verb catalog.
-
-### Alternative: npm
-
-An npm-distributed `khive` package also exists, but the published version there can lag behind
-the latest crates.io release. Check `khive --version` (or `khive-mcp --version`) after install
-and compare it to the [crates.io version](https://crates.io/crates/khive-mcp) before relying on
-features documented here.
-
-```bash
-npm install -g khive
-```
-
-```json
-{ "mcpServers": { "khive": { "command": "khive", "args": ["mcp"] } } }
-```
-
-### Build from source
-
-```bash
-git clone https://github.com/ohdearquant/khive.git && cd khive
-cd crates && cargo build --release -p kkernel
-# binary at crates/target/release/kkernel
-```
+MCP client discovers the `request` tool with the full 163-verb catalog.
 
 ### Usage
 
@@ -401,7 +419,7 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Status
 
-**Main after v0.7.0.** 144 verbs across 14 packs, 9 entity kinds, 19 edge relations, daemon warm startup
+163 verbs across 14 packs, 9 entity kinds, 20 edge relations, daemon warm startup
 (ADR-049), knowledge search with embedding rerank, Bayesian brain profiles, threaded messaging,
 scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.

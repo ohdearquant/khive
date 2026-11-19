@@ -94,6 +94,7 @@ fn kg_validate_end_to_end_exercises_all_five_builtin_rule_classes() {
 
     let output = Command::new(kkernel_bin())
         .env("HOME", tmp.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", tmp.path().join("volume-locks"))
         .args([
             "kg",
             "validate",
@@ -178,6 +179,7 @@ fn kg_validate_no_rules_flag_skips_all_builtin_rule_classes() {
 
     let output = Command::new(kkernel_bin())
         .env("HOME", tmp.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", tmp.path().join("volume-locks"))
         .args([
             "kg",
             "validate",
@@ -225,6 +227,7 @@ fn kg_validate_fails_when_a_mandatory_input_file_is_missing() {
 
     let output = Command::new(kkernel_bin())
         .env("HOME", tmp.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", tmp.path().join("volume-locks"))
         .args([
             "kg",
             "validate",
@@ -271,6 +274,7 @@ fn kg_validate_fails_when_present_optional_notes_are_not_utf8() {
 
     let output = Command::new(kkernel_bin())
         .env("HOME", tmp.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", tmp.path().join("volume-locks"))
         .args([
             "kg",
             "validate",

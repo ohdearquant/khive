@@ -22,16 +22,18 @@ mmap = ["dep:memmap2", "dep:uuid"]
 rayon = { workspace = true, optional = true }
 memmap2 = { workspace = true, optional = true }
 bytemuck = { workspace = true }
-rand = { version = "0.8", default-features = false, features = ["std_rng"] }
+rand = { version = "0.10.3", default-features = false, features = ["std_rng"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
-blake3 = { workspace = true }
+blake3 = { workspace = true, features = ["std"] }
 uuid = { workspace = true, optional = true }
-khive-quant = { version = "0.9.0", path = "../khive-quant", default-features = false }
+khive-quant = { version = "0.20.0", path = "../khive-quant", default-features = false }
+khive-types = { version = "0.20.0", path = "../khive-types", default-features = false }
+khive-score = { version = "0.20.0", path = "../khive-score", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
+khive-fs = { version = "0.20.0", path = "../khive-fs" }
 libc = { workspace = true }
-nix = { version = "0.31", features = ["dir"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -45,7 +47,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-blake3 = { workspace = true }
+blake3 = { workspace = true, features = ["std"] }
 tempfile = { workspace = true }
 criterion = { workspace = true }
 serde_json = { workspace = true }
@@ -55,6 +57,16 @@ toml = { workspace = true }
 name = "vamana_bench"
 harness = false
 
+[[bench]]
+name = "vamana_lifecycle"
+harness = false
+
+[[bench]]
+name = "vamana_persistence"
+harness = false
+required-features = ["mmap"]
+
 [[example]]
 name = "vec_bench"
 required-features = ["mmap"]
+test = true

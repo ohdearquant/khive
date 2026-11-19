@@ -1,0 +1,1 @@
+UPDATE notes SET properties = ?1, updated_at = ?2 WHERE id = ?3 AND updated_at = ?4 AND deleted_at IS ?5 AND ?2 > updated_at AND CASE WHEN json_type(properties, '$.status') = 'text' THEN json_extract(properties, '$.status') ELSE 'inbox' END = ?6

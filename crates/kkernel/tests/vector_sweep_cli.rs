@@ -47,6 +47,7 @@ fn isolated_command(root: &Path) -> Command {
     command
         .current_dir(root)
         .env("HOME", root)
+        .env("KHIVE_VOLUME_LOCK_DIR", root.join("volume-locks"))
         .env("KHIVE_NO_DAEMON", "1")
         .env("KHIVE_NO_EMBED", "true")
         .env("KHIVE_EVENTS_SPLIT", "0");
@@ -54,15 +55,12 @@ fn isolated_command(root: &Path) -> Command {
 }
 
 impl Fixture {
-    async fn new(engines: &[(&str, &str)]) -> Self {
+    async fn new(engines: &[&str]) -> Self {
         let root = tempfile::tempdir().expect("private vector fixture");
         let db = root.path().join("vectors.db");
         let mut config = String::from("[runtime]\npacks = [\"kg\"]\n");
-        for (index, (name, model)) in engines.iter().enumerate() {
-            config.push_str(&format!(
-                "\n[[engines]]\nname = {name:?}\nmodel = {model:?}\ndefault = {}\n",
-                index == 0
-            ));
+        for name in engines {
+            config.push_str(&format!("\n[[engines]]\nname = {name:?}\n"));
         }
         std::fs::write(root.path().join("khive.toml"), config)
             .expect("write private engine configuration");
@@ -73,27 +71,30 @@ impl Fixture {
         .expect("migrate private vector fixture");
         {
             let writer = runtime.backend().pool().writer().expect("substrate writer");
-            for (index, deleted_at) in [(1, None), (3, Some(2_i64))] {
-                writer
-                    .execute(
-                        "INSERT INTO entities \
+            writer
+                .autocommit(|conn| {
+                    for (index, deleted_at) in [(1, None), (3, Some(2_i64))] {
+                        conn.execute(
+                            "INSERT INTO entities \
                          (id, namespace, kind, name, created_at, updated_at, deleted_at) \
                          VALUES (?1, 'a', 'concept', 'Vector fixture entity', 1, 1, ?2)",
-                        (id(index).to_string(), deleted_at),
-                    )
-                    .expect("seed live and soft-deleted entities");
-            }
-            writer
-                .execute(
-                    "INSERT INTO notes \
+                            (id(index).to_string(), deleted_at),
+                        )
+                        .expect("seed live and soft-deleted entities");
+                    }
+                    conn.execute(
+                        "INSERT INTO notes \
                      (id, namespace, kind, content, created_at, updated_at) \
                      VALUES (?1, 'a', 'observation', 'Live vector fixture note', 1, 1)",
-                    [id(2).to_string()],
-                )
-                .expect("seed live note");
+                        [id(2).to_string()],
+                    )
+                    .expect("seed live note");
+                    Ok(())
+                })
+                .expect("seed substrate scope");
         }
 
-        let models: BTreeSet<&str> = engines.iter().map(|(_, model)| *model).collect();
+        let models: BTreeSet<&str> = engines.iter().copied().collect();
         for name in models {
             let model: EmbeddingModel = name.parse().expect("supported fixture model");
             let canonical = model.to_string();
@@ -126,19 +127,23 @@ impl Fixture {
     async fn seed_atom_vectors(&self, model_name: &str) {
         {
             let writer = self.runtime.backend().pool().writer().expect("atom writer");
-            for (index, slug, deleted_at) in [
-                (6, "live-vector-atom", None),
-                (7, "deleted-vector-atom", Some(2_i64)),
-            ] {
-                writer
-                    .execute(
-                        "INSERT INTO knowledge_atoms \
+            writer
+                .autocommit(|conn| {
+                    for (index, slug, deleted_at) in [
+                        (6, "live-vector-atom", None),
+                        (7, "deleted-vector-atom", Some(2_i64)),
+                    ] {
+                        conn.execute(
+                            "INSERT INTO knowledge_atoms \
                          (id, namespace, slug, name, created_at, updated_at, deleted_at) \
                          VALUES (?1, 'a', ?2, ?2, 1, 1, ?3)",
-                        (id(index).to_string(), slug, deleted_at),
-                    )
-                    .expect("seed live and soft-deleted knowledge atoms");
-            }
+                            (id(index).to_string(), slug, deleted_at),
+                        )
+                        .expect("seed live and soft-deleted knowledge atoms");
+                    }
+                    Ok(())
+                })
+                .expect("seed atom scope");
         }
 
         let model: EmbeddingModel = model_name.parse().expect("supported fixture model");
@@ -182,20 +187,24 @@ impl Fixture {
             .pool()
             .writer()
             .expect("vector snapshot connection");
-        let mut statement = writer
-            .conn()
-            .prepare(&format!(
-                "SELECT subject_id, namespace FROM vec_{} ORDER BY subject_id",
-                model_key(model)
-            ))
-            .expect("prepare vector row snapshot");
-        statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        writer
+            .autocommit(|conn| {
+                let mut statement = conn
+                    .prepare(&format!(
+                        "SELECT subject_id, namespace FROM vec_{} ORDER BY subject_id",
+                        model_key(model)
+                    ))
+                    .expect("prepare vector row snapshot");
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .expect("read vector rows")
+                    .collect::<Result<_, _>>()
+                    .expect("collect vector row snapshot");
+                Ok(rows)
             })
-            .expect("read vector rows")
-            .collect::<Result<_, _>>()
-            .expect("collect vector row snapshot")
+            .expect("vector snapshot scope")
     }
 
     fn row_count(&self, model: &str) -> u64 {
@@ -252,7 +261,7 @@ fn live_rows() -> BTreeMap<String, String> {
 
 #[tokio::test]
 async fn vector_sweep_dry_run_counts_all_namespaces_without_deleting() {
-    let fixture = Fixture::new(&[("primary", PRIMARY_MODEL)]).await;
+    let fixture = Fixture::new(&[PRIMARY_MODEL]).await;
     let before = fixture.rows(PRIMARY_MODEL);
     assert_eq!(fixture.row_count(PRIMARY_MODEL), 5);
 
@@ -270,14 +279,14 @@ async fn vector_sweep_dry_run_counts_all_namespaces_without_deleting() {
     assert_eq!(value["namespaces"], json!([]));
     assert_eq!(value["stores"].as_array().unwrap().len(), 1);
     let store = store_report(&value, PRIMARY_MODEL);
-    assert_eq!(store["engine_names"], json!(["primary"]));
+    assert_eq!(store["engine_names"], json!([PRIMARY_MODEL]));
     assert_eq!(store["namespaces"], json!([]));
     assert_counts(store, 5, 0, 3, false);
 }
 
 #[tokio::test]
 async fn vector_sweep_deletes_orphans_and_keeps_live_entities_and_notes() {
-    let fixture = Fixture::new(&[("primary", PRIMARY_MODEL)]).await;
+    let fixture = Fixture::new(&[PRIMARY_MODEL]).await;
     assert_eq!(fixture.row_count(PRIMARY_MODEL), 5);
 
     let value = report(&fixture.run(&[]));
@@ -290,7 +299,7 @@ async fn vector_sweep_deletes_orphans_and_keeps_live_entities_and_notes() {
 
 #[tokio::test]
 async fn vector_sweep_keeps_live_knowledge_atom_and_sweeps_deleted_atom() {
-    let fixture = Fixture::new(&[("primary", PRIMARY_MODEL)]).await;
+    let fixture = Fixture::new(&[PRIMARY_MODEL]).await;
     fixture.seed_atom_vectors(PRIMARY_MODEL).await;
     let before = fixture.rows(PRIMARY_MODEL);
     assert_eq!(before.len(), 7);
@@ -320,7 +329,7 @@ async fn vector_sweep_keeps_live_knowledge_atom_and_sweeps_deleted_atom() {
 
 #[tokio::test]
 async fn vector_sweep_limit_caps_deletions_and_a_second_run_removes_the_rest() {
-    let fixture = Fixture::new(&[("primary", PRIMARY_MODEL)]).await;
+    let fixture = Fixture::new(&[PRIMARY_MODEL]).await;
     assert_eq!(fixture.row_count(PRIMARY_MODEL), 5);
 
     let first = report(&fixture.run(&["--max-delete", "1"]));
@@ -341,7 +350,7 @@ async fn vector_sweep_limit_caps_deletions_and_a_second_run_removes_the_rest() {
 
 #[tokio::test]
 async fn vector_sweep_namespace_restricts_deletions() {
-    let fixture = Fixture::new(&[("primary", PRIMARY_MODEL)]).await;
+    let fixture = Fixture::new(&[PRIMARY_MODEL]).await;
     assert_eq!(fixture.row_count(PRIMARY_MODEL), 5);
 
     let output = fixture.run(&["--namespace", "a"]);
@@ -363,7 +372,7 @@ async fn vector_sweep_namespace_restricts_deletions() {
 
 #[tokio::test]
 async fn vector_sweep_rejects_oversized_limit_before_opening_database() {
-    let fixture = Fixture::new(&[("primary", PRIMARY_MODEL)]).await;
+    let fixture = Fixture::new(&[PRIMARY_MODEL]).await;
     let before = fixture.rows(PRIMARY_MODEL);
     let missing = fixture.root.path().join("uncreated/vectors.db");
     for db in [&fixture.db, &missing] {
@@ -383,7 +392,7 @@ async fn vector_sweep_rejects_oversized_limit_before_opening_database() {
 
 #[tokio::test]
 async fn vector_sweep_zero_limit_counts_without_deleting() {
-    let fixture = Fixture::new(&[("primary", PRIMARY_MODEL)]).await;
+    let fixture = Fixture::new(&[PRIMARY_MODEL]).await;
     let before = fixture.rows(PRIMARY_MODEL);
     for extra in [
         vec!["--max-delete", "0"],
@@ -400,7 +409,7 @@ async fn vector_sweep_zero_limit_counts_without_deleting() {
 
 #[tokio::test]
 async fn vector_sweep_shares_the_deletion_budget_across_models() {
-    let fixture = Fixture::new(&[("primary", PRIMARY_MODEL), ("secondary", SECONDARY_MODEL)]).await;
+    let fixture = Fixture::new(&[PRIMARY_MODEL, SECONDARY_MODEL]).await;
     for model in [PRIMARY_MODEL, SECONDARY_MODEL] {
         assert_eq!(fixture.row_count(model), 5);
     }
@@ -437,7 +446,7 @@ async fn vector_sweep_shares_the_deletion_budget_across_models() {
 
 #[tokio::test]
 async fn vector_sweep_dry_run_accounts_for_the_shared_budget_across_models() {
-    let fixture = Fixture::new(&[("primary", PRIMARY_MODEL), ("secondary", SECONDARY_MODEL)]).await;
+    let fixture = Fixture::new(&[PRIMARY_MODEL, SECONDARY_MODEL]).await;
     let before: Vec<_> = [PRIMARY_MODEL, SECONDARY_MODEL]
         .into_iter()
         .map(|model| fixture.rows(model))
@@ -457,56 +466,84 @@ async fn vector_sweep_dry_run_accounts_for_the_shared_budget_across_models() {
 
 #[tokio::test]
 async fn vector_sweep_selects_a_configured_engine_name() {
-    let fixture = Fixture::new(&[
-        ("primary", PRIMARY_MODEL),
-        ("primary-alias", PRIMARY_MODEL),
-        ("secondary", SECONDARY_MODEL),
-    ])
-    .await;
+    let fixture = Fixture::new(&[PRIMARY_MODEL, SECONDARY_MODEL]).await;
     let untouched = fixture.rows(PRIMARY_MODEL);
 
-    let value = report(&fixture.run(&["--engine", "secondary"]));
+    let value = report(&fixture.run(&["--engine", SECONDARY_MODEL]));
     assert_counts(&value, 5, 3, 3, false);
     assert_eq!(value["stores"].as_array().unwrap().len(), 1);
     let store = store_report(&value, SECONDARY_MODEL);
-    assert_eq!(store["engine_names"], json!(["secondary"]));
+    assert_eq!(store["engine_names"], json!([SECONDARY_MODEL]));
     assert_counts(store, 5, 3, 3, false);
     assert_eq!(fixture.row_count(SECONDARY_MODEL), 2);
     assert_eq!(fixture.rows(SECONDARY_MODEL), live_rows());
     assert_eq!(fixture.row_count(PRIMARY_MODEL), 5);
     assert_eq!(fixture.rows(PRIMARY_MODEL), untouched);
 
-    let alias = report(&fixture.run(&["--engine", "primary-alias"]));
-    assert_counts(&alias, 5, 3, 3, false);
-    assert_eq!(alias["stores"].as_array().unwrap().len(), 1);
+    let primary = report(&fixture.run(&["--engine", PRIMARY_MODEL]));
+    assert_counts(&primary, 5, 3, 3, false);
+    assert_eq!(primary["stores"].as_array().unwrap().len(), 1);
     assert_eq!(
-        store_report(&alias, PRIMARY_MODEL)["engine_names"],
-        json!(["primary-alias"])
+        store_report(&primary, PRIMARY_MODEL)["engine_names"],
+        json!([PRIMARY_MODEL])
     );
     assert_eq!(fixture.row_count(PRIMARY_MODEL), 2);
     assert_eq!(fixture.rows(PRIMARY_MODEL), live_rows());
 }
 
 #[tokio::test]
-async fn vector_sweep_groups_engine_aliases_and_sweeps_each_model_once() {
-    let fixture = Fixture::new(&[
-        ("primary", PRIMARY_MODEL),
-        ("primary-alias", PRIMARY_MODEL),
-        ("secondary", SECONDARY_MODEL),
-    ])
-    .await;
+async fn vector_sweep_sweeps_each_canonical_peer_once() {
+    let fixture = Fixture::new(&[PRIMARY_MODEL, SECONDARY_MODEL]).await;
 
     let value = report(&fixture.run(&[]));
     assert_counts(&value, 10, 6, 6, false);
     assert_eq!(value["stores"].as_array().unwrap().len(), 2);
     let primary = store_report(&value, PRIMARY_MODEL);
-    assert_eq!(primary["engine_names"], json!(["primary", "primary-alias"]));
+    assert_eq!(primary["engine_names"], json!([PRIMARY_MODEL]));
     assert_counts(primary, 5, 3, 3, false);
     let secondary = store_report(&value, SECONDARY_MODEL);
-    assert_eq!(secondary["engine_names"], json!(["secondary"]));
+    assert_eq!(secondary["engine_names"], json!([SECONDARY_MODEL]));
     assert_counts(secondary, 5, 3, 3, false);
     for model in [PRIMARY_MODEL, SECONDARY_MODEL] {
         assert_eq!(fixture.row_count(model), 2);
         assert_eq!(fixture.rows(model), live_rows());
+    }
+}
+
+#[tokio::test]
+async fn vector_sweep_rejects_legacy_duplicate_aliases_without_changing_data() {
+    let fixture = Fixture::new(&[PRIMARY_MODEL, SECONDARY_MODEL]).await;
+    let before: Vec<_> = [PRIMARY_MODEL, SECONDARY_MODEL]
+        .into_iter()
+        .map(|model| fixture.rows(model))
+        .collect();
+    std::fs::write(
+        fixture.root.path().join("khive.toml"),
+        format!(
+            "[runtime]\npacks = [\"kg\"]\n\
+             [[engines]]\nname = \"primary\"\nmodel = {PRIMARY_MODEL:?}\ndefault = true\n\
+             [[engines]]\nname = \"primary-alias\"\nmodel = \"all_minilm_l6_v2\"\n\
+             [[engines]]\nname = \"secondary\"\nmodel = {SECONDARY_MODEL:?}\n"
+        ),
+    )
+    .expect("write colliding legacy engine configuration");
+
+    let output = fixture.run(&[]);
+    assert!(
+        !output.status.success(),
+        "legacy aliases must not select the same vector engine twice"
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("alias canonicalization"),
+        "wrong refusal: {error}"
+    );
+    assert!(
+        error.contains(PRIMARY_MODEL),
+        "colliding canonical engine must be named: {error}"
+    );
+    for (model, expected) in [PRIMARY_MODEL, SECONDARY_MODEL].into_iter().zip(before) {
+        assert_eq!(fixture.row_count(model), 5);
+        assert_eq!(fixture.rows(model), expected);
     }
 }

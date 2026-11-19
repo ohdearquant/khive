@@ -1,83 +1,203 @@
-//! Static vocabulary: handler definitions and schema indexes for the comm pack.
+//! Static vocabulary: handler definitions and auxiliary schema for the comm pack.
 
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, Visibility};
 
-/// Pack-auxiliary indexes for comm inbox and thread queries (idempotent).
-/// The builtins-only outbound-due index belongs to a numbered core migration.
-/// Supported writers maintain its strict stored deadline key. See
-/// crates/khive-pack-comm/docs/api/message-lifecycle.md#vocabrscomm_schema_plan_stmts for
-/// why they filter on `deleted_at IS NULL` rather than a literal `kind` value,
-/// and why `idx_comm_message_external_id` is deliberately absent from this list.
-pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 7] = [
-    "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
-        ON notes(namespace, kind, json_extract(properties, '$.direction'), \
-        json_extract(properties, '$.read'), created_at DESC) \
-        WHERE deleted_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_comm_message_thread \
-        ON notes(namespace, kind, json_extract(properties, '$.thread_id'), created_at DESC) \
-        WHERE deleted_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_comm_message_to_actor \
-        ON notes(namespace, kind, \
-        json_extract(properties, '$.to_actor'), \
-        json_extract(properties, '$.direction'), \
-        json_extract(properties, '$.read'), \
-        created_at DESC) \
-        WHERE deleted_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_comm_message_outbound_ref \
-        ON notes(namespace, kind, json_extract(properties, '$.direction'), \
-        json_extract(properties, '$.from_actor'), \
-        json_extract(properties, '$.outbound_ref')) \
-        WHERE deleted_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_comm_message_outbound_recipient \
-        ON notes(namespace, kind, json_extract(properties, '$.direction'), \
-        json_extract(properties, '$.to_actor'), \
-        created_at DESC, id ASC) \
-        WHERE deleted_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_comm_quarantine_expiry \
-        ON notes(namespace, kind, json_extract(properties, '$.channel_kind'), \
-        json_extract(properties, '$.channel_slug'), expires_at, id) \
-        WHERE deleted_at IS NULL AND expires_at IS NOT NULL",
+/// The cursor is pack-owned; indexes on notes belong to core migration V52.
+pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 3] = [
     COMM_CHANNEL_CURSOR_SCHEMA_STMT,
+    COMM_SUPPRESSION_SCHEMA_STMT,
+    COMM_SUPPRESSION_MIRROR_SCHEMA_STMT,
 ];
 
 /// Pack-owned auxiliary cursor table for durable channel poll progress (issue
 /// #449), idempotent (`CREATE TABLE IF NOT EXISTS`). See
 /// crates/khive-pack-comm/docs/api/probe-cursor.md#vocabrscomm_channel_cursor_schema_stmt
 pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
-    "CREATE TABLE IF NOT EXISTS comm_channel_cursor (\
-    channel_kind TEXT NOT NULL CHECK (length(trim(channel_kind)) > 0),\
-    channel_slug TEXT NOT NULL CHECK (length(trim(channel_slug)) > 0),\
-    source TEXT NOT NULL CHECK (length(trim(source)) > 0),\
-    generation INTEGER NOT NULL CHECK (generation > 0),\
-    high_water INTEGER CHECK (high_water IS NULL OR high_water > 0),\
-    updated_at INTEGER NOT NULL,\
-    PRIMARY KEY (channel_kind, channel_slug)\
-)";
+    khive_runtime::sql!("channel_cursor_create");
 
-pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
+pub(crate) const COMM_SUPPRESSION_SCHEMA_STMT: &str =
+    khive_runtime::sql!("comm_suppression_create");
+
+/// One row: the time of the last successful remote suppression mirror refresh (ADR-200 §6),
+/// which external admission reads without network I/O.
+pub(crate) const COMM_SUPPRESSION_MIRROR_SCHEMA_STMT: &str =
+    khive_runtime::sql!("comm_suppression_mirror_create");
+
+const ATTACHMENTS_PARAM: ParamDef = ParamDef {
+    name: "attachments", param_type: "array", required: false,
+    description: "Up to 8 distinct existing blob content references, at most 64 MiB total. Local recipients and canonical main comm backend only; each message copy owns ordered metadata rows.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+const IDEMPOTENCY_KEY_PARAM: ParamDef = ParamDef {
+    name: "idempotency_key",
+    param_type: "string",
+    required: false,
+    description: "Optional caller key, at most 512 UTF-8 bytes and no U+0000. In the same namespace and sending actor, an identical request replays the original intact pair; a different request or incomplete pair returns key_conflict. Deleting the outbound releases the key.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+const SUBJECT_PARAM: ParamDef = ParamDef {
+    name: "subject",
+    param_type: "string",
+    required: false,
+    description: "Optional subject line.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+const CHANNEL_KIND_PARAM: ParamDef = ParamDef {
+    name: "channel_kind",
+    param_type: "string",
+    required: true,
+    description: "Channel kind identifier (e.g. `email`).",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+const CHANNEL_SLUG_PARAM: ParamDef = ParamDef {
+    name: "channel_slug",
+    param_type: "string",
+    required: true,
+    description: "Stable per-credential identifier distinguishing accounts of the same kind.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
+    HandlerDef {
+        name: "comm.suppression_add",
+        description: "Add a suppression entry for an email address, exact domain, or recipient key. Address values are normalized with the shared email recipient normalizer; domain values are ASCII-lowercased and match that domain only.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "scope",
+                param_type: "string",
+                required: true,
+                description: "Suppression direction: `outbound` or `inbound`.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "kind",
+                param_type: "string",
+                required: true,
+                description: "Value type: `address`, `domain`, or `recipient_key`.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "value",
+                param_type: "string",
+                required: true,
+                description: "Address, exact domain, or opaque recipient key to suppress.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "source",
+                param_type: "string",
+                required: true,
+                description: "Entry source: `operator`, `mailto_token`, `one_click`, or `reply_stop`.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "reason",
+                param_type: "string",
+                required: false,
+                description: "Optional free-text reason recorded with the entry.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
+    HandlerDef {
+        name: "comm.suppression_list",
+        description: "List live email suppression entries, optionally filtered by scope and kind.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "scope",
+                param_type: "string",
+                required: false,
+                description: "Optional scope filter: `outbound` or `inbound`.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "kind",
+                param_type: "string",
+                required: false,
+                description: "Optional kind filter: `address`, `domain`, or `recipient_key`.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Page size, default 100, maximum 500.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "offset",
+                param_type: "integer",
+                required: false,
+                description: "Number of matching entries to skip, default 0.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
+    HandlerDef {
+        name: "comm.suppression_remove",
+        description: "Remove one suppression entry. A non-empty reason is required; opt-out entries also require a later authenticated inbound message from the same address as evidence.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "uuid",
+                required: true,
+                description: "Full UUID of the suppression entry.",
+                resolution_mode: IdResolutionMode::FullUuidOnlyScopedToPrimary,
+            },
+            ParamDef {
+                name: "reason",
+                param_type: "string",
+                required: true,
+                description: "Non-empty reason for removing this entry; included in the audit event.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "evidence_inbound_message_id",
+                param_type: "uuid",
+                required: false,
+                description: "Full UUID of an authenticated later inbound email from the suppressed address; required for opt-out sources.",
+                resolution_mode: IdResolutionMode::FullUuidOnlyScopedToPrimary,
+            },
+        ],
+    },
+    HandlerDef {
+        name: "comm.withheld_body",
+        description: "Read the original RFC 5322 bytes of a delivered withheld message, base64-encoded with their size. Open to the message's recipient actor and to the configured maintainer; every other caller is refused before the original is read. Never returns a content reference, and every call is audited.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "id",
+                param_type: "string",
+                required: true,
+                description: "Short 8-char prefix or full UUID of the delivered withheld message.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
     HandlerDef {
         name: "comm.send",
         description: "Send a message, optionally threaded. Returns the outbound message ID; the recipient receives a different inbound ID whose properties.outbound_ref links to the outbound ID. comm.read takes the inbound ID.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[
-            ParamDef {
-                name: "attachments", param_type: "array", required: false,
-                description: "Up to 8 distinct existing blob content references, at most 64 MiB total. Local recipients and canonical main comm backend only; each message copy owns ordered metadata rows.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "idempotency_key",
-                param_type: "string",
-                required: false,
-                description: "Optional caller key, at most 512 UTF-8 bytes and no U+0000. In the same namespace and sending actor, an identical request replays the original intact pair; a different request or incomplete pair returns key_conflict. Deleting the outbound releases the key.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            ATTACHMENTS_PARAM,
+            IDEMPOTENCY_KEY_PARAM,
             ParamDef {
                 name: "to",
                 param_type: "string",
                 required: true,
-                description: "Actor label to send to (e.g. \"lambda:leo\"). Both copies land in the caller's namespace; no cross-namespace write occurs.",
+                description: "Actor label to send to (e.g. \"lambda:casey\"). Both copies land in the caller's namespace; no cross-namespace write occurs.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -87,13 +207,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
                 description: "Message body. Must not be empty.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
-            ParamDef {
-                name: "subject",
-                param_type: "string",
-                required: false,
-                description: "Optional subject line.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            SUBJECT_PARAM,
             ParamDef {
                 name: "thread_id",
                 param_type: "uuid",
@@ -136,8 +250,25 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
         }],
     },
     HandlerDef {
+        name: "comm.transport_status",
+        description: "Read sender-local transport status for an outbound UUID: pending, \
+                      recipient_stored, recipient_quarantined, failed or unknown. Holds \
+                      remain pending; absence in the caller's namespace is unknown.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
+        params: &[ParamDef {
+            name: "id",
+            param_type: "uuid",
+            required: true,
+            description: "Full outbound UUID returned as full_id by comm.send or comm.reply, \
+                          or as outbound_id in an ambiguous atomic-write error. Prefixes \
+                          require scoped resolution and are refused.",
+            resolution_mode: IdResolutionMode::FullUuidOnlyScopedToPrimary,
+        }],
+    },
+    HandlerDef {
         name: "comm.inbox",
-        description: "List and page through the caller's filtered inbound or sent messages, optionally waiting for a new matching message. Defaults to the inbound inbox. comm.send returns the outbound message ID; the recipient row has a different inbound ID and properties.outbound_ref links back to the outbound ID. comm.read takes the inbound ID.",
+        description: "Fetch and page through the caller's filtered inbound or sent messages without marking them read, optionally waiting for a new matching message. Defaults to the inbound inbox. comm.send returns the outbound message ID; the recipient row has a different inbound ID and properties.outbound_ref links back to the outbound ID. comm.read takes the inbound ID.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -271,7 +402,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
     },
     HandlerDef {
         name: "comm.read",
-        description: "Fetch one or up to 500 inbound messages and mark them read. Successful results include subject, content, and routing fields by default; body=false keeps the existing acknowledgement-only response. Mark writes are best-effort: each result carries status=success|failed|unknown (failed and unknown results add no message body; unknown means the write's execution seam terminated after the request was accepted, so it may already have applied — re-check with comm.inbox before deciding whether to re-issue; re-issuing is safe, marking read is idempotent), and bulk responses carry status=success|partial|failed|unknown.",
+        description: "Fetch one or up to 500 inbound messages and mark them read by default. With a single id, mark=false fetches without marking and reports the stored read state; ids with mark=false is refused even when empty. Successful results include subject, content, and routing fields by default; body=false omits those fields without changing the requested marking behavior. Mark writes are best-effort: each result carries status=success|failed|unknown (failed and unknown results add no message body; unknown means the write's execution seam terminated after the request was accepted, so it may already have applied — re-check with comm.inbox before deciding whether to re-issue; re-issuing is safe, marking read is idempotent), and bulk responses carry status=success|partial|failed|unknown.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[
@@ -279,28 +410,35 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
                 name: "id",
                 param_type: "string",
                 required: false,
-                description: "Short 8-char prefix or full UUID of one inbound message to mark read. Mutually exclusive with `ids`.",
+                description: "Short 8-char prefix or full UUID of one inbound message to fetch, marking it unless mark=false. Mutually exclusive with `ids`.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "ids",
                 param_type: "array of string",
                 required: false,
-                description: "One to 500 inbound message ids to mark read in one operation. Mutually exclusive with `id`; all targets are validated before mutation and duplicate resolved ids are updated once.",
+                description: "One to 500 inbound message ids to mark read in one operation. Mutually exclusive with `id`; mark=false is not supported, even for an empty array. All targets are validated before mutation and duplicate resolved ids are updated once.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "mark",
+                param_type: "boolean",
+                required: false,
+                description: "Defaults to true. Set false with a single id to fetch without marking read; the stored read state, properties, updated_at, and unread membership are unchanged. Not supported with ids, even when empty.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "body",
                 param_type: "boolean",
                 required: false,
-                description: "Defaults to true. Set false to retain the prior acknowledgement-only response without top-level subject, content, or routing fields; the read mark is still attempted.",
+                description: "Defaults to true. Set false to omit expanded message fields and attachment lookup. With mark=true the read mark is still attempted; with mark=false the compact response reports the fetched state without acknowledging a mark.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
     HandlerDef {
         name: "comm.mark_read",
-        description: "Mark up to 500 inbound messages as read; use comm.inbox or comm.thread to retrieve content. Best-effort responses carry status=success|partial|failed; atomic=true provides all-or-nothing mutation.",
+        description: "Mark up to 500 inbound messages as read without returning message content; use comm.inbox or comm.thread to retrieve content. Best-effort responses carry status=success|partial|failed; atomic=true provides all-or-nothing mutation.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[
@@ -308,7 +446,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
                 name: "ids",
                 param_type: "array of string",
                 required: true,
-                description: "One to 500 inbound message ids. Every target is validated before mutation and duplicate resolved ids are updated once.",
+                description: "One to 500 inbound message ids. `id` is accepted as an alias for `ids` for one message. Supply only one spelling, even when the values agree. Every target is validated before mutation and duplicate resolved ids are updated once.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -333,18 +471,8 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[
-            ParamDef {
-                name: "attachments", param_type: "array", required: false,
-                description: "Up to 8 distinct existing blob content references, at most 64 MiB total. Local recipients and canonical main comm backend only; each message copy owns ordered metadata rows.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "idempotency_key",
-                param_type: "string",
-                required: false,
-                description: "Optional caller key, at most 512 UTF-8 bytes and no U+0000. In the same namespace and sending actor, an identical request replays the original intact pair; a different request or incomplete pair returns key_conflict. Deleting the outbound releases the key.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            ATTACHMENTS_PARAM,
+            IDEMPOTENCY_KEY_PARAM,
             ParamDef {
                 name: "id",
                 param_type: "string",
@@ -370,7 +498,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
     },
     HandlerDef {
         name: "comm.thread",
-        description: "Retrieve all messages in a conversation thread, ordered chronologically.",
+        description: "Fetch all messages in a conversation thread without marking them read, ordered chronologically.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -452,13 +580,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
                 description: "Message body text.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
-            ParamDef {
-                name: "subject",
-                param_type: "string",
-                required: false,
-                description: "Optional subject line.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            SUBJECT_PARAM,
             ParamDef {
                 name: "thread_id",
                 param_type: "uuid",
@@ -600,13 +722,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
                               verb has no wire path for an untrusted caller to reach.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
-            ParamDef {
-                name: "channel_kind",
-                param_type: "string",
-                required: true,
-                description: "Channel kind identifier (e.g. `email`).",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            CHANNEL_KIND_PARAM,
             ParamDef {
                 name: "channel_slug",
                 param_type: "string",
@@ -649,6 +765,55 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
                 description: "RFC 3339 timestamp of this poll attempt. Defaults to now.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
+            ParamDef {
+                name: "held_messages",
+                param_type: "integer",
+                required: false,
+                description: "Messages that held the page this poll. Success outcome only; accepted by a writer that bounds its holds.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "quarantined_after_hold",
+                param_type: "integer",
+                required: false,
+                description: "Messages given a terminal disposition this poll because their failed polls reached the writer's bound. Success outcome only.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "originals_not_retained",
+                param_type: "integer",
+                required: false,
+                description: "Records written this poll without their original, across every reason including the retention limit. Success outcome only; added to the row's running total.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "original_not_retained_reason",
+                param_type: "string",
+                required: false,
+                description: "The last reason a record was written without its original this poll: retention-limit | original-unavailable | retention-count-unreadable | original-store-failed | quarantine-write-failed | secondary-backend. Required exactly when originals_not_retained is above zero, refused otherwise.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "original_retention_state",
+                param_type: "string",
+                required: false,
+                description: "Whether the writer kept its originals this poll: retained | failing. Replaced by each success that reports it.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "notices_failed",
+                param_type: "integer",
+                required: false,
+                description: "Notice sends that failed this poll. Success outcome only; added to the row's running total.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "notice_config_error",
+                param_type: "string",
+                required: false,
+                description: "Short description of a notice configuration problem, at most 255 bytes with no control characters. Success outcome only; cleared by a later success that omits it.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
         ],
     },
     HandlerDef {
@@ -668,7 +833,16 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
                        counts remain namespace-wide. Heartbeat entries include their \
                        nominal `poll_interval_secs` and a nullable advisory `stalled` schedule \
                        fact. `stalled` becomes true after three missed nominal intervals; it is \
-                       null for legacy/malformed rows and known failure/backoff state. This is \
+                       null for legacy/malformed rows and known failure/backoff state. \
+                       `consecutive_held_polls` counts successive polls on which at least one \
+                       message held the channel's page (0 after a poll with no hold), with \
+                       `held_messages` from the latest poll, `last_held_at` and \
+                       `last_quarantined_after_hold_at`; all four are null when the writer does \
+                       not report holds. `originals_not_retained` and `notices_failed` are \
+                       running totals with `last_original_not_retained_at`, \
+                       `last_original_not_retained_reason`, `original_retention_state`, \
+                       `last_notice_failed_at` and `notice_config_error`; all seven are null \
+                       when the writer does not report them. This is \
                        not a computed healthy bool; overall \
                        health judgment belongs to the caller. Reads from the caller's injected \
                        namespace — `token.namespace()`, the same explicit \
@@ -716,7 +890,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
                 name: "actor",
                 param_type: "string",
                 required: true,
-                description: "Actor label whose inbound queue is probed, e.g. \"lambda:leo\".",
+                description: "Actor label whose inbound queue is probed, e.g. \"lambda:casey\".",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -743,20 +917,8 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
         visibility: Visibility::Subhandler,
         category: khive_types::VerbCategory::Assertive,
         params: &[
-            ParamDef {
-                name: "channel_kind",
-                param_type: "string",
-                required: true,
-                description: "Channel kind identifier (e.g. `email`).",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "channel_slug",
-                param_type: "string",
-                required: true,
-                description: "Stable per-credential identifier distinguishing accounts of the same kind.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            CHANNEL_KIND_PARAM,
+            CHANNEL_SLUG_PARAM,
         ],
     },
     HandlerDef {
@@ -768,20 +930,8 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
         visibility: Visibility::Subhandler,
         category: khive_types::VerbCategory::Declaration,
         params: &[
-            ParamDef {
-                name: "channel_kind",
-                param_type: "string",
-                required: true,
-                description: "Channel kind identifier (e.g. `email`).",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "channel_slug",
-                param_type: "string",
-                required: true,
-                description: "Stable per-credential identifier distinguishing accounts of the same kind.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            CHANNEL_KIND_PARAM,
+            CHANNEL_SLUG_PARAM,
             ParamDef {
                 name: "source",
                 param_type: "string",

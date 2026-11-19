@@ -40,10 +40,12 @@
 | khive-runtime | {VERSION} | [link](https://crates.io/crates/khive-runtime) |
 | khive-mcp     | {VERSION} | [link](https://crates.io/crates/khive-mcp)     |
 
-## Install
+## Install from source
+
+From the repository root of a source checkout for this release:
 
 ```bash
-cargo install kkernel@{VERSION}
+cargo install --path crates/kkernel --locked
 ```
 
 ## MCP configuration

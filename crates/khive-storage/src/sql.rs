@@ -7,6 +7,7 @@ use std::pin::Pin;
 use async_trait::async_trait;
 
 use crate::types::{PageRequest, SqlRow, SqlStatement, SqlValue, StorageResult};
+use crate::StorageError;
 
 /// A boxed future, borrowing from the `&mut dyn SqlWriter` an
 /// [`AtomicUnitOp`] is called with (see [`SqlAccess::atomic_unit`]).
@@ -52,6 +53,23 @@ impl TopLevelMaintenance {
     }
 }
 
+/// Owned state for consuming one SQL result in statement order.
+///
+/// A consumer must do bounded synchronous work and must not reenter SQL or wait
+/// for another operation on the same connection. Only private output should be
+/// accumulated: a failed query does not return the consumer, but cannot undo
+/// external side effects performed by it. Cancellation cannot preempt a blocked
+/// consumer; an interrupt hard-cap timeout may leave the worker owning it until
+/// that worker exits.
+pub trait SqlRowConsumer: Send + 'static {
+    /// Consume one owned row, which may be dropped before the next row is read.
+    fn push_row(&mut self, row: SqlRow) -> StorageResult<()>;
+
+    /// Recover the concrete accumulator after a successful query.
+    /// A failed downcast must be handled as a storage error by the caller.
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send>;
+}
+
 /// Read-capable SQL connection.
 #[async_trait]
 pub trait SqlReader: Send + 'static {
@@ -66,6 +84,29 @@ pub trait SqlReader: Send + 'static {
     /// This compatibility primitive has no result-size bound. Callers that do
     /// not already constrain their SQL should use [`Self::query_page`].
     async fn query_all(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>>;
+    /// Consume one read-only statement without collecting all owned rows.
+    ///
+    /// Returns the same owned consumer only after successful completion. Driver,
+    /// consumer and cancellation errors expose no partially accumulated consumer.
+    /// The database engine may still buffer or sort rows for its query plan.
+    /// Transaction-control statements and writes are not accepted through this
+    /// method; an already-open read transaction remains owned by the reader.
+    ///
+    /// Unsupported backends fail explicitly instead of calling `query_all`.
+    /// On cancellation a backend may detach an interrupt-resistant worker after
+    /// its hard cap; that worker keeps its consumer and admission until it exits.
+    async fn query_consume(
+        &mut self,
+        _statement: SqlStatement,
+        _consumer: Box<dyn SqlRowConsumer>,
+    ) -> StorageResult<Box<dyn SqlRowConsumer>> {
+        Err(StorageError::Unsupported {
+            capability: crate::StorageCapability::Sql,
+            operation: "query_consume".into(),
+            message: "this reader does not support row consumption".into(),
+        })
+    }
+
     /// Execute `statement` and return only the requested offset page.
     ///
     /// The default preserves source compatibility for alternate backends by
@@ -96,6 +137,20 @@ pub trait SqlReader: Send + 'static {
     }
     /// Execute `statement` and return the first column of the first row as a scalar.
     async fn query_scalar(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlValue>>;
+    /// Execute a count statement and return its nonnegative integer scalar as `u64`.
+    ///
+    /// The default passes `statement` unchanged to [`Self::query_scalar`] exactly
+    /// once. It does not parse SQL or verify that the statement uses `COUNT`.
+    /// A negative integer, missing row, NULL, or non-integer scalar returns
+    /// [`StorageError::Internal`]; backend errors pass through unchanged.
+    async fn count(&mut self, statement: SqlStatement) -> StorageResult<u64> {
+        match self.query_scalar(statement).await? {
+            Some(SqlValue::Integer(value)) if value >= 0 => Ok(value as u64),
+            _ => Err(StorageError::Internal(
+                "SQL count expected a nonnegative integer scalar".into(),
+            )),
+        }
+    }
     /// Run `EXPLAIN QUERY PLAN` for `statement` and return the plan rows.
     async fn explain(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>>;
 }

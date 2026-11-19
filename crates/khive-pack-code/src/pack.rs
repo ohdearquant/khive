@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
-    KhiveRuntime, KindHook, NamespaceToken, NoteKindSpec, RuntimeError, SchemaPlan, VerbRegistry,
+    KhiveRuntime, KindHook, NamespaceToken, NoteKindSpec, RuntimeError, VerbRegistry,
 };
 use khive_types::{EdgeEndpointRule, HandlerDef, Pack};
 
@@ -15,8 +15,7 @@ use crate::hook::FindingHook;
 use crate::vocab::{CODE_EDGE_RULES, CODE_HANDLERS, CODE_NOTE_KIND_SPECS};
 
 /// Code ontology pack — additive edge rules over four concept subtypes, the
-/// `finding` audit-observation note kind, and the `code.ingest` verb
-/// (ADR-085 Amendment 2).
+/// `finding` audit-observation note kind, and source ingest plus registered-map read verbs (ADR-085, ADR-139).
 ///
 /// See `crates/khive-pack-code/docs/code-ontology.md`.
 pub struct CodePack {
@@ -31,11 +30,15 @@ impl Pack for CodePack {
     const EDGE_RULES: &'static [EdgeEndpointRule] = &CODE_EDGE_RULES;
     const REQUIRES: &'static [&'static str] = &["kg"];
     const NOTE_KIND_SPECS: &'static [NoteKindSpec] = &CODE_NOTE_KIND_SPECS;
-    const SCHEMA_PLAN: Option<khive_runtime::PackSchemaPlan> = None;
+    const SCHEMA_PLAN: Option<khive_runtime::PackSchemaPlan> =
+        Some(khive_runtime::PackSchemaPlan {
+            pack: "code",
+            statements: &[],
+        });
 }
 
 impl CodePack {
-    /// Bind the code vocabulary pack to `runtime`; the pack registers no verbs.
+    /// Bind the code vocabulary and source-map verbs to `runtime`.
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self { runtime }
     }
@@ -44,13 +47,7 @@ impl CodePack {
 struct CodePackFactory;
 
 impl khive_runtime::PackFactory for CodePackFactory {
-    fn name(&self) -> &'static str {
-        "code"
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        &["kg"]
-    }
+    khive_runtime::pack_factory_metadata!(CodePack);
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(CodePack::new(runtime))
@@ -61,40 +58,7 @@ inventory::submit! { khive_runtime::PackRegistration(&CodePackFactory) }
 
 #[async_trait]
 impl PackRuntime for CodePack {
-    fn name(&self) -> &str {
-        <CodePack as Pack>::NAME
-    }
-
-    fn note_kinds(&self) -> &'static [&'static str] {
-        <CodePack as Pack>::NOTE_KINDS
-    }
-
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        <CodePack as Pack>::ENTITY_KINDS
-    }
-
-    fn handlers(&self) -> &'static [HandlerDef] {
-        <CodePack as Pack>::HANDLERS
-    }
-
-    fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
-        <CodePack as Pack>::EDGE_RULES
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        <CodePack as Pack>::REQUIRES
-    }
-
-    fn note_kind_specs(&self) -> &'static [NoteKindSpec] {
-        <CodePack as Pack>::NOTE_KIND_SPECS
-    }
-
-    fn schema_plan(&self) -> SchemaPlan {
-        SchemaPlan {
-            pack: "code",
-            statements: &[],
-        }
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
         match kind {
@@ -112,6 +76,9 @@ impl PackRuntime for CodePack {
     ) -> Result<Value, RuntimeError> {
         match verb {
             "code.ingest" => self.handle_ingest(params).await,
+            "code.list" => self.handle_list(params).await,
+            "code.search" => self.handle_search(params).await,
+            "code.deps" => self.handle_deps(params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "code pack does not handle verb {verb:?}"
             ))),
@@ -120,19 +87,5 @@ impl PackRuntime for CodePack {
 }
 
 #[cfg(test)]
-mod tests {
-    use khive_types::Pack;
-
-    use super::CodePack;
-
-    #[test]
-    fn code_pack_declares_adr085_metadata() {
-        assert_eq!(<CodePack as Pack>::NAME, "code");
-        assert_eq!(<CodePack as Pack>::NOTE_KINDS, &["finding"]);
-        assert!(<CodePack as Pack>::ENTITY_KINDS.is_empty());
-        assert_eq!(<CodePack as Pack>::HANDLERS.len(), 1);
-        assert_eq!(<CodePack as Pack>::HANDLERS[0].name, "code.ingest");
-        assert_eq!(<CodePack as Pack>::REQUIRES, &["kg"]);
-        assert!(<CodePack as Pack>::SCHEMA_PLAN.is_none());
-    }
-}
+#[path = "pack_tests.rs"]
+mod tests;

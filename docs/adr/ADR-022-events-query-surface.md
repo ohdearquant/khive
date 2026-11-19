@@ -121,7 +121,7 @@ the namespace isolation contract from [ADR-007](ADR-007-namespace.md).
 the §3b canonical newest-first order — returning the most recent events first and
 disambiguating clock ties deterministically. Not overridable in v1.
 
-### 3. Aggregation — deferred
+### 3. Aggregation — original deferral
 
 `count_events` exists on `EventStore` but a `count(kind="event", ...)` verb is **not**
 added in this ADR. Downstream consumers needing aggregate counts can issue
@@ -131,6 +131,29 @@ make this feasible.
 A future verb `count(kind="event", group_by="verb")` is explicitly deferred — group-by
 semantics require a new `GROUP BY` path in the SQL builder that is disproportionate to
 the current use case.
+
+### Grouped event counts
+
+The original deferral above is lifted for `count(kind="event", group_by=...)`.
+`group_by` is one of `verb`, `kind`, or `actor`; the response is an object mapping
+stored group keys to integer counts. An empty result is `{}`, without zero-valued
+buckets. The handler sums counts across the sealed caller token's visible namespaces;
+it never adds namespaces not already authorized by that token.
+
+Optional filters are `verb`/`verbs`, `event_kind`/`event_kinds`, `actor`, `substrate`,
+`outcome`, `since`, and `until`. Singular and plural forms are merged as OR sets;
+different fields are ANDed. `since` and `until` are exclusive UTC-microsecond bounds,
+matching event-list time filtering. Unknown group keys, event kinds and unsupported
+substrates/outcomes refuse before any count. Other substrates are not accepted by
+`count`. These counts use the existing typed `EventFilter`, including its SQL-level
+outcome filter; this does not change the historical event-list handler described above.
+
+`EventStore::count_events_grouped` performs SQL `GROUP BY` over the scoped store.
+Split-event deployments aggregate both the main and events stores, and the events
+socket forwards the typed operation (protocol version 5; upgrade both peers together).
+Separate stores/namespaces are read sequentially, so concurrent appends can be observed
+between reads; the response does not promise a cross-store snapshot. It does not
+materialize or truncate event rows and does not alter append/audit behavior.
 
 ### 3a. Cognitive-primitive framing — `EventFilter` ↔ `Objective<Event>`; aggregators are `Fold<Event, State>`
 
@@ -574,3 +597,95 @@ impl KhiveRuntime {
 - `crates/khive-runtime/src/operations.rs`: `Resolved::Event` variant
 - `crates/khive-pack-kg/src/handlers/`: `handle_list`, `handle_get`, `handle_update`,
   `handle_delete` — extension points
+
+## Amendment: additive compound event pages (2026-10-06, #4118)
+
+**Status: Accepted (2026-10-06).** Acceptance is required before dependent implementation merges.
+`brain.event_page` adds a count-free ordered read. Existing KG event list/get and
+`brain.events` debugging behavior remain unchanged. This amendment changes no event
+producer, historical row, or task lifecycle recording.
+
+The request accepts required inclusive `since`, optional exclusive `until`, optional
+`kind` and `kinds`, `namespaces`, `exclude_namespaces`, `actor`, `all_actors`, `limit`,
+and `after`. Times use the existing brain time parser. Kind selectors combine and
+deduplicate. Limit defaults to 100 and must be an integer from 1 through 1000.
+Namespace selections are capped at 16 and exclusions at 32. Default selection is the
+token's namespace; an empty selection is empty. Explicit selections intersect the
+token's current visibility. Valid invisible or nonexistent names disclose no
+existence-specific information. Exclusions apply in storage before ordering/limit.
+Actor aliases, explicit-actor authorization and serving-runtime fleet readers follow
+the unchanged `brain.event_counts` policy. `all_actors` never broadens namespaces.
+
+The response contains stored event fields, page `count`, `has_more`, nullable
+`next_after`, resolved `since`/`until`, authorized nonexcluded namespace `scope`, and
+`consistency: "live_ordered_window"`. Event `id` is canonical, distinct from any
+payload-level ID; `created_at` is RFC3339 with microsecond precision. Payloads and
+metadata are preserved. No full-window total is implied. Current and historical GTD
+event-plane audit rows lack task ID and prior/new status; the reader leaves those
+fields absent. It must not reconstruct them from current task state or join an
+unlinked lifecycle table. Future typed GTD success-audit enrichment is separate work
+and is not a prerequisite for this read API.
+
+Pages use the exact ascending `(created_at, physical ID text BINARY)` order specified
+in [ADR-005](ADR-005-storage-capability-traits.md)'s compound-page amendment. The
+first omitted `until` freezes server time; subsequent omissions reuse the cursor's
+bound. A cursor is at most 512 bytes and has the canonical form
+`ep1:<until_us>:<last_created_at_us>:<hex physical ID>:<SHA256 binding>`. Integers use
+canonical signed decimal and hex is lowercase. The digest binds the version, current
+principal kind/ID, window, kinds, authorized actor aliases, authorized requested
+namespaces, and exclusions. Limit may change. Invalid, noncanonical or mismatched
+cursors are refused before storage reads, without echoing their contents.
+
+The digest detects accidental reuse; it is unsigned and conveys no authority.
+Every continuation reauthorizes against the current token and serving actor policy.
+Returned rows violating the requested scope, predicates or order cause an invariant
+error; post-filtering must not hide a broken storage predicate. Runtime fetches a
+bounded peek from every candidate/plane, globally merges them, and derives the next
+cursor from the last returned row only when the peek proves `has_more`.
+Equal physical time/ID keys in a fetched or merged prefix are refused before clipping
+the page, because a strict cursor cannot represent a position between them. This is
+an explicit invariant failure, not deduplication or repair of the event plane.
+
+Budget refusals are typed and never silent. A storage leaf that would pass its 1 MiB
+raw-text budget stops before that row and names the row's order key (ADR-005). Rows
+ordered before the earliest such key across all leaves are servable; later rows are
+not, because a stopped leaf's later rows are unknown. If at least `limit` servable
+rows precede the key, the page is returned normally with `has_more: true`, subject
+to the aggregate and response budgets, because the stopped row proves that more rows
+exist. If the aggregate budget permits the fetched windows and the stopped row is the
+first row after the cursor, it alone exceeds the leaf budget and no limit can serve it: the
+request fails with `row_exceeds_budget`, which carries that row's canonical event
+`id` and a server-issued `resume_after` cursor positioned at the row and bound to the
+same window, principal, kinds, actors, namespaces and exclusions. A one-row page whose
+serialized response exceeds 4 MiB fails the same way. Other multi-row leaf or response
+budget failures, and any 32 MiB aggregate failure, return `page_budget_exceeded`
+without a cursor. The aggregate charges serialized rows from each namespace's fetched
+window, including peek rows, before the merged rows are truncated to `limit`, so it
+can refuse even at `limit=1`. Lower `limit` where possible, retaining the same filters
+and `after`. If the aggregate budget still refuses at `limit=1`, request fewer
+namespaces or a smaller time window in a fresh traversal without `after`. Page any
+remaining subsets separately if the original selection is still needed; smaller
+queries may still hit a budget. Preserve a known prior `until` by passing it
+explicitly. Omitting both `after` and `until` freezes a new server-time bound. Continuing
+from `resume_after` skips exactly that row, by the caller's own act, and the row stays
+readable by ID through the existing event get. This is the only place the page API
+omits a row. Neither refusal carries the row's payload or its raw order key. Whether
+production stores hold rows above these budgets has not been measured.
+
+Independent reads form a live view, not a snapshot or sequence/highwater stream.
+Only a newly persisted key greater than the cursor and inside the frozen window can
+appear later. Backdated inserts and equal-time lower-ID inserts may fall before the
+cursor and remain unseen. Tests must demonstrate both the greater-key case and this
+limitation. Exhaustive ID parity against `window_event_total` uses a quiescent,
+explicitly frozen window with identical namespace, actor and kind selectors and a
+successful, untruncated count read. No moving-population parity claim is valid.
+
+The [event-page API guide](../../crates/khive-pack-brain/docs/api/event-pages.md)
+contains call examples and resource limits. Acceptance also covers real feedback
+and GTD writers through MCP, unchanged payloads, missing GTD fields, sparse filters,
+authorization changes, malformed cursors, and explicit budget failures. For budgets
+it requires an oversized event that refuses at limit 1 with its ID and cursor and
+whose continuation returns the next row; a control that drops `resume_after` and
+stays refused at that position; a multi-row page over budget that refuses without a
+cursor; and two rows that together exceed the leaf budget, read one per page at
+limit 1.

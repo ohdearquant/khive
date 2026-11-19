@@ -8,6 +8,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 
+use khive_fs::opened_file::{open_regular_file_within, ContainedOpenError};
 use khive_runtime::{NamedVectorIdentity, RuntimeError};
 use khive_types::canonical_json_bytes;
 
@@ -693,123 +694,29 @@ fn open_checkpoint_source(
     canonical_root: &Path,
     source_path: &Path,
 ) -> Result<std::fs::File, RuntimeError> {
-    let source = std::fs::File::open(source_path).map_err(|error| {
-        RuntimeError::Unconfigured(format!(
+    open_regular_file_within(canonical_root, source_path).map_err(|refusal| match refusal {
+        ContainedOpenError::Open(error) => RuntimeError::Unconfigured(format!(
             "opening checkpoint source {} for private snapshot: {error}",
             source_path.display()
-        ))
-    })?;
-    let metadata = source.metadata().map_err(|error| {
-        RuntimeError::Unconfigured(format!(
+        )),
+        ContainedOpenError::Metadata(error) => RuntimeError::Unconfigured(format!(
             "reading opened checkpoint source metadata {}: {error}",
             source_path.display()
-        ))
-    })?;
-    if !metadata.is_file() {
-        return Err(RuntimeError::Unconfigured(format!(
+        )),
+        ContainedOpenError::NotRegular => RuntimeError::Unconfigured(format!(
             "opened checkpoint source is not a regular file: {}",
             source_path.display()
-        )));
-    }
-    let opened_path = opened_file_path(&source).map_err(|error| {
-        RuntimeError::Unconfigured(format!(
+        )),
+        ContainedOpenError::Resolve(error) => RuntimeError::Unconfigured(format!(
             "resolving opened checkpoint source {}: {error}",
             source_path.display()
-        ))
-    })?;
-    if !opened_path.starts_with(canonical_root) {
-        return Err(RuntimeError::Unconfigured(format!(
+        )),
+        ContainedOpenError::Escapes { opened } => RuntimeError::Unconfigured(format!(
             "opened checkpoint source escapes model directory: {} -> {}",
             source_path.display(),
-            opened_path.display()
-        )));
-    }
-    Ok(source)
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn opened_file_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
-    use std::os::fd::AsRawFd as _;
-
-    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn opened_file_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
-    use std::ffi::OsStr;
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let mut bytes = vec![0_u8; libc::PATH_MAX as usize];
-    // SAFETY: `file` owns a live descriptor and `bytes` is a writable
-    // PATH_MAX-sized buffer for F_GETPATH. fcntl writes a NUL-terminated path
-    // on success and does not retain the pointer.
-    let result = unsafe {
-        libc::fcntl(
-            file.as_raw_fd(),
-            libc::F_GETPATH,
-            bytes.as_mut_ptr().cast::<libc::c_void>(),
-        )
-    };
-    if result == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let length = bytes.iter().position(|byte| *byte == 0).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "F_GETPATH returned no NUL terminator",
-        )
-    })?;
-    Ok(PathBuf::from(OsStr::from_bytes(&bytes[..length])))
-}
-
-#[cfg(windows)]
-fn opened_file_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt as _;
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
-    };
-
-    let mut path = vec![0_u16; 260];
-    loop {
-        // SAFETY: `file` owns a live handle and `path` exposes the writable
-        // buffer and length passed to the Win32 API for this call only.
-        let length = unsafe {
-            GetFinalPathNameByHandleW(
-                file.as_raw_handle(),
-                path.as_mut_ptr(),
-                path.len() as u32,
-                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
-            )
-        };
-        if length == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let length = length as usize;
-        if length < path.len() {
-            path.truncate(length);
-            return Ok(PathBuf::from(OsString::from_wide(&path)));
-        }
-        path.resize(length.saturating_add(1), 0);
-    }
-}
-
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios"
-    ))
-))]
-fn opened_file_path(_file: &std::fs::File) -> std::io::Result<PathBuf> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "secure opened-file path resolution is unsupported on this Unix target",
-    ))
+            opened.display()
+        )),
+    })
 }
 
 fn set_snapshot_tree_readonly(root: &Path, readonly: bool) -> Result<(), RuntimeError> {
@@ -1233,11 +1140,11 @@ mod tests {
             sha256_hex(&canonical_json_bytes(&serde_json::to_value(&core).unwrap()).unwrap());
         assert_eq!(
             fingerprint,
-            "b57fb3cf43da387cde12425e6d7d442af269ba37ecabfbe4c975cb80abdf56e5"
+            "f197ddf5aa2e5f086ce5a37f104e6a96d203502a0b6c19c626ec24f4c7fd5823"
         );
         assert_eq!(
             format!("moodboard_{fingerprint}_4"),
-            "moodboard_b57fb3cf43da387cde12425e6d7d442af269ba37ecabfbe4c975cb80abdf56e5_4"
+            "moodboard_f197ddf5aa2e5f086ce5a37f104e6a96d203502a0b6c19c626ec24f4c7fd5823_4"
         );
 
         let production_prompt =
@@ -1248,26 +1155,26 @@ mod tests {
         );
         assert_eq!(
             production_prompt.fingerprint,
-            "5d62815b1b662fa926c58aaaf58553e3d842b615cd90f431fe6e7c1bd782ea0b"
+            "54e625d43cefdb8d28ff3517fa099fb850aef289418793c4747134abc4878b99"
         );
         assert_eq!(
             production_prompt.model_key,
-            "moodboard_5d62815b1b662fa926c58aaaf58553e3d842b615cd90f431fe6e7c1bd782ea0b_4"
+            "moodboard_54e625d43cefdb8d28ff3517fa099fb850aef289418793c4747134abc4878b99_4"
         );
 
-        let indexed_qwen_09 = DescriptorIdentity::build(
+        let indexed_qwen = DescriptorIdentity::build(
             "hf-Qwen-Qwen3.5-0.8B-2fc06364715b967f1860aea9cf38778875588b17".to_string(),
             "6dca0d0e661696b36985cbce8f89e1a91377822065de31eac94e90a0e45d43d3".to_string(),
             1024,
         )
         .unwrap();
         assert_eq!(
-            indexed_qwen_09.fingerprint,
-            "bd91f5bf961eb429a6f57b6c16bafde9eeea249d799b1ff0d31e32cf05e5bc8f"
+            indexed_qwen.fingerprint,
+            "c3f82e8c23ce92d0d58b98930c7b5faae00a4193c21044d6493cf92da6c63923"
         );
         assert_eq!(
-            indexed_qwen_09.model_key,
-            "moodboard_bd91f5bf961eb429a6f57b6c16bafde9eeea249d799b1ff0d31e32cf05e5bc8f_1024"
+            indexed_qwen.model_key,
+            "moodboard_c3f82e8c23ce92d0d58b98930c7b5faae00a4193c21044d6493cf92da6c63923_1024"
         );
     }
 
@@ -1408,6 +1315,38 @@ mod tests {
         assert!(error
             .to_string()
             .contains("opened checkpoint source escapes model directory"));
+    }
+
+    #[test]
+    fn open_checkpoint_source_reads_a_regular_file_inside_the_directory() {
+        let checkpoint = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(checkpoint.path()).unwrap();
+        let weights = canonical_root.join("weights.bin");
+        std::fs::write(&weights, b"inside").unwrap();
+
+        let file = open_checkpoint_source(&canonical_root, &weights).unwrap();
+        assert_eq!(std::io::read_to_string(file).unwrap(), "inside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_checkpoint_source_refuses_a_directory_as_not_a_regular_file() {
+        let checkpoint = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(checkpoint.path()).unwrap();
+        let nested = canonical_root.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+
+        let message = match open_checkpoint_source(&canonical_root, &nested) {
+            Err(RuntimeError::Unconfigured(message)) => message,
+            other => panic!("expected an Unconfigured refusal, got {other:?}"),
+        };
+        assert_eq!(
+            message,
+            format!(
+                "opened checkpoint source is not a regular file: {}",
+                nested.display()
+            )
+        );
     }
 
     #[test]

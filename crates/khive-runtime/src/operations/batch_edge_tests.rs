@@ -44,11 +44,12 @@ async fn seed(runtime: &KhiveRuntime, namespace: &str, edges: Vec<Edge>) {
 fn rewrite(runtime: &KhiveRuntime, id: Uuid, assignment: &str) {
     let writer = runtime.backend().pool().try_writer().expect("writer");
     writer
-        .conn()
-        .execute(
-            &format!("UPDATE graph_edges SET {assignment} WHERE id=?1"),
-            [id.to_string()],
-        )
+        .autocommit(|conn| {
+            Ok(conn.execute(
+                &format!("UPDATE graph_edges SET {assignment} WHERE id=?1"),
+                [id.to_string()],
+            )?)
+        })
         .expect("real stored-row mutation");
 }
 
@@ -84,8 +85,11 @@ fn refuse_cold_graph_accessor(
     {
         let writer = backend.pool().try_writer().expect("cold backend writer");
         writer
-            .conn()
-            .execute_batch("DROP INDEX IF EXISTS idx_graph_edges_ns_src_rel; PRAGMA query_only=ON")
+            .autocommit(|conn| {
+                Ok(conn.execute_batch(
+                    "DROP INDEX IF EXISTS idx_graph_edges_ns_src_rel; PRAGMA query_only=ON",
+                )?)
+            })
             .expect("arm actual constructor DDL refusal");
     }
     let result = backend
@@ -94,8 +98,7 @@ fn refuse_cold_graph_accessor(
     {
         let writer = backend.pool().try_writer().expect("cold backend writer");
         writer
-            .conn()
-            .execute_batch("PRAGMA query_only=OFF")
+            .autocommit(|conn| Ok(conn.execute_batch("PRAGMA query_only=OFF")?))
             .expect("clear constructor DDL refusal");
     }
     result

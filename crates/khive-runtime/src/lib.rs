@@ -2,38 +2,77 @@
 //!
 //! Wraps `StorageBackend` and query compilation into a single Rust API surface.
 
+mod canonical_apply;
+pub use canonical_apply::prepare_canonical_changeset;
+
 #[cfg(test)]
 mod test_process;
 
 pub mod actor_identity;
 pub mod agent_lifecycle;
-pub mod ann_registry;
+#[doc(hidden)]
+pub use khive_retrieval::ann::registry as ann_registry;
 pub mod atomic_message;
 pub mod atomic_plan;
 pub mod atomic_prepare;
 pub mod atomic_runner;
+pub mod attachment_cutover;
+pub use attachment_cutover::{
+    coordinate_attachment_cutover, coordinate_empty_secondary_attachment_cutover,
+    legacy_preference_model_count, require_secondary_attachment_empty,
+};
 pub mod audit_batch;
+pub mod audit_error;
+pub mod backend_handle;
 pub mod blob;
+pub mod blob_tree;
+pub mod bounded_read;
 pub mod build_info;
+mod code_map_runtime;
+pub use code_map_runtime::{
+    CodeMapRegistry, FileIdentity, RegisteredCodeMap, RegistrationGeneration,
+};
 pub mod comm_recipient;
 pub mod comm_transport;
 pub mod config;
 pub mod config_ledger;
+pub mod context;
 pub mod cost_unit;
+pub mod credentials;
+pub mod node_pins;
+mod visibility_receipts;
+pub use visibility_receipts::AuthenticatedVisibilityReceipt;
 pub mod curation;
 pub mod daemon;
 pub mod email_message_id;
 pub mod embedder_registry;
+pub mod embedding;
+pub mod embedding_reranker;
+pub mod embedding_warning;
 pub mod engine_config;
 pub mod entity_write;
 pub mod error;
 mod error_projection;
+mod event_actor_scope;
+mod event_cursor_walk;
+mod event_page;
+mod event_plane_read;
 mod event_store_guard;
 pub mod events_split;
 mod fence_identity;
 pub mod file_policy;
 pub mod fusion;
 pub mod graph_traversal;
+pub mod hooks;
+mod index_repair;
+#[cfg(feature = "native-rerank")]
+pub mod native_reranker;
+pub use index_repair::IndexRepairReport;
+pub mod channel_section;
+#[cfg(test)]
+mod channel_section_tests;
+pub mod channel_send;
+pub mod graph_lint;
 pub mod input_schema;
 pub mod keyed_memory;
 #[cfg(test)]
@@ -47,25 +86,41 @@ mod note_index;
 mod note_read;
 pub mod note_search_ann;
 mod note_store_guard;
+mod note_validation;
 pub mod note_write;
 #[cfg(test)]
 mod note_write_tests;
 pub mod objectives;
 pub mod operations;
+mod outbound_email_policy;
+pub use outbound_email_policy::OutboundEmailPolicy;
+pub use outbound_email_policy::{
+    inbound_email_is_suppressed, outbound_email_is_suppressed, EmailSuppression,
+    EmailSuppressionKind, EmailSuppressionScope, SuppressionMirror,
+};
 pub mod pack;
+pub mod pack_metadata;
+mod params;
 pub mod phase_events;
 pub mod portability;
 pub mod preference_verification;
 pub mod presentation;
+pub mod process_group;
 pub mod process_retry;
 pub mod reference_resolution;
 pub mod reference_ring;
 pub mod registry;
 pub mod resource;
+pub mod resource_admission;
 pub mod retrieval;
 pub mod runtime;
+pub mod search_audit;
 pub mod secret_gate;
 pub(crate) mod secret_gate_finalizer;
+mod sql_include;
+#[cfg(test)]
+mod stage_overlap_tests;
+mod stage_seam;
 mod streams;
 pub mod telemetry_config;
 pub use streams::{
@@ -75,6 +130,8 @@ pub use streams::{
 pub mod time_anchor;
 pub use khive_storage::usage;
 pub mod validation;
+
+pub use context::{ContextContributor, ContextRequest, ContextSlice, ScoreSemantics};
 
 pub use actor_identity::{actor_is_unattributed, resolve_actor, should_warn_unattributed_actor};
 pub use agent_lifecycle::{
@@ -91,6 +148,7 @@ pub use atomic_runner::{
     run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome, AtomicRunnerError,
     CommittedPostCommitEffects,
 };
+pub use backend_handle::{BackendHandle, BackendHandleError, RetrievalTier};
 pub use blob::{
     resolve_blob_store, resolve_blob_store_for_mode, BlobHydrator, GovernedBlobError, VerifiedBlob,
     DEFAULT_BLOB_HYDRATION_BYTES,
@@ -102,24 +160,27 @@ pub use curation::{
     entity_embedding_text, entity_fts_document, entity_merge_guard_compared_values,
     entity_merge_guard_error, entity_merge_guard_refusal_message, note_embedding_text,
     note_fts_document, validate_entity_merge_floor, ContentMergeStrategy, EdgeListFilter,
-    EdgePatch, EntityDedupMergePolicy, EntityMergeGuard, EntityPatch, MergeEdgeConflictPreimage,
-    MergeEdgePreimage, MergeSummary, MergeTxBudgetReport, MergeTxLimits, NotePatch,
-    NoteUpdatePolicy,
+    EdgePatch, EntityDedupMergePolicy, EntityMergeGuard, EntityPatch, GuardedNoteMerge,
+    MergeAssertion, MergeEdgeConflictPreimage, MergeEdgePreimage, MergeSummary,
+    MergeTxBudgetReport, MergeTxLimits, NoteMergeGuard, NotePatch, NoteUpdatePolicy,
 };
 #[cfg(unix)]
 pub use daemon::{acquire_recovery_lock, pid_path, run_daemon, socket_path, DaemonDispatch};
 pub use daemon::{
     active_phase_names, background_task_count, background_task_names, daemon_shutdown_token,
-    register_active_phase, spawn_named_tracked_task, track_background_task,
-    track_named_background_task, DaemonRequestFrame, DaemonResponseFrame, PhaseGuard,
-    PROTOCOL_VERSION, UNNAMED_BACKGROUND_TASK,
+    recall_ledger_snapshot, register_active_phase, spawn_named_tracked_task, track_background_task,
+    track_named_background_task, track_recall_ledger_task, DaemonRequestFrame, DaemonResponseFrame,
+    PhaseGuard, PROTOCOL_VERSION, UNNAMED_BACKGROUND_TASK,
 };
 pub use email_message_id::{EmailMessageIdDomains, HISTORICAL_DOMAINS_ENV};
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
+pub use embedding::{EmbeddingModelRecord, EmbeddingModelStatus};
+pub use embedding_reranker::{EmbeddingCosineReranker, EmbeddingRerankHit};
 pub use engine_config::{
     config_from_env, resolve_wal_ceiling, BackendConfig, BackendKind, BlobConfig,
-    BrainSectionConfig, ConfigError, EngineConfig, GateSectionConfig, GitWriteEntryConfig,
-    GitWriteSectionConfig, KhiveConfig, PackConfig, ResolvedWalCeiling, StorageSectionConfig,
+    BrainSectionConfig, CodeMapConfig, ConfigError, EngineConfig, GateSectionConfig,
+    GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig, ResolvedWalCeiling,
+    StorageSectionConfig,
 };
 pub use error::{
     fts_text_leg_or_err, AdmissionFailureContext, AuditObligationFailure, AuditObligationReason,
@@ -131,25 +192,39 @@ pub use error::{
     WRITER_POOL_CHECKOUT_TIMEOUT_STAGE, WRITER_QUEUE_SATURATED_STAGE,
     WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
 };
-pub use error_projection::runtime_error_value;
+pub use error_projection::{
+    failure_entry_parts, failure_error_disposition, runtime_error_value, FailureEntryParts,
+    FailureEntrySource,
+};
+pub use event_actor_scope::{resolve_event_actor_read_scope, EventActorReadScope};
+pub use event_cursor_walk::{visit_events_cursor_walk, EventCursorWalkError};
+pub use event_page::{
+    page_budget_exceeded_error, row_exceeds_budget_error, EventReadPageRequest, EventReadPageResult,
+};
+#[cfg(any(test, feature = "test-internals"))]
+#[doc(hidden)]
+pub use event_plane_read::test_support_exports as event_plane_read_test_support;
 pub use event_store_guard::EventAttribution;
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
 pub use kg_read::KgNeighborRead;
+pub use khive_db::env::{env_flag, env_parse_or};
 pub use khive_db::{
-    checkpoint_once, run_checkpoint_task, run_migrations, CheckpointConfig,
-    CheckpointLifecycleOwner, CheckpointTick, ConnectionPool, StorageBackend,
+    checkpoint_once, run_checkpoint_task, run_migrations, stores::event::event_insert_statements,
+    CheckpointConfig, CheckpointLifecycleOwner, CheckpointTick, ConnectionPool, StorageBackend,
 };
 pub use khive_gate::{
-    classify_operation, is_valid_mailbox_actor_label, ActorRef, AllowAllGate, AuditDecision,
-    AuditEvent, CallerEnrollmentGate, Gate, GateContext, GateDecision, GateError, GateRef,
-    GateRequest, MailboxPolicyError, MailboxReadGate, Obligation, OperationAccess,
+    classify_operation, is_valid_mailbox_actor_label, split_stamped_label, ActorRef, AllowAllGate,
+    AuditDecision, AuditEvent, CallerEnrollmentGate, Gate, GateContext, GateDecision, GateError,
+    GateRef, GateRequest, MailboxPolicyError, MailboxReadGate, Obligation, OperationAccess,
     CLASSIFIED_OPERATIONS, OPERATION_CLASSIFIER_VERSION, RUNTIME_STAMPED_ACTOR_KINDS,
 };
 pub use khive_storage::types::TraversalOptions;
 pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};
 pub use khive_types::namespace::Namespace;
 pub use mailbox_view::MailboxView;
+#[cfg(feature = "native-rerank")]
+pub use native_reranker::RuntimeRerankDocumentResolver;
 pub use note_create::{effective_create_tags, EffectiveCreateTags};
 pub use objectives::{
     AmplifiedDecayAwareSalienceObjective, DecayAwareSalienceObjective, GraphProximityObjective,
@@ -164,9 +239,9 @@ pub use operations::{
 };
 pub use operations::{
     base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,
-    hex_prefix_to_uuid_pattern, merge_entry_metadata, uuid_prefix_bounds, EdgeEndpointKind,
-    EntityCreateSpec, LinkSpec, NoteCreateSpec, NoteSearchHit, NoteSearchOutcome,
-    PostCommitDegradation, QueryResult, Resolved,
+    hex_prefix_to_uuid_pattern, merge_entry_metadata, uuid_prefix_bounds, ConditionalInsertStage,
+    EdgeEndpointKind, EntityCreateSpec, LinkSpec, NoteCreateSpec, NoteSearchHit, NoteSearchOutcome,
+    PostCommitDegradation, PrefixScope, QueryResult, Resolved,
 };
 pub use pack::{
     resolve_explicit_namespace, ChannelIngestCapability, DispatchHook, HandlerDef,
@@ -177,6 +252,7 @@ pub use pack::{
     VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder, VerifiedActor,
     Visibility, AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
 };
+pub use params::{deser_params, integer_params_from_whole_floats};
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
 pub use preference_verification::{LegacyPreferenceVerifier, VerifiedModelNetworkAttachment};
@@ -193,11 +269,16 @@ pub use resource::{cpu_delta_us, process_resource_usage, ProcessResourceUsage};
 pub use retrieval::{HybridSearchOutcome, RankScoreKind, SearchHit, SearchSignals, SearchSource};
 pub use runtime::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
-    parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
-    BackendId, EntityTypeValidatorFn, KhiveRuntime, NamedVectorIdentity, NamespaceToken,
-    NoteMutationHookFn, NoteWriteValidatorFn, OpenedDiagnosticBackend, RuntimeConfig,
+    parse_pack_list, resolve_db_anchor, resolve_project_actor_id,
+    resolve_project_requires_attributed_actor, runtime_config_from_khive_config, BackendId,
+    EntityTypeValidatorFn, KhiveRuntime, NamedVectorIdentity, NamespaceToken, NoteMutationHookFn,
+    NoteWriteValidatorFn, OpenedDiagnosticBackend, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
+pub use secret_gate_finalizer::{
+    EntityCandidateAdmission, EntityCandidateContext, EntityCandidateMutation,
+    EntityCandidateOrigin, EntityCandidatePrepared, EntityFinalizationPlan,
+};
 pub use telemetry_config::{
     TelemetryCarrier, TelemetryChannelConfig, TelemetryConfig, TelemetryFailurePosture,
     TelemetryPolicy,

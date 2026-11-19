@@ -894,3 +894,188 @@ async fn supervisor_republished_after_disappearance_before_admission_prevents_sp
     assert!(!socket_path().exists());
     assert!(marker_path().exists());
 }
+
+#[test]
+#[serial]
+fn supervisor_marker_path_scopes_private_socket_spellings() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    let _cleanup = RecoveryTestGuard::new();
+    clear_daemon_env();
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+    let default_socket = home.join(".khive/khived.sock");
+    let default_marker = home.join(".khive/khived.supervisor");
+    for socket in [
+        None,
+        Some(std::path::Path::new("")),
+        Some(default_socket.as_path()),
+    ] {
+        match socket {
+            Some(path) => std::env::set_var("KHIVE_SOCKET", path),
+            None => std::env::remove_var("KHIVE_SOCKET"),
+        }
+        assert_eq!(
+            daemon::supervisor_marker_path().as_os_str(),
+            default_marker.as_os_str()
+        );
+        std::env::set_var("KHIVE_SUPERVISOR_MARKER", "");
+        assert_eq!(
+            daemon::supervisor_marker_path().as_os_str(),
+            default_marker.as_os_str()
+        );
+        std::env::remove_var("KHIVE_SUPERVISOR_MARKER");
+    }
+    for (socket, marker) in [
+        ("x.sock", "x.sock.supervisor-marker"),
+        ("x.other", "x.other.supervisor-marker"),
+        (".khive/khived", ".khive/khived.supervisor-marker"),
+    ] {
+        std::env::set_var("KHIVE_SOCKET", home.join(socket));
+        assert_eq!(
+            daemon::supervisor_marker_path().as_os_str(),
+            home.join(marker).as_os_str()
+        );
+        assert_ne!(
+            daemon::supervisor_marker_path().as_os_str(),
+            default_marker.as_os_str()
+        );
+        std::env::set_var("KHIVE_SUPERVISOR_MARKER", "");
+        assert_eq!(
+            daemon::supervisor_marker_path().as_os_str(),
+            home.join(marker).as_os_str()
+        );
+        std::env::remove_var("KHIVE_SUPERVISOR_MARKER");
+    }
+    for socket in [default_socket, home.join("x.sock")] {
+        std::env::set_var("KHIVE_SOCKET", socket);
+        std::env::set_var("KHIVE_SUPERVISOR_MARKER", "explicit-marker");
+        assert_eq!(
+            daemon::supervisor_marker_path().as_os_str(),
+            std::ffi::OsStr::new("explicit-marker")
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn default_marker_does_not_delay_private_socket_bootstrap() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    let _cleanup = RecoveryTestGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    isolate(dir.path());
+    std::env::remove_var("KHIVE_SUPERVISOR_MARKER");
+    let default_marker = std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+        .join(".khive/khived.supervisor");
+    std::fs::create_dir_all(default_marker.parent().unwrap()).unwrap();
+    write_marker(&default_marker, "default.job", std::process::id(), Some(60));
+    let before = std::fs::read(&default_marker).unwrap();
+    let default_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(supervisor_marker_lock_path(&default_marker))
+        .unwrap();
+    default_lock.lock().unwrap();
+    let attempts = AtomicUsize::new(0);
+    let spawn = || -> std::io::Result<std::process::Child> {
+        attempts.fetch_add(1, Ordering::SeqCst);
+        Err(std::io::ErrorKind::NotFound.into())
+    };
+    let frame = request("stats()");
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        khive_storage::scope_request_read_deadline(
+            Duration::from_secs(5),
+            forward_or_spawn_with(&frame, &spawn),
+        ),
+    )
+    .await
+    .expect("unrelated supervisor must not delay bootstrap")
+    .expect("no local fallback")
+    .expect_err("injected spawn failure");
+    assert_eq!(result.data.unwrap()["reason"], "respawn_failed");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(SIGTERM_COUNT.load(Ordering::SeqCst), 0);
+    assert_eq!(std::fs::read(default_marker).unwrap(), before);
+}
+
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn default_socket_keeps_its_supervisor_suppression() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    let _cleanup = RecoveryTestGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    isolate(dir.path());
+    std::env::remove_var("KHIVE_SUPERVISOR_MARKER");
+    std::env::remove_var("KHIVE_SOCKET");
+    std::env::remove_var("KHIVE_PID");
+    let default_socket = socket_path();
+    let default_pid = pid_path();
+    let default_marker = daemon::supervisor_marker_path();
+    std::fs::create_dir_all(default_marker.parent().unwrap()).unwrap();
+    write_marker(&default_marker, "default.job", std::process::id(), Some(60));
+    let before = std::fs::read(&default_marker).unwrap();
+    for explicit_default in [false, true] {
+        if explicit_default {
+            std::env::set_var("KHIVE_SOCKET", &default_socket);
+            std::env::set_var("KHIVE_PID", &default_pid);
+        }
+        assert_starting(
+            khive_storage::scope_request_read_deadline(
+                Duration::from_millis(250),
+                forward_or_spawn_with(&request("stats()"), &never_spawn),
+            )
+            .await,
+            "default.job",
+        );
+        assert_eq!(KILL_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(SIGTERM_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&default_marker).unwrap(), before);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn private_socket_uses_only_its_own_supervisor_marker() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    let _cleanup = RecoveryTestGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    isolate(dir.path());
+    std::env::remove_var("KHIVE_SUPERVISOR_MARKER");
+    let markers = [
+        dir.path().join("a.sock.supervisor-marker"),
+        dir.path().join("a.other.supervisor-marker"),
+    ];
+    for (marker, job) in markers.iter().zip(["first.job", "second.job"]) {
+        write_marker(marker, job, std::process::id(), Some(60));
+    }
+    let before: Vec<_> = markers
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    for (socket, job) in [("a.sock", "first.job"), ("a.other", "second.job")] {
+        std::env::set_var("KHIVE_SOCKET", dir.path().join(socket));
+        std::env::set_var("KHIVE_PID", dir.path().join(format!("{socket}.pid")));
+        assert_eq!(read_supervisor_marker().unwrap().job, job);
+        assert_starting(
+            khive_storage::scope_request_read_deadline(
+                Duration::from_millis(250),
+                forward_or_spawn_with(&request("stats()"), &never_spawn),
+            )
+            .await,
+            job,
+        );
+    }
+    for (marker, original) in markers.iter().zip(before) {
+        assert_eq!(std::fs::read(marker).unwrap(), original);
+    }
+    assert_eq!(SIGTERM_COUNT.load(Ordering::SeqCst), 0);
+}

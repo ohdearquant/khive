@@ -34,12 +34,16 @@ use khive_runtime::audit_batch::{
 use khive_runtime::pack::{
     audit_admission_refused_obligation_count, audit_admission_refused_obligation_last_at_ms,
     audit_admission_unresolved_obligation_count, audit_admission_unresolved_obligation_last_at_ms,
+    audit_retry_exhausted_obligation_count, audit_retry_exhausted_obligation_last_at_ms,
     HandlerDef, PackRuntime, VerbRegistryBuilder,
 };
 use khive_runtime::runtime::NamespaceToken;
-use khive_runtime::{KhiveRuntime, RuntimeError};
+use khive_runtime::{AuditObligationReason, KhiveRuntime, RuntimeError};
 use khive_storage::types::{BatchWriteSummary, Page, PageRequest};
-use khive_storage::{Event, EventFilter, EventStore, StorageResult};
+use khive_storage::{
+    CapacityUnavailablePhase, Event, EventFilter, EventStore, StorageCapability, StorageError,
+    StorageResult,
+};
 use khive_types::pack::{Pack, Visibility};
 use khive_types::{EventKind, EventOutcome, SubstrateKind, VerbCategory};
 use serial_test::serial;
@@ -66,6 +70,7 @@ struct MemoryEventStore {
     append_started: Option<Arc<tokio::sync::Notify>>,
     append_release: Option<Arc<tokio::sync::Notify>>,
     call_gates: Option<CallGates>,
+    retry_phase: Option<CapacityUnavailablePhase>,
 }
 
 #[async_trait]
@@ -109,6 +114,13 @@ impl EventStore for MemoryEventStore {
         &self,
         events: Vec<Event>,
     ) -> StorageResult<khive_storage::event::IdempotentEventBatchResult> {
+        if let Some(phase) = self.retry_phase {
+            return Err(StorageError::CapacityUnavailable {
+                capability: StorageCapability::Sql,
+                phase,
+                message: "lease admission remains contended".into(),
+            });
+        }
         if let Some(started) = &self.append_started {
             started.notify_one();
         }
@@ -140,6 +152,100 @@ impl EventStore for MemoryEventStore {
     fn supports_idempotent_audit_batch(&self) -> bool {
         true
     }
+}
+
+/// Exhausting transient retries degrades a successful safe read, with a
+/// dedicated diagnostic count; the same failure remains strict for a write.
+#[serial]
+#[tokio::test]
+#[serial(config_ledger)]
+async fn read_survives_lease_retry_exhaustion_but_write_stays_strict() {
+    let store = Arc::new(MemoryEventStore {
+        retry_phase: Some(CapacityUnavailablePhase::LockContended),
+        ..MemoryEventStore::default()
+    });
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register_trusted(AlphaPack);
+    builder.with_event_store(store);
+    builder.with_audit_batch_config(AuditBatchConfig {
+        max_commit_attempts: std::num::NonZeroU8::new(3).unwrap(),
+        retry_backoff: std::time::Duration::ZERO,
+        ..AuditBatchConfig::default()
+    });
+    let registry = builder.build().expect("trusted read/write registry");
+    let before_retry_exhausted = audit_retry_exhausted_obligation_count();
+    let before_refused = audit_admission_refused_obligation_count();
+    let before_unresolved = audit_admission_unresolved_obligation_count();
+    let result = registry
+        .dispatch_with_disposition("list", Value::Null, None)
+        .await
+        .expect("successful safe read survives exhausted lease retries");
+    assert_eq!(result, serde_json::json!({"pack": "kg", "verb": "list"}));
+    assert_eq!(
+        audit_retry_exhausted_obligation_count(),
+        before_retry_exhausted + 1
+    );
+    assert!(audit_retry_exhausted_obligation_last_at_ms().is_some());
+    assert_eq!(audit_admission_refused_obligation_count(), before_refused);
+    assert_eq!(
+        audit_admission_unresolved_obligation_count(),
+        before_unresolved
+    );
+
+    let error = registry
+        .dispatch_with_disposition("create", Value::Null, None)
+        .await
+        .expect_err("a write retains its audit obligation after exhausted retries")
+        .into_source();
+    let RuntimeError::AuditObligation {
+        failure,
+        domain_result,
+    } = error
+    else {
+        panic!("write must surface its terminal audit obligation: {error}");
+    };
+    assert_eq!(
+        failure.reason,
+        AuditObligationReason::Terminal(AuditTerminalReason::RetryExhausted)
+    );
+    assert_eq!(
+        domain_result,
+        serde_json::json!({"pack": "kg", "verb": "create"})
+    );
+    assert_eq!(
+        audit_retry_exhausted_obligation_count(),
+        before_retry_exhausted + 1,
+        "strict writes must not increment the safe-read degradation counter"
+    );
+
+    let metrics = registry.audit_batch_metrics().expect("batch metrics");
+    assert_eq!(
+        metrics.retry_exhausted_obligations,
+        before_retry_exhausted + 1
+    );
+    assert_eq!(
+        metrics.retry_exhausted_obligations_last_at_ms,
+        audit_retry_exhausted_obligation_last_at_ms()
+    );
+    let runtime = KhiveRuntime::memory().expect("memory runtime");
+    let report = runtime
+        .db_diagnostics_with_audit_metrics(Some(metrics))
+        .await
+        .expect("diagnostics");
+    assert_eq!(
+        report.writer_contention.audit_retry_exhausted_obligations,
+        Some(before_retry_exhausted + 1)
+    );
+    assert_eq!(
+        report
+            .writer_contention
+            .audit_retry_exhausted_obligations_last_at_ms,
+        audit_retry_exhausted_obligation_last_at_ms()
+    );
+    assert!(report
+        .writer_contention
+        .audit_retry_exhausted_obligations_unavailable_reason
+        .is_none());
 }
 
 /// Minimal pack exercising one allowlisted read (`get`, `Assertive`) whose
@@ -249,26 +355,8 @@ impl PackRuntime for AlphaPack {
     }
 }
 
-/// Rogue-pack probe: declares Assertive handlers under the verb names of
-/// several *other* real packs' allowlisted reads (`gtd.tasks`, `gtd.next`,
-/// `comm.inbox`) alongside the known-incidental-write names
-/// (`memory.recall`, `db_diagnostics`, `knowledge.*`), all under a pack name
-/// (`cross-pack-census-probe`) that matches none of
-/// `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`'s `(pack, verb)` entries.
-///
-/// This is exactly the shape of pack that admission-degrade eligibility must
-/// reject: a verb name alone is not a sound key, because any pack registered
-/// through the same `VerbRegistryBuilder` path can declare a handler under a
-/// name that collides with an allowlisted one while actually performing a
-/// durable write of its own. Binding eligibility to `(pack, verb)` — not
-/// `verb` alone — means every handler here must stay fail-closed regardless
-/// of verb name, proven by
-/// `cross_pack_reads_stay_strict_when_pack_identity_does_not_match_allowlist`
-/// below. The handlers are deliberately no-ops: this test exercises the
-/// registry's reviewed name/category/pack classification under a forced
-/// audit refusal, not real domain behavior (which the source census in
-/// `khive-runtime/src/pack.rs`'s `mod tests` audits separately).
-struct CrossPackCensusProbe;
+/// Foreign public declarations must fail before an audit policy can classify them.
+struct CrossPackCensusProbe(&'static [HandlerDef]);
 
 impl Pack for CrossPackCensusProbe {
     const NAME: &'static str = "cross-pack-census-probe";
@@ -346,7 +434,7 @@ impl PackRuntime for CrossPackCensusProbe {
         Self::ENTITY_KINDS
     }
     fn handlers(&self) -> &'static [HandlerDef] {
-        Self::HANDLERS
+        self.0
     }
     async fn dispatch(
         &self,
@@ -368,8 +456,47 @@ struct RecordingWritePack {
     effects: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+// These successful stand-ins exercise the registry's audit classification.
+// Actual ToolPack decision persistence remains covered by its receipt tests.
+struct PolicyDecisionProbe {
+    name: &'static str,
+    handlers: &'static [HandlerDef],
+}
+
+impl Pack for PolicyDecisionProbe {
+    const NAME: &'static str = "policy-decision-probe";
+    const NOTE_KINDS: &'static [&'static str] = &[];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const HANDLERS: &'static [HandlerDef] = &[];
+}
+
+#[async_trait]
+impl PackRuntime for PolicyDecisionProbe {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn note_kinds(&self) -> &'static [&'static str] {
+        Self::NOTE_KINDS
+    }
+    fn entity_kinds(&self) -> &'static [&'static str] {
+        Self::ENTITY_KINDS
+    }
+    fn handlers(&self) -> &'static [HandlerDef] {
+        self.handlers
+    }
+    async fn dispatch(
+        &self,
+        verb: &str,
+        _params: Value,
+        _registry: &khive_runtime::pack::VerbRegistry,
+        _token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        Ok(serde_json::json!({"pack": self.name, "verb": verb}))
+    }
+}
+
 impl Pack for RecordingWritePack {
-    const NAME: &'static str = "recording_write";
+    const NAME: &'static str = "kg";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -769,6 +896,16 @@ async fn driver_deadline_recovers_admission_capacity_from_a_stalled_generation()
         abandoned >= 1,
         "generation 1 must be recorded as DriverAppendAbandoned once the driver gives up on it"
     );
+    let health = batch.health_metrics();
+    assert!(
+        health.flush_failures >= abandoned as u64,
+        "every observed abandoned generation contributes a flush failure"
+    );
+    assert_eq!(health.degraded_rows, 0);
+    assert!(
+        !health.degraded,
+        "abandoning only obligation rows must not set the degraded flag"
+    );
 
     // (a) continued: a fresh row is admitted (pushed onto `pending`) again,
     // not synchronously refused — the bug this test guards against.
@@ -937,6 +1074,13 @@ async fn driver_sheds_generations_once_the_abandoned_append_cap_is_reached() {
         "exactly generations 1 and 2 must have abandoned before the cap takes effect: {:?}",
         snap.per_generation
     );
+    let before_shed = batch.health_metrics();
+    assert_eq!(before_shed.flush_failures, 2);
+    assert_eq!(before_shed.degraded_rows, 0);
+    assert!(
+        !before_shed.degraded,
+        "the two abandoned obligation-only generations must leave the flag clear"
+    );
 
     // (a): with the cap reached, three more generations shed immediately —
     // no store call is ever attempted (the call-gate count stays at 2),
@@ -970,6 +1114,19 @@ async fn driver_sheds_generations_once_the_abandoned_append_cap_is_reached() {
         batch.test_snapshot().outstanding_abandoned_appends,
         2,
         "shedding must not spawn or retain any additional detached appends"
+    );
+    let after_shed = batch.health_metrics();
+    assert_eq!(
+        after_shed
+            .flush_failures
+            .checked_sub(before_shed.flush_failures),
+        Some(3),
+        "each of the three shed generations contributes one flush failure"
+    );
+    assert_eq!(after_shed.degraded_rows, 0);
+    assert!(
+        !after_shed.degraded,
+        "shedding only obligation rows must not set the degraded flag"
     );
 
     // (d): admission capacity was never at risk — `pending` stayed far below
@@ -1172,6 +1329,151 @@ async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion_disposition
     drop(filler);
 }
 
+#[serial]
+#[tokio::test]
+#[serial(config_ledger)]
+async fn policy_decision_receipts_stay_strict_under_audit_admission_exhaustion() {
+    const fn handler(name: &'static str) -> HandlerDef {
+        HandlerDef {
+            name,
+            description: "policy decision admission probe",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        }
+    }
+    static TOOL_HANDLERS: [HandlerDef; 2] = [handler("tool.check"), handler("tool.describe")];
+    static GIT_HANDLERS: [HandlerDef; 4] = [
+        handler("git.receipts"),
+        handler("git.gates"),
+        handler("git.status"),
+        handler("git.log"),
+    ];
+
+    let store = Arc::new(MemoryEventStore::default());
+    let mut builder = VerbRegistryBuilder::new();
+    for (name, handlers) in [
+        ("tool", TOOL_HANDLERS.as_slice()),
+        ("git", GIT_HANDLERS.as_slice()),
+    ] {
+        builder.register_trusted(PolicyDecisionProbe { name, handlers });
+    }
+    builder.with_event_store(store.clone());
+    builder.with_audit_batch_config(AuditBatchConfig {
+        max_pending_rows: std::num::NonZeroUsize::new(1).unwrap(),
+        ..AuditBatchConfig::default()
+    });
+    let registry = builder.build().expect("trusted tool and git registry");
+    assert!(registry.admission_degrade_safe_probe("tool.describe"));
+    let audit_batch = registry
+        .audit_batch_handle()
+        .expect("audit batch configured");
+
+    fault_injection::arm_supervisor_sleep_before_spawn();
+    let occupant_batch = audit_batch.clone();
+    let occupant = tokio::spawn(async move {
+        occupant_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("policy.occupant"),
+                producer: AuditProducer::ConfigLocked,
+            })
+            .await
+    });
+    wait_until(std::time::Duration::from_secs(5), || {
+        let snapshot = audit_batch.test_snapshot();
+        snapshot.pending_rows == 0 && snapshot.in_flight_generation.is_some()
+    })
+    .await;
+    let filler_batch = audit_batch.clone();
+    let filler = tokio::spawn(async move {
+        filler_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("policy.filler"),
+                producer: AuditProducer::ConfigLocked,
+            })
+            .await
+    });
+    wait_until(std::time::Duration::from_secs(5), || {
+        audit_batch.test_snapshot().pending_rows == 1
+    })
+    .await;
+
+    let before_refused = audit_admission_refused_obligation_count();
+    let before_unresolved = audit_admission_unresolved_obligation_count();
+    for (owner, verb) in [
+        ("tool", "tool.check"),
+        ("git", "git.receipts"),
+        ("git", "git.gates"),
+        ("git", "git.status"),
+        ("git", "git.log"),
+    ] {
+        assert_eq!(audit_batch.test_snapshot().pending_rows, 1);
+        let error = registry
+            .dispatch(verb, Value::Null)
+            .await
+            .expect_err("a policy decision writer must retain its audit obligation");
+        let RuntimeError::AuditObligation {
+            failure,
+            domain_result,
+        } = error
+        else {
+            panic!("{verb} must fail after its successful handler result: {error}");
+        };
+        assert_eq!(failure.verb, verb);
+        assert_eq!(
+            failure.reason,
+            AuditObligationReason::Terminal(AuditTerminalReason::QueueAdmissionExhausted),
+            "{verb} must fail because the audit queue refused its row"
+        );
+        assert_eq!(
+            domain_result,
+            serde_json::json!({"pack": owner, "verb": verb}),
+            "the correctly owned handler must have succeeded before the audit refusal"
+        );
+        assert_eq!(audit_admission_refused_obligation_count(), before_refused);
+        assert_eq!(
+            audit_admission_unresolved_obligation_count(),
+            before_unresolved
+        );
+    }
+
+    assert_eq!(audit_batch.test_snapshot().pending_rows, 1);
+    let result = registry
+        .dispatch("tool.describe", Value::Null)
+        .await
+        .expect("the policy read control must survive the same saturated queue");
+    assert_eq!(
+        result,
+        serde_json::json!({"pack": "tool", "verb": "tool.describe"})
+    );
+    assert_eq!(
+        audit_admission_refused_obligation_count(),
+        before_refused + 1
+    );
+    assert_eq!(
+        audit_admission_unresolved_obligation_count(),
+        before_unresolved
+    );
+    assert!(store.events.lock().expect("events lock").is_empty());
+
+    assert!(audit_batch.test_abort_supervisor());
+    wait_until(std::time::Duration::from_secs(5), || {
+        audit_batch.test_snapshot().is_idle()
+    })
+    .await;
+    for submission in [occupant, filler] {
+        assert!(matches!(
+            submission.await.expect("saturation submission joins"),
+            Err(AuditTerminalReason::DriverCancelled
+                | AuditTerminalReason::AdmissionDeadlineExpired)
+        ));
+    }
+    assert_eq!(
+        audit_batch.close_and_drain().await,
+        Err(AuditTerminalReason::DriverCancelled)
+    );
+}
+
 /// khive-oss#2311: `pack.name()` is a value the `PackRuntime` trait object
 /// reports about itself, not something the registry verifies — so before
 /// this fix, any pack registered through the ordinary, untrusted
@@ -1270,121 +1572,23 @@ async fn allowlisted_read_stays_strict_when_pack_is_registered_untrusted() {
     drop(filler);
 }
 
-/// Admission-degrade eligibility is bound to `(pack, verb)`, not `verb`
-/// alone: every handler `CrossPackCensusProbe` declares is `Assertive` and
-/// several of its names (`gtd.tasks`, `gtd.next`, `comm.inbox`) are on
-/// `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`, but the pack that declares
-/// them here (`cross-pack-census-probe`) matches none of the allowlist's
-/// `(pack, verb)` pairs. Every handler must therefore stay fail-closed under
-/// a forced `QueueAdmissionExhausted` outcome — the previously-"safe" names
-/// included, since a bare name match without pack verification is exactly
-/// the gap this binding closes. Before the fix, the first three names in
-/// this test's loop degraded successfully (accepted as `true` by
-/// `admission_degrade_safe`), which is the failure mode the direct probe
-/// assertion below reproduces.
-#[serial]
-#[tokio::test]
-#[serial(config_ledger)]
-async fn cross_pack_reads_stay_strict_when_pack_identity_does_not_match_allowlist() {
-    let store = Arc::new(MemoryEventStore::default());
-    let mut builder = VerbRegistryBuilder::new();
-    // Trusted registration isolates pack-identity mismatch as the sole
-    // cause of ineligibility here — untrusted registration would reject
-    // these handlers too, but for the different reason this test does not
-    // exercise (see `allowlisted_read_stays_strict_when_pack_is_registered_untrusted`).
-    builder.register_trusted(CrossPackCensusProbe);
-    builder.with_event_store(store);
-    builder.with_audit_batch_config(AuditBatchConfig {
-        max_pending_rows: std::num::NonZeroUsize::new(1).unwrap(),
-        ..AuditBatchConfig::default()
-    });
-    let registry = builder.build().expect("registry builds");
-    let audit_batch = registry
-        .audit_batch_handle()
-        .expect("event store configured, so the batch seam is too");
-
-    // Direct white-box check, independent of the audit-pressure mechanics
-    // below: a handler named like an allowlisted verb but declared by the
-    // wrong pack must never read as admission-degrade-safe.
-    for verb in ["gtd.tasks", "gtd.next", "comm.inbox"] {
+#[test]
+fn cross_pack_public_reads_are_refused_before_audit_classification() {
+    for handler in CrossPackCensusProbe::HANDLERS {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_trusted(CrossPackCensusProbe(std::slice::from_ref(handler)));
+        let error = builder
+            .build()
+            .err()
+            .expect("foreign public owner must fail");
         assert!(
-            !registry.admission_degrade_safe_probe(verb),
-            "{verb} is on ADMISSION_DEGRADE_SAFE_VERBS under a different pack; \
-             cross-pack-census-probe's handler of the same name must not inherit \
-             its degrade-safety"
+            matches!(&error, RuntimeError::InvalidInput(message)
+                if message.contains(CrossPackCensusProbe::NAME)
+                    && message.contains(handler.name)),
+            "expected ownership refusal for {}, got {error:?}",
+            handler.name
         );
     }
-
-    fault_injection::arm_supervisor_sleep_before_spawn();
-    let occupant_batch = audit_batch.clone();
-    let occupant = tokio::spawn(async move {
-        occupant_batch
-            .submit(PreparedAuditRow {
-                event: mk_event("census.occupant"),
-                producer: AuditProducer::ConfigLocked,
-            })
-            .await
-    });
-    wait_until(std::time::Duration::from_secs(5), || {
-        let snap = audit_batch.test_snapshot();
-        snap.pending_rows == 0 && snap.in_flight_generation.is_some()
-    })
-    .await;
-
-    let filler_batch = audit_batch.clone();
-    let filler = tokio::spawn(async move {
-        filler_batch
-            .submit(PreparedAuditRow {
-                event: mk_event("census.filler"),
-                producer: AuditProducer::ConfigLocked,
-            })
-            .await
-    });
-    wait_until(std::time::Duration::from_secs(5), || {
-        audit_batch.test_snapshot().pending_rows == 1
-    })
-    .await;
-
-    let before_refused = audit_admission_refused_obligation_count();
-    let before_unresolved = audit_admission_unresolved_obligation_count();
-    for verb in [
-        "gtd.tasks",
-        "gtd.next",
-        "comm.inbox",
-        "memory.recall",
-        "db_diagnostics",
-        "knowledge.search",
-        "knowledge.suggest",
-        "knowledge.compose",
-    ] {
-        let error = match registry.dispatch(verb, Value::Null).await {
-            Ok(result) => panic!(
-                "{verb} must stay fail-closed under forced audit admission refusal — its \
-                 owning pack here does not match the allowlist's entry for this verb name; \
-                 unexpected result: {result}"
-            ),
-            Err(error) => error,
-        };
-        let message = error.to_string();
-        assert!(
-            message.contains("audit obligation commit failed")
-                && message.contains("QueueAdmissionExhausted"),
-            "{verb} must fail for the saturated audit obligation, got: {message}"
-        );
-    }
-    assert_eq!(
-        audit_admission_refused_obligation_count(),
-        before_refused,
-        "a pack-identity mismatch must never take the counted admission-degrade path"
-    );
-    assert_eq!(
-        audit_admission_unresolved_obligation_count(),
-        before_unresolved,
-        "forced queue refusal must not move the deadline-expiry counter"
-    );
-
-    drop(occupant);
-    drop(filler);
 }
 
 /// khive#2117/khive#2208 + khive#2147/khive#2217 combined: a read dispatch

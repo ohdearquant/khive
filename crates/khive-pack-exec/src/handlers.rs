@@ -25,11 +25,14 @@ use khive_pack_tool::policy::{
     actor_label, decide_with_receipt, opt_u32 as opt_limit, DecisionCaller, DecisionInvocation,
 };
 use khive_pack_tool::{registry_policy_inputs, RegistryPin};
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::ContentRef;
 
 #[cfg(unix)]
 use crate::capture::{drain_until, walk, CaptureRead, CaptureRoot, DrainStop, Drained, Tail};
+#[cfg(unix)]
+use crate::group_child::GroupChild;
 use crate::membership::{MembershipWork, SuppliedRefs};
 use crate::process_cleanup::{ProcessCleanup, TreeQuiescence};
 use crate::receipts;
@@ -53,7 +56,8 @@ fn opt_str(params: &Value, key: &str) -> Result<Option<String>, RuntimeError> {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.to_string())),
         Some(other) => Err(RuntimeError::InvalidInput(format!(
-            "{key} must be a string; got {other}"
+            "{key} must be a string; got {}",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
         ))),
     }
 }
@@ -172,7 +176,15 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
         }
         seen.insert(path.clone(), index);
 
-        let deleting = matches!(edit.get("delete"), Some(Value::Bool(true)));
+        let deleting = match edit.get("delete") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(deleting)) => *deleting,
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "edits[{index}].delete must be a boolean"
+                )));
+            }
+        };
         let reference = opt_str(edit, "ref")?;
         let content = opt_str(edit, "content")?;
         let named = usize::from(deleting)
@@ -313,7 +325,7 @@ pub async fn events(
 ) -> Result<Value, RuntimeError> {
     let run_id = opt_str(&params, "run_id")?;
     let limit = opt_limit(&params, "limit", 200, 5000)?;
-    let rows = receipts::events(rt, token.namespace().as_str(), run_id.as_deref(), limit).await?;
+    let rows = receipts::events(rt, token, run_id.as_deref(), limit).await?;
     Ok(json!({ "events": rows, "count": rows.len() }))
 }
 
@@ -713,14 +725,8 @@ fn hash_tool_binary(
         return Err(failure(BinaryDigestErrorKind::TimeLimit, None));
     }
     #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-            .open(path)
-            .map_err(|error| failure(BinaryDigestErrorKind::Read, Some(error.to_string())))?
-    };
+    let file = khive_fs::opened_file::open_readonly_file_nofollow(path)
+        .map_err(|error| failure(BinaryDigestErrorKind::Read, Some(error.to_string())))?;
     #[cfg(not(unix))]
     let file = std::fs::File::open(path)
         .map_err(|error| failure(BinaryDigestErrorKind::Read, Some(error.to_string())))?;
@@ -879,7 +885,7 @@ pub async fn run(
 
     match preflight(rt, token, cfg, &req, &mut receipt).await {
         Ok(ready) => {
-            if let Err(error) = execute(rt, &ns, cfg, &req, ready, &mut receipt).await {
+            if let Err(error) = execute(rt, token, cfg, &req, ready, &mut receipt).await {
                 // Hydration, profile/blob writes and spawn can fail after
                 // policy allowed the call. They still need a durable receipt.
                 receipt.success = false;
@@ -1396,7 +1402,7 @@ fn decode_limit_report(report: &[u8; LIMIT_REPORT_LEN]) -> Value {
 #[cfg(not(unix))]
 async fn execute(
     _rt: &KhiveRuntime,
-    _ns: &str,
+    _token: &NamespaceToken,
     _cfg: &Resolved,
     _req: &Request,
     _ready: Ready,
@@ -1410,7 +1416,7 @@ async fn execute(
 #[cfg(unix)]
 async fn execute(
     rt: &KhiveRuntime,
-    ns: &str,
+    token: &NamespaceToken,
     cfg: &Resolved,
     req: &Request,
     ready: Ready,
@@ -1438,7 +1444,7 @@ async fn execute(
     })?;
     if let Err(error) = receipts::event(
         rt,
-        ns,
+        token,
         &receipt.id,
         "materialized",
         json!({ "run_dir": run_dir.to_string_lossy(), "entries": ready.entries.len() }),
@@ -1491,8 +1497,7 @@ async fn execute(
         .current_dir(&work_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
     let prepared_limits = PreparedLimits::new(&cfg.limits);
     let (limit_reader, limit_writer) = limit_pipe()?;
     // SAFETY: the forked child uses fixed-size stack storage and only calls
@@ -1522,7 +1527,7 @@ async fn execute(
     let started = Instant::now();
     let wall_started = tokio::time::Instant::now();
     receipt.started_at = Some(receipts::now_micros());
-    let spawn = command.spawn();
+    let spawn = GroupChild::spawn(&mut command);
     // Parent side of the pipe: close the writer, read the child's report.
     unsafe {
         libc::close(limit_writer);
@@ -1540,11 +1545,11 @@ async fn execute(
         }
     };
     let report_wait = req.timeout.min(Duration::from_secs(1));
-    let pid = child.id().unwrap_or_default() as i32;
+    let pid = child.id() as i32;
     receipt.pids = Some(json!({ "child": pid, "pgid": pid }));
     if let Err(error) = receipts::event(
         rt,
-        ns,
+        token,
         &receipt.id,
         "launched",
         json!({ "pid": pid, "pgid": pid, "argv": receipt.argv }),
@@ -1554,8 +1559,8 @@ async fn execute(
         append_failure_reason(receipt, format!("launched event write failed: {error}"));
     }
 
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
+    let stdout = child.take_stdout().expect("stdout piped");
+    let stderr = child.take_stderr().expect("stderr piped");
     let cap = cfg.max_output_bytes;
     let deadline = wall_started + req.timeout;
     let out_task = tokio::spawn(async move { drain_until(stdout, cap, deadline).await });
@@ -1565,34 +1570,38 @@ async fn execute(
         wall_started,
         req.timeout,
         collect_limit_report(limit_reader, report_wait),
-        child.wait(),
+        child.wait_unreaped(),
     )
     .await;
     receipt.limits = json!({ "requested": cfg.limits.to_json(), "enforced": enforced });
-    let status = match waited {
-        Ok(Ok(status)) => {
-            use std::os::unix::process::ExitStatusExt;
-            // Only the delivered signal for a configured limit is observable
-            // here. ENOMEM/EAGAIN inside a child and generic SIGKILL are not
-            // resource evidence; timeout keeps the initial explicit null.
-            receipt.limiting_resource = match status.signal() {
-                Some(libc::SIGXCPU) if cfg.limits.cpu_seconds.is_some() => Some("cpu_seconds"),
-                Some(libc::SIGXFSZ) if cfg.limits.file_size.is_some() => Some("file_size"),
-                _ => None,
-            };
-            Some(status)
+    let observed_exit = match waited {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            append_failure_reason(receipt, format!("child exit observation failed: {error}"));
+            false
         }
-        Ok(Err(_)) => None,
         Err(_) => {
             receipt.timed_out = true;
-            kill_group(pid);
-            let _ = child.wait().await;
-            None
+            false
         }
     };
-    // Signal any remaining members of the initial group. A descendant that
-    // called setsid is outside this group and can outlive the run.
-    kill_group(pid);
+    let finished = child.finish().await;
+    let (status, cleanup_error) =
+        finished_child_outcome(observed_exit, finished, child.exit_status());
+    if let Some(error) = cleanup_error {
+        append_failure_reason(receipt, format!("process group cleanup failed: {error}"));
+    }
+    if let Some(status) = status {
+        use std::os::unix::process::ExitStatusExt;
+        // Only the delivered signal for a configured limit is observable
+        // here. ENOMEM/EAGAIN inside a child and generic SIGKILL are not
+        // resource evidence; timeout keeps the initial explicit null.
+        receipt.limiting_resource = match status.signal() {
+            Some(libc::SIGXCPU) if cfg.limits.cpu_seconds.is_some() => Some("cpu_seconds"),
+            Some(libc::SIGXFSZ) if cfg.limits.file_size.is_some() => Some("file_size"),
+            _ => None,
+        };
+    }
     let out = collect_stream(out_task, deadline, cap).await;
     let err = collect_stream(err_task, deadline, cap).await;
     if out.stop == DrainStop::Deadline || err.stop == DrainStop::Deadline {
@@ -1606,7 +1615,7 @@ async fn execute(
     // "exited" observes the directly waited child, not the whole process tree.
     if let Err(error) = receipts::event(
         rt,
-        ns,
+        token,
         &receipt.id,
         "exited",
         json!({ "pid": pid, "timed_out": receipt.timed_out, "elapsed_ms": started.elapsed().as_millis() as u64 }),
@@ -1852,16 +1861,6 @@ fn finish_cleanup(receipt: &mut Receipt, run_dir: &Path, profile_path: &Path, ke
 }
 
 #[cfg(unix)]
-fn kill_group(pid: i32) {
-    if pid <= 0 {
-        return;
-    }
-    unsafe {
-        libc::killpg(pid, libc::SIGKILL);
-    }
-}
-
-#[cfg(unix)]
 fn limit_pipe() -> Result<(libc::c_int, libc::c_int), RuntimeError> {
     let mut fds = [0 as libc::c_int; 2];
     #[cfg(any(
@@ -1993,6 +1992,19 @@ fn read_limit_report(reader: libc::c_int, wait: Duration) -> Value {
     }
 }
 
+#[cfg(unix)]
+fn finished_child_outcome(
+    observed_exit: bool,
+    finished: std::io::Result<std::process::ExitStatus>,
+    reaped_status: Option<std::process::ExitStatus>,
+) -> (Option<std::process::ExitStatus>, Option<std::io::Error>) {
+    let (status, error) = match finished {
+        Ok(status) => (Some(status), None),
+        Err(error) => (reaped_status, Some(error)),
+    };
+    (if observed_exit { status } else { None }, error)
+}
+
 #[cfg(test)]
 #[path = "parameter_helpers_tests.rs"]
 mod parameter_helpers_tests;
@@ -2000,6 +2012,47 @@ mod parameter_helpers_tests;
 #[cfg(test)]
 #[path = "process_cleanup_tests.rs"]
 mod process_cleanup_tests;
+
+#[cfg(all(test, unix))]
+mod finish_outcome_tests {
+    use super::finished_child_outcome;
+    use std::io;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    #[test]
+    fn cleanup_error_preserves_observed_status_without_exposing_timeout_status() {
+        for observed_exit in [true, false] {
+            let (status, error) = finished_child_outcome(
+                observed_exit,
+                Err(io::Error::from_raw_os_error(libc::EIO)),
+                Some(ExitStatus::from_raw(23 << 8)),
+            );
+            assert_eq!(
+                status.and_then(|status| status.code()),
+                observed_exit.then_some(23),
+                "cleanup failure must retain observed status and keep timeout status private"
+            );
+            assert_eq!(
+                error
+                    .expect("cleanup failure must remain visible")
+                    .raw_os_error(),
+                Some(libc::EIO)
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_failure_without_reaped_status_stays_unknown() {
+        let (status, error) =
+            finished_child_outcome(true, Err(io::Error::from_raw_os_error(libc::EPERM)), None);
+        assert!(
+            status.is_none(),
+            "failed cleanup must not invent exit status"
+        );
+        assert_eq!(error.unwrap().raw_os_error(), Some(libc::EPERM));
+    }
+}
 
 #[cfg(all(test, unix))]
 #[path = "grant_pin_tests.rs"]
@@ -2010,413 +2063,5 @@ mod grant_pin_tests;
 mod capture_run_tests;
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::io::FromRawFd;
-
-    #[test]
-    fn limit_pipe_descriptors_are_close_on_exec() {
-        let (reader, writer) = limit_pipe().unwrap();
-        let reader = unsafe { std::fs::File::from_raw_fd(reader) };
-        let writer = unsafe { std::fs::File::from_raw_fd(writer) };
-        for fd in [
-            std::os::fd::AsRawFd::as_raw_fd(&reader),
-            std::os::fd::AsRawFd::as_raw_fd(&writer),
-        ] {
-            assert_ne!(
-                unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
-                0
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn limit_report_arrives_without_waiting_for_writer_eof() {
-        let (reader, writer) = limit_pipe().unwrap();
-        let writer = unsafe { std::fs::File::from_raw_fd(writer) };
-        let bytes = encode_limit_report(
-            PreparedLimits::new(&sandbox::Limits {
-                cpu_seconds: Some(1),
-                ..Default::default()
-            }),
-            |_, value| Ok(value),
-        )
-        .unwrap();
-        let written = unsafe {
-            libc::write(
-                std::os::fd::AsRawFd::as_raw_fd(&writer),
-                bytes.as_ptr().cast(),
-                bytes.len(),
-            )
-        };
-        assert_eq!(written, bytes.len() as isize);
-        let outcome = tokio::time::timeout(
-            Duration::from_millis(750),
-            collect_limit_report(reader, Duration::from_secs(1)),
-        )
-        .await;
-        // Close the held writer before asserting the deadline. A broken
-        // EOF-dependent reader must be released before this test's Tokio
-        // runtime shuts down, so the failure stays bounded.
-        drop(writer);
-        let report = outcome.expect("report read waited for writer EOF");
-        assert_eq!(report, json!({"cpu_seconds": 1}));
-    }
-
-    #[tokio::test]
-    async fn silent_limit_report_writer_releases_blocking_worker() {
-        let (reader, writer) = limit_pipe().unwrap();
-        let writer = unsafe { std::fs::File::from_raw_fd(writer) };
-        let task = tokio::task::spawn_blocking(move || {
-            read_limit_report(reader, Duration::from_millis(30))
-        });
-        let outcome = tokio::time::timeout(Duration::from_millis(750), task).await;
-        drop(writer);
-        let report = outcome
-            .expect("blocking report reader did not reach its deadline")
-            .unwrap();
-        assert_eq!(report, json!({}));
-    }
-
-    #[test]
-    fn pending_limit_report_does_not_hold_async_executor() {
-        let (reader, writer) = limit_pipe().unwrap();
-        let writer = unsafe { std::fs::File::from_raw_fd(writer) };
-        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .unwrap();
-            let report = runtime.block_on(async move {
-                let report_task =
-                    tokio::spawn(collect_limit_report(reader, Duration::from_millis(800)));
-                tokio::task::yield_now().await;
-                let _ = progress_tx.send(());
-                report_task.await.unwrap()
-            });
-            let _ = done_tx.send(report);
-        });
-        // A synchronous pipe read on the current-thread executor prevents its
-        // own Tokio timer from firing. Observe progress from this independent
-        // test thread, then release the held writer before any assertion.
-        let progress = progress_rx.recv_timeout(Duration::from_millis(500));
-        drop(writer);
-        let report = done_rx.recv_timeout(Duration::from_secs(2));
-        if report.is_ok() {
-            worker.join().unwrap();
-        }
-        assert!(
-            progress.is_ok(),
-            "pending report blocked the async executor"
-        );
-        assert_eq!(
-            report.expect("pending report exceeded its deadline"),
-            json!({})
-        );
-    }
-
-    #[test]
-    fn wide_list_limit_saturates_before_clamping() {
-        let params = json!({"limit": u64::from(u32::MAX) + 1});
-        assert_eq!(opt_limit(&params, "limit", 20, 500).unwrap(), 500);
-        let params = json!({"limit": u64::MAX});
-        assert_eq!(opt_limit(&params, "limit", 20, 500).unwrap(), 500);
-    }
-
-    #[test]
-    fn input_budget_counts_repeated_materialization_and_cannot_wrap() {
-        assert_eq!(checked_input_total(3, 2, 5).unwrap(), 5);
-        assert!(checked_input_total(3, 3, 5).is_err());
-        assert!(checked_input_total(u64::MAX, 1, u64::MAX).is_err());
-    }
-
-    #[test]
-    fn binary_digest_is_streamed_and_a_failed_read_is_not_a_digest() {
-        let dir = tempfile::tempdir().unwrap();
-        let binary = dir.path().join("tool");
-        let bytes = vec![0x5a; 128 * 1024];
-        std::fs::write(&binary, &bytes).unwrap();
-        let budget = BinaryDigestBudget {
-            started: Instant::now(),
-            timeout: Duration::from_secs(5),
-            max_bytes: MAX_TOOL_BINARY_BYTES,
-        };
-        let progress = BinaryDigestProgress::default();
-        assert_eq!(
-            hash_tool_binary(&binary, budget, &progress).unwrap(),
-            digest_hex(&bytes)
-        );
-        std::fs::remove_file(&binary).unwrap();
-        let missing_budget = BinaryDigestBudget {
-            started: Instant::now(),
-            ..budget
-        };
-        let missing = hash_tool_binary(&binary, missing_budget, &BinaryDigestProgress::default());
-        assert!(matches!(
-            missing,
-            Err(BinaryDigestError {
-                kind: BinaryDigestErrorKind::Read,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn binary_digest_refuses_over_cap_without_returning_a_partial_digest() {
-        let dir = tempfile::tempdir().unwrap();
-        let binary = dir.path().join("oversize-tool");
-        std::fs::write(&binary, vec![0x5a; 2 * 1024]).unwrap();
-        let budget = BinaryDigestBudget {
-            started: Instant::now(),
-            timeout: Duration::from_secs(5),
-            max_bytes: 1024,
-        };
-        let progress = BinaryDigestProgress::default();
-        let error = hash_tool_binary(&binary, budget, &progress).unwrap_err();
-        assert_eq!(error.kind, BinaryDigestErrorKind::ByteLimit);
-        assert_eq!(error.kind.code(), "binary_digest_byte_limit");
-        assert_eq!(error.detail()["bytes_read"], 1025);
-        assert_eq!(error.detail()["byte_cap"], 1024);
-        assert_eq!(error.detail()["path_class"], "regular_file");
-    }
-
-    #[test]
-    fn binary_digest_refuses_expired_deadline_by_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let binary = dir.path().join("tool");
-        std::fs::write(&binary, b"tool").unwrap();
-        let budget = BinaryDigestBudget {
-            started: Instant::now() - Duration::from_secs(2),
-            timeout: Duration::from_secs(1),
-            max_bytes: MAX_TOOL_BINARY_BYTES,
-        };
-        let error =
-            hash_tool_binary(&binary, budget, &BinaryDigestProgress::default()).unwrap_err();
-        assert_eq!(error.kind, BinaryDigestErrorKind::TimeLimit);
-        assert_eq!(error.kind.code(), "binary_digest_time_limit");
-        assert_eq!(error.detail()["bytes_read"], 0);
-        assert_eq!(error.detail()["time_cap_ms"], 1000);
-    }
-
-    #[test]
-    fn binary_digest_refuses_reader_that_stalls_past_its_deadline() {
-        struct SlowEof {
-            read_called: bool,
-        }
-        impl Read for SlowEof {
-            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
-                self.read_called = true;
-                std::thread::sleep(Duration::from_millis(75));
-                Ok(0)
-            }
-        }
-
-        let budget = BinaryDigestBudget {
-            started: Instant::now(),
-            timeout: Duration::from_millis(50),
-            max_bytes: MAX_TOOL_BINARY_BYTES,
-        };
-        let mut reader = SlowEof { read_called: false };
-        let error = hash_tool_binary_reader(&mut reader, budget, &BinaryDigestProgress::default())
-            .unwrap_err();
-        assert!(
-            reader.read_called,
-            "the reader did not consume the deadline"
-        );
-        assert_eq!(error.kind.code(), "binary_digest_time_limit");
-        assert!(error.elapsed_ms >= error.time_cap_ms);
-        assert_eq!(error.bytes_read, 0);
-        assert_eq!(error.time_cap_ms, 50);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn report_collection_spends_the_same_wall_budget_as_child_wait() {
-        let started = tokio::time::Instant::now();
-        let (report, status) = collect_report_and_wait(
-            started,
-            Duration::from_secs(1),
-            async {
-                tokio::time::sleep(Duration::from_millis(600)).await;
-                json!({"delayed": true})
-            },
-            async {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                "exited"
-            },
-        )
-        .await;
-        assert_eq!(report, json!({"delayed": true}));
-        assert!(status.is_err(), "child outlived the shared wall deadline");
-    }
-
-    #[test]
-    fn invalid_resolved_timeout_cannot_reach_duration_conversion() {
-        let mut config = sandbox::resolve(&Default::default());
-        config.timeout_default_s = f64::NAN;
-        assert!(parse_request(
-            &json!({"tree": "tree", "tool": "tool", "actor": "local"}),
-            &config,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn limit_report_uses_values_prepared_before_spawn() {
-        let mut limits = sandbox::Limits {
-            cpu_seconds: Some(5),
-            file_size: Some(1_048_576),
-            address_space: Some(4_096),
-            nproc: Some(2),
-        };
-        let prepared = PreparedLimits::new(&limits);
-        limits.cpu_seconds = Some(99);
-        limits.file_size = None;
-        assert_eq!((limits.cpu_seconds, limits.file_size), (Some(99), None));
-
-        let mut applied = Vec::new();
-        let report = encode_limit_report(prepared, |resource, value| {
-            applied.push((resource, value));
-            Ok(value + 1)
-        })
-        .unwrap();
-        assert_eq!(applied[0], (libc::RLIMIT_CPU, 5));
-        assert_eq!(applied[1], (libc::RLIMIT_FSIZE, 1_048_576));
-
-        let expected = json!({ "cpu_seconds": 6, "file_size": 1_048_577 });
-        #[cfg(not(target_os = "macos"))]
-        let expected = {
-            assert_eq!(applied[2], (libc::RLIMIT_AS, 4_096));
-            assert_eq!(applied[3], (libc::RLIMIT_NPROC, 2));
-            let mut expected = expected;
-            expected["address_space"] = json!(4_097);
-            expected["nproc"] = json!(3);
-            expected
-        };
-        #[cfg(target_os = "macos")]
-        assert_eq!(applied.len(), 2);
-        assert_eq!(decode_limit_report(&report), expected);
-
-        let empty =
-            encode_limit_report(PreparedLimits::new(&sandbox::Limits::default()), |_, _| {
-                panic!("unset limit must not be applied")
-            })
-            .unwrap();
-        assert_eq!(decode_limit_report(&empty), json!({}));
-    }
-
-    #[test]
-    fn materialize_preserves_literal_symlink_targets() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("run");
-        let targets: &[(&str, &[u8])] = &[
-            ("inside", b"sub/../file"),
-            ("escape", b"../../x"),
-            ("absolute", b"/absolute/missing"),
-            ("non_utf8", b"target-\xff"),
-        ];
-        let mut entries = vec![TreeEntry {
-            path: "file".into(),
-            content_ref: digest_hex(b"content"),
-            mode: 644,
-        }];
-        let mut blobs = BTreeMap::from([(digest_hex(b"content"), b"content".to_vec())]);
-        for (path, target) in targets {
-            let content_ref = digest_hex(target);
-            entries.push(TreeEntry {
-                path: (*path).into(),
-                content_ref: content_ref.clone(),
-                mode: 120000,
-            });
-            blobs.insert(content_ref, target.to_vec());
-        }
-        materialize(&root, &entries, &blobs).unwrap();
-        assert_eq!(std::fs::read(root.join("file")).unwrap(), b"content");
-        for (path, expected) in targets {
-            let path = root.join(path);
-            assert!(std::fs::symlink_metadata(&path)
-                .unwrap()
-                .file_type()
-                .is_symlink());
-            assert_eq!(
-                std::fs::read_link(path).unwrap().as_os_str().as_bytes(),
-                *expected
-            );
-        }
-    }
-
-    #[test]
-    fn materialize_symlink_aliases_never_redirect_file_writes() {
-        for descendant in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let outside = dir.path().join("outside");
-            std::fs::create_dir(&outside).unwrap();
-            let sentinel = outside.join("child");
-            std::fs::write(&sentinel, b"unchanged").unwrap();
-            let link_target = if descendant {
-                outside.clone()
-            } else {
-                sentinel.clone()
-            };
-            let target = link_target.as_os_str().as_bytes().to_vec();
-            let link_ref = digest_hex(&target);
-            let file_ref = digest_hex(b"replacement");
-            let entries = vec![
-                TreeEntry {
-                    path: "A".into(),
-                    content_ref: link_ref.clone(),
-                    mode: 120000,
-                },
-                TreeEntry {
-                    path: if descendant { "a/child" } else { "a" }.into(),
-                    content_ref: file_ref.clone(),
-                    mode: 644,
-                },
-            ];
-            let bytes = BTreeMap::from([(link_ref, target), (file_ref, b"replacement".to_vec())]);
-            let root = dir.path().join("run");
-            let result = materialize(&root, &entries, &bytes);
-            assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
-            match result {
-                Ok(()) => {
-                    // A case-sensitive filesystem can represent both paths safely.
-                    assert!(std::fs::symlink_metadata(root.join("A"))
-                        .unwrap()
-                        .file_type()
-                        .is_symlink());
-                    assert_eq!(
-                        std::fs::read(root.join(if descendant { "a/child" } else { "a" })).unwrap(),
-                        b"replacement"
-                    );
-                }
-                Err(error) => {
-                    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-                    assert!(!root.exists(), "the partial input tree must be removed");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn materialize_refuses_an_existing_root_before_writes() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("run");
-        std::fs::create_dir(&root).unwrap();
-        let existing = root.join("file");
-        std::fs::write(&existing, b"unchanged").unwrap();
-        let content_ref = digest_hex(b"replacement");
-        let entries = vec![TreeEntry {
-            path: "file".into(),
-            content_ref: content_ref.clone(),
-            mode: 644,
-        }];
-        let bytes = BTreeMap::from([(content_ref, b"replacement".to_vec())]);
-        assert_eq!(
-            materialize(&root, &entries, &bytes).unwrap_err().kind(),
-            std::io::ErrorKind::AlreadyExists
-        );
-        assert_eq!(std::fs::read(existing).unwrap(), b"unchanged");
-    }
-}
+#[path = "handlers/tests.rs"]
+mod tests;

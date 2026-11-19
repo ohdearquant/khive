@@ -51,18 +51,22 @@ impl EmbeddingService for RoleVectorService {
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn runtime_cached_query_bypasses_full_queue_and_expired_admission_bound() {
     let inner = Arc::new(BlockingTestService::new());
     let _release = ReleaseWorkerOnDrop(Arc::clone(&inner));
     let runtime = queue_runtime(cached_blocking_service(Arc::clone(&inner)));
     assert_eq!(
-        runtime
-            .embed_query_with_model("queue-test", "later")
-            .await
-            .unwrap(),
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            runtime.embed_query_with_model("queue-test", "later"),
+        )
+        .await
+        .expect("query cache warmup must finish without releasing the worker")
+        .unwrap(),
         vec![1.0]
     );
+    assert_eq!(*inner.calls.lock().unwrap(), vec!["later".to_owned()]);
     let mut first = Box::pin(runtime.embed_with_model("queue-test", "first"));
     assert!(poll_once(first.as_mut()).await.is_pending());
     wait_for_entered(&inner, 2).await;
@@ -75,11 +79,15 @@ async fn runtime_cached_query_bypasses_full_queue_and_expired_admission_bound() 
         assert!(poll_once(call.as_mut()).await.is_pending());
         queued.push(call);
     }
-    let cached = khive_storage::scope_request_read_deadline(
-        Duration::ZERO,
-        runtime.embed_query_with_model("queue-test", "later"),
+    let cached = tokio::time::timeout(
+        Duration::from_secs(2),
+        khive_storage::scope_request_read_deadline(
+            Duration::ZERO,
+            runtime.embed_query_with_model("queue-test", "later"),
+        ),
     )
-    .await;
+    .await
+    .expect("query cache hit must complete while the worker and queue remain occupied");
     let calls_before_release = inner.entered.load(Ordering::Acquire);
     inner.release();
     assert_eq!(

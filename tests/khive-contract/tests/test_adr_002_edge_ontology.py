@@ -1,7 +1,7 @@
 """Edge ontology contract tests.
 
 ADR: ADR-002
-section: 19 canonical relations; Base endpoint contract; Cascade behavior;
+section: 20 canonical relations; Base endpoint contract; Cascade behavior;
          Annotation relation; Endpoint validation
 """
 
@@ -33,7 +33,7 @@ CONCEPT_CONCEPT_RELATIONS = (
     "located_in",
 )
 
-# All 19 canonical relations (ADR-002 base 15 + ADR-055 epistemic 2 + links_to + located_in).
+# All 20 canonical relations (ADR-002 base 15 + ADR-055 epistemic 2 + links_to + located_in + owns).
 # Imported from fixtures.py — single source of truth.
 ALL_CANONICAL_RELATIONS = tuple(sorted(EDGE_RELATIONS))
 
@@ -50,7 +50,7 @@ def test_link_concept_to_concept_relations(
     """Each non-annotates relation links concept→concept and returns a valid edge.
 
     ADR: ADR-002
-    section: 13 canonical relations; Base endpoint contract
+    section: 20 canonical relations; Base endpoint contract
 
     Each link succeeds, relation matches, get returns kind=="edge" wrapper.
     """
@@ -87,7 +87,7 @@ def test_invalid_relation_reports_closed_relation_set(
     temp_namespace: str,
     sample_entity,
 ) -> None:
-    """link with invalid relation returns per-op error listing all 19 canonical relations.
+    """link with invalid relation returns per-op error listing all 20 canonical relations.
 
     ADR: ADR-002
     section: Rules; Closed-set taxonomy
@@ -111,7 +111,7 @@ def test_invalid_relation_reports_closed_relation_set(
     assert err, "Error message must be non-empty"
     assert "invented_by" in err, f"Error must name offending relation 'invented_by': {err!r}"
 
-    # All 19 canonical relations must be listed
+    # All 20 canonical relations must be listed
     for rel in ALL_CANONICAL_RELATIONS:
         assert rel in err, (
             f"Canonical relation '{rel}' missing from error message: {err!r}"

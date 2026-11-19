@@ -37,14 +37,16 @@
 //! `try_create_note` and `try_create_note_as_trusted_ingest`) bypasses this
 //! decorator entirely by reaching the backend directly
 //! (`KhiveRuntime::raw_notes`) rather than through `notes()`; it enforces the
-//! identical property check itself, conditionally allowing the three keys
-//! only when called with a `ChannelIngestCapability`. That keeps the trusted
+//! identical property check itself (over the same kind-owned list this
+//! decorator reads), conditionally allowing those keys only when called
+//! with a `ChannelIngestCapability`. That keeps the trusted
 //! ingest path exempt by construction rather than by call site.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use khive_storage::note::{validate_note_key_for_store, NoteKeyAssignOutcome, NotePropertyPatch};
 use khive_storage::{
     BatchWriteSummary, BoundedCount, DeleteMode, Note, NoteFilter, NoteStore, NoteVisibility, Page,
     PageRequest, SeekCursor, SeekPage, StorageCapability, StorageError, StorageResult,
@@ -317,6 +319,23 @@ impl PolicyEnforcingNoteStore {
 
 #[async_trait]
 impl NoteStore for PolicyEnforcingNoteStore {
+    async fn assign_note_key_if_unset(
+        &self,
+        id: Uuid,
+        key: &str,
+        namespace: &str,
+    ) -> StorageResult<NoteKeyAssignOutcome> {
+        validate_note_key_for_store(key, "assign_note_key_if_unset")?;
+        let existing = self.inner.get_note_including_deleted(id).await?;
+        if existing.as_ref().is_some_and(has_web_receipt_provenance) {
+            return Err(web_receipt_write_refused("assign_note_key_if_unset"));
+        }
+        reject_existing_secret_gate_property(existing.as_ref(), "assign_note_key_if_unset")?;
+        self.inner
+            .assign_note_key_if_unset(id, key, namespace)
+            .await
+    }
+
     async fn get_live_notes_by_key(
         &self,
         namespace: &str,
@@ -472,6 +491,30 @@ impl NoteStore for PolicyEnforcingNoteStore {
             .await
     }
 
+    async fn try_patch_note_properties(
+        &self,
+        id: Uuid,
+        namespace: &str,
+        kind: &str,
+        patch: &NotePropertyPatch,
+    ) -> StorageResult<bool> {
+        reject_reserved_note_properties(
+            Some(&serde_json::json!(&patch.set)),
+            "try_patch_note_properties",
+        )?;
+        for key in patch.set.keys() {
+            reject_reserved_patch_target(key, "try_patch_note_properties")?;
+        }
+        let existing = self.inner.get_note_including_deleted(id).await?;
+        if existing.as_ref().is_some_and(has_web_receipt_provenance) {
+            return Err(web_receipt_write_refused("try_patch_note_properties"));
+        }
+        reject_existing_secret_gate_property(existing.as_ref(), "try_patch_note_properties")?;
+        self.inner
+            .try_patch_note_properties(id, namespace, kind, patch)
+            .await
+    }
+
     async fn patch_note_property_atomic(
         &self,
         ids: Vec<Uuid>,
@@ -482,21 +525,46 @@ impl NoteStore for PolicyEnforcingNoteStore {
         updated_at: i64,
     ) -> StorageResult<()> {
         reject_reserved_patch_target(json_path, "patch_note_property_atomic")?;
-        // Each target is read once. A secret-gate refusal is held back while the
-        // rest of the batch is scanned, so a web-receipt target anywhere in it is
-        // still refused first.
+        // Policy checks include tombstones and keep input order. Hold a secret
+        // refusal until every window has been checked for web provenance.
         let mut secret_gate_refusal = None;
-        for id in &ids {
-            let existing = self.inner.get_note_including_deleted(*id).await?;
-            if existing.as_ref().is_some_and(has_web_receipt_provenance) {
-                return Err(web_receipt_write_refused("patch_note_property_atomic"));
-            }
-            if secret_gate_refusal.is_none() {
-                secret_gate_refusal = reject_existing_secret_gate_property(
-                    existing.as_ref(),
-                    "patch_note_property_atomic",
-                )
-                .err();
+        for window in ids.chunks(128) {
+            match self.inner.get_notes_batch_including_deleted(window).await {
+                Ok(notes) => {
+                    let notes: HashMap<Uuid, Note> =
+                        notes.into_iter().map(|note| (note.id, note)).collect();
+                    for id in window {
+                        let existing = notes.get(id);
+                        if existing.is_some_and(has_web_receipt_provenance) {
+                            return Err(web_receipt_write_refused("patch_note_property_atomic"));
+                        }
+                        if secret_gate_refusal.is_none() {
+                            secret_gate_refusal = reject_existing_secret_gate_property(
+                                existing,
+                                "patch_note_property_atomic",
+                            )
+                            .err();
+                        }
+                    }
+                }
+                Err(_) => {
+                    // A later malformed row can fail batch decoding before an
+                    // earlier policy refusal. Replay this window in input order.
+                    for id in window {
+                        let existing = self.inner.get_note_including_deleted(*id).await?;
+                        let existing = existing.as_ref();
+                        if existing.is_some_and(has_web_receipt_provenance) {
+                            return Err(web_receipt_write_refused("patch_note_property_atomic"));
+                        }
+                        if secret_gate_refusal.is_none() {
+                            secret_gate_refusal = reject_existing_secret_gate_property(
+                                existing,
+                                "patch_note_property_atomic",
+                            )
+                            .err();
+                        }
+                    }
+                }
             }
         }
         if let Some(refusal) = secret_gate_refusal {
@@ -618,6 +686,10 @@ impl NoteStore for PolicyEnforcingNoteStore {
 
     async fn get_notes_batch(&self, ids: &[Uuid]) -> StorageResult<Vec<Note>> {
         self.inner.get_notes_batch(ids).await
+    }
+
+    async fn get_notes_batch_including_deleted(&self, ids: &[Uuid]) -> StorageResult<Vec<Note>> {
+        self.inner.get_notes_batch_including_deleted(ids).await
     }
 
     async fn get_note_visibility_batch(&self, ids: &[Uuid]) -> StorageResult<Vec<NoteVisibility>> {

@@ -5,7 +5,7 @@
 **Authors**: khive maintainers\
 **Depends on**:
 
-- [ADR-002](ADR-002-edge-ontology.md) — the closed 17-relation set and the base endpoint contract
+- [ADR-002](ADR-002-edge-ontology.md) — the closed relation set and the base endpoint contract
 - [ADR-055](ADR-055-epistemic-edge-relations.md) — same-substrate restriction on `supports` / `refutes`
 
 **Amends**:

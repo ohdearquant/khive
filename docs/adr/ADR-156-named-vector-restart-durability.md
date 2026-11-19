@@ -59,13 +59,13 @@ write into the old space — it lands in a new one per D2.
 identity, a search issued after a restart returns the same scores as before it, and the same
 hits wherever the ordering is total. This follows from D1–D3 plus the retrieval design: exact
 brute-force cosine over the named table with deterministic score conversion, no approximate
-index whose in-memory build state could differ across processes. The known gap in totality:
-the store query orders by distance and truncates at the candidate limit without a tie-break,
-so equal-distance rows at the truncation boundary can produce different hit sets. Full
-same-hits exactness under ties requires a total order (distance, then subject id) applied in
-the store query before the limit; until that lands, consumers may rely on score exactness
-unconditionally and on hit-set exactness only in the absence of boundary ties. A violation
-outside that carve-out is a defect, not drift to be tolerated.
+index whose in-memory build state could differ across processes. The store query applies a
+total order (distance, then subject id) before the limit: the KNN path widens its window from
+top_k+1 until the last row is strictly farther than the boundary row or eligible rows run out,
+orders ties at the boundary by subject id and cuts at top_k; past sqlite-vec's limit of 4096
+rows the exact scalar query orders by (distance, subject id) in SQL. Hit-set exactness
+therefore holds under ties, and a different hit set for an unchanged store and descriptor is a
+defect.
 
 **D5 — Read-path orphan policy: skip, do not error, never re-rank.** A hit whose backing
 artifact bytes are no longer resolvable (blob removed, entity soft-deleted) is dropped during

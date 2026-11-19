@@ -40,6 +40,24 @@ claim — see ADR-191 D2 for the rationale and the ADR-076 certificate dispositi
 pair, `Concept located_in Concept`, expanding the closed set from 18 → 19. Location — a finding
 in an organ, a device in a region — is neither constitution nor reference, and no existing
 relation expresses it without a false claim.
+**Amended 2026-10-05**: base endpoint contract gains two organization pairs:
+`Org located_in Concept` (an organization in the jurisdiction it is registered in or operates
+from) and `Org competes_with Org` (two organizations that name each other as competitors). See
+"Base endpoint contract" below and "Why the 2026-10-05 organization amendment?" in Rationale.
+This also amends ADR-196 D1, which kept `located_in` to one base row.
+**Amendment specified by [ADR-197](ADR-197-owns-relation.md)**: adds `owns`,
+the tenth category (Ownership), and the base pairs `Person owns Org` and
+`Org owns Org`, expanding the closed set from 19 → 20. ADR-197 keeps its
+own status.
+**Amended 2026-10-22**: base endpoint contract gains one implementation pair, `Artifact implements Concept`,
+so a source file, script or other code artifact can record the concept it realizes. Category 6 already defines
+`implements` as code or a service realizing a concept; the pair table listed only `Project` and `Service`. See
+"Base endpoint contract" below.
+**Amendment 2026-10-19 (accepted 2026-10-21)**: a `depends_on` edge whose endpoint pair has no inference
+default is accepted without a `dependency_kind` and stored without one; an explicit value is
+validated on every pair. See "Amendment 2026-10-19: an omitted qualifier on a pair with no
+default" under "`depends_on` governed metadata" below and "Why the 2026-10-19 qualifier
+amendment?" in Rationale.
 
 ## Context
 
@@ -61,7 +79,7 @@ classification ambiguity.
 
 ## Decision
 
-**19 canonical relations, grouped into 9 categories. No others.**
+**20 canonical relations, grouped into 10 categories. No others.**
 
 > **Amended 2026-06-14 ([ADR-055](ADR-055-epistemic-edge-relations.md))**: added Category 9
 > (Epistemic / Evidential) with `supports` and `refutes`, expanding the closed set from 15 → 17.
@@ -137,6 +155,20 @@ standard scale. Directional (evidence → claim), **not** symmetric.
 | ---------- | ---------------- | --------------------------------------------------------------- |
 | `supports` | evidence → claim | Evidence **for** the claim (corroborates, confirms, replicates) |
 | `refutes`  | evidence → claim | Evidence **against** the claim (contradicts, falsifies)         |
+
+### Category 10: Ownership (current whole or partial interest)
+
+| Relation | Direction     | When                                                                                                |
+| -------- | ------------- | --------------------------------------------------------------------------------------------------- |
+| `owns`   | owner → owned | A person or organization holds a current direct or beneficial interest in an organization (ADR-197) |
+
+Ownership is distinct from membership, composition and control. Weight remains
+confidence; conventional `pct`, `class`, `as_of`, `valid_from` and
+`by_class` metadata describe the stake. These keys are not governed.
+A holding is one current edge: update its metadata, delete it when the holding
+ends, and use `resurrect: true` on a later reacquisition. No transitive
+ownership or control edge is inferred. Retrieve edge metadata by the edge IDs
+returned by neighbors or traversal; those projections do not include it.
 
 ### `supersedes` vs `precedes`
 
@@ -245,10 +277,10 @@ non-symmetric — is legal at the storage layer for every relation. Three reason
 semantically coherent. For curation and validation-pipeline use (advisory — never
 write-time enforcement):
 
-| Class                                   | Relations                                                                                                                                            | Reciprocal pair means                                                                                                                                                                                          |
-| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Order-like — reciprocal pair INCOHERENT | `contains`, `part_of`, `instance_of`, `extends`, `variant_of`, `introduced_by`, `supersedes`, `derived_from`, `precedes`, `implements`, `located_in` | The two edges contradict: each claims a directional subordination or ordering the other denies. Surface as curation-review candidates.                                                                         |
-| State-like — reciprocal pair COHERENT   | `depends_on`, `enables`, `supports`, `refutes`, `links_to`                                                                                           | The two edges are independent assertions that can both hold (mutual dependency, mutual enablement, claims that each support or refute the other, two documents linking to each other). Not findings (ADR-191). |
+| Class                                   | Relations                                                                                                                                            | Reciprocal pair means                                                                                                                                                                                                                                   |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Order-like — reciprocal pair INCOHERENT | `contains`, `part_of`, `instance_of`, `extends`, `variant_of`, `introduced_by`, `supersedes`, `derived_from`, `precedes`, `implements`, `located_in` | The two edges contradict: each claims a directional subordination or ordering the other denies. Surface as curation-review candidates.                                                                                                                  |
+| State-like — reciprocal pair COHERENT   | `depends_on`, `enables`, `supports`, `refutes`, `links_to`, `owns`                                                                                   | The two edges are independent assertions that can both hold (mutual dependency, mutual enablement, claims that each support or refute the other, two documents linking to each other, reciprocal ownership interests). Not findings (ADR-191, ADR-197). |
 
 `annotates` is note-sourced, so it cannot form an entity-endpoint reciprocal pair and
 sits outside the entity census below. Note→note reciprocal `annotates` pairs (note A
@@ -410,6 +442,7 @@ allowlist but cannot remove base rules.
 | `Service`  | `instance_of` | `Project`  |
 | `Document` | `links_to`    | `Document` |
 | `Concept`  | `located_in`  | `Concept`  |
+| `Org`      | `located_in`  | `Concept`  |
 
 > **Amended 2026-09-20 ([ADR-191](ADR-191-web-pack-ontology-and-operations.md))**: added
 > `Document links_to Document` for the web's hyperlink. Deliberately one row: a link's target is
@@ -422,6 +455,23 @@ allowlist but cannot remove base rules.
 > for location. Deliberately one row: rows for other base kinds are left to the first pack that
 > emits them, through the additive `EDGE_RULES` mechanism, and a domain pack narrows the meaning
 > with typed endpoint rules for its own subtypes.
+
+> **Amended 2026-10-05**: added `Org located_in Concept`. Organization is a base kind, and a
+> registry of companies and subsidiaries needs jurisdiction as an edge so that "every subsidiary
+> registered in X" is a graph query rather than a property scan. The target is the jurisdiction
+> as a concept entity. `instance_of` is not used for this, because an organization is not an
+> instance of a place.
+
+#### Ownership relation
+
+| Source   | Relation | Target |
+| -------- | -------- | ------ |
+| `Person` | `owns`   | `Org`  |
+| `Org`    | `owns`   | `Org`  |
+
+These are exactly the base pairs from ADR-197. Self-loops remain refused;
+reciprocal Org→Org holdings are legal, directional assertions. Pack endpoint
+rules may add typed subtypes through the existing additive contract.
 
 #### Derivation relations
 
@@ -511,10 +561,16 @@ Those are better modeled with `extends`, `variant_of`, `supersedes`, or metadata
 
 #### Implementation relation
 
-| Source    | Relation     | Target    |
-| --------- | ------------ | --------- |
-| `Project` | `implements` | `Concept` |
-| `Service` | `implements` | `Concept` |
+| Source     | Relation     | Target    |
+| ---------- | ------------ | --------- |
+| `Project`  | `implements` | `Concept` |
+| `Service`  | `implements` | `Concept` |
+| `Artifact` | `implements` | `Concept` |
+
+> **Amended 2026-10-22**: added `Artifact implements Concept`. A repository or a running service was
+> the only representable source, so a single file that realizes a concept (a script carrying a rule's
+> mechanical check, a module implementing an algorithm) had to point through its project or hang off a
+> note. The pair adds no new relation and keeps the relation's direction and order-like coherence class.
 
 #### Lateral relations
 
@@ -523,6 +579,7 @@ Those are better modeled with `extends`, `variant_of`, `supersedes`, or metadata
 | `Concept` | `competes_with` | `Concept` |
 | `Project` | `competes_with` | `Project` |
 | `Service` | `competes_with` | `Service` |
+| `Org`     | `competes_with` | `Org`     |
 | `Concept` | `composed_with` | `Concept` |
 | `Project` | `composed_with` | `Project` |
 
@@ -638,6 +695,19 @@ endpoint kinds:
 Unknown `dependency_kind` values are rejected. `dependency_kind` is only valid on
 `depends_on` edges.
 
+#### Amendment 2026-10-19: an omitted qualifier on a pair with no default (#5709)
+
+**Status**: Accepted (2026-10-21). The coordinator route applies the same dependency defaults as the
+local route (#5786), and `crates/kkernel/src/coordinator/link_inference_tests.rs` checks both routes.
+
+"Requires" above governs what a stored qualifier may say, and inference supplies one where the
+endpoint pair has a default. When `dependency_kind` is omitted and the pair has no default (the
+base pair `Service → Project`, and pairs a pack declares, such as the KG pack's `Org → Org` and
+the GTD pack's task-to-task pair), the edge is accepted and stored without a `dependency_kind`. A reader treats an absent qualifier as
+unspecified, never as any one kind. An explicit value is validated on every `depends_on` pair,
+with or without a default. The reasoning is under "Why the 2026-10-19 qualifier amendment?" in
+Rationale.
+
 ## Edge Density Rules
 
 A sparse graph is a useless graph. Per-kind minimums (polish guidance, not write-time gates):
@@ -672,6 +742,7 @@ For provenance/lineage-sensitive relations, hard-delete cascade emits a warning 
 | `supports` / `refutes` | cascade edge; emit evidential-link-loss warning     |
 | `annotates`            | cascade as documented                               |
 | `located_in`           | cascade normally                                    |
+| `owns`                 | cascade normally; no ownership-loss audit warning   |
 | others                 | cascade normally                                    |
 
 Warnings use the existing `audit` event kind and target the hard-deleted record. The runtime
@@ -731,10 +802,15 @@ The fourth expansion (→ 19, [ADR-196](ADR-196-located-in-relation.md)) adds `l
   export. See [ADR-196](ADR-196-located-in-relation.md) for the analysis and the ADR-076
   certificate.
 
+The fifth expansion (→ 20, [ADR-197](ADR-197-owns-relation.md)) adds `owns`
+in the new **Ownership** category. Holder queries distinguish stakes from
+employment, subsidiary membership and structural containment. Its seven
+certificate fixtures preserve that distinction under the cheaper encodings.
+
 ### How is the closed set calculable and auditable?
 
 [ADR-076](ADR-076-relation-calculability-and-system-role.md) records why there is no
-first-principles relation algebra whose closure uniquely derives these 17 relations: khive's
+first-principles relation algebra whose closure uniquely derives the current relation set: khive's
 query classes are design inputs, not deductions. The calculable result is instead a repeatable
 falsification audit. Each relation names a system role, and a proposed relation is tested against
 seven cheaper encodings: converse (Cv), endpoint restriction (Er), attribute (At), polarity
@@ -742,6 +818,10 @@ seven cheaper encodings: converse (Cv), endpoint restriction (Er), attribute (At
 (Sr).
 
 The audit disposition for the current set is:
+
+- `located_in` and `owns` have explicit seven-family certificates in
+  `khive-types/tests/certificate`; the live coverage gate requires their fixtures.
+  Owns is not added to the grandfathered set or the closed collision exceptions.
 
 - Exactly the 15 base relations in this ADR are registered as the grandfathered
   `SurvivesAll` set. No base relation is treated as a converse, fixed composition, or
@@ -760,6 +840,10 @@ The audit disposition for the current set is:
   directly, not by the ratified list. An identical
   signature is a signal to run Er analysis, not by itself proof of redundancy; relations with the
   same legal endpoint kinds can still answer different questions.
+  Amended 2026-10-05: with the `Org located_in Concept` base row, the base signature of
+  `located_in` is {`Concept -> Concept`, `Org -> Concept`} and no longer equals that of `extends`,
+  so the audit finds only the ratified pair. The Er fixture still tests `located_in` against
+  `extends` on the pair they share.
 
 Accordingly, the audit does not replace the stored vocabulary with a smaller inferred generating
 set. The only demonstrated algebraic collapse is retained by a declared system role, and khive
@@ -843,10 +927,53 @@ indistinguishable.
 
 This pair is strictly additive; no existing rule is removed or narrowed.
 
-### Why 9 categories?
+### Why the 2026-10-05 organization amendment?
+
+An organization graph built from public filings has two facts that the base contract could not
+state as edges:
+
+- **Competitors.** A filing names the organizations it competes with. `competes_with` already
+  carries this meaning for concepts, projects and services. Organizations are the most common
+  competitors in such a corpus, and storing them as notes hides the relation from traversal.
+  The pair is symmetric, and stored and canonicalized like the other `competes_with` pairs.
+- **Jurisdiction.** An organization is registered in, or operates from, a jurisdiction. Kept as
+  a property, "every subsidiary registered in X" is a scan over all organizations. `located_in`
+  (ADR-196) already means "the source occupies, or is manifested in, the target without being a
+  constituent of it", which is exactly this fact. `part_of` would claim that the organization is
+  a constituent of the jurisdiction, and `instance_of` that it is a kind of place. Both are false.
+
+ADR-196 D1 left rows for other base kinds to the first pack that emits them. That route needs a
+pack linked into the binary. A store that uses only the base `kg` pack cannot take it, and
+runtime Subjects (ADR-072) are still proposed. Organization is a base kind, so its row belongs
+in the base contract. No other base kind is added.
+
+The change removes the endpoint-signature collision between `located_in` and `extends`, which
+had shared the single pair `Concept -> Concept`. The `located_in` certificate's Er fixture still
+stands on that shared pair. The collision exemption in the signature tripwire is withdrawn
+rather than left stale.
+
+### Why the 2026-10-19 qualifier amendment?
+
+The sentence "`depends_on` requires a `dependency_kind` qualifier" admitted two readings: a write
+refused whenever the edge would end up without a qualifier, or a rule about the stored value that
+inference fills where it can. The runtime implements the second. It validates an explicit value
+on every `depends_on` edge, adds the default for the seven pairs in the inference table, and leaves
+the metadata unchanged for every other pair. This amendment writes that behaviour down.
+
+Refusing an omitted qualifier on the pairs without a default was considered and not adopted. The
+GTD pack writes each task dependency as `depends_on` between two task notes with no metadata, so
+the stricter reading would refuse every task dependency in the default pack set. An absent
+qualifier also makes no false claim about the dependency.
+
+Adding defaults for `Service → Project` and `Org → Org` was considered and not adopted. A service
+can depend on a project to build it or to run it, and one organization can depend on another in
+ways no single kind names, so a default for either pair would store a guess. A caller that knows
+the kind states it.
+
+### Why 10 categories?
 
 Each category serves a distinct query class. Single- or two-relation categories (Implementation,
-Annotation, Provenance, Temporal, Epistemic) are justified because the relation(s) within each
+Annotation, Provenance, Temporal, Epistemic, Ownership) are justified because the relation(s) within each
 answer a question no other category covers. Category count is driven by query semantics, not by
 balancing relation counts.
 
@@ -876,6 +1003,7 @@ pub enum EdgeCategory {
     Lateral,
     Annotation,
     Epistemic,
+    Ownership,
 }
 
 pub enum EdgeRelation {
@@ -897,6 +1025,8 @@ pub enum EdgeRelation {
     Annotates,
     // Epistemic
     Supports, Refutes,
+    // Ownership
+    Owns,
 }
 ```
 

@@ -1,0 +1,1587 @@
+{
+ "benches": {
+  "fuse_dispatcher/KeywordOnly": {
+   "a": {
+    "ci_hi_ns": 161.6202087120149,
+    "ci_lo_ns": 161.54323705129792,
+    "median_ns": 161.5820044448592
+   },
+   "aa_spread": 1.0139,
+   "b": {
+    "ci_hi_ns": 163.8875885730768,
+    "ci_lo_ns": 163.75924518849413,
+    "median_ns": 163.83520523744966
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 162.709,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "fuse_dispatcher/Rrf": {
+   "a": {
+    "ci_hi_ns": 14024.832886904762,
+    "ci_lo_ns": 14021.773541666667,
+    "median_ns": 14023.170582706767
+   },
+   "aa_spread": 1.0028,
+   "b": {
+    "ci_hi_ns": 13985.88603419842,
+    "ci_lo_ns": 13980.844219951785,
+    "median_ns": 13983.99649070779
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 14003.584,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "fuse_dispatcher/Union": {
+   "a": {
+    "ci_hi_ns": 8998.68087468724,
+    "ci_lo_ns": 8996.031989377112,
+    "median_ns": 8997.074615077781
+   },
+   "aa_spread": 1.0011,
+   "b": {
+    "ci_hi_ns": 8989.878845664887,
+    "ci_lo_ns": 8986.303121605066,
+    "median_ns": 8987.51441170862
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 8992.295,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "fuse_dispatcher/VectorOnly": {
+   "a": {
+    "ci_hi_ns": 157.0822884610624,
+    "ci_lo_ns": 156.7769898112739,
+    "median_ns": 156.96725037123088
+   },
+   "aa_spread": 1.0379,
+   "b": {
+    "ci_hi_ns": 151.34240888656046,
+    "ci_lo_ns": 151.03989005321407,
+    "median_ns": 151.23236178210152
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 154.1,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "fuse_dispatcher/Weighted": {
+   "a": {
+    "ci_hi_ns": 16233.646260121881,
+    "ci_lo_ns": 16228.722355371901,
+    "median_ns": 16231.607489577349
+   },
+   "aa_spread": 1.0,
+   "b": {
+    "ci_hi_ns": 16234.771074380165,
+    "ci_lo_ns": 16231.67119244392,
+    "median_ns": 16232.378520880744
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 16231.993,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "fuse_dispatcher/rrf_topk/10": {
+   "a": {
+    "ci_hi_ns": 49052.90277777778,
+    "ci_lo_ns": 49043.69348060345,
+    "median_ns": 49048.46424534575
+   },
+   "aa_spread": 1.0139,
+   "b": {
+    "ci_hi_ns": 48380.34512195122,
+    "ci_lo_ns": 48367.54999313595,
+    "median_ns": 48376.15752939896
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 48712.311,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "fuse_dispatcher/rrf_topk/100": {
+   "a": {
+    "ci_hi_ns": 49073.77368421053,
+    "ci_lo_ns": 49059.84775641026,
+    "median_ns": 49067.26136824324
+   },
+   "aa_spread": 1.0003,
+   "b": {
+    "ci_hi_ns": 49088.63617021277,
+    "ci_lo_ns": 49073.217391304344,
+    "median_ns": 49082.847187499996
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 49075.054,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "fuse_dispatcher/rrf_topk/50": {
+   "a": {
+    "ci_hi_ns": 49063.65795454545,
+    "ci_lo_ns": 49052.342764705885,
+    "median_ns": 49058.36159340659
+   },
+   "aa_spread": 1.014,
+   "b": {
+    "ci_hi_ns": 48388.63026155328,
+    "ci_lo_ns": 48375.20853658537,
+    "median_ns": 48381.08841463414
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 48719.725,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "fuse_dispatcher/weighted_rrf/2src_500items_top10": {
+   "a": {
+    "ci_hi_ns": 64564.64433357092,
+    "ci_lo_ns": 64551.569086651056,
+    "median_ns": 64558.35068306011
+   },
+   "aa_spread": 1.0027,
+   "b": {
+    "ci_hi_ns": 64735.601012536164,
+    "ci_lo_ns": 64725.1527936629,
+    "median_ns": 64730.41617442092
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 64644.383,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "fuse_dispatcher/weighted_rrf/2src_500items_top100": {
+   "a": {
+    "ci_hi_ns": 64570.96018735363,
+    "ci_lo_ns": 64558.3918813427,
+    "median_ns": 64565.968819883434
+   },
+   "aa_spread": 1.0015,
+   "b": {
+    "ci_hi_ns": 64665.68950819672,
+    "ci_lo_ns": 64655.57259790528,
+    "median_ns": 64661.385837887065
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 64613.677,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "fuse_dispatcher/weighted_rrf/2src_500items_top50": {
+   "a": {
+    "ci_hi_ns": 64466.10666505154,
+    "ci_lo_ns": 64453.798080767694,
+    "median_ns": 64461.48223162348
+   },
+   "aa_spread": 1.0049,
+   "b": {
+    "ci_hi_ns": 64785.897398366666,
+    "ci_lo_ns": 64768.31967213115,
+    "median_ns": 64776.46587183309
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 64618.974,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "fuse_dispatcher/weighted_rrf/3src_500items_top10": {
+   "a": {
+    "ci_hi_ns": 94686.5,
+    "ci_lo_ns": 94661.30243669375,
+    "median_ns": 94671.90458152958
+   },
+   "aa_spread": 1.0095,
+   "b": {
+    "ci_hi_ns": 95583.29472329472,
+    "ci_lo_ns": 95559.59253246753,
+    "median_ns": 95567.62251984127
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 95119.764,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "fuse_dispatcher/weighted_rrf/3src_500items_top100": {
+   "a": {
+    "ci_hi_ns": 94724.90846560846,
+    "ci_lo_ns": 94705.10887445888,
+    "median_ns": 94716.76413690476
+   },
+   "aa_spread": 1.0134,
+   "b": {
+    "ci_hi_ns": 95992.96534800714,
+    "ci_lo_ns": 95973.65213414634,
+    "median_ns": 95984.19376296402
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 95350.479,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "fuse_dispatcher/weighted_rrf/3src_500items_top50": {
+   "a": {
+    "ci_hi_ns": 94725.20238095238,
+    "ci_lo_ns": 94708.41443932411,
+    "median_ns": 94718.71590070137
+   },
+   "aa_spread": 1.0127,
+   "b": {
+    "ci_hi_ns": 95933.85365853658,
+    "ci_lo_ns": 95915.80487804877,
+    "median_ns": 95925.42464222887
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 95322.07,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "rrf/2src/150items": {
+   "a": {
+    "ci_hi_ns": 14296.636277056277,
+    "ci_lo_ns": 14292.709207066226,
+    "median_ns": 14294.948795128315
+   },
+   "aa_spread": 1.0004,
+   "b": {
+    "ci_hi_ns": 14290.994517119245,
+    "ci_lo_ns": 14287.876675098814,
+    "median_ns": 14288.972763975155
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 14291.961,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "rrf/2src/500items": {
+   "a": {
+    "ci_hi_ns": 49493.04156976744,
+    "ci_lo_ns": 49478.65626190476,
+    "median_ns": 49485.86656709559
+   },
+   "aa_spread": 1.0078,
+   "b": {
+    "ci_hi_ns": 49108.36670040486,
+    "ci_lo_ns": 49100.76315592204,
+    "median_ns": 49104.55956439394
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 49295.213,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "rrf/2src/50items": {
+   "a": {
+    "ci_hi_ns": 4541.306383473277,
+    "ci_lo_ns": 4539.634687928669,
+    "median_ns": 4540.057472117003
+   },
+   "aa_spread": 1.0194,
+   "b": {
+    "ci_hi_ns": 4628.970681522446,
+    "ci_lo_ns": 4626.81051212938,
+    "median_ns": 4628.081186502177
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 4584.069,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "rrf/3src/150items": {
+   "a": {
+    "ci_hi_ns": 20814.161135161135,
+    "ci_lo_ns": 20809.762496109557,
+    "median_ns": 20811.85739760925
+   },
+   "aa_spread": 1.0067,
+   "b": {
+    "ci_hi_ns": 20953.291511524825,
+    "ci_lo_ns": 20948.58722361285,
+    "median_ns": 20951.148899985525
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 20881.503,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "rrf/3src/500items": {
+   "a": {
+    "ci_hi_ns": 71348.93190177638,
+    "ci_lo_ns": 71332.09571035026,
+    "median_ns": 71337.16713903742
+   },
+   "aa_spread": 1.0032,
+   "b": {
+    "ci_hi_ns": 71111.46462391775,
+    "ci_lo_ns": 71100.29241071429,
+    "median_ns": 71107.00589337523
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 71222.087,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "union/2src/150items": {
+   "a": {
+    "ci_hi_ns": 8987.748184260272,
+    "ci_lo_ns": 8985.082488830772,
+    "median_ns": 8986.226393429224
+   },
+   "aa_spread": 1.0026,
+   "b": {
+    "ci_hi_ns": 8965.209148727985,
+    "ci_lo_ns": 8961.201591038813,
+    "median_ns": 8963.153729071537
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 8974.69,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "union/2src/500items": {
+   "a": {
+    "ci_hi_ns": 32153.30075493612,
+    "ci_lo_ns": 32141.63094880607,
+    "median_ns": 32148.30893116849
+   },
+   "aa_spread": 1.0033,
+   "b": {
+    "ci_hi_ns": 32049.015176151763,
+    "ci_lo_ns": 32036.93778720396,
+    "median_ns": 32043.799369456763
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 32096.054,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "union/2src/50items": {
+   "a": {
+    "ci_hi_ns": 2835.418341527695,
+    "ci_lo_ns": 2834.094161849711,
+    "median_ns": 2834.823662670259
+   },
+   "aa_spread": 1.0045,
+   "b": {
+    "ci_hi_ns": 2848.2830741492,
+    "ci_lo_ns": 2846.609243697479,
+    "median_ns": 2847.5883761169525
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 2841.206,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "union/3src/150items": {
+   "a": {
+    "ci_hi_ns": 13237.528370120963,
+    "ci_lo_ns": 13233.297433347161,
+    "median_ns": 13235.206056597723
+   },
+   "aa_spread": 1.0036,
+   "b": {
+    "ci_hi_ns": 13285.105343980344,
+    "ci_lo_ns": 13281.283819533819,
+    "median_ns": 13282.938696509009
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 13259.072,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "union/3src/500items": {
+   "a": {
+    "ci_hi_ns": 46192.798802235826,
+    "ci_lo_ns": 46183.07352941176,
+    "median_ns": 46187.05619092831
+   },
+   "aa_spread": 1.0068,
+   "b": {
+    "ci_hi_ns": 46510.73921568628,
+    "ci_lo_ns": 46490.29952376753,
+    "median_ns": 46500.593035608894
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 46343.825,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weight_utils/is_normalized_false": {
+   "a": {
+    "ci_hi_ns": 2.442679500961446,
+    "ci_lo_ns": 2.4422517628092115,
+    "median_ns": 2.442482567021054
+   },
+   "aa_spread": 1.0001,
+   "b": {
+    "ci_hi_ns": 2.443011104231002,
+    "ci_lo_ns": 2.442530189277015,
+    "median_ns": 2.4428283154725667
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 2.443,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weight_utils/is_normalized_true": {
+   "a": {
+    "ci_hi_ns": 2.0717039170880316,
+    "ci_lo_ns": 2.071562878010421,
+    "median_ns": 2.0716264935775097
+   },
+   "aa_spread": 1.0,
+   "b": {
+    "ci_hi_ns": 2.0716959445869305,
+    "ci_lo_ns": 2.0715863180425034,
+    "median_ns": 2.071631591522517
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 2.072,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weight_utils/normalize_2": {
+   "a": {
+    "ci_hi_ns": 15.53908816301293,
+    "ci_lo_ns": 15.538202707087564,
+    "median_ns": 15.538592341989988
+   },
+   "aa_spread": 1.0,
+   "b": {
+    "ci_hi_ns": 15.53992767053303,
+    "ci_lo_ns": 15.53824860414984,
+    "median_ns": 15.539103291188049
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 15.539,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weight_utils/normalize_20": {
+   "a": {
+    "ci_hi_ns": 45.81851563363162,
+    "ci_lo_ns": 45.49210970756987,
+    "median_ns": 45.68442993919659
+   },
+   "aa_spread": 1.006,
+   "b": {
+    "ci_hi_ns": 46.125523026692974,
+    "ci_lo_ns": 45.39885182062708,
+    "median_ns": 45.95753647276085
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 45.821,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weight_utils/normalize_3": {
+   "a": {
+    "ci_hi_ns": 16.968601114720716,
+    "ci_lo_ns": 16.963899651564606,
+    "median_ns": 16.966684965567673
+   },
+   "aa_spread": 1.0004,
+   "b": {
+    "ci_hi_ns": 16.97768719619472,
+    "ci_lo_ns": 16.97040489272632,
+    "median_ns": 16.973778744597418
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 16.97,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weight_utils_fallible/finite_unnormalized/2": {
+   "a": {
+    "ci_hi_ns": 17.235099727316708,
+    "ci_lo_ns": 17.23335901386749,
+    "median_ns": 17.234125419642588
+   },
+   "aa_spread": 1.0001,
+   "b": {
+    "ci_hi_ns": 17.233512174881454,
+    "ci_lo_ns": 17.232437072728402,
+    "median_ns": 17.233079569555578
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 17.234,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weight_utils_fallible/finite_unnormalized/20": {
+   "a": {
+    "ci_hi_ns": 52.34050078054872,
+    "ci_lo_ns": 52.190021296915525,
+    "median_ns": 52.28200846450892
+   },
+   "aa_spread": 1.0013,
+   "b": {
+    "ci_hi_ns": 52.507050735588535,
+    "ci_lo_ns": 52.072531248067634,
+    "median_ns": 52.21322927346367
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 52.248,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weight_utils_fallible/finite_unnormalized/3": {
+   "a": {
+    "ci_hi_ns": 18.92992426012643,
+    "ci_lo_ns": 18.928400182662305,
+    "median_ns": 18.929187249617726
+   },
+   "aa_spread": 1.0001,
+   "b": {
+    "ci_hi_ns": 18.928564978357443,
+    "ci_lo_ns": 18.92749691176696,
+    "median_ns": 18.92792918428691
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 18.929,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weight_utils_fallible/infinity_last/2": {
+   "a": {
+    "ci_hi_ns": 1.4126442289165744,
+    "ci_lo_ns": 1.412573849254847,
+    "median_ns": 1.4126120376178601
+   },
+   "aa_spread": 1.0002,
+   "b": {
+    "ci_hi_ns": 1.41235772348008,
+    "ci_lo_ns": 1.412265769012362,
+    "median_ns": 1.4123072619166916
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 1.412,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weight_utils_fallible/infinity_last/20": {
+   "a": {
+    "ci_hi_ns": 11.865997339561304,
+    "ci_lo_ns": 11.865192168106484,
+    "median_ns": 11.865542757312227
+   },
+   "aa_spread": 1.0,
+   "b": {
+    "ci_hi_ns": 11.865960884088095,
+    "ci_lo_ns": 11.864542086096401,
+    "median_ns": 11.865361695111304
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 11.865,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weight_utils_fallible/infinity_last/3": {
+   "a": {
+    "ci_hi_ns": 2.0726656140020454,
+    "ci_lo_ns": 2.009827131376401,
+    "median_ns": 2.0492247962213055
+   },
+   "aa_spread": 1.0017,
+   "b": {
+    "ci_hi_ns": 2.0759868387878315,
+    "ci_lo_ns": 2.0214127701941176,
+    "median_ns": 2.045747386301464
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 2.047,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weight_utils_fallible/nan_last/2": {
+   "a": {
+    "ci_hi_ns": 1.4126398692921898,
+    "ci_lo_ns": 1.4125058892791993,
+    "median_ns": 1.4125628263940762
+   },
+   "aa_spread": 1.0001,
+   "b": {
+    "ci_hi_ns": 1.412446539837577,
+    "ci_lo_ns": 1.4123430285730463,
+    "median_ns": 1.4124009395577306
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 1.412,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weight_utils_fallible/nan_last/20": {
+   "a": {
+    "ci_hi_ns": 11.864964231408319,
+    "ci_lo_ns": 11.864120611484513,
+    "median_ns": 11.864533873678237
+   },
+   "aa_spread": 1.0001,
+   "b": {
+    "ci_hi_ns": 11.864705065260635,
+    "ci_lo_ns": 11.863525524842736,
+    "median_ns": 11.863938009156485
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 11.864,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weight_utils_fallible/nan_last/3": {
+   "a": {
+    "ci_hi_ns": 2.0266190873178695,
+    "ci_lo_ns": 1.9796847816786927,
+    "median_ns": 2.0079100350468395
+   },
+   "aa_spread": 1.004,
+   "b": {
+    "ci_hi_ns": 2.0098051361679166,
+    "ci_lo_ns": 1.9781424678803186,
+    "median_ns": 1.9999620383614336
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 2.004,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weight_utils_fallible/normalized/2": {
+   "a": {
+    "ci_hi_ns": 17.23580378030577,
+    "ci_lo_ns": 17.233811240405743,
+    "median_ns": 17.23481705631722
+   },
+   "aa_spread": 1.0001,
+   "b": {
+    "ci_hi_ns": 17.233883261211645,
+    "ci_lo_ns": 17.2326640509475,
+    "median_ns": 17.233124659419744
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 17.234,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weight_utils_fallible/normalized/20": {
+   "a": {
+    "ci_hi_ns": 52.51322769286199,
+    "ci_lo_ns": 52.421929907524174,
+    "median_ns": 52.470830564988844
+   },
+   "aa_spread": 1.0019,
+   "b": {
+    "ci_hi_ns": 52.618173999637875,
+    "ci_lo_ns": 52.546878432615124,
+    "median_ns": 52.57046798270121
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 52.521,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weight_utils_fallible/normalized/3": {
+   "a": {
+    "ci_hi_ns": 18.92871676778438,
+    "ci_lo_ns": 18.92734359806881,
+    "median_ns": 18.927850981172647
+   },
+   "aa_spread": 1.0001,
+   "b": {
+    "ci_hi_ns": 18.929889980002383,
+    "ci_lo_ns": 18.928360706993054,
+    "median_ns": 18.929041511623538
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 18.928,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weighted/2src/150items": {
+   "a": {
+    "ci_hi_ns": 16427.9589958159,
+    "ci_lo_ns": 16423.01766356029,
+    "median_ns": 16425.488284518826
+   },
+   "aa_spread": 1.0132,
+   "b": {
+    "ci_hi_ns": 16211.80171800125,
+    "ci_lo_ns": 16208.597958191542,
+    "median_ns": 16210.91791378155
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 16318.203,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weighted/2src/500items": {
+   "a": {
+    "ci_hi_ns": 56136.29246938776,
+    "ci_lo_ns": 56120.01530612245,
+    "median_ns": 56126.97341269841
+   },
+   "aa_spread": 1.0041,
+   "b": {
+    "ci_hi_ns": 55903.86408450704,
+    "ci_lo_ns": 55888.943043627616,
+    "median_ns": 55897.36384976526
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 56012.169,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weighted/2src/50items": {
+   "a": {
+    "ci_hi_ns": 5402.3354730246065,
+    "ci_lo_ns": 5400.54352525054,
+    "median_ns": 5401.377193276747
+   },
+   "aa_spread": 1.0023,
+   "b": {
+    "ci_hi_ns": 5389.794361888113,
+    "ci_lo_ns": 5388.487858915279,
+    "median_ns": 5388.99958936087
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 5395.188,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weighted/3src/150items": {
+   "a": {
+    "ci_hi_ns": 24507.751644736843,
+    "ci_lo_ns": 24503.801482090643,
+    "median_ns": 24505.925066361004
+   },
+   "aa_spread": 1.004,
+   "b": {
+    "ci_hi_ns": 24412.339356295877,
+    "ci_lo_ns": 24407.794310919075,
+    "median_ns": 24408.736867210653
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 24457.331,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  },
+  "weighted/3src/500items": {
+   "a": {
+    "ci_hi_ns": 83160.71785714285,
+    "ci_lo_ns": 83144.80302287583,
+    "median_ns": 83152.60355902778
+   },
+   "aa_spread": 1.0011,
+   "b": {
+    "ci_hi_ns": 83256.68263888889,
+    "ci_lo_ns": 83231.45153061225,
+    "median_ns": 83247.42319023568
+   },
+   "clock_khz_median": {
+    "a": 3548993.5,
+    "b": 3549000
+   },
+   "median_ns": 83200.013,
+   "verdict": "MEASURED",
+   "window": {
+    "a": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.0026393398579061924,
+     "other_busy_max": 13.7
+    },
+    "b": {
+     "band_basis": "loaded-core",
+     "busy_frac": 0.0,
+     "clock_band": 0.002658495350803043,
+     "other_busy_max": 12.9
+    }
+   }
+  }
+ },
+ "class": {
+  "cores": "2,3",
+  "cpu": "AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics",
+  "cpufreq": {
+   "driver": "amd-pstate-epp",
+   "epp": [
+    "performance"
+   ],
+   "governor": [
+    "performance"
+   ],
+   "max_khz": [
+    "3600000"
+   ]
+  },
+  "kernel": "6.8.0-142-generic",
+  "profile": "bench",
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)"
+ },
+ "commands": {
+  "khive-fusion:fusion_bench": {
+   "a": "taskset -c 2,3 cargo bench --manifest-path=crates/Cargo.toml -p khive-fusion --locked --bench fusion_bench -- --save-baseline aa-a --noplot",
+   "b": "taskset -c 2,3 cargo bench --manifest-path=crates/Cargo.toml -p khive-fusion --locked --bench fusion_bench -- --save-baseline aa-b --noplot"
+  }
+ },
+ "crate": "khive-fusion",
+ "criterion": "the benchmark's own configuration (no time or sample-size override)",
+ "evidence": {
+  "archive": {
+   "location": "outside the repository",
+   "manifest": "MANIFEST.sha256 (sha256 of every stored file)",
+   "manifest_sha256": "1ebdfca95abec7167914ef7e2c12fbbe25aae9a5943ade7ced00de0952994e47"
+  },
+  "job": "bb-refc-c8276608"
+ },
+ "excluded_targets": {},
+ "load1": {
+  "end": "1.26",
+  "start": "1.58"
+ },
+ "pin_status": {
+  "end": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=400000\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3549666\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=3541359\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000",
+  "start": "policy0 gov=performance epp=performance max_khz=3600000 cur_khz=3543512\npolicy1 gov=performance epp=performance max_khz=3600000 cur_khz=3549745\npolicy2 gov=performance epp=performance max_khz=3600000 cur_khz=3546812\ndriver=amd-pstate-epp policies=16 owner=ci pin_max_khz=3600000"
+ },
+ "reduction": {
+  "aa_spread": "max(a,b)/min(a,b)",
+  "busy": "fraction of samples with a CPU outside the pinned cores above busy_max, judged against busy_frac_max; other_busy_max is logged",
+  "busy_frac_max": 0.05,
+  "busy_max": 20.0,
+  "clock_band": "(max-min)/median of the loaded pinned core's clock per sample, readings equal to clock_floor_khz dropped",
+  "clock_floor_khz": 400000,
+  "freq_band": 0.1,
+  "noise_ceiling": 1.15,
+  "statistic": "Criterion median estimate per arm (estimates.json)"
+ },
+ "run": {
+  "host": "Ubuntu-noble-latest-amd64-base.zst",
+  "mode": "reference",
+  "window": "03:55-06:15Z"
+ },
+ "schema": "bench-reference/v1",
+ "sha": "c82766083139abd22f95e9a34cf778c3cd20b95f",
+ "targets": [
+  "khive-fusion:fusion_bench"
+ ]
+}

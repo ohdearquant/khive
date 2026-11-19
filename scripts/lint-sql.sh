@@ -21,7 +21,8 @@
 #                   here rather than in a test run. Positional binds are filled
 #                   with NULL and the statement runs under EXPLAIN, so nothing is
 #                   evaluated and no row is touched. A file is classified by its
-#                   first keyword, not by its name or its directory.
+#                   first keyword, except for actual registered core migrations,
+#                   which may begin with data reconciliation before their DDL.
 #   2. hygiene    — no trailing whitespace, no tabs.
 #   3. format     — multi-column CREATE TABLE must be one column per line
 #                   (catches comma-jammed single-line tables).
@@ -40,7 +41,20 @@ if [ -z "$SQL_FILES" ]; then
     exit 0
 fi
 
-python3 - "$SQL_FILES" <<'PY'
+# The DQS guard below needs sqlite3.Connection.setconfig (Python 3.12+). Run the
+# first interpreter that has it: KHIVE_SQL_LINT_PYTHON, then versioned names, then
+# python3. When none has it, python3 runs and the lint fails closed with its message.
+PYTHON=python3
+for candidate in "${KHIVE_SQL_LINT_PYTHON:-}" python3.14 python3.13 python3.12 python3; do
+    if [ -n "$candidate" ] && command -v "$candidate" >/dev/null 2>&1 \
+        && "$candidate" -c 'import sqlite3, sys; sys.exit(0 if hasattr(sqlite3.Connection, "setconfig") else 1)' \
+            >/dev/null 2>&1; then
+        PYTHON=$candidate
+        break
+    fi
+done
+
+"$PYTHON" - "$SQL_FILES" "$ROOT" <<'PY'
 import os
 import re
 import sqlite3
@@ -49,6 +63,184 @@ import sys
 files = sys.argv[1].split("\n") if len(sys.argv) > 1 else []
 files = [f for f in files if f.strip()]
 failed = 0
+
+def lint_connection():
+    """Create a lint database that never treats unknown quoted names as strings."""
+    missing = []
+    if not callable(getattr(sqlite3.Connection, "setconfig", None)):
+        missing.append("Connection.setconfig")
+    for name in ("SQLITE_DBCONFIG_DQS_DML", "SQLITE_DBCONFIG_DQS_DDL"):
+        if not hasattr(sqlite3, name):
+            missing.append(name)
+    if missing:
+        raise SystemExit(
+            "SQL lint: Python 3.12+ with SQLite DQS configuration support is required; "
+            "missing " + ", ".join(missing)
+        )
+    con = sqlite3.connect(":memory:")
+    try:
+        con.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
+        con.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
+    except (AttributeError, sqlite3.Error, ValueError) as error:
+        con.close()
+        raise SystemExit(f"SQL lint: cannot disable SQLite DQS: {error}") from error
+    return con
+
+def sql_parameter_surface(sql):
+    """Hide quoted text and comments from bind checks, never preparation."""
+    surface = list(sql)
+    at = 0
+    while at < len(sql):
+        if sql.startswith("--", at):
+            end = sql.find("\n", at + 2)
+            if end < 0:
+                end = len(sql)
+        elif sql.startswith("/*", at):
+            end = sql.find("*/", at + 2)
+            end = len(sql) if end < 0 else end + 2
+        elif sql[at] in "'\"`[":
+            quote = sql[at]
+            closing = "]" if quote == "[" else quote
+            end = at + 1
+            while end < len(sql):
+                if sql[end] == closing:
+                    end += 1
+                    if quote != "[" and end < len(sql) and sql[end] == closing:
+                        end += 1
+                        continue
+                    break
+                end += 1
+        else:
+            at += 1
+            continue
+        for index in range(at, end):
+            if surface[index] not in "\r\n":
+                surface[index] = " "
+        at = end
+    return "".join(surface)
+
+def rust_tokens(source):
+    """Read registration syntax without mistaking comments or strings for Rust."""
+    tokens = []
+    at = 0
+    while at < len(source):
+        if source[at].isspace():
+            at += 1
+        elif source.startswith("//", at):
+            end = source.find("\n", at)
+            at = len(source) if end < 0 else end
+        elif source.startswith("/*", at):
+            depth = 1
+            at += 2
+            while depth and at < len(source):
+                if source.startswith("/*", at):
+                    depth += 1
+                    at += 2
+                elif source.startswith("*/", at):
+                    depth -= 1
+                    at += 2
+                else:
+                    at += 1
+            if depth:
+                raise ValueError("unterminated Rust comment")
+        elif raw := re.match(r'r(#+)?"', source[at:]):
+            end_marker = '"' + (raw.group(1) or "")
+            end = source.find(end_marker, at + raw.end())
+            if end < 0:
+                raise ValueError("unterminated Rust raw string")
+            end += len(end_marker)
+            tokens.append(source[at:end])
+            at = end
+        elif source[at] == '"':
+            end = at + 1
+            while end < len(source) and source[end] != '"':
+                end += 2 if source[end] == "\\" else 1
+            if end >= len(source):
+                raise ValueError("unterminated Rust string")
+            tokens.append(source[at:end + 1])
+            at = end + 1
+        elif char := re.match(r"'(?:\\(?:u\{[0-9A-Fa-f_]+\}|x[0-9A-Fa-f]{2}|.)|[^'\\])'", source[at:]):
+            tokens.append(char.group())
+            at += char.end()
+        elif word := re.match(r"[A-Za-z_][A-Za-z_0-9]*", source[at:]):
+            tokens.append(word.group())
+            at += word.end()
+        else:
+            tokens.append(source[at])
+            at += 1
+    return tokens
+
+def split_rust_fields(tokens):
+    fields, field, stack = [], [], []
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    for token in tokens:
+        if token == "," and not stack:
+            if field:
+                fields.append(field)
+                field = []
+            continue
+        if token in pairs:
+            stack.append(pairs[token])
+        elif token in pairs.values():
+            if not stack or stack.pop() != token:
+                raise ValueError("unbalanced Rust registration")
+        field.append(token)
+    if stack:
+        raise ValueError("unbalanced Rust registration")
+    if field:
+        fields.append(field)
+    return fields
+
+def registered_migration_files(root):
+    core_sql = os.path.join(root, "crates/khive-db/sql") + os.sep
+    if not any(path.startswith(core_sql) for path in files):
+        return set()
+    source = os.path.join(root, "crates/khive-db/src/migrations.rs")
+    with open(source) as fh:
+        tokens = rust_tokens(fh.read())
+
+    def constant(name):
+        starts = [i for i in range(len(tokens) - 1)
+                  if tokens[i:i + 2] == ["const", name]]
+        if len(starts) != 1:
+            raise ValueError(f"expected one migration constant {name}")
+        at = starts[0] + 2
+        end = tokens.index(";", at)
+        equals = tokens.index("=", at, end)
+        return tokens[equals + 1:end]
+
+    registry = constant("MIGRATIONS")
+    if registry[:2] != ["&", "["] or registry[-1:] != ["]"]:
+        raise ValueError("MIGRATIONS must be a literal VersionedMigration array")
+    registered = set()
+    entries = split_rust_fields(registry[2:-1])
+    if not entries:
+        raise ValueError("MIGRATIONS must not be empty")
+    for entry in entries:
+        if entry[:2] != ["VersionedMigration", "{"] or entry[-1:] != ["}"]:
+            raise ValueError("unrecognized VersionedMigration registration")
+        fields = split_rust_fields(entry[2:-1])
+        up = [field[2:] for field in fields if field[:2] == ["up", ":"]]
+        if len(up) != 1 or len(up[0]) != 1:
+            raise ValueError("migration up must name one include constant")
+        expression = constant(up[0][0])
+        if (expression[:3] != ["include_str", "!", "("]
+                or expression[-1:] != [")"] or len(expression) != 5):
+            raise ValueError(f"unresolved migration include {up[0][0]}")
+        target = re.fullmatch(r'"\.\./sql/([A-Za-z0-9_.-]+\.sql)"', expression[3])
+        if not target:
+            raise ValueError(f"migration include must name a file in ../sql: {up[0][0]}")
+        path = os.path.join(root, "crates/khive-db/sql", target.group(1))
+        if path not in files:
+            raise ValueError(f"registered migration is missing: {path}")
+        registered.add(path)
+    return registered
+
+try:
+    registered = registered_migration_files(sys.argv[2])
+except (OSError, ValueError) as error:
+    print(f"SQL lint: cannot resolve registered migrations: {error}")
+    sys.exit(1)
 
 # ── Hygiene + format (file-local, every file) ──────────────────────────────
 create_re = re.compile(r"^\s*CREATE\s+(VIRTUAL\s+)?TABLE\b", re.IGNORECASE)
@@ -95,14 +287,104 @@ def is_ddl(path):
             return bool(ddl_re.match(line))
     return True  # an empty file has nothing to prepare
 
-chain = sorted([f for f in files if in_db_chain(f)], key=chain_order)
-others = [f for f in files if not in_db_chain(f)]
-ddl_files = [f for f in others if is_ddl(f)]
-query_files = [f for f in others if not is_ddl(f)]
+ddl = {f for f in files if is_ddl(f)}
+chain = sorted([f for f in files if f in registered or (in_db_chain(f) and f in ddl)],
+               key=chain_order)
+ddl_files = [f for f in files if f in ddl and f not in chain]
+query_files = [f for f in files if f not in ddl and f not in registered]
+
+# This guarded pack upgrade requires the pre-namespace table, not current DDL.
+GTD_LEGACY_FIXTURE = """CREATE TABLE gtd_lifecycle_audit (
+    note_id TEXT NOT NULL,
+    from_state TEXT NOT NULL,
+    to_state TEXT NOT NULL,
+    note TEXT,
+    at INTEGER NOT NULL
+)
+"""
+
+def gtd_legacy_upgrade(root):
+    directory = os.path.join(root, "crates/khive-pack-gtd/sql")
+    paths = {role: os.path.join(directory, "task-lifecycle-audit-" + name + ".sql")
+             for role, name in [("upgrade", "add-namespace"), ("table", "ddl"),
+                                ("index", "note-index"), ("inspect", "table-info")]}
+    if not any(path in files for path in paths.values()):
+        return None
+    for path in paths.values():
+        if path not in files:
+            raise ValueError(f"incomplete GTD upgrade bundle: missing {path}")
+        if path not in ddl_files:
+            raise ValueError(f"GTD upgrade bundle must contain pack DDL: {path}")
+    return paths
+
+def validate_gtd_legacy_upgrade(paths):
+    fixture = "gtd_lifecycle_audit_without_namespace"
+    if any(line.rstrip() != line or "\t" in line for line in GTD_LEGACY_FIXTURE.splitlines()):
+        raise ValueError(f"{fixture}: invalid fixture whitespace")
+    statements = {}
+    for role, path in paths.items():
+        with open(path) as fh:
+            statements[role] = fh.read()
+    old_layout = [(at, name, kind, required, None, 0)
+                  for at, (name, kind, required) in enumerate([
+                      ("note_id", "TEXT", 1), ("from_state", "TEXT", 1),
+                      ("to_state", "TEXT", 1), ("note", "TEXT", 0),
+                      ("at", "INTEGER", 1)])]
+    new_layout = old_layout + [(5, "namespace", "TEXT", 0, None, 0)]
+
+    def expect_layout(con, sql, expected, context):
+        actual = con.execute(sql).fetchall()
+        if actual != expected:
+            raise ValueError(f"{fixture}: {context}: unexpected table layout {actual!r}")
+
+    con = sqlite3.connect(":memory:")
+    try:
+        con.execute(GTD_LEGACY_FIXTURE)
+        expect_layout(con, "PRAGMA table_info(gtd_lifecycle_audit)", old_layout, "legacy fixture")
+        con.execute(statements["table"])
+        con.execute(statements["index"])
+        expect_layout(con, statements["inspect"], old_layout, "before upgrade")
+        con.execute("INSERT INTO gtd_lifecycle_audit VALUES (?, ?, ?, ?, ?)",
+                    ("fixture-id", "inbox", "next", None, 7))
+        # execute admits one statement; the actual ALTER runs once, without a skip.
+        con.execute(statements["upgrade"])
+        expect_layout(con, "PRAGMA table_info(gtd_lifecycle_audit)", new_layout, "after upgrade")
+        if con.execute("SELECT * FROM gtd_lifecycle_audit").fetchall() != [
+                ("fixture-id", "inbox", "next", None, 7, None)]:
+            raise ValueError(f"{fixture}: upgrade changed the retained audit row")
+    finally:
+        con.close()
+
+    con = sqlite3.connect(":memory:")
+    try:
+        con.execute(statements["table"])
+        con.execute(statements["index"])
+        expect_layout(con, statements["inspect"], new_layout, "canonical schema")
+    finally:
+        con.close()
+
+try:
+    gtd_upgrade = gtd_legacy_upgrade(sys.argv[2])
+except ValueError as error:
+    print(f"SQL lint: cannot resolve GTD legacy upgrade: {error}")
+    sys.exit(1)
+legacy_upgrade_files = {gtd_upgrade["upgrade"]} if gtd_upgrade else set()
+ddl_files = [path for path in ddl_files if path not in legacy_upgrade_files]
+populations = [set(chain), set(ddl_files), set(query_files), legacy_upgrade_files]
+if (set.union(*populations) != set(files)
+        or sum(map(len, populations)) != len(files)):
+    print("SQL lint: validation populations must cover every file exactly once")
+    sys.exit(1)
+if gtd_upgrade:
+    try:
+        validate_gtd_legacy_upgrade(gtd_upgrade)
+    except (OSError, sqlite3.Error, sqlite3.Warning, ValueError) as error:
+        print(f"{gtd_upgrade['upgrade']}: FAILED legacy fixture gtd_lifecycle_audit_without_namespace: {error}")
+        failed += 1
 
 # Replay the migration chain cumulatively in one database so a forward migration
 # (e.g. ALTER TABLE / CREATE INDEX on a baseline table) sees prior schema.
-con = sqlite3.connect(":memory:")
+con = lint_connection()
 try:
     for path in chain:
         with open(path) as fh:
@@ -122,7 +404,7 @@ fragment_groups = {}
 for path in ddl_files:
     fragment_groups.setdefault(os.path.dirname(path), []).append(path)
 for directory in sorted(fragment_groups):
-    con = sqlite3.connect(":memory:")
+    con = lint_connection()
     try:
         fixtures = []
         if directory.replace(os.sep, "/").endswith(
@@ -142,11 +424,19 @@ for directory in sorted(fragment_groups):
 
 # ── Preparation (query files) ──────────────────────────────────────────────
 # Statements extracted out of Rust are queries, not DDL. Executing one is both
-# wrong and impossible (executescript refuses bound parameters), so they are
-# PREPARED instead, against a database holding every table this tree declares.
+# wrong: unbound parameters act as NULL and can mutate rows or fail constraints.
+# PREPARE instead against a database holding every table this tree declares.
 if query_files:
-    con = sqlite3.connect(":memory:")
+    con = lint_connection()
     try:
+        # EXPLAIN resolves runtime function names and arity without evaluating
+        # their bodies. Keep this stub out of the DDL validation connections.
+        con.create_function("khive_tag_contains", 2, lambda tags, marker: None,
+                            deterministic=True)
+        con.create_function("code_name_score", 2, lambda name, query: None,
+                            deterministic=True)
+        con.create_function("khive_rfc3339_strict_key", 1, lambda value: None,
+                            deterministic=True)
         for path in chain:
             with open(path) as fh:
                 try:
@@ -175,13 +465,15 @@ if query_files:
                     print(f"{path}: more than one statement — one statement per file")
                     failed += 1
                     continue
-                binds = re.findall(r"\?(\d+)", sql)
+                parameter_sql = sql_parameter_surface(sql)
+                binds = re.findall(r"\?(\d+)", parameter_sql)
                 highest = max((int(b) for b in binds), default=0)
                 if binds and sorted({int(b) for b in binds}) != list(range(1, highest + 1)):
                     print(f"{path}: positional binds must run 1..N with no gaps")
                     failed += 1
                     continue
-                if re.search(r"\?(?!\d)", sql) or re.search(r"[:@$][A-Za-z_]", sql):
+                if (re.search(r"\?(?!\d)", parameter_sql)
+                        or re.search(r"[:@$][A-Za-z_]", parameter_sql)):
                     print(f"{path}: use numbered binds (?1, ?2), not anonymous or named ones")
                     failed += 1
                     continue

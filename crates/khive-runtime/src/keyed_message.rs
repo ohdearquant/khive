@@ -1,4 +1,7 @@
-//! A message pair publishes its outbound identity in the final atomic statement.
+//! A message pair claims its caller key before any extra statement of the unit runs.
+//!
+//! The claim decides a duplicate-key race, so a competing pair loses at the claim and replays the
+//! existing holder instead of failing at a later row.
 
 use khive_storage::{Note, SqlStatement, SqlValue};
 use khive_types::{Details, KhiveError};
@@ -30,14 +33,37 @@ pub async fn create_keyed_message_pair(
     create_keyed_message_pair_with_attachments(runtime, specs, physical_key, &[]).await
 }
 
-/// Include every copy's attachments before the final key claim in the same unit.
+/// Include every copy's attachments in the same unit, ahead of the key claim.
 pub async fn create_keyed_message_pair_with_attachments(
     runtime: &KhiveRuntime,
     specs: [AtomicNoteSpec<'_>; 2],
     physical_key: &str,
     attachments: &[khive_storage::NewAttachment],
 ) -> RuntimeResult<KeyedMessageWrite> {
+    create_keyed_message_pair_with_extra_statements(
+        runtime,
+        specs,
+        physical_key,
+        attachments,
+        Vec::new(),
+    )
+    .await
+}
+
+/// Like [`create_keyed_message_pair_with_attachments`], and also commit `extra_statements` in the
+/// same unit, after the attachments and after the key claim. The claim is the only statement that
+/// decides a duplicate-key race: a competing pair loses there, before any extra row is written,
+/// and the existing holder is returned. A winning pair commits the claim, the notes, the
+/// attachments and the extra rows together.
+pub async fn create_keyed_message_pair_with_extra_statements(
+    runtime: &KhiveRuntime,
+    specs: [AtomicNoteSpec<'_>; 2],
+    physical_key: &str,
+    attachments: &[khive_storage::NewAttachment],
+    extra_statements: Vec<SqlStatement>,
+) -> RuntimeResult<KeyedMessageWrite> {
     crate::atomic_message::validate_note_attachments(runtime, attachments)?;
+    crate::secret_gate::check_at(physical_key, "note", "key")?;
     let namespace = specs[0].token.namespace().as_str().to_owned();
     if specs.iter().any(|spec| spec.kind != "message")
         || specs[1].token.namespace().as_str() != namespace
@@ -86,6 +112,11 @@ pub async fn create_keyed_message_pair_with_attachments(
         },
         guard: Some(AffectedRowGuard::exactly(1)),
     });
+    // The claim is the only statement that decides a duplicate-key race, so it runs before the
+    // extra statements. A competing pair then rolls back here and replays the existing holder;
+    // were an extra row (for example a transport row keyed by the same logical id) placed first,
+    // the loser would fail on that row and surface as an internal error instead of a replay.
+    crate::atomic_message::append_extra_statements(&mut prepared, extra_statements)?;
 
     match run_atomic_unit(runtime.sql().as_ref(), prepared.plans).await {
         Ok(AtomicRunOutcome::Committed { .. }) => {
@@ -104,39 +135,17 @@ pub async fn create_keyed_message_pair_with_attachments(
                 },
             ..
         }) if statement_label.as_deref() == Some(KEY_CLAIM) => {
-            let holder = runtime
-                .sql()
-                .reader()
+            find_keyed_message_holder(runtime, &namespace, physical_key)
                 .await?
-                .query_scalar(SqlStatement {
-                    sql: "SELECT id FROM notes WHERE namespace = ?1 AND kind = 'message' \
-                      AND key = ?2 AND deleted_at IS NULL LIMIT 1"
-                        .into(),
-                    params: vec![
-                        SqlValue::Text(namespace),
-                        SqlValue::Text(physical_key.to_owned()),
-                    ],
-                    label: Some("message-key-holder".into()),
+                .map(KeyedMessageWrite::Existing)
+                .ok_or_else(|| {
+                    KhiveError::unavailable("message key holder disappeared during reconciliation")
+                        .with_details(Details::new_owned([(
+                            "reason",
+                            "key_holder_unresolved".into(),
+                        )]))
+                        .into()
                 })
-                .await?;
-            match holder {
-                Some(SqlValue::Text(id)) => Uuid::parse_str(&id)
-                    .map(KeyedMessageWrite::Existing)
-                    .map_err(|error| {
-                        RuntimeError::Internal(format!("invalid message holder id: {error}"))
-                    }),
-                None => Err(KhiveError::unavailable(
-                    "message key holder disappeared during reconciliation",
-                )
-                .with_details(Details::new_owned([(
-                    "reason",
-                    "key_holder_unresolved".into(),
-                )]))
-                .into()),
-                Some(_) => Err(RuntimeError::Internal(
-                    "message holder id is not text".into(),
-                )),
-            }
         }
         Ok(AtomicRunOutcome::RolledBack {
             failed_op_index,
@@ -147,3 +156,40 @@ pub async fn create_keyed_message_pair_with_attachments(
         Err(error) => Err(RuntimeError::Storage(error.0)),
     }
 }
+
+/// Look up the live outbound holder without preparing or attempting a write.
+/// The comm layer must validate the request and intact pair before returning it.
+pub async fn find_keyed_message_holder(
+    runtime: &KhiveRuntime,
+    namespace: &str,
+    physical_key: &str,
+) -> RuntimeResult<Option<Uuid>> {
+    let holder = runtime
+        .sql()
+        .reader()
+        .await?
+        .query_scalar(SqlStatement {
+            sql: "SELECT id FROM notes WHERE namespace = ?1 AND kind = 'message' \
+              AND key = ?2 AND deleted_at IS NULL LIMIT 1"
+                .into(),
+            params: vec![
+                SqlValue::Text(namespace.to_owned()),
+                SqlValue::Text(physical_key.to_owned()),
+            ],
+            label: Some("message-key-holder".into()),
+        })
+        .await?;
+    match holder {
+        Some(SqlValue::Text(id)) => Uuid::parse_str(&id)
+            .map(Some)
+            .map_err(|error| RuntimeError::Internal(format!("invalid message holder id: {error}"))),
+        None => Ok(None),
+        Some(_) => Err(RuntimeError::Internal(
+            "message holder id is not text".into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+#[path = "keyed_message_tests.rs"]
+mod tests;

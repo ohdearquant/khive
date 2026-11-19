@@ -2,6 +2,9 @@
 
 **Status**: Accepted
 **Date**: 2026-07-08
+**Amendment**: [restore and schema version 2](#amendment-2026-10-13-restore-and-schema-version-2)
+(accepted 2026-10-18) adds a sixth D1 operation, `restore`, and advances the NDJSON schema to
+version 2.
 **Depends on**: ADR-002 (edge ontology), ADR-016 (request DSL — the op shape this format serializes), ADR-017 (pack standard), ADR-020 (git-native KG implementation — `KgArchive` as the import/export envelope this ADR does not replace)
 **Related**: ADR-088 (git-lifecycle pack — the future-work loop below), ADR-100 (store backup and replication — whole-graph snapshots, a different artifact from the change-set this ADR defines)
 
@@ -127,6 +130,29 @@ op-list itself stays producer-agnostic.
 > the trailer. The field is optional precisely because D4's identifier is opaque
 > producer-internal tracking — a producer without its own batching model should not be forced
 > to invent one, and the fallback keeps the trailer's round-trip contract intact either way.
+
+### Amendment (2026-10-13): restore and schema version 2
+
+**Status: Accepted 2026-10-18.** This amendment extends D1
+with a sixth operation, `restore`, for an existing soft-deleted entity, note or
+edge. It carries the target identifier and the full record expected once live,
+including content, status, expiry, namespace and timestamps. Decoding uses the
+same strict record mirrors as delete preimages, rejects mismatched identifiers,
+and requires no deletion tombstone in the expected record. It cannot insert a
+hard-deleted row or reverse a merge.
+
+The expected record is complete review evidence. Its timestamps do not authorize
+rewriting storage clocks: current content is checked under the substrate-specific
+lifecycle rules in [the restore API](../../crates/khive-changeset/docs/api/restore.md).
+The live note restore always returns status `active`; an expected archived or
+deleted note is therefore refused, rather than silently changing its status.
+The live applier remains responsible for merge-provenance and other restore
+guards; the domain record alone does not prove that a tombstone is not a merge.
+
+The added operation advances the NDJSON schema to version 2 under the crate's
+single-version, fail-loud policy. Version-1 readers reject a version-2 envelope
+before decoding operations. Version-2 readers and writers reject version-1
+envelopes. No silent schema migration is implied.
 
 ### D2 — Serialization: NDJSON-delta
 

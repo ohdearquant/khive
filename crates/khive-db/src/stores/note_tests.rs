@@ -1,5 +1,7 @@
 use super::*;
 use crate::pool::PoolConfig;
+use crate::test_hooks::TestHooks;
+use khive_storage::WriterTaskRequestState;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
 use serial_test::serial;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -118,6 +120,39 @@ fn setup_memory_store() -> SqlNoteStore {
 
 fn make_note(namespace: &str, kind: &str, content: &str) -> Note {
     Note::new(namespace, kind, content)
+}
+
+#[tokio::test]
+async fn note_batch_including_deleted_keeps_tombstones_and_chunk_boundaries() {
+    let store = setup_memory_store();
+    let notes: Vec<_> = (0..901)
+        .map(|_| make_note("local", "observation", "batch row"))
+        .collect();
+    store.upsert_notes(notes.clone()).await.unwrap();
+    assert!(store
+        .delete_note(notes[0].id, DeleteMode::Soft)
+        .await
+        .unwrap());
+    let mut ids: Vec<_> = notes.iter().map(|note| note.id).collect();
+    ids.push(notes[0].id);
+    ids.push(Uuid::new_v4());
+    let fetched = store.get_notes_batch_including_deleted(&ids).await.unwrap();
+    let fetched_ids: HashSet<_> = fetched.iter().map(|note| note.id).collect();
+    assert_eq!(fetched_ids, notes.iter().map(|note| note.id).collect());
+    assert!(fetched
+        .iter()
+        .find(|note| note.id == notes[0].id)
+        .unwrap()
+        .deleted_at
+        .is_some());
+    let live = store.get_notes_batch(&ids).await.unwrap();
+    assert_eq!(live.len(), 900);
+    assert!(live.iter().all(|note| note.deleted_at.is_none()));
+    assert!(store
+        .get_notes_batch_including_deleted(&[])
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 fn keyed_note(namespace: &str, kind: &str, key: &str) -> Note {
@@ -964,7 +999,10 @@ async fn filtered_count_free_page_runs_without_count_over_large_match_set() {
     };
     {
         let reader = pool.reader().unwrap();
-        reader.conn().authorizer(Some(deny_count_function)).unwrap();
+        reader
+            .conn()
+            .test_authorizer(Some(deny_count_function))
+            .unwrap();
     }
 
     let request = PageRequest {
@@ -1008,7 +1046,7 @@ async fn filtered_count_free_page_runs_without_count_over_large_match_set() {
     let reader = pool.reader().unwrap();
     reader
         .conn()
-        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
         .unwrap();
 }
 
@@ -1370,71 +1408,7 @@ async fn bounded_filtered_count_is_exact_at_cap_and_saturates_above_it() {
     );
 }
 
-#[tokio::test]
-async fn test_soft_delete_sets_status_deleted() {
-    let pool = setup_pool();
-    let store = SqlNoteStore::new(Arc::clone(&pool), false);
-    let note = make_note("default", "observation", "to delete");
-    let id = note.id;
-    store.upsert_note(note).await.unwrap();
-    let deleted = store.delete_note(id, DeleteMode::Soft).await.unwrap();
-    assert!(deleted);
-    // Verify directly via raw SQL
-    let writer = pool.writer().unwrap();
-    let status: String = writer
-        .conn()
-        .query_row(
-            "SELECT status FROM notes WHERE id = ?1",
-            [id.to_string()],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(status, "deleted");
-}
-
-#[tokio::test]
-async fn test_note_status_field_roundtrip() {
-    let store = setup_memory_store();
-    let note = make_note("default", "observation", "status test");
-    let id = note.id;
-    store.upsert_note(note).await.unwrap();
-    let fetched = store.get_note(id).await.unwrap().unwrap();
-    assert_eq!(fetched.status, "active");
-}
-
-#[tokio::test]
-async fn set_note_property_initializes_null_and_preserves_json_type() {
-    let store = setup_memory_store();
-    let note = make_note("default", "observation", "atomic property set");
-    let id = note.id;
-    let updated_at = note.updated_at + 1;
-    store.upsert_note(note).await.unwrap();
-
-    assert!(store
-        .set_note_property(
-            id,
-            "delivery.stamp",
-            serde_json::json!({ "channel": "email", "attempt": 1 }),
-            updated_at,
-        )
-        .await
-        .unwrap());
-    assert!(store
-        .set_note_property(id, "explicit_null", serde_json::Value::Null, updated_at + 1)
-        .await
-        .unwrap());
-
-    let fetched = store.get_note(id).await.unwrap().unwrap();
-    assert_eq!(
-        fetched.properties,
-        Some(serde_json::json!({
-            "delivery.stamp": { "channel": "email", "attempt": 1 },
-            "explicit_null": null
-        })),
-        "keys must be literal top-level segments and values must keep their JSON types"
-    );
-    assert_eq!(fetched.updated_at, updated_at + 1);
-}
+include!("note_tests/status_and_property_value_tests.rs");
 
 #[tokio::test]
 async fn concurrent_distinct_note_property_sets_both_survive() {
@@ -1570,128 +1544,7 @@ async fn try_patch_note_property_refuses_array_document() {
     assert_eq!(fetched.updated_at, original_updated_at);
 }
 
-#[test]
-fn text_prefix_upper_bound_increments_the_last_code_point() {
-    assert_eq!(text_prefix_upper_bound("email:").as_deref(), Some("email;"));
-    assert_eq!(text_prefix_upper_bound("a").as_deref(), Some("b"));
-    // A trailing char::MAX has no successor; the bound moves to the previous
-    // code point. An empty prefix (or all char::MAX) has no upper bound.
-    assert_eq!(text_prefix_upper_bound("a\u{10FFFF}").as_deref(), Some("b"));
-    assert_eq!(text_prefix_upper_bound(""), None);
-    assert_eq!(text_prefix_upper_bound("\u{10FFFF}"), None);
-    // The surrogate gap is skipped so the bound stays a valid char.
-    assert_eq!(
-        text_prefix_upper_bound("x\u{D7FF}").as_deref(),
-        Some("x\u{E000}")
-    );
-}
-
-/// `TextStartsWithIndexed` is a byte-order range over the JSON text value:
-/// it admits exactly the strings with the prefix, rejects the prefix's
-/// neighbours on both sides, and never matches a missing, null, or numeric
-/// field (those sort outside the text range in SQLite).
-#[tokio::test]
-async fn text_starts_with_indexed_matches_prefix_only() {
-    use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
-    use khive_storage::types::{PageRequest, SqlValue};
-
-    let store = setup_memory_store();
-    let seeded = [
-        (
-            "email:a@b.c",
-            serde_json::json!({"to_actor": "email:a@b.c"}),
-        ),
-        ("email:", serde_json::json!({"to_actor": "email:"})),
-        ("emaik:zzz", serde_json::json!({"to_actor": "emaik:zzz"})),
-        ("email;", serde_json::json!({"to_actor": "email;"})),
-        ("telegram:1", serde_json::json!({"to_actor": "telegram:1"})),
-        ("number", serde_json::json!({"to_actor": 5})),
-        ("null", serde_json::json!({"to_actor": null})),
-        ("missing", serde_json::json!({})),
-    ];
-    for (name, properties) in seeded {
-        let mut note = Note::new("default", "message", name);
-        note.properties = Some(properties);
-        store.upsert_note(note).await.unwrap();
-    }
-    let filter = NoteFilter {
-        kind: Some("message".into()),
-        property_filters: vec![PropertyFilter {
-            json_path: "$.to_actor".into(),
-            op: FilterOp::TextStartsWithIndexed,
-            value: SqlValue::Text("email:".into()),
-        }],
-        ..Default::default()
-    };
-    let page = store
-        .query_notes_filtered_count_free(
-            "default",
-            &filter,
-            PageRequest {
-                limit: 50,
-                offset: 0,
-            },
-        )
-        .await
-        .unwrap();
-    let mut names: Vec<_> = page.items.iter().map(|n| n.content.clone()).collect();
-    names.sort();
-    assert_eq!(names, vec!["email:", "email:a@b.c"]);
-
-    let mut bucket_filter = filter.clone();
-    bucket_filter.property_filters[0].op = FilterOp::TextColonPrefixBucketIndexed;
-    let bucket_page = store
-        .query_notes_filtered_count_free(
-            "default",
-            &bucket_filter,
-            PageRequest {
-                limit: 50,
-                offset: 0,
-            },
-        )
-        .await
-        .unwrap();
-    let mut bucket_names: Vec<_> = bucket_page
-        .items
-        .iter()
-        .map(|n| n.content.clone())
-        .collect();
-    bucket_names.sort();
-    assert_eq!(
-        bucket_names, names,
-        "channel bucket must match the full prefix"
-    );
-    for invalid in ["", "email", "email::"] {
-        bucket_filter.property_filters[0].value = SqlValue::Text(invalid.into());
-        assert!(build_note_filter_where("default", &bucket_filter).is_err());
-    }
-
-    let every_text = NoteFilter {
-        kind: Some("message".into()),
-        property_filters: vec![PropertyFilter {
-            json_path: "$.to_actor".into(),
-            op: FilterOp::TextStartsWithIndexed,
-            value: SqlValue::Text(String::new()),
-        }],
-        ..Default::default()
-    };
-    let page = store
-        .query_notes_filtered_count_free(
-            "default",
-            &every_text,
-            PageRequest {
-                limit: 50,
-                offset: 0,
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        page.items.len(),
-        5,
-        "an empty prefix admits every text value and nothing else"
-    );
-}
+include!("note_tests/text_prefix_property_filter_tests.rs");
 
 fn atomic_mark_read_filter() -> khive_storage::note::NoteFilter {
     use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
@@ -2035,221 +1888,7 @@ async fn test_filtered_namespace_and_kind_isolation() {
     assert_eq!(page.total, Some(1));
 }
 
-#[tokio::test]
-async fn test_filtered_order_by_json_path_asc() {
-    let store = setup_memory_store();
-    use khive_storage::note::PropertyFilter as NotePropFilter;
-    use khive_storage::note::{FilterOp, NoteFilter, SortDir};
-    use khive_storage::types::{PageRequest, SqlValue};
-
-    // Insert in reverse order — filter should return ascending by trigger_at.
-    let n3 = make_note_with_props(
-        "ns1",
-        "scheduled_event",
-        "third",
-        serde_json::json!({"status": "pending", "trigger_at": "2027-01-03T00:00:00Z"}),
-    );
-    let n1 = make_note_with_props(
-        "ns1",
-        "scheduled_event",
-        "first",
-        serde_json::json!({"status": "pending", "trigger_at": "2027-01-01T00:00:00Z"}),
-    );
-    let n2 = make_note_with_props(
-        "ns1",
-        "scheduled_event",
-        "second",
-        serde_json::json!({"status": "pending", "trigger_at": "2027-01-02T00:00:00Z"}),
-    );
-    store.upsert_note(n3).await.unwrap();
-    store.upsert_note(n1).await.unwrap();
-    store.upsert_note(n2).await.unwrap();
-
-    let filter = NoteFilter {
-        kind: Some("scheduled_event".to_string()),
-        property_filters: vec![NotePropFilter {
-            json_path: "$.status".to_string(),
-            op: FilterOp::Eq,
-            value: SqlValue::Text("pending".to_string()),
-        }],
-        order_by: Some(("$.trigger_at".to_string(), SortDir::Asc)),
-        ..Default::default()
-    };
-
-    let page = store
-        .query_notes_filtered("ns1", &filter, PageRequest::default())
-        .await
-        .unwrap();
-    assert_eq!(page.items.len(), 3);
-    assert_eq!(page.items[0].content, "first");
-    assert_eq!(page.items[1].content, "second");
-    assert_eq!(page.items[2].content, "third");
-}
-
-#[tokio::test]
-async fn filtered_default_order_is_stable_across_equal_timestamp_pages() {
-    let store = setup_memory_store();
-    let created_at = 1_750_000_000_000_000_i64;
-    let mut expected_ids = Vec::new();
-
-    for index in 0..317 {
-        let mut note = make_note("ns1", "observation", &format!("note-{index}"));
-        note.created_at = created_at;
-        expected_ids.push(note.id);
-        store.upsert_note(note).await.unwrap();
-    }
-    expected_ids.sort_unstable();
-
-    let mut actual_ids = Vec::new();
-    let page_size = 29_u32;
-    let mut offset = 0_u64;
-    loop {
-        let page = store
-            .query_notes_filtered(
-                "ns1",
-                &NoteFilter::default(),
-                PageRequest {
-                    offset,
-                    limit: page_size,
-                },
-            )
-            .await
-            .unwrap();
-        if page.items.is_empty() {
-            break;
-        }
-        offset += page.items.len() as u64;
-        actual_ids.extend(page.items.into_iter().map(|note| note.id));
-    }
-
-    assert_eq!(actual_ids, expected_ids);
-}
-
-/// #1671: `query_notes` (the single-namespace `list` path) had no `id`
-/// tiebreak at all. Rows sharing `created_at` swept via offset pages must come
-/// back exactly once — no duplicates, no misses across page boundaries.
-#[tokio::test]
-async fn query_notes_offset_sweep_covers_equal_created_at_exactly_once() {
-    let store = setup_memory_store();
-    let created_at = 1_750_000_000_000_000_i64;
-    let mut expected_ids = Vec::new();
-
-    for index in 0..211 {
-        let mut note = make_note("ns1", "observation", &format!("note-{index}"));
-        note.created_at = created_at;
-        expected_ids.push(note.id);
-        store.upsert_note(note).await.unwrap();
-    }
-    expected_ids.sort_unstable();
-
-    let mut actual_ids = Vec::new();
-    let page_size = 37_u32;
-    let mut offset = 0_u64;
-    loop {
-        let page = store
-            .query_notes(
-                "ns1",
-                None,
-                PageRequest {
-                    offset,
-                    limit: page_size,
-                },
-            )
-            .await
-            .unwrap();
-        if page.items.is_empty() {
-            break;
-        }
-        offset += page.items.len() as u64;
-        actual_ids.extend(page.items.into_iter().map(|note| note.id));
-    }
-
-    assert_eq!(actual_ids, expected_ids);
-}
-
-/// #1671: a custom JSON `order_by` whose extracted value repeats must also get
-/// an `id` tiebreak in the primary key's direction, or offset pages over equal
-/// values are unsound.
-#[tokio::test]
-async fn query_notes_filtered_custom_order_offset_sweep_is_total() {
-    let store = setup_memory_store();
-    let mut expected_ids = Vec::new();
-
-    for index in 0..113 {
-        let note = make_note_with_props(
-            "ns1",
-            "observation",
-            &format!("note-{index}"),
-            serde_json::json!({"rank": 7}),
-        );
-        expected_ids.push(note.id);
-        store.upsert_note(note).await.unwrap();
-    }
-    expected_ids.sort_unstable_by(|a, b| b.cmp(a));
-
-    let filter = NoteFilter {
-        order_by: Some(("$.rank".to_string(), SortDir::Desc)),
-        ..Default::default()
-    };
-    let mut actual_ids = Vec::new();
-    let page_size = 23_u32;
-    let mut offset = 0_u64;
-    loop {
-        let page = store
-            .query_notes_filtered(
-                "ns1",
-                &filter,
-                PageRequest {
-                    offset,
-                    limit: page_size,
-                },
-            )
-            .await
-            .unwrap();
-        if page.items.is_empty() {
-            break;
-        }
-        offset += page.items.len() as u64;
-        actual_ids.extend(page.items.into_iter().map(|note| note.id));
-    }
-
-    assert_eq!(actual_ids, expected_ids);
-}
-
-#[tokio::test]
-async fn test_filtered_soft_deleted_excluded() {
-    let store = setup_memory_store();
-    use khive_storage::note::PropertyFilter as NotePropFilter;
-    use khive_storage::note::{FilterOp, NoteFilter};
-    use khive_storage::types::{DeleteMode, PageRequest, SqlValue};
-
-    let n = make_note_with_props(
-        "ns1",
-        "scheduled_event",
-        "to_delete",
-        serde_json::json!({"status": "pending"}),
-    );
-    let id = n.id;
-    store.upsert_note(n).await.unwrap();
-    store.delete_note(id, DeleteMode::Soft).await.unwrap();
-
-    let filter = NoteFilter {
-        kind: Some("scheduled_event".to_string()),
-        property_filters: vec![NotePropFilter {
-            json_path: "$.status".to_string(),
-            op: FilterOp::Eq,
-            value: SqlValue::Text("pending".to_string()),
-        }],
-        order_by: None,
-        ..Default::default()
-    };
-
-    let page = store
-        .query_notes_filtered("ns1", &filter, PageRequest::default())
-        .await
-        .unwrap();
-    assert_eq!(page.items.len(), 0, "soft-deleted rows must not appear");
-}
+include!("note_tests/json_ordering_and_pagination_tests.rs");
 
 #[tokio::test]
 async fn test_filtered_invalid_json_path_rejected() {
@@ -2527,17 +2166,29 @@ async fn pooled_transaction_commit_failure_with_verified_rollback_keeps_writer_u
     let result = store
         .with_writer_tx("test_pooled_commit", |conn| {
             conn.execute("INSERT INTO tx_finalize (id) VALUES (1)", [])?;
-            conn.authorizer(Some(deny_commit))?;
+            conn.test_authorizer(Some(deny_commit))?;
             Ok(())
         })
         .await;
+    assert_eq!(
+        result
+            .as_ref()
+            .err()
+            .and_then(StorageError::sqlite_write_failure),
+        Some(khive_storage::error::SqliteWriteFailure {
+            stage: khive_storage::error::SqliteWriteStage::Commit,
+            primary_code: rusqlite::ffi::SQLITE_AUTH,
+            extended_code: rusqlite::ffi::SQLITE_AUTH,
+            settlement_unknown: false,
+        })
+    );
     assert!(
         matches!(
             &result,
             Err(StorageError::WriterTaskRequestFailed {
                 request_state: WriterTaskRequestState::TransactionRolledBack,
                 source,
-            }) if matches!(source.as_ref(), StorageError::Pool { operation, .. }
+            }) if matches!(source.without_sqlite_write_stage(), StorageError::Pool { operation, .. }
                 if operation == "test_pooled_commit")
         ),
         "a denied COMMIT followed by a verified rollback must report the commit error: {result:?}"
@@ -2549,7 +2200,7 @@ async fn pooled_transaction_commit_failure_with_verified_rollback_keeps_writer_u
         .expect("verified rollback must leave the pooled writer usable");
     let conn = writer.conn();
     assert!(conn.is_autocommit());
-    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+    conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
         .unwrap();
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM tx_finalize", [], |row| row.get(0))
@@ -2573,7 +2224,7 @@ async fn pooled_transaction_rollback_failure_reports_unknown_and_retires_writer(
             "test_pooled_rollback",
             |conn| -> Result<(), rusqlite::Error> {
                 conn.execute("INSERT INTO tx_rollback_fault (id) VALUES (1)", [])?;
-                conn.authorizer(Some(deny_rollback))?;
+                conn.test_authorizer(Some(deny_rollback))?;
                 Err(rusqlite::Error::InvalidQuery)
             },
         )
@@ -2583,6 +2234,7 @@ async fn pooled_transaction_rollback_failure_reports_unknown_and_retires_writer(
             result,
             Err(StorageError::WriterTaskTerminated {
                 request_state: WriterTaskRequestState::SideEffectsUnknown,
+                ..
             })
         ),
         "a failed rollback cannot claim that the attempted write did not land"
@@ -2594,12 +2246,10 @@ async fn pooled_transaction_rollback_failure_reports_unknown_and_retires_writer(
         "a connection with an unverified rollback must never be checked out again"
     );
 
-    let legacy = store.pool.legacy_conn();
-    let legacy_guard = legacy.lock();
-    let direct_probe = legacy_guard.query_row("SELECT 1", [], |row| row.get::<_, i64>(0));
+    let direct_probe = store.pool.probe_retired_pooled_writer_for_test();
     assert!(
         direct_probe.is_err(),
-        "the compatibility raw-connection handle must not bypass retirement quarantine"
+        "the retired pooled connection's authorizer must still quarantine raw SQL"
     );
 }
 
@@ -2617,7 +2267,7 @@ async fn pooled_transaction_panic_with_failed_rollback_reports_unknown_and_retir
     let result = store
         .with_writer_tx("test_pooled_panic", |conn| -> Result<(), rusqlite::Error> {
             conn.execute("INSERT INTO tx_panic_fault (id) VALUES (1)", [])?;
-            conn.authorizer(Some(deny_rollback))?;
+            conn.test_authorizer(Some(deny_rollback))?;
             panic!("intentional pooled transaction panic");
         })
         .await;
@@ -2626,6 +2276,7 @@ async fn pooled_transaction_panic_with_failed_rollback_reports_unknown_and_retir
             result,
             Err(StorageError::WriterTaskTerminated {
                 request_state: WriterTaskRequestState::SideEffectsUnknown,
+                ..
             })
         ),
         "a panic whose rollback cannot be verified must report unknown side effects"
@@ -2641,10 +2292,10 @@ async fn pooled_transaction_panic_with_failed_rollback_reports_unknown_and_retir
 #[tokio::test]
 async fn pooled_transaction_refuses_preexisting_non_autocommit_connection() {
     let store = setup_memory_store();
-    {
-        let writer = store.pool.try_writer().unwrap();
-        writer.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
-    }
+    store
+        .pool
+        .leave_pooled_writer_transaction_open_for_test()
+        .unwrap();
     let operation_ran = Arc::new(AtomicBool::new(false));
     let operation_ran_in_closure = Arc::clone(&operation_ran);
 
@@ -2659,6 +2310,7 @@ async fn pooled_transaction_refuses_preexisting_non_autocommit_connection() {
             result,
             Err(StorageError::WriterTaskTerminated {
                 request_state: WriterTaskRequestState::SideEffectsUnknown,
+                ..
             })
         ),
         "an inherited transaction has an unknown prior outcome and must fail closed"
@@ -3760,7 +3412,7 @@ async fn unread_probe_bounded_by_inbound_not_by_recipients_own_outbound_history(
 }
 
 /// `comm.inbox(status="unread")` builds its `to_actor` predicate at
-/// khive-pack-comm/src/handlers.rs ~613-624: `direction` (`Eq`), `read`
+/// khive-pack-comm/src/handlers/inbox.rs::handle_inbox: `direction` (`Eq`), `read`
 /// (`JsonTypeNeMissing`), then `to_actor`. Before this test's fix, that last
 /// filter used `FilterOp::EqOrMissing`, whose SQL
 /// (`(json_extract(...) = ? OR json_extract(...) IS NULL)`) is a different
@@ -3770,10 +3422,10 @@ async fn unread_probe_bounded_by_inbound_not_by_recipients_own_outbound_history(
 /// fell back to `idx_comm_message_direction` (namespace, kind, direction,
 /// read — no recipient key at all) and every caller's unread inbox listing
 /// scanned every unread inbound row IN THE NAMESPACE, not just their own.
-/// `idx_comm_message_direction` (khive-pack-comm/src/vocab.rs) is reproduced
-/// here verbatim since khive-db has no dependency on khive-pack-comm to
-/// import it from; it must be present for this test to reflect the real
-/// index landscape a comm-pack-loaded server actually has.
+/// `idx_comm_message_direction` (core migration V52,
+/// sql/052-comm-core-indexes.sql) is reproduced here verbatim because this
+/// fixture builds the notes table without running migrations; it must be
+/// present for this test to reflect the index landscape of a real database.
 ///
 /// The control section pins the pre-fix `EqOrMissing` shape (still reachable
 /// as a `FilterOp` variant) against the exact regression this closes: it
@@ -3887,11 +3539,11 @@ async fn inbox_unread_listing_uses_recipient_index_not_direction_blind_scan() {
     fn build_pool_with_comm_indexes() -> Arc<ConnectionPool> {
         let pool = setup_pool();
         let writer = pool.writer().unwrap();
-        // Reproduces khive-pack-comm/src/vocab.rs COMM_SCHEMA_PLAN_STMTS's
-        // idx_comm_message_direction verbatim: applied at comm-pack init in
-        // the real system, so this test reflects the actual index landscape
-        // a comm-pack-loaded server has (khive-db cannot depend on
-        // khive-pack-comm to import the constant directly).
+        // Reproduces idx_comm_message_direction from core migration V52
+        // (sql/052-comm-core-indexes.sql) verbatim: every migrated database
+        // has it, so this test reflects the real index landscape; this
+        // fixture builds the notes table without running migrations, so the
+        // index is created here.
         writer
             .conn()
             .execute_batch(

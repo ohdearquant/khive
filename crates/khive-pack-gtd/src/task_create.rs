@@ -12,6 +12,7 @@
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{KhiveRuntime, NamespaceToken, Resolved, RuntimeError};
 use khive_storage::EdgeRelation;
 
@@ -56,7 +57,8 @@ fn optional_string_field(
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(other) => Err(RuntimeError::InvalidInput(format!(
-            "{display_name} must be a string or null; got {other}"
+            "{display_name} must be a string or null; got {}",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
         ))),
     }
 }
@@ -105,7 +107,8 @@ impl TaskCreateInput {
             Some(Value::Object(_)) => args["properties"].clone(),
             Some(other) => {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "properties must be an object or null; got {other}"
+                    "properties must be an object or null; got {}",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, &other.to_string())
                 )))
             }
         };
@@ -281,8 +284,9 @@ pub(crate) async fn prepare_task_create(
     let status = normalize_status(status_in);
     if !is_valid_status(status) {
         return Err(RuntimeError::InvalidInput(format!(
-            "invalid status {status_in:?} — valid: inbox, next, waiting, someday, active, done, cancelled \
-             (aliases: in_progress, todo, blocked, later, finished)"
+            "invalid status {:?} — valid: inbox, next, waiting, someday, active, done, cancelled \
+             (aliases: in_progress, todo, blocked, later, finished)",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, status_in)
         )));
     }
     if is_terminal(status) {
@@ -299,6 +303,15 @@ pub(crate) async fn prepare_task_create(
     let obj = props
         .as_object_mut()
         .expect("props is object after replacement");
+    // Only a cancellation can record a duplicate judgment, so a new task never carries one.
+    if obj.contains_key("duplicate_of") {
+        return Err(RuntimeError::InvalidInput(
+            "properties.duplicate_of cannot be set when creating a task; record a duplicate \
+             by cancelling the task with gtd.transition or gtd.complete and a duplicate_of \
+             argument"
+                .into(),
+        ));
+    }
 
     let priority = input.priority.clone().or_else(|| {
         obj.get("priority")
@@ -308,7 +321,8 @@ pub(crate) async fn prepare_task_create(
     if let Some(ref p) = priority {
         if !is_valid_priority(p) {
             return Err(RuntimeError::InvalidInput(format!(
-                "invalid priority {p:?} — valid: p0, p1, p2, p3"
+                "invalid priority {:?} — valid: p0, p1, p2, p3",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, p)
             )));
         }
     }
@@ -399,12 +413,30 @@ pub(crate) async fn prepare_task_create(
             None => runtime.config().display_timezone,
             Some(name) => name.parse::<chrono_tz::Tz>().map_err(|_| {
                 RuntimeError::InvalidInput(format!(
-                    "timezone must be an IANA zone name (e.g. \"America/New_York\"); got {name:?}"
+                    "timezone must be an IANA zone name (e.g. \"America/New_York\"); got {:?}",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, name)
                 ))
             })?,
         };
+        // Validate the retained nested alias after the selected zone so its
+        // existing refusal diagnostic remains unchanged.
+        if let Some(value) = obj.get("timezone").filter(|value| !value.is_null()) {
+            let name = value.as_str().ok_or_else(|| {
+                RuntimeError::InvalidInput(format!(
+                    "properties.timezone must be a string or null; got {}",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, &value.to_string())
+                ))
+            })?;
+            name.parse::<chrono_tz::Tz>().map_err(|_| {
+                RuntimeError::InvalidInput(format!(
+                    "properties.timezone must be an IANA zone name (e.g. \"America/New_York\"); got {:?}",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, name)
+                ))
+            })?;
+        }
         obj.insert("due".into(), json!(parse_due(due, zone)?));
         obj.insert("due_timezone".into(), json!(zone.name()));
+        obj.remove("timezone");
     }
     if let Some(ref start) = input.start {
         obj.insert("start".into(), json!(start));

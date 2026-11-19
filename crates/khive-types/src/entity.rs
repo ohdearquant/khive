@@ -113,6 +113,19 @@ impl FromStr for EntityKind {
     }
 }
 
+/// Entity-kind admission for an explicit archive import.
+///
+/// This policy never changes relation validation or registers new kinds for
+/// ordinary writes. VCS snapshot degradation is a separate policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImportKindPolicy {
+    /// Refuse entity kinds outside the importer's installed vocabulary.
+    #[default]
+    Strict,
+    /// Preserve genuinely unknown, nonblank entity-kind spellings verbatim.
+    PreserveUnknown,
+}
+
 /// A graph node with a type, display name, and key-value properties.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -167,12 +180,19 @@ pub struct Link {
     pub deleted_at: Option<Timestamp>,
 }
 
+/// Return whether an edge weight is finite and within `[0.0, 1.0]`.
+///
+/// Both endpoints and signed zero are accepted; NaN and infinities are rejected.
+pub fn validate_edge_weight(weight: f64) -> bool {
+    weight.is_finite() && (0.0..=1.0).contains(&weight)
+}
+
 impl Link {
     /// Return `true` if all numeric fields carry finite, domain-valid values.
     ///
     /// - `weight` must be finite and in `[0.0, 1.0]`.
     pub fn is_valid(&self) -> bool {
-        self.weight.is_finite() && self.weight >= 0.0 && self.weight <= 1.0
+        validate_edge_weight(self.weight)
     }
 }
 
@@ -220,7 +240,7 @@ impl TryFrom<LinkRaw> for Link {
                 raw.weight
             ));
         }
-        if !(0.0..=1.0).contains(&raw.weight) {
+        if !validate_edge_weight(raw.weight) {
             return Err(alloc::format!(
                 "Link weight must be in [0.0, 1.0], got {}",
                 raw.weight
@@ -289,6 +309,22 @@ mod tests {
     use crate::{Namespace, Timestamp};
     #[cfg(feature = "serde")]
     use alloc::string::ToString;
+
+    #[test]
+    fn edge_weight_validation_covers_numeric_boundaries() {
+        for weight in [-0.0, 0.0, f64::from_bits(1), 0.5, 1.0] {
+            assert!(crate::validate_edge_weight(weight), "{weight:?}");
+        }
+        for weight in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -f64::from_bits(1),
+            1.0 + f64::EPSILON,
+        ] {
+            assert!(!crate::validate_edge_weight(weight), "{weight:?}");
+        }
+    }
 
     #[test]
     fn entity_with_properties() {

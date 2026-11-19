@@ -8,6 +8,80 @@ use khive_types::{Id128, NoteDraft, ProposalChangeset, ProposalCreatedPayload};
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
 use uuid::Uuid;
 
+#[tokio::test]
+async fn canonical_committed_reindex_failure_preserves_applying_and_cannot_replay() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+    let entity = rt
+        .create_entity_with_embedding_report(
+            &tok,
+            "concept",
+            None,
+            "CanonicalBeforeReindexFailure",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap()
+        .0;
+    let envelope = khive_changeset::Envelope::new(
+        "fixture",
+        "fixture-family",
+        khive_types::Timestamp::from_secs(1),
+    );
+    let op = serde_json::json!({"op":"update","target_id":entity.id,
+        "patch":{"target":"entity","name":"CanonicalCommitted"},
+        "preimage":{"target":"entity","name":"CanonicalBeforeReindexFailure"}});
+    let proposal_id = Uuid::new_v4();
+    seed_proposal_created_event(
+        &rt,
+        &tok,
+        proposal_id,
+        ProposalChangeset::Canonical {
+            schema_version: khive_changeset::CURRENT_SCHEMA_VERSION,
+            delta: format!("{}\n{op}\n", serde_json::to_string(&envelope).unwrap()),
+        },
+    )
+    .await;
+    insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+    replace_fts_entities_with_incompatible_table(&rt).await;
+    let registry = build_registry(&rt);
+    let worker = ProposalApplyWorker::new(rt.clone());
+    worker
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .unwrap();
+    let committed = rt.get_entity(&tok, entity.id).await.unwrap();
+    assert_eq!(committed.name, "CanonicalCommitted");
+    let row = ProposalsProjectionWorker::new(rt.clone())
+        .get_proposal_row(&tok, proposal_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "applying");
+    let events = rt.events(&tok).unwrap();
+    assert_eq!(
+        events
+            .count_events(EventFilter {
+                kinds: vec![EventKind::ProposalApplied],
+                payload_proposal_id: Some(proposal_id),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        0
+    );
+    worker
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        rt.get_entity(&tok, entity.id).await.unwrap().updated_at,
+        committed.updated_at
+    );
+}
+
 struct TruncationService;
 
 #[async_trait]
@@ -1647,4 +1721,738 @@ fn count_new_entries_recursive() {
         ],
     };
     assert_eq!(count_new_entries(&nested), 3, "1 + 2 nested = 3");
+}
+
+mod supersede_liveness {
+    use super::*;
+    use khive_runtime::{AtomicOpFailure, AtomicRunOutcome, EventAttribution, RuntimeConfig};
+    use khive_storage::{Event, LinkId, Note};
+    use khive_types::{
+        ApplyResult, EdgeRelation, ProposalAppliedPayload, ProposalDecision,
+        ProposalReviewedPayload, SubstrateKind,
+    };
+    use serde_json::{json, Value};
+
+    struct Fixture {
+        runtime: KhiveRuntime,
+        registry: VerbRegistry,
+        reviewer: NamespaceToken,
+        old: Uuid,
+        new: Uuid,
+        notes: [Uuid; 2],
+        invalid: Vec<Uuid>,
+    }
+
+    impl Fixture {
+        async fn new() -> Self {
+            let runtime = KhiveRuntime::new(RuntimeConfig {
+                db_path: None,
+                packs: vec!["kg".into()],
+                brain_profile: None,
+                actor_id: Some("apply-reviewer".into()),
+                events_split: None,
+                ..RuntimeConfig::no_embeddings()
+            })
+            .unwrap();
+            let reviewer = runtime.authorize(Namespace::local()).unwrap();
+            let mut builder = VerbRegistryBuilder::new();
+            builder.with_actor_id(Some("apply-proposer".into()));
+            builder.register(crate::KgPack::new(runtime.clone()));
+            let registry = builder.build().unwrap();
+            runtime.install_edge_rules(registry.all_edge_rules());
+            let mut fixture = Self {
+                runtime,
+                registry,
+                reviewer,
+                old: Uuid::nil(),
+                new: Uuid::nil(),
+                notes: [Uuid::nil(); 2],
+                invalid: Vec::new(),
+            };
+            fixture.old = fixture.entity("Old", "local").await;
+            fixture.new = fixture.entity("New", "local").await;
+            for index in 0..2 {
+                fixture.notes[index] = id(&fixture
+                    .call(
+                        "create",
+                        json!({
+                            "kind": "observation", "content": format!("Live ordinary note {index}"),
+                            "skip_dedup_check": true
+                        }),
+                    )
+                    .await);
+                let stored = fixture
+                    .runtime
+                    .notes(&fixture.reviewer)
+                    .unwrap()
+                    .get_note(fixture.notes[index])
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(stored.kind, "observation");
+                assert!(stored.deleted_at.is_none());
+            }
+            let memory = Note::new("local", "memory", "Typed memory-note substrate");
+            fixture
+                .runtime
+                .notes(&fixture.reviewer)
+                .unwrap()
+                .upsert_note(memory.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(
+                    fixture
+                        .runtime
+                        .notes(&fixture.reviewer)
+                        .unwrap()
+                        .get_note(memory.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(&memory).unwrap()
+            );
+            let linked = fixture
+                .call(
+                    "link",
+                    json!({
+                        "source_id": fixture.old, "target_id": fixture.new, "relation": "contains"
+                    }),
+                )
+                .await;
+            let edge_id = id(&linked);
+            let edge = fixture
+                .runtime
+                .graph(&fixture.reviewer)
+                .unwrap()
+                .get_edge(LinkId(edge_id))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(edge.relation, EdgeRelation::Contains);
+            let entity_event = fixture
+                .events(EventFilter {
+                    kinds: vec![EventKind::EntityCreated],
+                    target_id: Some(fixture.old),
+                    ..Default::default()
+                })
+                .await;
+            assert_eq!(entity_event.len(), 1);
+            let deleted = fixture.entity("Already deleted", "local").await;
+            fixture.call("delete", json!({"id": deleted})).await;
+            fixture.invalid = vec![
+                Uuid::new_v4(),
+                fixture.notes[0],
+                memory.id,
+                edge_id,
+                entity_event[0].id,
+                deleted,
+            ];
+            for invalid in &fixture.invalid {
+                assert!(matches!(
+                    fixture
+                        .runtime
+                        .get_entity(&fixture.reviewer, *invalid)
+                        .await,
+                    Err(RuntimeError::NotFound(_))
+                ));
+            }
+            // Real immutable proposal history and the production projection predate every case.
+            fixture
+                .call(
+                    "propose",
+                    json!({
+                        "title": "Retained history", "description": "Persisted unrelated proposal", "changeset": {"kind": "add_entity",
+                            "entity": {"kind": "concept", "name": "Unapplied history"}}
+                    }),
+                )
+                .await;
+            let domain = fixture.domain().await;
+            for key in ["entities", "notes", "edges", "entity_fts", "note_fts"] {
+                assert!(
+                    !domain[key].as_array().unwrap().is_empty(),
+                    "nonempty {key}"
+                );
+            }
+            assert!(!fixture.events(EventFilter::default()).await.is_empty());
+            fixture
+        }
+
+        async fn call(&self, verb: &str, params: Value) -> Value {
+            self.registry.dispatch(verb, params).await.unwrap()
+        }
+
+        async fn entity(&self, name: &str, namespace: &str) -> Uuid {
+            let result = self
+                .call(
+                    "create",
+                    json!({
+                        "kind": "concept", "name": name, "namespace": namespace,
+                        "description": format!("Searchable {name} entity"),
+                        "properties": {"fixture": name}, "skip_dedup_check": true
+                    }),
+                )
+                .await;
+            let id = id(&result);
+            let stored = self.runtime.get_entity(&self.reviewer, id).await.unwrap();
+            assert_eq!(stored.namespace, namespace);
+            assert!(stored.deleted_at.is_none());
+            id
+        }
+
+        async fn domain(&self) -> Value {
+            let mut reader = self.runtime.sql().reader().await.unwrap();
+            let mut result = serde_json::Map::new();
+            for (name, query) in [
+                ("entities", "SELECT * FROM entities ORDER BY id"),
+                ("notes", "SELECT * FROM notes ORDER BY id"),
+                ("edges", "SELECT * FROM graph_edges ORDER BY id"),
+                (
+                    "entity_fts",
+                    "SELECT rowid, * FROM fts_entities ORDER BY rowid",
+                ),
+                ("note_fts", "SELECT rowid, * FROM fts_notes ORDER BY rowid"),
+            ] {
+                let rows = reader
+                    .query_all(SqlStatement::new(query, vec![]))
+                    .await
+                    .unwrap();
+                result.insert(name.into(), serde_json::to_value(rows).unwrap());
+            }
+            Value::Object(result)
+        }
+
+        async fn events(&self, filter: EventFilter) -> Vec<Event> {
+            let store = self.runtime.events(&self.reviewer).unwrap();
+            let page = store
+                .query_events(
+                    filter.clone(),
+                    PageRequest {
+                        limit: 1000,
+                        offset: 0,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                store.count_events(filter).await.unwrap(),
+                page.items.len() as u64
+            );
+            page.items
+        }
+
+        async fn projection(&self, proposal: Uuid) -> Value {
+            let rows = self.runtime.sql().reader().await.unwrap().query_all(SqlStatement::new(
+                "SELECT proposal_id, namespace, proposer, title, status, created_at, CASE WHEN proposal_id = ?1 THEN NULL ELSE updated_at END AS updated_at, expiry, last_decision, review_count, approve_count, reject_count FROM proposals_open ORDER BY proposal_id",
+                vec![SqlValue::Text(proposal.to_string())],
+            )).await.unwrap();
+            // Only this proposal's updated_at may change during applying -> approved.
+            // Every other projection row, timestamp and review counter stays exact.
+            assert!(!rows.is_empty());
+            serde_json::to_value(rows).unwrap()
+        }
+
+        async fn approve(&self, proposal: Uuid) {
+            let projection = ProposalsProjectionWorker::new(self.runtime.clone());
+            let open = projection
+                .get_proposal_row(&self.reviewer, proposal)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(open.status, "open");
+            assert_eq!(open.proposer, "apply-proposer");
+            assert_ne!(open.proposer, self.reviewer.actor().id);
+            let payload = ProposalReviewedPayload {
+                proposal_id: Id128::from_u128(proposal.as_u128()),
+                reviewer: self.reviewer.actor().id.clone(),
+                decision: ProposalDecision::Approve,
+                comment: Some("Approve before a separately scheduled apply".into()),
+            };
+            let mut event = Event::new(
+                "local",
+                "review",
+                EventKind::ProposalReviewed,
+                SubstrateKind::Entity,
+                &payload.reviewer,
+            );
+            event.payload = serde_json::to_value(&payload).unwrap();
+            event.aggregate_kind = Some("proposal".into());
+            event.aggregate_id = Some(proposal);
+            let expected = EventAttribution::from_token(&self.reviewer).stamp(event.clone());
+            let (changed, event_id) = projection
+                .reviewed_and_emit(&self.reviewer, &payload, event, true)
+                .await
+                .unwrap();
+            assert!(changed);
+            assert_eq!(event_id, expected.id);
+            assert_eq!(
+                self.runtime
+                    .events(&self.reviewer)
+                    .unwrap()
+                    .get_event(event_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                expected
+            );
+            let approved = projection
+                .get_proposal_row(&self.reviewer, proposal)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(approved.proposal_id, proposal.to_string());
+            assert_eq!(approved.proposer, "apply-proposer");
+            assert_eq!(approved.status, "approved");
+            assert_eq!(approved.approve_count, 1);
+            assert_eq!(approved.reject_count, 0);
+            let counters = self
+                .runtime
+                .sql()
+                .reader()
+                .await
+                .unwrap()
+                .query_row(SqlStatement::new(
+                    "SELECT review_count, last_decision FROM proposals_open WHERE proposal_id = ?1",
+                    vec![SqlValue::Text(proposal.to_string())],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(counters.i64_or_none("review_count"), Some(1));
+            assert_eq!(counters.text_or_none("last_decision"), Some("approve"));
+            assert!(self.applied(proposal).await.is_empty());
+        }
+
+        async fn propose(&self, changeset: &ProposalChangeset) -> Uuid {
+            let response = self
+                .call(
+                    "propose",
+                    json!({
+                        "title": "Apply-time entity liveness", "description": "Two stored entities",
+                        "changeset": changeset
+                    }),
+                )
+                .await;
+            assert_eq!(response["status"], "open");
+            let proposal = id(&response);
+            self.approve(proposal).await;
+            proposal
+        }
+
+        async fn historical(&self, changeset: ProposalChangeset) -> Uuid {
+            let proposal = Uuid::new_v4();
+            let payload = ProposalCreatedPayload {
+                proposal_id: Id128::from_u128(proposal.as_u128()),
+                proposer: "apply-proposer".into(),
+                title: "Historical supersession".into(),
+                description: "Persisted before entity-only admission".into(),
+                changeset,
+                reviewers: vec![],
+                expiry: None,
+                parent_id: None,
+            };
+            let mut event = Event::new(
+                "local",
+                "propose",
+                EventKind::ProposalCreated,
+                SubstrateKind::Entity,
+                "apply-proposer",
+            );
+            event.payload = serde_json::to_value(&payload).unwrap();
+            event.aggregate_kind = Some("proposal".into());
+            event.aggregate_id = Some(proposal);
+            let event = EventAttribution::from_token(&self.reviewer).stamp(event);
+            let event_id = event.id;
+            self.runtime
+                .events(&self.reviewer)
+                .unwrap()
+                .append_event(event.clone())
+                .await
+                .unwrap();
+            ProposalsProjectionWorker::new(self.runtime.clone())
+                .on_proposal_created(
+                    &self.reviewer,
+                    proposal,
+                    &payload.proposer,
+                    &payload.title,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                self.runtime
+                    .events(&self.reviewer)
+                    .unwrap()
+                    .get_event(event_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                event
+            );
+            self.approve(proposal).await;
+            proposal
+        }
+
+        async fn applied(&self, proposal: Uuid) -> Vec<Event> {
+            self.events(EventFilter {
+                kinds: vec![EventKind::ProposalApplied],
+                payload_proposal_id: Some(proposal),
+                ..Default::default()
+            })
+            .await
+        }
+
+        async fn failed_without_domain_write(&self, proposal: Uuid, raw_error: String) {
+            let domain = self.domain().await;
+            let projection = self.projection(proposal).await;
+            let history = self.events(EventFilter::default()).await;
+            assert!(self.applied(proposal).await.is_empty());
+            ProposalApplyWorker::new(self.runtime.clone())
+                .maybe_apply(&self.reviewer, proposal, &self.registry, None)
+                .await
+                .unwrap();
+            let applied = self.applied(proposal).await;
+            assert_eq!(applied.len(), 1);
+            let payload: ProposalAppliedPayload =
+                serde_json::from_value(applied[0].payload.clone()).unwrap();
+            assert_eq!(payload.proposal_id, Id128::from_u128(proposal.as_u128()));
+            assert_eq!(payload.applied_by, "system:propose-apply");
+            assert_eq!(
+                applied[0].actor,
+                format!(
+                    "{}:{}",
+                    self.reviewer.actor().kind,
+                    self.reviewer.actor().id
+                )
+            );
+            assert_eq!(
+                payload.result,
+                ApplyResult::Failed {
+                    error: RuntimeError::NotFound(raw_error).to_string(),
+                    applied_step_count: 0
+                }
+            );
+            assert_eq!(self.domain().await, domain);
+            assert_eq!(self.projection(proposal).await, projection);
+            let after = self.events(EventFilter::default()).await;
+            assert_eq!(after.len(), history.len() + 1);
+            for old in history {
+                assert_eq!(after.iter().find(|event| event.id == old.id), Some(&old));
+            }
+        }
+
+        async fn assert_edge(&self, source: Uuid, target: Uuid) {
+            let graph = self.runtime.graph(&self.reviewer).unwrap();
+            let edge = graph
+                .get_edge_by_natural_key_including_deleted(
+                    "local",
+                    source,
+                    target,
+                    EdgeRelation::Supersedes,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(edge.source_id, source);
+            assert_eq!(edge.target_id, target);
+            assert_eq!(edge.relation, EdgeRelation::Supersedes);
+            assert!(edge.deleted_at.is_none());
+            assert!(graph
+                .get_edge_by_natural_key_including_deleted(
+                    "local",
+                    target,
+                    source,
+                    EdgeRelation::Supersedes
+                )
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    fn id(value: &Value) -> Uuid {
+        let text = value["id"].as_str().unwrap();
+        let id = Uuid::parse_str(text).unwrap();
+        assert_eq!(text, id.to_string());
+        id
+    }
+
+    fn supersede(old: Uuid, new: Uuid, nested: bool) -> ProposalChangeset {
+        let step = ProposalChangeset::SupersedeEntity {
+            old: Id128::from_u128(old.as_u128()),
+            new: Id128::from_u128(new.as_u128()),
+        };
+        if nested {
+            ProposalChangeset::Compound {
+                steps: vec![ProposalChangeset::Compound { steps: vec![step] }],
+            }
+        } else {
+            step
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_supersession_refuses_deleted_and_merged_operands() {
+        for old_operand in [true, false] {
+            for merged in [false, true] {
+                for nested in [false, true] {
+                    let f = Fixture::new().await;
+                    let proposal = f.propose(&supersede(f.old, f.new, nested)).await;
+                    let invalid = if old_operand { f.old } else { f.new };
+                    let detail = if merged {
+                        let kept_name = if old_operand { "Old kept" } else { "New kept" };
+                        let kept = f.entity(kept_name, "local").await;
+                        f.call("merge", json!({"into_id": kept, "from_id": invalid}))
+                            .await;
+                        let tombstone = f
+                            .runtime
+                            .get_entity_including_deleted(&f.reviewer, invalid)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert!(tombstone.deleted_at.is_some());
+                        assert_eq!(tombstone.merged_into, Some(kept));
+                        format!("{invalid} was merged into {kept}; query the kept id")
+                    } else {
+                        f.call("delete", json!({"id": invalid})).await;
+                        assert!(f
+                            .runtime
+                            .get_entity_including_deleted(&f.reviewer, invalid)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .deleted_at
+                            .is_some());
+                        format!("entity {invalid}")
+                    };
+                    assert!(matches!(f.runtime.get_entity(&f.reviewer, invalid).await,
+                        Err(RuntimeError::NotFound(message)) if message == detail));
+                    f.failed_without_domain_write(
+                        proposal,
+                        format!("{invalid} does not name a live entity: {detail}"),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_supersession_refuses_non_entity_operands() {
+        let f = Fixture::new().await;
+        // Run the legal generic note pair first: omitting the entity precondition
+        // must reach an erroneous successful apply, not an unrelated missing-ID refusal.
+        for nested in [false, true] {
+            let proposal = f
+                .historical(supersede(f.notes[0], f.notes[1], nested))
+                .await;
+            f.failed_without_domain_write(
+                proposal,
+                format!(
+                    "{} does not name a live entity: entity {}",
+                    f.notes[0], f.notes[0]
+                ),
+            )
+            .await;
+        }
+        for invalid in &f.invalid {
+            for old_operand in [true, false] {
+                for nested in [false, true] {
+                    let (old, new) = if old_operand {
+                        (*invalid, f.new)
+                    } else {
+                        (f.old, *invalid)
+                    };
+                    let proposal = f.historical(supersede(old, new, nested)).await;
+                    f.failed_without_domain_write(
+                        proposal,
+                        format!("{invalid} does not name a live entity: entity {invalid}"),
+                    )
+                    .await;
+                }
+            }
+        }
+        // The underlying link contract admits note-to-note Supersedes; only the
+        // proposal's entity precondition rejects this historical changeset.
+        f.call(
+            "link",
+            json!({"source_id": f.notes[1], "target_id": f.notes[0],
+            "relation": "supersedes"}),
+        )
+        .await;
+        f.assert_edge(f.notes[1], f.notes[0]).await;
+    }
+
+    #[tokio::test]
+    async fn approved_supersession_applies_cross_namespace_and_restored_entities() {
+        let f = Fixture::new().await;
+        let old = f.entity("Cross namespace old", "old-space").await;
+        let new = f.entity("Cross namespace new", "new-space").await;
+        let proposal = f.propose(&supersede(old, new, true)).await;
+        let worker = ProposalApplyWorker::new(f.runtime.clone());
+        worker
+            .maybe_apply(&f.reviewer, proposal, &f.registry, None)
+            .await
+            .unwrap();
+        f.assert_edge(new, old).await;
+        let applied = f.applied(proposal).await;
+        assert_eq!(applied.len(), 1);
+        let payload: ProposalAppliedPayload =
+            serde_json::from_value(applied[0].payload.clone()).unwrap();
+        assert!(
+            matches!(payload.result, ApplyResult::Success { ref created_records } if created_records.is_empty())
+        );
+        let row = ProposalsProjectionWorker::new(f.runtime.clone())
+            .get_proposal_row(&f.reviewer, proposal)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "applied");
+        assert_eq!((row.approve_count, row.reject_count), (1, 0));
+        let stable = f.domain().await;
+        let history = f.events(EventFilter::default()).await;
+        worker
+            .maybe_apply(&f.reviewer, proposal, &f.registry, None)
+            .await
+            .unwrap();
+        assert_eq!(f.domain().await, stable);
+        assert_eq!(f.events(EventFilter::default()).await, history);
+
+        let retry = f.propose(&supersede(f.old, f.new, false)).await;
+        f.call("delete", json!({"id": f.old})).await;
+        f.failed_without_domain_write(
+            retry,
+            format!("{} does not name a live entity: entity {}", f.old, f.old),
+        )
+        .await;
+        let (restored, changed) = f
+            .runtime
+            .restore_entity(&f.reviewer, f.old)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(changed);
+        assert_eq!(restored.id, f.old);
+        assert!(restored.deleted_at.is_none());
+        worker
+            .maybe_apply(&f.reviewer, retry, &f.registry, None)
+            .await
+            .unwrap();
+        f.assert_edge(f.new, f.old).await;
+        let results = f.applied(retry).await;
+        assert_eq!(results.len(), 2);
+        let payloads: Vec<ProposalAppliedPayload> = results
+            .iter()
+            .map(|event| serde_json::from_value(event.payload.clone()).unwrap())
+            .collect();
+        assert_eq!(
+            payloads
+                .iter()
+                .filter(|payload| matches!(payload.result, ApplyResult::Failed { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            payloads
+                .iter()
+                .filter(|payload| matches!(payload.result, ApplyResult::Success { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_supersession_rolls_back_after_either_endpoint_is_deleted() {
+        for old_operand in [true, false] {
+            let f = Fixture::new().await;
+            let worker = ProposalApplyWorker::new(f.runtime.clone());
+            let changeset = supersede(f.old, f.new, false);
+            assert!(f
+                .runtime
+                .graph(&f.reviewer)
+                .unwrap()
+                .get_edge_by_natural_key_including_deleted(
+                    "local",
+                    f.new,
+                    f.old,
+                    EdgeRelation::Supersedes
+                )
+                .await
+                .unwrap()
+                .is_none());
+            let prepared = worker
+                .prepare_changeset(
+                    &f.reviewer,
+                    &changeset,
+                    &f.registry,
+                    &mut WriteBudget::new(None),
+                )
+                .await
+                .unwrap();
+            let super::super::worker::PreparedApply::Atomic { plans, .. } = prepared else {
+                panic!("supersession uses the canonical atomic writer");
+            };
+            assert_eq!(plans.len(), 1);
+            let invalid = if old_operand { f.old } else { f.new };
+            f.call("delete", json!({"id": invalid})).await;
+            let domain = f.domain().await;
+            let history = f.events(EventFilter::default()).await;
+            let outcome = khive_runtime::run_atomic_unit(f.runtime.sql().as_ref(), plans)
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    AtomicRunOutcome::RolledBack {
+                        failed_op_index: 0,
+                        failure: AtomicOpFailure::GuardFailed { observed: 0, .. }
+                    }
+                ),
+                "the applying writer must reject the stale endpoint: {outcome:?}"
+            );
+            assert_eq!(f.domain().await, domain);
+            assert_eq!(f.events(EventFilter::default()).await, history);
+
+            let healthy_old = f.entity("Healthy old", "local").await;
+            let healthy_new = f.entity("Healthy new", "local").await;
+            let prepared = worker
+                .prepare_changeset(
+                    &f.reviewer,
+                    &supersede(healthy_old, healthy_new, false),
+                    &f.registry,
+                    &mut WriteBudget::new(None),
+                )
+                .await
+                .unwrap();
+            let super::super::worker::PreparedApply::Atomic { plans, .. } = prepared else {
+                panic!("healthy supersession uses the same writer");
+            };
+            let links_before = f
+                .events(EventFilter {
+                    kinds: vec![EventKind::LinkCreated],
+                    ..Default::default()
+                })
+                .await;
+            let outcome = khive_runtime::run_atomic_unit(f.runtime.sql().as_ref(), plans)
+                .await
+                .unwrap();
+            assert!(matches!(outcome, AtomicRunOutcome::Committed { .. }));
+            f.assert_edge(healthy_new, healthy_old).await;
+            let links_after = f
+                .events(EventFilter {
+                    kinds: vec![EventKind::LinkCreated],
+                    ..Default::default()
+                })
+                .await;
+            assert_eq!(links_after.len(), links_before.len() + 1);
+            for prior in links_before {
+                assert_eq!(
+                    links_after.iter().find(|event| event.id == prior.id),
+                    Some(&prior)
+                );
+            }
+        }
+    }
 }

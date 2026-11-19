@@ -8,8 +8,8 @@ use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use khive_storage::attachment::{Attachment, AttachmentSubstrate};
-use khive_storage::entity::{Entity, EntityFilter, EntityTypeCounts};
-use khive_storage::error::{StorageError, WriterTaskRequestState};
+use khive_storage::entity::{Entity, EntityFilter, EntityTombstones, EntityTypeCounts};
+use khive_storage::error::StorageError;
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlStatement, SqlValue,
 };
@@ -217,6 +217,29 @@ pub fn entity_soft_delete_statement(id: Uuid, deleted_at: i64) -> SqlStatement {
     }
 }
 
+/// Preserve merge provenance when tombstoning a live source in its existing namespace.
+pub fn entity_merge_tombstone_statement(
+    namespace: &str,
+    from_id: Uuid,
+    into_id: Uuid,
+    merge_event_id: Uuid,
+    now: i64,
+) -> SqlStatement {
+    SqlStatement::new(
+        "UPDATE entities \
+             SET deleted_at = ?1, merged_into = ?2, merge_event_id = ?3, updated_at = ?1, version = version + 1 \
+             WHERE namespace = ?4 AND id = ?5 AND deleted_at IS NULL",
+        vec![
+            SqlValue::Integer(now),
+            SqlValue::Text(into_id.to_string()),
+            SqlValue::Text(merge_event_id.to_string()),
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(from_id.to_string()),
+        ],
+    )
+    .labelled("entity-merge-tombstone")
+}
+
 /// The exact hard-delete `DELETE` this store's `delete_entity(Hard)` issues
 /// (no `deleted_at` predicate — purges live and already-tombstoned rows).
 pub fn entity_hard_delete_statement(id: Uuid) -> SqlStatement {
@@ -235,6 +258,21 @@ pub fn entity_hard_delete_statement(id: Uuid) -> SqlStatement {
 pub struct SqlEntityStore {
     pool: Arc<ConnectionPool>,
     writer_task: Option<WriterTaskHandle>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntityPageMode {
+    ExactTotal,
+    CountFree,
+}
+
+impl EntityPageMode {
+    fn operation(self) -> &'static str {
+        match self {
+            Self::ExactTotal => "query_entities",
+            Self::CountFree => "query_entities_count_free",
+        }
+    }
 }
 
 impl SqlEntityStore {
@@ -299,7 +337,7 @@ impl SqlEntityStore {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|e| map_err(e, op)), op)
                 .await;
         }
 
@@ -307,8 +345,13 @@ impl SqlEntityStore {
             .record_direct_route(crate::timeout_sink::Site::DirectRouteEntity);
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
-            let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
-            f(guard.conn()).map_err(|e| map_err(e, op))
+            let guard = pool
+                .autocommit_write_unit()
+                .map_err(|e| map_sqlite_err(e, op))?;
+            f(guard.conn())
+                .map_err(|e| map_err(e, op))
+                .map_err(crate::error::statement_failure)
+                .inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Entities, op, e))?
@@ -324,7 +367,7 @@ impl SqlEntityStore {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|error| map_err(error, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|error| map_err(error, op)), op)
                 .await;
         }
 
@@ -332,33 +375,18 @@ impl SqlEntityStore {
             .record_direct_route(crate::timeout_sink::Site::DirectRouteEntity);
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
-            let guard = pool
-                .try_writer()
-                .map_err(|error| map_sqlite_err(error, op))?;
+            let mut guard = pool
+                .transaction_write_unit()
+                .map_err(|error| map_sqlite_err(error, op))
+                .inspect_err(|error| pool.record_direct_writer_error(error))?;
             let conn = guard.conn();
-            if !conn.is_autocommit() {
-                pool.retire_pooled_writer(conn);
-                return Err(StorageError::WriterTaskTerminated {
-                    request_state: WriterTaskRequestState::SideEffectsUnknown,
-                });
-            }
-            if let Err(begin_error) = conn.execute_batch("BEGIN IMMEDIATE") {
-                if !conn.is_autocommit() {
-                    pool.retire_pooled_writer(conn);
-                    return Err(StorageError::WriterTaskTerminated {
-                        request_state: WriterTaskRequestState::SideEffectsUnknown,
-                    });
-                }
-                return Err(map_err(begin_error, op));
-            }
-
             let (result, terminal_state) = execute_wrapped_transaction(conn, op, move |conn| {
                 f(conn).map_err(|error| map_err(error, op))
             });
             if terminal_state.is_some() {
-                pool.retire_pooled_writer(conn);
+                pool.retire_pooled_writer(guard.conn_mut());
             }
-            result
+            result.inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await
         .map_err(|error| StorageError::driver(StorageCapability::Entities, op, error))?
@@ -376,6 +404,194 @@ impl SqlEntityStore {
             move |conn| f(conn).map_err(|error| map_err(error, op)),
         )
         .await
+    }
+
+    async fn with_list_reader<F, R>(
+        &self,
+        op: &'static str,
+        index: Option<&'static str>,
+        mut read: F,
+    ) -> Result<R, StorageError>
+    where
+        F: FnMut(&rusqlite::Connection, bool) -> Result<R, rusqlite::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        self.with_reader(op, move |conn| match read(conn, true) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let Some(index) = index.filter(|index| missing_list_index(&error, index)) else {
+                    return Err(error);
+                };
+                tracing::dispatcher::with_default(&dispatch, || {
+                    tracing::warn!(
+                        index,
+                        operation = op,
+                        "entity list index missing; retrying without forced index"
+                    );
+                });
+                read(conn, false)
+            }
+        })
+        .await
+    }
+
+    async fn query_entities_page(
+        &self,
+        namespace: &str,
+        filter: EntityFilter,
+        page: PageRequest,
+        mode: EntityPageMode,
+    ) -> Result<Page<Entity>, StorageError> {
+        let operation = mode.operation();
+        super::validate_json_equality_paths(
+            &filter.property_equalities,
+            StorageCapability::Entities,
+            operation,
+        )?;
+        let namespace = namespace.to_string();
+        let skip_total = mode == EntityPageMode::CountFree || is_complete_id_lookup(&filter, &page);
+        let limit_i64 = i64::from(page.limit);
+        let offset_i64 = i64::try_from(page.offset).map_err(|_| StorageError::InvalidInput {
+            capability: StorageCapability::Entities,
+            operation: operation.into(),
+            message: format!(
+                "PageRequest: offset must be <= i64::MAX, got {}",
+                page.offset
+            ),
+        })?;
+
+        let streaming = mode == EntityPageMode::CountFree && is_entity_streaming_page(&filter);
+        let index = if streaming {
+            entity_count_free_index(&filter)
+        } else {
+            entity_list_index(&filter)
+        };
+        let read = move |conn: &rusqlite::Connection, force_index| {
+            let total = if filter.names_ci.is_empty() && !skip_total {
+                let (count_sql, count_params) = build_entity_where(&namespace, &filter);
+                let sql = entity_list_query(
+                    &filter,
+                    build_entity_count_query(&filter, &count_sql),
+                    force_index,
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    count_params.iter().map(|p| p.as_ref()).collect();
+                Some(stmt.query_row(param_refs.as_slice(), |row| row.get::<_, i64>(0))? as u64)
+            } else {
+                None
+            };
+
+            let mut lookup_filter = filter.clone();
+            lookup_filter.names_ci.clear();
+            let effective_filter = if filter.names_ci.is_empty() {
+                &filter
+            } else {
+                &lookup_filter
+            };
+            let (where_sql, mut data_params) = if streaming {
+                build_entity_streaming_where(&namespace, effective_filter)
+            } else {
+                build_entity_where(&namespace, effective_filter)
+            };
+
+            let candidate_param_indices = if filter.names_ci.is_empty() {
+                Vec::new()
+            } else {
+                let mut candidates: Vec<String> = filter
+                    .names_ci
+                    .iter()
+                    .map(|name| name.to_ascii_lowercase())
+                    .collect();
+                candidates.sort_unstable();
+                candidates.dedup();
+                candidates
+                    .into_iter()
+                    .map(|candidate| {
+                        data_params.push(Box::new(candidate));
+                        data_params.len()
+                    })
+                    .collect()
+            };
+
+            // #818: when a name_prefix filter is active, an exact
+            // ASCII-case-insensitive match must never be pushed out of the page by
+            // pattern candidates that merely share the prefix. Rank exact
+            // matches first (deterministic tiebreak via created_at) so page
+            // truncation can never hide the record a caller resolved by name.
+            let order_by = if let Some(ref prefix) = filter.name_prefix {
+                data_params.push(Box::new(prefix.to_ascii_lowercase()));
+                format!(
+                    "CASE WHEN LOWER(name) = ?{} THEN 0 ELSE 1 END, created_at DESC, id DESC",
+                    data_params.len()
+                )
+            } else {
+                // #1671: append `id` as the final tiebreak in the primary
+                // key's direction so equal-`created_at` rows keep a fixed
+                // order across page boundaries. The deterministic total order
+                // removes tie-order instability only — offset paging can still
+                // duplicate or skip rows under concurrent inserts/deletes or
+                // sort-key updates (that would need snapshot isolation or
+                // keyset pagination).
+                "created_at DESC, id DESC".to_string()
+            };
+
+            data_params.push(Box::new(limit_i64));
+            data_params.push(Box::new(offset_i64));
+
+            let limit_idx = data_params.len() - 1;
+            let offset_idx = data_params.len();
+
+            let columns = ENTITY_SELECT_COLUMNS;
+            let data_sql = if streaming {
+                build_entity_count_free_page_query(
+                    columns,
+                    effective_filter,
+                    &where_sql,
+                    &order_by,
+                    limit_idx,
+                    offset_idx,
+                )
+            } else if filter.names_ci.is_empty() {
+                build_entity_page_query(
+                    columns,
+                    effective_filter,
+                    &where_sql,
+                    &order_by,
+                    limit_idx,
+                    offset_idx,
+                )
+            } else {
+                build_candidate_entity_query(
+                    columns,
+                    effective_filter,
+                    &where_sql,
+                    &candidate_param_indices,
+                    &order_by,
+                    limit_idx,
+                    offset_idx,
+                )
+            };
+
+            let data_sql = if streaming {
+                entity_count_free_query(effective_filter, data_sql, force_index)
+            } else {
+                entity_list_query(effective_filter, data_sql, force_index)
+            };
+            let mut stmt = conn.prepare(&data_sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                data_params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), read_entity)?;
+
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row?);
+            }
+
+            Ok(Page { items, total })
+        };
+        self.with_list_reader(operation, index, read).await
     }
 }
 
@@ -502,6 +718,37 @@ fn build_entity_where(
     namespace: &str,
     filter: &EntityFilter,
 ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    build_entity_where_with_mode(namespace, filter, false)
+}
+
+/// Evaluate legacy type membership on the current row instead of first
+/// materializing every matching entity ID. Deduplication also makes each
+/// single-value ordered-index prefix a single SQL bound value.
+fn build_entity_streaming_where(
+    namespace: &str,
+    filter: &EntityFilter,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut filter = filter.clone();
+    for values in [
+        &mut filter.namespaces,
+        &mut filter.kinds,
+        &mut filter.entity_types,
+    ] {
+        values.sort_unstable();
+        values.dedup();
+    }
+    for values in filter.entity_types_by_kind.values_mut() {
+        values.sort_unstable();
+        values.dedup();
+    }
+    build_entity_where_with_mode(namespace, &filter, true)
+}
+
+fn build_entity_where_with_mode(
+    namespace: &str,
+    filter: &EntityFilter,
+    row_local: bool,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
     // When filter.namespaces is non-empty use `namespace IN (...)` so that
     // multi-namespace read visibility works.  Otherwise fall back to the
     // single-namespace equality check for backward compatibility.
@@ -526,7 +773,12 @@ fn build_entity_where(
             )
         };
 
-    let mut conditions: Vec<String> = vec![ns_condition, "deleted_at IS NULL".to_string()];
+    let mut conditions: Vec<String> = vec![ns_condition];
+    match filter.tombstones {
+        EntityTombstones::Live => conditions.push("deleted_at IS NULL".into()),
+        EntityTombstones::All => {}
+        EntityTombstones::Only => conditions.push("deleted_at IS NOT NULL".into()),
+    }
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = ns_params;
 
     if !filter.ids.is_empty() {
@@ -555,7 +807,18 @@ fn build_entity_where(
 
     let type_scope = conditions.join(" AND ");
     let type_predicate = |scope: &str, placeholders: &str| {
-        if filter.legacy_entity_type_fallback {
+        if filter.legacy_entity_type_fallback && row_local {
+            // CASE is lazy: malformed JSON never reaches json_type/extract.
+            // A present canonical type always wins over legacy properties.
+            format!(
+                "CASE WHEN entity_type IS NOT NULL THEN entity_type IN ({placeholders}) \
+                 WHEN json_valid(properties) THEN \
+                     CASE WHEN json_type(properties, '$.type') = 'text' \
+                          THEN json_extract(properties, '$.type') IN ({placeholders}) \
+                          ELSE 0 END \
+                 ELSE 0 END"
+            )
+        } else if filter.legacy_entity_type_fallback {
             // Legacy properties can contain invalid JSON. Exclude those rows
             // from type fallback without rewriting them. Keep json_valid as
             // an explicit term matching the partial legacy-type index;
@@ -659,6 +922,12 @@ fn build_entity_where(
         ));
     }
 
+    super::append_json_equalities(
+        &mut conditions,
+        &mut params,
+        "properties",
+        &filter.property_equalities,
+    );
     let clause = format!(" WHERE {}", conditions.join(" AND "));
     (clause, params)
 }
@@ -676,7 +945,7 @@ fn entity_read_source(filter: &EntityFilter) -> &'static str {
 }
 
 fn build_entity_count_query(filter: &EntityFilter, where_sql: &str) -> String {
-    let source = entity_read_source(filter);
+    let source = entity_list_source(filter);
     format!("SELECT COUNT(*) FROM {source}{where_sql}")
 }
 
@@ -688,11 +957,172 @@ fn build_entity_page_query(
     limit_idx: usize,
     offset_idx: usize,
 ) -> String {
-    let source = entity_read_source(filter);
+    let source = entity_list_source(filter);
+    build_entity_page_query_from_source(columns, source, where_sql, order_by, limit_idx, offset_idx)
+}
+
+fn build_entity_count_free_page_query(
+    columns: &str,
+    filter: &EntityFilter,
+    where_sql: &str,
+    order_by: &str,
+    limit_idx: usize,
+    offset_idx: usize,
+) -> String {
+    let source = entity_count_free_source(filter);
+    build_entity_page_query_from_source(columns, source, where_sql, order_by, limit_idx, offset_idx)
+}
+
+fn build_entity_page_query_from_source(
+    columns: &str,
+    source: &str,
+    where_sql: &str,
+    order_by: &str,
+    limit_idx: usize,
+    offset_idx: usize,
+) -> String {
     format!(
         "SELECT {columns} FROM {source}{where_sql} \
          ORDER BY {order_by} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
     )
+}
+
+/// Match only ordinary list shapes whose leading predicates fit these indexes.
+/// Keep selective names/kinds/tags and legacy JSON paths free to choose their
+/// own access paths. Explicit IDs always keep the bounded primary-key plan.
+fn entity_list_source(filter: &EntityFilter) -> &'static str {
+    if filter.tombstones != EntityTombstones::Live
+        || !filter.property_equalities.is_empty()
+        || !filter.ids.is_empty()
+        || !filter.kinds.is_empty()
+        || !filter.entity_types_by_kind.is_empty()
+        || filter.legacy_entity_type_fallback
+        || filter.name_prefix.is_some()
+        || filter.name_exact.is_some()
+        || !filter.names_ci.is_empty()
+        || !filter.tags_any.is_empty()
+    {
+        return entity_read_source(filter);
+    }
+    if !filter.entity_types.is_empty() {
+        "entities INDEXED BY idx_entities_live_namespace_type_order"
+    } else if filter.namespaces.len() <= 1 {
+        "entities INDEXED BY idx_entities_live_namespace_order"
+    } else {
+        "entities"
+    }
+}
+
+fn entity_list_index(filter: &EntityFilter) -> Option<&'static str> {
+    if !filter.ids.is_empty() {
+        return None;
+    }
+    entity_list_source(filter).strip_prefix("entities INDEXED BY ")
+}
+
+fn is_entity_streaming_page(filter: &EntityFilter) -> bool {
+    filter.ids.is_empty()
+        && filter.name_prefix.is_none()
+        && filter.name_exact.is_none()
+        && filter.names_ci.is_empty()
+}
+
+fn has_one_distinct_value(values: &[String]) -> bool {
+    values
+        .first()
+        .is_some_and(|first| values.iter().all(|value| value == first))
+}
+
+/// Pin creation-order walks only when every leading index column is fixed.
+/// Other predicates remain row-local residual filters, so the page can stop
+/// after its limit without materializing the complete matching ID set.
+fn entity_count_free_source(filter: &EntityFilter) -> &'static str {
+    if filter.tombstones != EntityTombstones::Live {
+        return entity_read_source(filter);
+    }
+    if !is_entity_streaming_page(filter) {
+        return entity_list_source(filter);
+    }
+    if !filter.namespaces.is_empty() && !has_one_distinct_value(&filter.namespaces) {
+        return "entities";
+    }
+    // A grouped-type map whose groups are all empty matches nothing and becomes
+    // a constant-false predicate. SQLite folds it into the WHERE clause and can
+    // then no longer prove the `deleted_at IS NULL` term of a partial order
+    // index, so forcing one fails with "no query solution".
+    if !filter.entity_types_by_kind.is_empty()
+        && filter.entity_types_by_kind.values().all(Vec::is_empty)
+    {
+        return "entities";
+    }
+
+    let mut kind_groups = filter
+        .entity_types_by_kind
+        .iter()
+        .filter(|(_, types)| !types.is_empty());
+    let one_kind_group = kind_groups.next().is_some() && kind_groups.next().is_none();
+    if has_one_distinct_value(&filter.kinds) || one_kind_group {
+        "entities INDEXED BY idx_entities_live_namespace_kind_order"
+    } else if !filter.legacy_entity_type_fallback && has_one_distinct_value(&filter.entity_types) {
+        // Multiple distinct types give multiple ordered runs, not one global
+        // creation order. Use the namespace index for that residual predicate.
+        "entities INDEXED BY idx_entities_live_namespace_type_order"
+    } else {
+        "entities INDEXED BY idx_entities_live_namespace_order"
+    }
+}
+
+fn entity_count_free_index(filter: &EntityFilter) -> Option<&'static str> {
+    if !filter.ids.is_empty() {
+        return None;
+    }
+    entity_count_free_source(filter).strip_prefix("entities INDEXED BY ")
+}
+
+fn missing_list_index(error: &rusqlite::Error, index: &str) -> bool {
+    if error
+        .sqlite_error()
+        .is_none_or(|detail| detail.extended_code != rusqlite::ffi::SQLITE_ERROR)
+    {
+        return false;
+    }
+    let message = match error {
+        rusqlite::Error::SqliteFailure(_, Some(message)) => message.as_str(),
+        rusqlite::Error::SqlInputError { msg, .. } => msg.as_str(),
+        _ => return false,
+    };
+    message.strip_prefix("no such index: ") == Some(index)
+}
+
+fn entity_list_query(filter: &EntityFilter, sql: String, force_index: bool) -> String {
+    entity_query_with_index(
+        sql,
+        entity_list_source(filter),
+        entity_list_index(filter),
+        force_index,
+    )
+}
+
+fn entity_count_free_query(filter: &EntityFilter, sql: String, force_index: bool) -> String {
+    entity_query_with_index(
+        sql,
+        entity_count_free_source(filter),
+        entity_count_free_index(filter),
+        force_index,
+    )
+}
+
+fn entity_query_with_index(
+    sql: String,
+    source: &str,
+    index: Option<&str>,
+    force_index: bool,
+) -> String {
+    if force_index || index.is_none() {
+        sql
+    } else {
+        sql.replacen(source, "entities", 1)
+    }
 }
 
 fn build_candidate_entity_query(
@@ -732,16 +1162,16 @@ fn build_entity_cursor_query(
     limit_idx: usize,
 ) -> String {
     // CROSS JOIN fixes the loop order. An explicit ID set drives entities by
-    // primary key, then looks up each sequence. The unfiltered walk drives
-    // the sequence first. Kind-filtered walks without IDs retain the
-    // planner's existing index choice.
+    // primary key, then looks up each sequence. Every non-ID walk drives
+    // the sequence range first and checks the entity through its primary key;
+    // kind/type predicates must not force a full matching-set sort.
     let source = entity_read_source(filter);
     let from_clause = if !filter.ids.is_empty() {
         format!("{source} CROSS JOIN entities_seq ON entities.id = entities_seq.entity_id")
-    } else if filter.kinds.is_empty() {
-        "entities_seq CROSS JOIN entities ON entities.id = entities_seq.entity_id".to_string()
     } else {
-        "entities_seq JOIN entities ON entities.id = entities_seq.entity_id".to_string()
+        "entities_seq CROSS JOIN entities INDEXED BY sqlite_autoindex_entities_1 \
+         ON entities.id = entities_seq.entity_id"
+            .to_string()
     };
     format!(
         "SELECT {columns}, entities_seq.seq FROM {from_clause}{where_sql} \
@@ -751,6 +1181,7 @@ fn build_entity_cursor_query(
 
 fn is_complete_id_lookup(filter: &EntityFilter, page: &PageRequest) -> bool {
     !filter.ids.is_empty()
+        && filter.property_equalities.is_empty()
         && filter.kinds.is_empty()
         && filter.entity_types.is_empty()
         && filter.entity_types_by_kind.is_empty()
@@ -844,10 +1275,13 @@ impl EntityStore for SqlEntityStore {
         // closure would violate SQLite's nested-transaction rule).
         if let Some(writer_task) = self.current_writer_task("upsert_entities")? {
             return writer_task
-                .send_bounded(move |conn| {
-                    batch_upsert_entities(conn, &entities, attempted)
-                        .map_err(|e| map_err(e, "upsert_entities"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        batch_upsert_entities(conn, &entities, attempted)
+                            .map_err(|e| map_err(e, "upsert_entities"))
+                    },
+                    "upsert_entities",
+                )
                 .await;
         }
 
@@ -962,121 +1396,18 @@ impl EntityStore for SqlEntityStore {
         filter: EntityFilter,
         page: PageRequest,
     ) -> Result<Page<Entity>, StorageError> {
-        let namespace = namespace.to_string();
-        let skip_total = is_complete_id_lookup(&filter, &page);
-        let limit_i64 = i64::from(page.limit);
-        let offset_i64 = i64::try_from(page.offset).map_err(|_| StorageError::InvalidInput {
-            capability: StorageCapability::Entities,
-            operation: "query_entities".into(),
-            message: format!(
-                "PageRequest: offset must be <= i64::MAX, got {}",
-                page.offset
-            ),
-        })?;
+        self.query_entities_page(namespace, filter, page, EntityPageMode::ExactTotal)
+            .await
+    }
 
-        self.with_reader("query_entities", move |conn| {
-            let total = if filter.names_ci.is_empty() && !skip_total {
-                let (count_sql, count_params) = build_entity_where(&namespace, &filter);
-                let sql = build_entity_count_query(&filter, &count_sql);
-                let mut stmt = conn.prepare(&sql)?;
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    count_params.iter().map(|p| p.as_ref()).collect();
-                Some(stmt.query_row(param_refs.as_slice(), |row| row.get::<_, i64>(0))? as u64)
-            } else {
-                None
-            };
-
-            let mut lookup_filter = filter.clone();
-            lookup_filter.names_ci.clear();
-            let effective_filter = if filter.names_ci.is_empty() {
-                &filter
-            } else {
-                &lookup_filter
-            };
-            let (where_sql, mut data_params) = build_entity_where(&namespace, effective_filter);
-
-            let candidate_param_indices = if filter.names_ci.is_empty() {
-                Vec::new()
-            } else {
-                let mut candidates: Vec<String> = filter
-                    .names_ci
-                    .iter()
-                    .map(|name| name.to_ascii_lowercase())
-                    .collect();
-                candidates.sort_unstable();
-                candidates.dedup();
-                candidates
-                    .into_iter()
-                    .map(|candidate| {
-                        data_params.push(Box::new(candidate));
-                        data_params.len()
-                    })
-                    .collect()
-            };
-
-            // #818: when a name_prefix filter is active, an exact
-            // ASCII-case-insensitive match must never be pushed out of the page by
-            // pattern candidates that merely share the prefix. Rank exact
-            // matches first (deterministic tiebreak via created_at) so page
-            // truncation can never hide the record a caller resolved by name.
-            let order_by = if let Some(ref prefix) = filter.name_prefix {
-                data_params.push(Box::new(prefix.to_ascii_lowercase()));
-                format!(
-                    "CASE WHEN LOWER(name) = ?{} THEN 0 ELSE 1 END, created_at DESC, id DESC",
-                    data_params.len()
-                )
-            } else {
-                // #1671: append `id` as the final tiebreak in the primary
-                // key's direction so equal-`created_at` rows keep a fixed
-                // order across page boundaries. The deterministic total order
-                // removes tie-order instability only — offset paging can still
-                // duplicate or skip rows under concurrent inserts/deletes or
-                // sort-key updates (that would need snapshot isolation or
-                // keyset pagination).
-                "created_at DESC, id DESC".to_string()
-            };
-
-            data_params.push(Box::new(limit_i64));
-            data_params.push(Box::new(offset_i64));
-
-            let limit_idx = data_params.len() - 1;
-            let offset_idx = data_params.len();
-
-            let columns = ENTITY_SELECT_COLUMNS;
-            let data_sql = if filter.names_ci.is_empty() {
-                build_entity_page_query(
-                    columns,
-                    effective_filter,
-                    &where_sql,
-                    &order_by,
-                    limit_idx,
-                    offset_idx,
-                )
-            } else {
-                build_candidate_entity_query(
-                    columns,
-                    effective_filter,
-                    &where_sql,
-                    &candidate_param_indices,
-                    &order_by,
-                    limit_idx,
-                    offset_idx,
-                )
-            };
-
-            let mut stmt = conn.prepare(&data_sql)?;
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                data_params.iter().map(|p| p.as_ref()).collect();
-            let rows = stmt.query_map(param_refs.as_slice(), read_entity)?;
-
-            let mut items = Vec::new();
-            for row in rows {
-                items.push(row?);
-            }
-
-            Ok(Page { items, total })
-        })
-        .await
+    async fn query_entities_count_free(
+        &self,
+        namespace: &str,
+        filter: EntityFilter,
+        page: PageRequest,
+    ) -> Result<Page<Entity>, StorageError> {
+        self.query_entities_page(namespace, filter, page, EntityPageMode::CountFree)
+            .await
     }
 
     async fn query_entities_after(
@@ -1086,6 +1417,11 @@ impl EntityStore for SqlEntityStore {
         after: Option<SeekCursor>,
         limit: u32,
     ) -> Result<SeekPage<Entity>, StorageError> {
+        super::validate_json_equality_paths(
+            &filter.property_equalities,
+            StorageCapability::Entities,
+            "query_entities_after",
+        )?;
         if limit == 0 {
             return Ok(SeekPage::default());
         }
@@ -1101,7 +1437,11 @@ impl EntityStore for SqlEntityStore {
         let limit_usize = limit as usize;
         let probe_limit_i64 = i64::from(limit) + 1;
         self.with_reader("query_entities_after", move |conn| {
-            let (mut where_sql, mut params) = build_entity_where(&namespace, &filter);
+            let (mut where_sql, mut params) = if filter.ids.is_empty() {
+                build_entity_streaming_where(&namespace, &filter)
+            } else {
+                build_entity_where(&namespace, &filter)
+            };
             if let Some(cursor) = after {
                 params.push(Box::new(cursor.sequence));
                 where_sql.push_str(&format!(" AND entities_seq.seq > ?{}", params.len()));
@@ -1184,12 +1524,22 @@ impl EntityStore for SqlEntityStore {
         namespace: &str,
         filter: EntityFilter,
     ) -> Result<u64, StorageError> {
+        super::validate_json_equality_paths(
+            &filter.property_equalities,
+            StorageCapability::Entities,
+            "count_entities",
+        )?;
         let namespace = namespace.to_string();
 
-        self.with_reader("count_entities", move |conn| {
+        let index = entity_list_index(&filter);
+        self.with_list_reader("count_entities", index, move |conn, force_index| {
             if filter.namespaces.is_empty() {
                 let (where_sql, params) = build_entity_where(&namespace, &filter);
-                let sql = build_entity_count_query(&filter, &where_sql);
+                let sql = entity_list_query(
+                    &filter,
+                    build_entity_count_query(&filter, &where_sql),
+                    force_index,
+                );
                 let mut stmt = conn.prepare(&sql)?;
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     params.iter().map(|p| p.as_ref()).collect();
@@ -1212,7 +1562,11 @@ impl EntityStore for SqlEntityStore {
                     ..filter.clone()
                 };
                 let (where_sql, params) = build_entity_where(&namespace, &chunk_filter);
-                let sql = build_entity_count_query(&chunk_filter, &where_sql);
+                let sql = entity_list_query(
+                    &chunk_filter,
+                    build_entity_count_query(&chunk_filter, &where_sql),
+                    force_index && index.is_some(),
+                );
                 let mut stmt = conn.prepare(&sql)?;
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     params.iter().map(|p| p.as_ref()).collect();
@@ -1242,3 +1596,15 @@ mod tests;
 #[cfg(test)]
 #[path = "entity_type_counts_tests.rs"]
 mod entity_type_counts_tests;
+
+#[cfg(test)]
+#[path = "entity_busy_tests.rs"]
+mod direct_busy_tests;
+
+#[cfg(test)]
+#[path = "entity_list_plan_tests.rs"]
+mod entity_list_plan_tests;
+
+#[cfg(test)]
+#[path = "entity_merge_tombstone_tests.rs"]
+mod entity_merge_tombstone_tests;

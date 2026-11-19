@@ -6,7 +6,7 @@ use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibili
 pub const PACK_NAME: &str = "exec";
 
 /// Manifest schema tag carried by every tree object.
-pub const TREE_SCHEMA: &str = "khive-tree/v1";
+pub use khive_runtime::blob_tree::TREE_SCHEMA;
 
 /// Pack-owned tables, applied idempotently at boot.
 pub static EXEC_SCHEMA_PLAN_STMTS: [&str; 6] = [
@@ -135,7 +135,7 @@ pub static EXEC_HANDLERS: [HandlerDef; 9] = [
     },
     HandlerDef {
         name: "exec.events",
-        description: "Append-only materialization and launch audit rows, oldest first.",
+        description: "Materialized, launched, and exited lifecycle rows from legacy and event stores, oldest time then string id first. Excludes per-call dispatch audits; every id is a string.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[

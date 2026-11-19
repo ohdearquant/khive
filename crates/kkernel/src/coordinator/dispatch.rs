@@ -1,5 +1,6 @@
 //! SubstrateCoordinator — cross-backend dispatch (D2-D4).
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,16 +10,20 @@ use tokio::task::JoinError;
 use uuid::Uuid;
 
 use khive_pack_kg::handlers::{SearchSubstrate, ValidatedSearchRequest};
+use khive_retrieval::hybrid::{combine_best_ranked_evidence, fuse_labelled, HitLabel};
+use khive_retrieval::DEFAULT_RRF_K;
 use khive_runtime::{
     BackendId, EdgeEndpointKind, KhiveRuntime, NamespaceToken, NoteSearchHit, Resolved,
-    RuntimeError, SearchHit, SearchSource,
+    RuntimeError, RuntimeResult, SearchHit, SearchSource,
 };
-use khive_score::{rrf_score, DeterministicScore};
+use khive_score::DeterministicScore;
 use khive_storage::EdgeRelation;
 use khive_types::{namespace::Namespace, SubstrateKind};
 
+use super::ensure_search_active;
 use super::locator::LocatorCache;
 use super::registry::BackendRegistry;
+use super::search_profile;
 
 #[cfg(test)]
 #[path = "message_search_scope_tests.rs"]
@@ -69,6 +74,9 @@ fn search_token(
     caller: Option<(&NamespaceToken, &serde_json::Value)>,
     search_notes: bool,
 ) -> Result<(NamespaceToken, Option<khive_runtime::MailboxView>), RuntimeError> {
+    let _phase = khive_storage::request_context::enter_search_phase(
+        khive_storage::request_context::SearchPhase::Authorization,
+    );
     // Retain the old primary and per-extra namespace admission checks even
     // when message partitioning uses the sealed caller's actor.
     let authorized = runtime.authorize_with_visibility(namespace.clone(), visible.to_vec())?;
@@ -93,7 +101,14 @@ async fn scope_note_search_hits(
         return Ok(());
     }
     let ids: Vec<_> = hits.iter().map(|hit| hit.note_id).collect();
+    let hydration_phase = khive_storage::request_context::enter_search_phase(
+        khive_storage::request_context::SearchPhase::MailboxScopeHydration,
+    );
     let notes = runtime.notes(token)?.get_notes_batch(&ids).await?;
+    drop(hydration_phase);
+    let _authorization_phase = khive_storage::request_context::enter_search_phase(
+        khive_storage::request_context::SearchPhase::MailboxAuthorization,
+    );
     let permitted: std::collections::HashSet<_> = notes
         .iter()
         .filter(|note| view.permits_message_note(token, note))
@@ -207,15 +222,22 @@ pub struct SubstrateCoordinator {
     #[cfg(test)]
     pub(super) panic_backend_id: Option<String>,
     /// Test-only: named backend's fan-out search task never resolves,
-    /// simulating a hung backend (MAJ-2 timeout regression coverage).
+    /// simulating a hung backend whose search must time out.
     #[cfg(test)]
     pub(super) hang_backend_ids: Vec<String>,
     /// Test-only: delay a backend result past the shared absolute deadline.
     #[cfg(test)]
     pub(super) delay_backend: Option<(String, Duration)>,
+    #[cfg(test)]
+    pub(super) phase_hold_backend: Option<(String, khive_storage::request_context::SearchPhase)>,
+    /// Test-only: a named single backend enters this phase, waits for the request read
+    /// deadline the way a deadline-aware reader admission does, then fails with a timeout.
+    #[cfg(test)]
+    pub(super) phase_deadline_error_backend:
+        Option<(String, khive_storage::request_context::SearchPhase)>,
     /// Test-only: when set, a backend's entity fan-out task returns this
     /// list verbatim instead of calling `hybrid_search`, so RRF-merge
-    /// regression tests can pin exact ranks/UUIDs (MAJ-4).
+    /// tests can pin exact ranks/UUIDs for RRF merge ordering.
     #[cfg(test)]
     pub(super) entity_hits_override: Option<HashMap<String, Vec<SearchHit>>>,
     /// Test-only: same as `entity_hits_override`, for the note substrate.
@@ -238,6 +260,10 @@ impl SubstrateCoordinator {
             #[cfg(test)]
             delay_backend: None,
             #[cfg(test)]
+            phase_hold_backend: None,
+            #[cfg(test)]
+            phase_deadline_error_backend: None,
+            #[cfg(test)]
             entity_hits_override: None,
             #[cfg(test)]
             note_hits_override: None,
@@ -257,6 +283,10 @@ impl SubstrateCoordinator {
             hang_backend_ids: Vec::new(),
             #[cfg(test)]
             delay_backend: None,
+            #[cfg(test)]
+            phase_hold_backend: None,
+            #[cfg(test)]
+            phase_deadline_error_backend: None,
             #[cfg(test)]
             entity_hits_override: None,
             #[cfg(test)]
@@ -279,6 +309,10 @@ impl SubstrateCoordinator {
             hang_backend_ids: Vec::new(),
             #[cfg(test)]
             delay_backend: None,
+            #[cfg(test)]
+            phase_hold_backend: None,
+            #[cfg(test)]
+            phase_deadline_error_backend: None,
             #[cfg(test)]
             entity_hits_override: None,
             #[cfg(test)]
@@ -323,6 +357,26 @@ impl SubstrateCoordinator {
     #[cfg(test)]
     pub fn with_delayed_backend(mut self, backend_id: &str, delay: Duration) -> Self {
         self.delay_backend = Some((backend_id.to_string(), delay));
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_phase_hold_backend(
+        mut self,
+        backend_id: &str,
+        phase: khive_storage::request_context::SearchPhase,
+    ) -> Self {
+        self.phase_hold_backend = Some((backend_id.to_string(), phase));
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_phase_deadline_error_backend(
+        mut self,
+        backend_id: &str,
+        phase: khive_storage::request_context::SearchPhase,
+    ) -> Self {
+        self.phase_deadline_error_backend = Some((backend_id.to_string(), phase));
         self
     }
 
@@ -495,6 +549,79 @@ impl SubstrateCoordinator {
         }
     }
 
+    /// Search requires an owner read to distinguish absence from a failed probe.
+    /// Generic by-ID lookup retains its existing optional-result contract.
+    pub(super) async fn locate_for_search(
+        &self,
+        id: Uuid,
+        namespace: &Namespace,
+        substrate: khive_runtime::error::SearchReadSubstrate,
+    ) -> khive_runtime::RuntimeResult<Option<BackendId>> {
+        if let Some(backend_id) = self.locator.get(id) {
+            let Some(entry) = self.registry.get(&backend_id) else {
+                return Ok(None);
+            };
+            return Self::probe_search_owner(&entry.runtime, namespace, id)
+                .await
+                .map(|found| found.then_some(backend_id.clone()))
+                .map_err(|error| error.with_search_read_context(backend_id, substrate));
+        }
+
+        let mut handles = Vec::with_capacity(self.registry.len());
+        for entry in self.registry.iter() {
+            let backend_id = entry.id.clone();
+            let runtime = Arc::clone(&entry.runtime);
+            let namespace = namespace.clone();
+            let locator = Arc::clone(&self.locator);
+            let task_backend = backend_id.clone();
+            let handle = tokio::spawn(khive_storage::inherit_request_read_context(async move {
+                let found = Self::probe_search_owner(&runtime, &namespace, id).await?;
+                if found {
+                    locator.insert(id, task_backend);
+                }
+                Ok::<_, RuntimeError>(found)
+            }));
+            handles.push((backend_id, handle));
+        }
+        // Settle every probe, preserving registry order rather than task finish
+        // order. A healthy owner wins over an unrelated failed candidate.
+        let mut owner = None;
+        let mut first_error = None;
+        for (backend_id, handle) in handles {
+            let result = match handle.await {
+                Ok(result) => result,
+                Err(_) => Err(RuntimeError::Internal(
+                    "search owner probe task failed".into(),
+                )),
+            };
+            match result {
+                Ok(true) if owner.is_none() => owner = Some(backend_id),
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(error.with_search_read_context(backend_id, substrate));
+                }
+                _ => {}
+            }
+        }
+        match (owner, first_error) {
+            (Some(owner), _) => Ok(Some(owner)),
+            (None, Some(error)) => Err(error),
+            (None, None) => Ok(None),
+        }
+    }
+
+    async fn probe_search_owner(
+        runtime: &Arc<KhiveRuntime>,
+        namespace: &Namespace,
+        id: Uuid,
+    ) -> khive_runtime::RuntimeResult<bool> {
+        let token = runtime.authorize(namespace.clone())?;
+        match runtime.resolve_edge_endpoint(&token, id).await? {
+            Some(Resolved::Entity(_) | Resolved::Note(_) | Resolved::Event(_)) => return Ok(true),
+            Some(Resolved::PackRecord { .. }) | None => {}
+        }
+        Ok(runtime.get_edge(&token, id).await?.is_some())
+    }
+
     /// Prewarm the locator cache after a successful create.
     ///
     /// Called by the `SubstrateCoordinatorService` so that the first `locate()`
@@ -514,8 +641,8 @@ impl SubstrateCoordinator {
     ///
     /// Locates both `source_id` and `target_id`. When they are on different backends,
     /// the edge is written on the source backend with `target_backend` stamped to the
-    /// target backend id. When both endpoints are on the same backend, delegates to
-    /// the normal `link` path (no `target_backend` stamp).
+    /// target backend id. Endpoints on the same backend have no `target_backend`
+    /// stamp and retain the runtime's local metadata inference.
     ///
     /// The coordinator validates endpoints via `validate_link_endpoints` on the source
     /// backend's runtime before writing the edge.
@@ -571,12 +698,13 @@ impl SubstrateCoordinator {
 
         let cross_backend = src_backend.as_str() != tgt_backend.as_str();
 
-        if !cross_backend {
+        let metadata = if !cross_backend {
             // Same-backend: full endpoint validation including existence and kind checks.
             src_runtime
                 .validate_link_endpoints(&token, source_id, target_id, relation)
                 .await
                 .map_err(|e| e.to_string())?;
+            metadata
         } else if relation == EdgeRelation::Annotates {
             // Cross-backend annotates: `locate_endpoint` already resolved each
             // endpoint's substrate kind using the same by-ID order `get` uses
@@ -591,6 +719,7 @@ impl SubstrateCoordinator {
                     Some(tgt_located.kind),
                 )
                 .map_err(|e| e.to_string())?;
+            metadata
         } else {
             // Cross-backend, non-annotates: the target entity lives on a different backend so the source
             // runtime cannot resolve it via its own DB. Fetch each endpoint from its
@@ -621,7 +750,21 @@ impl SubstrateCoordinator {
                     tgt_resolved.as_ref(),
                 )
                 .map_err(|e| e.to_string())?;
-        }
+            let source_entity_kind = match src_resolved.as_ref() {
+                Some(Resolved::Entity(entity)) => Some(entity.kind.as_str()),
+                _ => None,
+            };
+            let target_entity_kind = match tgt_resolved.as_ref() {
+                Some(Resolved::Entity(entity)) => Some(entity.kind.as_str()),
+                _ => None,
+            };
+            KhiveRuntime::prepare_link_metadata(
+                relation,
+                source_entity_kind,
+                target_entity_kind,
+                metadata,
+            )
+        };
         let target_backend_stamp = if cross_backend {
             Some(tgt_backend.as_str().to_string())
         } else {
@@ -651,11 +794,12 @@ impl SubstrateCoordinator {
 
     /// Broadcast a validated KG search request to all registered backends in
     /// parallel. One selected backend passes its ranking evidence through;
-    /// multiple selected backends use outer RRF (k=60). Every filter in the
+    /// multiple selected backends use outer RRF (shared default k). Every filter in the
     /// request reaches the matching runtime search method on every backend.
     ///
     /// Per-backend errors are captured in [`BackendSearchResult::error`] — a single
     /// failing backend does NOT abort the fan-out.
+    /// A stopped caller request returns its typed error instead of a partial page.
     ///
     /// Authorizes each backend token against `namespace` alone (visible set
     /// `[namespace]`) — see [`Self::fan_out_search_with_visibility`] for the
@@ -664,13 +808,13 @@ impl SubstrateCoordinator {
         &self,
         request: &ValidatedSearchRequest,
         namespace: &Namespace,
-    ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
+    ) -> RuntimeResult<(Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>)> {
         self.fan_out_search_with_visibility(request, namespace, &[])
             .await
     }
 
     /// Same as [`Self::fan_out_search`], but authorizes each backend token
-    /// with an explicit extra read-visibility set (MAJ-3 fix).
+    /// with an explicit extra read-visibility set.
     ///
     /// `extra_visible` mirrors the normal registry dispatch path's
     /// `['local'] ∪ visible_namespaces` widening
@@ -687,13 +831,19 @@ impl SubstrateCoordinator {
         request: &ValidatedSearchRequest,
         namespace: &Namespace,
         extra_visible: &[Namespace],
-    ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
+    ) -> RuntimeResult<(Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>)> {
+        ensure_search_active()?;
+        let started = search_profile::start();
         let (mut entity_hits, mut note_hits, per_backend) = self
             .fan_out_search_candidates_with_visibility(request, namespace, extra_visible, None)
             .await;
+        ensure_search_active()?;
+        search_profile::fanout(started, &entity_hits, &note_hits, &per_backend);
+        let started = search_profile::start();
         self.finalize_search_hits(&mut entity_hits, &mut note_hits, request, namespace)
-            .await;
-        (entity_hits, note_hits, per_backend)
+            .await?;
+        search_profile::stage("finalize", started, &[]);
+        Ok((entity_hits, note_hits, per_backend))
     }
 
     /// Coordinated search keeps the sealed actor and read scope from dispatch
@@ -704,12 +854,14 @@ impl SubstrateCoordinator {
         token: &NamespaceToken,
         args: &serde_json::Value,
         extra_visible: &[Namespace],
-    ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
+    ) -> RuntimeResult<(Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>)> {
+        ensure_search_active()?;
         if request.substrate() == SearchSubstrate::Entity {
             return self
                 .fan_out_search_with_visibility(request, token.gate_namespace(), extra_visible)
                 .await;
         }
+        let started = search_profile::start();
         let (mut entity_hits, mut note_hits, per_backend) = self
             .fan_out_search_candidates_with_visibility(
                 request,
@@ -718,9 +870,13 @@ impl SubstrateCoordinator {
                 Some((token, args)),
             )
             .await;
+        ensure_search_active()?;
+        search_profile::fanout(started, &entity_hits, &note_hits, &per_backend);
+        let started = search_profile::start();
         self.finalize_search_hits(&mut entity_hits, &mut note_hits, request, token.namespace())
-            .await;
-        (entity_hits, note_hits, per_backend)
+            .await?;
+        search_profile::stage("finalize", started, &[]);
+        Ok((entity_hits, note_hits, per_backend))
     }
 
     async fn fan_out_search_candidates_with_visibility(
@@ -730,7 +886,65 @@ impl SubstrateCoordinator {
         extra_visible: &[Namespace],
         caller: Option<(&NamespaceToken, &serde_json::Value)>,
     ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
+        let (entities, notes, backends, _) = self
+            .fan_out_search_candidates_with_count(request, namespace, extra_visible, caller)
+            .await;
+        (entities, notes, backends)
+    }
+
+    /// Keep status counts only from successful backend legs accepted before the
+    /// shared deadline. The result and backend DTOs retain their existing shape.
+    pub async fn fan_out_search_with_token_and_count(
+        &self,
+        request: &ValidatedSearchRequest,
+        token: &NamespaceToken,
+        args: &serde_json::Value,
+        extra_visible: &[Namespace],
+    ) -> RuntimeResult<(
+        Vec<SearchHit>,
+        Vec<NoteSearchHit>,
+        Vec<BackendSearchResult>,
+        u64,
+    )> {
+        ensure_search_active()?;
+        if request.substrate() == SearchSubstrate::Entity {
+            let (entities, notes, backends) = self
+                .fan_out_search_with_visibility(request, token.gate_namespace(), extra_visible)
+                .await?;
+            return Ok((entities, notes, backends, 0));
+        }
+        let started = search_profile::start();
+        let (mut entity_hits, mut note_hits, per_backend, dropped) = self
+            .fan_out_search_candidates_with_count(
+                request,
+                token.namespace(),
+                extra_visible,
+                Some((token, args)),
+            )
+            .await;
+        ensure_search_active()?;
+        search_profile::fanout(started, &entity_hits, &note_hits, &per_backend);
+        let started = search_profile::start();
+        self.finalize_search_hits(&mut entity_hits, &mut note_hits, request, token.namespace())
+            .await?;
+        search_profile::stage("finalize", started, &[]);
+        Ok((entity_hits, note_hits, per_backend, dropped))
+    }
+
+    async fn fan_out_search_candidates_with_count(
+        &self,
+        request: &ValidatedSearchRequest,
+        namespace: &Namespace,
+        extra_visible: &[Namespace],
+        caller: Option<(&NamespaceToken, &serde_json::Value)>,
+    ) -> (
+        Vec<SearchHit>,
+        Vec<NoteSearchHit>,
+        Vec<BackendSearchResult>,
+        u64,
+    ) {
         let search_notes = request.substrate() == SearchSubstrate::Note;
+        let note_status = request.note_status();
         let requested_substrate = if search_notes {
             SubstrateKind::Note
         } else {
@@ -758,7 +972,7 @@ impl SubstrateCoordinator {
             .collect();
 
         if entries.is_empty() {
-            return (vec![], vec![], vec![]);
+            return (vec![], vec![], vec![], 0);
         }
 
         let timeout_ms = backend_search_timeout_ms();
@@ -769,25 +983,30 @@ impl SubstrateCoordinator {
 
         if entries.len() == 1 {
             let (backend_id, runtime) = &entries[0];
-            let (token, mailbox) =
-                match search_token(runtime, namespace, extra_visible, caller, search_notes) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %bounded_backend_cause_for_log(&e.to_string()),
-                            "fan_out_search: authorization denied for namespace"
-                        );
-                        let backend_result = BackendSearchResult {
-                            backend_id: backend_id.clone(),
-                            hits: vec![],
-                            note_hits: vec![],
-                            error: Some(BackendSearchFailure::from_runtime_error(e)),
-                            vector_error: None,
-                        };
-                        return (vec![], vec![], vec![backend_result]);
-                    }
-                };
-            // MAJ-2 (r2 follow-up): the single-backend early return has no
+            let phase_trace = khive_storage::request_context::SearchPhaseTrace::new();
+            let token_result = khive_storage::request_context::scope_search_phase_trace(
+                phase_trace.clone(),
+                async { search_token(runtime, namespace, extra_visible, caller, search_notes) },
+            )
+            .await;
+            let (token, mailbox) = match token_result {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %bounded_backend_cause_for_log(&e.to_string()),
+                        "fan_out_search: authorization denied for namespace"
+                    );
+                    let backend_result = BackendSearchResult {
+                        backend_id: backend_id.clone(),
+                        hits: vec![],
+                        note_hits: vec![],
+                        error: Some(BackendSearchFailure::from_runtime_error(e)),
+                        vector_error: None,
+                    };
+                    return (vec![], vec![], vec![backend_result], 0);
+                }
+            };
+            // The single-backend early return has no
             // spawned task to bound with the fan-out timeout loop below, so
             // both awaits are wrapped directly in the same
             // `backend_search_timeout_ms()` budget — an unbounded await here
@@ -800,18 +1019,36 @@ impl SubstrateCoordinator {
                 .any(|id| id == backend_id.as_str());
             #[cfg(not(test))]
             let should_hang = false;
+            #[cfg(test)]
+            let phase_deadline_error = self
+                .phase_deadline_error_backend
+                .as_ref()
+                .and_then(|(id, phase)| (id == backend_id.as_str()).then_some(*phase));
+            #[cfg(not(test))]
+            let phase_deadline_error: Option<
+                khive_storage::request_context::SearchPhase,
+            > = None;
             if search_notes {
                 let search_fut = async {
                     if should_hang {
                         std::future::pending::<()>().await;
                         unreachable!("a pending future never resolves");
                     }
+                    if let Some(phase) = phase_deadline_error {
+                        let _phase = khive_storage::request_context::enter_search_phase(phase);
+                        khive_storage::request_context::wait_for_request_read_cancellation().await;
+                        return Err(RuntimeError::Storage(
+                            khive_storage::StorageError::Timeout {
+                                operation: "held search phase".into(),
+                            },
+                        ));
+                    }
                     runtime
                         .backend()
                         .pool_arc()
                         .record_search_dispatch(backend_id.as_str(), &requested_kind);
-                    let mut outcome = runtime
-                        .search_notes_outcome_with_text_mode(
+                    let (mut outcome, dropped) = runtime
+                        .search_notes_outcome_with_text_mode_and_status(
                             &token,
                             request.query(),
                             search_limit,
@@ -820,18 +1057,31 @@ impl SubstrateCoordinator {
                             &tags_owned,
                             props_filter_owned.as_ref(),
                             request.text_mode(),
+                            note_status.expect("validated note search has a status selector"),
+                            mailbox.as_ref(),
                         )
                         .await?;
                     if let Some(view) = &mailbox {
                         scope_note_search_hits(runtime, &token, view, &mut outcome.hits).await?;
                     }
-                    Ok::<_, RuntimeError>(outcome)
+                    Ok::<_, RuntimeError>((outcome, dropped))
                 };
+                let search_fut = khive_storage::request_context::scope_search_phase_trace(
+                    phase_trace.clone(),
+                    search_fut,
+                );
+                let deadline_snapshot_store = std::sync::OnceLock::new();
+                let search_fut = search_with_deadline_snapshot(
+                    Box::pin(search_fut),
+                    phase_trace.clone(),
+                    request_deadline.async_at(),
+                    &deadline_snapshot_store,
+                );
                 let search_fut =
                     khive_storage::scope_request_read_deadline_at(request_deadline, search_fut);
                 tokio::pin!(search_fut);
                 match tokio::time::timeout_at(request_deadline.async_at(), &mut search_fut).await {
-                    Ok(Ok(outcome)) => {
+                    Ok((Ok((outcome, dropped)), None)) => {
                         let filtered_note_hits: Vec<NoteSearchHit> = outcome
                             .hits
                             .iter()
@@ -849,9 +1099,9 @@ impl SubstrateCoordinator {
                             error: None,
                             vector_error: outcome.vector_error,
                         };
-                        return (vec![], filtered_note_hits, vec![backend_result]);
+                        return (vec![], filtered_note_hits, vec![backend_result], dropped);
                     }
-                    Ok(Err(e)) => {
+                    Ok((Err(e), None)) => {
                         let backend_result = BackendSearchResult {
                             backend_id: backend_id.clone(),
                             hits: vec![],
@@ -859,17 +1109,56 @@ impl SubstrateCoordinator {
                             error: Some(BackendSearchFailure::from_runtime_error(e)),
                             vector_error: None,
                         };
-                        return (vec![], vec![], vec![backend_result]);
+                        return (vec![], vec![], vec![backend_result], 0);
+                    }
+                    Ok((_late, Some(phase_snapshot))) => {
+                        search_profile::backend_deadline(
+                            backend_id.as_str(),
+                            "completed_after_deadline",
+                            "deadline_capture",
+                            &phase_snapshot,
+                        );
+                        tracing::warn!(
+                            backend = %bounded_backend_id_for_log(backend_id.as_str()),
+                            timeout_ms,
+                            in_flight_phase = %phase_snapshot.in_flight_phase,
+                            phase_elapsed_ms = phase_snapshot.phase_elapsed_ms,
+                            active_phases = %phase_snapshot.active_phases,
+                            completed_phases = %phase_snapshot.completed_phases,
+                            "backend search task completed after the shared request deadline"
+                        );
+                        let backend_result = BackendSearchResult {
+                            backend_id: backend_id.clone(),
+                            hits: vec![],
+                            note_hits: vec![],
+                            error: Some(BackendSearchFailure::timeout(timeout_ms)),
+                            vector_error: None,
+                        };
+                        return (vec![], vec![], vec![backend_result], 0);
                     }
                     Err(_elapsed) => {
+                        let (phase_snapshot, snapshot_origin) = deadline_snapshot_with_origin(
+                            deadline_snapshot_store.get().cloned(),
+                            &phase_trace,
+                        );
                         let _ = tokio::time::timeout(
                             khive_db::sqlite_interrupt_grace_from_env(),
                             &mut search_fut,
                         )
                         .await;
+                        search_profile::backend_deadline(
+                            backend_id.as_str(),
+                            "timed_out",
+                            snapshot_origin,
+                            &phase_snapshot,
+                        );
                         tracing::warn!(
                             backend = %bounded_backend_id_for_log(backend_id.as_str()),
                             timeout_ms,
+                            in_flight_phase = %phase_snapshot.in_flight_phase,
+                            phase_elapsed_ms = phase_snapshot.phase_elapsed_ms,
+                            active_phases = %phase_snapshot.active_phases,
+                            completed_phases = %phase_snapshot.completed_phases,
                             "backend search task timed out"
                         );
                         let backend_result = BackendSearchResult {
@@ -879,7 +1168,7 @@ impl SubstrateCoordinator {
                             error: Some(BackendSearchFailure::timeout(timeout_ms)),
                             vector_error: None,
                         };
-                        return (vec![], vec![], vec![backend_result]);
+                        return (vec![], vec![], vec![backend_result], 0);
                     }
                 }
             } else {
@@ -887,6 +1176,15 @@ impl SubstrateCoordinator {
                     if should_hang {
                         std::future::pending::<()>().await;
                         unreachable!("a pending future never resolves");
+                    }
+                    if let Some(phase) = phase_deadline_error {
+                        let _phase = khive_storage::request_context::enter_search_phase(phase);
+                        khive_storage::request_context::wait_for_request_read_cancellation().await;
+                        return Err(RuntimeError::Storage(
+                            khive_storage::StorageError::Timeout {
+                                operation: "held search phase".into(),
+                            },
+                        ));
                     }
                     runtime
                         .backend()
@@ -905,11 +1203,22 @@ impl SubstrateCoordinator {
                         )
                         .await
                 };
+                let search_fut = khive_storage::request_context::scope_search_phase_trace(
+                    phase_trace.clone(),
+                    search_fut,
+                );
+                let deadline_snapshot_store = std::sync::OnceLock::new();
+                let search_fut = search_with_deadline_snapshot(
+                    Box::pin(search_fut),
+                    phase_trace.clone(),
+                    request_deadline.async_at(),
+                    &deadline_snapshot_store,
+                );
                 let search_fut =
                     khive_storage::scope_request_read_deadline_at(request_deadline, search_fut);
                 tokio::pin!(search_fut);
                 match tokio::time::timeout_at(request_deadline.async_at(), &mut search_fut).await {
-                    Ok(Ok(outcome)) => {
+                    Ok((Ok(outcome), None)) => {
                         let filtered_hits: Vec<SearchHit> = outcome
                             .hits
                             .iter()
@@ -927,9 +1236,9 @@ impl SubstrateCoordinator {
                             error: None,
                             vector_error: outcome.vector_error,
                         };
-                        return (filtered_hits, vec![], vec![backend_result]);
+                        return (filtered_hits, vec![], vec![backend_result], 0);
                     }
-                    Ok(Err(e)) => {
+                    Ok((Err(e), None)) => {
                         let backend_result = BackendSearchResult {
                             backend_id: backend_id.clone(),
                             hits: vec![],
@@ -937,17 +1246,56 @@ impl SubstrateCoordinator {
                             error: Some(BackendSearchFailure::from_runtime_error(e)),
                             vector_error: None,
                         };
-                        return (vec![], vec![], vec![backend_result]);
+                        return (vec![], vec![], vec![backend_result], 0);
+                    }
+                    Ok((_late, Some(phase_snapshot))) => {
+                        search_profile::backend_deadline(
+                            backend_id.as_str(),
+                            "completed_after_deadline",
+                            "deadline_capture",
+                            &phase_snapshot,
+                        );
+                        tracing::warn!(
+                            backend = %bounded_backend_id_for_log(backend_id.as_str()),
+                            timeout_ms,
+                            in_flight_phase = %phase_snapshot.in_flight_phase,
+                            phase_elapsed_ms = phase_snapshot.phase_elapsed_ms,
+                            active_phases = %phase_snapshot.active_phases,
+                            completed_phases = %phase_snapshot.completed_phases,
+                            "backend search task completed after the shared request deadline"
+                        );
+                        let backend_result = BackendSearchResult {
+                            backend_id: backend_id.clone(),
+                            hits: vec![],
+                            note_hits: vec![],
+                            error: Some(BackendSearchFailure::timeout(timeout_ms)),
+                            vector_error: None,
+                        };
+                        return (vec![], vec![], vec![backend_result], 0);
                     }
                     Err(_elapsed) => {
+                        let (phase_snapshot, snapshot_origin) = deadline_snapshot_with_origin(
+                            deadline_snapshot_store.get().cloned(),
+                            &phase_trace,
+                        );
                         let _ = tokio::time::timeout(
                             khive_db::sqlite_interrupt_grace_from_env(),
                             &mut search_fut,
                         )
                         .await;
+                        search_profile::backend_deadline(
+                            backend_id.as_str(),
+                            "timed_out",
+                            snapshot_origin,
+                            &phase_snapshot,
+                        );
                         tracing::warn!(
                             backend = %bounded_backend_id_for_log(backend_id.as_str()),
                             timeout_ms,
+                            in_flight_phase = %phase_snapshot.in_flight_phase,
+                            phase_elapsed_ms = phase_snapshot.phase_elapsed_ms,
+                            active_phases = %phase_snapshot.active_phases,
+                            completed_phases = %phase_snapshot.completed_phases,
                             "backend search task timed out"
                         );
                         let backend_result = BackendSearchResult {
@@ -957,7 +1305,7 @@ impl SubstrateCoordinator {
                             error: Some(BackendSearchFailure::timeout(timeout_ms)),
                             vector_error: None,
                         };
-                        return (vec![], vec![], vec![backend_result]);
+                        return (vec![], vec![], vec![backend_result], 0);
                     }
                 }
             }
@@ -984,7 +1332,15 @@ impl SubstrateCoordinator {
         let delay_backend = self.delay_backend.clone();
         #[cfg(not(test))]
         let delay_backend: Option<(String, Duration)> = None;
+        #[cfg(test)]
+        let phase_hold_backend = self.phase_hold_backend.clone();
+        #[cfg(not(test))]
+        let phase_hold_backend: Option<(
+            String,
+            khive_storage::request_context::SearchPhase,
+        )> = None;
 
+        let fan_out_started = search_profile::start();
         let mut handles = Vec::with_capacity(entries.len());
         for (backend_id, runtime) in entries {
             let q = query.clone();
@@ -1010,6 +1366,9 @@ impl SubstrateCoordinator {
             let delay = delay_backend
                 .as_ref()
                 .and_then(|(id, delay)| (id == backend_id.as_str()).then_some(*delay));
+            let phase_hold = phase_hold_backend
+                .as_ref()
+                .and_then(|(id, phase)| (id == backend_id.as_str()).then_some(*phase));
             #[cfg(test)]
             let entity_override: Option<Vec<SearchHit>> = self
                 .entity_hits_override
@@ -1027,12 +1386,14 @@ impl SubstrateCoordinator {
             #[cfg(not(test))]
             let note_override: Option<Vec<NoteSearchHit>> = None;
             let joined_backend_id = backend_id.clone();
+            let phase_trace = khive_storage::request_context::SearchPhaseTrace::new();
+            let task_trace = phase_trace.clone();
             let search = async move {
                 if should_panic {
                     panic!("injected backend search panic");
                 }
                 if should_hang {
-                    // Never resolves — exercises the fan-out timeout (MAJ-2).
+                    // Never resolves — exercises the fan-out timeout.
                     std::future::pending::<()>().await;
                     unreachable!("a pending future never resolves");
                 }
@@ -1047,16 +1408,17 @@ impl SubstrateCoordinator {
                         )),
                         None::<Vec<NoteSearchHit>>,
                         None,
+                        0,
                     );
                 }
                 if search_notes && caller.is_none() {
                     if let Some(hits) = note_override.as_ref() {
-                        return (backend_id, Ok(vec![]), Some(hits.clone()), None);
+                        return (backend_id, Ok(vec![]), Some(hits.clone()), None, 0);
                     }
                 }
                 if !search_notes {
                     if let Some(hits) = entity_override {
-                        return (backend_id, Ok(hits), None, None);
+                        return (backend_id, Ok(hits), None, None, 0);
                     }
                 }
                 let (token, mailbox) = match search_token(
@@ -1072,19 +1434,24 @@ impl SubstrateCoordinator {
                             error = %bounded_backend_cause_for_log(&e.to_string()),
                             "fan_out_search: authorization denied for namespace"
                         );
-                        return (backend_id, Err(e), None, None);
+                        return (backend_id, Err(e), None, None, 0);
                     }
                 };
+                if let Some(phase) = phase_hold {
+                    let _phase = task_trace.enter(phase);
+                    std::future::pending::<()>().await;
+                    unreachable!("a held search phase never resolves");
+                }
                 if search_notes {
                     if let Some(mut hits) = note_override {
                         if let Some(view) = &mailbox {
                             if let Err(error) =
                                 scope_note_search_hits(&runtime, &token, view, &mut hits).await
                             {
-                                return (backend_id, Err(error), None, None);
+                                return (backend_id, Err(error), None, None, 0);
                             }
                         }
-                        return (backend_id, Ok(vec![]), Some(hits), None);
+                        return (backend_id, Ok(vec![]), Some(hits), None, 0);
                     }
                 }
                 runtime
@@ -1093,7 +1460,7 @@ impl SubstrateCoordinator {
                     .record_search_dispatch(backend_id.as_str(), &requested_kind);
                 if search_notes {
                     let result = runtime
-                        .search_notes_outcome_with_text_mode(
+                        .search_notes_outcome_with_text_mode_and_status(
                             &token,
                             &q,
                             sl,
@@ -1102,16 +1469,18 @@ impl SubstrateCoordinator {
                             &tg,
                             pf.as_ref(),
                             text_mode,
+                            note_status.expect("validated note search has a status selector"),
+                            mailbox.as_ref(),
                         )
                         .await;
                     match result {
                         // Full search_limit-bounded window is retained here —
-                        // truncating to the caller's limit per backend (MAJ-4)
+                        // truncating to the caller's limit per backend
                         // would remove candidates the RRF merge needs to fairly
                         // rank a hit that only places #2+ on any single backend.
                         // Finalization applies the floor and requested order
                         // before imposing the caller's limit.
-                        Ok(mut outcome) => {
+                        Ok((mut outcome, dropped)) => {
                             if let Some(view) = &mailbox {
                                 if let Err(error) = scope_note_search_hits(
                                     &runtime,
@@ -1121,7 +1490,7 @@ impl SubstrateCoordinator {
                                 )
                                 .await
                                 {
-                                    return (backend_id, Err(error), None, None);
+                                    return (backend_id, Err(error), None, None, 0);
                                 }
                             }
                             (
@@ -1129,9 +1498,10 @@ impl SubstrateCoordinator {
                                 Ok(vec![]),
                                 Some(outcome.hits),
                                 outcome.vector_error,
+                                dropped,
                             )
                         }
-                        Err(e) => (backend_id, Err(e), None, None),
+                        Err(e) => (backend_id, Err(e), None, None, 0),
                     }
                 } else {
                     let result = runtime
@@ -1148,34 +1518,68 @@ impl SubstrateCoordinator {
                         .await;
                     match result {
                         // See the note-substrate arm above: no per-backend
-                        // truncation before RRF merge (MAJ-4).
-                        Ok(outcome) => (backend_id, Ok(outcome.hits), None, outcome.vector_error),
-                        Err(e) => (backend_id, Err(e), None, None),
+                        // truncation before RRF merge.
+                        Ok(outcome) => {
+                            (backend_id, Ok(outcome.hits), None, outcome.vector_error, 0)
+                        }
+                        Err(e) => (backend_id, Err(e), None, None, 0),
                     }
                 }
             };
+            let scope_trace = phase_trace.clone();
+            let deadline_trace = phase_trace.clone();
+            let deadline_snapshot_store = Arc::new(std::sync::OnceLock::new());
+            let worker_deadline_snapshot_store = Arc::clone(&deadline_snapshot_store);
+            let phase_deadline = request_deadline.async_at();
             let search = async move {
+                let search =
+                    khive_storage::request_context::scope_search_phase_trace(scope_trace, search);
+                tokio::pin!(search);
+                let deadline_snapshot = tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(phase_deadline) => {
+                        let snapshot = deadline_trace.snapshot();
+                        let _ = worker_deadline_snapshot_store.set(snapshot.clone());
+                        Some(snapshot)
+                    }
+                    result = &mut search => {
+                        return (result, tokio::time::Instant::now(), None);
+                    }
+                };
                 let result = search.await;
-                (result, tokio::time::Instant::now())
+                (result, tokio::time::Instant::now(), deadline_snapshot)
             };
-            let handle = tokio::spawn(khive_storage::inherit_request_read_context(
-                khive_storage::scope_request_read_deadline_at(request_deadline, search),
+            let handle = tokio::spawn(khive_runtime::search_audit::inherit(
+                khive_storage::inherit_request_read_context(
+                    khive_storage::scope_request_read_deadline_at(request_deadline, search),
+                ),
             ));
-            handles.push((joined_backend_id, handle));
+            handles.push((
+                joined_backend_id,
+                phase_trace,
+                deadline_snapshot_store,
+                handle,
+            ));
         }
 
         let mut per_backend: Vec<BackendSearchResult> = Vec::new();
+        let mut dropped_total = 0_u64;
         let mut entity_ranked_lists: Vec<Vec<SearchHit>> = Vec::new();
         let mut note_ranked_lists: Vec<Vec<NoteSearchHit>> = Vec::new();
         let interrupt_settlement_deadline =
             request_deadline.async_at() + khive_db::sqlite_interrupt_grace_from_env();
-        for (joined_backend_id, mut handle) in handles {
+        for (joined_backend_id, phase_trace, deadline_snapshot_store, mut handle) in handles {
+            let mut deadline_snapshot = None;
             let joined = if handle.is_finished() {
                 Ok((&mut handle).await)
             } else {
                 match tokio::time::timeout_at(request_deadline.async_at(), &mut handle).await {
                     Ok(result) => Ok(result),
                     Err(elapsed) => {
+                        deadline_snapshot = Some(deadline_snapshot_with_origin(
+                            deadline_snapshot_store.get().cloned(),
+                            &phase_trace,
+                        ));
                         let settled =
                             tokio::time::timeout_at(interrupt_settlement_deadline, &mut handle)
                                 .await;
@@ -1190,10 +1594,31 @@ impl SubstrateCoordinator {
                     }
                 }
             };
+            let finished_at = fan_out_started.map(|_| match &joined {
+                Ok(Ok((_, completed_at, _))) => *completed_at,
+                _ => tokio::time::Instant::now(),
+            });
             match joined {
-                Ok(Ok(((backend_id, Ok(hits), note_hits_opt, vector_error), completed_at)))
-                    if completed_at <= request_deadline.async_at() =>
-                {
+                Ok(Ok((
+                    (backend_id, Ok(hits), note_hits_opt, vector_error, dropped),
+                    completed_at,
+                    _,
+                ))) if completed_at <= request_deadline.async_at() => {
+                    let Some(total) = dropped_total.checked_add(dropped) else {
+                        per_backend.push(BackendSearchResult {
+                            backend_id,
+                            hits: vec![],
+                            note_hits: vec![],
+                            error: Some(BackendSearchFailure::from_runtime_error(
+                                RuntimeError::Internal(
+                                    "note search status count exceeds u64".into(),
+                                ),
+                            )),
+                            vector_error: None,
+                        });
+                        continue;
+                    };
+                    dropped_total = total;
                     let note_hits = note_hits_opt.unwrap_or_default();
                     if !hits.is_empty() {
                         entity_ranked_lists.push(hits.clone());
@@ -1209,7 +1634,7 @@ impl SubstrateCoordinator {
                         vector_error,
                     });
                 }
-                Ok(Ok(((backend_id, Err(e), _, _), completed_at)))
+                Ok(Ok(((backend_id, Err(e), _, _, _), completed_at, _)))
                     if completed_at <= request_deadline.async_at() =>
                 {
                     per_backend.push(BackendSearchResult {
@@ -1237,10 +1662,25 @@ impl SubstrateCoordinator {
                         vector_error: None,
                     });
                 }
-                Ok(Ok((_late_result, _completed_at))) => {
+                Ok(Ok((_late_result, _completed_at, worker_deadline_snapshot))) => {
+                    let (phase_snapshot, snapshot_origin) = worker_deadline_snapshot
+                        .or_else(|| deadline_snapshot_store.get().cloned())
+                        .map(|snapshot| (snapshot, "deadline_capture"))
+                        .or(deadline_snapshot)
+                        .unwrap_or_else(|| deadline_snapshot_with_origin(None, &phase_trace));
+                    search_profile::backend_deadline(
+                        joined_backend_id.as_str(),
+                        "completed_after_deadline",
+                        snapshot_origin,
+                        &phase_snapshot,
+                    );
                     tracing::warn!(
                         backend = %bounded_backend_id_for_log(joined_backend_id.as_str()),
                         timeout_ms,
+                        in_flight_phase = %phase_snapshot.in_flight_phase,
+                        phase_elapsed_ms = phase_snapshot.phase_elapsed_ms,
+                        active_phases = %phase_snapshot.active_phases,
+                        completed_phases = %phase_snapshot.completed_phases,
                         "backend search task completed after the shared request deadline"
                     );
                     per_backend.push(BackendSearchResult {
@@ -1252,9 +1692,27 @@ impl SubstrateCoordinator {
                     });
                 }
                 Err(_elapsed) => {
+                    let (phase_snapshot, snapshot_origin) = deadline_snapshot
+                        .or_else(|| {
+                            deadline_snapshot_store
+                                .get()
+                                .cloned()
+                                .map(|snapshot| (snapshot, "deadline_capture"))
+                        })
+                        .unwrap_or_else(|| deadline_snapshot_with_origin(None, &phase_trace));
+                    search_profile::backend_deadline(
+                        joined_backend_id.as_str(),
+                        "timed_out",
+                        snapshot_origin,
+                        &phase_snapshot,
+                    );
                     tracing::warn!(
                         backend = %bounded_backend_id_for_log(joined_backend_id.as_str()),
                         timeout_ms,
+                        in_flight_phase = %phase_snapshot.in_flight_phase,
+                        phase_elapsed_ms = phase_snapshot.phase_elapsed_ms,
+                        active_phases = %phase_snapshot.active_phases,
+                        completed_phases = %phase_snapshot.completed_phases,
                         "backend search task timed out"
                     );
                     per_backend.push(BackendSearchResult {
@@ -1266,17 +1724,65 @@ impl SubstrateCoordinator {
                     });
                 }
             }
+            if let (Some(started), Some(finished_at), Some(result)) =
+                (fan_out_started, finished_at, per_backend.last())
+            {
+                search_profile::backend(result, finished_at.duration_since(started));
+            }
         }
 
+        let started = search_profile::start();
         let merged_entities =
             rrf_merge_entity_hits_filtered(entity_ranked_lists, usize::MAX, request.source());
         let merged_notes =
             rrf_merge_note_hits_filtered(note_ranked_lists, usize::MAX, request.source());
-        (merged_entities, merged_notes, per_backend)
+        search_profile::stage("merge", started, &[]);
+        (merged_entities, merged_notes, per_backend, dropped_total)
     }
 }
 
-/// Per-backend fan-out search timeout (MAJ-2 fix): bounds how long a single
+/// Retain whether the existing warning selected a timer capture or a fallback
+/// observation. A fallback remains a fallback even if cleanup later fills the store.
+fn deadline_snapshot_with_origin(
+    captured: Option<khive_storage::request_context::SearchPhaseSnapshot>,
+    trace: &khive_storage::request_context::SearchPhaseTrace,
+) -> (
+    khive_storage::request_context::SearchPhaseSnapshot,
+    &'static str,
+) {
+    match captured {
+        Some(snapshot) => (snapshot, "deadline_capture"),
+        None => (trace.snapshot(), "fallback_observation"),
+    }
+}
+
+/// Race one single-backend search against the request deadline instant, as the fan-out
+/// worker does, so a search still in flight at the deadline is reported with the phase it
+/// was in even when it then resolves: a deadline-aware wait (reader admission, checkout)
+/// returns an error at the deadline instead of outliving the outer timeout. The snapshot is
+/// also left in `store` for the arm that sees the outer timeout elapse first. Callers pass
+/// the search boxed so its state lives on the heap: held inline, it made the caller's
+/// future large enough to overflow a 2 MiB test thread stack in an unoptimized build.
+async fn search_with_deadline_snapshot<F: std::future::Future>(
+    search: F,
+    trace: khive_storage::request_context::SearchPhaseTrace,
+    deadline: tokio::time::Instant,
+    store: &std::sync::OnceLock<khive_storage::request_context::SearchPhaseSnapshot>,
+) -> (
+    F::Output,
+    Option<khive_storage::request_context::SearchPhaseSnapshot>,
+) {
+    tokio::pin!(search);
+    let snapshot = tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => trace.snapshot(),
+        result = &mut search => return (result, None),
+    };
+    let _ = store.set(snapshot.clone());
+    (search.await, Some(snapshot))
+}
+
+/// Per-backend fan-out search timeout: bounds how long a single
 /// backend's search task may run before the coordinator gives up on it and
 /// reports a timeout-specific error for that backend, so one hung backend
 /// cannot block the whole fan-out from returning healthy siblings' results.
@@ -1292,15 +1798,569 @@ fn backend_search_timeout_ms() -> u64 {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_BACKEND_SEARCH_TIMEOUT_MS);
-        khive_runtime::config_ledger::record_config_locked(
-            "KHIVE_COORDINATOR_SEARCH_TIMEOUT_MS",
-            ms.to_string(),
+        tracing::info!(
+            target: "khive::config_lock",
+            name = "KHIVE_COORDINATOR_SEARCH_TIMEOUT_MS",
+            value = ms,
         );
         ms
     })
 }
 
-/// Per-backend fan-out over-fetch bound for RRF merge fairness (MAJ-4 fix).
+#[cfg(test)]
+mod search_phase_trace_tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use khive_pack_kg::handlers::ValidatedSearchRequest;
+    use khive_runtime::{KhiveRuntime, PackRegistry, VerbRegistryBuilder};
+    use khive_storage::request_context::SearchPhase;
+    use khive_types::namespace::Namespace;
+
+    use super::{search_profile, BackendRegistry, SubstrateCoordinator};
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MakeLogCapture(LogCapture);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeLogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.0.clone()
+        }
+    }
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).expect("captured logs are UTF-8")
+        }
+    }
+
+    fn runtime() -> Arc<KhiveRuntime> {
+        Arc::new(KhiveRuntime::memory().expect("memory runtime"))
+    }
+
+    fn search_request(query: &str) -> ValidatedSearchRequest {
+        search_request_of_kind("entity", query)
+    }
+
+    fn search_request_of_kind(kind: &str, query: &str) -> ValidatedSearchRequest {
+        let runtime = runtime();
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_gate(runtime.config().gate.clone());
+        builder.with_default_namespace(runtime.config().default_namespace.as_str());
+        builder.with_actor_id(runtime.config().actor_id.clone());
+        PackRegistry::register_packs(&["kg".to_string()], (*runtime).clone(), &mut builder)
+            .expect("register KG pack");
+        let registry = builder.build().expect("build KG registry");
+        runtime.install_edge_rules(registry.all_edge_rules());
+        ValidatedSearchRequest::from_value(
+            serde_json::json!({"kind": kind, "query": query, "limit": 10}),
+            &registry,
+        )
+        .expect("valid search request")
+    }
+
+    fn subscriber(capture: LogCapture) -> impl tracing::Subscriber + Send + Sync + 'static {
+        tracing_subscriber::fmt()
+            .with_writer(MakeLogCapture(capture))
+            .with_ansi(false)
+            .without_time()
+            .finish()
+    }
+
+    fn multi_backend_coordinator(held_phase: Option<SearchPhase>) -> SubstrateCoordinator {
+        let mut registry = BackendRegistry::new();
+        registry.register(
+            khive_runtime::BackendId::parse("held").expect("backend id"),
+            runtime(),
+        );
+        registry.register(
+            khive_runtime::BackendId::parse("healthy").expect("backend id"),
+            runtime(),
+        );
+        let coordinator = SubstrateCoordinator::new(registry);
+        match held_phase {
+            Some(phase) => coordinator.with_phase_hold_backend("held", phase),
+            None => coordinator.with_hanging_backend("held"),
+        }
+    }
+
+    fn profile_records(lines: &[String]) -> Vec<serde_json::Value> {
+        lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("profile JSON"))
+            .collect()
+    }
+
+    fn assert_deadline_correlation(records: &[serde_json::Value], backend: &str) {
+        let deadline = records
+            .iter()
+            .find(|record| record["s"] == "backend_deadline" && record["b"] == backend)
+            .expect("backend deadline record");
+        let backend_record = records
+            .iter()
+            .find(|record| record["s"] == "backend" && record["b"] == backend)
+            .expect("backend timing record");
+        let search = records
+            .iter()
+            .find(|record| record["s"] == "search")
+            .expect("search timing record");
+        assert!(deadline["c"].as_u64().is_some_and(|id| id > 0));
+        assert_eq!(deadline["c"], backend_record["c"]);
+        assert_eq!(deadline["c"], search["c"]);
+        assert_eq!(deadline["o"], "timeout");
+        assert_eq!(backend_record["o"], "timeout");
+        assert!(deadline.get("us").is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn timeout_profile_correlates_the_held_backend_and_preserves_its_sibling() {
+        let coordinator = multi_backend_coordinator(Some(SearchPhase::VectorEmbedding));
+        let request = search_request("profile held embedding");
+        let (result, lines) = search_profile::capture(search_profile::profiled(
+            coordinator.fan_out_search(&request, &Namespace::local()),
+        ))
+        .await;
+        let (_, _, per_backend) = result.expect("backend timeout preserves active parent search");
+        assert!(khive_storage::ensure_request_read_active("search").is_ok());
+        let records = profile_records(&lines);
+        assert_deadline_correlation(&records, "held");
+        let deadlines: Vec<_> = records
+            .iter()
+            .filter(|record| record["s"] == "backend_deadline")
+            .collect();
+        assert_eq!(deadlines.len(), 1, "{records:?}");
+        assert_eq!(deadlines[0]["observation"], "timed_out");
+        assert_eq!(deadlines[0]["in_flight_phase"], "vector_embedding");
+        assert!(deadlines[0]["active_phases"]
+            .as_str()
+            .expect("active phases")
+            .contains("vector_embedding="));
+        assert_eq!(per_backend.len(), 2);
+        let healthy = per_backend
+            .iter()
+            .find(|result| result.backend_id.as_str() == "healthy")
+            .expect("healthy sibling retained");
+        assert!(healthy.error.is_none());
+        let held = per_backend
+            .iter()
+            .find(|result| result.backend_id.as_str() == "held")
+            .expect("held backend retained");
+        assert_eq!(
+            held.error.as_ref().expect("timeout").kind,
+            super::BackendSearchFailureKind::Timeout
+        );
+        assert!(held.hits.is_empty() && held.note_hits.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn single_backend_late_profiles_cover_entities_and_notes() {
+        for (kind, phase, expected) in [
+            (
+                "entity",
+                SearchPhase::EntityReaderAdmission,
+                "entity_reader_admission",
+            ),
+            (
+                "note",
+                SearchPhase::NoteReaderAdmission,
+                "note_reader_admission",
+            ),
+        ] {
+            let coordinator = SubstrateCoordinator::single(runtime())
+                .with_phase_deadline_error_backend("main", phase);
+            let request = search_request_of_kind(kind, "profile late admission");
+            let (result, lines) = search_profile::capture(search_profile::profiled(
+                coordinator.fan_out_search(&request, &Namespace::local()),
+            ))
+            .await;
+            let (hits, notes, per_backend) =
+                result.expect("backend deadline remains a partial result");
+            assert!(khive_storage::ensure_request_read_active("search").is_ok());
+            let records = profile_records(&lines);
+            assert_deadline_correlation(&records, "main");
+            let deadlines: Vec<_> = records
+                .iter()
+                .filter(|record| record["s"] == "backend_deadline")
+                .collect();
+            assert_eq!(deadlines.len(), 1, "{kind}: {records:?}");
+            assert_eq!(deadlines[0]["observation"], "completed_after_deadline");
+            assert_eq!(deadlines[0]["snapshot_origin"], "deadline_capture");
+            assert_eq!(deadlines[0]["in_flight_phase"], expected);
+            assert!(hits.is_empty() && notes.is_empty());
+            assert_eq!(per_backend.len(), 1);
+            assert!(per_backend[0].hits.is_empty() && per_backend[0].note_hits.is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn single_backend_timeout_profiles_cover_entities_and_notes() {
+        for kind in ["entity", "note"] {
+            let coordinator = SubstrateCoordinator::single(runtime()).with_hanging_backend("main");
+            let request = search_request_of_kind(kind, "profile unentered timeout");
+            let (result, lines) = search_profile::capture(search_profile::profiled(
+                coordinator.fan_out_search(&request, &Namespace::local()),
+            ))
+            .await;
+            result.expect("backend timeout remains a partial result");
+            assert!(khive_storage::ensure_request_read_active("search").is_ok());
+            let records = profile_records(&lines);
+            assert_deadline_correlation(&records, "main");
+            let deadline = records
+                .iter()
+                .find(|record| record["s"] == "backend_deadline")
+                .expect("single backend timeout profile");
+            assert_eq!(deadline["observation"], "timed_out");
+            assert_eq!(deadline["active_phases"], "none");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn fanout_late_completion_keeps_its_deadline_profile() {
+        let mut registry = BackendRegistry::new();
+        for name in ["first", "second"] {
+            registry.register(
+                khive_runtime::BackendId::parse(name).expect("backend id"),
+                runtime(),
+            );
+        }
+        let mut coordinator = SubstrateCoordinator::new(registry);
+        // Derive collection order from the registry itself. The first task holds
+        // settlement open while the second finishes after the result deadline.
+        let ids: Vec<_> = coordinator
+            .registry
+            .iter()
+            .map(|entry| entry.id.as_str().to_string())
+            .collect();
+        let first = &ids[0];
+        let late = &ids[1];
+        let delay = std::time::Duration::from_millis(super::backend_search_timeout_ms())
+            + khive_db::sqlite_interrupt_grace_from_env() / 2;
+        coordinator = coordinator
+            .with_hanging_backend(first)
+            .with_delayed_backend(late, delay);
+        coordinator.entity_hits_override = Some(std::collections::HashMap::from([(
+            late.clone(),
+            Vec::new(),
+        )]));
+        let request = search_request("profile late fanout");
+        let (result, lines) = search_profile::capture(search_profile::profiled(
+            coordinator.fan_out_search(&request, &Namespace::local()),
+        ))
+        .await;
+        let (hits, notes, per_backend) =
+            result.expect("late backends preserve active parent search");
+        assert!(khive_storage::ensure_request_read_active("search").is_ok());
+        let records = profile_records(&lines);
+        assert_deadline_correlation(&records, late);
+        let deadline = records
+            .iter()
+            .find(|record| record["s"] == "backend_deadline" && record["b"] == late.as_str())
+            .expect("late fanout deadline record");
+        assert_eq!(deadline["observation"], "completed_after_deadline");
+        assert_eq!(deadline["snapshot_origin"], "deadline_capture");
+        assert_eq!(deadline["in_flight_phase"], "not_entered");
+        assert!(hits.is_empty() && notes.is_empty());
+        assert_eq!(per_backend.len(), 2);
+        assert!(per_backend.iter().all(|result| {
+            result
+                .error
+                .as_ref()
+                .is_some_and(|error| error.kind == super::BackendSearchFailureKind::Timeout)
+                && result.hits.is_empty()
+                && result.note_hits.is_empty()
+        }));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn deadline_profile_preserves_frozen_phases_and_labels_fallbacks() {
+        let trace = khive_storage::request_context::SearchPhaseTrace::new();
+        let held = trace.enter(SearchPhase::VectorEmbedding);
+        let frozen = trace.snapshot();
+        drop(held);
+        let (captured, captured_origin) =
+            super::deadline_snapshot_with_origin(Some(frozen), &trace);
+        let (fallback, fallback_origin) = super::deadline_snapshot_with_origin(None, &trace);
+        let ((), lines) = search_profile::capture(search_profile::profiled(async {
+            search_profile::backend_deadline("held", "timed_out", captured_origin, &captured);
+            search_profile::backend_deadline("held", "timed_out", fallback_origin, &fallback);
+        }))
+        .await;
+        let records = profile_records(&lines);
+        assert_eq!(records[0]["snapshot_origin"], "deadline_capture");
+        assert_eq!(records[0]["in_flight_phase"], "vector_embedding");
+        assert!(records[0]["active_phases"]
+            .as_str()
+            .unwrap()
+            .contains("vector_embedding="));
+        assert_eq!(records[1]["snapshot_origin"], "fallback_observation");
+        assert_eq!(records[1]["in_flight_phase"], "between_phases");
+        assert_eq!(records[1]["active_phases"], "none");
+        assert!(records[1]["completed_phases"]
+            .as_str()
+            .unwrap()
+            .contains("vector_embedding="));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn timeout_reports_the_held_search_phase() {
+        for (phase, expected) in [
+            (SearchPhase::TextSearch, "text_search"),
+            (SearchPhase::VectorSearch, "vector_search"),
+        ] {
+            let capture = LogCapture::default();
+            let guard = tracing::subscriber::set_default(subscriber(capture.clone()));
+            let coordinator = multi_backend_coordinator(Some(phase));
+            let request = search_request("phase trace timeout");
+            let _ = coordinator
+                .fan_out_search(&request, &Namespace::local())
+                .await
+                .expect("active search succeeds");
+            drop(guard);
+            let logs = capture.contents();
+
+            assert!(
+                logs.contains(&format!("in_flight_phase={expected}")),
+                "timeout did not name {expected}: {logs}"
+            );
+            assert!(logs.contains("completed_phases=authorization="), "{logs}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn timeout_before_any_phase_says_not_entered() {
+        let capture = LogCapture::default();
+        let guard = tracing::subscriber::set_default(subscriber(capture.clone()));
+        let coordinator = multi_backend_coordinator(None);
+        let request = search_request("no search phase entered");
+        let _ = coordinator
+            .fan_out_search(&request, &Namespace::local())
+            .await
+            .expect("active search succeeds");
+        drop(guard);
+        let logs = capture.contents();
+
+        assert!(logs.contains("in_flight_phase=not_entered"), "{logs}");
+        assert!(logs.contains("active_phases=none"), "{logs}");
+        assert!(logs.contains("completed_phases=none"), "{logs}");
+    }
+
+    // The default deployment has one backend and no fan-out worker. A deadline-aware wait
+    // there (reader admission) fails at the deadline rather than hanging, so the search
+    // resolves with an error inside the outer timeout; the warning must still name the
+    // phase that was in flight at the deadline.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(config_ledger)]
+    async fn single_backend_deadline_error_names_the_held_search_phase() {
+        for (kind, phase, expected) in [
+            (
+                "entity",
+                SearchPhase::EntityReaderAdmission,
+                "entity_reader_admission",
+            ),
+            (
+                "note",
+                SearchPhase::NoteReaderAdmission,
+                "note_reader_admission",
+            ),
+        ] {
+            let capture = LogCapture::default();
+            let guard = tracing::subscriber::set_default(subscriber(capture.clone()));
+            let coordinator = SubstrateCoordinator::single(runtime())
+                .with_phase_deadline_error_backend("main", phase);
+            let request = search_request_of_kind(kind, "single backend deadline");
+            let _ = coordinator
+                .fan_out_search(&request, &Namespace::local())
+                .await
+                .expect("active search succeeds");
+            drop(guard);
+            let logs = capture.contents();
+
+            assert!(
+                logs.contains(&format!("in_flight_phase={expected}")),
+                "{kind} search deadline did not name {expected}: {logs}"
+            );
+            assert!(
+                logs.contains("completed after the shared request deadline"),
+                "{kind}: {logs}"
+            );
+            assert!(
+                logs.contains("completed_phases=authorization="),
+                "{kind}: {logs}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn completed_search_has_no_timeout_and_keeps_its_results() {
+        let runtime = runtime();
+        let namespace = Namespace::local();
+        let token = runtime
+            .authorize(namespace.clone())
+            .expect("authorize search");
+        runtime
+            .create_entity_with_embedding_report(
+                &token,
+                "concept",
+                None,
+                "SearchPhaseTraceResult",
+                Some("search phase result probe"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create search result");
+        let request = search_request("SearchPhaseTraceResult");
+        let expected = runtime
+            .hybrid_search_outcome_with_text_mode(
+                &token,
+                request.query(),
+                super::rrf_fanout_search_limit(&request),
+                request.kind_filter(),
+                request.entity_type(),
+                request.tags(),
+                request.properties(),
+                request.text_mode(),
+            )
+            .await
+            .expect("direct backend search");
+
+        let capture = LogCapture::default();
+        let guard = tracing::subscriber::set_default(subscriber(capture.clone()));
+        let mut registry = BackendRegistry::new();
+        registry.register(
+            khive_runtime::BackendId::parse("seeded").expect("backend id"),
+            Arc::clone(&runtime),
+        );
+        registry.register(
+            khive_runtime::BackendId::parse("empty").expect("backend id"),
+            self::runtime(),
+        );
+        let coordinator = SubstrateCoordinator::new(registry);
+        let (hits, _, per_backend) = coordinator
+            .fan_out_search(&request, &namespace)
+            .await
+            .expect("active search succeeds");
+        drop(guard);
+        let logs = capture.contents();
+
+        assert!(!logs.contains("backend search task timed out"), "{logs}");
+        assert!(
+            !logs.contains("backend search task completed after the shared request deadline"),
+            "{logs}"
+        );
+        assert_eq!(per_backend.len(), 2);
+        assert!(
+            per_backend.iter().all(|backend| backend.error.is_none()),
+            "a backend that finished in time reported an error"
+        );
+        assert!(!expected.hits.is_empty(), "control search found no result");
+        let seeded = per_backend
+            .iter()
+            .find(|backend| backend.backend_id.as_str() == "seeded")
+            .expect("seeded backend result");
+        let hit_key = |hit: &khive_runtime::SearchHit| {
+            (
+                hit.entity_id,
+                hit.score,
+                hit.source,
+                hit.title.clone(),
+                hit.snippet.clone(),
+            )
+        };
+        assert_eq!(
+            seeded.hits.iter().map(hit_key).collect::<Vec<_>>(),
+            expected.hits.iter().map(hit_key).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            hits.iter().map(|hit| hit.entity_id).collect::<Vec<_>>(),
+            expected
+                .hits
+                .iter()
+                .map(|hit| hit.entity_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn a_traced_search_records_the_phases_it_ran() {
+        let runtime = runtime();
+        let token = runtime
+            .authorize(Namespace::local())
+            .expect("authorize search");
+        runtime
+            .create_entity_with_embedding_report(
+                &token,
+                "concept",
+                None,
+                "SearchPhaseBoundaryProbe",
+                Some("search phase boundary probe"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create search result");
+        let request = search_request("SearchPhaseBoundaryProbe");
+        let trace = khive_storage::request_context::SearchPhaseTrace::new();
+        let outcome = khive_storage::request_context::scope_search_phase_trace(
+            trace.clone(),
+            runtime.hybrid_search_outcome_with_text_mode(
+                &token,
+                request.query(),
+                super::rrf_fanout_search_limit(&request),
+                request.kind_filter(),
+                request.entity_type(),
+                request.tags(),
+                request.properties(),
+                request.text_mode(),
+            ),
+        )
+        .await
+        .expect("traced search");
+        assert!(!outcome.hits.is_empty(), "control search found no result");
+
+        let snapshot = trace.snapshot();
+        for phase in [
+            "text_search=",
+            "vector_search=",
+            "fusion=",
+            "entity_hydration=",
+        ] {
+            assert!(
+                snapshot.completed_phases.contains(phase),
+                "{phase} missing from {}",
+                snapshot.completed_phases
+            );
+        }
+        assert_eq!(snapshot.in_flight_phase, "between_phases");
+        assert_eq!(snapshot.active_phases, "none");
+    }
+}
+
+/// Per-backend fan-out over-fetch bound for RRF merge fairness.
 ///
 /// Each backend must contribute more than just the caller's `limit` worth of
 /// ranked candidates, or a candidate that ranks #2+ on multiple backends can
@@ -1325,78 +2385,67 @@ fn rrf_fanout_search_limit(request: &ValidatedSearchRequest) -> u32 {
 
 // ---- RRF merge ----
 
-#[derive(Default)]
-struct RrfMergeBucket {
-    score: DeterministicScore,
-    // Ranked lists follow backend ID order; equal ranks retain the earlier backend.
-    evidence_rank: Option<usize>,
-    signals: khive_runtime::SearchSignals,
-    source: Option<SearchSource>,
-    title: Option<String>,
-    snippet: Option<String>,
+/// Fuse ranked lists with RRF (shared default k), keep hits whose fused source passes
+/// `source_filter`, then cut the filtered order to `limit`.
+///
+/// Each list is one arm and each hit carries its position in its own list. Later copies of an id
+/// widen the source and fill a missing title or snippet, and the signals come from the
+/// best-ranked appearance, with the earlier list winning a tie.
+fn merge_labelled(
+    arms: Vec<Vec<(Uuid, HitLabel)>>,
+    limit: usize,
+    source_filter: Option<SearchSource>,
+) -> Vec<(Uuid, DeterministicScore, HitLabel)> {
+    let mut fused = fuse_labelled(arms, DEFAULT_RRF_K, combine_best_ranked_evidence);
+    fused.retain(|(_, _, label)| source_filter.is_none_or(|want| label.source == want));
+    fused.truncate(limit);
+    fused
 }
 
-/// Merge multiple ranked entity hit lists via Reciprocal Rank Fusion (k=60).
+/// Merge ranked entity hit lists via Reciprocal Rank Fusion with the shared default k.
 #[cfg(test)]
 pub(super) fn rrf_merge_entity_hits(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
     rrf_merge_entity_hits_filtered(lists, limit, None)
 }
 
-fn rrf_merge_entity_hits_filtered(
+pub(super) fn rrf_merge_entity_hits_filtered(
     lists: Vec<Vec<SearchHit>>,
     limit: usize,
     source_filter: Option<SearchSource>,
 ) -> Vec<SearchHit> {
-    const K: usize = 60;
-
-    let mut scores: HashMap<Uuid, RrfMergeBucket> = HashMap::new();
-
-    for list in &lists {
-        for (i, hit) in list.iter().enumerate() {
-            let entry = scores.entry(hit.entity_id).or_default();
-            entry.score = entry.score + rrf_score(i + 1, K);
-            if entry.evidence_rank.is_none_or(|best_rank| i < best_rank) {
-                entry.evidence_rank = Some(i);
-                entry.signals = hit.signals;
-            }
-            entry.source = Some(match entry.source {
-                Some(source) => source.union(hit.source),
-                None => hit.source,
-            });
-            if entry.title.is_none() {
-                entry.title = hit.title.clone();
-            }
-            if entry.snippet.is_none() {
-                entry.snippet = hit.snippet.clone();
-            }
+    let mut arms = Vec::with_capacity(lists.len());
+    for list in lists {
+        let mut arm = Vec::with_capacity(list.len());
+        for (rank, hit) in list.into_iter().enumerate() {
+            let label = HitLabel {
+                rank,
+                signals: hit.signals,
+                source: hit.source,
+                title: hit.title,
+                snippet: hit.snippet,
+            };
+            arm.push((hit.entity_id, label));
         }
+        arms.push(arm);
     }
 
-    let mut merged: Vec<SearchHit> = scores
-        .into_iter()
-        .filter_map(|(id, bucket)| {
-            let source = bucket.source.expect("each bucket gets a source");
-            if source_filter.is_some_and(|expected| source != expected) {
-                return None;
-            }
-            Some(SearchHit {
-                entity_id: id,
-                score: bucket.score,
-                rank_score_kind: khive_runtime::RankScoreKind::Rrf,
-                signals: bucket.signals,
-                source,
-                title: bucket.title,
-                snippet: bucket.snippet,
-            })
-        })
-        .collect();
-
-    merged.sort_by(|a, b| b.score.cmp(&a.score).then(a.entity_id.cmp(&b.entity_id)));
-    merged.truncate(limit);
+    let fused = merge_labelled(arms, limit, source_filter);
+    let mut merged = Vec::with_capacity(fused.len());
+    for (entity_id, score, label) in fused {
+        merged.push(SearchHit {
+            entity_id,
+            score,
+            rank_score_kind: khive_runtime::RankScoreKind::Rrf,
+            signals: label.signals,
+            source: label.source,
+            title: label.title,
+            snippet: label.snippet,
+        });
+    }
     merged
 }
 
-/// Merge multiple ranked note hit lists via Reciprocal Rank Fusion (k=60).
+/// Merge ranked note hit lists via Reciprocal Rank Fusion with the shared default k.
 #[cfg(test)]
 pub(super) fn rrf_merge_note_hits(
     lists: Vec<Vec<NoteSearchHit>>,
@@ -1405,57 +2454,40 @@ pub(super) fn rrf_merge_note_hits(
     rrf_merge_note_hits_filtered(lists, limit, None)
 }
 
-fn rrf_merge_note_hits_filtered(
+pub(super) fn rrf_merge_note_hits_filtered(
     lists: Vec<Vec<NoteSearchHit>>,
     limit: usize,
     source_filter: Option<SearchSource>,
 ) -> Vec<NoteSearchHit> {
-    const K: usize = 60;
-
-    let mut scores: HashMap<Uuid, RrfMergeBucket> = HashMap::new();
-
-    for list in &lists {
-        for (i, hit) in list.iter().enumerate() {
-            let entry = scores.entry(hit.note_id).or_default();
-            entry.score = entry.score + rrf_score(i + 1, K);
-            if entry.evidence_rank.is_none_or(|best_rank| i < best_rank) {
-                entry.evidence_rank = Some(i);
-                entry.signals = hit.signals;
-            }
-            entry.source = Some(match entry.source {
-                Some(source) => source.union(hit.source),
-                None => hit.source,
-            });
-            if entry.title.is_none() {
-                entry.title = hit.title.clone();
-            }
-            if entry.snippet.is_none() {
-                entry.snippet = hit.snippet.clone();
-            }
+    let mut arms = Vec::with_capacity(lists.len());
+    for list in lists {
+        let mut arm = Vec::with_capacity(list.len());
+        for (rank, hit) in list.into_iter().enumerate() {
+            let label = HitLabel {
+                rank,
+                signals: hit.signals,
+                source: hit.source,
+                title: hit.title,
+                snippet: hit.snippet,
+            };
+            arm.push((hit.note_id, label));
         }
+        arms.push(arm);
     }
 
-    let mut merged: Vec<NoteSearchHit> = scores
-        .into_iter()
-        .filter_map(|(id, bucket)| {
-            let source = bucket.source.expect("each bucket gets a source");
-            if source_filter.is_some_and(|expected| source != expected) {
-                return None;
-            }
-            Some(NoteSearchHit {
-                note_id: id,
-                score: bucket.score,
-                rank_score_kind: khive_runtime::RankScoreKind::Rrf,
-                signals: bucket.signals,
-                source,
-                title: bucket.title,
-                snippet: bucket.snippet,
-            })
-        })
-        .collect();
-
-    merged.sort_by(|a, b| b.score.cmp(&a.score).then(a.note_id.cmp(&b.note_id)));
-    merged.truncate(limit);
+    let fused = merge_labelled(arms, limit, source_filter);
+    let mut merged = Vec::with_capacity(fused.len());
+    for (note_id, score, label) in fused {
+        merged.push(NoteSearchHit {
+            note_id,
+            score,
+            rank_score_kind: khive_runtime::RankScoreKind::Rrf,
+            signals: label.signals,
+            source: label.source,
+            title: label.title,
+            snippet: label.snippet,
+        });
+    }
     merged
 }
 

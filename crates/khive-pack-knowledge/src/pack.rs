@@ -9,9 +9,11 @@ use uuid::Uuid;
 
 use khive_brain_core::SectionPosteriorState;
 use khive_runtime::pack::{PackByIdResolver, PackRuntime};
+use khive_runtime::resource_admission::{
+    AdmittedJob, BodyOutcome, FinalizationOutcome, JobOutcome, TrackedJob, WorkClass,
+};
 use khive_runtime::{
-    KhiveRuntime, Namespace, NamespaceToken, PackSchemaPlan, Resolved, RuntimeError, SchemaPlan,
-    VerbRegistry,
+    KhiveRuntime, Namespace, NamespaceToken, PackSchemaPlan, Resolved, RuntimeError, VerbRegistry,
 };
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{PhaseCancelledPayload, PhaseCompletedPayload, PhaseStartedPayload};
@@ -78,13 +80,7 @@ impl KnowledgePack {
 struct KnowledgePackFactory;
 
 impl khive_runtime::PackFactory for KnowledgePackFactory {
-    fn name(&self) -> &'static str {
-        "knowledge"
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        &["kg"]
-    }
+    khive_runtime::pack_factory_metadata!(KnowledgePack);
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(KnowledgePack::new_with_index_role(
@@ -103,38 +99,135 @@ impl khive_runtime::PackFactory for KnowledgePackFactory {
 
 inventory::submit! { khive_runtime::PackRegistration(&KnowledgePackFactory) }
 
+// The supervisor outlives its control handle so cancellation can finalize telemetry.
+async fn run_knowledge_embedder_warm(
+    runtime: KhiveRuntime,
+    token: Option<NamespaceToken>,
+    job: AdmittedJob,
+) -> JobOutcome<Result<Vec<f32>, RuntimeError>> {
+    let phase_entry = std::time::Instant::now();
+    let entry_cpu = khive_runtime::process_resource_usage();
+    let mut start_attempted = false;
+    let start_finished = if let Some(token) = &token {
+        match job
+            .run_body(async {
+                // Set on the future's first poll, after run_body's pre-start check.
+                start_attempted = true;
+                khive_runtime::emit_phase_event(
+                    &runtime,
+                    token,
+                    "knowledge.embedder_warm",
+                    EventKind::PhaseStarted,
+                    PhaseStartedPayload {
+                        work_class: "warm".into(),
+                        phase: "knowledge_embedder_warm".into(),
+                        corpus_size: None,
+                    },
+                )
+                .await;
+            })
+            .await
+        {
+            BodyOutcome::Finished(()) => true,
+            BodyOutcome::Cancelled => false,
+        }
+    } else {
+        true
+    };
+    if !start_finished && !start_attempted {
+        // No phase append was even polled, so do not invent a terminal pair.
+        return JobOutcome::Cancelled;
+    }
+    let (phase_start, cpu_start, result) = if start_finished {
+        // Preserve the ordinary timing boundary after the start append returns.
+        let phase_start = std::time::Instant::now();
+        let cpu_start = khive_runtime::process_resource_usage();
+        let result = job
+            .run_body(runtime.embed("__khive_knowledge_warm__"))
+            .await;
+        (phase_start, cpu_start, result)
+    } else {
+        tracing::warn!(
+            phase = "knowledge_embedder_warm",
+            start_attempted,
+            start_finished,
+            start_append_persistence = "unknown",
+            "warm start append was interrupted before returning",
+        );
+        (phase_entry, entry_cpu, BodyOutcome::Cancelled)
+    };
+    let cancelled = match &result {
+        BodyOutcome::Cancelled => true,
+        BodyOutcome::Finished(Err(error)) => khive_runtime::is_benign_shutdown_cancellation(error),
+        BodyOutcome::Finished(Ok(_)) => false,
+    };
+    if let BodyOutcome::Finished(Err(error)) = &result {
+        tracing::warn!(error = %error, "knowledge_embedder_warm: warm operation returned an error");
+    }
+    let finalization = if let Some(token) = &token {
+        let wall_us = phase_start.elapsed().as_micros() as i64;
+        let cpu_us =
+            khive_runtime::cpu_delta_us(cpu_start, khive_runtime::process_resource_usage());
+        // Select the terminal once; cancellation only shortens its append budget.
+        job.finalize(async {
+            if cancelled {
+                khive_runtime::emit_phase_event(
+                    &runtime,
+                    token,
+                    "knowledge.embedder_warm",
+                    EventKind::PhaseCancelled,
+                    PhaseCancelledPayload {
+                        work_class: "warm".into(),
+                        phase: "knowledge_embedder_warm".into(),
+                        wall_us,
+                        cpu_us,
+                    },
+                )
+                .await;
+            } else {
+                khive_runtime::emit_phase_event(
+                    &runtime,
+                    token,
+                    "knowledge.embedder_warm",
+                    EventKind::PhaseCompleted,
+                    PhaseCompletedPayload {
+                        work_class: "warm".into(),
+                        phase: "knowledge_embedder_warm".into(),
+                        wall_us,
+                        cpu_us,
+                    },
+                )
+                .await;
+            }
+        })
+        .await
+    } else {
+        job.no_telemetry()
+    };
+    match finalization {
+        FinalizationOutcome::AttemptTimedOut
+        | FinalizationOutcome::NoAttemptBeforeDeadline
+        | FinalizationOutcome::DeadlineOverflow => {
+            tracing::warn!(
+                ?finalization,
+                "knowledge_embedder_warm: terminal append attempt did not finish"
+            );
+            return JobOutcome::FinalizationTimedOut;
+        }
+        FinalizationOutcome::AlreadyFinalized => {
+            tracing::warn!("knowledge_embedder_warm: terminal finalization was already claimed");
+        }
+        FinalizationOutcome::AttemptReturned | FinalizationOutcome::NoTelemetryToken => {}
+    }
+    match result {
+        BodyOutcome::Finished(result) => JobOutcome::Completed(result),
+        BodyOutcome::Cancelled => JobOutcome::Cancelled,
+    }
+}
+
 #[async_trait]
 impl PackRuntime for KnowledgePack {
-    fn name(&self) -> &str {
-        <KnowledgePack as Pack>::NAME
-    }
-
-    fn note_kinds(&self) -> &'static [&'static str] {
-        <KnowledgePack as Pack>::NOTE_KINDS
-    }
-
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        <KnowledgePack as Pack>::ENTITY_KINDS
-    }
-
-    fn brain_consumer_kinds(&self) -> &'static [&'static str] {
-        <KnowledgePack as Pack>::BRAIN_CONSUMER_KINDS
-    }
-
-    fn handlers(&self) -> &'static [HandlerDef] {
-        &KNOWLEDGE_HANDLERS
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        <KnowledgePack as Pack>::REQUIRES
-    }
-
-    fn schema_plan(&self) -> SchemaPlan {
-        SchemaPlan {
-            pack: "knowledge",
-            statements: &KNOWLEDGE_SCHEMA_PLAN_STMTS,
-        }
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     async fn warm(&self) {
         // Vamana warm may register a missing ANN consumer or publish a rebuilt
@@ -145,84 +238,35 @@ impl PackRuntime for KnowledgePack {
             crate::knowledge::vamana::start_rotation_watcher(&self.runtime, &self.ann);
         }
         if !self.runtime.default_embedder_name().is_empty() {
-            let runtime = self.runtime.clone();
-            // ADR-103 Amendment 1 Part 2: the phase span brackets ONLY this
-            // configured-embedder branch's spawned embed call, not the
-            // unconditional `warm_known_snapshots` above -- an unconditional
-            // span would record a phase for an embedder warmup that never
-            // ran whenever no embedder is configured. Minted here (before
-            // spawn) rather than inside the task: `authorize` is cheap and
-            // synchronous, and minting outside keeps the same shape as
-            // KgPack::warm's unconditional case.
+            let runtime = self.runtime.background_view();
+            let domain = runtime.background_domain();
+            // Register synchronously before queueing, without a second tracked task.
+            let tracking = TrackedJob::register("knowledge_embedder_warm");
             let token = match runtime.authorize(khive_runtime::Namespace::local()) {
                 Ok(token) => Some(token),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "knowledge_embedder_warm: failed to mint ADR-103 phase-span \
-                         attribution token; warmup proceeds without telemetry"
-                    );
+                Err(error) => {
+                    tracing::warn!(error = %error, "knowledge_embedder_warm: warmup proceeds without telemetry");
                     None
                 }
             };
+            // This ambient task does admission/handoff only. The phase and embed
+            // body run on the isolated domain after admission, never on this task.
             tokio::spawn(async move {
-                if let Some(token) = &token {
-                    khive_runtime::emit_phase_event(
-                        &runtime,
-                        token,
-                        "knowledge.embedder_warm",
-                        EventKind::PhaseStarted,
-                        PhaseStartedPayload {
-                            work_class: "warm".into(),
-                            phase: "knowledge_embedder_warm".into(),
-                            corpus_size: None,
-                        },
-                    )
-                    .await;
-                }
-                let phase_start = std::time::Instant::now();
-                let cpu_start = khive_runtime::process_resource_usage();
-                let result = runtime.embed("__khive_knowledge_warm__").await;
-                if let Some(token) = &token {
-                    let wall_us = phase_start.elapsed().as_micros() as i64;
-                    let cpu_us = khive_runtime::cpu_delta_us(
-                        cpu_start,
-                        khive_runtime::process_resource_usage(),
-                    );
-                    match &result {
-                        Err(e) if khive_runtime::is_benign_shutdown_cancellation(e) => {
-                            khive_runtime::emit_phase_event(
-                                &runtime,
-                                token,
-                                "knowledge.embedder_warm",
-                                EventKind::PhaseCancelled,
-                                PhaseCancelledPayload {
-                                    work_class: "warm".into(),
-                                    phase: "knowledge_embedder_warm".into(),
-                                    wall_us,
-                                    cpu_us,
-                                },
-                            )
-                            .await;
-                        }
-                        _ => {
-                            khive_runtime::emit_phase_event(
-                                &runtime,
-                                token,
-                                "knowledge.embedder_warm",
-                                EventKind::PhaseCompleted,
-                                PhaseCompletedPayload {
-                                    work_class: "warm".into(),
-                                    phase: "knowledge_embedder_warm".into(),
-                                    wall_us,
-                                    cpu_us,
-                                },
-                            )
-                            .await;
-                        }
+                let admitted = match domain.admit(WorkClass::Warm, &tracking).await {
+                    Ok(job) => job,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "knowledge_embedder_warm: admission refused");
+                        return;
+                    }
+                };
+                match domain.spawn_supervised(admitted, move |job| {
+                    run_knowledge_embedder_warm(runtime, token, job)
+                }) {
+                    Ok(task) => task.detach(),
+                    Err(error) => {
+                        tracing::warn!(error = %error, "knowledge_embedder_warm: supervisor submission refused");
                     }
                 }
-                let _ = result;
             });
         }
     }
@@ -243,6 +287,8 @@ impl PackRuntime for KnowledgePack {
             }
             "knowledge.get" => KnowledgeHandlers::get(&self.runtime, token, params).await,
             "knowledge.list" => KnowledgeHandlers::list(&self.runtime, token, params).await,
+            "knowledge.export" => KnowledgeHandlers::export(&self.runtime, token, params).await,
+            "knowledge.lint" => self.handle_lint(token, params, registry).await,
             "knowledge.delete_atoms" => {
                 KnowledgeHandlers::delete_atoms(&self.runtime, token, params).await
             }
@@ -343,10 +389,7 @@ impl PackByIdResolver for KnowledgePack {
         // 1. Check knowledge_domains first (canonical over the mirror atom).
         let domain_row = reader
             .query_row(SqlStatement {
-                sql: "SELECT id, namespace, slug, name, description, tags, members, \
-                      created_at, updated_at, deleted_at \
-                      FROM knowledge_domains WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_resolver_live_domain").into(),
                 params: vec![SqlValue::Text(id_str.clone())],
                 label: Some("knowledge.resolve_by_id.domain".into()),
             })
@@ -368,10 +411,7 @@ impl PackByIdResolver for KnowledgePack {
         // 2. Check knowledge_atoms.
         let atom_row = reader
             .query_row(SqlStatement {
-                sql: "SELECT id, namespace, slug, name, content, tags, properties, \
-                      status, finalized, source_uri, source_type, created_at, updated_at, deleted_at \
-                      FROM knowledge_atoms WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_resolver_live_atom").into(),
                 params: vec![SqlValue::Text(id_str)],
                 label: Some("knowledge.resolve_by_id.atom".into()),
             })
@@ -411,10 +451,7 @@ impl PackByIdResolver for KnowledgePack {
 
         let domain_row = reader
             .query_row(SqlStatement {
-                sql: "SELECT id, namespace, slug, name, description, tags, members, \
-                      created_at, updated_at, deleted_at \
-                      FROM knowledge_domains WHERE id = ?1 LIMIT 1"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_resolver_domain_including_deleted").into(),
                 params: vec![SqlValue::Text(id_str.clone())],
                 label: Some("knowledge.resolve_by_id_incl_deleted.domain".into()),
             })
@@ -437,10 +474,7 @@ impl PackByIdResolver for KnowledgePack {
 
         let atom_row = reader
             .query_row(SqlStatement {
-                sql: "SELECT id, namespace, slug, name, content, tags, properties, \
-                      status, finalized, source_uri, source_type, created_at, updated_at, deleted_at \
-                      FROM knowledge_atoms WHERE id = ?1 LIMIT 1"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_resolver_atom_including_deleted").into(),
                 params: vec![SqlValue::Text(id_str)],
                 label: Some("knowledge.resolve_by_id_incl_deleted.atom".into()),
             })
@@ -510,19 +544,19 @@ impl PackByIdResolver for KnowledgePack {
                     writer
                         .execute_batch(vec![
                             SqlStatement {
-                                sql: "DELETE FROM knowledge_sections WHERE atom_id = ?1".into(),
+                                sql: khive_runtime::sql!("knowledge_atom_sections_delete").into(),
                                 params: vec![SqlValue::Text(id_str.clone())],
                                 label: Some(
                                     "knowledge.delete_by_id.domain_mirror_sections.hard".into(),
                                 ),
                             },
                             SqlStatement {
-                                sql: "DELETE FROM knowledge_atoms WHERE id = ?1".into(),
+                                sql: khive_runtime::sql!("knowledge_atom_hard_delete").into(),
                                 params: vec![SqlValue::Text(id_str.clone())],
                                 label: Some("knowledge.delete_by_id.domain_mirror.hard".into()),
                             },
                             SqlStatement {
-                                sql: "DELETE FROM knowledge_domains WHERE id = ?1".into(),
+                                sql: khive_runtime::sql!("knowledge_domain_hard_delete").into(),
                                 params: vec![SqlValue::Text(id_str.clone())],
                                 label: Some("knowledge.delete_by_id.domain.hard".into()),
                             },
@@ -536,9 +570,7 @@ impl PackByIdResolver for KnowledgePack {
                 } else {
                     writer
                         .execute(SqlStatement {
-                            sql: "UPDATE knowledge_domains SET deleted_at = ?1 \
-                                  WHERE id = ?2 AND deleted_at IS NULL"
-                                .into(),
+                            sql: khive_runtime::sql!("knowledge_domain_soft_delete").into(),
                             params: vec![SqlValue::Integer(now_us), SqlValue::Text(id_str.clone())],
                             label: Some("knowledge.delete_by_id.domain.soft".into()),
                         })
@@ -551,9 +583,7 @@ impl PackByIdResolver for KnowledgePack {
                     // Tombstone the mirror atom so FTS no longer surfaces it.
                     writer
                         .execute(SqlStatement {
-                            sql: "UPDATE knowledge_atoms SET deleted_at = ?1 \
-                                  WHERE id = ?2 AND deleted_at IS NULL"
-                                .into(),
+                            sql: khive_runtime::sql!("knowledge_atom_soft_delete").into(),
                             params: vec![SqlValue::Integer(now_us), SqlValue::Text(id_str.clone())],
                             label: Some("knowledge.delete_by_id.domain_mirror.soft".into()),
                         })
@@ -571,12 +601,12 @@ impl PackByIdResolver for KnowledgePack {
                     writer
                         .execute_batch(vec![
                             SqlStatement {
-                                sql: "DELETE FROM knowledge_sections WHERE atom_id = ?1".into(),
+                                sql: khive_runtime::sql!("knowledge_atom_sections_delete").into(),
                                 params: vec![SqlValue::Text(id_str.clone())],
                                 label: Some("knowledge.delete_by_id.atom_sections.hard".into()),
                             },
                             SqlStatement {
-                                sql: "DELETE FROM knowledge_atoms WHERE id = ?1".into(),
+                                sql: khive_runtime::sql!("knowledge_atom_hard_delete").into(),
                                 params: vec![SqlValue::Text(id_str.clone())],
                                 label: Some("knowledge.delete_by_id.atom.hard".into()),
                             },
@@ -588,9 +618,7 @@ impl PackByIdResolver for KnowledgePack {
                 } else {
                     writer
                         .execute(SqlStatement {
-                            sql: "UPDATE knowledge_atoms SET deleted_at = ?1 \
-                                  WHERE id = ?2 AND deleted_at IS NULL"
-                                .into(),
+                            sql: khive_runtime::sql!("knowledge_atom_soft_delete").into(),
                             params: vec![SqlValue::Integer(now_us), SqlValue::Text(id_str.clone())],
                             label: Some("knowledge.delete_by_id.atom.soft".into()),
                         })
@@ -617,158 +645,9 @@ impl PackByIdResolver for KnowledgePack {
 }
 
 #[cfg(test)]
-mod tests {
-    use khive_runtime::pack::PackRuntime;
-    use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
-    use lattice_embed::EmbeddingModel;
+#[path = "pack_tests.rs"]
+mod tests;
 
-    use super::KnowledgePack;
-
-    // ADR-103 Amendment 1 Part 2: knowledge_embedder_warm phase-span events.
-    //
-    // `KhiveRuntime::memory()` builds on `RuntimeConfig::no_embeddings()`
-    // (runtime.rs), so `default_embedder_name()` is empty and the
-    // configured-embedder branch in `KnowledgePack::warm()` never runs. This
-    // pins that gating: the unconditional `vamana::warm_known_snapshots` call
-    // above the branch must never itself emit a phase event, and the
-    // configured-only branch must not fire when unconfigured.
-    #[tokio::test]
-    async fn knowledge_warm_emits_no_phase_events_when_no_embedder_configured() {
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let token = rt.authorize(Namespace::local()).expect("authorize local");
-        let event_store = rt.events(&token).expect("event store must be available");
-
-        let pack = KnowledgePack::new(rt.clone());
-        pack.warm().await;
-
-        let page = event_store
-            .query_events(
-                khive_storage::EventFilter::default(),
-                khive_storage::PageRequest {
-                    limit: 10,
-                    offset: 0,
-                },
-            )
-            .await
-            .expect("query events");
-
-        assert!(
-            page.items.is_empty(),
-            "no embedder configured -> KnowledgePack::warm() must emit zero phase events \
-             (configured-only branch must not fire, and warm_known_snapshots must not \
-             independently emit): {:?}",
-            page.items
-        );
-    }
-
-    #[tokio::test]
-    async fn read_only_knowledge_cache_miss_does_not_start_ann_writer_lifecycle() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = RuntimeConfig {
-            db_path: Some(dir.path().join("read-only-knowledge-ann.db")),
-            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
-            additional_embedding_models: vec![],
-            ..RuntimeConfig::no_embeddings()
-        };
-        drop(KhiveRuntime::new(config.clone()).expect("migrate snapshot source"));
-
-        #[cfg(unix)]
-        {
-            let db_path = config.db_path.as_ref().expect("db path");
-            khive_storage::test_support::freeze_snapshot_sidecars(db_path);
-        }
-
-        let read_only = KhiveRuntime::new_readonly(config).expect("open snapshot read-only");
-        let token = read_only
-            .authorize(Namespace::local())
-            .expect("authorize local");
-        let pack = KnowledgePack::new(read_only.clone());
-        let key = crate::knowledge::vamana::AnnKey::new(
-            token.namespace().as_str(),
-            read_only.default_embedder_name(),
-        );
-        let before = read_only.backend().pool().writer_acquisition_snapshot();
-
-        crate::knowledge::vamana::ensure_ann_background(&read_only, &token, &pack.ann);
-
-        assert!(
-            !crate::knowledge::vamana::is_warming_not_loaded(&pack.ann, &key),
-            "a read-only search cache miss must not claim or spawn an ANN warm slot"
-        );
-        assert_eq!(
-            read_only.backend().pool().writer_acquisition_snapshot(),
-            before,
-            "read-only ANN admission must not acquire a writer"
-        );
-    }
-
-    /// Pack-level lifecycle coverage for `start_rotation_watcher`'s
-    /// production wiring (issue #2340): the rotation tests elsewhere in this
-    /// crate call the private `refresh_rotated_segments_once` test helper
-    /// directly, so nothing previously asserted that a writable `warm()`
-    /// actually starts the tracked watcher, that a repeated `warm()` is
-    /// idempotent, or that the watcher exits once its `AnnState` is dropped.
-    /// Time is paused so the watcher's 5-second tick can be crossed
-    /// deterministically instead of by a real sleep.
-    #[tokio::test(start_paused = true)]
-    #[serial_test::serial(background_tasks)]
-    async fn writable_warm_starts_one_tracked_watcher_idempotently_and_it_exits_on_drop() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = RuntimeConfig {
-            db_path: Some(dir.path().join("rotation-watcher-lifecycle.db")),
-            embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
-            additional_embedding_models: vec![],
-            ..RuntimeConfig::no_embeddings()
-        };
-        let rt = KhiveRuntime::new(config).expect("writable runtime");
-        let pack = KnowledgePack::new(rt);
-
-        let before = khive_runtime::background_task_count();
-        pack.warm().await;
-        assert!(
-            crate::knowledge::vamana::rotation_watch_started_for_test(&pack.ann),
-            "a writable warm must start the rotation watcher"
-        );
-        assert_eq!(
-            khive_runtime::background_task_count(),
-            before + 1,
-            "warm must track exactly one rotation watcher task"
-        );
-
-        // A repeated warm must not start a second tracked watcher.
-        pack.warm().await;
-        assert_eq!(
-            khive_runtime::background_task_count(),
-            before + 1,
-            "a repeated warm must be idempotent and not start a second watcher"
-        );
-
-        // The watcher retains only a Weak<AnnState>; dropping every strong
-        // reference lets its next tick observe the failed upgrade and exit.
-        let ann_weak = std::sync::Arc::downgrade(&pack.ann);
-        drop(pack);
-        assert!(
-            ann_weak.upgrade().is_none(),
-            "dropping the pack must drop its last strong ANN reference"
-        );
-
-        // The watcher builds its interval on its first poll, which can land
-        // after this advance; under paused time `sleep` auto-advances the
-        // clock once every task is idle, so the tick is reached by virtual
-        // time rather than by a fixed yield budget.
-        tokio::time::advance(std::time::Duration::from_secs(6)).await;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-        while khive_runtime::background_task_count() != before {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the watcher must exit once its ANN state is dropped"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert_eq!(
-            khive_runtime::background_task_count(),
-            before,
-            "the watcher must exit once its ANN state is dropped"
-        );
-    }
-}
+#[cfg(test)]
+#[path = "warm_admission_tests.rs"]
+mod warm_admission_tests;

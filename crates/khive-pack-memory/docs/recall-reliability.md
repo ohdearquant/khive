@@ -41,7 +41,7 @@ Deterministic embedding fixtures give controlled two-dimensional similarities wh
 
 The suite establishes:
 
-- two profiles can order the same candidates differently;
+- a served profile scores with the default weights, so two profiles whose posteriors project to different weights order the same candidates identically unless an entity term or a `local_factor` differs;
 - the no-profile path remains unchanged;
 - explicit `profile_id` overrides binding resolution and stamps the serving ID;
 - profile component breakdown is neutral without projected change;
@@ -50,7 +50,8 @@ The suite establishes:
 - positive feedback lifts the target candidate;
 - repeated feedback cannot escape the `[0.85, 1.15]` entity clamp;
 - one profile's entity learning cannot affect another profile;
-- entity posterior lookup and global weight projection remain distinct components.
+- entity posterior lookup and the diagnostic weight projection remain distinct components;
+- a profile's `local_factor` scales rows in the `local` namespace only, ahead of the first `min_score` admission, the duplicate-prefix penalty and the supersedes check.
 
 Isolation fixtures keep signal counts and weights equal across profiles while targeting different notes, so a rank difference cannot be attributed to unequal global salience updates. Shared vocabulary keeps retrieval relevance close enough for the entity term to be observable.
 

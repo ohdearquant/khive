@@ -24,7 +24,7 @@ T = TypeVar("T")
 
 
 class EdgeRelation(str, Enum):
-    """The closed edge ontology (ADR-002, with ADR-055, ADR-191 and ADR-196)."""
+    """The closed edge ontology (ADR-002, with ADR-055, ADR-191, ADR-196 and ADR-197)."""
 
     contains = "contains"
     part_of = "part_of"
@@ -45,6 +45,7 @@ class EdgeRelation(str, Enum):
     annotates = "annotates"
     supports = "supports"
     refutes = "refutes"
+    owns = "owns"
 
 
 class _Record(BaseModel):

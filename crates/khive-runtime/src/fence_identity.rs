@@ -8,7 +8,7 @@
 //! refusal live here rather than at either call site because the guarantee must
 //! not differ by route.
 
-use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::types::SqlValue;
 use khive_storage::{SqlWriter, StorageError};
 use uuid::Uuid;
 
@@ -29,15 +29,9 @@ pub(crate) async fn read_holder(
     label: &'static str,
 ) -> Result<Option<Holder>, StorageError> {
     let row = writer
-        .query_row(SqlStatement {
-            sql: "SELECT id, version FROM notes WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL".into(),
-            params: vec![
-                SqlValue::Text(namespace.into()),
-                SqlValue::Text(kind.into()),
-                SqlValue::Text(key.into()),
-            ],
-            label: Some(label.into()),
-        })
+        .query_row(
+            khive_db::statement_lists::live_holder_read(namespace, kind, key).labelled(label),
+        )
         .await?;
     row.map(|row| {
         let id = match row.get("id") {

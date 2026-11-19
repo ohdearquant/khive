@@ -4,7 +4,7 @@ use criterion::{
 };
 use khive_bm25::{Bm25Config, Bm25Index, SearchContext};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::hint::black_box;
 
 // Deterministic vocabulary: 500 content words drawn from a fixed seeded RNG.
@@ -316,7 +316,7 @@ const VOCAB: &[&str] = &[
 
 fn gen_doc(rng: &mut StdRng, num_words: usize) -> String {
     (0..num_words)
-        .map(|_| VOCAB[rng.gen_range(0..VOCAB.len())])
+        .map(|_| VOCAB[rng.random_range(0..VOCAB.len())])
         .collect::<Vec<_>>()
         .join(" ")
 }

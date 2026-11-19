@@ -22,9 +22,19 @@ fn every_production_handler_has_an_explicit_reviewed_access_class() {
         .collect();
     let mut expected_packs: BTreeSet<String> =
         RuntimeConfig::built_in_packs().into_iter().collect();
+    expected_packs.insert("charter".into());
     // These packs are linked by the executable but are not enabled by default;
     // the access census must cover their handlers as well as the shipping set.
-    expected_packs.extend(["agent", "telemetry", "web"].map(String::from));
+    // Each is an optional feature, so it is expected only in a build that links it.
+    for (name, linked) in [
+        ("agent", cfg!(feature = "pack-agent")),
+        ("telemetry", cfg!(feature = "pack-telemetry")),
+        ("web", cfg!(feature = "pack-web")),
+    ] {
+        if linked {
+            expected_packs.insert(name.into());
+        }
+    }
     if cfg!(feature = "pack-formal") {
         expected_packs.insert("formal".into());
     }
@@ -74,6 +84,9 @@ fn every_production_handler_has_an_explicit_reviewed_access_class() {
         .iter()
         .map(|(name, _)| *name)
         .filter(|name| !matches!(*name, "authorize" | "authorize.visible"))
+        .filter(|name| cfg!(feature = "pack-agent") || !name.starts_with("agent."))
+        .filter(|name| cfg!(feature = "pack-telemetry") || !name.starts_with("telemetry."))
+        .filter(|name| cfg!(feature = "pack-web") || !name.starts_with("web."))
         .filter(|name| cfg!(feature = "pack-moodboard") || !name.starts_with("moodboard."))
         .collect();
     assert_eq!(

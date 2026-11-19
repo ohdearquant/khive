@@ -1,5 +1,47 @@
 # khive-request Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-request`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+Comparison class: `rustc 1.95.0 (59807616e 2026-04-14)`, `bench` profile, AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics, cores 2,3, kernel 6.8.0-142-generic.
+
+| Benchmark                                                                       | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ------------------------------------------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `khive-request:request_bench/parse/batch/10/median_ns`                          | 4.860 µs         | 1.005     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_bench/parse/batch/3/median_ns`                           | 863.223 ns       | 1.030     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_bench/parse/chain/2/median_ns`                           | 846.450 ns       | 1.026     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_bench/parse/chain/5/median_ns`                           | 2.140 µs         | 1.025     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_bench/parse/json_form/3_ops/median_ns`                   | 1.558 µs         | 1.028     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_bench/parse/single/complex/median_ns`                    | 989.087 ns       | 1.016     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_bench/parse/single/simple/median_ns`                     | 205.004 ns       | 1.033     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/eligible/10/median_ns`  | 39.736 ns        | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/eligible/100/median_ns` | 274.487 ns       | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/eligible/50/median_ns`  | 144.144 ns       | 1.082     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/mixed/10/median_ns`     | 115.114 ns       | 1.046     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/mixed/100/median_ns`    | 1.933 µs         | 1.110     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/mixed/50/median_ns`     | 770.521 ns       | 1.039     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/rejected/10/median_ns`  | 183.408 ns       | 1.025     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/rejected/100/median_ns` | 2.834 µs         | 1.075     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/atomic/rejected/50/median_ns`  | 1.316 µs         | 1.070     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/parse_batch/100/median_ns`     | 49.937 µs        | 1.007     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/parse_batch/50/median_ns`      | 23.504 µs        | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/parse_chain/10/median_ns`      | 3.676 µs         | 1.007     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/parse_chain/20/median_ns`      | 7.576 µs         | 1.060     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/plan/batch/10/median_ns`       | 16.593 µs        | 1.007     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/plan/batch/3/median_ns`        | 4.256 µs         | 1.004     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/plan/chain/2/median_ns`        | 3.458 µs         | 1.017     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/plan/chain/5/median_ns`        | 8.441 µs         | 1.048     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/plan/single/complex/median_ns` | 2.765 µs         | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/plan/single/simple/median_ns`  | 1.420 µs         | 1.014     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/typed_json/10/median_ns`       | 2.177 µs         | 1.076     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/typed_json/100/median_ns`      | 21.916 µs        | 1.015     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-request:request_pipeline/request_pipeline/typed_json/50/median_ns`       | 11.167 µs        | 1.038     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+
+<!-- bench-reference:end -->
+
 ## Run command
 
 ```bash
@@ -54,3 +96,111 @@ HTML reports land in `target/criterion/` when gnuplot or plotters is available.
 - Notes: none
 
 Last reviewed: v0.2.8 (2026-06-08)
+
+## Planning, admission, typed input, and scale
+
+The additive `request_pipeline` target covers downstream request inspection and
+larger parser inputs. The original `request_bench` target and its historical
+measurements above are retained.
+
+```bash
+cd crates
+cargo bench -p khive-request --bench request_pipeline -- --quick --noplot
+cargo bench -p khive-request --benches -- --quick --noplot
+```
+
+| Group              | Scenarios                                                               | Public operation and actual input                                                                                  | Baseline |
+| ------------------ | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | -------- |
+| `request_pipeline` | `plan/single/{simple,complex}`, `plan/batch/{3,10}`, `plan/chain/{2,5}` | `plan_request` over the six unchanged legacy DSL inputs with a fixed benchmark catalog                             | pending  |
+| `request_pipeline` | `atomic/{eligible,mixed,rejected}/{10,50,100}`                          | `check_atomic_admissible` on prepared operation vectors, covering admitted names and all four rejection categories | pending  |
+| `request_pipeline` | `typed_json/{10,50,100}`                                                | `parse_typed_json_batch` on already-decoded operation vectors with nested JSON scalar/list/object arguments        | pending  |
+| `request_pipeline` | `parse_batch/{50,100}`                                                  | `parse_request` with the original generated batch shape, up to `MAX_OPS=100`                                       | pending  |
+| `request_pipeline` | `parse_chain/{10,20}`                                                   | `parse_request` with the original generated chain shape and `$prev.id` at every subsequent operation               | pending  |
+
+These are 22 scenarios. Inputs are deterministic source-generated values, require
+no external data, and never construct a runtime or execute a tool. The owning
+`ann-query` benchmark component produces new baselines on a qualified host; the
+record must include commit, toolchain, machine, flags, command, and complete
+sample output. All new baselines remain **pending** that measurement.
+
+### Meaning of each operation
+
+`plan_request` takes **raw DSL text**, parses it, and builds a JSON description
+using catalog lookups. Its measured time includes that parsing and projection.
+It is syntax/catalog inspection: it does not perform dispatch admission, resolve
+`$prev`, or execute a request. The catalog contains `create`, `search`, `get`,
+`link`, and `memory.remember`; the legacy `verb(...)` fixture deliberately remains
+unknown. Checks verify modes, stages, arguments, catalog membership, unit ranges,
+and literal previous-result references after timing.
+
+Atomic admission checks only tool names in an already-prepared operation vector.
+The eligible pattern cycles `update`, `delete`, `link`; the mixed pattern combines
+eligible names with `create`, `search`, `missing.benchmark`, and `merge`; the
+rejected pattern cycles those four rejected names. Their categories are
+embedding-bearing, read, unlisted, and known-unimplemented, respectively. Every
+returned index, tool and reason is checked in input order. There is no atomic
+request flag, prepare/apply work, transaction, or database in this measurement.
+Arguments are empty because this API does not inspect them.
+
+Typed JSON parsing consumes a fresh owned `Vec<TypedJsonOp>` per call. The vector
+is cloned **before** the timer; conversion and structural validation are timed,
+including any destruction performed inside the consuming API. JSON-text decoding
+is not measured. This trusted-transport seam has no original raw bytes and does
+not enforce the raw DSL byte cap; the public DSL scale scenes still use
+`parse_request`. Result checks compare all typed arguments, operation order,
+mode, and unit ranges. Chain checks preserve `$prev.id` as an unresolved reference.
+
+### Timing boundaries
+
+Each selected benchmark scenario runs one preflight, then prints one
+`request_call_report` from 1,001 actual single calls. The median is sorted rank
+501. Sampling begins inside Criterion's selected callback, before its timed
+iterations. A separate Criterion trend
+uses 10 samples, a one-second warmup and a three-second measurement target;
+`--quick` selects Criterion quick mode. Only 1,001 durations are retained at once,
+and setup is sequential rather than an accumulating batch of owned fixtures.
+
+Every per-call timer includes `Instant`/black-box overhead. Input construction or
+cloning, result assertions, returned-value destruction, sorting and reporting
+are excluded. Criterion receives the sum of individual call durations; untimed
+work still consumes wall time. These short-call medians should be compared using
+the same harness and host, and are not interchangeable with historical Criterion
+estimates. Every valid parsing scene must succeed, and expected rejected atomic
+operations must return the full rejection list.
+
+### Listing and correctness-only runs
+
+```bash
+cargo bench -p khive-request --bench request_pipeline -- --list
+cargo bench -p khive-request --bench request_pipeline -- --test
+```
+
+Criterion owns scenario filtering and listing. Listing registers the same 22
+scenario IDs without invoking their measured operations or result checks;
+filtered-out scenes likewise do no operation or report sampling. Small,
+deterministic input fixtures are still constructed during registration.
+
+Correctness-only mode runs one checked call per selected scenario and emits no
+`request_call_report`. This includes `--test` with `--bench`, and direct
+execution without `--bench`, matching Criterion's mode precedence. Arguments
+after `--` are filter text, not mode flags. Planning's parsed expected fixture is
+initialized lazily during its first result check, outside the timed operation.
+Ordinary benchmark runs retain the 1,001-sample report once per selected scene
+and the Criterion timing boundaries above. Explicit `--profile-time` runs skip
+the supplemental report samples, so those samples do not enter the profile.
+No new baseline is claimed.
+
+## Performance guarantees
+
+All six rows are advisory latency trends, with no fixed percentage or timing
+threshold. No new allocation/count gate is introduced. Historical values describe
+the recorded release and are not new measurements or promises.
+
+| Operation              | Input                         | Metric         | Bound                                        | Baseline             |
+| ---------------------- | ----------------------------- | -------------- | -------------------------------------------- | -------------------- |
+| parse single (simple)  | `verb(arg="value")`           | latency median | Advisory trend; last ledger value 338.3 ns   | historical: 338.3 ns |
+| parse single (complex) | memory.remember 5 args + UUID | latency median | Advisory trend; last ledger value 1.390 µs   | historical: 1.390 µs |
+| parse batch (10 ops)   | 10-op parallel batch          | latency median | Advisory trend; last ledger value 7.083 µs   | historical: 7.083 µs |
+| parse chain (5 ops)    | 5-op chain with $prev         | latency median | Advisory trend; last ledger value 2.948 µs   | historical: 2.948 µs |
+| parse batch (100 ops)  | 100-op batch (MAX_OPS)        | latency median | Advisory trend against the recorded baseline | 49.937 µs (415e1e86) |
+| plan_request           | 10-op batch                   | latency median | Advisory trend against the recorded baseline | 16.593 µs (415e1e86) |

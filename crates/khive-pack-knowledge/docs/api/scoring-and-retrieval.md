@@ -5,6 +5,19 @@
 The search path uses a multi-signal TF-IDF variant with optional embedding rerank and optional
 query decomposition.
 
+### Atom and domain classification
+
+Across import, delete, listing, totals, cursor pagination, embedding coverage, and
+search kind filters, a domain mirror is a row whose decoded JSON string-array
+`tags` contains the exact, case-sensitive element `type:domain`. Escaped spellings
+such as `type\u003adomain` count; `type:domain-extra`, `prefix:type:domain`, and
+`TYPE:DOMAIN` remain ordinary atom tags. Legacy tags that are not a complete JSON
+string array retain the conservative, case-sensitive raw substring check.
+
+SQLite read predicates and Rust checks use the same classifier. Cursor indexes
+cover all live rows; classification is applied before the page limit. Upgrading
+rebuilds the atom cursor index without rewriting stored tags or atom content.
+
 ### Scoring
 
 For each candidate atom/domain, the score is a weighted sum of per-field TF scores multiplied
@@ -53,6 +66,30 @@ Knowledge retrieval uses the default embedder for both query and atom vectors. A
 `knowledge.index` writes only default-model atom vectors; additional registered models are not
 indexed until a knowledge read path can select or fuse them.
 
+### Learned atom weights
+
+`knowledge.search` reads persisted `atom_weights` for candidate atom IDs in the
+caller's namespace on each request, in one bounded batch. Each candidate stage fetches up to
+100 candidates regardless of the requested output limit; the lexical raw candidate
+pool remains unchanged. The distinct lexical/ANN union may therefore contain up
+to 200 candidates. Candidates outside those stage caps are not globally reranked.
+Missing weight rows apply a factor of `1.0`; stored weights use the shared
+loader's `0.1` to `5.0` bounds. Domain hits always apply `1.0`.
+
+After any embedding blend and status normalization/multipliers, the score is
+multiplied by the learned factor. Search then sorts by weighted score (slug
+breaks ties), applies `min_score` to that weighted score and takes the requested
+limit. The resulting score can exceed `1.0`; it is not clamped. A factor of
+`1.0` preserves the candidate's prior score. Each hit reports its applied factor
+as numeric `atom_weight`.
+
+A failed weight read retains the candidate scores with factor `1.0` and reports
+`degraded.atom_weights_unavailable`, even when results are nonempty. The reason
+is `cancelled` for request cancellation, `timeout` for a deadline or admission
+timeout, and `storage` for other read failures. This fallback does not claim
+that stored weight rows are absent. The read uses the original request deadline
+and adds no retry. A request with no atom candidates performs no weight read.
+
 ### Vamana ANN Signal
 
 Alongside the TF-IDF signal, if a Vamana ANN index is warm (populated via `knowledge.index
@@ -99,7 +136,8 @@ composes with `knowledge.suggest`'s existing ANN-unavailable degradation object 
 through auto-`knowledge.compose` when its internal suggestion is degraded.
 
 Eligibility refill does not override caller-requested score semantics: `min_score` is reapplied
-after status multipliers, so a genuine score-floor rejection may still return fewer than `limit`.
+after status multipliers and learned atom weights, so a genuine score-floor rejection may still
+return fewer than `limit`.
 
 ## Fold (`knowledge.fold`)
 
@@ -130,9 +168,17 @@ Section content...
 ```
 
 The parser (`parse_atlas_md`) reads the `# Title` line as the atom name, collects text before
-the first `##` heading as the atom body, and maps each `##` heading to a `SectionType` via
-`SectionType::from_str_loose` (which accepts common heading aliases). Headings that don't match
-any canonical type are classified as `Other`.
+the first `##` heading as the atom body, and maps each `##` heading to a `SectionType`. A heading
+that ends in a `{type}` marker declares its type: the marker must be a canonical snake_case
+`SectionType` value (`## Why memoization terminates {core_model}`), aliases are not accepted inside
+the braces, and the marker is removed from the stored heading. Brace text that is not a trailing
+lowercase token stays part of the heading. Headings without a marker go through
+`SectionType::from_str_loose` (which accepts common heading aliases for the eight section types).
+A section whose heading resolves to no type, whether its marker names no section type or no alias
+matches, is never guessed: it is not imported, it is counted in `sections_unknown_type` and logged
+with its file and heading. The retired `references` and `other` types are not section types, so a
+`## References` heading is refused this way, and an imported atom always carries
+`source_type = "imported"`.
 
 Optional delimiter-bounded YAML frontmatter is removed before markdown parsing and content
 storage. `id`, `atlas_id`, and `atlas-id` are agreeing aliases for canonical identity; when
@@ -157,7 +203,8 @@ closed at 32 directory levels, 100,000 entries, or 10,000 markdown files. A root
 is rejected even with a trailing separator. Limit errors name the exact failing path and report the
 current/configured depth, entry, and markdown-file counts. The response retains `imported_atoms`,
 `imported_sections`, and `files_processed`, and adds `entries_visited`, `files_discovered`,
-`files_skipped`, `traversal_errors`, `sections_discovered`, and `sections_skipped`.
+`files_skipped`, `traversal_errors`, `sections_discovered`, `sections_skipped` (sections under the
+minimum content length), and `sections_unknown_type`.
 
 ## Numeric Validation
 
@@ -165,3 +212,24 @@ All public request float fields (`min_score`, `intersection_bonus`, `rerank_alph
 `diversity_bias`, `epistemic_weight`, `category_weights.*`, `candidates[*].score`,
 `candidates[*].information_gain`, `weights.*`) are validated with `is_finite()` at the handler
 boundary before being cast to `f32`. Non-finite values return `RuntimeError::InvalidInput`.
+
+## Suggest query admission
+
+`knowledge.suggest` requires at least five words of orientation context. Each
+whitespace-separated piece without CJK characters counts as one word, preserving
+existing Latin-query behavior. Han, Hiragana, Katakana, and Hangul letters in the
+shared CJK script ranges count as one word per two letters; the total is rounded
+down once across the entire query. Punctuation within these CJK script ranges does not contribute letters
+or an additional whitespace word. A piece containing CJK does not also count as
+a separate Latin word.
+
+For example, `如何提升中文检索质量` has ten CJK letters and is admitted;
+`如何提升中文检索质` has nine and is refused. `如何提升中文检索质 retrieval`
+has four CJK-derived words plus one whitespace word and is admitted. Short queries
+can use `knowledge.search`.
+
+Auto-`knowledge.compose` uses the same counting rule with a ten-word minimum, so
+an unspaced query needs twenty CJK letters. Providing explicit `domain_ids` or
+`atom_ids` bypasses that minimum; a nonempty query is still required. The thresholds
+remain five words for suggest and ten for auto-compose. Retrieval ranking and
+embedding-model selection are unchanged.

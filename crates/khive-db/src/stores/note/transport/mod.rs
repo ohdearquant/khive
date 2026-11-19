@@ -1,7 +1,7 @@
 //! Durable sender-side records. No transport adapter performs SQL.
 use super::{map_err, SqlNoteStore};
 use crate::pool::ConnectionPool;
-use khive_storage::{StorageCapability, StorageError, StorageResult};
+use khive_storage::{SqlStatement, SqlValue, StorageCapability, StorageError, StorageResult};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -73,10 +73,7 @@ impl SenderEnvelope {
             return Err(invalid("invalid transport identity"));
         }
         if self.recipient_key_fingerprint.len() != 64
-            || !self
-                .recipient_key_fingerprint
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || !khive_types::is_lowercase_hex(&self.recipient_key_fingerprint)
         {
             return Err(invalid("fingerprint must be 32 lowercase hex bytes"));
         }
@@ -241,6 +238,46 @@ fn sql_integer(value: u64) -> StorageResult<i64> {
     i64::try_from(value)
         .map_err(|_| invalid("unsigned transport value exceeds SQLite integer range"))
 }
+/// Label carried by the statement from [`sender_envelope_insert_statement`] so a failure in a
+/// shared atomic unit can be traced to the transport row.
+pub const SENDER_TRANSPORT_INSERT_LABEL: &str = "sender-transport-insert";
+
+/// Build the INSERT for the first envelope of a logical message as one parameterized statement,
+/// so a caller can commit it in the same transaction as the outbound note it belongs to.
+///
+/// The envelope is validated here. The row is always the first envelope (`envelope_seq` 1); a
+/// key-change re-encryption still goes through [`SenderTransportStore::create`]. Params follow
+/// the order of `comm-sender-envelope-insert.sql`.
+pub fn sender_envelope_insert_statement(envelope: &SenderEnvelope) -> StorageResult<SqlStatement> {
+    envelope.validate()?;
+    let now = chrono::Utc::now().timestamp_micros();
+    Ok(SqlStatement::new(
+        INSERT_SQL,
+        vec![
+            SqlValue::Text(envelope.namespace.clone()),
+            SqlValue::Text(envelope.logical_message_id.to_string()),
+            SqlValue::Text(envelope.outbound_note_id.to_string()),
+            SqlValue::Text(envelope.kind.clone()),
+            SqlValue::Text(envelope.slug.clone()),
+            SqlValue::Text(envelope.credential_ref.clone()),
+            SqlValue::Text(envelope.recipient_address.clone()),
+            SqlValue::Integer(i64::from(envelope.protocol_version)),
+            SqlValue::Text(envelope.sender_agent_id.clone()),
+            SqlValue::Text(envelope.recipient_agent_id.clone()),
+            SqlValue::Text(envelope.recipient_device_id.to_string()),
+            SqlValue::Integer(sql_integer(envelope.recipient_key_epoch)?),
+            SqlValue::Integer(sql_integer(envelope.contact_generation)?),
+            SqlValue::Integer(sql_integer(envelope.sender_key_epoch)?),
+            SqlValue::Text(envelope.recipient_key_fingerprint.clone()),
+            SqlValue::Blob(envelope.enc.clone()),
+            SqlValue::Blob(envelope.ciphertext.clone()),
+            SqlValue::Integer(now),
+            SqlValue::Integer(1),
+            SqlValue::Text(encode(&envelope.sender_assurance).to_string()),
+        ],
+    )
+    .labelled(SENDER_TRANSPORT_INSERT_LABEL))
+}
 fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SenderRecord> {
     Ok(SenderRecord {
         envelope: SenderEnvelope {
@@ -312,31 +349,17 @@ const LOAD_SQL: &str = concat!(
     "recipient_device_id=?2 AND recipient_key_epoch=?3",
 );
 
-const TERMINAL_SQL: &str = concat!(
-    "SELECT EXISTS(SELECT 1 FROM comm_sender_transport WHERE logical_message_id=?1 ",
-    "AND receipt IS NOT NULL)",
-);
+const TERMINAL_SQL: &str = include_str!("../../../../sql/comm-sender-receipt-exists.sql");
 
 const PRIOR_SQL: &str = concat!(
     "SELECT {COLUMNS} FROM comm_sender_transport WHERE logical_message_id=?1 ORDER BY ",
     "envelope_seq DESC LIMIT 1",
 );
 
-const DEVICE_EPOCH_SQL: &str = concat!(
-    "SELECT MAX(recipient_key_epoch) FROM comm_sender_transport WHERE ",
-    "logical_message_id=?1 AND recipient_device_id=?2",
-);
+const DEVICE_EPOCH_SQL: &str =
+    include_str!("../../../../sql/comm-sender-device-key-epoch-max-select.sql");
 
-const INSERT_SQL: &str = concat!(
-    "INSERT INTO comm_sender_transport (namespace, logical_message_id, ",
-    "outbound_note_id, kind, slug, credential_ref, recipient_address, ",
-    "protocol_version, sender_agent_id, recipient_agent_id, recipient_device_id, ",
-    "recipient_key_epoch, contact_generation, sender_key_epoch, ",
-    "recipient_key_fingerprint, enc, ",
-    "ciphertext,state,created_at,updated_at,envelope_seq,sender_assurance) VALUES ",
-    "(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17, ",
-    "'pending',?18,?18,?19,?20)",
-);
+const INSERT_SQL: &str = include_str!("../../../../sql/comm-sender-envelope-insert.sql");
 
 const PENDING_SQL: &str = concat!(
     "SELECT {COLUMNS} FROM comm_sender_transport AS t WHERE namespace=?1 AND kind=?2 ",
@@ -348,34 +371,13 @@ const PENDING_SQL: &str = concat!(
     "created_at,logical_message_id LIMIT ?5",
 );
 
-const FAILURE_SQL: &str = concat!(
-    "UPDATE comm_sender_transport SET ",
-    "state=?4,attempt_count=?5,next_retry_at=?6,last_failure_class=?7,updated_at=?8,",
-    "hold_reason=CASE WHEN ?4='pending' THEN hold_reason ELSE NULL END,",
-    "policy_mode=CASE WHEN ?4='pending' THEN policy_mode ELSE NULL END,",
-    "policy_revision=CASE WHEN ?4='pending' THEN policy_revision ELSE NULL END ",
-    "WHERE logical_message_id=?1 AND recipient_device_id=?2 AND ",
-    "recipient_key_epoch=?3",
-);
+const FAILURE_SQL: &str = include_str!("../../../../sql/comm-sender-failure-update.sql");
 
-const ADMISSION_SQL: &str = concat!(
-    "UPDATE comm_sender_transport SET admitted_at=?4,next_retry_at=?5,updated_at=?6 ",
-    "WHERE logical_message_id=?1 AND recipient_device_id=?2 AND recipient_key_epoch=?3 ",
-    "AND state='pending' AND hold_reason IS NULL",
-);
+const ADMISSION_SQL: &str = include_str!("../../../../sql/comm-sender-admission-update.sql");
 
-const HOLD_SQL: &str = concat!(
-    "UPDATE comm_sender_transport SET hold_reason=?4,updated_at=?5,",
-    "policy_mode=?6,policy_revision=?7 WHERE ",
-    "logical_message_id=?1 AND recipient_device_id=?2 AND recipient_key_epoch=?3",
-);
+const HOLD_SQL: &str = include_str!("../../../../sql/comm-sender-hold-update.sql");
 
-const RECEIPT_SQL: &str = concat!(
-    "UPDATE comm_sender_transport SET ",
-    "state=?4,receipt=?5,next_retry_at=NULL,hold_reason=NULL,",
-    "policy_mode=NULL,policy_revision=NULL,updated_at=?6 WHERE ",
-    "logical_message_id=?1 AND recipient_device_id=?2 AND recipient_key_epoch=?3",
-);
+const RECEIPT_SQL: &str = include_str!("../../../../sql/comm-sender-receipt-update.sql");
 
 /// Store uses the note writer's transaction/queue routing and bounded pooled readers.
 pub struct SenderTransportStore {
@@ -390,6 +392,58 @@ impl SenderTransportStore {
     pub async fn get(&self, key: EnvelopeKey) -> StorageResult<Option<SenderRecord>> {
         self.notes
             .with_reader("sender_transport_get", move |conn| load(conn, key))
+            .await
+    }
+    /// Read the caller's outbound transport record. A recipient receipt wins over
+    /// a newer envelope; without a receipt, use the latest local envelope sequence.
+    pub async fn get_by_outbound_note_id(
+        &self,
+        namespace: &str,
+        outbound_note_id: Uuid,
+    ) -> StorageResult<Option<SenderRecord>> {
+        let namespace = namespace.to_owned();
+        self.notes
+            .with_reader("sender_transport_status", move |conn| {
+                conn.query_row(
+                    &format!(
+                        "SELECT {COLUMNS} FROM comm_sender_transport \
+                         WHERE namespace = ?1 AND outbound_note_id = ?2 \
+                         ORDER BY (receipt IS NOT NULL) DESC, envelope_seq DESC LIMIT 1"
+                    ),
+                    params![namespace, outbound_note_id.to_string()],
+                    read_row,
+                )
+                .optional()
+            })
+            .await
+    }
+    /// The current envelope for one logical message: the row with the highest envelope
+    /// sequence, whatever its state (held and failed rows included). Use [`Self::get`] with the
+    /// full key to read a specific historical envelope.
+    pub async fn current_by_logical_id(
+        &self,
+        namespace: &str,
+        kind: &str,
+        slug: &str,
+        logical_id: Uuid,
+    ) -> StorageResult<Option<SenderRecord>> {
+        let namespace = namespace.to_owned();
+        let kind = kind.to_owned();
+        let slug = slug.to_owned();
+        self.notes
+            .with_reader("sender_transport_current", move |conn| {
+                conn.query_row(
+                    &format!(
+                        "SELECT {COLUMNS} FROM comm_sender_transport \
+                         WHERE namespace = ?1 AND kind = ?2 AND slug = ?3 \
+                         AND logical_message_id = ?4 \
+                         ORDER BY envelope_seq DESC LIMIT 1"
+                    ),
+                    params![namespace, kind, slug, logical_id.to_string()],
+                    read_row,
+                )
+                .optional()
+            })
             .await
     }
     /// Exact retries reuse the record. Only confirmed key-change operations
@@ -756,5 +810,7 @@ impl SenderTransportStore {
             .await
     }
 }
+#[cfg(test)]
+mod source_tests;
 #[cfg(test)]
 mod tests;

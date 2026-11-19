@@ -304,3 +304,81 @@ async fn invalid_legacy_context_is_refused_without_rows() {
         );
     }
 }
+
+#[tokio::test]
+async fn granted_ingest_skips_forwarded_but_preserves_metadata_and_delivery() {
+    for forwarded in [json!({"from_actor": "forged:sender"}), Value::Null] {
+        let (registry, rt) = fixture();
+        let mut args = input(NEW_A, "a@example.com");
+        let ordinary_details = json!({"labels": ["inbox", "important"], "attempt": 1});
+        args["metadata"] = json!({
+            "forwarded": forwarded,
+            "adapter_tag": "ordinary metadata",
+            "adapter_details": ordinary_details,
+            "comm_schema_version": 999,
+            "from": "forged:from",
+            "to": "forged:to",
+            "from_actor": "forged:sender",
+            "to_actor": "forged:recipient",
+            "direction": "outbound",
+            "read": true,
+            "thread_id": "forged-thread",
+            "sent_at": "forged-time",
+            "channel_kind": "telegram",
+            "channel_slug": "forged-channel",
+            "external_id": "forged-external",
+            "subject": "forged subject",
+            "outbound_ref": "forged-outbound",
+            "sent_by_process": "forged-process"
+        });
+        let ack = registry
+            .dispatch("comm.ingest", args.clone())
+            .await
+            .unwrap();
+        assert_eq!(ack["deduplicated"], false);
+        assert_eq!(ack["external_id"], NEW_A);
+        let before = read_note(&rt, &ack).await;
+        assert_eq!(before.kind, "message");
+        assert_eq!(before.namespace, "local");
+        assert_eq!(before.content, "Test message body");
+        let props = before.properties.as_ref().unwrap();
+        assert!(props.get("forwarded").is_none());
+        assert_eq!(props["adapter_tag"], "ordinary metadata");
+        assert_eq!(props["adapter_details"], ordinary_details);
+        assert_eq!(props["comm_schema_version"], 1);
+        assert_eq!(props["from"], "email:sender@example.com");
+        assert_eq!(props["to"], "email:maintainer@example.com");
+        assert_eq!(props["from_actor"], "email:sender@example.com");
+        assert_eq!(props["to_actor"], "email:maintainer@example.com");
+        assert_eq!(props["direction"], "inbound");
+        assert_eq!(props["read"], false);
+        assert_eq!(props["thread_id"], ack["thread_id"]);
+        ack["thread_id"]
+            .as_str()
+            .unwrap()
+            .parse::<uuid::Uuid>()
+            .unwrap();
+        assert_ne!(props["sent_at"], "forged-time");
+        assert!(props["sent_at"].as_str().is_some());
+        assert_eq!(props["channel_kind"], "email");
+        assert_eq!(props["channel_slug"], "a@example.com");
+        assert_eq!(props["external_id"], NEW_A);
+        for absent in ["subject", "outbound_ref", "sent_by_process"] {
+            assert!(props.get(absent).is_none(), "{absent}");
+        }
+
+        let replay = registry.dispatch("comm.ingest", args).await.unwrap();
+        assert_eq!(replay["deduplicated"], true);
+        assert_eq!(replay["thread_id"], ack["thread_id"]);
+        unchanged(&rt, &before).await;
+        let token = rt.authorize(Namespace::local()).unwrap();
+        assert_eq!(
+            rt.notes(&token)
+                .unwrap()
+                .count_notes("local", Some("message"))
+                .await
+                .unwrap(),
+            1
+        );
+    }
+}

@@ -749,16 +749,61 @@ between ticks and exits on daemon shutdown or state drop.
 
 ### `ann_rebuild_threshold` default — why 20%
 
-Tail replay is per-row: one primary-key embedding read plus one ADR-052 incremental insert
-(greedy-search dominated, single-threaded, ~2-3 ms/vector at the current ~553K-vector scale).
-Full rebuild amortizes the same greedy inserts with batch locality and parallelism at roughly
-0.5-0.7 ms/vector (the measured 4-6 minute rebuild). The cost crossover therefore sits near
-20-25% of `vector_count`; past it, replay approaches rebuild latency while yielding a
-worse-conditioned graph (accumulated tombstones, no consolidation). 20% is the conservative side
-of that crossover. Worst-case replay just under threshold at current scale: ~110K rows ≈ 3-4
-minutes — bounded by the same ceiling as today's rebuild, and §2 serve-stale applies throughout.
-The expected case is orders of magnitude smaller: a typical restart tail is one session's writes
-(hundreds to low thousands of rows), i.e. seconds.
+The default remains `0.20`, and the comparisons count raw log rows. This is an
+adopted bound on raw-tail work, not a measured replay/rebuild crossover for every
+workload.
+
+Let `N` be the live vector count, `R` the scoped raw tail rows, `D` the distinct
+tail subjects and `U` the final in-scope upserts (`U <= D <= R`). Replay applies
+one final state update per subject. An upsert may tombstone the old ordinal before
+inserting its replacement; a delete tombstones only a mapped subject. A useful
+cost decomposition is:
+
+```text
+T_replay ~= T_log_and_coalesce(R,D) + T_hydrate(R,U) + T_id_map(N,D)
+            + U*c_upsert + (D-U)*c_delete + T_replay_publication(N,D)
+T_rebuild ~= T_corpus_scan(N) + N*c_build + T_rebuild_publication(N)
+```
+
+The SQL and publication terms are consumer-specific. Knowledge groups the log
+before reading each final upsert's embedding. Memory currently joins embeddings
+to selected raw rows before coalescing them in Rust. Repeated writes therefore
+reduce the number of graph mutations without eliminating all raw-row work.
+
+Under the additional assumptions that final operations are mostly distinct
+upserts and that graph insertion dominates the other terms, the historical
+estimates of `2–3 ms` per incremental insert and `0.5–0.7 ms` per rebuilt vector,
+using insertion time as a proxy for `c_upsert`, give
+`U/N ~= c_build/c_upsert`: approximately `0.17–0.35`, with midpoint estimates of
+`0.24`. These estimates explain the historical choice of `0.20`;
+they do not establish a universal `20–25%` crossover or a latency ceiling. If
+`q = U/R`, the same simplified model puts the raw-row crossover at
+`R/N ~= c_build/(q*c_upsert)` for `q > 0`. With many rewrites, `q` is small and
+the unchanged raw-row policy can choose a rebuild before the graph-insertion
+crossover. Workload-specific crossover claims require measurements of raw rows,
+distinct subjects, operation mix, SQL/hydration work, graph work and publication
+cost. §2 serve-stale applies while replay or rebuild runs.
+
+The setting controls three coupled behaviors:
+
+1. Restart classification for knowledge and memory: raw tails at or below
+   `ceil(ann_rebuild_threshold * N)` use final-state replay; larger tails request
+   a rebuild.
+2. Memory maintenance: the same raw-tail limit chooses incremental maintenance
+   or rebuild, and checkpoint scheduling uses a quarter of that allowance,
+   bounded by the configured operation limit and a minimum of one operation:
+   `max(1, min(max_dirty_ops, floor(ann_rebuild_threshold * N / 4)))`, using the
+   installed bridge's live count for `N`. Dirty operations count raw log rows.
+   Cumulative delta-chain compaction has its own limit.
+3. [ADR-118 §3](ADR-118-fresh-tail-recall-visibility.md#3-cost-shape-and-the-no-index-case)'s
+   no-index exact leg for both consumers: the newest
+   `ceil(ann_rebuild_threshold * N)` retained raw rows are selected before
+   final-state coalescing. Changing the setting therefore changes which retained
+   writes remain visible while no ANN index serves. The serving-index exact leg
+   remains uncapped by this setting.
+
+Changing this bound or substituting a distinct-subject count requires considering
+all three roles. The accepted default and raw-row comparisons remain unchanged.
 
 ### Lever inventory (full residency budget, with projections)
 
@@ -944,3 +989,908 @@ This corrects §1's save-order and interrupted-save recovery wording while retai
 Amendment 1's ordering for a **completed** save, the checksum/fingerprint gates,
 and the Hot/Stale/Cold decision table. ADR-052 Amendment 1 records the
 same index-level file sequence.
+
+---
+
+## Amendment 4 (2026-10-03): contract for a shared ANN lifecycle host
+
+**Status**: Proposed (2026-10-03) ([#3922](https://github.com/ohdearquant/khive/issues/3922)).
+
+### Context
+
+ADR-079 was written for the knowledge bridge. Amendment 1 added the memory pack's note index as a
+global-scope consumer and recorded the first differences between the two consumers: the recovery
+fence in decision rule 4, and the watermark capture rules in "Watermark capture and publication are
+linearized per index scope". Since then each pack has carried the whole index lifecycle (state,
+warm-up, rotation, checkpoint, fresh-tail merge and restart classification) in
+`crates/khive-pack-memory/src/ann.rs` and `crates/khive-pack-knowledge/src/knowledge/vamana.rs`.
+Issue #3929 tracks moving that mechanism into shared lower crates.
+
+A shared lifecycle host needs the differences between the consumers written down as parameters of
+one contract. It also needs rules for points this ADR leaves open: the meaning of the generation
+counter, the statement that reads the write-log tail, the order of candidates with equal scores in
+the fresh-tail merge, and how the segment keys of different consumers stay apart.
+
+This amendment states those rules. For each point it records what each pack does at revision
+8ca97556, fixes the rule, and names the issue that changes code. Line numbers are at that revision.
+A path without a crate prefix is under `crates/khive-pack-memory/src` for memory and under
+`crates/khive-pack-knowledge/src/knowledge` for knowledge. Enabling incremental maintenance for the
+knowledge index, and the design of an entity index, are out of scope.
+
+### Decision
+
+The host takes the differences between consumers as per-corpus parameters. The table gives each
+parameter, the value each pack uses at this revision, and the item below that fixes the rule.
+
+| Parameter                                    | Memory                                       | Knowledge                             | Fixed by    |
+| -------------------------------------------- | -------------------------------------------- | ------------------------------------- | ----------- |
+| Consumer scope                               | all namespaces, one wildcard row per model   | one namespace per index               | Amendment 1 |
+| Recovery fence                               | pending, `-2`                                | durable, `-1`                         | item 1      |
+| Generation counters                          | staleness only                               | epoch and staleness, bumped together  | item 2      |
+| Install entry points                         | ordered                                      | racing and ordered                    | item 2      |
+| Watermark capture                            | scoped maximum with the consumer's own floor | log high-water from `sqlite_sequence` | item 3      |
+| Incremental maintenance and checkpoint timer | on                                           | off                                   | item 4      |
+| Warm wait                                    | none                                         | 5000 ms                               | item 7      |
+| Segment key                                  | `global::memory_vamana::{model}`             | `{namespace}::vamana::{model}`        | item 8      |
+
+#### 1. The recovery fence is a per-corpus parameter
+
+**Today.** Memory registers one wildcard row per model (`ANN_WILDCARD_NS` is `"*"`, ann.rs:2230,
+used by `register_consumer_identity`, ann.rs:2240) at the pending watermark `-2`. In
+`ensure_ann_for_model` (ann.rs:1573) a pending row evicts an unprotected index and forces a full
+rebuild (ann.rs:1589). Any other negative value refuses to serve with an "unsupported recovery
+state" error (ann.rs:1593-1603). Knowledge registers per namespace and publishes the durable `-1`
+after registry loss (`write_force_rebuild_sentinel_row`, vamana.rs:1268). Its
+`prepare_full_corpus_scan` (vamana.rs:1380) promotes an absent or pending row to `-1` before a full
+scan. The registry records the difference in lifetime: `-1` never expires and `-2` retires after 24
+hours (`RECOVERING_WATERMARK`, `PENDING_WATERMARK` and `PENDING_GRACE_US`,
+`crates/khive-retrieval/src/ann/registry.rs:19-28`).
+
+Wildcard rows enter the compaction minimum of every namespace in the pair (Amendment 1,
+"Global-scope consumers", step 2). A wildcard row held at `-1` would therefore stop log compaction
+for that model in every namespace for as long as it stayed at `-1`.
+
+**Rule.** The fence is a parameter of the corpus with two values: pending (`-2`, retired after the
+grace period) and durable (`-1`, never retired). A corpus whose consumer row is the wildcard row
+MUST use the pending fence. A corpus whose consumer rows are per namespace MUST use the durable
+fence. Memory is the first kind and knowledge is the second, so the rule changes no behaviour in
+either pack. Decision rule 4 of Amendment 1 and its knowledge registry-loss refinement stay as
+written.
+
+**Tested by.** Memory `pathless_pending_reader_waits_for_checkpoint_activation` (ann.rs:5521) and
+`pathless_pending_reader_evicts_after_registration_loss` (ann.rs:5580). Knowledge
+`fresh_tail_missing_registration_publishes_force_rebuild_sentinel` (vamana.rs:3815),
+`registry_loss_evicts_stale_bridge_and_forces_authoritative_rebuild` (vamana.rs:6025) and
+`ordinary_checkpoint_cannot_clear_force_rebuild_sentinel` (vamana.rs:6422). Each pack's tests run
+its own fence and stay unchanged when the pack moves onto the host.
+
+**Implemented by.** The host ports #3924 (knowledge) and #3926 (memory).
+
+#### 2. Two generation counters, defined by what a bump does to the slot
+
+**Today.** Memory keeps one counter per model. `bump_generation` (ann.rs:385) increments it and does
+nothing else, so the slot is never emptied. The counter is read by `is_current` (ann.rs:407), by
+`ensure_ann_background` and its retry loop (ann.rs:1224-1336) and by `ensure_ann_for_model` and its
+inner function (ann.rs:1625-1649 and 1824). Memory's `install_replacing` (ann.rs:2197) does not read
+it. It installs into a vacant slot, replaces an incumbent of equal or lower generation, and refuses
+an incumbent of higher generation. Knowledge keeps one counter per namespace. Its only bump is in
+`clear_namespace` (vamana.rs:642), which evicts the namespace's slots and warm states and then bumps
+(vamana.rs:652). Knowledge has two install functions, and both reject a candidate below that
+counter. `install_if_fresher` (vamana.rs:318) installs into a vacant slot or over a lower incumbent
+and keeps an incumbent of equal or higher generation. `install_replacing` (vamana.rs:358) never
+reads the incumbent: once the counter check passes, it replaces whatever is in the slot. Neither
+counter is ever lowered, because `bump_generation` is the only code that writes either map
+(ann.rs:385 and vamana.rs:296). Outside tests memory has seven install calls and knowledge has ten,
+six of `install_replacing` and four of `install_if_fresher`. The install table below lists each one
+with the lock or permit it holds.
+
+One field therefore has two meanings. In memory it counts writes and never empties a slot, so a
+build that finishes late still installs. In knowledge it counts invalidations that did empty the
+slot, so a build that finishes late has to be rejected, because there is no incumbent to compare it
+with.
+
+**Rule.** The host keeps two counters, each defined by its effect on the slot:
+
+- Epoch is a bump that empties the slot. A build captured before an epoch bump MUST be rejected.
+- Staleness is a bump that marks the installed state stale and schedules a rebuild, without
+  forbidding a late install.
+
+One install rule serves both packs, and the tie policy is an explicit argument of the install call.
+A candidate MUST be installed if and only if `candidate.epoch >= scope.epoch` and one of three
+things holds: the slot is vacant, or `incumbent.staleness < candidate.staleness`, or the two
+staleness values are equal and the tie policy is replace. The rule does not compare a candidate's
+staleness with the scope's staleness counter. Memory installs a candidate stamped below that
+counter, by design, because a staleness bump marks the installed state stale without forbidding a
+late install.
+
+The host offers two named entry points, which differ only in the tie policy, in the same way the two
+counters differ only in their effect on the slot. The ordered entry point MUST replace the incumbent
+on a tie, and the racing entry point MUST keep the incumbent on a tie. Every install call outside
+tests takes one of them, as the install table shows.
+
+| Call             | In function                                                                       | Entry point | Held at the call                                                                       | Why this tie policy                                                                                                                                                                      |
+| ---------------- | --------------------------------------------------------------------------------- | ----------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ann.rs:1540`    | `refresh_rotated_segment`                                                         | ordered     | model warm lock (ann.rs:1464)                                                          | The reloaded rotated segment carries the incumbent's own generation, a tie by construction, and replaces its predecessor                                                                 |
+| `ann.rs:3971`    | `checkpoint_raise_compact_readopt`, no segment directory                          | ordered     | model warm lock, taken by the caller (ann.rs:1635)                                     | The pass's build, installed before the registry row is raised, replaces whatever an earlier step of the pass installed                                                                   |
+| `ann.rs:4003`    | `checkpoint_raise_compact_readopt`, full publication                              | ordered     | model warm lock, taken by the caller (ann.rs:1635)                                     | The reopened segment, or the build when there is none, replaces whatever an earlier step of the pass installed                                                                           |
+| `ann.rs:4009`    | `checkpoint_raise_compact_readopt`, delta publication                             | ordered     | model warm lock, taken by the caller (ann.rs:1635)                                     | The build, marked with its delta, replaces whatever an earlier step of the pass installed                                                                                                |
+| `ann.rs:4258`    | `classify_and_adopt_segment`, no tail above the watermark                         | ordered     | model warm lock, taken by the caller (ann.rs:1635)                                     | The committed segment is loaded, and a later result of the pass replaces it                                                                                                              |
+| `ann.rs:4336`    | `classify_and_adopt_segment`, replay on a process that is not the warm index host | ordered     | model warm lock, taken by the caller (ann.rs:1635)                                     | The replayed bridge is served without publishing, and a later result of the pass replaces it                                                                                             |
+| `ann.rs:4386`    | `classify_and_adopt_segment`, tail above the rebuild threshold                    | ordered     | model warm lock, taken by the caller (ann.rs:1635)                                     | The valid segment is served while the rebuild runs, and the rebuild's result at the same generation replaces it                                                                          |
+| `vamana.rs:2434` | `adopt_checkpoint_winner`                                                         | ordered     | checkpoint lock, taken by its only caller (vamana.rs:2487)                             | Publication of a durable segment under the key's checkpoint lock; the incumbent is removed first (vamana.rs:2433)                                                                        |
+| `vamana.rs:2551` | `checkpoint_raise_compact_readopt`, segment write failed                          | ordered     | checkpoint lock (vamana.rs:2487)                                                       | Publication of a durable segment under the key's checkpoint lock; the build is served from memory because the write failed                                                               |
+| `vamana.rs:2573` | `checkpoint_raise_compact_readopt`, file-backed publication                       | ordered     | checkpoint lock and the segment directory's publication lock (vamana.rs:2487 and 2495) | Publication of a durable segment under the key's checkpoint lock; the reopened segment, or the build when the reopen fails, replaces the slot's content before the durable row is raised |
+| `vamana.rs:2595` | `checkpoint_raise_compact_readopt`, in-memory runtime, raise failed               | ordered     | checkpoint lock (vamana.rs:2487)                                                       | Publication of a durable segment under the key's checkpoint lock; the deferred candidate is installed once the durable row is found not ahead of it                                      |
+| `vamana.rs:2615` | `checkpoint_raise_compact_readopt`, in-memory runtime, raise succeeded            | ordered     | checkpoint lock (vamana.rs:2487)                                                       | Publication of a durable segment under the key's checkpoint lock; the deferred candidate is installed after the durable row is raised                                                    |
+| `vamana.rs:3141` | `refresh_rotated_segment`                                                         | ordered     | checkpoint lock and the segment directory's publication lock (vamana.rs:3083 and 3100) | The reloaded rotated segment carries the incumbent's own generation (vamana.rs:3089 and 3136), a tie by construction, and replaces its predecessor                                       |
+| `vamana.rs:3295` | `classify_and_adopt_segment`, no tail above the watermark                         | racing      | warm permit, no checkpoint lock                                                        | The pass's first result is a loaded segment. No lock orders it against a publication or a rotation reload at the same generation, so an equal incumbent stays                            |
+| `vamana.rs:3389` | `classify_and_adopt_segment`, replay on a process that is not the warm index host | racing      | warm permit, no checkpoint lock                                                        | The replayed bridge is served without publishing. No lock orders it against a publication or a rotation reload at the same generation, so an equal incumbent stays                       |
+| `vamana.rs:3414` | `classify_and_adopt_segment`, tail above the rebuild threshold                    | racing      | warm permit, no checkpoint lock                                                        | The segment is served while the rebuild runs. No lock orders it against a publication or a rotation reload at the same generation, so an equal incumbent stays                           |
+| `vamana.rs:3562` | `ensure_ann_for_model`, legacy snapshot                                           | racing      | warm permit, no checkpoint lock                                                        | The legacy snapshot build is the pass's first result. No lock orders it against a publication or a rotation reload at the same generation, so an equal incumbent stays                   |
+
+Two paths in knowledge install nothing, so they make no publication and fall outside the tie-order
+sentence below:
+
+- On an in-memory runtime, when the durable raise fails and the row read back is absent, negative or
+  unreadable, the deferred candidate is dropped and the call returns false (vamana.rs:2600-2612).
+- When a rotated segment fails validation, the reload evicts the predecessor and installs nothing
+  (vamana.rs:3149-3157).
+
+A permit is the per-key warm claim (`begin_warm`, vamana.rs:405). It does not order an install
+against the index verb handler's checkpoint publication or against the rotation reload, because
+neither takes it. In knowledge, `checkpoint_raise_compact_readopt` is called from the warm path
+(vamana.rs:3392 and 3602) and from the index verb handler (`index_handler.rs:189`), and
+`refresh_rotated_segment` runs in the rotation watcher task (`start_rotation_watcher`,
+vamana.rs:2952). The five checkpoint-lock rows of the table are therefore ordered among themselves
+and against the rotation reload by the checkpoint lock, and none of the four racing rows takes that
+lock. In memory, `ensure_ann_for_model` takes the model warm lock (ann.rs:1635) and then calls its
+inner function (ann.rs:1694), which calls `classify_and_adopt_segment` (ann.rs:1863) and
+`checkpoint_raise_compact_readopt` (ann.rs:1915 and 4356). `refresh_rotated_segment` takes the same
+lock itself.
+
+A new caller MUST take the racing entry point unless it holds the key's serialization lock at the
+call (memory: the model warm lock, knowledge: the checkpoint lock) and its candidate is meant to
+supersede an equal incumbent.
+
+In the sentence below, a publication is the install that `checkpoint_raise_compact_readopt` makes of
+the segment it wrote, which is the call at vamana.rs:2573, 2595 or 2615. A publication is completed
+when its durable watermark raise succeeded (vamana.rs:2583, after which the call continues at 2614),
+or was confirmed committed, which is the case where the raise reported an error and the row read
+back equals the value this publication applied (vamana.rs:2585-2598). A row read back behind the
+publication does not make it completed.
+
+On a tie between a completed publication and a racing install, both at or above the scope's counter,
+the completed publication MUST end up installed whichever of the two arrives first. If the racing
+install arrives first, the publication replaces it. If the racing install arrives second, it is kept
+out. The racing entry point replaces only a lower incumbent (vamana.rs:333), and the ordered entry
+point replaces whatever the slot holds once the counter check passes (vamana.rs:358-371). Memory has
+no racing install, so the sentence concerns knowledge only.
+
+The complement is existing behaviour, and this amendment changes no code. A file-backed publication
+is installed before its durable raise (vamana.rs:2573, raise at 2583). A publication that loses the
+raise to a peer, because the durable row read back is ahead of the value it applied
+(vamana.rs:2585-2589), is withdrawn under the same checkpoint lock, and the peer's segment is
+adopted by `adopt_checkpoint_winner`, which removes the slot's content and then installs the winner
+(vamana.rs:2433-2434). If the winner's segment trails its watermark or cannot be loaded, the slot is
+left empty (vamana.rs:2443 and 2452), and on an in-memory runtime the slot is emptied when no
+current index is found (vamana.rs:2459-2465). The next install through either entry point fills an
+empty slot, subject to the counter check. Two further outcomes leave a file-backed publication
+installed. If the raise reported an error and the durable row read back is behind the value the
+publication applied, the publication stays installed (the install at vamana.rs:2573, the branch at
+2586-2598), a state the code comments call a safe under-compaction (vamana.rs:2591-2593). If the
+raise failed and the row read back is absent, negative or unreadable, the publication also stays
+installed, the key is marked for a forced rebuild and the call reports failure
+(vamana.rs:2600-2612). These two are installed and not completed, so they fall outside the tie-order
+sentence above. While installed they are an incumbent like any other, so a racing install at the
+same generation is kept out by the racing entry point (vamana.rs:333).
+
+An installed bridge MUST NOT carry a generation above its scope's counter. At this revision every
+stamp is read from the counter before the build or copied from the incumbent, and nothing lowers a
+counter, so the invariant holds in both packs.
+
+Knowledge's `install_replacing` differs from the ordered entry point in one cell. It never reads the
+incumbent, so it would install a candidate that is at or above the counter and below the incumbent,
+and the ordered entry point rejects that candidate. The ordered entry point is therefore a
+function-level tightening of `install_replacing`. Under the invariant the cell cannot occur: the
+incumbent's generation is at most the counter, and a candidate that passes the epoch clause is at
+least the counter.
+
+Memory bumps staleness only, so its epoch clause is always true. Knowledge bumps both counters at
+its single site, so for knowledge staleness equals epoch. Whether an adapter ignores the epoch
+follows from which counter its sites bump, so the host needs no branch for it.
+
+A new bump site MUST declare which counter it bumps and why. The test is whether the bump empties
+the slot: a bump that does is an epoch bump, and any other is a staleness bump.
+
+**Outside the install rule.** Memory's `maintain_installed` (ann/incremental.rs:190) installs
+through neither entry point. It forks the incumbent, applies the log tail to the fork, and puts the
+fork in the slot only while the incumbent still matches the fence it captured before the fork. The
+fence is `MaintenanceFence` (incremental.rs:153): the incumbent's incarnation, applied sequence,
+durable-epoch baseline, generation, published sequence, dirty-operation count, commit digest and
+last delta nonce. It is compared under the index write lock (incremental.rs:250, 308, 346, 362 and
+372), and the pathless publication makes the same incarnation check by hand
+(incremental.rs:413-419). `maintain_installed` takes the generation to stamp as an argument and
+never reads either counter. The epoch it compares is memory's durable epoch, the reindex signal of
+M1, which is a different value from the epoch counter above. An install that lands while maintenance
+runs puts a bridge with a new incarnation in the slot, so the fence no longer matches, maintenance
+installs nothing and returns `Absent`. Maintenance MUST NOT install over a bridge that no longer
+matches its fence.
+
+Every production call of `bump_generation` at this revision is one of the fifteen sites below,
+fourteen in memory and one in knowledge. Memory's sites are under `crates/khive-pack-memory/src` and
+knowledge's site is under `crates/khive-pack-knowledge/src/knowledge`.
+
+| #   | Site                                             | Condition                                                                                       | Counter             |
+| --- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------- | ------------------- |
+| M1  | `ann.rs:499` in `maybe_check_durable_epoch`      | the durable epoch advanced past the installed baseline                                          | staleness           |
+| M2  | `ann.rs:1544` in `refresh_rotated_segment`       | the adopted peer segment is behind local unpublished writes                                     | staleness           |
+| M3  | `ann.rs:3562` in `fresh_tail_serving`            | the persisted segment state cannot be read                                                      | staleness           |
+| M4  | `ann.rs:3580` in `fresh_tail_serving`            | the persisted sequence is missing or below the registry minimum                                 | staleness           |
+| M5  | `ann.rs:3623` in `fresh_tail_pathless_reresolve` | no bridge is installed                                                                          | staleness           |
+| M6  | `ann.rs:3631` in `fresh_tail_pathless_reresolve` | the pathless search failed                                                                      | staleness           |
+| M7  | `ann.rs:3690` in `fresh_tail_pathless_reresolve` | the pathless floor is above the resolved sequence                                               | staleness           |
+| M8  | `ann.rs:3737` in `fresh_tail_reresolve`          | no segment directory exists                                                                     | staleness           |
+| M9  | `ann.rs:3753` in `fresh_tail_reresolve`          | the segment load failed                                                                         | staleness           |
+| M10 | `ann.rs:3765` in `fresh_tail_reresolve`          | the search on the reloaded segment failed                                                       | staleness           |
+| M11 | `ann.rs:3774` in `fresh_tail_reresolve`          | every round of the re-resolve, because the installed bridge is older than the published segment | staleness           |
+| M12 | `handlers/remember.rs:167` in `handle_remember`  | a row was written and the call was not a replay                                                 | staleness           |
+| M13 | `handlers/prune.rs:241` in `handle_prune`        | rows were pruned                                                                                | staleness           |
+| M14 | `pack.rs:558` in the note mutation hook          | a memory note was created, updated, deleted or merged                                           | staleness           |
+| K1  | `vamana.rs:652` in `clear_namespace`             | a vector write, a registry loss, or a peer compaction past the watermark                        | epoch and staleness |
+
+At M1 to M14 a build that finishes after the bump is installed. At K1 it is rejected. No memory site
+empties the slot, so a late build meets an incumbent of the same or lower generation, or an empty
+slot, and is at least as recent as what would otherwise serve. It installs below the counter, so
+`is_current` stays false and the next request schedules another rebuild. Rows written after the
+build's scan are served from the write-log tail (`fetch_final_tail_on` reads `seq > ?2`,
+ann.rs:2562).
+
+Existing tests that observe the bump at a site:
+
+- M1: `maybe_check_durable_epoch_detects_reindex_from_a_separate_warm_daemon` (ann.rs:6862) and
+  `durable_epoch_change_bypasses_incremental_maintenance` (ann/tests/incremental_tests.rs:786).
+- M2: `dirty_delete_rotation_adopts_peer_floor_and_recovers_unpublished_tail`
+  (ann/tests/incremental_edge_tests.rs:142).
+- M3: `fresh_tail_leg_drops_stale_candidates_when_the_delta_head_cannot_be_read` (ann.rs:8165).
+- M4: `fresh_tail_leg_drops_stale_candidates_when_registry_minimum_exceeds_persisted_base`
+  (ann.rs:7696), `fresh_tail_leg_drops_stale_candidates_when_publication_metadata_is_missing`
+  (ann.rs:8211), `fresh_tail_leg_drops_stale_candidates_when_publication_metadata_is_malformed`
+  (ann.rs:8241) and `fresh_tail_leg_drops_stale_candidates_when_delta_head_is_missing_below_minimum`
+  (ann.rs:8275).
+- M9: `fresh_tail_leg_drops_stale_candidates_when_a_valid_delta_head_names_a_missing_chunk`
+  (ann.rs:7893).
+- M10: `fresh_tail_leg_drops_stale_candidates_when_the_re_resolved_search_fails` (ann.rs:8371).
+- M11: `fresh_tail_leg_reresolves_to_a_newer_persisted_segment_on_mismatch` (ann.rs:7786),
+  `fresh_tail_reresolve_revalidates_registry_minimum_against_interleaved_compaction` (ann.rs:8559)
+  and `fresh_tail_reresolve_falls_back_to_floor_after_max_rounds` (ann.rs:8755).
+- M14: `kg_update_reindex_invalidates_warm_ann_without_subsequent_remember` (pack.rs:1222),
+  `kg_delete_invalidates_warm_ann_without_subsequent_remember` (pack.rs:1250) and
+  `kg_merge_invalidates_warm_ann_without_subsequent_remember` (pack.rs:1280).
+- K1: `clear_namespace_bumps_generation_scoped_to_namespace` (vamana.rs:4282),
+  `stale_build_installs_before_invalidation_race_is_rejected_after` (vamana.rs:4303),
+  `stale_build_rejected_installing_into_still_empty_post_invalidation_slot` (vamana.rs:4357) and
+  `wait_ready_resumes_polling_when_unavailable_marker_is_stale` (vamana.rs:4526).
+
+Six sites have no test of their own. M5, M6, M7, M8 and M12 have no test that observes the bump, and
+M13 is pinned only together with M14, by `prune_invalidates_warm_ann_without_subsequent_remember`
+(pack.rs:1191). A test-only change tracked under #3929 pins M5 to M8, M12 and M13 at their current
+behaviour (the bump is observed and a late build installs) before the shared rule lands. So does a
+table test to be added by #3924, with one case per site and a second table that compares each entry
+point with the install function it replaces on the cells {vacant, incumbent older, incumbent equal,
+incumbent newer} by {epoch bumped, epoch not bumped}, with a tie column for each entry point. It
+compares each of the other cells directly, and it asserts the one cell named under the rule to be
+unreachable under the invariant.
+
+**Stated limits.** Three points were not established by the read behind the table. None of them
+changes the rule, because in each the result is the same as what the incumbent does today.
+
+1. M1: what the reindexing process writes besides the epoch, in particular whether changed vectors
+   also appear in the write log. If they do not, a build scanned before the reindex serves
+   pre-reindex vectors until the forced rebuild completes, which is also what the incumbent does.
+2. The write-log tail switched off with `KHIVE_ANN_FRESH_TAIL=0`
+   (`crates/khive-runtime/src/config.rs:498`). A late build then serves without the rows written
+   after its scan until the rebuild completes, which is again what the incumbent does.
+3. Whether a persisted segment stores a generation. Bridges are constructed and loaded with
+   generation 0 (memory ann.rs:669 and 1019, knowledge vamana.rs:820, 986 and 1090).
+
+**Tested by.** The existing install tests pin the arms that exist today. Memory:
+`install_replacing_rejects_older_generation_candidate` (ann.rs:5335),
+`install_replacing_replaces_older_installed_entry` (ann.rs:5774) and
+`install_replacing_replaces_on_equal_generation` (ann.rs:5791). Knowledge:
+`install_if_fresher_rejects_late_stale_build` (vamana.rs:4182),
+`stale_build_installs_before_invalidation_race_is_rejected_after` (vamana.rs:4303) and
+`stale_build_rejected_installing_into_still_empty_post_invalidation_slot` (vamana.rs:4357). The
+racing entry point's tie is pinned by `install_if_fresher_ties_keep_incumbent` (vamana.rs:4240) and
+the ordered tie in memory by `install_replacing_replaces_on_equal_generation` (ann.rs:5791). No
+existing test is named for the ordered tie in knowledge. The install rule with a tie column for each
+entry point, and the declaration of a new site's counter, are tested by the table test to be added
+by #3924. That test compares each entry point with the function it replaces cell by cell, and for
+the one cell that cannot occur it asserts the unreachability instead of comparing. Four more tests
+are to be added by #3924. The first asserts the invariant: after each install call of the table
+test, the installed bridge's generation is at most the scope's counter. No existing test asserts it;
+the nearest is `empty_tail_refresh_keeps_incumbent_without_fork`
+(ann/tests/maintenance_lock_tests.rs:431), which checks equality in one memory case. The second
+builds the differing cell directly, a candidate at or above the counter and below the incumbent, and
+asserts that the ordered entry point rejects it. The third installs a completed publication and a
+racing candidate at equal generation, both at or above the counter, in both arrival orders, and
+asserts that the publication is installed in both. The fourth makes a file-backed publication lose
+the raise to a peer and asserts that the slot never keeps the losing publication: it holds the
+peer's segment or is empty. No existing test constructs either arrival order or a publication that
+loses the raise after it is installed. The two tests that call `install_replacing` (vamana.rs:4833
+and 4881) call it alone, and the racing tie pin `install_if_fresher_ties_keep_incumbent`
+(vamana.rs:4240) uses the racing entry point twice.
+`stale_normal_checkpoint_adopts_newer_publisher_without_overwrite` (vamana.rs:6699) loses at the
+check before the segment is written, and the concurrent checkpoint tests (vamana.rs:6533 and 6579)
+run on an in-memory runtime. The maintenance fence is pinned by memory
+`maintenance_does_not_resurrect_evicted_or_replaced_bridge`
+(ann/tests/maintenance_lock_tests.rs:356), which evicts or replaces the bridge while maintenance is
+scanning and asserts that maintenance returns `Absent` and the replacement survives.
+
+**Implemented by.** The decision is recorded on #3921, and this item fixes the two entry points and
+their tie policies. The rule lands with the host ports #3924 and #3926.
+
+#### 3. Watermark capture stays per corpus
+
+**Today.** Memory captures the watermark `S` in the corpus scan statement of
+`load_and_build_from_vector_store` (ann.rs:2028). `S` is the larger of the scoped `MAX(seq)` over
+note rows (ann.rs:2062) and the consumer's own active watermark. Knowledge reads the `ann_write_log`
+high-water from `sqlite_sequence` in the statement of `scan_corpus_raw` (vamana.rs:2682, statement
+at vamana.rs:2724). Amendment 1 states both rules.
+
+**Rule.** The capture rule is a parameter of the corpus, with the two values Amendment 1 defines:
+the scoped maximum with the consumer's own floor, and the log high-water. The host MUST take the
+rule from the corpus and MUST NOT apply one rule to both. Making the two agree is a change to
+Amendment 1 and needs its own amendment.
+
+**Tested by.** Memory `pathless_full_checkpoint_inherits_compacted_active_floor` (ann.rs:5435). Test
+to be added by #3905: for each pack, the capture statement equals the current literal, and swapping
+the two capture values makes both comparisons fail.
+
+**Implemented by.** #3905.
+
+#### 4. Incremental maintenance and the checkpoint timer are optional per corpus
+
+**Today.** Memory builds both into its lifecycle. `ensure_ann_for_model_inner` (ann.rs:1811) calls
+`maintain_installed` (ann.rs:1840), `ensure_ann_for_model` schedules the timer through
+`checkpoint_timer::schedule_checkpoint` (ann.rs:1709), the policy is read from the environment when
+the shared state is built (`CheckpointPolicy::from_env`, ann.rs:319), and a checkpoint can publish a
+delta head file (`delta::write`, ann.rs:4147, file name `memory_delta.head`, ann/delta.rs:18). The
+knowledge crate has none of these: a search of `crates/khive-pack-knowledge/src` for
+`maintain_installed`, `schedule_checkpoint`, `checkpoint_timer`, `CheckpointPolicy`, `memory_delta`
+and `delta::write` finds nothing. Knowledge replays the log tail at restart (`replay_final_states`,
+vamana.rs:1726) and merges the fresh tail when serving. Sections 3 and 4 of this ADR were written
+when the knowledge bridge was the only consumer, and the knowledge crate does not implement them.
+
+**Rule.** Incremental maintenance (section 3) and the checkpoint timer (section 4) are optional
+features of a corpus. Sections 3 and 4 apply to a corpus that turns them on. A corpus that leaves
+incremental maintenance off MUST NOT write delta files and MUST NOT schedule the checkpoint timer.
+Memory turns both on. Knowledge leaves both off. Turning them on for knowledge adds files to
+knowledge segment directories, so it is a separate behaviour change and needs its own amendment.
+
+**Tested by.** Memory's tests under `ann/tests/` (`incremental_tests.rs`,
+`incremental_edge_tests.rs` and `maintenance_lock_tests.rs`) run with both features on, and #3926
+adds the check that turning them off in memory's corpus description makes them fail. Test to be
+added by #3924: after a knowledge checkpoint the segment directory holds no delta head file and no
+timer was scheduled.
+
+**Implemented by.** #3906 moves the bridge core and the delta file format into khive-vamana without
+changing knowledge. #3926 moves memory's incremental maintenance and timer onto the host with both
+on. #3924 keeps both off for knowledge.
+
+#### 5. One single-statement tail reader
+
+**Today.** Memory reads the tail with `fetch_final_tail_on` (ann.rs:2562). Its statement selects
+every log row above the watermark and left-joins the vector table and the notes table once per raw
+row. `parse_final_tail_rows` (ann.rs:2718) then keeps the last operation per subject and returns the
+operations with the new applied sequence, which starts at the watermark and rises to the highest
+sequence seen. `fetch_protected_tail_on` (ann.rs:2635) reads the registry minimum together with a
+capped raw delta. Knowledge reads the tail with `fresh_tail_snapshot_statement` (vamana.rs:1809).
+Its statement reduces the suffix to one row per subject, keeping the last operation at the position
+of the subject's first appearance, before it joins the vector table, and it reads the registry
+minimum and the consumer's own watermark in the same statement. Its result type `FreshTailSnapshot`
+(vamana.rs:1798) has no applied-sequence field. Knowledge's restart replay computes an applied
+sequence of its own in `fetch_final_states` (vamana.rs:1666).
+
+**Rule.** The host reads the tail with one statement, which is knowledge's statement with the scope
+and the live-row predicate supplied by the corpus. For every log it MUST return the same operations
+in the same order, and the same applied sequence, as coalescing the raw rows one at a time. The
+applied sequence MUST equal the value `parse_final_tail_rows` returns today, which is the starting
+watermark or the highest sequence in the suffix if that is larger. Amendment 1 already requires the
+tail read and the watermark read to share one snapshot.
+
+**Tested by.** Knowledge `fresh_tail_snapshot_ops_match_per_row_coalescing_of_the_raw_log`
+(vamana.rs:5667) compares the knowledge statement with per-row coalescing. Test to be added by
+#3925: the same comparison for memory, on randomized write logs that include soft-deleted subjects
+and the live-count cap, comparing operations, order and applied sequence. Memory
+`fresh_tail_snapshot_cannot_return_a_torn_log_vector_pair` (ann.rs:4588) stays unchanged.
+
+**Implemented by.** #3925, which also removes the per-row join cost reported in #3877.
+
+#### 6. Equal scores are ordered by ascending id
+
+**Today.** Three fresh-tail merges exist. Memory's `merge_fresh_tail_for_route` (ann.rs:2948, called
+by note search at note_search.rs:133) and knowledge's `merge_fresh_tail` (vamana.rs:2041) both break
+equal scores by ascending id. Memory's `merge_fresh_tail` (ann.rs:3200, called by recall through
+`outcome_into_candidates`, ann.rs:3233, and at handlers/common.rs:1864) extends the list from a hash
+map and sorts by score alone, so equal-score candidates can come back in a different order on
+identical calls. ADR-118 section 2 says that orderings are consumed as ranks and accepts near-tie
+misordering. It does not say how equal scores are ordered.
+
+**Rule.** In every fresh-tail merge, candidates whose scores compare equal MUST be ordered by
+ascending id. The rule does not change the order of candidates with different scores, and the
+near-tie risk that ADR-118 accepts stays as accepted there. ADR-118 points to this item.
+
+**Tested by.** Test to be added by #3927: equal-score tail upserts come back in ascending id order
+across repeated runs, and reverting the sort change makes it fail.
+
+**Implemented by.** #3927.
+
+#### 7. The warm state machine is the superset
+
+**Today.** Knowledge has a warm state machine: `AnnWarmState` (vamana.rs:124), `AnnWarmPermit`
+(vamana.rs:142), `begin_warm` (vamana.rs:405) and `finish_warm` (vamana.rs:492) give each key one
+owner, `mark_unavailable` and `is_terminally_unavailable` (vamana.rs:598 and 608) record a terminal
+failure, and `wait_ready` (vamana.rs:731) waits up to `ANN_WARM_WAIT_TIMEOUT_MS`, 5000 ms
+(vamana.rs:757), which search calls (search.rs:191). Memory keeps a set of keys being warmed with a
+drop guard (`lock_warming`, ann.rs:1171, `WarmingGuard`, ann.rs:1178, `try_take_warming_guard`,
+ann.rs:1248) and has no wait: the memory crate has no reference to `wait_ready` or to the warm-wait
+constant.
+
+**Rule.** The host MUST use knowledge's warm state machine. The wait is a parameter of the corpus.
+Knowledge keeps its 5000 ms and memory MUST set none, so a memory request that arrives while a build
+runs does not block. Amendment 2 still governs how the wait value is configured.
+
+**Tested by.** Knowledge `wait_ready_returns_true_immediately_when_already_loaded` (vamana.rs:4449),
+`wait_ready_returns_false_on_timeout_when_never_loaded` (vamana.rs:4461),
+`wait_ready_returns_false_immediately_when_marked_unavailable` (vamana.rs:4507) and
+`dropped_warm_permit_cannot_leave_stale_warming_ownership` (vamana.rs:4773). Memory
+`ensure_ann_for_model_concurrent_callers_emit_one_phase_pair` (ann.rs:5898) and
+`ensure_ann_background_releases_warming_guard_after_success_and_allows_later_rebuild` (ann.rs:6421).
+Test to be added by #3926: memory on the host machine with no wait returns without blocking while a
+build runs.
+
+**Implemented by.** #3924 moves knowledge's machine onto the host. #3926 moves memory onto it and
+states this swap as the one internal behaviour change of that port.
+
+#### 8. Segment keys are disjoint under every registered key parser
+
+**Today.** Memory's segment key is `global::memory_vamana::{model}` (`snapshot_key`, ann.rs:1061),
+hex-encoded as the directory name (`ann_segment_dir_from_root`, ann.rs:2160). Memory has no parser
+for directory names: its warm pass enumerates the registered models (`warm_existing_memory_indexes`,
+ann.rs:1346). Knowledge's segment key is `{namespace}::vamana::{model}` (`snapshot_key`,
+vamana.rs:1130), hex-encoded the same way (`ann_segment_dir_from_root`, vamana.rs:1146). Its warm
+pass decodes every directory name under the ANN root with `decode_ann_dir_name` (vamana.rs:1161,
+called from `warm_known_snapshots`, vamana.rs:2928), which accepts any name that decodes to text
+containing `::vamana::` with a non-empty part on each side. A directory of another corpus whose key
+contained `::vamana::` would be claimed by that scan.
+
+**Rule.** A segment key MUST be rejected by the key parser of every other registered corpus. In
+particular a key MUST NOT contain `::vamana::` unless it belongs to the knowledge corpus. A change
+that adds a corpus MUST add a test that its key is rejected by every existing parser and accepted
+only by its own. The key formats of memory and knowledge do not change.
+
+**Tested by.** Memory `snapshot_key_does_not_collide_with_knowledge_vamana` (ann.rs:4885) and
+knowledge `ann_segment_dir_encode_decode_round_trip` (vamana.rs:5725) cover the two existing
+corpora. Test to be added by the change that adds a corpus, which for a third corpus is #3928.
+
+**Implemented by.** #3924 and #3926 keep the two key formats. #3928 applies the rule to a third
+corpus.
+
+#### 9. The new host items sit on published crates
+
+**Today.** `khive-vamana`, `khive-runtime` and `khive-retrieval` are published
+(`scripts/publish.sh:53`, `67` and `68`), and none of the three is on the exclusion list of the
+release semver check (`scripts/lib/semver_excludes.txt`). Anything made `pub` in them is public
+surface.
+
+**Note.** The host items added to `khive-retrieval` sit behind its new `ann` feature, and the items
+added to `khive-vamana` sit behind its existing `mmap` feature. Items meant only for the two packs
+are marked `#[doc(hidden)]`. #3901, #3902, #3906 and #3907 each mark the items they add in this way.
+
+### Consequences
+
+- The text of this amendment changes no code. Items 1, 3, 4 and 8 describe behaviour each pack
+  already has, and the host ports keep it.
+- Item 6 changes the order of equal-score candidates in memory recall, which was unspecified before.
+  Item 7 replaces the internals of memory's warm path. Item 5 changes how memory reads the tail, and
+  the pull request that makes the change reports any difference its comparison test finds.
+- Each of the seventeen install calls takes the entry point the install table gives it, so the host
+  ports keep their call sites. The table test of #3924 compares each entry point with the function
+  it replaces, cell by cell, and asserts the one cell that cannot occur under the invariant instead
+  of comparing it.
+- The three points under "Stated limits" stay open until a later change measures them.
+- Memory and knowledge keep their consumer identifiers, segment keys and statement labels, so
+  existing segment directories remain valid.
+
+### References (Amendment 4)
+
+- #3921: the generation counter decision and the fifteen-site table
+- #3922: this amendment
+- #3929: tracking issue for the shared lifecycle host
+- #3877, #3901, #3902, #3905, #3906, #3907, #3924, #3925, #3926, #3927, #3928: the issues named
+  under the items
+- Amendment 1: decision rule 4, "Watermark capture and publication are linearized per index scope"
+  and "Global-scope consumers"; sections 3 and 4 of this ADR
+- [ADR-118](ADR-118-fresh-tail-recall-visibility.md) section 2, which accepts near-tie misordering
+  and points to item 6
+
+## Amendment 5 (2026-10-13): the memory note index is per namespace and note class
+
+**Status**: Proposed (2026-10-13)
+
+### Requirements
+
+The memory pack has to serve many tenants on one machine. Two properties follow, and every decision
+item below serves at least one of them:
+
+- **R1.** A recall's cost scales with the querying tenant's own memories and visible namespaces, never
+  with the whole store.
+- **R2.** No tenant's rows pin another tenant's write-log compaction.
+
+### Context
+
+Line numbers in this amendment are at revision 2afffb61. A path without a crate prefix is under
+`crates/khive-pack-memory/src`. Every number is labeled MEASURED (with the instrument) or DERIVED
+(with the arithmetic and the lines it comes from).
+
+**One graph per model over every namespace and every note kind.** The memory pack's key is
+`AnnKey { model }` (ann.rs:75-79). Its corpus is `memory_corpus()`: `namespace: None`,
+`record_kind: Some("note")`, `field: "note.content"`, joined to live notes (ann.rs:2253-2264,
+join at `crates/khive-retrieval/src/ann/corpus.rs:94-102`). Every live note vector of every
+namespace and every note kind is in the graph. The segment directory is the hex encoding of
+`global::memory_vamana::{model}` (ann.rs:1004-1009, 2061-2065).
+
+**Wildcard registry rows.** Two consumers register on that one graph, `memory-notes:note.content`
+and `note_search`, each at namespace `'*'` (ann.rs:2095-2103, registration at ann.rs:2113-2129).
+Every pair's compaction minimum includes `'*'` rows (`min_watermark_subquery`,
+`crates/khive-retrieval/src/ann/registry.rs:317-323`; the compaction statements
+`crates/khive-retrieval/sql/ann_write_log_compact_namespace.sql` and `..._model.sql`). Active rows
+never age out (registry.rs:25-28). So the global graph's two rows bound write-log compaction in
+every namespace, including namespaces whose own consumers have checkpointed further.
+
+**Recall over-fetches, then widens.** Recall asks the global graph for
+`max(4C, C + 32)` candidates (handlers/common.rs:1216-1222). With the default `C = 150`
+(config.rs:373; capped by `max_recall_candidates = 200`, scoring.rs:547, applied at
+handlers/recall.rs:364-365) that is 600. When the index may hold non-visible namespaces
+(handlers/common.rs:1977-1986), each widening round first re-hydrates every current candidate to
+count visible memories (handlers/common.rs:2001-2011) and then doubles the fetch
+(handlers/common.rs:2016). The default round count is 3 (handlers/common.rs:177-190) and the loop
+runs `1..rounds` (handlers/common.rs:1994), so:
+
+- DERIVED: fetch 600 -> 1,200 -> 2,400 per model, and up to 600 + 1,200 = 1,800 note rows
+  hydrated inside the loop, from handlers/common.rs:1219-1222, 1994, 2002, 2016 and config.rs:373.
+- The final list then goes through the fresh-tail merge at the widened fetch size
+  (handlers/common.rs:2046-2055) and is hydrated a second time by `load_memory_candidate_notes`,
+  which only then drops rows that are not live, visible, unexpired memories
+  (handlers/common.rs:1558-1608).
+- The recall-level loop (handlers/recall.rs:522-564) can repeat the whole collection with
+  `C = min(4C, 200)`. DERIVED: a second collection at `C = 200` fetches 800 -> 1,600 -> 3,200.
+
+**Note search post-filters.** Note search searches the same global graph with
+`max(4k, k + 32)`, keeps only live notes of the token's one namespace (note_search.rs:30-46), and
+doubles the fetch each round up to the same round count (note_search.rs:101-155).
+
+**Per-vector cost.** MEASURED with `ls -l` and `du -sk` on the two global memory segment
+directories of a store holding 122,478 and 120,488 vectors for the two models (2026-10-13):
+
+| File                      | all-minilm-l6-v2 | paraphrase-multilingual-minilm-l12-v2 |
+| ------------------------- | ---------------- | ------------------------------------- |
+| `vectors.bin`             | 188,126,208 B    | 185,069,568 B                         |
+| `codes.bin`               | 47,033,120 B     | 46,268,960 B                          |
+| `graph.bin`               | 28,724,748 B     | 27,778,064 B                          |
+| `lifecycle.bin`           | 28,740,084 B     | 27,793,152 B                          |
+| `external_ids.bin`        | 1,959,728 B      | 1,927,888 B                           |
+| `du -sk` of the directory | 290,972 kB       | 285,352 kB                            |
+| delta chunk files         | 116              | 114                                   |
+
+- DERIVED: vectors = `vectors.bin` / 1,536 (384 f32) = 122,478 and 120,488. The same counts follow
+  from (`external_ids.bin` - 80) / 16, using the 80-byte header at
+  `crates/khive-vamana/src/external_ids.rs:38`.
+- DERIVED: base segment bytes per vector = 294,583,888 / 122,478 = 2,405 B and
+  288,837,632 / 120,488 = 2,397 B, about 2.4 kB per vector per model.
+- DERIVED: while a delta chain that contains an upsert exists, every process that loaded the segment
+  holds an owned copy of the vectors and codes (`crates/khive-pack-memory/docs/ann.md:171-179`):
+  188,126,208 + 47,033,120 = 235,159,328 B for the first model. That cost follows the whole
+  database's index, whichever namespace is queried.
+
+### Decision
+
+#### 1. The key is (namespace, note class, model)
+
+`AnnKey` becomes `{ namespace, class, model }`. `class` has two values: `memory` (notes of kind
+`memory`) and `other` (every other live note kind). Each live note vector is in exactly one graph
+per model; no vector is indexed twice. Each key has its own segment directory, commit record, delta
+chain, registry rows, watermark, single-flight lock and checkpoint timer. Every lifecycle rule of
+Amendment 1, Amendment 3 and ADR-118 applies per key unchanged, including the checkpoint lock of
+"Global-scope consumers" step 4, which is now taken in the key's own directory.
+
+#### 2. Segment directories are named by a fixed-length digest; the key is kept beside the segment
+
+The directory name is `memory-` followed by the 64 lowercase hex digits of the BLAKE3-256 digest
+(already a dependency of the pack: `Cargo.toml:26`, used at ann/delta.rs:70) of a versioned,
+length-prefixed encoding of `(namespace, class, model)`. The name is 71 bytes for every key. The key
+itself is written to a small file in the directory before any segment file. Adoption reads that file
+and requires it to equal the requested key; a missing or different file is decision rule 1 (Cold),
+and a build never writes segment files into a directory whose recorded key names another key.
+
+This supersedes, for memory only, the sentence of Amendment 4 item 8 "The key formats of memory and
+knowledge do not change". Item 8's rule stands: the knowledge parser `decode_ann_dir_name`
+(`crates/khive-pack-knowledge/src/knowledge/vamana/segment_key.rs:39-58`) rejects every memory
+directory name, because `m`, `o`, `r`, `y` and `-` are not hex digits (segment_key.rs:47-49), and
+the memory key file is never a directory name, so no parser decodes it. The change that lands this
+item adds the test item 8 requires: a memory directory name is rejected by `decode_ann_dir_name`, a
+knowledge directory name is rejected by memory's key-file check, and each is accepted only by its
+own. The existing test `snapshot_key_does_not_collide_with_knowledge_vamana` (ann_tests.rs:435)
+stays until the global directory is removed (item 10).
+
+The rotation watcher already iterates installed keys and derives each directory from its key
+(ann.rs:1361-1371), so it needs no reverse mapping from names.
+
+#### 3. Registration is per namespace and class, at the pending fence
+
+Each key registers one row `(consumer, namespace, model)` at its real namespace. The consumer
+identity encodes the class, because both classes of a namespace share the registry's
+`(consumer, namespace, embedding_model)` key: `memory-notes:note.content:memory` and
+`memory-notes:note.content:other`. Recall and note search read the same graphs, so one consumer per
+graph protects both readers and the separate `note_search` consumer retires (item 10). This
+supersedes the "Global-scope consumers" addendum of Amendment 1 for the memory corpus; the addendum
+stays the contract for any other global-scope consumer.
+
+The fence stays pending (`-2`, retired after the grace period) for memory's per-namespace rows. This
+amends Amendment 4 item 1, whose rule ties the fence to the row shape ("A corpus whose consumer rows
+are per namespace MUST use the durable fence"). Item 1 states its own purpose as changing no
+behaviour in either pack; memory's ensure path accepts only an active or pending row and refuses
+every other negative value (ann.rs:1526-1556 and 1580-1600). The fence is therefore a parameter
+named by the corpus, memory pending and knowledge durable, whatever the row shape. Amendment 4's
+parameter table reads, for memory: consumer scope "one namespace and one note class per index",
+segment key "digest of (namespace, class, model), item 2 of Amendment 5".
+
+#### 4. A key with no live rows does not pin its namespace
+
+Many keys are empty: a namespace holding only memories has an empty `other` key, and one holding no
+memories has an empty `memory` key. Today an absent row is registered pending on every ensure
+(ann.rs:1543-1549) and an Empty classification returns without activating it (ann.rs:1815-1817,
+1904-1905). Per key, that would hold `-2` on the namespace's compaction minimum until the grace
+period retires it, and an active row whose class later empties would hold its last watermark
+forever. Rule: when a key classifies Empty (decision rule 5), it raises its own row to the watermark
+`S` captured in the same read snapshot as the zero live count. No segment is written. A later write
+in that class leaves a tail above `S` with no commit record, which is decision rule 1 (Cold), and the
+next search rebuilds the key from the corpus.
+
+#### 5. Corpus and tail predicates
+
+The key's `CorpusScope` sets `namespace: Some(ns)` (already supported, corpus.rs:48-61, with
+`CompactionScope::Namespace`, corpus.rs:177-182) and gains a class predicate on the live-note join:
+`n.kind = 'memory'` or `n.kind <> 'memory'`. The corpus scan, `scope_counts`, the restart
+classifier, `fetch_final_tail_on`, `fetch_protected_tail_on` (ann.rs:2351-2428, which today reads
+every namespace and binds `'*'` at ann.rs:2397) and the session fence (ann.rs:2619-2637, binding
+`ANN_CONSUMER` and `'*'` at ann.rs:2676-2677 and ann/session_exact.rs:45-46) gain `namespace = ?`
+on the write log and bind the key's own consumer row. The class is filtered only at the notes join:
+the write log's `kind` column holds the vector row's record kind (`note`), not the note kind
+(`crates/khive-db/sql/011-ann-write-log.sql`; ann.rs:2630). Both class graphs of a namespace therefore
+read the same log rows. A final upsert whose subject is a live note of the other class replays as a
+delete, as Amendment 1's soft-delete paragraph already requires for any subject outside the
+predicate. Namespace-scoped log reads use `idx_ann_write_log_ns_model_seq`
+(011-ann-write-log.sql).
+
+#### 6. Recall searches the memory graph of each visible namespace
+
+For each model, recall searches the `memory` key of each namespace in the caller's visible set with
+`k = C + 32`, runs each key's fresh-tail leg against that key's own watermark, merges the
+per-namespace lists by descending score and then ascending subject id (the order of Amendment 4
+item 6, implemented in `crates/khive-retrieval/src/ann.rs:60-64`), and keeps the first `C + 32`.
+The top `C + 32` of the union is contained in the union of the per-namespace top `C + 32` lists, so
+the truncation drops nothing a single graph over the visible memories would have returned. Every hit
+is already a visible memory, so the `4C` factor, `index_namespace_set` and the widening rounds
+(handlers/common.rs:1977-2037) are removed. Hydration still re-checks namespace, kind, deletion and
+expiry (handlers/common.rs:1596-1607). The bounded readiness wait (default 8,000 ms,
+handlers/common.rs:192-208) is one wait per model shared by that model's keys, so latency does not
+grow with the number of visible namespaces. The recall-level loop (handlers/recall.rs:522-564)
+stays: it also serves the text leg and the creation-time window. The sqlite-vec fallback is already
+per namespace (handlers/common.rs:2093-2141) and is unchanged.
+
+#### 7. Note search searches the token namespace's two graphs
+
+Note search searches the `memory` and `other` keys of the token's namespace with `k` candidates
+each, merges them by the same order and keeps `k`. The post-filter (note_search.rs:30-46) stays as a
+check; the widening rounds are removed.
+
+#### 8. Maintenance per write touches one graph
+
+A write appends the same `ann_write_log` rows as today. The note-mutation hook carries the note's
+namespace, so a write bumps, probes and replays only its own key. Today the hook receives
+`(kind, id)` only (`crates/khive-runtime/src/runtime.rs:118-132`) and returns early for every kind
+except `memory` (pack.rs:526-546); under this amendment a non-memory write bumps its namespace's
+`other` key. Remember (handlers/remember.rs:199) and prune (handlers/prune.rs:240) build the key from
+the token's namespace. Checkpoint thresholds are computed from the key's own live count:
+`max(1, min(1000, floor(0.2 L / 4)))` dirty operations (ann/incremental.rs:22, 31-37) and delta
+compaction at `max(ceil(base / 10), 5000)` raw operations (ann/delta.rs:25, 76-81).
+
+#### 9. Namespace moves and kind changes
+
+A namespace move appends a `delete` under the source namespace and an `upsert` under the target for
+every moved vector (`crates/khive-db/src/namespace_move.rs:1265-1288`), and visibility fences follow
+their note (namespace_move.rs:1147). Each per-namespace key replays its own half: one tombstone in
+the source key and one insert in the target key.
+
+No note update path changes a note's kind at this revision: the update patch has no kind field
+(`crates/khive-runtime/src/curation/types_and_guards.rs:547-557`). The note store's upsert statement
+does assign `kind` on conflict (`crates/khive-db/src/stores/note.rs:77-94`). Rule: a writer that
+changes a note's kind across the `memory` / `other` boundary MUST append an `upsert` log row for each
+of that note's vectors in the same transaction. The two class keys of the namespace then replay it as
+a delete in one and an insert in the other (item 5). Without that row the old key keeps a candidate
+that hydration drops, and the new key misses the note until its next rebuild.
+
+#### 10. Migration, wildcard retirement and the global directory
+
+- Serving is lazy: the first search of a key registers it pending, builds it from a
+  namespace-filtered corpus scan and activates it.
+- A background backfill builds, one key at a time, every key of every namespace that holds live note
+  vectors and has no active row. Without it, a namespace that is never searched would never activate
+  and the wildcard rows would never retire. The backfill may read many namespaces in one scan ordered
+  by namespace, provided every key it builds registered pending before that scan's read snapshot.
+- For each model, once every namespace holding live note vectors has an active row for both class
+  keys (empty keys raised by item 4), the `'*'` rows of `memory-notes:note.content` and
+  `note_search` for that model are deleted in one writer transaction that re-checks the condition
+  inside the transaction. This needs a registry primitive that deletes an active row; the registry
+  today deletes only expired pending rows (registry.rs:652-669).
+- After retirement, the global segment directory is removed under its checkpoint lock.
+
+#### 11. Startup
+
+Startup builds and adopts nothing eagerly beyond the keys of the namespaces visible to the token
+the warm pass already uses (`Namespace::local()`, ann.rs:1291-1308). Every other key is adopted on
+its first search; adoption of a Hot segment maps it with no corpus read (decision rule 6).
+
+#### 12. Mixed binaries and rollback
+
+A process running a binary without this amendment finds its wildcard row absent, registers it
+pending and rebuilds the global graph (ann.rs:1543-1549), which pins compaction in every namespace
+again. All processes on one database therefore upgrade together. A rollback costs one global rebuild
+plus removal of the per-namespace memory rows (`memory-notes:note.content:memory` and `:other`) and
+their directories. Until those rows are removed they keep bounding each namespace's compaction at
+their last watermarks, because active rows never age out.
+
+#### 13. One publication check per process per tick
+
+Today the rotation watcher checks every installed key's publication identity every 5 seconds
+(`ROTATION_WATCH_INTERVAL`, ann.rs:485; the loop at ann.rs:1361-1371). One check opens the key's
+directory and reads its commit record, commit info and HEAD (`publication_digest`,
+ann/delta.rs:174-188). With per-namespace keys this becomes a steady cost per tenant. DERIVED: T
+namespaces, 2 classes and M models give `T x 2 x M / 5` checks per second, which is 40 at T = 100 and
+M = 1 (one embedding model), 400 at T = 1,000 and M = 1, and twice those with two models.
+
+Every checkpoint publication, after its key's commit record and HEAD are durable and while it still
+holds the key's cross-process checkpoint lock, advances one process-wide publication sequence record in
+the memory ANN root, written atomically with the same write-then-rename discipline as the key's commit
+record. The watcher reads that one record each tick and checks per-key identities only when the
+sequence has moved since its last walk. Two keys publishing at once can read the same value and both
+write its successor, losing one increment. No publication is missed: each publisher reads the sequence
+only after its own commit is durable, so the walk that the first write triggers already sees both
+commits. A full per-key walk still runs every 60 ticks (5 minutes) as a
+backstop for a publisher that stopped between its key's commit and the sequence write. Such a miss
+delays this process's reload of that key by at most the backstop interval. Searches stay correct in
+the meantime, because the fresh tail serves log rows above the installed watermark (ADR-118); the
+cost of the miss is that the predecessor's unlinked segment files stay mapped, and their disk space is
+not returned, until the reload.
+
+DERIVED steady state per process: 0.2 sequence reads per second plus `T x 2 x M / 300` per-key checks
+per second from the backstop, which is 0.67 at T = 100 and M = 1 and 6.7 at T = 1,000 and M = 1.
+
+### Alternatives considered
+
+- **Keep the global graph and filter inside the search (filtered ANN).** The graph would visit
+  namespace and kind labels during traversal. This removes the hydration rounds but keeps the
+  global segment, the owned-copy cost of the whole index in every process
+  (`crates/khive-pack-memory/docs/ann.md:171-179`), maintenance on the global graph for every write,
+  and the wildcard rows that pin compaction everywhere. It also needs a label store and a filtered
+  traversal in the graph crate, which does not exist. Not chosen.
+- **One graph per namespace without the class split.** Note search needs every kind and recall needs
+  only memories, so a mixed graph keeps recall's over-fetch and widening whenever a namespace holds
+  more non-memory notes than memories. The share of non-memory vectors per namespace was not
+  measured. The split costs one more key per namespace and adds no vector twice. Not chosen.
+- **Hex-encoded key names like knowledge's.** A namespace can be 256 bytes
+  (`crates/khive-types/src/namespace.rs:45-67`), and hex doubles every byte, so any hex name that
+  contains the namespace is at least 512 bytes. MEASURED: a 255-byte file name is accepted and a
+  256-byte name is refused with "File name too long" on the filesystem that holds the store. DERIVED
+  from knowledge's form `hex("{ns}::vamana::{model}")` (segment_key.rs:4-32): the name fits only
+  when `ns + 10 + model <= 127` bytes, so namespaces up to 101 bytes for the 16-byte model name
+  `all-minilm-l6-v2` and up to 80 bytes for the 37-byte name
+  `paraphrase-multilingual-minilm-l12-v2`. Not chosen.
+- **Adopt the durable fence for per-namespace memory rows, as Amendment 4 item 1 reads.** This is a
+  behaviour change bundled into a re-key: memory refuses `-1` today (ann.rs:1532-1542). Knowledge's
+  rule keeps `-1` durable after an Empty recovery, which for an empty class key would pin its
+  namespace's compaction indefinitely. Not chosen; item 3 amends item 1 instead.
+- **Eager migration at startup.** Building every key at boot is a filtered full vec0 scan per
+  namespace before the first request is served. Not chosen; item 10 builds on demand and in the
+  background.
+
+### Consequences
+
+Positive:
+
+- A tenant's on-disk cost is about 2.4 kB per vector per model for its own notes (DERIVED above), and
+  an overlay's owned copy is the size of its own key's vectors and codes, whatever other tenants hold.
+- Recall makes one ANN search per visible namespace per model with `k = C + 32` and no widening rounds;
+  the vector leg hydrates at most `C + 32` rows per model where today it can fetch 2,400 and hydrate
+  1,800 inside the loop (DERIVED above).
+- After the wildcard rows retire, a namespace's compaction is bounded only by consumers registered for
+  that namespace.
+- A write's maintenance work follows its own key's size.
+
+Negative:
+
+- Many small graphs. Per-key fixed costs (a registry row, a directory, a single-flight lock, a
+  checkpoint timer) scale with namespaces x 2 x models. The publication check scales with them only
+  through its 5-minute backstop walk (item 13).
+- Every checkpoint publication writes one more small record (the process-wide sequence, item 13).
+- Small graphs checkpoint often: DERIVED from ann/incremental.rs:31-37, a key below 20 live vectors
+  checkpoints at every write, and below 20,000 every `floor(L / 20)` writes. The delta compaction floor
+  of 5,000 operations (ann/delta.rs:25) exceeds 10% of any base below 50,000 vectors, so small keys
+  carry long delta chains relative to their size.
+- A per-namespace corpus scan is a filtered full scan of the model's vec0 table. The table declares
+  `namespace` as a plain column (`crates/khive-db/src/backend.rs:1125-1133`), and sqlite-vec 0.1.9
+  plans any query without a KNN or rowid constraint as a full scan (`sqlite-vec.c:5836-5840`).
+  Backfilling T namespaces costs T scans unless they share one ordered scan (item 10).
+- The tail of each class key includes the other class's log rows of its namespace (item 5).
+- The recall vector leg passes at most `C + 32` candidates per model to fusion. Today, on a store whose
+  first `4C` hits are mostly visible memories, it passes up to `4C`. Fused rankings can differ in the
+  tail of the candidate window; the step 3 gate reports any difference.
+- Mixed binaries on one database are not supported (item 12).
+
+Neutral:
+
+- Schemas are unchanged: `ann_write_log`, the vector tables, notes and the registry tables.
+- Response shapes of recall and note search are unchanged. Scoring, fusion and the session exact arm's
+  candidate SQL are unchanged; the session fence binds the key's own row (item 5).
+- The knowledge pack is untouched.
+
+### Implementation plan
+
+1. Thread `&AnnKey` through every lifecycle function with only the global scope constructed; consumer,
+   registry namespace, segment directory and corpus are derived from the key. Zero behaviour change.
+   Gate: the memory crate suite and clippy, unchanged expectations. Implemented by: to be filed.
+2. Build, maintain, checkpoint and compact per-namespace keys with the class predicate, the digest
+   directory and key file, and the Empty raise; no reader switches. Gate: tests for build, replay and
+   compaction per key; kind change and namespace move; compaction bounded by per-namespace rows; the
+   item 8 parser test; an Empty key leaves no `-2` row; on an unchanged tick the watcher reads the
+   sequence record and no key's identity, and a key published without the sequence write (the control)
+   is reloaded by the backstop walk. Implemented by: to be filed.
+3. Recall switches to per-namespace memory keys. Gate: on a fixture of three namespaces, two visible,
+   each holding memories and other notes with visible memories at most 25% of all vectors, recall's
+   vector leg equals the exact cosine top `C + 32` over visible memories, the ANN search count per model
+   equals the number of visible namespaces (the test counter at ann.rs:243-246, incremented at
+   ann.rs:1082-1083), no candidate is a non-memory or non-visible id, and the difference from the
+   unpatched result on the same fixture is reported. Implemented by: to be filed.
+4. Note search switches; backfill; wildcard retirement; global directory removal; documentation.
+   Gate: note search equals the unpatched result and searches two keys; after every namespace
+   activates, both `'*'` rows are gone and compaction for a namespace deletes rows up to that
+   namespace's minimum, with a control showing that before retirement the same call deletes nothing
+   above the `'*'` watermark. Implemented by: to be filed.
+
+### Stated limits
+
+1. Idle eviction of installed graphs is not designed. It is the next lever for tenants per process.
+2. A checkpoint floor for tiny graphs (for example a minimum dirty count) is not chosen.
+3. Not measured: the resident and on-disk cost of a per-namespace key, and the share of non-memory
+   vectors per namespace. The per-tenant cost claim is falsified if a key's base segment bytes per
+   vector exceed the global segment's 2.4 kB by more than its fixed file overhead, or if a process
+   that searched only one namespace holds resident memory that grows with other namespaces' vectors.
+4. Not measured: the latency of `|V|` searches against one wider search for callers with many
+   visible namespaces.
+5. The backstop interval of item 13 (60 ticks) is chosen, not measured; it bounds how long a missed
+   sequence write keeps a predecessor's unlinked files mapped.
+
+### References (Amendment 5)
+
+- Amendment 1: "Scope rule", decision rules 1, 4, 5 and 6, compaction step 3, the operational note on
+  active rows, "Global-scope consumers" and "Soft-delete visibility"
+- Amendment 4: the parameter table, item 1 (amended by item 3), item 6 (merge order), item 8 (one
+  sentence superseded for memory by item 2)
+- [ADR-118](ADR-118-fresh-tail-recall-visibility.md): section 1 (compaction linearization and the
+  registration precondition, applied per key) and section 4 (the memory and note-search consumers are
+  per key)
+- `crates/khive-pack-memory/src/ann.rs`, `handlers/common.rs`, `handlers/recall.rs`, `note_search.rs`,
+  `pack.rs`; `crates/khive-retrieval/src/ann/corpus.rs`, `ann/registry.rs`;
+  `crates/khive-runtime/src/runtime.rs`; `crates/khive-db/src/namespace_move.rs`;
+  `crates/khive-types/src/namespace.rs`; `crates/khive-pack-knowledge/src/knowledge/vamana/segment_key.rs`

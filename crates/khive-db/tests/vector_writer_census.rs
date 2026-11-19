@@ -15,35 +15,35 @@ const EXPECTED: &[(&str, &str, &str, &str, usize)] = &[
         1,
     ),
     (
-        "khive-db/src/stores/vectors.rs",
+        "khive-db/src/stores/vectors/dml.rs",
         "replace_vector_row_dml",
         "DELETE",
         "{table}",
         3,
     ),
     (
-        "khive-db/src/stores/vectors.rs",
+        "khive-db/src/stores/vectors/dml.rs",
         "replace_vector_row_dml",
         "INSERT",
         "{table}",
         1,
     ),
     (
-        "khive-db/src/stores/vectors.rs",
+        "khive-db/src/stores/vectors/dml.rs",
         "delete_vector_subjects_dml",
         "DELETE",
         "{table}",
         1,
     ),
     (
-        "khive-db/src/stores/vectors.rs",
+        "khive-db/src/stores/vectors/dml.rs",
         "delete_subject_from_vector_tables",
         "DELETE",
         "{table}",
         1,
     ),
     (
-        "khive-db/src/stores/vectors.rs",
+        "khive-db/src/stores/vectors/dml.rs",
         "orphan_sweep_dml",
         "DELETE",
         "{table}",
@@ -51,42 +51,42 @@ const EXPECTED: &[(&str, &str, &str, &str, usize)] = &[
     ),
     (
         "khive-runtime/src/atomic_message.rs",
-        "vector_insert_statements",
+        "vector_insert_statements_for_substrate",
         "DELETE",
         "{table}",
         1,
     ),
     (
         "khive-runtime/src/atomic_message.rs",
-        "vector_insert_statements",
+        "vector_insert_statements_for_substrate",
         "INSERT",
         "{table}",
         1,
     ),
     (
-        "khive-runtime/src/atomic_prepare.rs",
+        "khive-runtime/src/atomic_prepare/index_purge.rs",
         "purge_index_row_statement",
         "DELETE",
         "{table}",
         1,
     ),
     (
-        "khive-runtime/src/curation.rs",
+        "khive-runtime/src/curation/entity_curation.rs",
         "entity_vector_insert_statements",
         "DELETE",
         "{table}",
         1,
     ),
     (
-        "khive-runtime/src/curation.rs",
+        "khive-runtime/src/curation/entity_curation.rs",
         "entity_vector_insert_statements",
         "INSERT",
         "{table}",
         1,
     ),
     (
-        "khive-runtime/src/curation.rs",
-        "reindex_note_with_plan",
+        "khive-runtime/src/curation/note_reindex.rs",
+        "reindex_note_report_with_plan",
         "DELETE",
         "{table}",
         1,
@@ -148,8 +148,8 @@ const NON_VEC0: &[(&str, &str, &str, &str, usize)] = &[
     // Database identity bootstrap writes one fixed metadata table, never a
     // vec0 or note table. Keep the dynamic DML site visible to this census.
     (
-        "khive-db/src/pool.rs",
-        "initialize_database_id",
+        "khive-db/src/pool/identity.rs",
+        "initialize_database_id_with_admission",
         "INSERT",
         "main.{DATABASE_ID_TABLE}",
         1,
@@ -281,63 +281,19 @@ const NON_VEC0: &[(&str, &str, &str, &str, usize)] = &[
         "{}",
         1,
     ),
-    (
-        "khive-runtime/src/curation.rs",
-        "merge_entity_sql",
-        "DELETE",
-        "{fts_map}",
-        1,
-    ),
-    (
-        "khive-runtime/src/curation.rs",
-        "merge_entity_sql",
-        "DELETE",
-        "{fts_table}",
-        2,
-    ),
-    (
-        "khive-runtime/src/curation.rs",
-        "merge_entity_sql",
-        "INSERT",
-        "{fts_map}",
-        1,
-    ),
-    (
-        "khive-runtime/src/curation.rs",
-        "merge_entity_sql",
-        "INSERT",
-        "{}",
-        1,
-    ),
-    (
-        "khive-runtime/src/curation.rs",
-        "merge_note_sql",
-        "DELETE",
-        "{fts_map}",
-        1,
-    ),
-    (
-        "khive-runtime/src/curation.rs",
-        "merge_note_sql",
-        "DELETE",
-        "{fts_table}",
-        2,
-    ),
-    (
-        "khive-runtime/src/curation.rs",
-        "merge_note_sql",
-        "INSERT",
-        "{fts_map}",
-        1,
-    ),
-    (
-        "khive-runtime/src/curation.rs",
-        "merge_note_sql",
-        "INSERT",
-        "{}",
-        1,
-    ),
 ];
+
+// The lexical scanner also sees the Rust `ImportConflictMode::Update {` conditions
+// (the entity and edge identity checks) as UPDATEs of `{`. Pin these two non-SQL
+// occurrences without excluding their function or changing detection of actual
+// dynamic-table SQL.
+const LEXICAL_FALSE_POSITIVES: &[(&str, &str, &str, &str, usize)] = &[(
+    "khive-runtime/src/portability/conflicts.rs",
+    "prepare_import",
+    "UPDATE",
+    "{",
+    2,
+)];
 
 const TEST_SUPPORT: &[(&str, &str, &str, &str, usize)] = &[
     (
@@ -364,7 +320,7 @@ const TEST_SUPPORT: &[(&str, &str, &str, &str, usize)] = &[
 ];
 
 const DELETE_VECTOR_CALLERS: &[(&str, &str, usize)] = &[(
-    "khive-db/src/stores/vectors.rs",
+    "khive-db/src/stores/vectors/vector_store_impl.rs",
     "VectorStore for SqliteVecStore::delete",
     1,
 )];
@@ -445,10 +401,18 @@ fn production_lines(source: &str) -> Vec<&str> {
             break;
         }
         let indent = lines[item].len() - lines[item].trim_start().len();
+        // A `use` item ends at its `;`, including a grouped `use a::{b, c};`, so its braces are
+        // not a body to strip through.
+        let head = lines[item].trim_start();
+        let head = match head.strip_prefix("pub") {
+            Some(rest) => rest.trim_start_matches(|c: char| c != ' ').trim_start(),
+            None => head,
+        };
+        let use_item = head.starts_with("use ");
         let mut end = item;
         let mut has_body = false;
         while end < lines.len() {
-            if lines[end].contains('{') {
+            if !use_item && lines[end].contains('{') {
                 has_body = true;
                 break;
             }
@@ -620,6 +584,7 @@ fn raw_vec0_writer_census_includes_note_vectors_apply() {
     let expected: BTreeMap<String, usize> = EXPECTED
         .iter()
         .chain(NON_VEC0)
+        .chain(LEXICAL_FALSE_POSITIVES)
         .map(|(path, function, operation, table, count)| {
             (format!("{path}::{function}::{operation}::{table}"), *count)
         })
@@ -710,9 +675,11 @@ fn raw_vec0_writer_census_pins_test_support_fixture() {
 
 #[test]
 fn raw_vec0_writer_census_rejects_new_builder_caller() {
-    let source = include_str!("../src/stores/vectors.rs");
-    let relative = "khive-db/src/stores/vectors.rs";
-    assert!(source.contains("pub(crate) fn delete_vector_statement("));
+    let source = include_str!("../src/stores/vectors/vector_store_impl.rs");
+    let relative = "khive-db/src/stores/vectors/vector_store_impl.rs";
+    assert!(
+        include_str!("../src/stores/vectors.rs").contains("pub(crate) fn delete_vector_statement(")
+    );
     let mutant = format!(
         "{source}\n#[cfg(test)]\nmod unclassified_caller {{\n \
          use super::*;\n \
@@ -832,4 +799,29 @@ fn raw_vec0_writer_census_keeps_production_cfg_and_fixture_names() {
         sites("new-crate/src/unconditional_fixture.rs", &source).len(),
         1
     );
+}
+
+#[test]
+fn raw_vec0_writer_census_ends_test_only_use_at_its_semicolon() {
+    let writer = r#"sql!("DELETE FROM vec_live WHERE id = ?1");"#;
+    let fixture = r#"sql!("INSERT INTO vec_fixture VALUES (1)");"#;
+    for import in [
+        "use super::{Uuid, Value};",
+        "use super::{\n    Uuid,\n    Value,\n};",
+        "pub(crate) use super::{Uuid, Value};",
+    ] {
+        let source = format!(
+            "#[cfg(test)]\n{import}\nimpl Handler {{\n    fn writer() {{ {writer} }}\n}}\n\
+             #[cfg(test)]\nmod tests {{\n    fn fixture() {{ {fixture} }}\n}}\n"
+        );
+        let found: Vec<_> = sites("new-crate/src/writer.rs", &source)
+            .into_iter()
+            .map(|(site, _)| site)
+            .collect();
+        assert_eq!(
+            found,
+            vec!["new-crate/src/writer.rs::writer::DELETE::vec_live".to_string()],
+            "{import}"
+        );
+    }
 }

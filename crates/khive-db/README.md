@@ -22,15 +22,15 @@ optional `sqlite-vec` vector storage over a WAL-mode connection pool.
 ## Usage
 
 ```rust
-use khive_db::{run_migrations, StorageBackend};
+use khive_db::StorageBackend;
 
 // File-backed (WAL mode, 1 writer + N readers) or StorageBackend::memory() for tests.
 let backend = StorageBackend::sqlite("/path/to/khive.db")?;
 
-{
-    let mut writer = backend.pool().try_writer()?;
-    run_migrations(writer.conn_mut())?;
-}
+// Core migrations through the pool's own write admission. The raw
+// `run_migrations(conn)` takes the volume lease itself, so it is not called on a
+// connection borrowed from a pool writer that is still held.
+backend.pool().run_migrations()?;
 
 let entities = backend.entities()?; // Arc<dyn khive_storage::EntityStore>
 let attachments = backend.attachments()?; // Arc<dyn khive_storage::AttachmentStore>
@@ -49,6 +49,73 @@ store. Namespace-scoped variants
 (`entities_for_namespace`, `graph_for_namespace`, …) validate that the namespace is
 non-empty; the store itself remains namespace-agnostic — callers pass namespace on
 each query.
+
+## Guarded note property patches
+
+`NoteStore::try_patch_note_properties` updates one live note only while its ID,
+namespace, kind and property preconditions still match. The supplied namespace is
+an explicit match predicate, not an authorization boundary. The operation merges
+up to 32 top-level property writes into the stored object and accepts up to 32
+preconditions. It preserves JSON types, unrelated properties and row identity.
+Missing properties remain distinct from explicit JSON null in absent-or-equal
+conditions. A non-object properties document does not match; SQL-NULL properties
+start from an empty object.
+
+The same statement installs or extends an optional expiry and takes the maximum
+of the existing and supplied update timestamps. Writing `next_attempt_at` also
+maintains its derived retry-deadline columns. A false result means no row matched;
+storage failures remain errors. Backends without the operation return
+`Unsupported` instead of replacing a fetched note.
+
+The SQLite implementation executes through the existing `SqlBridge` writer over
+the same pool, retaining queued admission, standalone file fallback and settlement
+behavior. Runtime's public note accessor enforces its property protections on this
+operation. Comm's duplicate-quarantine repair reaches it through a capability-gated
+runtime method that constructs only the channel-slug and original-reference patch.
+
+## Filtered note reads and guarded attachment cleanup
+
+`NoteFilter::created_before(micros)` and `expires_before(micros)` add inclusive
+upper bounds (`<=`) measured in microseconds since the Unix epoch. An expiry
+bound excludes notes whose `expires_at` is absent. Bounds compose with the
+existing namespace, property and minimum-creation selectors and apply to filtered
+pages, counts and cursors. Defaults remain live-only and unbounded.
+
+`NoteFilter::include_deleted()` includes tombstones in those reads. It does not
+relax the live-row precondition of either scalar or atomic property patches.
+Tombstone reads do not pin indexes whose predicates require live notes.
+Both filtered patch APIs also validate each JSON filter path before writer
+admission; malformed paths refuse without changing any target.
+
+`NoteFilter::expiry_fallback` accepts a `NoteExpiryFallback` with inclusive
+`expires_at_or_before` and `created_at_or_before` bounds. It matches an expiry at
+or before the first bound, or an absent expiry with creation at or before the
+second. A future expiry never falls back to old creation time. Other bounds
+remain additional AND constraints.
+
+For a bounded cleanup page, `time_order` accepts `NoteTimeOrder::ExpiresAt` or
+`ExpiresAtOrCreatedAt`: ascending expiry or `COALESCE(expires_at, created_at)`,
+then ascending ID. Counted, count-free and bounded pages apply this order before
+LIMIT. Counts ignore ordering; keyed/sequence reads and filtered mutations
+reject it. It cannot be combined with property/instant/unordered ordering or
+cursor fields. Existing ordering remains unchanged when it is absent.
+
+Two generic property operators preserve legacy JSON selectors:
+`MissingNullOrSpaceEmptyText` matches missing/null values or text empty after
+SQLite's ASCII-space-only trim; tabs and Unicode whitespace do not match.
+`TrueOrTextTrue` matches JSON boolean true or exact text `"true"`, excluding
+numeric 1. Their `PropertyFilter.value` is unused. These predicates run in SQL
+before ordering and LIMIT, so rejected rows cannot starve a bounded page.
+
+`AttachmentStore::delete_attachment_if(id, role, substrate, &content_ref)` removes
+one attachment only while all four values match in the same conditional write.
+It returns `false` for a missing or changed attachment, leaves other roles and
+owners untouched, and does not delete blob content. SQLite uses its existing
+writer admission and queue routes; backends without this primitive return
+`Unsupported` instead of using a read followed by an unguarded delete.
+
+These are storage foundations for comm cleanup; comm consumers still use their
+existing queries and cleanup policy.
 
 ## Migrations
 

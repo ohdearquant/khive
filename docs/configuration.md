@@ -13,6 +13,10 @@ multi-backend deployment model specifically, see
 ties those two together and covers the parts operators hit first: discovery
 order and the `--db` interaction.
 
+For named credential references and the receipt-key custody seam, see
+[Credential custody](credentials.md). These tables validate at startup; receipt
+issuance and web credential binding are staged separately.
+
 ---
 
 ## Config file discovery order
@@ -291,6 +295,32 @@ file) is the entry point for every MCP client. When your config declares
 declared `main` backend or is the explicit `:memory:` escape hatch. The config
 file is authoritative for backend paths.
 
+### Verb catalog verbosity
+
+MCP clients discover khive's verbs in the `request` tool description. The default
+`full` mode includes the complete catalog descriptions. To request shorter
+summaries for one client, add the option to that client's command arguments:
+
+```sh
+kkernel mcp --catalog-verbosity compact
+```
+
+Compact mode keeps every enabled callable verb, including mounted verbs, in
+sorted order. Each row retains its contributing packs and a `verb(help=true)`
+pointer. A contribution shows the first nonempty description line with normalized
+whitespace, up to 160 Unicode scalar values including any shortening ellipsis.
+A header identifies these summaries and explains how to obtain full help.
+`verb(help=true)` returns complete help, including argument definitions; `verbs`
+keeps its complete descriptions.
+
+Omit the option or pass `--catalog-verbosity full` to retain the original full
+request-tool description. This is a choice for the individual MCP server
+instance; it does not change the loaded packs, dispatch, daemon identity or
+forwarding. There is no corresponding environment variable or TOML setting.
+Rust callers can use
+`server.with_catalog_verbosity(khive_mcp::args::CatalogVerbosity::Compact)`;
+existing server constructors default to `Full`.
+
 ### Claude Code (`.mcp.json` or `.claude/settings.json`)
 
 ```json
@@ -424,24 +454,43 @@ arrive and has no way to tell that from a slow one. Ending the session is what
 turns that into an end-of-input the client can act on, so an interrupted
 response closes the session exactly as any other failed response does.
 
-**Known gap.** The response-delivery deadline covers responses this transport
-writes. It does not cover parse-error responses, which the underlying line
-transport writes directly through its own framed writer without passing through
-the deadline. A peer that sends malformed input and then stops reading can leave
-that one write pending.
+**The response-delivery deadline also covers replies emitted inside receive.**
+Invalid Request replies (-32600, without an id) from rmcp's line transport pass
+through the same `DeadlineWriter`, even though they bypass the outer transport's
+`send` method. If writing or flushing one of these replies stays pending until
+`KHIVE_BRIDGE_RESPONSE_DEADLINE_SECS` expires, the writer cancels the root session
+and returns `TimedOut`. This bound does not depend on the idle timeout or the
+request-obligation TTL.
 
-What bounds that pending write depends on what else the session has
-outstanding, and the idle window alone is not the answer:
+With rmcp 2.2, syntactically invalid JSON is ignored without a reply. Valid JSON
+that is not a valid JSON-RPC message receives Invalid Request; the oversized-line
+sentinel uses that category. The limits and recovery behavior are documented in
+[the CLI usage guide](../crates/kkernel/docs/usage.md).
 
-- Idle timeout disabled: nothing bounds it.
-- Idle timeout enabled, nothing else outstanding: the idle window bounds it.
-- Idle timeout enabled with a request still awaiting its response: the idle
-  close defers while that obligation is fresh, so the bound is the request
-  obligation TTL rather than the idle window. A peer can reach this deliberately
-  by admitting a request and then sending malformed input.
+## Observing process-scoped configuration
 
-Closing the gap requires replacing or adapting the line transport and is tracked
-separately.
+These three settings describe the bridge or coordinator process rather than a
+single runtime's store:
+
+| Setting                               | Scope                                                                  |
+| ------------------------------------- | ---------------------------------------------------------------------- |
+| `KHIVE_REQUEST_READ_TIMEOUT_SECS`     | Bridge transport, including requests forwarded without local dispatch. |
+| `KHIVE_SEARCH_PROFILE`                | Search coordinator across multiple runtimes.                           |
+| `KHIVE_COORDINATOR_SEARCH_TIMEOUT_MS` | Search coordinator, read before fan-out across multiple runtimes.      |
+
+On the first read through each cached accessor, the setting is reported once per
+process as an INFO tracing record with target `khive::config_lock` and fields
+`name` and `value`. Later reads use the cached value and do not repeat that record.
+If you need evidence of these effective settings, capture and retain that target
+at INFO from the first accessor read; enabling capture afterward does not replay
+it. Settings whose accessors are not used need not emit a record.
+
+These process-scoped names do not produce `ConfigLocked` rows in any store.
+Runtime-scoped settings instead use the runtime's own config-lock ledger and its
+bound registry's best-effort append path. Store event history is therefore not a
+complete inventory of process configuration. See
+[ADR-094's accepted 2026-10-21 config-lock amendment](adr/ADR-094-lifecycle-telemetry-events.md#2026-10-21-amendment-a-config-lock-row-belongs-to-the-runtime-that-read-the-value-5901),
+Decision 4.
 
 ## Troubleshooting a connect failure
 
@@ -504,6 +553,39 @@ cover yet.
 
 ---
 
+## `[channel.*]` — component configuration
+
+Every value under `[channel]` is retained without interpretation. A host registers
+component validators before constructing its pack registry; each validator receives
+the value under its exact component name, or its absence. The component decides
+whether a table is required and validates its own fields before activation.
+
+An unregistered name remains stored but has no effect: its presence does not start
+a component, install a channel, or add a send route. Nested values and scalar values
+are preserved unchanged. Registering two validators under the same name is refused
+instead of replacing the first registration.
+
+Library hosts use `ServeRegistrations::register_config_validator` and
+`run_with_registrations` to validate components before runtime construction, even
+when comm is not loaded. The same callbacks remain installed for pack activation;
+checks must be pure and idempotent because validation may run more than once.
+
+Hosts install custom address policies with `ServeRegistrations::register_send_route`.
+Each route receives the authorized runtime, namespace token, and original validated
+send parameters. The route owns persistence, replay handling, and transport submission;
+the core returns its result without adding a message or falling back to another route.
+Built-in transport and local actor address kinds cannot be overridden.
+
+On Unix, a host carrying validators or send routes must run as the daemon or select local
+dispatch with `KHIVE_NO_DAEMON=1`, whatever its transport: requests from a non-daemon host are
+forwarded to the daemon, and callbacks cannot be forwarded to another process. The prebuilt
+`serve_server_with_registrations` API refuses bundles containing validators or send routes. A host
+that configures `RuntimeConfig` before constructing its server can pass only its
+channels and residents to that prebuilt entrypoint; the same local-dispatch rule applies when
+that server's runtime carries validators or send routes.
+
+---
+
 ## References
 
 - [docs/khive-config-example.toml](khive-config-example.toml): full annotated
@@ -512,7 +594,8 @@ cover yet.
   `[packs.*]` deployment model, pack routing, cross-backend operation limits.
 - `crates/khive-runtime/src/engine_config.rs`: `KhiveConfig::load`,
   `load_with_home_fallback`, `load_with_roots`, `BackendConfig`, `PackConfig`.
-- `crates/khive-mcp/src/serve.rs`: `build_registry_for_multi_backend` (the
-  `--db` / `[[backends]]` fail-loud check), `resolve_runtime_config`.
+- `crates/khive-mcp/src/serve/storage_topology.rs`: `build_registry_for_multi_backend`
+  and the `--db` / `[[backends]]` fail-loud check.
+- `crates/khive-mcp/src/serve/runtime_config.rs`: `resolve_runtime_config`.
 - `crates/khive-mcp/src/args.rs`: the `kkernel mcp` CLI argument surface
   (`--db`, `--config`, `--actor`, `--namespace`, `--pack`, `--brain-profile`).

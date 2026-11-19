@@ -2,8 +2,66 @@
 
 use std::time::Duration;
 
-use khive_storage::{StorageCapability, StorageError};
+use khive_storage::error::{SqliteWriteFailure, SqliteWriteStage};
+use khive_storage::{StorageCapability, StorageError, WriterTaskRequestState};
 use thiserror::Error;
+
+// Inspect only owned error shapes. User callbacks may supply cyclic or effectful
+// source() implementations; attaching evidence must not invoke those again.
+pub(crate) fn native_write_failure(
+    error: &(dyn std::error::Error + 'static),
+    stage: SqliteWriteStage,
+) -> Option<SqliteWriteFailure> {
+    if let Some(error) = error.downcast_ref::<StorageError>() {
+        return match error {
+            StorageError::SqliteWrite { failure, .. } => Some(*failure),
+            StorageError::Driver { source, .. } => native_write_failure(source.as_ref(), stage),
+            StorageError::WriterTaskRequestFailed { source, .. } => {
+                native_write_failure(source.as_ref(), stage)
+            }
+            _ => None,
+        };
+    }
+    if let Some(error) = error.downcast_ref::<SqliteError>() {
+        return match error {
+            SqliteError::Write { stage, source } => native_write_failure(source, *stage),
+            SqliteError::WriteSettlementUnknown { failure } => Some(*failure),
+            SqliteError::Rusqlite(source) => native_write_failure(source, stage),
+            _ => None,
+        };
+    }
+    if let Some(
+        rusqlite::Error::SqliteFailure(code, _)
+        | rusqlite::Error::SqlInputError { error: code, .. },
+    ) = error.downcast_ref::<rusqlite::Error>()
+    {
+        return Some(SqliteWriteFailure {
+            stage,
+            primary_code: code.extended_code & 0xff,
+            extended_code: code.extended_code,
+            settlement_unknown: false,
+        });
+    }
+    None
+}
+
+pub(crate) fn with_write_stage(error: StorageError, stage: SqliteWriteStage) -> StorageError {
+    match native_write_failure(&error, stage) {
+        Some(failure) => error.with_sqlite_write_failure(failure),
+        None => error,
+    }
+}
+
+pub(crate) fn statement_failure(error: StorageError) -> StorageError {
+    with_write_stage(error, SqliteWriteStage::Statement)
+}
+
+pub(crate) fn unknown_write_settlement(mut error: StorageError) -> StorageError {
+    if let StorageError::SqliteWrite { failure, .. } = &mut error {
+        failure.settlement_unknown = true;
+    }
+    error
+}
 
 /// Stable ADR-194 capacity stages. The refusal stage is reserved for the WAL
 /// I/O limiter; this configuration-only slice emits only unavailable.
@@ -13,6 +71,15 @@ pub const SQLITE_WAL_CAPACITY_UNAVAILABLE_STAGE: &str = "sqlite_wal_capacity_una
 /// Errors produced by the SQLite storage backend.
 #[derive(Debug, Error)]
 pub enum SqliteError {
+    #[error("strict writer routing refused a direct logical write: {operation}")]
+    WriterRouteViolation { operation: &'static str },
+
+    #[error("sqlite error: {source}")]
+    Write {
+        stage: SqliteWriteStage,
+        #[source]
+        source: rusqlite::Error,
+    },
     /// A request-scoped read or store acquisition stopped, or read cleanup failed.
     #[error(transparent)]
     RequestReadStopped(khive_storage::StorageError),
@@ -24,6 +91,25 @@ pub enum SqliteError {
     /// Data invariant violation (corrupt row, unexpected schema state).
     #[error("invalid data: {0}")]
     InvalidData(String),
+
+    /// A pooled connection contained a transaction from an earlier owner.
+    /// Its prior side effects cannot be attributed to the new request.
+    #[error("pooled writer contains an inherited transaction; prior side effects are unknown")]
+    InheritedWriterTransaction,
+
+    /// The writer could not prove transaction settlement before retirement.
+    #[error("writer transaction settlement is unknown; connection retired")]
+    WriterSettlementUnknown,
+
+    /// Source-free native evidence retained when cleanup cannot prove settlement.
+    #[error("writer transaction settlement is unknown; connection retired")]
+    WriteSettlementUnknown { failure: SqliteWriteFailure },
+
+    /// An earlier write on this database could not prove its settlement, so
+    /// every later write is refused before it starts. Only the write whose
+    /// settlement failed reports an unknown outcome; this one never ran.
+    #[error("writer refused: an earlier write's settlement is unknown; this write did not start")]
+    WriterPoisoned,
 
     /// The process-local writer mutex was not acquired within the pool's
     /// configured finite checkout deadline. This stage happens before SQLite
@@ -43,12 +129,34 @@ pub enum SqliteError {
     /// because the volume's free space had reached its configured reserve.
     #[error(
         "refusing sqlite write on {volume}: {available_bytes} bytes available, \
-         at or below the {floor_bytes}-byte free-space floor"
+         at or below the {floor_bytes}-byte free-space floor plus \
+         {required_headroom_bytes} bytes of operation headroom"
     )]
     CapacityFloor {
         volume: String,
         available_bytes: u64,
         floor_bytes: u64,
+        required_headroom_bytes: u64,
+    },
+
+    /// A new logical write could not resolve its volume, acquire its lease,
+    /// or sample available space.
+    #[error("sqlite capacity admission unavailable in {phase} phase: {message}")]
+    CapacityUnavailable {
+        phase: khive_storage::CapacityUnavailablePhase,
+        message: String,
+    },
+
+    /// The thread asking for a volume's write lease already holds it, so
+    /// waiting could never succeed. This is a nested write, not lock
+    /// contention, and it is refused at once instead of at the deadline.
+    #[error(
+        "volume lease re-entry: this thread already holds the lease for this volume \
+         (held at {holder_site}, requested again at {requester_site})"
+    )]
+    VolumeLeaseReentry {
+        holder_site: String,
+        requester_site: String,
     },
 
     /// A configured WAL ceiling cannot be represented by SQLite's signed
@@ -101,10 +209,122 @@ pub enum SqliteError {
         version: u32,
         /// Human-readable description of the failure.
         error: String,
+        /// The typed cause, when the failure came from an error value. It keeps
+        /// the native result code and write-stage evidence that `error` renders
+        /// as text.
+        #[source]
+        source: Option<Box<SqliteError>>,
     },
 }
 
 impl SqliteError {
+    /// Attach a known write boundary while retaining the original native driver error.
+    pub fn write(error: rusqlite::Error, stage: SqliteWriteStage) -> Self {
+        if matches!(
+            error,
+            rusqlite::Error::SqliteFailure(..) | rusqlite::Error::SqlInputError { .. }
+        ) {
+            Self::Write {
+                stage,
+                source: error,
+            }
+        } else {
+            Self::Rusqlite(error)
+        }
+    }
+
+    pub(crate) fn settlement_with_cause(
+        error: &(dyn std::error::Error + 'static),
+        stage: SqliteWriteStage,
+    ) -> Self {
+        match native_write_failure(error, stage) {
+            Some(mut failure) => {
+                failure.settlement_unknown = true;
+                Self::WriteSettlementUnknown { failure }
+            }
+            None => Self::WriterSettlementUnknown,
+        }
+    }
+
+    pub fn write_failure(&self) -> Option<SqliteWriteFailure> {
+        match self {
+            Self::Write { stage, source } => native_write_failure(source, *stage),
+            Self::WriteSettlementUnknown { failure } => Some(*failure),
+            _ => None,
+        }
+    }
+    /// A migration failure that keeps its typed cause.
+    ///
+    /// The message is the cause's own display text, read before the cause is
+    /// converted into a `SqliteError`, so it reads exactly as it did when only
+    /// the text was kept. A driver error therefore keeps its bare driver text
+    /// instead of gaining the `sqlite error:` prefix of its wrapped form.
+    pub fn migration(version: u32, cause: impl std::fmt::Display + Into<SqliteError>) -> Self {
+        let error = cause.to_string();
+        Self::Migration {
+            version,
+            error,
+            source: Some(Box::new(cause.into())),
+        }
+    }
+
+    /// A migration failure with a message of its own that still keeps its
+    /// typed cause.
+    pub fn migration_with_cause(
+        version: u32,
+        message: impl Into<String>,
+        cause: impl Into<SqliteError>,
+    ) -> Self {
+        Self::Migration {
+            version,
+            error: message.into(),
+            source: Some(Box::new(cause.into())),
+        }
+    }
+
+    /// A migration failure that has no underlying error value.
+    pub fn migration_message(version: u32, message: impl Into<String>) -> Self {
+        Self::Migration {
+            version,
+            error: message.into(),
+            source: None,
+        }
+    }
+
+    /// The typed cause of a failed migration, when one was kept.
+    pub fn migration_cause(&self) -> Option<&SqliteError> {
+        match self {
+            Self::Migration { source, .. } => source.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The SQLite extended result code behind this error, when it carries one.
+    ///
+    /// Reads only owned shapes (the driver error, the write evidence and a
+    /// migration's kept cause) and never calls into `source()`, for the same
+    /// reason as `native_write_failure`.
+    pub fn native_extended_code(&self) -> Option<i32> {
+        match self {
+            Self::Rusqlite(source) | Self::Write { source, .. } => {
+                Self::driver_extended_code(source)
+            }
+            Self::WriteSettlementUnknown { failure } => Some(failure.extended_code),
+            Self::Migration { source, .. } => source
+                .as_deref()
+                .and_then(|cause| cause.native_extended_code()),
+            _ => None,
+        }
+    }
+
+    fn driver_extended_code(error: &rusqlite::Error) -> Option<i32> {
+        match error {
+            rusqlite::Error::SqliteFailure(code, _)
+            | rusqlite::Error::SqlInputError { error: code, .. } => Some(code.extended_code),
+            _ => None,
+        }
+    }
+
     /// Stable structured stage for an ADR-194 WAL-capacity failure.
     pub fn wal_capacity_stage(&self) -> Option<&'static str> {
         match self {
@@ -113,23 +333,129 @@ impl SqliteError {
         }
     }
 
-    pub(crate) fn into_storage_error(
+    /// Capacity admission is a property of the SQLite file, so its refusals
+    /// carry `StorageCapability::Sql` whichever store requested the write.
+    /// Concrete backend callers use the same mapping as trait implementations:
+    /// capacity and writer-settlement failures retain their storage taxonomy,
+    /// and other failures remain typed sources of `StorageError::Driver`.
+    pub fn into_storage_error(
         self,
         capability: StorageCapability,
         operation: &'static str,
     ) -> StorageError {
         match self {
+            Self::WriterRouteViolation { operation } => StorageError::WriterRouteViolation {
+                operation: operation.into(),
+            },
+            error @ Self::Write { stage, .. } => {
+                with_write_stage(StorageError::driver(capability, operation, error), stage)
+            }
             Self::CapacityFloor {
                 volume,
                 available_bytes,
                 floor_bytes,
+                required_headroom_bytes,
             } => StorageError::CapacityFloor {
-                capability,
+                capability: StorageCapability::Sql,
                 volume,
                 available_bytes,
                 floor_bytes,
+                required_headroom_bytes,
             },
+            Self::CapacityUnavailable { phase, message } => StorageError::CapacityUnavailable {
+                capability: StorageCapability::Sql,
+                phase,
+                message,
+            },
+            Self::WriteSettlementUnknown { failure } => {
+                StorageError::writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown)
+                    .with_sqlite_write_failure(failure)
+            }
+            Self::InheritedWriterTransaction | Self::WriterSettlementUnknown => {
+                StorageError::writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown)
+            }
+            Self::WriterPoisoned => {
+                StorageError::writer_task_terminated(WriterTaskRequestState::NotStarted)
+            }
             other => StorageError::driver(capability, operation, other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khive_storage::CapacityUnavailablePhase;
+
+    #[test]
+    fn capacity_and_settlement_errors_keep_their_meaning_from_any_store() {
+        for capability in [StorageCapability::Entities, StorageCapability::Sql] {
+            let refused = SqliteError::CapacityFloor {
+                volume: "/volume".to_string(),
+                available_bytes: 99,
+                floor_bytes: 100,
+                required_headroom_bytes: 12,
+            }
+            .into_storage_error(capability, "write");
+            assert!(
+                matches!(
+                    refused,
+                    StorageError::CapacityFloor {
+                        capability: StorageCapability::Sql,
+                        available_bytes: 99,
+                        floor_bytes: 100,
+                        required_headroom_bytes: 12,
+                        ..
+                    }
+                ),
+                "{capability:?}: {refused:?}"
+            );
+
+            let unavailable = SqliteError::CapacityUnavailable {
+                phase: CapacityUnavailablePhase::LockContended,
+                message: "lease timed out".to_string(),
+            }
+            .into_storage_error(capability, "write");
+            assert!(
+                matches!(
+                    unavailable,
+                    StorageError::CapacityUnavailable {
+                        capability: StorageCapability::Sql,
+                        phase: CapacityUnavailablePhase::LockContended,
+                        ..
+                    }
+                ),
+                "{capability:?}: {unavailable:?}"
+            );
+
+            for unsettled in [
+                SqliteError::InheritedWriterTransaction,
+                SqliteError::WriterSettlementUnknown,
+            ] {
+                let mapped = unsettled.into_storage_error(capability, "write");
+                assert!(
+                    matches!(
+                        mapped,
+                        StorageError::WriterTaskTerminated {
+                            request_state: WriterTaskRequestState::SideEffectsUnknown,
+                            ..
+                        }
+                    ),
+                    "{capability:?}: {mapped:?}"
+                );
+            }
+
+            let refused = SqliteError::WriterPoisoned.into_storage_error(capability, "write");
+            assert!(
+                matches!(
+                    refused,
+                    StorageError::WriterTaskTerminated {
+                        request_state: WriterTaskRequestState::NotStarted,
+                        ..
+                    }
+                ),
+                "{capability:?}: {refused:?}"
+            );
         }
     }
 }

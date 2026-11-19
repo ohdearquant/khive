@@ -18,11 +18,15 @@ default = ["std"]
 serde = ["dep:serde", "dep:serde_json"]
 std = []
 blake3 = ["dep:blake3"]
+sha2 = ["dep:sha2"]
 
 [dependencies]
 serde = { workspace = true, optional = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
 blake3 = { workspace = true, optional = true, default-features = false }
+# Keep this optional primitive usable without std; the workspace dependency
+# enables sha2's default features for its other consumers.
+sha2 = { version = "0.10", optional = true, default-features = false }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -8,13 +8,17 @@ pub use khive_runtime::{KhiveRuntime, PackRegistry, VerbRegistryBuilder};
 
 // Force-link pack crates so their `inventory::submit!` constructors are
 // included by the linker. These are the only direct references to the pack
-// crate types inside `khive-mcp`.
+// crate types inside `khive-mcp`. A pack that is an optional feature (agent,
+// telemetry, web, moodboard) takes a `#[cfg(feature = ...)]` on its line.
+#[cfg(feature = "pack-agent")]
 #[doc(hidden)]
 pub use khive_pack_agent::AgentPack as _AgentPack;
 #[doc(hidden)]
 pub use khive_pack_blob::BlobPack as _BlobPack;
 #[doc(hidden)]
 pub use khive_pack_brain::BrainPack as _BrainPack;
+#[doc(hidden)]
+pub use khive_pack_charter::CharterPack as _CharterPack;
 #[doc(hidden)]
 pub use khive_pack_code::CodePack as _CodePack;
 #[doc(hidden)]
@@ -38,10 +42,12 @@ pub use khive_pack_moodboard::MoodboardPack as _MoodboardPack;
 pub use khive_pack_schedule::SchedulePack as _SchedulePack;
 #[doc(hidden)]
 pub use khive_pack_session::SessionPack as _SessionPack;
+#[cfg(feature = "pack-telemetry")]
 #[doc(hidden)]
 pub use khive_pack_telemetry::TelemetryPack as _TelemetryPack;
 #[doc(hidden)]
 pub use khive_pack_tool::ToolPack as _ToolPack;
+#[cfg(feature = "pack-web")]
 #[doc(hidden)]
 pub use khive_pack_web::WebPack as _WebPack;
 #[doc(hidden)]

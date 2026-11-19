@@ -48,6 +48,14 @@ system-default fallback for `consumer_kind="recall"` when no explicit binding ma
 `brain.bind` consumer kinds must appear in the loaded registry's composed
 `BRAIN_CONSUMER_KINDS`; `"*"` remains the explicit wildcard.
 
+When a consumer kind is declared by the loaded registry but has no eligible profile,
+`brain.resolve` succeeds with `matched_binding=false`, echoes `requested_consumer_kind`,
+and returns `null` for `resolved_profile_id`, `matched_consumer_kind`, and `lifecycle`.
+This is normal absence: recall and composition can use their pack-local tuning prior
+without recording a failed nested resolution. Existing binding and fallback matches
+retain their profile fields. An unmatched consumer kind absent from the registry still
+returns `NotFound`; caller authorization and malformed-parameter refusals are unchanged.
+
 **Event interpretation** (`event::interpret`): The `brain.feedback` verb is the
 `FeedbackExplicit` event emitter. Legacy rows whose canonical event verb is `brain.emit` predate
 this design and are treated as `Irrelevant` to avoid spurious updates during event replay.
@@ -58,9 +66,11 @@ automatic wrapper stamps `brain.auto_feedback`, and the deprecated alias stamps 
 ### Section Posteriors (ADR-048)
 
 Section posteriors track per-section relevance weights within a knowledge atom. Each profile
-maintains a `SectionPosteriorState` keyed by `SectionType` (10 canonical types: Overview,
+maintains a `SectionPosteriorState` keyed by `SectionType` (8 canonical types: Overview,
 CoreModel, BoundaryConditions, Formalism, OperationalGuidance, Examples, FailureModes,
-ExpertLens, References, Other).
+ExpertLens). A persisted map written before the 2026-10-04 amendment to ADR-048 may still carry
+`references` and `other`; it loads with those entries dropped, and a recorded feedback event
+naming them replays its remaining signals. Live writes refuse both names as unknown.
 
 **Default priors per section type**:
 
@@ -74,8 +84,6 @@ ExpertLens, References, Other).
 | Examples            | 5        | 2       | 0.71 |
 | FailureModes        | 3        | 2       | 0.60 |
 | ExpertLens          | 3        | 2       | 0.60 |
-| References          | 2        | 2       | 0.50 |
-| Other               | 2        | 2       | 0.50 |
 
 **Thompson sampling** (explore mode, `exploration_epoch > 0`):
 
@@ -131,6 +139,11 @@ $$\text{Beta}(\alpha_1 + \alpha_2 - \alpha_{\text{prior}},\; \beta_1 + \beta_2 -
 - `brain.bind` rejects archived profiles to prevent creating unresolvable bindings (issue C3).
 - `brain.create_profile` enforces a profile-id grammar: alphanumeric + hyphens only, no dots,
   underscores, or wildcards; leading/trailing whitespace is trimmed (issue R3-3).
+- `brain.create_profile` accepts an optional `local_factor`, a finite number in `[0.5, 1]` stored as
+  given on the profile record. Only creation sets it: no verb edits it, `brain.reset` keeps it and a
+  reload from the persisted snapshot keeps it. A record without the field loads as no factor, which
+  is the same as 1. `brain.profile` returns it as `local_factor` (`null` when absent) beside
+  `posterior_means`, the means of the three stored recall posteriors.
 - `brain.auto_feedback(namespace=...)` applies ADR-007's exact escape to both sides of the
   mutation: the feedback event/fold-gate row and the selected namespace's live + durable
   posterior state. Target IDs remain globally resolvable by ID. Direct `PackRuntime` calls must

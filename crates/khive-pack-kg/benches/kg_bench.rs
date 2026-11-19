@@ -402,6 +402,215 @@ fn bench_traverse(c: &mut Criterion) {
     group.finish();
 }
 
+// ── stats ─────────────────────────────────────────────────────────────────────
+
+fn bench_stats(c: &mut Criterion) {
+    let rt = tokio_rt();
+    let (_, registry) = build_registry();
+
+    // Shaped like a working store: a structural chain between entities, one
+    // more structural edge per entity, and provenance notes annotating them,
+    // which is where most edges on a real store come from.
+    rt.block_on(async {
+        let ids = seed_graph(&registry, 1000).await;
+        for (i, id) in ids.iter().enumerate() {
+            registry
+                .dispatch(
+                    "link",
+                    json!({
+                        "source_id": id,
+                        "target_id": ids[(i * 7 + 3) % ids.len()],
+                        "relation": "enables",
+                    }),
+                )
+                .await
+                .expect("seed structural edge");
+        }
+        for i in 0..2000 {
+            let note = registry
+                .dispatch(
+                    "create",
+                    json!({"kind": "observation", "content": format!("bench provenance note {i}")}),
+                )
+                .await
+                .expect("seed note");
+            let note_id = note["id"].as_str().expect("id").to_string();
+            registry
+                .dispatch(
+                    "link",
+                    json!({
+                        "source_id": note_id,
+                        "target_id": ids[i % ids.len()],
+                        "relation": "annotates",
+                    }),
+                )
+                .await
+                .expect("seed annotates edge");
+        }
+    });
+
+    let mut group = c.benchmark_group("kg_stats");
+    group.sample_size(30);
+
+    group.bench_function("entities_1000_edges_3999", |b| {
+        b.to_async(&rt).iter(|| {
+            let registry = &registry;
+            async move {
+                let resp = registry
+                    .dispatch("stats", black_box(json!({})))
+                    .await
+                    .expect("stats");
+                black_box(resp)
+            }
+        });
+    });
+
+    group.finish();
+}
+
+// ── note pages across visible namespaces ──────────────────────────────────────
+
+fn bench_list_notes_visible(c: &mut Criterion) {
+    use khive_runtime::Namespace;
+    use khive_storage::note::NoteFilter;
+
+    let rt = tokio_rt();
+    let (runtime, _) = build_registry();
+    let ns_a = Namespace::parse("bench-list-a").expect("namespace");
+    let ns_b = Namespace::parse("bench-list-b").expect("namespace");
+    // A token that reads its own namespace and one more, as an actor configured
+    // with a second visible namespace does, and a token that reads one.
+    let both = runtime
+        .authorize_with_visibility(ns_a.clone(), vec![ns_b.clone()])
+        .expect("token");
+    let only_b = runtime.authorize(ns_b).expect("token");
+
+    rt.block_on(async {
+        let only_a = runtime.authorize(ns_a).expect("token");
+        for i in 0..5000 {
+            for token in [&only_a, &only_b] {
+                runtime
+                    .create_note(
+                        token,
+                        "observation",
+                        None,
+                        &format!("bench listed note {i}"),
+                        None,
+                        None,
+                        vec![],
+                    )
+                    .await
+                    .expect("seed note");
+            }
+        }
+    });
+
+    let mut group = c.benchmark_group("kg_list_notes");
+    group.sample_size(50);
+
+    for (label, token) in [
+        ("two_namespaces_10000_limit20", &both),
+        ("one_namespace_5000_limit20", &only_b),
+    ] {
+        group.bench_function(label, |b| {
+            b.to_async(&rt).iter(|| {
+                let runtime = &runtime;
+                async move {
+                    let page = runtime
+                        .list_notes_filtered(token, black_box(NoteFilter::default()), 20, 0)
+                        .await
+                        .expect("list notes");
+                    assert_eq!(page.len(), 20);
+                    black_box(page)
+                }
+            });
+        });
+    }
+
+    group.finish();
+}
+
+// ── delete ────────────────────────────────────────────────────────────────────
+
+fn bench_delete(c: &mut Criterion) {
+    let rt = tokio_rt();
+    let (_, registry) = build_registry();
+
+    // About 9,000 edges that do not touch the deleted entity: the chain from
+    // `seed_graph` and eight structural edges out of every entity.
+    let ids = rt.block_on(async {
+        let ids = seed_graph(&registry, 1000).await;
+        for stride in 1..=8 {
+            for (i, id) in ids.iter().enumerate() {
+                let target = (i * (2 * stride + 1) + stride) % ids.len();
+                if target == i {
+                    continue;
+                }
+                registry
+                    .dispatch(
+                        "link",
+                        json!({
+                            "source_id": id,
+                            "target_id": ids[target],
+                            "relation": "enables",
+                        }),
+                    )
+                    .await
+                    .expect("seed structural edge");
+            }
+        }
+        ids
+    });
+
+    let mut group = c.benchmark_group("kg_delete");
+    group.sample_size(30);
+
+    // One iteration creates an entity, links it to the graph and deletes it.
+    // A hard delete also removes its incident edges and records lineage
+    // warnings; a soft delete only tombstones the row.
+    for (label, hard) in [
+        ("hard_entity_one_edge_edges_9000", true),
+        ("soft_entity_one_edge_edges_9000", false),
+    ] {
+        group.bench_function(label, |b| {
+            let mut seq: u64 = 0;
+            b.to_async(&rt).iter(|| {
+                seq += 1;
+                let registry = &registry;
+                let anchor = ids[(seq as usize) % ids.len()].clone();
+                async move {
+                    let created = registry
+                        .dispatch(
+                            "create",
+                            json!({
+                                "kind": "entity",
+                                "name": format!("BenchDelete{label}{seq}"),
+                                "entity_kind": "concept",
+                            }),
+                        )
+                        .await
+                        .expect("create entity");
+                    let id = created["id"].as_str().expect("id").to_string();
+                    registry
+                        .dispatch(
+                            "link",
+                            json!({"source_id": id, "target_id": anchor, "relation": "enables"}),
+                        )
+                        .await
+                        .expect("link entity");
+                    let resp = registry
+                        .dispatch("delete", black_box(json!({"id": id, "hard": hard})))
+                        .await
+                        .expect("delete entity");
+                    black_box(resp)
+                }
+            });
+        });
+    }
+
+    group.finish();
+}
+
 // ── criterion entry points ────────────────────────────────────────────────────
 
 criterion_group!(
@@ -413,5 +622,8 @@ criterion_group!(
     bench_link,
     bench_neighbors,
     bench_traverse,
+    bench_stats,
+    bench_list_notes_visible,
+    bench_delete,
 );
 criterion_main!(kg_benches);

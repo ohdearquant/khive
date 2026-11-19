@@ -692,7 +692,7 @@ async fn settle_refresh_from_snapshot(
     if outcome.status != 304 {
         if let Some((buffer, truncated)) = outcome.body.take() {
             was_truncated = Some(truncated);
-            let store = crate::blob_store(runtime)?;
+            let store = runtime.require_blob_store()?;
             let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
             let content_ref_str = content_ref.to_string();
             response_content_ref = content_ref_str.clone();
@@ -1064,21 +1064,6 @@ mod tests {
         .await
     }
 
-    /// The in-crate test runtime carries no `VerbRegistry`, so the web
-    /// pack's own `EDGE_RULES` (`site contains page|resource`) are never
-    /// installed on it by default — a redirect-hop `link(Contains, ...)` (via
-    /// `mint_bare`) then refuses against the base allowlist alone. Register
-    /// kg+web through a throwaway registry purely to read back their
-    /// combined `all_edge_rules()`, matching `fetch.rs`'s own test helper of
-    /// the same name.
-    fn install_web_edge_rules(runtime: &KhiveRuntime) {
-        let mut builder = khive_runtime::VerbRegistryBuilder::new();
-        builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-        builder.register(WebPack::new(runtime.clone()));
-        let registry = builder.build().expect("registry builds");
-        runtime.install_edge_rules(registry.all_edge_rules());
-    }
-
     async fn test_runtime() -> (KhiveRuntime, NamespaceToken, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = khive_db::stores::blob::FsBlobStore::new(dir.path().to_path_buf(), 0)
@@ -1091,7 +1076,7 @@ mod tests {
             ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime");
-        install_web_edge_rules(&runtime);
+        crate::test_support::install_web_edge_rules(&runtime);
         runtime
             .install_blob_store(Arc::new(store))
             .expect("install blob store");
@@ -1117,7 +1102,7 @@ mod tests {
         let (runtime, token, _dir) = test_runtime().await;
         let url = Url::parse("https://legacy-capture.example.test/body").unwrap();
         let prefix = b"synthetic prefix only";
-        let store = crate::blob_store(&runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref = store.put(prefix.to_vec()).await.unwrap();
         let reference = content_ref.to_string();
         let (_, id) = crate::fetch::mint_bare(&runtime, &token, &url)
@@ -1185,7 +1170,7 @@ mod tests {
         let (runtime, token, _dir) = test_runtime().await;
         let url = Url::parse("https://legacy-capture.example.test/complete").unwrap();
         let body = b"synthetic complete body";
-        let store = crate::blob_store(&runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref = store.put(body.to_vec()).await.unwrap();
         let reference = content_ref.to_string();
         let (_, id) = crate::fetch::mint_bare(&runtime, &token, &url)
@@ -1406,7 +1391,7 @@ mod tests {
         .await
         .unwrap();
         let id = identity::document_id(site, &identity::path_and_query(&canonical));
-        let store = crate::blob_store(runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref = store.put(body.to_vec()).await.unwrap();
         crate::entities::get_or_create(
             runtime,
@@ -1558,7 +1543,7 @@ mod tests {
         let after2_props = after2.properties.unwrap();
         assert_eq!(after2_props["content_type"], "text/plain");
         let new_ref = after2_props["blob_ref"].as_str().unwrap();
-        let store = crate::blob_store(&runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let stored = store
             .get_bounded_verified(
                 &khive_storage::ContentRef::from_hex(new_ref).unwrap(),

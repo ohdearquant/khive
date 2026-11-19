@@ -1,5 +1,65 @@
 # khive-fold Benchmarks
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-fold`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+Comparison class: `rustc 1.95.0 (59807616e 2026-04-14)`, `bench` profile, AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics, cores 2,3, kernel 6.8.0-142-generic.
+
+| Benchmark                                                                         | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| --------------------------------------------------------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `khive-fold:fold_bench/fold/count/10/median_ns`                                   | 3.887 ns         | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/count/100/median_ns`                                  | 45.207 ns        | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/count/500/median_ns`                                  | 273.944 ns       | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/derive/10/median_ns`                                  | 7.911 ns         | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/derive/100/median_ns`                                 | 59.477 ns        | 1.005     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/derive/500/median_ns`                                 | 289.923 ns       | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/fn_closure/10/median_ns`                              | 2.825 ns         | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/fn_closure/100/median_ns`                             | 15.257 ns        | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/fn_closure/500/median_ns`                             | 71.763 ns        | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/sum_i64/10/median_ns`                                 | 16.526 ns        | 1.017     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/sum_i64/100/median_ns`                                | 144.510 ns       | 1.002     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/fold/sum_i64/500/median_ns`                                | 713.653 ns       | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/batch_score/10/median_ns`                        | 23.831 ns        | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/batch_score/100/median_ns`                       | 147.257 ns       | 1.002     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/batch_score/500/median_ns`                       | 635.010 ns       | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/select_all/10/median_ns`                         | 230.610 ns       | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/select_all/100/median_ns`                        | 2.038 µs         | 1.035     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/select_all/500/median_ns`                        | 11.729 µs        | 1.002     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/select_top/10/median_ns`                         | 121.119 ns       | 1.004     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/select_top/100/median_ns`                        | 1.625 µs         | 1.008     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/objective/select_top/500/median_ns`                        | 7.111 µs         | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/ordering/cmp_desc/scalar/median_ns`                        | 16.525 ns        | 1.023     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/ordering/heap_top_k/100/median_ns`                         | 785.382 ns       | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/ordering/heap_top_k/500/median_ns`                         | 4.229 µs         | 1.004     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/ordering/sort/10/median_ns`                                | 48.159 ns        | 1.003     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/ordering/sort/100/median_ns`                               | 1.280 µs         | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/ordering/sort/500/median_ns`                               | 9.488 µs         | 1.000     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/selector/greedy/10/median_ns`                              | 535.348 ns       | 1.004     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/selector/greedy/100/median_ns`                             | 5.373 µs         | 1.005     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/selector/greedy/500/median_ns`                             | 31.103 µs        | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/selector/greedy_diversity/10/median_ns`                    | 2.688 µs         | 1.015     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/selector/greedy_diversity/100/median_ns`                   | 36.085 µs        | 1.014     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_bench/selector/greedy_diversity/500/median_ns`                   | 229.636 µs       | 1.020     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_selector_scale/selector/diversity_scale/1000/median_ns`          | 625.680 µs       | 1.017     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_selector_scale/selector/diversity_scale/5000/median_ns`          | 4.447 ms         | 1.002     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_selector_scale/selector/epistemic_gain/100/median_ns`            | 2.696 µs         | 1.020     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_selector_scale/selector/epistemic_gain/500/median_ns`            | 17.144 µs        | 1.027     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/anchor/credit/100/median_ns`                           | 24.187 µs        | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/anchor/credit/500/median_ns`                           | 122.450 µs       | 1.015     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/anchor/trace/100/median_ns`                            | 21.922 µs        | 1.004     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/anchor/trace/500/median_ns`                            | 114.242 µs       | 1.020     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/checkpoint/save_load/10/median_ns`                     | 9.869 µs         | 1.005     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/checkpoint/save_load/100/median_ns`                    | 106.540 µs       | 1.014     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/compose/filter_even/500/median_ns`                     | 230.006 ns       | 1.006     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/compose/map_double/500/median_ns`                      | 711.878 ns       | 1.001     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/compose/sequential_composed_five_stages/500/median_ns` | 469.624 ns       | 1.015     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+| `khive-fold:fold_workloads/compose/sequential_two_stages/500/median_ns`           | 177.975 ns       | 1.008     | `415e1e86fee18cc9c71355dfd8d106016cf167df` | 2026-10-24  |
+
+<!-- bench-reference:end -->
+
 Benchmark suite: `benches/fold_bench.rs`. Run with:
 
 ```bash
@@ -36,6 +96,108 @@ constants so runs are fully reproducible. Scores are uniform in [0.0, 1.0).
 
 `iter_batched(SmallInput)` is used for benchmarks that sort or consume the input vector to
 avoid measuring clone overhead inside the timed region.
+
+## Additional workload coverage
+
+The current suite also includes `fold_workloads` and `fold_selector_scale`.
+The original target and the release ledger below are retained. The original
+CountFold zero-allocation description is a source/API characterization; these
+wall-clock benchmarks do not measure allocation counts. Historical values below
+are observations from their recorded commit, not a current baseline or promise.
+
+```sh
+cd crates
+cargo bench -p khive-fold --benches -- --quick --noplot
+cargo bench -p khive-fold --bench fold_workloads -- --noplot
+cargo bench -p khive-fold --bench fold_selector_scale -- --noplot
+cargo bench -p khive-fold --bench fold_selector_scale -- --list
+```
+
+| Target / group                         | Inputs                                                          | Timed public work                                                                                                             | Untimed fixture and output checks                                                                                                                             |
+| -------------------------------------- | --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fold_workloads` / compose             | 500 integers                                                    | `SequentialFold::execute` for two stages, or composed five stages; `FilterFold::derive` and `MapFold::derive`                 | Context carries the prior state; exact sums/counts and entries processed for every stage                                                                      |
+| `fold_workloads` / checkpoint          | 10 and 100 distinct checkpoints, each with 32 i64 state entries | All synchronous `save` calls followed by all `load` calls, including serialization, hashing, lock and stored-state clone work | Fresh store and owned checkpoint clones before each timer; exact stored IDs, state, hash, UUID, context, version, timestamp and processed count               |
+| `fold_workloads` / anchor              | 100 and 500 nodes, edges i→i+1 and i→i+2                        | `BfsAnchor::trace` from the first node or `credit` from the last, depth cap N                                                 | Graph/UUID generation; every other node exactly once, full node fields, exact credit weight 2^-shortest_distance                                              |
+| `fold_selector_scale` / epistemic gain | 100 and 500 inputs, weight 0.5                                  | `GreedySelector::select` with nonzero information gains and explicit rank scores                                              | Input clone; exact selected order and record fields, budget accounting; weight-zero control must select the opposite end of the input                         |
+| `fold_selector_scale` / diversity      | 1,000 and 5,000 inputs, 8 categories, bias 0.5                  | Actual diversity selection with the existing LCG, item-size and budget shape                                                  | Input clone; exact repeatable selected identities, no duplicates, record fields, budget accounting, all eight categories and a different order from bias zero |
+
+Fixtures are created lazily in selected callbacks. Listing or selecting another
+group does not build the 5,000-item fixture. Every consumed selector input is
+cloned before its timer, and each iteration completes and drops its output before
+the next begins; the harness never batches many large input clones in memory.
+Result checks and output destruction are outside the timer. Each measurement uses
+`Instant`, so per-call clock overhead is included rather than subtracted.
+
+`fold_workloads` requests 10 Criterion samples, one second of warmup and three
+seconds of measurement. The selector target requests flat sampling with 10
+samples, 100 ms warmup and one second of measurement. These are requested sampling
+parameters, not wall-time guarantees: a slow call or minimum sample count can
+exceed them. `--quick` changes Criterion's sampling, not input sizes or output
+checks. Timing medians are Criterion sample estimates, not invented single-call
+percentiles.
+
+The diversity implementation rescans remaining inputs after each selection.
+With N inputs and k selected items, its candidate loop visits
+`k * (2*N - k + 1) / 2` items, plus `N-k` for a final unsuccessful scan when items
+remain. The upper bound is `N*(N+1)/2`, or 12,502,500 at N=5,000. This describes
+source work, not elapsed time, and excludes initial sorting and record validation.
+The fixture prints the actual selected k, total budget use and source-derived
+visit count once per selected size. It checks at least half the inputs are selected,
+so a tiny budget cannot accidentally turn this into a cheap path. Both sizes run;
+no result is extrapolated from the old 500-item case.
+
+The `compose/sequential_composed_five_stages/500` scene is an explicit public
+composition: two `SequentialFold::execute` pairs followed by one terminal
+`Fold::derive`. `SequentialFold` itself accepts exactly two folds and does not
+implement `Fold`, so this is not a nonexistent nested five-fold constructor.
+Every stage traverses the same 500 entries, with the previous stage's result
+carried through `FoldContext`. All five states (124,750 through 623,750) and all
+five processed counts are checked. Context mapping and the public composition's
+five full traversals are inside the timer. The two-stage scene uses one pair.
+
+`FilterFold` and `MapFold` have no `execute` method; their public entry is
+`Fold::derive`. Filtering still visits all 500 entries, so the even-count result
+is 250 while `entries_processed` is 500. Mapping doubles 0..499 for a sum of
+249,500. Checkpoint storage is synchronous, not an async or persistence benchmark;
+its in-memory map is fresh on every iteration.
+
+The selector's `epistemic_weight` adds a caller-provided information-gain bonus.
+The measured path supplies nonzero gains and proves that weight 0.5 changes the
+selected identities relative to weight zero. It does not measure an objective's
+precision computation or an embedding/model operation. The higher-precision rank
+score field is also populated, as required by the real selector API.
+
+## Current baseline ledger
+
+The owning `storage-brain` bench-track component produces the new baselines on its
+qualified host. Record the measured commit, toolchain, CPU/OS, command and output
+artifact. New baselines and a rerun of all existing groups are pending measurement;
+no numbers are inferred from source inspection or copied forward as current.
+
+| Group                                            | Current baseline                     | Commit / toolchain / machine |
+| ------------------------------------------------ | ------------------------------------ | ---------------------------- |
+| Original fold/objective/ordering/selector groups | Pending qualified-host remeasurement | Pending                      |
+| Sequential, filter and map folds                 | Pending qualified-host measurement   | Pending                      |
+| Checkpoint save/load                             | Pending qualified-host measurement   | Pending                      |
+| Anchor trace/credit                              | Pending qualified-host measurement   | Pending                      |
+| Epistemic-gain selector                          | Pending qualified-host measurement   | Pending                      |
+| Diversity at 1k/5k                               | Pending qualified-host measurement   | Pending                      |
+
+## Performance guarantees
+
+| Operation                       | Input                              | Metric         | Bound                                                                                      |
+| ------------------------------- | ---------------------------------- | -------------- | ------------------------------------------------------------------------------------------ |
+| Fold count (500 items)          | 500 i64 entries                    | latency median | Advisory trend; historical ledger value 935.8 ns                                           |
+| Objective select_top (500, n/5) | 500 f64 candidates                 | latency median | Advisory trend; historical ledger value 6.192 µs                                           |
+| Ordering sort (500)             | 500 ScoredEntry                    | latency median | Advisory trend; historical ledger value 9.869 µs                                           |
+| Selector greedy (500)           | 500 inputs, bias=0                 | latency median | Advisory trend; historical ledger value 22.32 µs                                           |
+| Selector greedy_diversity (500) | 500 inputs, 8 categories, bias=0.5 | latency median | Advisory trend; historical ledger value 10.99 ms                                           |
+| SequentialFold                  | 500 inputs, chain=5                | latency median | Advisory trend against the recorded baseline                                               |
+| Precision-weighted selector     | 500 inputs, epistemic_weight=0.5   | latency median | Advisory trend against the recorded baseline; actual caller-provided information-gain path |
+
+No timing threshold is a hard test gate. The benchmark output checks validate the
+fixture and selected public path, rather than turning historical performance
+observations into requirements.
 
 ## Release Ledger
 

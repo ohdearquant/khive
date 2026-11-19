@@ -21,7 +21,9 @@ call time and feed back into via explicit or implicit signals.
   `FeedbackExplicit` event to the shared event log; `brain.auto_feedback` is
   convenience sugar for attributing a signal to one explicitly selected
   `memory.recall` result without constructing a full feedback call. An omitted
-  signal is an abstention, and rank position never creates positive evidence
+  signal is an abstention, and rank position never creates positive evidence.
+  `signal="unjudged"` appends a `feedback_unjudged` telemetry event without
+  training a profile or consuming a serve-ledger grade
 - **Deterministic fold reducers** — `BalancedRecallFold` and
   `SectionPosteriorFold` implement pure `khive_fold::Fold<Event, S>` reducers.
   They are available to embedders, but the running handlers and dispatch hook do
@@ -44,13 +46,36 @@ verbs through the MCP `request` DSL, not called directly as a Rust API:
 ```text
 request(ops="brain.create_profile(name=\"my-profile-v1\", consumer_kind=\"recall\")")
 request(ops="brain.resolve(consumer_kind=\"recall\")")
-request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
+request(ops="brain.feedback(id=\"<uuid>\", signal=\"useful\")")
 request(ops="brain.auto_feedback(query=\"why\", results=[{\"id\": \"<uuid>\"}], target_id=\"<uuid>\", signal=\"implicit_positive\")")
 ```
 
+To record a serve without a judgment, name the selected result explicitly:
+
+```text
+request(ops='brain.auto_feedback(query="why", results=[{"id":"<uuid>","serve_attribution":"unattributed"}], target_id="<uuid>", signal="unjudged")')
+```
+
+Unjudged events preserve query, candidate ids, and available serve attribution.
+They do not resolve a default profile or require a profile to remain active;
+historical profile ids describe the serve without receiving credit. Anonymous
+callers may record this non-judgment under their own event attribution.
+Read it with `list(kind="event", event_kind="feedback_unjudged")`; the payload's
+`originating_verb` is `brain.auto_feedback`, while the stored verb remains
+`brain.feedback`. Aggregate event counts show telemetry separately from judgments.
+
+The optional `scorer_run_id` and `serve_ledger_id` must be supplied together and
+match the selected target and serve attribution. Unjudged retains that pair
+without consuming its grade or deduplication budget. A later caller-judged
+`useful`, `not_useful`, or `wrong` auto-feedback call with the same pair commits
+its grade, event, and posterior update exactly once, subject to the usual
+caller/profile guards. Another scorer run is a distinct pair. Manual
+`brain.feedback` retains its existing implicit-only scorer-provenance rule.
+
 `brain.feedback` and `brain.auto_feedback` can target a live KG entity or note
 on another configured pack backend, including a message returned by
-`search(kind="message", query="handoff")`. Copy its full UUID into `target_id`;
+`search(kind="message", query="handoff")`. Copy its full UUID into `id` for
+`brain.feedback` or `target_id` for `brain.auto_feedback`;
 `get(id="<uuid>")` uses the same shared entity/note read resolver. For
 `auto_feedback`, the selected ID must still match exactly one supplied result.
 Normal Gate checks apply, and target lookup by ID does not filter the stored

@@ -27,7 +27,28 @@ all-features = false
 # "workspace" = only unmaintained direct workspace deps are reported.
 unmaintained = "workspace"
 yanked = "deny"
-ignore = []
+ignore = [
+    # webpki-roots 0.26.11 (via ureq 2, from lattice-inference) is a shim whose
+    # only item is `pub use parent::TLS_SERVER_ROOTS` with parent = webpki-roots
+    # ^1, so its roots are the locked 1.x copy (1.0.10, patched). The advisory's
+    # patched range (>= 1.0.10) cannot match a 0.26 version. Remove this entry
+    # when ureq 2 leaves the tree or the 1.x lock drops below 1.0.10.
+    { id = "RUSTSEC-2026-0381", reason = "0.26.11 re-exports the patched webpki-roots 1.0.10 roots" },
+    # rmcp 2.2: both advisories sit behind features this workspace does not
+    # enable. The resolved rmcp feature set (`cargo tree -e features -i rmcp
+    # --workspace --all-features`) is base64, client, default, macros, server,
+    # transport-async-rw, transport-child-process and transport-io. Remove both
+    # entries when rmcp moves to 3.9 or later, or when `auth` or any
+    # `transport-streamable-http-client-*` feature is enabled.
+    { id = "RUSTSEC-2026-0457", reason = "OAuth client metadata fetch; the rmcp auth feature is not enabled" },
+    { id = "RUSTSEC-2026-0462", reason = "Streamable HTTP client body buffering; no transport-streamable-http-client feature is enabled" },
+    # chrono and chrono-tz are marked unmaintained with no fixed release. Both are
+    # direct dependencies across the workspace; the move to a maintained crate is
+    # tracked in #6754. Remove both entries when no workspace crate depends on
+    # either directly.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained with no fixed release; replacement tracked in #6754" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz is unmaintained with no fixed release; replacement tracked in #6754" },
+]
 
 [licenses]
 confidence-threshold = 0.93

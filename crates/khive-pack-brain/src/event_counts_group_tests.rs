@@ -6,7 +6,6 @@ use khive_storage::{Event, EventFilter};
 use khive_types::{EventKind, SubstrateKind};
 use serde_json::{json, Value};
 
-use crate::event_counts_grouping::EventCountGroupBy;
 use crate::handlers::{fetch_event_counts_window, fetch_event_counts_window_exhaustive};
 use crate::BrainPack;
 
@@ -290,105 +289,6 @@ async fn group_by_is_optional_and_accepts_only_the_ordered_pair() {
 }
 
 #[tokio::test]
-async fn cross_uses_the_sampled_and_exhaustive_event_windows_including_audit_segregation() {
-    let (runtime, _) = fixture(true);
-    for offset in 0..5 {
-        seed(
-            &runtime,
-            "local",
-            "audit.verb",
-            &format!("actor:sample:{offset}"),
-            EventKind::Audit,
-            SINCE + 10 + offset,
-        )
-        .await;
-    }
-    for offset in 0..2 {
-        seed(
-            &runtime,
-            "local",
-            "quiet.search",
-            "actor:quiet",
-            EventKind::SearchExecuted,
-            SINCE + offset,
-        )
-        .await;
-    }
-    let store = runtime.backend().events_for_namespace("local").unwrap();
-    let filter = EventFilter {
-        after: Some(SINCE - 1),
-        before: Some(UNTIL),
-        ..Default::default()
-    };
-    let (sample, total, truncated) = fetch_event_counts_window(store.as_ref(), &filter, true, 2)
-        .await
-        .unwrap();
-    assert_eq!(total, 7);
-    assert!(truncated);
-    let mut result = json!({});
-    EventCountGroupBy::VerbActor.add_to_result(&mut result, &sample, None, truncated);
-    assert!(result.get("counts_by_verb_and_actor").is_none());
-    assert_eq!(
-        result["counts_by_verb_and_actor_page_scoped"],
-        json!({
-            "audit.verb": {"actor:sample:4": 1, "actor:sample:3": 1},
-            "quiet.search": {"actor:quiet": 2},
-        })
-    );
-    assert_eq!(
-        cross_sum(&result["counts_by_verb_and_actor_page_scoped"]),
-        sample.len() as u64
-    );
-    let cells: usize = result["counts_by_verb_and_actor_page_scoped"]
-        .as_object()
-        .unwrap()
-        .values()
-        .map(|actors| actors.as_object().unwrap().len())
-        .sum();
-    assert!(
-        cells <= sample.len(),
-        "a cross cannot invent unobserved cells"
-    );
-
-    let audit_filter = EventFilter {
-        kinds: vec![EventKind::Audit],
-        ..filter.clone()
-    };
-    let (audit, total, truncated) =
-        fetch_event_counts_window(store.as_ref(), &audit_filter, false, 2)
-            .await
-            .unwrap();
-    assert_eq!(total, 5);
-    assert!(truncated);
-    let mut audit_result = json!({});
-    EventCountGroupBy::VerbActor.add_to_result(&mut audit_result, &audit, None, truncated);
-    assert!(audit_result["counts_by_verb_and_actor_page_scoped"]
-        .get("quiet.search")
-        .is_none());
-    assert_eq!(
-        cross_sum(&audit_result["counts_by_verb_and_actor_page_scoped"]),
-        2
-    );
-
-    let (all, total, truncated) =
-        fetch_event_counts_window_exhaustive(store.as_ref(), &filter, 2, 20)
-            .await
-            .unwrap();
-    assert_eq!(total, 7);
-    assert!(!truncated);
-    let mut complete = json!({});
-    EventCountGroupBy::VerbActor.add_to_result(&mut complete, &all, None, truncated);
-    assert!(complete
-        .get("counts_by_verb_and_actor_page_scoped")
-        .is_none());
-    assert_eq!(cross_sum(&complete["counts_by_verb_and_actor"]), 7);
-    assert_eq!(
-        complete["counts_by_verb_and_actor"]["quiet.search"]["actor:quiet"],
-        2
-    );
-}
-
-#[tokio::test]
 async fn more_cross_cells_than_marginal_keys_do_not_create_another_cap() {
     let (runtime, registry) = fixture(true);
     for verb in ["v.one", "v.two"] {
@@ -423,4 +323,128 @@ async fn more_cross_cells_than_marginal_keys_do_not_create_another_cap() {
         result["counts_by_verb_and_actor"],
         json!({"v.one": {"actor:a": 1, "actor:b": 1}, "v.two": {"actor:a": 1, "actor:b": 1}})
     );
+}
+
+#[tokio::test]
+async fn kind_grouped_admission_matches_per_kind_counts_at_window_boundaries() {
+    let (runtime, registry) = fixture(true);
+    for (kind, time) in [
+        (EventKind::Audit, SINCE),
+        (EventKind::Audit, SINCE + 2),
+        (EventKind::FeedbackExplicit, SINCE),
+        (EventKind::FeedbackExplicit, SINCE + 1),
+        (EventKind::SearchExecuted, UNTIL - 1),
+        (EventKind::Audit, SINCE - 1),
+        (EventKind::FeedbackExplicit, UNTIL),
+    ] {
+        seed(&runtime, "local", "window.verb", CALLER, kind, time).await;
+    }
+    seed(
+        &runtime,
+        "lambda:visible",
+        "window.verb",
+        CALLER,
+        EventKind::Audit,
+        SINCE,
+    )
+    .await;
+    let store = runtime.backend().events_for_namespace("local").unwrap();
+    let filter = EventFilter {
+        actors: vec![CALLER.into()],
+        after: Some(SINCE - 1),
+        before: Some(UNTIL),
+        ..EventFilter::default()
+    };
+    let grouped = store
+        .count_events_grouped(filter.clone(), khive_storage::event::EventGroupBy::Kind)
+        .await
+        .unwrap();
+    let mut separate = std::collections::BTreeMap::new();
+    for kind in EventKind::ALL {
+        let count = store
+            .count_events(EventFilter {
+                kinds: vec![kind],
+                ..filter.clone()
+            })
+            .await
+            .unwrap();
+        if count != 0 {
+            separate.insert(kind.name().to_string(), count);
+        }
+    }
+    assert_eq!(grouped, separate);
+    assert_eq!(
+        grouped,
+        std::collections::BTreeMap::from([
+            ("audit".to_string(), 2),
+            ("feedback_explicit".to_string(), 2),
+            ("search_executed".to_string(), 1),
+        ])
+    );
+
+    let (all, total, truncated) = fetch_event_counts_window(store.as_ref(), &filter, true, 20)
+        .await
+        .unwrap();
+    assert_eq!((all.len(), total, truncated), (5, 5, false));
+    assert!(all.iter().all(|event| event.namespace == "local"
+        && event.created_at >= SINCE
+        && event.created_at < UNTIL));
+    let expected_ids: std::collections::BTreeSet<_> = all.iter().map(|event| event.id).collect();
+    assert_eq!(expected_ids.len(), 5);
+    let (sample, total, truncated) = fetch_event_counts_window(store.as_ref(), &filter, true, 1)
+        .await
+        .unwrap();
+    assert_eq!((sample.len(), total, truncated), (2, 5, true));
+    assert_eq!(sample[0].kind, EventKind::Audit);
+    assert_ne!(sample[1].kind, EventKind::Audit);
+    assert!(sample.iter().all(|event| expected_ids.contains(&event.id)));
+
+    let feedback_filter = EventFilter {
+        kinds: vec![EventKind::FeedbackExplicit],
+        ..filter.clone()
+    };
+    let (feedback, total, truncated) =
+        fetch_event_counts_window(store.as_ref(), &feedback_filter, false, 1)
+            .await
+            .unwrap();
+    assert_eq!((feedback.len(), total, truncated), (1, 2, true));
+    assert_eq!(feedback[0].kind, EventKind::FeedbackExplicit);
+    let (exhaustive, total, truncated) =
+        fetch_event_counts_window_exhaustive(store.as_ref(), &filter, 2, 5)
+            .await
+            .unwrap();
+    assert_eq!((exhaustive.len(), total, truncated), (5, 5, false));
+    assert_eq!(
+        exhaustive
+            .iter()
+            .map(|event| event.id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected_ids
+    );
+    let empty_filter = EventFilter {
+        actors: vec!["lambda:no-events".into()],
+        ..filter.clone()
+    };
+    let (empty, total, truncated) =
+        fetch_event_counts_window(store.as_ref(), &empty_filter, false, 1)
+            .await
+            .unwrap();
+    assert_eq!((empty.len(), total, truncated), (0, 0, false));
+
+    for exhaustive in [false, true] {
+        let mut args = window();
+        args["all_actors"] = json!(true);
+        args["exhaustive"] = json!(exhaustive);
+        args["group_by"] = json!(["verb", "actor"]);
+        let result = registry.dispatch("brain.event_counts", args).await.unwrap();
+        assert_eq!(result["window_event_total"], 5);
+        assert_eq!(result["total"], 5);
+        assert_eq!(result["truncated"], false);
+        assert_eq!(result["scope"]["namespace"], "local");
+        assert_eq!(
+            result["counts_by_kind"],
+            json!({"audit": 2, "feedback_explicit": 2, "search_executed": 1})
+        );
+        assert_eq!(cross_sum(&result["counts_by_verb_and_actor"]), 5);
+    }
 }

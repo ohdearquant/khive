@@ -1,7 +1,7 @@
 # KG Rule Configuration
 
-**ADRs**: ADR-034 (KG validation), ADR-035 (kg init and vcs status)
-**Last reviewed**: 2026-08-06
+**ADRs**: ADR-034 (KG validation), ADR-035 (kg init and vcs status), ADR-102 (tiered validation)
+**Last reviewed**: 2026-10-14
 
 ## Overview
 
@@ -96,3 +96,50 @@ security benefit, and an operator must be able to run taxonomy validation agains
 strict-mode deployment. See `enforce_strict_actor_mode` in `crates/khive-mcp/src/serve.rs`
 for the authoritative boundary definition. `KgTaxonomy` itself is `pub(super)` so
 `kg::commit` (ADR-102) can reuse the same taxonomy sets rather than re-deriving them.
+
+## Tier configuration for `kg review`
+
+`kkernel kg review --rules <path>` reads the rules file once. The shared
+`khive-rule-evaluator` uses that same immutable configuration for its rule pass and
+operation classification. Validation findings and the independent model-family gate
+remain part of the report.
+
+The optional `[tier]` section configures Tier 1 eligibility:
+
+```toml
+[tier]
+tier_1_operations = ["create", "link", "update"]
+minimum_weight = 0.7
+# Omission allows all closed relations and mutable entity fields within the floor.
+# tier_1_relations = ["contains", "extends"]
+# tier_1_entity_fields = ["name", "description"]
+```
+
+| Field                  | Default                        | Meaning                                                                                                                                            |
+| ---------------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tier_1_operations`    | `create`, `link`, `update`     | Eligible operation kinds; accepted names also include `delete` and `merge`, which always remain Tier 2.                                            |
+| `tier_1_relations`     | All closed relations           | Eligible link relations, subject to the fixed floor.                                                                                               |
+| `tier_1_entity_fields` | All five mutable entity fields | Every touched field must be admitted: `name`, `description`, `properties`, `tags`, `entity_type`. Clearing a nullable field counts as touching it. |
+| `minimum_weight`       | `0.7`                          | A finite value in `[0,1]`; increasing it narrows eligible links.                                                                                   |
+
+Omitted sections and keys preserve the existing default classification and reason
+fields. Empty lists deliberately exclude every member of that category. Unknown keys,
+wrong types, unknown names, duplicate entries and invalid thresholds refuse the rules
+file.
+
+For example, `[tier] tier_1_operations = ["create"]` keeps additive creates eligible
+and moves an otherwise eligible non-judgment link to Tier 2. An empty
+`tier_1_relations = []` excludes all links. Configured restrictions appear as
+`config.*` entries in each operation's `tier_reasons`.
+
+The ADR-102 floor always wins: `supports`, `supersedes`, `refutes`, every delete or
+merge, existing-edge relation/weight updates, resulting weights below `0.7`, and
+error-severity findings require Tier 2. Explicitly admitting these operations or using
+a lower threshold cannot relax that floor. Note updates retain their conservative
+Tier 2 classification. Warning and informational findings remain visible and do not
+alone escalate operations.
+
+The existing partial-view rule projection still omits updates, deletes and merges.
+Their `review-rule-coverage` error blocks approval, even when a mutable entity update
+matches the configured Tier 1 eligibility. Tier configuration does not expand
+validation coverage or introduce a write path.

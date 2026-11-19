@@ -62,7 +62,31 @@ impl fmt::Display for EventOutcome {
     }
 }
 
-/// Discriminant for the 41 typed event variants produced by the verb dispatch path
+/// Declared persistence destination for an event class.
+///
+/// This metadata does not route writes or provide an operator audit store.
+/// There is deliberately no default: every new event kind must choose its sink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum EventSink {
+    /// The event store exposed through ordinary caller event queries.
+    CallerEventStore,
+    /// A separate operator audit destination, outside caller event queries.
+    OperatorAudit,
+}
+
+impl EventSink {
+    /// Return the canonical snake_case declaration name.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::CallerEventStore => "caller_event_store",
+            Self::OperatorAudit => "operator_audit",
+        }
+    }
+}
+
+/// Discriminant for the 44 typed event variants produced by the verb dispatch path
 /// and by lifecycle telemetry producers (channel polling/backoff, config-lock,
 /// checkpoint outcome, background phase spans).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -79,6 +103,10 @@ pub enum EventKind {
     SearchExecuted,
     /// A tool-use policy decision was computed by tool.check or exec.run.
     ToolCheckDecided,
+    /// A registration correction changed its canonical grant-policy inputs.
+    /// Retention: `pinned_while_referenced`; the payload/target registry row
+    /// is the referent and its deletion is the terminal condition (ADR-180 A10).
+    ToolRegistrationChanged,
     /// A new directed edge was created between two nodes.
     LinkCreated,
     /// A new entity was created.
@@ -105,6 +133,8 @@ pub enum EventKind {
     TaskTransitioned,
     /// An explicit user feedback signal was recorded.
     FeedbackExplicit,
+    /// Telemetry recording a serve without a judgment (ADR-104 Amendment 3).
+    FeedbackUnjudged,
     /// The brain recommended a profile resolution update.
     ProfileResolutionRecommended,
     /// Two brain profiles were merged.
@@ -151,16 +181,19 @@ pub enum EventKind {
     PhaseCancelled,
     /// An attempted operation was refused while retaining its existing subject.
     Refusal,
+    /// An authority record changed with its attributable transactional history.
+    GrantChange,
 }
 
 impl EventKind {
-    /// All 41 event kind variants in declaration order.
-    pub const ALL: [Self; 41] = [
+    /// All 44 event kind variants in declaration order.
+    pub const ALL: [Self; 44] = [
         Self::Audit,
         Self::RecallExecuted,
         Self::RerankExecuted,
         Self::SearchExecuted,
         Self::ToolCheckDecided,
+        Self::ToolRegistrationChanged,
         Self::LinkCreated,
         Self::EntityCreated,
         Self::EntityUpdated,
@@ -174,6 +207,7 @@ impl EventKind {
         Self::EdgeDeleted,
         Self::TaskTransitioned,
         Self::FeedbackExplicit,
+        Self::FeedbackUnjudged,
         Self::ProfileResolutionRecommended,
         Self::ProfileMerged,
         Self::EmbeddingModelChanged,
@@ -197,7 +231,61 @@ impl EventKind {
         Self::PhaseCompleted,
         Self::PhaseCancelled,
         Self::Refusal,
+        Self::GrantChange,
     ];
+
+    /// Return this class's explicitly declared persistence destination.
+    ///
+    /// Existing classes retain their caller-store declaration. The exhaustive
+    /// match makes a new kind without a sink declaration a compilation error.
+    pub const fn sink(self) -> EventSink {
+        match self {
+            Self::Audit => EventSink::CallerEventStore,
+            Self::RecallExecuted => EventSink::CallerEventStore,
+            Self::RerankExecuted => EventSink::CallerEventStore,
+            Self::SearchExecuted => EventSink::CallerEventStore,
+            Self::ToolCheckDecided => EventSink::CallerEventStore,
+            Self::ToolRegistrationChanged => EventSink::CallerEventStore,
+            Self::LinkCreated => EventSink::CallerEventStore,
+            Self::EntityCreated => EventSink::CallerEventStore,
+            Self::EntityUpdated => EventSink::CallerEventStore,
+            Self::EntityDeleted => EventSink::CallerEventStore,
+            Self::EntityMerged => EventSink::CallerEventStore,
+            Self::NoteMerged => EventSink::CallerEventStore,
+            Self::NoteCreated => EventSink::CallerEventStore,
+            Self::NoteUpdated => EventSink::CallerEventStore,
+            Self::NoteDeleted => EventSink::CallerEventStore,
+            Self::EdgeUpdated => EventSink::CallerEventStore,
+            Self::EdgeDeleted => EventSink::CallerEventStore,
+            Self::TaskTransitioned => EventSink::CallerEventStore,
+            Self::FeedbackExplicit => EventSink::CallerEventStore,
+            Self::FeedbackUnjudged => EventSink::CallerEventStore,
+            Self::ProfileResolutionRecommended => EventSink::CallerEventStore,
+            Self::ProfileMerged => EventSink::CallerEventStore,
+            Self::EmbeddingModelChanged => EventSink::CallerEventStore,
+            Self::EmbeddingMigrationCompleted => EventSink::CallerEventStore,
+            Self::EmbeddingMigrationFailed => EventSink::CallerEventStore,
+            Self::EmbeddingDriftDetected => EventSink::CallerEventStore,
+            Self::EmbedderInitialized => EventSink::CallerEventStore,
+            Self::ProposalCreated => EventSink::CallerEventStore,
+            Self::ProposalReviewed => EventSink::CallerEventStore,
+            Self::ProposalApplied => EventSink::CallerEventStore,
+            Self::ProposalWithdrawn => EventSink::CallerEventStore,
+            Self::ChannelPollStarted => EventSink::CallerEventStore,
+            Self::ChannelPollSucceeded => EventSink::CallerEventStore,
+            Self::ChannelPollFailed => EventSink::CallerEventStore,
+            Self::ChannelBackoffArmed => EventSink::CallerEventStore,
+            Self::ChannelBackoffReset => EventSink::CallerEventStore,
+            Self::ChannelHeartbeatPersistFailed => EventSink::CallerEventStore,
+            Self::ConfigLocked => EventSink::CallerEventStore,
+            Self::CheckpointOutcomeRecorded => EventSink::CallerEventStore,
+            Self::PhaseStarted => EventSink::CallerEventStore,
+            Self::PhaseCompleted => EventSink::CallerEventStore,
+            Self::PhaseCancelled => EventSink::CallerEventStore,
+            Self::Refusal => EventSink::CallerEventStore,
+            Self::GrantChange => EventSink::CallerEventStore,
+        }
+    }
 
     /// Return the canonical snake_case string for this event kind.
     pub const fn name(self) -> &'static str {
@@ -207,6 +295,7 @@ impl EventKind {
             Self::RerankExecuted => "rerank_executed",
             Self::SearchExecuted => "search_executed",
             Self::ToolCheckDecided => "tool_check_decided",
+            Self::ToolRegistrationChanged => "tool_registration_changed",
             Self::LinkCreated => "link_created",
             Self::EntityCreated => "entity_created",
             Self::EntityUpdated => "entity_updated",
@@ -220,6 +309,7 @@ impl EventKind {
             Self::EdgeDeleted => "edge_deleted",
             Self::TaskTransitioned => "task_transitioned",
             Self::FeedbackExplicit => "feedback_explicit",
+            Self::FeedbackUnjudged => "feedback_unjudged",
             Self::ProfileResolutionRecommended => "profile_resolution_recommended",
             Self::ProfileMerged => "profile_merged",
             Self::EmbeddingModelChanged => "embedding_model_changed",
@@ -243,6 +333,7 @@ impl EventKind {
             Self::PhaseCompleted => "phase_completed",
             Self::PhaseCancelled => "phase_cancelled",
             Self::Refusal => "refusal",
+            Self::GrantChange => "grant_change",
         }
     }
 }
@@ -259,6 +350,7 @@ const EVENT_KIND_VALID: &[&str] = &[
     "rerank_executed",
     "search_executed",
     "tool_check_decided",
+    "tool_registration_changed",
     "link_created",
     "entity_created",
     "entity_updated",
@@ -272,6 +364,7 @@ const EVENT_KIND_VALID: &[&str] = &[
     "edge_deleted",
     "task_transitioned",
     "feedback_explicit",
+    "feedback_unjudged",
     "profile_resolution_recommended",
     "profile_merged",
     "embedding_model_changed",
@@ -295,6 +388,7 @@ const EVENT_KIND_VALID: &[&str] = &[
     "phase_completed",
     "phase_cancelled",
     "refusal",
+    "grant_change",
 ];
 
 impl core::str::FromStr for EventKind {
@@ -307,6 +401,7 @@ impl core::str::FromStr for EventKind {
             "rerank_executed" => Ok(Self::RerankExecuted),
             "search_executed" => Ok(Self::SearchExecuted),
             "tool_check_decided" => Ok(Self::ToolCheckDecided),
+            "tool_registration_changed" => Ok(Self::ToolRegistrationChanged),
             "link_created" => Ok(Self::LinkCreated),
             "entity_created" => Ok(Self::EntityCreated),
             "entity_updated" => Ok(Self::EntityUpdated),
@@ -320,6 +415,7 @@ impl core::str::FromStr for EventKind {
             "edge_deleted" => Ok(Self::EdgeDeleted),
             "task_transitioned" => Ok(Self::TaskTransitioned),
             "feedback_explicit" => Ok(Self::FeedbackExplicit),
+            "feedback_unjudged" => Ok(Self::FeedbackUnjudged),
             "profile_resolution_recommended" => Ok(Self::ProfileResolutionRecommended),
             "profile_merged" => Ok(Self::ProfileMerged),
             "embedding_model_changed" => Ok(Self::EmbeddingModelChanged),
@@ -343,6 +439,7 @@ impl core::str::FromStr for EventKind {
             "phase_completed" => Ok(Self::PhaseCompleted),
             "phase_cancelled" => Ok(Self::PhaseCancelled),
             "refusal" => Ok(Self::Refusal),
+            "grant_change" => Ok(Self::GrantChange),
             other => Err(crate::error::UnknownVariant::new(
                 "event_kind",
                 other,
@@ -383,6 +480,8 @@ pub enum EventPayload {
     RerankExecuted(RerankExecutedPayload),
     /// Structured payload for a tool-use policy decision.
     ToolCheckDecided(ToolCheckDecidedPayload),
+    /// A registration correction without disclosing the changed field values.
+    ToolRegistrationChanged(ToolRegistrationChangedPayload),
     /// Structured payload for a proposal-created event (requires `serde` feature).
     #[cfg(feature = "serde")]
     ProposalCreated(ProposalCreatedPayload),
@@ -414,6 +513,32 @@ pub struct ToolCheckDecidedPayload {
     pub caller_verb: String,
 }
 
+/// A correction to the four policy inputs covered by a tool registration digest.
+/// Values of the corrected fields are deliberately absent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ToolRegistrationChangedPayload {
+    /// Authenticated actor stamped into the event row.
+    pub actor: String,
+    /// Canonical full UUID of the registry row.
+    pub id: String,
+    /// Canonical policy-input digest before the correction.
+    pub digest_before: String,
+    /// Canonical policy-input digest after the correction.
+    pub digest_after: String,
+}
+
+/// Implementation that produced a rerank event (ADR-042 Amendment 1).
+/// Events written before the discriminator existed are native reranks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum RerankerKind {
+    #[default]
+    Native,
+    Weighted,
+}
+
 /// Payload for a rerank pass event, recording per-candidate scores.
 ///
 /// All score values (`reranked` section scores, `final_scores`) must be finite.
@@ -421,10 +546,22 @@ pub struct ToolCheckDecidedPayload {
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct RerankExecutedPayload {
+    /// Native model or weighted feature scoring; legacy events default to native.
+    pub reranker: RerankerKind,
     /// Brain profile that served this rerank, if any.
     pub served_by_profile_id: Option<String>,
-    /// Model used for reranking.
-    pub model_id: Id128,
+    /// Model used for reranking; absent for weighted feature scoring.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub model_id: Option<Id128>,
+    /// Opaque caller-supplied query correlation; never generated or parsed as a UUID.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub query_id: Option<String>,
+    /// Positive recognized feature weights, in scoring order.
+    pub tiers: Vec<String>,
+    /// Configured keys unknown to weighted scoring, in lexical order.
+    pub ignored_weights: Vec<String>,
+    /// Candidates without a parseable UUID, omitted from the three ID arrays.
+    pub unidentified_candidates: usize,
     /// Candidate IDs in input order.
     pub candidates: Vec<Id128>,
     /// Per-candidate named sub-scores from the reranker.
@@ -459,8 +596,17 @@ impl<'de> serde::Deserialize<'de> for RerankExecutedPayload {
     {
         #[derive(serde::Deserialize)]
         struct Raw {
+            #[serde(default)]
+            reranker: RerankerKind,
             served_by_profile_id: Option<String>,
-            model_id: Id128,
+            model_id: Option<Id128>,
+            query_id: Option<String>,
+            #[serde(default)]
+            tiers: Vec<String>,
+            #[serde(default)]
+            ignored_weights: Vec<String>,
+            #[serde(default)]
+            unidentified_candidates: usize,
             candidates: Vec<Id128>,
             reranked: Vec<(Id128, Vec<(String, f32)>)>,
             final_scores: Vec<(Id128, f32)>,
@@ -489,8 +635,13 @@ impl<'de> serde::Deserialize<'de> for RerankExecutedPayload {
         }
 
         Ok(RerankExecutedPayload {
+            reranker: raw.reranker,
             served_by_profile_id: raw.served_by_profile_id,
             model_id: raw.model_id,
+            query_id: raw.query_id,
+            tiers: raw.tiers,
+            ignored_weights: raw.ignored_weights,
+            unidentified_candidates: raw.unidentified_candidates,
             candidates: raw.candidates,
             reranked: raw.reranked,
             final_scores: raw.final_scores,
@@ -647,6 +798,10 @@ pub enum ProposalChangeset {
         old: Id128,
         new: Id128,
     },
+    Canonical {
+        schema_version: u32,
+        delta: String,
+    },
     Compound {
         steps: Vec<ProposalChangeset>,
     },
@@ -663,7 +818,7 @@ impl ProposalChangeset {
                             "ProposalChangeset AddEdge weight must be finite, got {w}"
                         ));
                     }
-                    if !(*w >= 0.0 && *w <= 1.0) {
+                    if !crate::validate_edge_weight(f64::from(*w)) {
                         return Err(alloc::format!(
                             "ProposalChangeset AddEdge weight must be in [0.0, 1.0], got {w}"
                         ));
@@ -673,6 +828,9 @@ impl ProposalChangeset {
             }
             Self::Compound { steps } => {
                 for step in steps {
+                    if matches!(step, Self::Canonical { .. }) {
+                        return Err("Canonical proposal changesets must be top-level".into());
+                    }
                     step.validate()?;
                 }
                 Ok(())
@@ -688,6 +846,13 @@ impl<'de> serde::Deserialize<'de> for ProposalChangeset {
     where
         D: serde::Deserializer<'de>,
     {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CanonicalFields {
+            schema_version: u32,
+            delta: String,
+        }
+
         #[derive(serde::Deserialize)]
         #[serde(tag = "kind", rename_all = "snake_case")]
         enum ProposalChangesetRaw {
@@ -715,6 +880,7 @@ impl<'de> serde::Deserialize<'de> for ProposalChangeset {
                 old: Id128,
                 new: Id128,
             },
+            Canonical(CanonicalFields),
             Compound {
                 steps: Vec<ProposalChangeset>,
             },
@@ -742,6 +908,13 @@ impl<'de> serde::Deserialize<'de> for ProposalChangeset {
             ProposalChangesetRaw::SupersedeEntity { old, new } => {
                 Self::SupersedeEntity { old, new }
             }
+            ProposalChangesetRaw::Canonical(CanonicalFields {
+                schema_version,
+                delta,
+            }) => Self::Canonical {
+                schema_version,
+                delta,
+            },
             ProposalChangesetRaw::Compound { steps } => Self::Compound { steps },
         };
         cs.validate().map_err(serde::de::Error::custom)?;
@@ -765,6 +938,10 @@ pub enum ProposalChangeset {
     SupersedeEntity {
         old: Id128,
         new: Id128,
+    },
+    Canonical {
+        schema_version: u32,
+        delta: String,
     },
     Compound {
         steps: Vec<ProposalChangeset>,
@@ -819,6 +996,20 @@ pub struct ProposalAppliedPayload {
     pub applied_at: crate::Timestamp,
     pub applied_by: String,
     pub result: ApplyResult,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub preimage: Option<ProposalPreimageStatus>,
+}
+
+/// Whether an apply result carries checked stage-time preimages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum ProposalPreimageStatus {
+    None,
+    Captured,
 }
 
 /// Outcome of applying a proposal: either all steps succeeded or the apply failed with an error.
@@ -922,253 +1113,9 @@ impl EventBuilder {
 }
 
 #[cfg(test)]
-mod tests {
-    extern crate alloc;
+#[path = "event_tests.rs"]
+mod tests;
 
-    use super::*;
-    use crate::{Namespace, Timestamp};
-    #[cfg(feature = "serde")]
-    use alloc::string::ToString;
-
-    fn header() -> Header {
-        Header::new(
-            Id128::from_u128(1),
-            Namespace::local(),
-            Timestamp::from_secs(1700000000),
-        )
-    }
-
-    #[test]
-    fn event_kind_parse_roundtrip() {
-        for kind in EventKind::ALL {
-            let parsed: EventKind = kind
-                .name()
-                .parse()
-                .expect("EventKind::name must parse back");
-            assert_eq!(parsed, kind);
-        }
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn refusal_kind_has_canonical_string_and_serde_roundtrip() {
-        let kind = EventKind::Refusal;
-        assert!(EventKind::ALL.contains(&kind));
-        assert_eq!(kind.name(), "refusal");
-        assert_eq!(kind.to_string(), "refusal");
-        assert_eq!("refusal".parse::<EventKind>().unwrap(), kind);
-        assert_eq!(serde_json::to_string(&kind).unwrap(), "\"refusal\"");
-        assert_eq!(
-            serde_json::from_str::<EventKind>("\"refusal\"").unwrap(),
-            kind
-        );
-    }
-
-    #[test]
-    fn rerank_payload_records_served_profile() {
-        let payload = EventPayload::RerankExecuted(RerankExecutedPayload {
-            served_by_profile_id: Some("profile-a".into()),
-            model_id: Id128::from_u128(1),
-            candidates: Vec::new(),
-            reranked: Vec::new(),
-            final_scores: Vec::new(),
-            latency_us: 100,
-            hook_applied: false,
-            hook_target_match: false,
-        });
-        let event = EventBuilder::new("rerank", SubstrateKind::Note, "agent:test")
-            .kind(EventKind::RerankExecuted)
-            .payload(payload)
-            .build(header());
-
-        if let EventPayload::RerankExecuted(ref p) = event.payload {
-            assert_eq!(p.served_by_profile_id.as_deref(), Some("profile-a"));
-        } else {
-            panic!("unexpected payload variant");
-        }
-    }
-
-    #[test]
-    fn proposal_payloads_are_typed() {
-        let payload = EventPayload::ProposalReviewed(ProposalReviewedPayload {
-            proposal_id: Id128::from_u128(42),
-            reviewer: "operator".into(),
-            decision: ProposalDecision::Approve,
-            comment: None,
-        });
-        let event = EventBuilder::new("review", SubstrateKind::Entity, "operator")
-            .kind(EventKind::ProposalReviewed)
-            .payload(payload)
-            .build(header());
-        assert_eq!(event.kind.name(), "proposal_reviewed");
-    }
-
-    /// C1 regression: all ProposalChangeset variants that carry Id128 fields must
-    /// round-trip through serde_json::Value.  Previously `Id128::deserialize` used
-    /// `<&str>::deserialize` which fails when the deserializer holds owned data
-    /// (the Value-backed path used by the MCP DSL parser).
-    #[cfg(feature = "serde")]
-    #[test]
-    fn proposal_changeset_id_variants_deserialize_from_value() {
-        let uuid = "7426afd6-0234-4701-9045-83dfd39166e6";
-        let uuid2 = "abcdef01-2345-6789-abcd-ef0123456789";
-
-        // UpdateEntity — patch is now a structured ProposalEntityPatch object
-        let v =
-            serde_json::json!({"kind": "update_entity", "id": uuid, "patch": {"name": "NewName"}});
-        let cs: ProposalChangeset =
-            serde_json::from_value(v).expect("UpdateEntity must deserialize from Value");
-        assert!(
-            matches!(cs, ProposalChangeset::UpdateEntity { .. }),
-            "expected UpdateEntity"
-        );
-
-        // Tri-state entity_type (ADR-014): absent vs explicit null vs set
-        // must all survive the proposal wire boundary distinctly.
-        for (json, expected) in [
-            (serde_json::json!({}), None),
-            (serde_json::json!({"entity_type": null}), Some(None)),
-            (
-                serde_json::json!({"entity_type": "algorithm"}),
-                Some(Some("algorithm".to_string())),
-            ),
-        ] {
-            let v = serde_json::json!({"kind": "update_entity", "id": uuid, "patch": json});
-            let cs: ProposalChangeset =
-                serde_json::from_value(v).expect("UpdateEntity must deserialize");
-            let ProposalChangeset::UpdateEntity { patch, .. } = cs else {
-                panic!("expected UpdateEntity");
-            };
-            assert_eq!(patch.entity_type, expected, "patch: {json}");
-        }
-
-        // The clear must serialize back as an explicit null.
-        let patch = ProposalEntityPatch {
-            name: None,
-            description: None,
-            properties: None,
-            tags: None,
-            entity_type: Some(None),
-        };
-        let v = serde_json::to_value(&patch).expect("serialize");
-        assert_eq!(v.get("entity_type"), Some(&serde_json::Value::Null));
-        assert!(
-            v.get("name").is_none(),
-            "absent fields must not be serialized"
-        );
-
-        // AddEdge
-        let v = serde_json::json!({
-            "kind": "add_edge",
-            "source": uuid, "target": uuid2,
-            "relation": "extends", "weight": 1.0
-        });
-        let cs: ProposalChangeset =
-            serde_json::from_value(v).expect("AddEdge must deserialize from Value");
-        assert!(
-            matches!(cs, ProposalChangeset::AddEdge { .. }),
-            "expected AddEdge"
-        );
-
-        // MergeEntities
-        let v = serde_json::json!({"kind": "merge_entities", "into": uuid, "from": uuid2});
-        let cs: ProposalChangeset =
-            serde_json::from_value(v).expect("MergeEntities must deserialize from Value");
-        assert!(
-            matches!(cs, ProposalChangeset::MergeEntities { .. }),
-            "expected MergeEntities"
-        );
-
-        // SupersedeEntity
-        let v = serde_json::json!({"kind": "supersede_entity", "old": uuid, "new": uuid2});
-        let cs: ProposalChangeset =
-            serde_json::from_value(v).expect("SupersedeEntity must deserialize from Value");
-        assert!(
-            matches!(cs, ProposalChangeset::SupersedeEntity { .. }),
-            "expected SupersedeEntity"
-        );
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn proposal_changeset_rejects_invalid_edge_weight() {
-        let uuid = "7426afd6-0234-4701-9045-83dfd39166e6";
-        let uuid2 = "abcdef01-2345-6789-abcd-ef0123456789";
-
-        let v = serde_json::json!({
-            "kind": "add_edge",
-            "source": uuid, "target": uuid2,
-            "relation": "extends", "weight": 2.0
-        });
-        let result: Result<ProposalChangeset, _> = serde_json::from_value(v);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("[0.0, 1.0]"),
-            "error should mention range: {err}"
-        );
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn proposal_changeset_accepts_null_edge_weight() {
-        let uuid = "7426afd6-0234-4701-9045-83dfd39166e6";
-        let uuid2 = "abcdef01-2345-6789-abcd-ef0123456789";
-
-        let v = serde_json::json!({
-            "kind": "add_edge",
-            "source": uuid, "target": uuid2,
-            "relation": "extends", "weight": null
-        });
-        let cs: ProposalChangeset =
-            serde_json::from_value(v).expect("null weight should be accepted");
-        assert!(matches!(
-            cs,
-            ProposalChangeset::AddEdge { weight: None, .. }
-        ));
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn rerank_payload_serde_rejects_non_finite_score() {
-        let json = serde_json::json!({
-            "served_by_profile_id": null,
-            "model_id": "00000000-0000-0000-0000-000000000001",
-            "candidates": [],
-            "reranked": [],
-            "final_scores": [["00000000-0000-0000-0000-000000000001", "Infinity"]],
-            "latency_us": 100,
-            "hook_applied": false,
-            "hook_target_match": false
-        });
-        let result: Result<RerankExecutedPayload, _> = serde_json::from_value(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn rerank_payload_is_valid_checks_finite() {
-        let p = RerankExecutedPayload {
-            served_by_profile_id: None,
-            model_id: Id128::from_u128(1),
-            candidates: Vec::new(),
-            reranked: Vec::new(),
-            final_scores: alloc::vec![(Id128::from_u128(1), 0.5)],
-            latency_us: 100,
-            hook_applied: false,
-            hook_target_match: false,
-        };
-        assert!(p.is_valid());
-
-        let p_inf = RerankExecutedPayload {
-            served_by_profile_id: None,
-            model_id: Id128::from_u128(1),
-            candidates: Vec::new(),
-            reranked: Vec::new(),
-            final_scores: alloc::vec![(Id128::from_u128(1), f32::INFINITY)],
-            latency_us: 100,
-            hook_applied: false,
-            hook_target_match: false,
-        };
-        assert!(!p_inf.is_valid());
-    }
-}
+#[cfg(all(test, feature = "serde"))]
+#[path = "event_canonical_tests.rs"]
+mod canonical_tests;

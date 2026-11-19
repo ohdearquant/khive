@@ -1,23 +1,163 @@
-//! Canonical structured projection of typed runtime failures.
+//! Canonical typed runtime projection and per-operation failure construction.
 //!
-//! Transport nesting limits and removal of a nested operation's domain result
-//! belong to the transport boundary, not to this lossless shared projection.
+//! Ordinary typed projections retain their structured evidence. Search-read
+//! context deliberately exposes only closed classifications and safe context. The shared entry builder applies the
+//! response boundary's nesting and domain-result retention rules afterwards.
 
-use khive_storage::StorageCapability;
+use khive_storage::{StorageCapability, StorageError};
 use serde_json::{json, Value};
 
 use crate::{DomainDisposition, RuntimeError};
 
-/// Project the original typed error, preserving every structured source field.
+/// Project typed evidence, with explicit privacy narrowing for search-read context.
 ///
 /// `disposition` describes the enclosing operation. Named runtime refusals keep
 /// their existing wire override. This function moves an obligation's result
 /// without cloning or recursively serializing it; callers apply their own depth
 /// limits before any recursive operation on the returned value.
 pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> Value {
+    let disposition = if disposition == DomainDisposition::Committed {
+        disposition
+    } else {
+        error.batch_write_disposition().unwrap_or(disposition)
+    };
+    runtime_error_value_inner(error, disposition)
+}
+
+/// Original input to the shared per-operation failure builder.
+pub enum FailureEntrySource {
+    /// A typed runtime failure and the original dispatch boundary's outcome.
+    Runtime {
+        error: RuntimeError,
+        boundary: DomainDisposition,
+    },
+    /// An error payload whose disposition is supplied by its caller.
+    Value {
+        error: Value,
+        disposition: DomainDisposition,
+    },
+}
+
+/// An owned normalized failure, consumable as an error or a per-operation entry.
+pub struct FailureEntryParts {
+    error: Value,
+    disposition: DomainDisposition,
+}
+
+impl FailureEntryParts {
+    /// Return the normalized error without constructing an outer entry.
+    pub fn into_error(self) -> Value {
+        self.error
+    }
+
+    /// Move the normalized error into its per-operation response entry.
+    pub fn into_entry(self, tool: impl Into<String>) -> Value {
+        let mut entry = serde_json::Map::new();
+        entry.insert("ok".into(), Value::Bool(false));
+        entry.insert("tool".into(), Value::String(tool.into()));
+        entry.insert(
+            "domain_disposition".into(),
+            json!(self.disposition.as_str()),
+        );
+        entry.insert("error".into(), self.error);
+        Value::Object(entry)
+    }
+}
+
+/// Read the outcome named by a canonical error payload, defaulting to uncertainty.
+///
+/// This reads an existing payload; it does not establish write provenance.
+pub fn failure_error_disposition(error: &Value) -> DomainDisposition {
+    match error.get("domain_disposition").and_then(Value::as_str) {
+        Some("committed") => DomainDisposition::Committed,
+        Some("not_committed") => DomainDisposition::NotCommitted,
+        _ => DomainDisposition::Unknown,
+    }
+}
+
+/// Build the canonical failure parts shared by request executors.
+///
+/// Runtime input uses the public typed projection once. Both final disposition
+/// fields use its result. A domain result survives only when both the original
+/// boundary and projection are committed. The boundary's depth handling runs
+/// first, preserving its existing code and message replacement even when the
+/// projection subsequently removes the result. Value input always uses its
+/// caller's explicit disposition, ignoring any competing JSON claim.
+pub fn failure_entry_parts(source: FailureEntrySource) -> FailureEntryParts {
+    use crate::daemon::{drop_error_detail_iteratively, error_detail_value_within_limit};
+
+    let (error, boundary, disposition) = match source {
+        FailureEntrySource::Runtime { error, boundary } => {
+            let projected = runtime_error_value(error, boundary);
+            let disposition = failure_error_disposition(&projected);
+            (projected, boundary, disposition)
+        }
+        FailureEntrySource::Value { error, disposition } => (error, disposition, disposition),
+    };
+    let mut error = match error {
+        Value::Object(map) => map,
+        Value::String(message) => serde_json::Map::from_iter([
+            ("kind".into(), json!("runtime_error")),
+            ("message".into(), Value::String(message)),
+        ]),
+        other => {
+            drop_error_detail_iteratively(other);
+            serde_json::Map::from_iter([
+                ("kind".into(), json!("runtime_error")),
+                ("message".into(), json!("operation failed")),
+            ])
+        }
+    };
+    let committed = |value: DomainDisposition| value == DomainDisposition::Committed;
+    if let Some(result) = error.remove("domain_result") {
+        if !committed(boundary) {
+            drop_error_detail_iteratively(result);
+        } else if !error_detail_value_within_limit(&result) {
+            drop_error_detail_iteratively(result);
+            error.insert("code".into(), json!("result_too_deep"));
+            error.insert(
+                "message".into(),
+                json!("committed domain result omitted because it exceeds the nesting depth limit"),
+            );
+        } else if !committed(disposition) {
+            drop_error_detail_iteratively(result);
+        } else {
+            error.insert("domain_result".into(), result);
+        }
+    }
+    error.insert("domain_disposition".into(), json!(disposition.as_str()));
+    FailureEntryParts {
+        error: Value::Object(error),
+        disposition,
+    }
+}
+
+// Choose operation-local proof once. Recursive projection must not promote an
+// inner batch proof past an enclosing context with earlier or unknown effects.
+fn runtime_error_value_inner(error: RuntimeError, disposition: DomainDisposition) -> Value {
     // These named outcomes carry their own domain proof. Do not infer general
     // write disposition from a conflict or unavailable variant.
+    let sqlite_write_failure = match error.refusal_source() {
+        RuntimeError::Storage(error) => error.sqlite_write_failure(),
+        _ => None,
+    };
+    let outcome_has_precedence = error.writer_task_failure_context().is_some_and(|context| {
+        context.task_terminated
+            || context.request_state == khive_storage::WriterTaskRequestState::SideEffectsUnknown
+    });
+    let receipt_projection = crate::visibility_receipts::receipt_error_projection(&error);
     let named_disposition = match &error {
+        RuntimeError::Storage(error) if error.is_write_outcome_unknown() => Some("unknown"),
+        RuntimeError::Storage(error)
+            if matches!(
+                error.without_sqlite_write_stage(),
+                StorageError::WriterOwnerUnavailable { .. }
+                    | StorageError::WriterRouteViolation { .. }
+            ) =>
+        {
+            Some("not_committed")
+        }
+        _ if receipt_projection.is_some_and(|(_, replay)| replay) => Some("not_committed"),
         // An immutable-stream policy refusal is a definite no-write. It is matched by the
         // shared predicate rather than by a reason string so the two consumers of that
         // predicate and this projection cannot drift into disagreeing about it.
@@ -30,9 +170,11 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
                 khive_types::ErrorKind::Internal,
                 Some("post_commit_degraded" | "embedding_input_truncated"),
             ) => Some("committed"),
-            (khive_types::ErrorKind::Conflict, Some("key_conflict" | "fence_conflict")) => {
-                Some("not_committed")
-            }
+            // These keyed conflicts certify that this request wrote no domain record.
+            (
+                khive_types::ErrorKind::Conflict,
+                Some("key_conflict" | "fence_conflict" | "idempotency_key_conflict"),
+            ) => Some("not_committed"),
             (khive_types::ErrorKind::Unavailable, Some("key_holder_unresolved")) => Some("unknown"),
             // ADR-174 A1.1: a stream member refusal carries
             // `domain_disposition: not_committed` wherever it surfaces. In
@@ -52,9 +194,15 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
             (khive_types::ErrorKind::NotFound, Some("stream_write_not_found")) => {
                 Some("not_committed")
             }
-            (khive_types::ErrorKind::InvalidInput, Some("member_unavailable")) => {
+            // An exact keyed replay whose holder was hard-deleted before its
+            // provenance read: the attempt's unit rolled back on the key claim.
+            (khive_types::ErrorKind::NotFound, Some("keyed_replay_holder_missing")) => {
                 Some("not_committed")
             }
+            (
+                khive_types::ErrorKind::InvalidInput,
+                Some("member_unavailable" | "sequence_exhausted"),
+            ) => Some("not_committed"),
             _ => None,
         },
         _ => None,
@@ -64,9 +212,92 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
     let denial_message =
         matches!(error, RuntimeError::PermissionDenied { .. }).then(|| error.to_string());
     let payload = match error {
+        RuntimeError::SearchRead { context } => {
+            let message = context.to_string();
+            let backend = context.backend().as_str().to_owned();
+            let substrate = context.substrate().as_str();
+            let cause_class = context.source().audit_error_class().as_str();
+            let retryable = context.source().retryable_failure_context().is_some();
+            // Only the canonical source kind and typed outcome survive. Never
+            // copy arbitrary source messages, details, codes or retry values.
+            let source = runtime_error_value_inner(context.into_source(), disposition);
+            let kind = source["kind"]
+                .as_str()
+                .expect("canonical error kind is a string");
+            assert!(
+                matches!(
+                    kind,
+                    "runtime_error"
+                        | "obligation"
+                        | "internal"
+                        | "remote_fetch_error"
+                        | "not_found"
+                        | "storage"
+                        | "unavailable"
+                        | "invalid_input"
+                        | "unauthorized"
+                        | "conflict"
+                ),
+                "canonical error kind must have an explicit privacy classification"
+            );
+            let mut value = json!({
+                "kind": kind,
+                "code": "search_read_failed",
+                "message": message,
+                "cause_class": cause_class,
+                "domain_disposition": failure_error_disposition(&source).as_str(),
+                "search_context": {"backend": backend, "substrate": substrate},
+            });
+            if retryable {
+                value["retryable"] = json!(true);
+            }
+            return value;
+        }
+        RuntimeError::CanonicalUnsupportedOperation {
+            op_index,
+            operation,
+        } => {
+            return json!({
+                "kind": "runtime_error",
+                "code": "invalid_input",
+                "reason": "KnownUnimplemented",
+                "operation": operation,
+                "op_index": op_index,
+                "message": format!("canonical operation {op_index}: {operation} is KnownUnimplemented for canonical apply"),
+                "domain_disposition": "not_committed",
+                "retryable": false,
+            });
+        }
+        RuntimeError::CanonicalAdmission { op_index, source } => {
+            // Preparation precedes all domain DML. Keep the original typed
+            // refusal (including secret detector/permission receipt) and add
+            // only the constituent's index; never stringify captured input.
+            let mut value = runtime_error_value_inner(*source, DomainDisposition::NotCommitted);
+            value["op_index"] = json!(op_index);
+            value["domain_disposition"] = json!("not_committed");
+            value["retryable"] = json!(false);
+            return value;
+        }
+        RuntimeError::LintFix { source, detail } => {
+            let mut value = runtime_error_value_inner(*source, DomainDisposition::Unknown);
+            let object = value
+                .as_object_mut()
+                .expect("runtime error projection is an object");
+            let details = object.entry("details").or_insert_with(|| json!({}));
+            if !details.is_object() {
+                *details = json!({});
+            }
+            details["lint_fix"] = json!(detail);
+            // Earlier actions may already have committed. A named refusal of
+            // the last action cannot certify the whole call as not committed.
+            value["domain_disposition"] = json!("unknown");
+            value["retryable"] = json!(false);
+            return value;
+        }
+
         RuntimeError::WithResolution { context } => {
             let crate::error::ResolutionFailureContext { source, resolution } = context;
-            let mut value = runtime_error_value(*source, disposition);
+            let mut value = runtime_error_value_inner(*source, disposition);
             let details = value
                 .as_object_mut()
                 .expect("runtime error projection is an object")
@@ -78,11 +309,35 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
             details["resolution"] = json!(resolution);
             return value;
         }
+        RuntimeError::BatchWrite { context } => {
+            let crate::error::BatchWriteContext {
+                source, admission, ..
+            } = *context;
+            let mut value = runtime_error_value_inner(*source, disposition);
+            if let Some(report) = admission {
+                if report.validation_complete {
+                    if let Some(first) = report.refused.first() {
+                        if !value["details"].is_object() {
+                            value["details"] = json!({});
+                        }
+                        value["details"]["index"] = json!(first.index.to_string());
+                        value["details"]["field"] = json!(first.field);
+                        value["details"]["reason"] = json!(first.reason);
+                    }
+                } else {
+                    value["unchecked_indices"] = json!(report.unchecked_indices);
+                }
+                value["refused"] = json!(report.refused);
+                value["validation_complete"] = json!(report.validation_complete);
+            }
+            value["domain_disposition"] = json!(disposition.as_str());
+            return value;
+        }
         RuntimeError::RefusedWithEvents { context } => {
             let crate::error::RefusalEventContext { source, recordings } = context;
             // Project the source first so named dispositions, code/details,
             // detector location and refusal text retain their original meaning.
-            let mut value = runtime_error_value(*source, disposition);
+            let mut value = runtime_error_value_inner(*source, disposition);
             if !recordings.is_empty() {
                 value["refusal_recorded"] = json!(recordings.iter().all(|recording| {
                     matches!(recording, crate::RefusalEventRecording::Recorded { .. })
@@ -169,7 +424,6 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
             "message": missing.to_string(),
         }),
         other @ (RuntimeError::Storage(_)
-        | RuntimeError::Sqlite(_)
         | RuntimeError::Query(_)
         | RuntimeError::InvalidInput(_)
         | RuntimeError::UnknownVerb(_)
@@ -197,8 +451,16 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
         | RuntimeError::AmbiguousId { .. }
         | RuntimeError::CrossNamespaceWrite { .. }
         | RuntimeError::WriteBudgetExceeded { .. }
-        | RuntimeError::DeadlineExceeded { .. }) => {
-            if let Some(context) = other.writer_task_failure_context() {
+        | RuntimeError::DeadlineExceeded { .. }
+        | RuntimeError::AttachmentCutoverRequired { .. }) => {
+            if let Some(capacity) = sqlite_capacity_failure(&other) {
+                let mut value = capacity.into_value(other.to_string());
+                if let Some(context) = other.writer_task_failure_context() {
+                    value["request_state"] = json!(context.request_state.to_string());
+                    value["task_terminated"] = json!(context.task_terminated);
+                }
+                value
+            } else if let Some(context) = other.writer_task_failure_context() {
                 json!({"kind":"storage", "code":context.stage, "stage":context.stage,
                     "message":other.to_string(), "retryable":context.retryable,
                     "request_state":context.request_state.to_string(), "task_terminated":context.task_terminated})
@@ -218,11 +480,194 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
         }
     };
     let mut value = payload;
+    if let Some(failure) = sqlite_write_failure {
+        // Capacity refusal retains its existing caller-visible precedence.
+        if !outcome_has_precedence
+            && !failure.settlement_unknown
+            && failure.primary_code != rusqlite::ffi::SQLITE_FULL
+        {
+            value["code"] = json!(failure.stage.as_str());
+            value["stage"] = json!(failure.stage.as_str());
+            if value["kind"] == "runtime_error" {
+                value["kind"] = json!("storage");
+            }
+        }
+        value["sqlite_write_stage"] = json!(failure.stage.as_str());
+        value["sqlite_primary_code"] = json!(failure.primary_code);
+        value["sqlite_extended_code"] = json!(failure.extended_code);
+    }
+    if let Some((retryable, _)) = receipt_projection {
+        value["retryable"] = json!(retryable);
+    }
     value["domain_disposition"] = json!(disposition.as_str());
     if let Some(named) = named_disposition {
         value["domain_disposition"] = json!(named);
     }
     value
+}
+
+enum SqliteCapacityFailure {
+    Refused {
+        volume: String,
+        available_bytes: u64,
+        reserve_bytes: u64,
+        required_headroom_bytes: u64,
+    },
+    Unavailable {
+        phase: khive_storage::CapacityUnavailablePhase,
+    },
+    NativeFull {
+        primary_code: i32,
+        extended_code: i32,
+    },
+}
+
+impl SqliteCapacityFailure {
+    fn into_value(self, message: String) -> Value {
+        match self {
+            Self::Refused {
+                volume,
+                available_bytes,
+                reserve_bytes,
+                required_headroom_bytes,
+            } => json!({
+                "kind": "storage",
+                "code": "sqlite_capacity_refused",
+                "stage": "sqlite_capacity_refused",
+                "message": message,
+                "retryable": false,
+                "capability": "sql",
+                "volume": volume,
+                "available_bytes": available_bytes,
+                "reserve_bytes": reserve_bytes,
+                "required_headroom_bytes": required_headroom_bytes,
+            }),
+            Self::Unavailable { phase } => json!({
+                "kind": "storage",
+                "code": "sqlite_capacity_unavailable",
+                "stage": "sqlite_capacity_unavailable",
+                "message": message,
+                "retryable": phase == khive_storage::CapacityUnavailablePhase::LockContended,
+                "capability": "sql",
+                "phase": phase.as_str(),
+            }),
+            Self::NativeFull {
+                primary_code,
+                extended_code,
+            } => json!({
+                "kind": "storage",
+                "code": "sqlite_disk_full",
+                "stage": "sqlite_disk_full",
+                "message": message,
+                "retryable": false,
+                "capability": "sql",
+                "sqlite_primary_code": primary_code,
+                "sqlite_extended_code": extended_code,
+            }),
+        }
+    }
+}
+
+fn sqlite_capacity_failure(error: &RuntimeError) -> Option<SqliteCapacityFailure> {
+    match error {
+        RuntimeError::Storage(storage) => sqlite_capacity_failure_from_storage(storage),
+        _ => None,
+    }
+}
+
+fn sqlite_capacity_failure_from_storage(error: &StorageError) -> Option<SqliteCapacityFailure> {
+    match error {
+        StorageError::CapacityFloor {
+            capability: StorageCapability::Sql,
+            volume,
+            available_bytes,
+            floor_bytes,
+            required_headroom_bytes,
+        } => Some(SqliteCapacityFailure::Refused {
+            volume: volume.clone(),
+            available_bytes: *available_bytes,
+            reserve_bytes: *floor_bytes,
+            required_headroom_bytes: *required_headroom_bytes,
+        }),
+        StorageError::CapacityUnavailable {
+            capability: StorageCapability::Sql,
+            phase,
+            ..
+        } => Some(SqliteCapacityFailure::Unavailable { phase: *phase }),
+        StorageError::WriterTaskTerminated {
+            sqlite_full_codes: Some((primary_code, extended_code)),
+            ..
+        } if *primary_code == rusqlite::ffi::SQLITE_FULL
+            && *extended_code >= 0
+            && (*extended_code & 0xff) == *primary_code =>
+        {
+            Some(SqliteCapacityFailure::NativeFull {
+                primary_code: *primary_code,
+                extended_code: *extended_code,
+            })
+        }
+        StorageError::SqliteWrite { failure, .. }
+            if failure.primary_code == rusqlite::ffi::SQLITE_FULL =>
+        {
+            Some(SqliteCapacityFailure::NativeFull {
+                primary_code: failure.primary_code,
+                extended_code: failure.extended_code,
+            })
+        }
+        StorageError::WriterTaskRequestFailed { source, .. }
+        | StorageError::WriterOwnerUnavailable { source, .. }
+        | StorageError::SqliteWrite { source, .. } => sqlite_capacity_failure_from_storage(source),
+        StorageError::Driver { source, .. } => {
+            if let Some(sqlite) = source.downcast_ref::<khive_db::SqliteError>() {
+                sqlite_capacity_failure_from_sqlite(sqlite)
+            } else {
+                native_sqlite_full(source.as_ref())
+            }
+        }
+        _ => None,
+    }
+}
+
+fn sqlite_capacity_failure_from_sqlite(
+    error: &khive_db::SqliteError,
+) -> Option<SqliteCapacityFailure> {
+    match error {
+        khive_db::SqliteError::CapacityFloor {
+            volume,
+            available_bytes,
+            floor_bytes,
+            required_headroom_bytes,
+        } => Some(SqliteCapacityFailure::Refused {
+            volume: volume.clone(),
+            available_bytes: *available_bytes,
+            reserve_bytes: *floor_bytes,
+            required_headroom_bytes: *required_headroom_bytes,
+        }),
+        khive_db::SqliteError::CapacityUnavailable { phase, .. } => {
+            Some(SqliteCapacityFailure::Unavailable { phase: *phase })
+        }
+        khive_db::SqliteError::Rusqlite(sqlite)
+        | khive_db::SqliteError::Write { source: sqlite, .. } => native_sqlite_full(sqlite),
+        _ => None,
+    }
+}
+
+fn native_sqlite_full(error: &(dyn std::error::Error + 'static)) -> Option<SqliteCapacityFailure> {
+    let mut source = Some(error);
+    while let Some(current) = source {
+        if let Some(rusqlite::Error::SqliteFailure(code, _)) =
+            current.downcast_ref::<rusqlite::Error>()
+        {
+            if code.code == rusqlite::ErrorCode::DiskFull {
+                return Some(SqliteCapacityFailure::NativeFull {
+                    primary_code: code.extended_code & 0xff,
+                    extended_code: code.extended_code,
+                });
+            }
+        }
+        source = current.source();
+    }
+    None
 }
 
 fn storage_capability_wire_name(capability: StorageCapability) -> &'static str {
@@ -241,371 +686,5 @@ fn storage_capability_wire_name(capability: StorageCapability) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::runtime_error_value;
-    use crate::{
-        AuditObligationFailure, DenialAuditOutcome, DenialReceipt, DomainDisposition, RuntimeError,
-    };
-    use khive_storage::StorageCapability;
-    use khive_types::{Details, ErrorCode, ErrorDomain, KhiveError};
-    use serde_json::json;
-
-    #[test]
-    fn missing_subject_projection_is_typed_without_matching_error_text() {
-        for disposition in [DomainDisposition::Unknown, DomainDisposition::NotCommitted] {
-            let error = RuntimeError::NotFound("subject missing".into());
-            let message = error.to_string();
-            let value = runtime_error_value(error, disposition);
-            assert_eq!(value["kind"], "not_found");
-            assert_eq!(value.get("code"), Some(&serde_json::Value::Null));
-            assert_eq!(value.get("details"), Some(&serde_json::Value::Null));
-            assert_eq!(value["message"], message);
-            assert_eq!(value["domain_disposition"], disposition.as_str());
-        }
-        for error in [
-            RuntimeError::Internal("not found: damaged store index".into()),
-            RuntimeError::InvalidInput("not found: malformed reference".into()),
-        ] {
-            let value = runtime_error_value(error, DomainDisposition::Unknown);
-            assert_eq!(value["kind"], "runtime_error");
-        }
-    }
-
-    #[test]
-    fn projection_preserves_structured_source_fields_and_serialized_bytes() {
-        let source = KhiveError::unavailable("append reply missing")
-            .with_code(ErrorCode::new(ErrorDomain::Db, 71))
-            .with_details(Details::new([
-                ("operation", "append"),
-                ("driver_phase", "awaiting_reply"),
-                ("retry_hint", "do_not_repeat"),
-                ("extra", "preserve me\nincluding escapes"),
-            ]));
-        let mut expected = serde_json::to_value(&source).unwrap();
-        expected["domain_disposition"] = json!("unknown");
-        let expected_bytes = serde_json::to_vec(&expected).unwrap();
-        let actual = runtime_error_value(source.into(), DomainDisposition::Unknown);
-        assert_eq!(actual, expected);
-        assert_eq!(serde_json::to_vec(&actual).unwrap(), expected_bytes);
-    }
-
-    #[test]
-    fn embedding_truncation_after_write_projects_committed_disposition() {
-        let error = KhiveError::internal("embedding input truncated").with_details(Details::new([
-            ("reason", "embedding_input_truncated"),
-            ("record_id", "00000000-0000-0000-0000-000000000001"),
-            ("committed", "true"),
-            ("retryable", "false"),
-        ]));
-        let value = runtime_error_value(error.into(), DomainDisposition::Unknown);
-        assert_eq!(value["domain_disposition"], "committed");
-        assert_eq!(
-            value["details"]["record_id"],
-            "00000000-0000-0000-0000-000000000001"
-        );
-    }
-
-    #[test]
-    fn resolution_wrapper_adds_details_without_changing_source_classification() {
-        let source = RuntimeError::Khive(KhiveError::conflict("source conflict").with_details(
-            Details::new([("reason", "seq_conflict"), ("extra", "retained")]),
-        ));
-        let selected = uuid::Uuid::from_u128(1);
-        let duplicate = uuid::Uuid::from_u128(2);
-        let error = source.with_resolution(crate::error::ResolutionFacts {
-            project_id: selected,
-            duplicate_anchor_ids: vec![duplicate],
-            slug_backfilled: true,
-            project_created: false,
-            orphaned_project_id: None,
-            orphaned_note_count: 0,
-        });
-        assert!(matches!(error.refusal_source(), RuntimeError::Khive(_)));
-        let value = runtime_error_value(error, DomainDisposition::Unknown);
-        assert_eq!(value["domain_disposition"], "not_committed");
-        assert_eq!(value["details"]["reason"], "seq_conflict");
-        assert_eq!(value["details"]["extra"], "retained");
-        assert_eq!(
-            value["details"]["resolution"]["project_id"],
-            selected.to_string()
-        );
-        assert_eq!(
-            value["details"]["resolution"]["duplicate_anchor_ids"],
-            json!([duplicate])
-        );
-    }
-
-    #[test]
-    fn resolution_wrapper_projects_remote_fetch_type_and_anchor_facts() {
-        let selected = uuid::Uuid::from_u128(3);
-        let error = RuntimeError::RemoteFetchError {
-            remote: "https://example.com/repo".into(),
-            message: "cache repair failed".into(),
-        }
-        .with_resolution(crate::error::ResolutionFacts {
-            project_id: selected,
-            duplicate_anchor_ids: vec![],
-            slug_backfilled: false,
-            project_created: false,
-            orphaned_project_id: None,
-            orphaned_note_count: 0,
-        });
-        let value = runtime_error_value(error, DomainDisposition::Unknown);
-        assert_eq!(value["kind"], "remote_fetch_error");
-        assert_eq!(value["remote"], "https://example.com/repo");
-        assert_eq!(value["message"], "cache repair failed");
-        assert_eq!(value["domain_disposition"], "unknown");
-        assert_eq!(
-            value["details"]["resolution"]["project_id"],
-            selected.to_string()
-        );
-        assert_eq!(value["details"]["resolution"]["project_created"], false);
-    }
-
-    #[test]
-    fn named_refusals_keep_their_override_without_classifying_arbitrary_conflicts() {
-        for (reason, expected) in [
-            ("seq_conflict", "not_committed"),
-            ("fence_conflict", "not_committed"),
-            ("arbitrary_conflict", "unknown"),
-        ] {
-            let source = KhiveError::conflict("same rendered message")
-                .with_details(Details::new([("reason", reason), ("extra", "retained")]));
-            let value = runtime_error_value(source.into(), DomainDisposition::Unknown);
-            assert_eq!(value["domain_disposition"], expected);
-            assert_eq!(value["details"]["extra"], "retained");
-        }
-    }
-
-    #[test]
-    fn shared_projection_retains_obligation_result_and_denial_receipt() {
-        let domain_result = json!({"rows": [{"id": "recorded", "extra": [null, true, 17]}]});
-        let failure = Box::new(AuditObligationFailure::new(
-            "stream.append",
-            crate::audit_batch::AuditTerminalReason::StoreFailure,
-        ));
-        let expected = json!({
-            "kind": "obligation", "code": failure.wire_code(),
-            "message": failure.to_string(), "domain_result": domain_result,
-            "domain_disposition": "unknown",
-        });
-        let projected = runtime_error_value(
-            RuntimeError::AuditObligation {
-                failure,
-                domain_result,
-            },
-            DomainDisposition::Unknown,
-        );
-        assert_eq!(projected, expected);
-        assert_eq!(
-            serde_json::to_vec(&projected).unwrap(),
-            serde_json::to_vec(&expected).unwrap()
-        );
-
-        let event_id = uuid::Uuid::from_u128(17);
-        let denied = RuntimeError::PermissionDenied {
-            verb: "stream.append".into(),
-            reason: "policy".into(),
-            receipt: Box::new(DenialReceipt {
-                audit_event_id: Some(event_id),
-                audit_outcome: DenialAuditOutcome::Committed,
-            }),
-        };
-        let expected = json!({
-            "kind": "runtime_error", "code": "permission_denied", "message": denied.to_string(),
-            "verb": "stream.append", "reason": "policy", "audit_event_id": event_id.to_string(),
-            "audit_outcome": "committed", "domain_disposition": "not_committed",
-        });
-        assert_eq!(
-            runtime_error_value(denied, DomainDisposition::NotCommitted),
-            expected
-        );
-    }
-
-    /// A refusal that wrote a durable receipt must name it as its own field.
-    /// The consumer contract is `error.receipt_id`, not a substring of the
-    /// sentence: the sentence is free to be reworded and a regular expression
-    /// over it breaks without failing anything.
-    #[test]
-    fn a_refusal_receipt_id_is_a_field_and_not_only_a_substring_of_the_message() {
-        let error = RuntimeError::RefusedWithReceipt(Box::new(crate::error::ReceiptRefusal {
-            code: "exec_refused",
-            message: "exec.run refused: tool not registered (receipt_id=r-1)".into(),
-            receipt_id: "r-1".into(),
-            reason: "tool not registered".into(),
-            detail: json!({ "effective_max_output_bytes": 65536, "receipt_id": "shadow" }),
-        }));
-
-        // Disposition is deliberately the wrong one on the way in: a receipt-bearing
-        // refusal establishes its own no-write, so the boundary's guess is overridden.
-        let value = runtime_error_value(error, DomainDisposition::Unknown);
-
-        assert_eq!(
-            value["receipt_id"], "r-1",
-            "a detail member cannot shadow a contract field"
-        );
-        assert_eq!(value["code"], "exec_refused");
-        assert_eq!(value["kind"], "runtime_error");
-        assert_eq!(value["domain_disposition"], "not_committed");
-        assert_eq!(value["reason"], "tool not registered");
-        assert_eq!(value["effective_max_output_bytes"], 65536);
-        assert_eq!(
-            value["message"], "exec.run refused: tool not registered (receipt_id=r-1)",
-            "the existing wording is kept so a reader that parses it today keeps working"
-        );
-    }
-
-    /// The control for the arm above: a refusal carrying no receipt is a
-    /// different error entirely and must not grow a `receipt_id`. Without this,
-    /// an implementation that stamped the field unconditionally would pass.
-    #[test]
-    fn an_ordinary_invalid_input_has_no_receipt_id() {
-        let value = runtime_error_value(
-            RuntimeError::InvalidInput("exec.run refused: tool not registered".into()),
-            DomainDisposition::Unknown,
-        );
-
-        assert!(
-            value.get("receipt_id").is_none(),
-            "an error with no durable receipt must not name one: {value}"
-        );
-        assert_eq!(value["domain_disposition"], "unknown");
-    }
-
-    #[test]
-    fn projection_keeps_typed_writer_state_and_capability_spelling() {
-        let error = RuntimeError::Storage(khive_storage::StorageError::WriterTaskTerminated {
-            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-        });
-        let value = runtime_error_value(error, DomainDisposition::Unknown);
-        assert_eq!(value["request_state"], "side_effects_unknown");
-        assert_eq!(value["task_terminated"], true);
-        assert_eq!(value["retryable"], false);
-        assert_eq!(value["domain_disposition"], "unknown");
-
-        let error = RuntimeError::Storage(khive_storage::StorageError::driver(
-            StorageCapability::Sql,
-            "append checkout",
-            khive_db::SqliteError::WriterPoolCheckoutTimeout {
-                timeout: std::time::Duration::from_millis(17),
-            },
-        ));
-        let value = runtime_error_value(error, DomainDisposition::Unknown);
-        assert_eq!(value["capability"], "sql");
-        assert_eq!(value["timeout_ms"], 17);
-        assert_eq!(value["operation"], "append checkout");
-        assert_eq!(value["domain_disposition"], "unknown");
-    }
-
-    #[test]
-    fn refusal_events_project_mixed_recording_without_changing_the_original_secret_error() {
-        use crate::{RefusalEventRecording, RefusalRecordingErrorClass};
-        let source = || {
-            RuntimeError::SecretDetected(crate::secret_gate::SecretMatch {
-                detector: "fixture",
-                trigger: None,
-                masked: "PRIVATE-MASKED-EXCERPT".into(),
-                location: Some("atoms[1].properties[0].value".into()),
-            })
-        };
-        let subject_a = uuid::Uuid::from_u128(11);
-        let subject_b = uuid::Uuid::from_u128(12);
-        let event = uuid::Uuid::from_u128(13);
-        let expected = runtime_error_value(source(), DomainDisposition::Unknown);
-        let mut actual = runtime_error_value(
-            source().with_refusal_events(vec![
-                RefusalEventRecording::Recorded {
-                    item_index: 1,
-                    subject: subject_a,
-                    event_id: event,
-                },
-                RefusalEventRecording::Failed {
-                    item_index: 4,
-                    subject: subject_b,
-                    error_class: RefusalRecordingErrorClass::EventAppendFailed,
-                },
-            ]),
-            DomainDisposition::Unknown,
-        );
-        assert_eq!(actual["refusal_recorded"], false);
-        assert_eq!(
-            actual["refusal_events"],
-            json!([
-                {"item_index":1, "subject":subject_a, "event_id":event},
-                {"item_index":4, "subject":subject_b, "error_class":"event_append_failed"},
-            ])
-        );
-        assert!(!actual.to_string().contains("PRIVATE-MASKED-EXCERPT"));
-        assert!(actual.get("receipt_id").is_none());
-        let object = actual.as_object_mut().unwrap();
-        object.remove("refusal_recorded");
-        object.remove("refusal_events");
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn refusal_events_keep_typed_details_and_named_disposition_with_all_recorded() {
-        use crate::RefusalEventRecording;
-        let source = || {
-            RuntimeError::Khive(
-                KhiveError::conflict("fixed reason")
-                    .with_code(ErrorCode::new(ErrorDomain::Db, 71))
-                    .with_details(Details::new([
-                        ("reason", "seq_conflict"),
-                        ("extra", "unchanged"),
-                    ])),
-            )
-        };
-        let mut expected = runtime_error_value(source(), DomainDisposition::Unknown);
-        expected["refusal_recorded"] = json!(true);
-        expected["refusal_events"] = json!([
-            {"item_index":0, "subject":uuid::Uuid::from_u128(1), "event_id":uuid::Uuid::from_u128(2)},
-            {"item_index":3, "subject":uuid::Uuid::from_u128(3), "event_id":uuid::Uuid::from_u128(4)},
-        ]);
-        let actual = runtime_error_value(
-            source().with_refusal_events(vec![
-                RefusalEventRecording::Recorded {
-                    item_index: 0,
-                    subject: uuid::Uuid::from_u128(1),
-                    event_id: uuid::Uuid::from_u128(2),
-                },
-                RefusalEventRecording::Recorded {
-                    item_index: 3,
-                    subject: uuid::Uuid::from_u128(3),
-                    event_id: uuid::Uuid::from_u128(4),
-                },
-            ]),
-            DomainDisposition::Unknown,
-        );
-        assert_eq!(actual, expected);
-        assert_eq!(actual["domain_disposition"], "not_committed");
-    }
-
-    #[test]
-    fn refusal_events_do_not_invent_receipts_for_failed_or_absent_recordings() {
-        use crate::{RefusalEventRecording, RefusalRecordingErrorClass};
-        for class in [
-            RefusalRecordingErrorClass::EventStoreUnavailable,
-            RefusalRecordingErrorClass::EventAppendFailed,
-        ] {
-            let error = RuntimeError::InvalidInput("validation refused".into())
-                .with_refusal_events(vec![RefusalEventRecording::Failed {
-                    item_index: 0,
-                    subject: uuid::Uuid::from_u128(1),
-                    error_class: class,
-                }]);
-            let actual = runtime_error_value(error, DomainDisposition::Unknown);
-            assert_eq!(actual["refusal_recorded"], false);
-            assert_eq!(actual["refusal_events"][0]["error_class"], class.as_str());
-            assert!(actual["refusal_events"][0].get("event_id").is_none());
-            assert!(actual.get("receipt_id").is_none());
-            assert_eq!(actual["message"], "invalid input: validation refused");
-        }
-        let actual = runtime_error_value(
-            RuntimeError::InvalidInput("validation refused".into()).with_refusal_events(vec![]),
-            DomainDisposition::Unknown,
-        );
-        assert!(actual.get("refusal_recorded").is_none());
-        assert!(actual.get("refusal_events").is_none());
-    }
-}
+#[path = "error_projection_tests.rs"]
+mod tests;

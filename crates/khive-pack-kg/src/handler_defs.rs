@@ -1,4 +1,4 @@
-//! Static `KG_HANDLERS` table (26 `HandlerDef` entries) and the `verbs` introspection handler.
+//! Static `KG_HANDLERS` table (32 `HandlerDef` entries) and the `verbs` introspection handler.
 
 // Illocutionary classification (Searle 1976):
 //   Assertive  -- retrieves/presents state of affairs
@@ -13,8 +13,192 @@ use serde_json::Value;
 
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
-
-pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
+pub(crate) static SEARCH_PARAMS: &[ParamDef] = &[
+    ParamDef {
+        name: "created_after",
+        param_type: "string",
+        required: false,
+        description: "Inclusive RFC 3339 lower bound on entity/note created_at (at most 9 fractional-second digits). Metadata filter before the final limit over returned candidates: limit × 50, capped at 500 per backend. Can underfill; does not scan the full time range or use the larger property/tag pushdown window.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "created_before",
+        param_type: "string",
+        required: false,
+        description: "Inclusive RFC 3339 upper bound on entity/note created_at (at most 9 fractional-second digits). Must not precede created_after. Omitted/null bounds are unrestricted; compared as instants before ordering and the final limit within the returned candidate window.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "kind",
+        param_type: "string",
+        required: true,
+        description: "Substrate or granular kind to search.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "query",
+        param_type: "string",
+        required: true,
+        description: "Free-text search query.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "text_mode",
+        param_type: "string",
+        required: false,
+        description: "Lexical matching: all_terms (default, every normalized term group must match) | any_term (one or more term groups may match). Changes only the text arm of entity and note search.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "limit",
+        param_type: "integer",
+        required: false,
+        description: "Maximum results to return (default 10).",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "entity_kind",
+        param_type: "string",
+        required: false,
+        description: "Filter search results to a specific entity kind (kind=\"entity\" only).",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "entity_type",
+        param_type: "string",
+        required: false,
+        description: "Filter search results by entity type field (kind=\"entity\" only, e.g. \"paper\", \"algorithm\").",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "note_kind",
+        param_type: "string",
+        required: false,
+        description: "Filter search results to a specific note kind (kind=\"note\" only).",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "note_status",
+        param_type: "string",
+        required: false,
+        description: "Notes only: active (default for omitted/null), archived, or any, selecting the note lifecycle status at hydration. The bounded gather may return a short page. Separate from workflow properties.status. Entity searches reject this parameter.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "include_superseded",
+        param_type: "boolean",
+        required: false,
+        description: "When true, include notes that are targeted by a supersedes edge (kind=\"note\" only). Default false — superseded notes are excluded from results.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "properties",
+        param_type: "object",
+        required: false,
+        description: "Filter to records whose properties contain all listed key=value pairs (kind=\"entity\" or kind=\"note\"). Predicates are applied BEFORE result truncation inside a bounded candidate window (entity tags: SQL-level; entity/note properties: Rust-level in the alive-set loop). For notes, properties are stored in the note's `properties` JSON object. E.g. {\"type\": \"paper\", \"domain\": \"attention\"}. Matches ranked beyond the runtime candidate budget (limit × 4 × handler_overfetch) may still be missed — use specific queries to bring matches into the top candidates.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "tags",
+        param_type: "array",
+        required: false,
+        description: "Filter to records with any listed tag (kind=\"entity\" or kind=\"note\", OR semantics, case-insensitive). Predicates are applied BEFORE result truncation inside a bounded candidate window (entity tags: SQL-level via EntityFilter; note tags: Rust-level in the alive-set loop). For notes, tags are read from `properties[\"tags\"]` (there is no separate tag column on notes). E.g. [\"rust\", \"ml\"]. Matches ranked beyond the runtime candidate budget (limit × 4 × handler_overfetch) may still be missed — use specific queries to bring matches into the top candidates.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "source",
+        param_type: "string",
+        required: false,
+        description: "Filter by exact retrieval source: text | vector | both. Applied before the caller limit inside a bounded candidate window; both means the final hit received both text and vector contributions.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "min_rank_score",
+        param_type: "number",
+        required: false,
+        description: "Inclusive strategy-local rank floor (0.0–1.0, default 0), applied after fusion, exact-title boosts and note salience weighting, before the final limit for every order. Not a similarity or probability threshold. Cannot be supplied together with min_score, even if either value is null.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "min_score",
+        param_type: "number",
+        required: false,
+        description: "Deprecated exact alias of min_rank_score (0.0–1.0). Uses the same deterministic ordering score, never a component signal. Supplying both spellings is invalid, even with equal or null values.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "order_by",
+        param_type: "string",
+        required: false,
+        description: "Result order: score (default, by relevance) | updated_at | created_at. Both time orders are descending — most recent first — and records sharing a timestamp keep their relevance order. An unrecognised value is refused. A time order ranks a bounded candidate window rather than the whole corpus, so a match whose relevance falls outside that window may still be missed — use a specific query to bring it into the candidates.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+];
+pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
+    HandlerDef {
+        name: "attach",
+        description: "Add or replace one role-keyed blob rendition on an existing live main-backend entity or note. Bytes are base64. Returns id, role, content_ref, size, media_type and replaced. Authenticated pack-owned roles require their owning pack's publication verbs; local file paths are not accepted.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef { name: "id", param_type: "uuid", required: true, description: "Existing entity or note UUID, unique hexadecimal prefix or entity name under normal KG resolution.", resolution_mode: IdResolutionMode::UnscopedById },
+            ParamDef { name: "role", param_type: "string", required: true, description: "Nonempty rendition role without control characters, for example markdown, pdf or content. One attachment per role per record.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "bytes", param_type: "string", required: true, description: "Standard base64-encoded bytes to publish before the attachment row commits.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "media_type", param_type: "string", required: false, description: "Optional caller-declared MIME type, for example text/markdown.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
+    HandlerDef {
+        name: "kg.proposal_cleanup",
+        description: "Archive applied or rejected proposals whose last projection activity is strictly older than the required duration, in the resolved write namespace. Returns {archived: count}; preserves proposal identity and all events. Operator-only, unavailable through MCP or --atomic.",
+        visibility: Visibility::Subhandler,
+        category: VerbCategory::Declaration,
+        params: &[ParamDef {
+            name: "older_than",
+            param_type: "string",
+            required: true,
+            description: "Positive ASCII integer immediately followed by s, m, h, or d (fixed seconds, minutes, hours, or days). No default; for example 30d.",
+            resolution_mode: IdResolutionMode::NotApplicable,
+        }],
+    },
+    HandlerDef {
+        name: "apply_changeset",
+        description: "Apply one bounded canonical NDJSON change-set atomically, preserving staged identifiers and checking each captured preimage immediately before its operation in the writer transaction. A refused operation rolls back the whole unit and names its index and field. Merge is KnownUnimplemented and refused before preparation. A committed post-commit failure requires reconciliation and must not be replayed.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef { name: "delta", param_type: "string", required: true, description: "Complete original NDJSON-delta text including its supported schema envelope, at most 2000 operations in source order.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
+    HandlerDef {
+        name: "schema",
+        description: "Report the full unfiltered loaded vocabulary and declared endpoint matrix. \
+                      Base * means any entity kind, not any substrate. Rows retain base or pack \
+                      origin, source/target substrate and optional entity-type columns. Returns \
+                      counts and a content hash; accepts no filters. Declarations do not replace \
+                      link validation or authorization.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[],
+    },
+    HandlerDef {
+        name: "count",
+        description: "Count matching events in storage, grouped by verb, kind or actor. Only caller-visible namespaces contribute; an empty result is an empty object.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef { name: "kind", param_type: "string", required: true, description: "Required substrate: event.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "group_by", param_type: "string", required: true, description: "Count per stored verb, kind or actor; returns a key-to-count object over caller-visible namespaces.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "verb", param_type: "string", required: false, description: "Exact event verb; merged with verbs.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "verbs", param_type: "array of string", required: false, description: "Allowed event verbs, ORed together.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "event_kind", param_type: "string", required: false, description: "Typed event kind; merged with event_kinds.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "event_kinds", param_type: "array of string", required: false, description: "Allowed typed event kinds, ORed together.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "actor", param_type: "string", required: false, description: "Exact stored actor attribution.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "substrate", param_type: "string", required: false, description: "Exact event substrate: entity, note or event.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "outcome", param_type: "string", required: false, description: "Exact outcome: success, denied or error.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "since", param_type: "integer", required: false, description: "Exclusive lower created_at bound in UTC microseconds.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "until", param_type: "integer", required: false, description: "Exclusive upper created_at bound in UTC microseconds.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
     HandlerDef {
         name: "stream.append",
         description: "Append one immutable JSON record with a dense per-stream sequence; expected_seq is checked in the same transaction as note and ledger insertion.",
@@ -34,7 +218,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
     },
     HandlerDef {
         name: "stream.read",
-        description: "Read entries after an exclusive sequence in ascending order, with head_seq and next_after from the same snapshot. Unknown streams return an empty page.",
+        description: "Read retained entries after an exclusive sequence in ascending order, with floor_seq, head_seq and next_after from the same snapshot. A cursor below the persisted floor resumes at the retained prefix. Unknown streams return an empty page with floor_seq 1.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -46,12 +230,23 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
     },
     HandlerDef {
         name: "stream.stat",
-        description: "Read count and head_seq in one snapshot; divergence indicates a broken ledger density invariant.",
+        description: "Read retained count, persisted floor_seq and head_seq in one snapshot. Head survives whole-prefix truncation; retained density is count = head_seq - floor_seq + 1.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
             ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "namespace", param_type: "string", required: false, description: "Visible namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
+        ],
+    },
+    HandlerDef {
+        name: "stream.truncate",
+        description: "Hard-delete a stream prefix below before_seq in one writer transaction, removing each ledger row and note together. Returns {removed, floor_seq, head_seq}; head and future numbering do not move. Values at or below the floor are no-ops, values above head_seq + 1 are clipped, and unknown streams return {removed:0, floor_seq:1, head_seq:0}. Requires namespace write authority. Retention policy is caller-owned.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef { name: "stream", param_type: "string", required: true, description: "Namespace-scoped stream name, at most 512 UTF-8 bytes and no U+0000.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "before_seq", param_type: "integer", required: true, description: "Exclusive prefix boundary as a signed 64-bit integer. Values at or below floor_seq remove nothing; values above head_seq + 1 are clipped.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "namespace", param_type: "string", required: false, description: "Write namespace; defaults to the authorized writer namespace.", resolution_mode: IdResolutionMode::NotApplicable },
         ],
     },
     HandlerDef {
@@ -212,6 +407,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
+            ParamDef { name: "hydrate", param_type: "array of string", required: false, description: "Entity/note attachment roles whose bytes should be included as base64 in the role-keyed attachments map. Default get includes metadata only; an unknown requested role is an error. Records without attachments omit the map.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "parse_content",
                 param_type: "boolean",
@@ -246,7 +442,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
     // Assertive: retrieves and presents filtered records
     HandlerDef {
         name: "list",
-        description: "List live records with optional filtering; this verb does not accept `include_deleted` and always excludes soft-deleted rows. Offset-mode results always use \
+        description: "List live records with optional filtering; note lists default to active notes, with note_status=archived or any for explicit access. This verb does not accept `include_deleted` and always excludes soft-deleted rows. Offset-mode results always use \
                       {\"items\": [...], \"requested_limit\": N, \"effective_limit\": M, \
                       \"limit_clamped\": bool, \"has_more\": bool}; clients advance offset by \
                       items.length, while M discloses the server cap and is not a guaranteed row \
@@ -275,6 +471,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
             ParamDef { name: "created_after", param_type: "string", required: false, description: "Notes only: inclusive RFC 3339 created_at lower bound; does not require keys or change ordinary insertion-order cursor semantics.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "updated_after", param_type: "string", required: false, description: "Notes only: inclusive RFC 3339 updated_at lower bound; without key_prefix it includes keyed and unkeyed notes.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "tag_mode", param_type: "string", required: false, description: "Notes only: any (default) or all requested tags, ASCII case-insensitive, applied before pagination. Empty tags impose no constraint.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "note_status", param_type: "string", required: false, description: "Notes only: active (default), archived, or any, selecting the note status before pagination. Omitted/null selects active. Any includes every stored note status while soft-deleted rows stay excluded. Separate from scheduled-event workflow status.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "status", param_type: "string", required: false, description: "For scheduled_event notes only (kind=scheduled_event or kind=note with note_kind=scheduled_event): exact property status, applied before pagination. Valid: provisioning, pending, firing, fired, cancelled, missed, failed. Omitted/null imposes no constraint. Proposal lists retain their separate proposal-status filter; other kinds reject this parameter.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "created_by_actor", param_type: "string", required: false, description: "Scheduled_event notes only: exact, case-sensitive, non-blank creator display metadata, applied before pagination. May name any creator; never an authorization check or verified attribution. No implicit self-filter or wildcard. Omitted/null imposes no constraint; other kinds reject this parameter.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
@@ -623,7 +820,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 name: "relation",
                 param_type: "string",
                 required: false,
-                description: "New edge relation (edges only; any of the 19 canonical relations).",
+                description: "New edge relation (edges only; any of the 20 canonical relations).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -637,7 +834,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 name: "properties",
                 param_type: "object",
                 required: false,
-                description: "Properties to merge in (shallow merge).",
+                description: "Properties to merge in at the top level: each patch key replaces the stored value, omitted keys are kept, and a null value is stored as null. No key is removed through update.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -781,109 +978,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
     // Assertive: retrieves and presents search results
     HandlerDef {
         name: "search",
-        description: "Hybrid FTS + vector search over live knowledge-graph entities and notes. Each hit carries strategy-local rank_score, rank_score_kind and available component signals; score is a deprecated exact alias of rank_score. Rank scores are ordering values, not probabilities or comparable across queries. Entity exact-title boosts and note salience weighting remain inside the rrf rank score. This verb does not accept `include_deleted`; corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
+        description: "Hybrid FTS + vector search over live knowledge-graph entities and notes. Each hit carries strategy-local rank_score, rank_score_kind and available component signals; score is a deprecated exact alias of rank_score. Rank scores are ordering values, not probabilities or comparable across queries. Entity exact-title boosts and note salience weighting remain inside the rrf rank score. Note searches default to active lifecycle status; note_status=archived or any provides explicit access, separately from workflow properties.status. Successful MCP note searches report note_status and note_status_dropped beside result, including zero; the count describes distinct gathered notes excluded by status after the other hydration predicates, not a corpus total or a promise of extra Any hits. Raw registry results remain hit arrays. This verb does not accept `include_deleted`; corpora owned by other packs (for example teaching or document corpora with their own search verbs) are disjoint and are not searched here.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
-        params: &[
-            ParamDef {
-                name: "kind",
-                param_type: "string",
-                required: true,
-                description: "Substrate or granular kind to search.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "query",
-                param_type: "string",
-                required: true,
-                description: "Free-text search query.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "text_mode",
-                param_type: "string",
-                required: false,
-                description: "Lexical matching: all_terms (default, every normalized term group must match) | any_term (one or more term groups may match). Changes only the text arm of entity and note search.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "limit",
-                param_type: "integer",
-                required: false,
-                description: "Maximum results to return (default 10).",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "entity_kind",
-                param_type: "string",
-                required: false,
-                description: "Filter search results to a specific entity kind (kind=\"entity\" only).",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "entity_type",
-                param_type: "string",
-                required: false,
-                description: "Filter search results by entity type field (kind=\"entity\" only, e.g. \"paper\", \"algorithm\").",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "note_kind",
-                param_type: "string",
-                required: false,
-                description: "Filter search results to a specific note kind (kind=\"note\" only).",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "include_superseded",
-                param_type: "boolean",
-                required: false,
-                description: "When true, include notes that are targeted by a supersedes edge (kind=\"note\" only). Default false — superseded notes are excluded from results.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "properties",
-                param_type: "object",
-                required: false,
-                description: "Filter to records whose properties contain all listed key=value pairs (kind=\"entity\" or kind=\"note\"). Predicates are applied BEFORE result truncation inside a bounded candidate window (entity tags: SQL-level; entity/note properties: Rust-level in the alive-set loop). For notes, properties are stored in the note's `properties` JSON object. E.g. {\"type\": \"paper\", \"domain\": \"attention\"}. Matches ranked beyond the runtime candidate budget (limit × 4 × handler_overfetch) may still be missed — use specific queries to bring matches into the top candidates.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "tags",
-                param_type: "array",
-                required: false,
-                description: "Filter to records with any listed tag (kind=\"entity\" or kind=\"note\", OR semantics, case-insensitive). Predicates are applied BEFORE result truncation inside a bounded candidate window (entity tags: SQL-level via EntityFilter; note tags: Rust-level in the alive-set loop). For notes, tags are read from `properties[\"tags\"]` (there is no separate tag column on notes). E.g. [\"rust\", \"ml\"]. Matches ranked beyond the runtime candidate budget (limit × 4 × handler_overfetch) may still be missed — use specific queries to bring matches into the top candidates.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "source",
-                param_type: "string",
-                required: false,
-                description: "Filter by exact retrieval source: text | vector | both. Applied before the caller limit inside a bounded candidate window; both means the final hit received both text and vector contributions.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "min_rank_score",
-                param_type: "number",
-                required: false,
-                description: "Inclusive strategy-local rank floor (0.0–1.0, default 0), applied after fusion, exact-title boosts and note salience weighting, before the final limit for every order. Not a similarity or probability threshold. Cannot be supplied together with min_score, even if either value is null.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "min_score",
-                param_type: "number",
-                required: false,
-                description: "Deprecated exact alias of min_rank_score (0.0–1.0). Uses the same deterministic ordering score, never a component signal. Supplying both spellings is invalid, even with equal or null values.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-            ParamDef {
-                name: "order_by",
-                param_type: "string",
-                required: false,
-                description: "Result order: score (default, by relevance) | updated_at | created_at. Both time orders are descending — most recent first — and records sharing a timestamp keep their relevance order. An unrecognised value is refused. A time order ranks a bounded candidate window rather than the whole corpus, so a match whose relevance falls outside that window may still be missed — use a specific query to bring it into the candidates.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
-        ],
+        params: SEARCH_PARAMS,
     },
     // Commissive: commits a typed edge to the graph
     HandlerDef {
@@ -900,7 +998,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 name: "source_id",
                 param_type: "uuid",
                 required: false,
-                description: "Required in singleton mode. Source node complete UUID or globally \
+                description: "`source` is accepted as an alias for `source_id`; supply only one spelling, even when the values agree. Required in singleton mode. Source node complete UUID or globally \
                               unique 8+ hex prefix. UUID \
                               and prefix lookup apply no namespace filter at all, which is a \
                               wider reach than the caller's visible set; entity-name fallback \
@@ -912,7 +1010,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 name: "target_id",
                 param_type: "uuid",
                 required: false,
-                description: "Required in singleton mode. Target node complete UUID or globally \
+                description: "`target` is accepted as an alias for `target_id`; supply only one spelling, even when the values agree. Required in singleton mode. Target node complete UUID or globally \
                               unique 8+ hex prefix. UUID \
                               and prefix lookup apply no namespace filter at all, which is a \
                               wider reach than the caller's visible set; entity-name fallback \
@@ -932,22 +1030,23 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 // drift and only that test will say so. Pack extensions come from
                 // `KG_EDGE_RULES` in this crate's `pack.rs`. A crate path and an issue
                 // number cannot be acted on by the caller this text is published to.
-                description: "Required in singleton mode; ignored when links is supplied. Edge relation (contains | part_of | instance_of | links_to | located_in | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes). \
+                description: "`kind` is accepted as an alias for `relation`; supply only one spelling, even when the values agree. Required in singleton mode; ignored when links is supplied. Edge relation (contains | part_of | instance_of | links_to | located_in | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes | owns). \
                     Each relation only accepts specific (source_kind -> target_kind) endpoint pairs; an out-of-allowlist pair between two otherwise-valid endpoints is rejected with InvalidInput, and a missing endpoint returns NotFound — never silently accepted. \
                     Base entity->entity allowlist: \
                     contains: concept->concept, project->project, project->artifact, org->project, org->service. \
                     part_of: concept->concept, project->project, project->org. \
                     instance_of: *->concept (any source kind), service->project. \
                     links_to: document->document. \
-                    located_in: concept->concept. \
+                    owns: person->org, org->org. \
+                    located_in: concept->concept, org->concept. \
                     extends: concept->concept. variant_of: concept->concept, artifact->artifact. \
                     introduced_by: concept->document, concept->person, concept->org, artifact->document, project->document, service->document, document->person, document->org. \
                     derived_from: artifact->dataset, artifact->document, artifact->project, artifact->artifact, document->document. \
                     precedes: document->document, dataset->dataset, artifact->artifact, service->service, project->project. \
                     depends_on: project->project, service->project, service->service, service->artifact, service->dataset, artifact->project, artifact->service, document->document. \
                     enables: concept->concept, service->concept, dataset->concept. \
-                    implements: project->concept, service->concept. \
-                    competes_with (symmetric): concept<->concept, project<->project, service<->service. \
+                    implements: project->concept, service->concept, artifact->concept. \
+                    competes_with (symmetric): concept<->concept, project<->project, service<->service, org<->org. \
                     composed_with (symmetric): concept<->concept, project<->project. \
                     supersedes: concept->concept, document->document, artifact->artifact, service->service, dataset->dataset, note->note (same-substrate only). \
                     supports / refutes: concept->concept, document->concept, dataset->concept, artifact->concept (evidence -> claim), note->note (same-substrate only). \
@@ -1025,9 +1124,16 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
     // Assertive: retrieves immediate graph neighbors
     HandlerDef {
         name: "neighbors",
-        description: "Immediate graph neighbors. With no explicit `limit`, the response remains a \
-                      bare array of hits. An explicit limit returns a `neighbors` page with \
-                      `requested_limit`, `effective_limit`, `limit_clamped`, and `next_after`. \
+        description: "Immediate graph neighbors. For an anchor that is not a memory row, a call \
+                      with no explicit `limit` returns a bare array of hits. An explicit limit \
+                      returns a `neighbors` page with `requested_limit`, `effective_limit`, \
+                      `limit_clamped`, and `next_after`. A call anchored on a memory row always \
+                      returns the object shape, with `next_after` null when no limit is given, \
+                      and carries `hidden_incoming_edges` once at the top: `{total, by_relation}` \
+                      counting the incoming memory edges stored in namespaces the caller cannot \
+                      read, with no endpoint id, namespace or content; `by_relation` lists each \
+                      relation of the filter, or with no filter each relation above zero, and \
+                      the count is 0 for direction `outgoing`. \
                       Each record hit carries origin_id for the queried node, edge_id, relation, \
                       weight, and the neighbor's id, kind and name; include_entity_type=true adds \
                       entity_type when the neighbor has one. This verb does not accept \
@@ -1036,7 +1142,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
         category: VerbCategory::Assertive,
         params: &[
             ParamDef {
-                name: "node_id",
+                name: "id",
                 param_type: "uuid",
                 required: true,
                 description: "Complete UUID, unique 8+ hex prefix, or entity name of the node \
@@ -1093,6 +1199,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 description: "Neighbor response shape: edge (edge identity and endpoints), summary (neighbor identity and metadata), or record (full current record shape, default).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
+            ParamDef {
+                name: "include_entity_type",
+                param_type: "boolean",
+                required: false,
+                description: "If true, each hit carries entity_type when the neighbor has one. Default false.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
         ],
     },
     // Assertive: retrieves multi-hop traversal results
@@ -1109,13 +1222,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
         category: VerbCategory::Assertive,
         params: &[
             ParamDef {
-                name: "roots",
+                name: "ids",
                 param_type: "array of uuid",
                 required: true,
                 description: "Starting node complete UUIDs, unique 8+ hex prefixes, or entity \
                               names (maximum 100; aliases resolving to the same UUID are \
                               de-duplicated). Prefix and name resolution search the caller's \
-                              primary namespace.",
+                              primary namespace. `roots` and `start_ids` remain accepted aliases for `ids`.",
                 resolution_mode: IdResolutionMode::PrefixScopedToPrimary,
             },
             ParamDef {
@@ -1324,7 +1437,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                     add_note — {kind: \"add_note\", note: {kind: <note-kind>, content: <string>, name?: <string>, properties?: <object>}}; \
                     merge_entities — {kind: \"merge_entities\", into: <full UUID>, from: <full UUID>}; \
                     supersede_entity — {kind: \"supersede_entity\", old: <full UUID>, new: <full UUID>}; \
-                    compound — {kind: \"compound\", steps: [<changeset>, ...]}.",
+                    compound — {kind: \"compound\", steps: [<changeset>]}: one step only for now; a compound with more than one step, at any depth, is refused until multi-step compounds apply atomically.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -1520,9 +1633,15 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
     HandlerDef {
         name: "db_diagnostics",
         description: "Report reader- and writer-contention, graph-edge integrity, and WAL/checkpoint \
-                      diagnostics for every already-open database. Existing root fields \
-                      describe main; `databases` has one canonical-file entry with backend_names, \
-                      path, diagnostics, and error for each opened backend: reader admission \
+                      diagnostics for every already-open database, or for the one serving \
+                      backend=<name>. Root fields describe the first inspected file (main unless \
+                      backend selects another); `databases` has one canonical-file entry with \
+                      backend_names, path, diagnostics, and error for each inspected backend. \
+                      All backends share the request's read deadline, which the daemon sets \
+                      from its own configuration: when it arrives, the backends already \
+                      inspected are returned, each remaining backend's error starts with \
+                      `not inspected: request deadline`, and `complete` is false; `complete` is \
+                      true when every selected backend was reached. Per backend: reader admission \
                       capacity/availability, pooled reader checkouts, \
                       separately attributed request/infrastructure standalone reader opens, \
                       reader checkout timeouts, active/peak/completed pooled checkouts and maximum \
@@ -1545,17 +1664,47 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                       merge provenance, the state an earlier restore left behind; restore names \
                       such a row as live_merged_entity. \
                       A bounded dbstat size composition reports per-table/per-index pages and \
-                      row, index, FTS, vector, mixed row-and-embedding, and internal byte totals. \
+                      row, index, FTS, vector, mixed row-and-embedding, and internal byte totals; \
+                      it runs only when the same read snapshot has at most 8192 pages AND \
+                      32 MiB. Larger snapshots have no composition and size_composition_error \
+                      names the observed footprint and limits. These are footprint limits, \
+                      not a latency guarantee. size_composition=false skips the walk regardless \
+                      of size. page_accounting (page_size_bytes, \
+                      page_count, freelist_pages) is three pragma reads and is always reported. \
                       WAL checkpoint counters, a PASSIVE \
                       checkpoint probe, the -wal sidecar file size, and an explicitly qualified \
                       WAL-pin holder census reconciled with a bounded read-only sidecar pass. The \
                       checkpoint probe issues a real PRAGMA wal_checkpoint(PASSIVE), which \
                       backfills WAL frames into the main database on the happy path — that \
                       is ordinary checkpoint I/O, never a TRUNCATE escalation, and it never \
-                      creates a missing database file or perturbs the reported counters.",
+                      creates a missing database file or perturbs the reported counters. \
+                      code_map_vfs reports process-wide quarantine_occupancy, quarantine_cap, \
+                      registrations, and registration_cap, sampled independently under each \
+                      ledger mutex. This observe-only diagnostics block has no stability \
+                      contract and may change.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
-        params: &[],
+        params: &[
+            ParamDef {
+                name: "backend",
+                param_type: "string",
+                required: false,
+                description: "Inspect only the opened database serving this backend name. An \
+                              unknown or not-yet-opened name is invalid_input listing the opened \
+                              backends.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "size_composition",
+                param_type: "boolean",
+                required: false,
+                description: "Defaults true. Composition is collected only for snapshots of at \
+                              most 8192 pages AND 32 MiB; larger snapshots carry an explicit \
+                              size_composition_error. false skips the dbstat walk regardless of \
+                              size. page_accounting is still reported.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
     },
     // Assertive: verb discovery (ue-help-introspection H5)
     HandlerDef {
@@ -1654,631 +1803,5 @@ pub(crate) async fn handle_verbs(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn find_handler(name: &str) -> &'static HandlerDef {
-        KG_HANDLERS
-            .iter()
-            .find(|h| h.name == name)
-            .unwrap_or_else(|| panic!("handler {name:?} not found in KG_HANDLERS"))
-    }
-
-    #[test]
-    fn count_verb_help_explains_edge_count_scopes_and_ledger_delta() {
-        let stats = find_handler("stats");
-        assert!(
-            stats.description.contains("caller-visible namespaces")
-                && stats.description.contains("live rows"),
-            "stats help must disclose its namespace and deletion scope"
-        );
-
-        let diagnostics = find_handler("db_diagnostics");
-        for required in [
-            "reader admission capacity",
-            "maximum completed hold time",
-            "all namespaces",
-            "soft-deleted rows",
-            "hard deletion",
-            "graph_edges_seq_minus_graph_edges",
-        ] {
-            assert!(
-                diagnostics.description.contains(required),
-                "db_diagnostics help must explain {required:?}"
-            );
-        }
-    }
-
-    /// `link`'s id params resolve through `resolve_uuid_unfiltered`, which passes no
-    /// namespace predicate at all (`KhiveRuntime::resolve_prefix_unfiltered` ->
-    /// `resolve_prefix_inner(None, ..)`). Their help text said the lookup searched "every
-    /// namespace you can see", which is a visibility-bounded reach and a narrower claim than
-    /// the truth, while the shared id contract appended to the same description said "no
-    /// namespace filter" — so one description asserted both readings at once and a caller
-    /// could take either.
-    ///
-    /// The must-not-match arm is the load-bearing one: a description can state the correct
-    /// rule and still carry the contradicting sentence beside it, which is exactly the state
-    /// this test was written to end.
-    #[test]
-    fn link_id_params_state_unfiltered_resolution_and_not_a_visible_set() {
-        let link = find_handler("link");
-        for name in ["source_id", "target_id"] {
-            let param = link
-                .params
-                .iter()
-                .find(|p| p.name == name)
-                .unwrap_or_else(|| panic!("link must declare {name:?}"));
-            assert!(
-                param.description.contains("no namespace filter"),
-                "link.{name} help must state that UUID and prefix lookup are unfiltered; got: {}",
-                param.description
-            );
-            assert!(
-                !param.description.contains("every namespace you can see"),
-                "link.{name} help must not describe resolution as bounded by the caller's \
-                 visible set — it is not bounded at all; got: {}",
-                param.description
-            );
-            assert!(
-                param.description.contains("primary namespace"),
-                "link.{name} help must keep the entity-name fallback's namespace scope, which \
-                 IS the caller's primary namespace; got: {}",
-                param.description
-            );
-        }
-    }
-
-    /// Regression for #899: `create.entity_kind`/`list.entity_kind` help text must list
-    /// every canonical `EntityKind::NAMES` entry, so a stale hand-written list fails loudly.
-    #[test]
-    fn entity_kind_param_descriptions_list_all_canonical_kinds() {
-        for handler_name in ["create", "list"] {
-            let h = find_handler(handler_name);
-            let entity_kind_param = h
-                .params
-                .iter()
-                .find(|p| p.name == "entity_kind")
-                .unwrap_or_else(|| panic!("{handler_name}.entity_kind param not found"));
-            for kind in crate::vocab::EntityKind::NAMES {
-                assert!(
-                    entity_kind_param.description.contains(kind),
-                    "{handler_name}.entity_kind description missing canonical kind {kind:?}: {:?}",
-                    entity_kind_param.description
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn propose_params_has_required_title_description_changeset() {
-        let h = find_handler("propose");
-        assert!(!h.params.is_empty(), "propose must have params");
-        assert!(
-            h.params.iter().any(|p| p.name == "title" && p.required),
-            "propose must have required title param"
-        );
-        assert!(
-            h.params
-                .iter()
-                .any(|p| p.name == "description" && p.required),
-            "propose must have required description param"
-        );
-        assert!(
-            h.params.iter().any(|p| p.name == "changeset" && p.required),
-            "propose must have required changeset param"
-        );
-    }
-
-    #[test]
-    fn link_help_schema_matches_strict_singleton_and_bulk_params() {
-        let handler = find_handler("link");
-        let advertised = handler
-            .params
-            .iter()
-            .map(|param| param.name)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            advertised,
-            [
-                "source_id",
-                "target_id",
-                "relation",
-                "weight",
-                "metadata",
-                "dependency_kind",
-                "resurrect",
-                "verbose",
-                "links",
-                "atomic",
-            ],
-            "link help must enumerate the complete LinkParams surface in wire order"
-        );
-        assert!(
-            handler.params.iter().all(|param| !param.required),
-            "link has a singleton-or-bulk contract, so no one field is unconditionally required"
-        );
-
-        let accepted = serde_json::from_value::<crate::handlers::LinkParams>(serde_json::json!({
-            "source_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-            "target_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-            "relation": "depends_on",
-            "weight": 0.7,
-            "metadata": {"optional": true},
-            "dependency_kind": "build",
-            "resurrect": true,
-            "verbose": true,
-            "links": [],
-            "atomic": false,
-        }));
-        if let Err(error) = accepted {
-            panic!("every link help parameter must be accepted by LinkParams: {error}");
-        }
-
-        for payload in [
-            serde_json::json!({"properties": {"x": 1}}),
-            serde_json::json!({
-                "links": [{
-                    "source_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-                    "target_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-                    "relation": "extends",
-                    "properties": {"x": 1},
-                }],
-            }),
-        ] {
-            let error = match serde_json::from_value::<crate::handlers::LinkParams>(payload) {
-                Ok(_) => panic!("unknown link fields must be rejected"),
-                Err(error) => error.to_string(),
-            };
-            assert!(
-                error.contains("unknown field") && error.contains("properties"),
-                "link must reject unknown fields explicitly, got: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn propose_params_has_optional_reviewers_expiry_parent_id() {
-        let h = find_handler("propose");
-        assert!(
-            h.params
-                .iter()
-                .any(|p| p.name == "reviewers" && !p.required),
-            "propose must document optional reviewers"
-        );
-        assert!(
-            h.params.iter().any(|p| p.name == "expiry" && !p.required),
-            "propose must document optional expiry"
-        );
-        assert!(
-            h.params
-                .iter()
-                .any(|p| p.name == "parent_id" && !p.required),
-            "propose must document optional parent_id"
-        );
-    }
-
-    #[test]
-    fn review_params_has_required_id_and_decision() {
-        let h = find_handler("review");
-        assert!(!h.params.is_empty(), "review must have params");
-        assert!(
-            h.params.iter().any(|p| p.name == "id" && p.required),
-            "review must have required id param"
-        );
-        assert!(
-            h.params.iter().any(|p| p.name == "decision" && p.required),
-            "review must have required decision param"
-        );
-        assert!(
-            h.params.iter().any(|p| p.name == "comment" && !p.required),
-            "review must document optional comment param"
-        );
-    }
-
-    /// Locate the substring of `desc` documenting `relation` — either its own
-    /// `"{relation}:"` clause, its `"{relation} (symmetric):"` clause, or a
-    /// grouped `"a / b:"` clause (used for `supports / refutes`).
-    fn relation_clause<'a>(desc: &'a str, relation: &str) -> &'a str {
-        desc.split(". ")
-            .find(|c| {
-                c.contains(&format!("{relation}:"))
-                    || c.contains(&format!("{relation} ("))
-                    || c.contains(&format!("{relation} /"))
-                    || c.contains(&format!("/ {relation}"))
-            })
-            .unwrap_or_else(|| {
-                panic!("link.relation help must document a clause for relation `{relation}`")
-            })
-    }
-
-    fn endpoint_kind_label(kind: &khive_types::EndpointKind) -> String {
-        match kind {
-            khive_types::EndpointKind::EntityOfKind(k) => (*k).to_string(),
-            khive_types::EndpointKind::NoteOfKind(k) => format!("{k}-note"),
-            khive_types::EndpointKind::EntityOfType { kind, .. } => (*kind).to_string(),
-        }
-    }
-
-    /// Regression for #964: `link(help=true)` must surface the per-relation
-    /// edge-endpoint allowlist so batch appliers can defer to the kernel's own
-    /// table instead of reimplementing (and drifting from) it.
-    ///
-    /// Full-coverage drift tripwire (#1060): derives the
-    /// expected rows from the live rule sources (`base_entity_endpoint_rules()`
-    /// and `KG_EDGE_RULES`) instead of asserting a handful of substrings, so a
-    /// typo'd or dropped row in an untested relation (e.g. `derived_from`,
-    /// `depends_on`, the epistemic pairs) fails the test rather than shipping
-    /// a stale contract.
-    #[test]
-    fn link_relation_param_documents_edge_endpoint_allowlist() {
-        let h = find_handler("link");
-        let relation_param = h
-            .params
-            .iter()
-            .find(|p| p.name == "relation")
-            .expect("link must document a relation param");
-        let desc = relation_param.description;
-
-        for (src, relation, tgt) in khive_runtime::base_entity_endpoint_rules() {
-            let rel = relation.as_str();
-            let clause = relation_clause(desc, rel);
-            if relation.is_symmetric() {
-                let a = format!("{src}<->{tgt}");
-                let b = format!("{tgt}<->{src}");
-                assert!(
-                    clause.contains(&a) || clause.contains(&b),
-                    "link.relation help missing symmetric base row {rel}: {src}<->{tgt}"
-                );
-            } else {
-                let row = format!("{src}->{tgt}");
-                assert!(
-                    clause.contains(&row),
-                    "link.relation help missing base row {rel}: {row}\nclause: {clause}"
-                );
-            }
-        }
-
-        // The three same-substrate note->note families (ADR-055/ADR-002) must
-        // be documented alongside their entity->entity cases.
-        for rel in ["supersedes", "supports", "refutes"] {
-            let clause = relation_clause(desc, rel);
-            assert!(
-                clause.contains("note->note"),
-                "link.relation help must document {rel}: note->note (same-substrate only)"
-            );
-        }
-
-        // annotates: the only relation permitting a note source with any target.
-        assert!(
-            desc.contains("annotates: note ->"),
-            "link.relation help must document the annotates note->* endpoint"
-        );
-
-        // kg pack's additive EDGE_RULES — every (relation, source, target)
-        // TRIPLE must appear in the pack clause, not merely the endpoint pair.
-        // The clause groups relations that share an endpoint pair
-        // ("part_of/instance_of person->org"), so a row is verified by finding a
-        // comma-delimited segment that carries BOTH the relation token AND the
-        // "src->tgt" endpoint — deleting a relation from a grouped run (e.g.
-        // dropping instance_of but keeping part_of) then fails the test.
-        let kg_clause = desc
-            .split(". ")
-            .find(|c| c.contains("kg` pack additionally allows"))
-            .expect("link.relation help must document the kg pack's additive EDGE_RULES clause");
-        for rule in crate::pack::KG_EDGE_RULES.iter() {
-            let src = endpoint_kind_label(&rule.source);
-            let tgt = endpoint_kind_label(&rule.target);
-            let row = format!("{src}->{tgt}");
-            let rel = rule.relation.as_str();
-            let matched = kg_clause
-                .split(", ")
-                .any(|seg| seg.contains(&row) && seg.contains(rel));
-            assert!(
-                matched,
-                "kg pack EDGE_RULES triple missing from help: {rel} {row}\nclause: {kg_clause}"
-            );
-        }
-    }
-
-    #[test]
-    fn withdraw_params_has_required_id_and_optional_rationale() {
-        let h = find_handler("withdraw");
-        assert!(!h.params.is_empty(), "withdraw must have params");
-        assert!(
-            h.params.iter().any(|p| p.name == "id" && p.required),
-            "withdraw must have required id param"
-        );
-        assert!(
-            h.params
-                .iter()
-                .any(|p| p.name == "rationale" && !p.required),
-            "withdraw must document optional rationale param"
-        );
-    }
-
-    // ── update/help param-documentation regressions ──────────────────────────
-
-    #[test]
-    fn update_params_documents_note_tag_replacement_and_precedence() {
-        let h = find_handler("update");
-        assert!(h
-            .description
-            .contains("name/content/salience/decay_factor/properties/tags"));
-        let tags = h.params.iter().find(|p| p.name == "tags").unwrap();
-        for detail in [
-            "entities or notes",
-            "omission preserves",
-            "[] clears",
-            "properties.tags",
-            "takes precedence",
-            "including when empty",
-        ] {
-            assert!(
-                tags.description.contains(detail),
-                "missing tag contract: {detail}"
-            );
-        }
-    }
-
-    /// ADR-172 Amendment 5, acceptance arm 6: both routes state which rule
-    /// an identical write gets.
-    #[test]
-    fn help_states_that_a_fenced_identical_write_still_mints_a_version() {
-        let update = find_handler("update");
-        let expected = update
-            .params
-            .iter()
-            .find(|p| p.name == "expected_version")
-            .expect("update documents expected_version");
-        assert!(
-            expected
-                .description
-                .contains("changes nothing is still a write")
-                && expected.description.contains("unchanged=true"),
-            "update.expected_version must state the fenced-write and no-op rules"
-        );
-        let batch = find_handler("stream.batch");
-        let ops = batch.params.iter().find(|p| p.name == "ops").unwrap();
-        assert!(
-            ops.description
-                .contains("always advances the version by exactly one")
-                && ops.description.contains("never a no-op"),
-            "stream.batch.ops must state that an accepted write member always mints"
-        );
-    }
-
-    /// update.help must document `content` for notes.
-    #[test]
-    fn update_params_documents_content_for_notes() {
-        let h = find_handler("update");
-        assert!(
-            h.params.iter().any(|p| p.name == "content"),
-            "update must document 'content' param (notes only)"
-        );
-        let content = h.params.iter().find(|p| p.name == "content").unwrap();
-        assert!(
-            content.description.contains("note"),
-            "update.content description must mention 'note'"
-        );
-    }
-
-    /// update.name must NOT say "entities only".
-    #[test]
-    fn update_params_name_not_entities_only() {
-        let h = find_handler("update");
-        let name_param = h.params.iter().find(|p| p.name == "name").unwrap();
-        assert!(
-            !name_param.description.contains("entities only"),
-            "update.name must not claim 'entities only' — notes also have names"
-        );
-    }
-
-    /// update.help must document `salience` for notes.
-    #[test]
-    fn update_params_documents_salience_for_notes() {
-        let h = find_handler("update");
-        assert!(
-            h.params.iter().any(|p| p.name == "salience"),
-            "update must document 'salience' param (notes only)"
-        );
-    }
-
-    /// update.help must document `decay_factor` for notes.
-    #[test]
-    fn update_params_documents_decay_factor_for_notes() {
-        let h = find_handler("update");
-        assert!(
-            h.params.iter().any(|p| p.name == "decay_factor"),
-            "update must document 'decay_factor' param (notes only)"
-        );
-    }
-
-    /// update.help must document `relation` for edges.
-    #[test]
-    fn update_params_documents_relation_for_edges() {
-        let h = find_handler("update");
-        assert!(
-            h.params.iter().any(|p| p.name == "relation"),
-            "update must document 'relation' param (edges only)"
-        );
-        let rel = h.params.iter().find(|p| p.name == "relation").unwrap();
-        assert!(
-            rel.description.contains("edge"),
-            "update.relation description must mention 'edge'"
-        );
-    }
-
-    /// update.help must document `weight` for edges.
-    #[test]
-    fn update_params_documents_weight_for_edges() {
-        let h = find_handler("update");
-        assert!(
-            h.params.iter().any(|p| p.name == "weight"),
-            "update must document 'weight' param (edges only)"
-        );
-        let w = h.params.iter().find(|p| p.name == "weight").unwrap();
-        assert!(
-            w.description.contains("edge"),
-            "update.weight description must mention 'edge'"
-        );
-    }
-
-    // ── ue-help-introspection C3 regression ──────────────────────────────────
-
-    /// No handler named "thread" should exist in the KG pack (guards against accidental addition).
-    #[test]
-    fn no_thread_verb_in_kg_handlers() {
-        assert!(
-            KG_HANDLERS.iter().all(|h| h.name != "thread"),
-            "KG_HANDLERS must not contain a 'thread' handler — see C3"
-        );
-    }
-
-    // ── ue-help-introspection H5 regression ──────────────────────────────────
-
-    /// The `verbs` introspection handler must be present and have params.
-    #[test]
-    fn verbs_handler_is_present_and_has_params() {
-        let h = find_handler("verbs");
-        assert!(
-            !h.params.is_empty(),
-            "verbs must have documented params (category, pack)"
-        );
-        assert!(
-            h.params.iter().any(|p| p.name == "category"),
-            "verbs must document 'category' filter param"
-        );
-        assert!(
-            h.params.iter().any(|p| p.name == "pack"),
-            "verbs must document 'pack' filter param"
-        );
-    }
-
-    #[test]
-    fn query_help_documents_mixed_variable_chain_limitation() {
-        let h = find_handler("query");
-        assert!(
-            h.description
-                .contains("mixes fixed-length and variable-length"),
-            "query help must document mixed fixed/variable traversal limitation"
-        );
-        let query_param = h
-            .params
-            .iter()
-            .find(|p| p.name == "query")
-            .expect("query param documented");
-        assert!(
-            query_param
-                .description
-                .contains("split them into separate query() calls"),
-            "query param help must document split-query workaround"
-        );
-        let page_size_param = h
-            .params
-            .iter()
-            .find(|p| p.name == "page_size")
-            .expect("page_size param must be documented in query handler metadata");
-        assert!(!page_size_param.required, "page_size must be optional");
-        assert!(
-            page_size_param.description.contains("hard cap 10 000")
-                && page_size_param.description.contains("Query-text LIMIT"),
-            "page_size help must document hard-cap and query-LIMIT composition"
-        );
-        let limit_param = h
-            .params
-            .iter()
-            .find(|p| p.name == "limit")
-            .expect("limit param must be documented in query handler metadata");
-        assert!(!limit_param.required, "limit must be optional");
-        assert!(
-            limit_param.description.contains("Deprecated alias"),
-            "legacy limit must be explicitly documented as an alias"
-        );
-    }
-
-    // ── issue #160 return-shape regressions ──────────────────────────────────
-
-    /// propose returns {id, ...}; the correct chain key is $prev.id, not $prev.proposal_id (#160).
-    /// The description may mention $prev.proposal_id in a "not this" warning, which is fine.
-    #[test]
-    fn propose_description_documents_id_field_not_proposal_id() {
-        let h = find_handler("propose");
-        assert!(
-            h.description.contains("Returns {id"),
-            "propose description must name the 'id' return field"
-        );
-        assert!(
-            h.description.contains("$prev.id"),
-            "propose description must document chaining via $prev.id"
-        );
-        // The description warns callers off $prev.proposal_id by name; the critical
-        // check is that $prev.id appears first as the authoritative form.
-        let id_pos = h
-            .description
-            .find("$prev.id")
-            .expect("$prev.id must appear in propose description");
-        let proposal_id_pos = h.description.find("$prev.proposal_id");
-        if let Some(pid_pos) = proposal_id_pos {
-            // $prev.proposal_id is only acceptable when it appears AFTER $prev.id
-            // (i.e., as a negative example, not as the recommended form).
-            assert!(
-                id_pos < pid_pos,
-                "propose description must present $prev.id before $prev.proposal_id"
-            );
-        }
-    }
-
-    /// merge returns {kept_id, removed_id, ...}; no top-level 'id' field.
-    /// Chain with $prev.kept_id, not $prev.id (#160).
-    #[test]
-    fn merge_description_documents_kept_id_and_removed_id_return_fields() {
-        let h = find_handler("merge");
-        assert!(
-            h.description.contains("kept_id") && h.description.contains("removed_id"),
-            "merge description must name both kept_id and removed_id return fields"
-        );
-        assert!(
-            h.description.contains("$prev.kept_id"),
-            "merge description must document chaining via $prev.kept_id"
-        );
-    }
-
-    #[test]
-    fn merge_metadata_documents_the_complete_wire_contract() {
-        let h = find_handler("merge");
-        assert!(
-            h.description.contains("entities or notes"),
-            "merge description must cover both supported substrates"
-        );
-        for required in ["into_id", "from_id"] {
-            assert!(
-                h.params.iter().any(|p| p.name == required && p.required),
-                "merge must document required {required}"
-            );
-        }
-        for optional in [
-            "kind",
-            "strategy",
-            "content_strategy",
-            "dry_run",
-            "force",
-            "reason",
-        ] {
-            assert!(
-                h.params.iter().any(|p| p.name == optional && !p.required),
-                "merge must document optional {optional}"
-            );
-        }
-        assert!(
-            h.description.contains("details.guard") && h.description.contains("details.compared"),
-            "merge must document the structured guard refusal and what the guard compared"
-        );
-        // The refusal a dry run predicts is part of the verb's contract, and the
-        // field a caller reads it from has to be named where the caller looks.
-        assert!(
-            h.description.contains("would_merge"),
-            "merge must document that a dry run reports the floor it would hit"
-        );
-    }
-}
+#[path = "handler_defs_tests.rs"]
+mod tests;

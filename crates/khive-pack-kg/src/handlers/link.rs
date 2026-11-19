@@ -2,6 +2,7 @@
 
 use serde_json::{json, Value};
 
+use khive_runtime::operations::dependency_kind_inference_hint;
 use khive_runtime::{merge_entry_metadata, LinkSpec, NamespaceToken, RuntimeError, VerbRegistry};
 
 use super::common::{
@@ -10,13 +11,25 @@ use super::common::{
 };
 use crate::KgPack;
 
+// Keep the default bulk response bounded while verbose callers retain the
+// original caller-indexed explanations.
+fn add_bulk_inference_hints(response: &mut Value, hints: Vec<Value>, verbose: bool) {
+    if !hints.is_empty() {
+        response["inferred_count"] = json!(hints.len());
+        if verbose {
+            response["hints"] = Value::Array(hints);
+        }
+    }
+}
+
 impl KgPack {
     pub(crate) async fn handle_link(
         &self,
         token: &NamespaceToken,
-        params: Value,
+        mut params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
+        super::normalize_link_params(&mut params)?;
         let p: LinkParams = deser(params)?;
         let verbose = p.verbose.unwrap_or(false);
 
@@ -42,24 +55,9 @@ impl KgPack {
                     let target =
                         resolve_uuid_unfiltered(&entry.target_id, &self.runtime, token).await?;
                     let relation = parse_relation(&entry.relation)?;
-                    // Canonicalize only the duplicate-detection key. Runtime validation
-                    // must see caller order so a rejected symmetric relation reports the
-                    // legal set for the requested ordered pair; `build_edge` canonicalizes
-                    // the accepted edge before persistence.
-                    let (key_source, key_target) = if relation.is_symmetric() && target < source {
-                        (target, source)
-                    } else {
-                        (source, target)
-                    };
-                    let key = format!("{key_source}::{key_target}::{}", relation.as_str());
-                    if !seen.insert(key) {
-                        skipped += 1;
-                        continue;
-                    }
                     let weight = validate_weight(entry.weight)?;
                     let metadata = merge_entry_metadata(entry.metadata, entry.dependency_kind)?;
-                    entry_indices.push(idx);
-                    specs.push(LinkSpec {
+                    let spec = LinkSpec {
                         namespace: Some(token.namespace().as_str().to_owned()),
                         source_id: source,
                         target_id: target,
@@ -67,7 +65,41 @@ impl KgPack {
                         weight,
                         metadata,
                         resurrect: entry.resurrect.unwrap_or(false),
-                    });
+                    };
+                    // Canonicalize only the duplicate-detection key. Runtime validation
+                    // must see caller order so a rejected symmetric relation reports the
+                    // legal set for the requested ordered pair; `build_edge` canonicalizes
+                    // the accepted edge before persistence.
+                    let (key_source, key_target) = relation.canonical_endpoints(source, target);
+                    let key = format!("{key_source}::{key_target}::{}", relation.as_str());
+                    if !seen.insert(key) {
+                        // Selected entries reach the batch validators below. A discarded
+                        // duplicate must still pass the same hook and edge preflight.
+                        registry
+                            .validate_link_hooks(&self.runtime, token, std::slice::from_ref(&spec))
+                            .await?;
+                        match self.runtime.build_edge(token, &spec).await {
+                            Ok(_) => {}
+                            Err(RuntimeError::InvalidInput(ref msg))
+                                if msg.contains("not in the base endpoint allowlist") =>
+                            {
+                                let enriched = enrich_bulk_atomic_allowlist_error(
+                                    msg,
+                                    &self.runtime,
+                                    token,
+                                    std::slice::from_ref(&spec),
+                                    std::slice::from_ref(&idx),
+                                )
+                                .await;
+                                return Err(RuntimeError::InvalidInput(enriched));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                        skipped += 1;
+                        continue;
+                    }
+                    entry_indices.push(idx);
+                    specs.push(spec);
                 }
                 registry
                     .validate_link_hooks(&self.runtime, token, &specs)
@@ -103,6 +135,25 @@ impl KgPack {
                         row.disposition == khive_storage::EdgeUpsertDisposition::Resurrected
                     })
                     .count();
+                let inference_hints: Vec<_> = rows
+                    .iter()
+                    .zip(&specs)
+                    .map(|(row, spec)| {
+                        dependency_kind_inference_hint(
+                            spec.relation,
+                            spec.metadata.as_ref(),
+                            row.edge.metadata.as_ref(),
+                        )
+                    })
+                    .collect();
+                let hints: Vec<_> = inference_hints
+                    .iter()
+                    .zip(&entry_indices)
+                    .filter_map(|(hint, index)| {
+                        hint.as_ref()
+                            .map(|hint| json!({"index": index, "hint": hint}))
+                    })
+                    .collect();
                 let mut resp = serde_json::json!({
                     "attempted": attempted,
                     "created": created,
@@ -111,16 +162,21 @@ impl KgPack {
                     "skipped": skipped,
                     "failed": 0,
                 });
+                add_bulk_inference_hints(&mut resp, hints, verbose);
                 if verbose {
                     resp["edges"] = Value::Array(
                         rows.iter()
-                            .map(|row| {
+                            .zip(&inference_hints)
+                            .map(|(row, hint)| {
                                 let mut value = to_json(&row.edge)?;
                                 if let Some(object) = value.as_object_mut() {
                                     object.insert(
                                         "mutation".to_string(),
                                         json!(row.disposition.name()),
                                     );
+                                    if let Some(hint) = hint {
+                                        object.insert("hint".to_string(), json!(hint));
+                                    }
                                 }
                                 Ok(value)
                             })
@@ -131,6 +187,7 @@ impl KgPack {
             } else {
                 let mut results: Vec<Value> = Vec::new();
                 let mut error_list: Vec<Value> = Vec::new();
+                let mut hints: Vec<Value> = Vec::new();
                 let mut seen = std::collections::HashSet::new();
                 let mut skipped = 0usize;
                 let mut created = 0usize;
@@ -162,18 +219,6 @@ impl KgPack {
                             continue;
                         }
                     };
-                    // Keep caller order for validation/diagnostics; only the dedup key
-                    // needs UUID-canonical endpoints. `link` canonicalizes on success.
-                    let (key_source, key_target) = if relation.is_symmetric() && target < source {
-                        (target, source)
-                    } else {
-                        (source, target)
-                    };
-                    let key = format!("{key_source}::{key_target}::{}", relation.as_str());
-                    if !seen.insert(key) {
-                        skipped += 1;
-                        continue;
-                    }
                     let weight = match validate_weight(entry.weight) {
                         Ok(w) => w,
                         Err(e) => {
@@ -205,6 +250,33 @@ impl KgPack {
                         error_list.push(json!({"index": idx, "error": format!("{e}")}));
                         continue;
                     }
+                    // Only successful entries reserve a natural key. Failed validation
+                    // or a refused write must not suppress a later valid entry.
+                    let (key_source, key_target) = relation.canonical_endpoints(source, target);
+                    let key = format!("{key_source}::{key_target}::{}", relation.as_str());
+                    if seen.contains(&key) {
+                        match self.runtime.build_edge(token, &spec).await {
+                            Ok(_) => skipped += 1,
+                            Err(RuntimeError::InvalidInput(ref msg))
+                                if msg.contains("not in the base endpoint allowlist") =>
+                            {
+                                let enriched = enrich_allowlist_error(
+                                    msg,
+                                    &self.runtime,
+                                    token,
+                                    source,
+                                    target,
+                                    relation,
+                                )
+                                .await;
+                                error_list.push(json!({"index": idx, "error": enriched}));
+                            }
+                            Err(e) => {
+                                error_list.push(json!({"index": idx, "error": format!("{e}")}))
+                            }
+                        }
+                        continue;
+                    }
                     match self
                         .runtime
                         .link_observed(
@@ -219,6 +291,7 @@ impl KgPack {
                         .await
                     {
                         Ok(row) => {
+                            seen.insert(key);
                             match row.disposition {
                                 khive_storage::EdgeUpsertDisposition::Created => created += 1,
                                 khive_storage::EdgeUpsertDisposition::Updated => updated += 1,
@@ -226,10 +299,21 @@ impl KgPack {
                                     resurrected += 1
                                 }
                             }
+                            let hint = dependency_kind_inference_hint(
+                                relation,
+                                spec.metadata.as_ref(),
+                                row.edge.metadata.as_ref(),
+                            );
                             let mut value = to_json(&row.edge)?;
                             if let Some(object) = value.as_object_mut() {
                                 object
                                     .insert("mutation".to_string(), json!(row.disposition.name()));
+                                if let Some(hint) = hint.as_ref() {
+                                    object.insert("hint".to_string(), json!(hint));
+                                }
+                            }
+                            if let Some(hint) = hint {
+                                hints.push(json!({"index": idx, "hint": hint}));
                             }
                             results.push(value);
                         }
@@ -259,6 +343,7 @@ impl KgPack {
                     "failed": error_list.len(),
                     "errors": error_list,
                 });
+                add_bulk_inference_hints(&mut resp, hints, verbose);
                 if verbose {
                     resp["edges"] = serde_json::Value::Array(results);
                 }
@@ -320,6 +405,13 @@ impl KgPack {
         let mut raw = to_json(&row.edge)?;
         if let Some(obj) = raw.as_object_mut() {
             obj.insert("mutation".to_string(), json!(row.disposition.name()));
+            if let Some(hint) = dependency_kind_inference_hint(
+                relation,
+                spec.metadata.as_ref(),
+                row.edge.metadata.as_ref(),
+            ) {
+                obj.insert("hint".to_string(), json!(hint));
+            }
         }
         if relation.is_symmetric() {
             if let Some(obj) = raw.as_object_mut() {
@@ -330,3 +422,11 @@ impl KgPack {
         Ok(format_edge_output(raw, verbose))
     }
 }
+
+#[cfg(test)]
+#[path = "link_dedup_tests.rs"]
+mod link_dedup_tests;
+
+#[cfg(test)]
+#[path = "link_inference_tests.rs"]
+mod link_inference_tests;

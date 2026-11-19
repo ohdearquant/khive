@@ -894,8 +894,8 @@ model as `esbuild` and `turbo`.
 
 ## References
 
-- [ADR-002](ADR-002-edge-ontology.md): Edge ontology — `validate` enforces the 15-relation
-  closed enum and pack-extensible endpoint contract on every NDJSON import
+- [ADR-002](ADR-002-edge-ontology.md): Edge ontology — `validate` enforces the closed enum
+  of relations and pack-extensible endpoint contract on every NDJSON import
 - [ADR-003](ADR-003-system-architecture.md): System architecture — kkernel binary
 - [ADR-005](ADR-005-storage-capability-traits.md): Storage capability traits —
   `working.db` implements the same SqlAccess + GraphStore + VectorStore + TextSearch
@@ -917,3 +917,119 @@ model as `esbuild` and `turbo`.
 - NDJSON specification: <https://ndjson.org/>
 - git sparse-checkout: <https://git-scm.com/docs/git-sparse-checkout>
 - GitHub Contents API: <https://docs.github.com/en/rest/repos/contents>
+
+## Amendment (2026-10-09): scope of the §5 CLI surface after ADR-101 and ADR-102
+
+[ADR-101](ADR-101-kg-changeset-model.md) and [ADR-102](ADR-102-tiered-validate-and-merge.md)
+moved graph change onto a change-set model with MCP-client-only access to the live graph
+(ADR-102 D5) and a local, non-remote change-set and snapshot repository (ADR-102 D6). ADR-102
+restores `kg commit` for that flow and states that the restoration "does not resurrect the
+whole of ADR-020 §5's original eleven-verb workflow". This amendment records which §5 rows
+that leaves standing.
+
+Superseded by ADR-101/102 and not to be built against the project-repository `.khive/kg/`
+layout: `kg diff`, `kg resolve` (including `--ours`, `--theirs` and `--merge-properties`),
+`kg migrate` and `.khive/kg/migrations/`, and `kg validate --schema-compat <ref>`. Entity-level
+diff, conflict handling and schema evolution are change-set concerns under ADR-101 D2-D4 and
+ADR-102 D1-D4; a line-level git merge of committed NDJSON is no longer the integration path.
+§7, §9 and §10 above describe that superseded path and stay as the historical record.
+
+Still standing, as extensions of shipped verbs that do not depend on the git merge path:
+`kg import --on-conflict error|skip|update` and `--force` (§13; [ADR-036](ADR-036-kg-import-export-adapters.md)
+keeps the same flags for adapter imports), and `kg update <remote> [--ref <ref>]` (§8), which
+moves the schema remote's Git `commit` pin. The current `kg fetch` path remains
+explicit-argument-only as recorded in [ADR-037](ADR-037-remote-resolution-and-hash-verification.md):
+it does not load schema remotes. Its optional archive-content `pin` is a separate SHA-256
+value; moving a Git commit does not implicitly repin archive content or fetch an archive.
+
+## Amendment (2026-10-19): import conflict modes over edges, the update projection and the force flag (#4766)
+
+**Status: Accepted (2026-10-21).** Refs #4766. `kkernel kg import` implements it (#5767):
+`--on-conflict error|skip|update` and `--force` in `crates/kkernel/src/kg/types.rs`. The rules
+below cover every archive record and edge except tool-registry rows:
+[ADR-036](ADR-036-kg-import-export-adapters.md) Amendment 2 skips those, with the edges incident
+to them, in every conflict mode. `crates/kkernel/tests/kg_import_conflicts.rs` checks each case
+listed under Acceptance below, except that it checks an unknown relation only with `--force`;
+without `--force` the archive reader refuses it (`invalid_relation_rejected_at_deserialize` in
+`crates/khive-runtime/src/portability.rs`).
+
+§13 names the three `--on-conflict` modes and §5 names `--force`, but neither says how a mode
+applies to edges, what `update` writes, or what `--force` bypasses. #4766 adds both flags to
+`kkernel kg import`; this amendment settles those three points for that command. It does not
+change the
+[ADR-035 import policy boundary](ADR-035-cli-config-and-auto-embed.md#import-policy-boundary):
+unknown entity kinds follow `[schema].strict`, and unknown relations are refused in every mode.
+
+### The mode applies to every UUID the archive carries
+
+The mode governs records and edges alike, and is decided before any write:
+
+- `error`: an archive record or edge whose UUID already exists fails the import, and nothing is
+  written. A tool-registry row is the exception: ADR-036 Amendment 2 skips it, with its incident
+  edges, in this mode as in the others.
+- `skip`: the existing row is left untouched and counted as skipped. Edges incident to a skipped
+  record are omitted and counted, as §13 states.
+- `update`: an existing record is patched as described below, and an existing edge is updated
+  in place under its own UUID, keeping its creation time.
+
+No mode mints a replacement UUID, matches an edge by its source, relation and target instead of
+its UUID, or turns a storage uniqueness refusal into a skip. An archive edge whose UUID is new
+but whose triple is already held by a stored edge fails the import in every mode, and nothing is
+written.
+
+### What `update` writes
+
+The archive record is applied as an `EntityPatch` or `NotePatch`
+([ADR-014](ADR-014-curation-operations.md)):
+
+- An omitted or null optional field leaves the stored value unchanged. Import never clears a
+  field; unlike the MCP wire mapping, where `null` clears, an archive `null` reads as omitted.
+- Present record `properties` follow ADR-014's update semantics: a top-level merge with archive
+  values winning at their keys, where a nested object at an archive key replaces the stored value
+  at that key. Present edge `properties` replace the stored edge properties, as `EdgePatch` does.
+- A non-empty `tags` array replaces the stored tags. An empty array leaves them unchanged: an
+  archive cannot tell "no tags" from "tags not recorded", and clearing tags stays a curation act.
+- Kind, creation time, namespace and deletion state are never written by import.
+- An archive record whose kind differs from the stored record's kind, or an archive edge whose
+  endpoints differ from the stored edge's, fails the import before any write. A patch cannot
+  express either change, and dropping the difference would report an update that did not happen.
+
+Index maintenance after a committed update follows the existing entity update path. As the
+ADR-035 amendment states, the refusal-before-write guarantee does not make later index work part
+of the import's all-or-nothing unit.
+
+### What `--force` bypasses
+
+Without `--force`, §13 holds: an edge whose source or target does not resolve, or that fails the
+endpoint contract, refuses the whole import before any write. With `--force` the import proceeds
+without those edges and reports each one with its edge UUID and cause (missing source, missing
+target or endpoint contract). `--force` relaxes nothing else: unknown relations, malformed weights
+or reserved fields, unknown entity kinds under a strict schema, and `error`-mode collisions are
+refused with or without it. Tool-registry rows and their incident edges are skipped with or
+without `--force` under ADR-036 Amendment 2, and are never an `error`-mode collision.
+
+### Scope
+
+This amendment governs `kkernel kg import`. The library import entry points keep their present
+behavior, which skips such edges and reports them; that difference from §13 is recorded here, not
+ruled on. [ADR-036](ADR-036-kg-import-export-adapters.md) adapter imports keep `--continue` as
+sugar for `skip`.
+
+### Acceptance
+
+- An archive holding one entity already stored under a different name: the default mode fails
+  with nothing written, `skip` keeps the stored name, `update` writes the archive name, and the
+  summary reports a count per outcome.
+- An archive edge whose UUID is stored: `error` refuses with nothing written, `skip` leaves the
+  stored edge unchanged and counts it, and `update` rewrites it in place under the same UUID.
+- An archive edge with a new UUID and a stored triple is refused in all three modes with nothing
+  written.
+- `update` with an omitted field, a null field, new and nested properties, a non-empty and an
+  empty tags array, and a kind mismatch: the first two leave the stored values, properties merge
+  at the top level with a nested object replaced, the non-empty tags replace, the empty array
+  leaves the stored tags, and the kind mismatch refuses with nothing written.
+- An edge with an unresolved endpoint is refused without `--force` with nothing written; with
+  `--force` the remaining rows import and the edge is reported with its cause. An unknown
+  relation is refused with and without `--force`.
+- `--dry-run` reports the same per-outcome counts and skipped edges the real run produces, and
+  writes nothing.

@@ -4,6 +4,9 @@
 //! profile's `total_events` counter lives in `snapshot.balanced_recall.total_events`.
 //! These tests verify the dispatch hook still updates the balanced-recall state.
 
+#[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
+mod receipt_credentials;
+
 use std::sync::Arc;
 
 use khive_pack_brain::BrainPack;
@@ -68,7 +71,9 @@ async fn dispatch_hook_fires_on_cold_namespace_no_prior_activation() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let hook: Arc<dyn DispatchHook> = brain.clone();
     builder.with_dispatch_hook(hook);
     let registry = builder.build().expect("registry builds");
@@ -111,7 +116,9 @@ async fn dispatch_hook_applies_signals_per_namespace_independently() {
         let ns_owned = ns.to_string();
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt2));
-        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(MemoryPack::new(
+            receipt_credentials::with_receipt_credentials(rt.clone()),
+        ));
         builder.with_default_namespace(ns_owned);
         let hook: Arc<dyn DispatchHook> = brain2;
         builder.with_dispatch_hook(hook);
@@ -192,9 +199,8 @@ async fn brain_pack_hook_does_not_fire_on_unknown_verb() {
 ///
 /// Sequence:
 ///   1. Create a real entity for brain.feedback target validation.
-///   2. Using brain_a, dispatch 5 brain.feedback calls — enough to cross
-///      DEFAULT_SNAPSHOT_BATCH_SIZE (5) and force upsert_snapshot into the
-///      shared DB.  Record persisted_total == 5.
+///   2. Using brain_a, dispatch 5 brain.feedback calls, each persisting its
+///      snapshot into the shared DB. Record persisted_total == 5.
 ///   3. Construct brain_b = BrainPack::new(rt.clone()), a fresh instance over
 ///      the same runtime/DB with empty in-memory state.  brain_a is no longer
 ///      used; its in-memory state is not accessible to brain_b.
@@ -246,8 +252,7 @@ async fn cold_hook_signal_applies_on_top_of_persisted_snapshot() {
         .to_string();
 
     // --- Step 2: dispatch 5 brain.feedback calls via brain_a ---
-    // DEFAULT_SNAPSHOT_BATCH_SIZE = 5; the 5th call triggers upsert_snapshot,
-    // writing the "local" namespace snapshot into the shared DB.
+    // Every call writes the "local" namespace snapshot into the shared DB.
     let brain_a = BrainPack::new(rt.clone());
     let empty_registry = VerbRegistryBuilder::new()
         .build()
@@ -290,7 +295,9 @@ async fn cold_hook_signal_applies_on_top_of_persisted_snapshot() {
     // pending_hook_signals (cold pending path, not the saved_states path).
     let mut hook_builder = VerbRegistryBuilder::new();
     hook_builder.register(KgPack::new(rt.clone()));
-    hook_builder.register(MemoryPack::new(rt.clone()));
+    hook_builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     hook_builder.with_default_namespace("local".to_string());
     let hook_arc: Arc<dyn DispatchHook> = brain_b.clone();
     hook_builder.with_dispatch_hook(hook_arc);
@@ -437,8 +444,9 @@ async fn brain_feedback_accepts_foreign_namespace_target_id() {
 ///     path fires on a *real* hit, not a miss);
 ///   - `balanced_recall.temporal` moved off its `BetaPosterior::new(1.0, 9.0)`
 ///     prior;
-///   - `balanced_recall.entity_posteriors` gained an entry for the hit's id,
-///     and that entry moved off the `BetaPosterior::new(1.0, 1.0)` default.
+///   - `balanced_recall.entity_posteriors` did not gain an entry for the hit's
+///     id: a recall hit is exposure, not a judgment, so per-entity evidence is
+///     untouched.
 #[tokio::test]
 async fn memory_recall_through_real_registry_updates_brain_posteriors() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -449,7 +457,9 @@ async fn memory_recall_through_real_registry_updates_brain_posteriors() {
     // purely off the runtime's real post-dispatch machinery.
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let hook: Arc<dyn DispatchHook> = brain.clone();
     builder.with_dispatch_hook(hook);
     let registry = builder.build().expect("registry builds");
@@ -514,18 +524,12 @@ async fn memory_recall_through_real_registry_updates_brain_posteriors() {
     );
 
     let hit_uuid: uuid::Uuid = hit_id.parse().expect("hit id is a valid uuid");
-    let entity_posterior = after
-        .entity_posteriors
-        .get(&hit_uuid)
-        .expect("hit entity must have a posterior entry after a real recall hit");
-    assert_ne!(
-        (entity_posterior.alpha(), entity_posterior.beta()),
-        (1.0, 1.0),
-        "hit entity posterior must move off the BetaPosterior::new(1.0, 1.0) default; got {:?}",
-        (entity_posterior.alpha(), entity_posterior.beta())
-    );
     assert!(
-        !before.entity_posteriors.contains_key(&hit_uuid),
-        "sanity: the hit entity must not have had a posterior before this recall"
+        !after.entity_posteriors.contains_key(&hit_uuid),
+        "a recall hit is not a judgment and must not create a per-entity posterior"
+    );
+    assert_eq!(
+        after.entity_posteriors, before.entity_posteriors,
+        "no per-entity posterior may change on a recall hit"
     );
 }

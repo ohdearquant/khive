@@ -27,6 +27,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from documented_verb_counts import validate_documented_counts
+from documented_guide_tables import validate_guide_verb_tables
 from kkernel_binary import REPO_ROOT, resolve_binary_path
 
 BINARY = resolve_binary_path()
@@ -236,7 +237,7 @@ def main():
 
         # verbs: verb discovery introspection.
         # Result shape: {"verbs": list, "total": int, "pack_counts": object}.
-        # Each entry has verb, pack, description, category (handler_defs.rs:735-742).
+        # handler_defs::handle_verbs reports verb, pack, description, category and signature.
         verbs_result = call_verb(proc, "verbs", {})
         assert "verbs" in verbs_result, f"verbs must return 'verbs' key: {verbs_result}"
         assert "total" in verbs_result, f"verbs must return 'total' key: {verbs_result}"
@@ -270,8 +271,19 @@ def main():
             "published verb/pack counts drifted from the live registry:\n"
             + "\n".join(f"  - {error}" for error in documented_count_errors)
         )
+        guide_table_errors = [
+            error
+            for source in ("CLAUDE.md", "AGENTS.md")
+            for error in validate_guide_verb_tables(
+                Path(__file__).resolve().parent.parent, verbs_result, source=source
+            )
+        ]
+        assert not guide_table_errors, (
+            "published pack verb tables drifted from the live registry:\n"
+            + "\n".join(f"  - {error}" for error in guide_table_errors)
+        )
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 14 production packs and exposes 144 MCP-callable verbs
+        # unset) loads 14 production packs and exposes 163 MCP-callable verbs
         # (count what verbs() returns, not internal dispatch arms). The session
         # pack contributes seven verbs: 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
@@ -285,11 +297,13 @@ def main():
         # (ADR-091 operator surface, the 20th kg-substrate bare verb), comm.health
         # (#606, verified live 2026-07-04), comm.probe (#644 read-only
         # inbound poll), and brain.event_counts (#724, ADR-103 Stage 1
-        # windowed event read) are included in the count; git contributes
+        # windowed event read) and brain.event_page (#4118, bounded pages of
+        # stored event rows) are included in the count; git contributes
         # git.digest (ADR-088 Amendment 1) plus git.commit / git.branch /
         # git.update_ref / git.push (four thin write verbs shelling to system git
-        # with hardened argv construction); code contributes exactly one
-        # verb, `code.ingest` (ADR-085 Amendment 2, PR #1039 — L1 manifest +
+        # with hardened argv construction); code contributes three registered-map
+        # read verbs (`code.list`, `code.search`, `code.deps`, ADR-139) plus
+        # `code.ingest` (ADR-085 Amendment 2, PR #1039 — L1 manifest +
         # L1.5 import-scan tiers; its `finding` note kind and
         # `findings.json` batch ingest remain reachable only via the
         # `kkernel code-ingest` admin CLI, never this MCP verb surface);
@@ -301,17 +315,25 @@ def main():
         # by [blob] file_transfers = true or KHIVE_FILE_TRANSFERS=1; storage
         # operations require an installed backend.
         # The kg pack also carries its one documented sub-namespace,
-        # stream.append / stream.batch / stream.read / stream.stat (ADR-174
+        # stream.append / stream.batch / stream.read / stream.stat / stream.truncate (ADR-174
         # §2); git grew from four verbs to seventeen with the dev-loop surface
         # (checkout, diff, gates, receipts, reconcile, status, log, init,
         # pr_open, pr_review, pr_merge, update_ref; ADR-182) plus git.ingest_cursor
         # (ADR-088 Amendment 1, the persisted ingest cursor read);
-        # tool contributes fourteen verbs, including tool.policy_delete, and
-        # exec nine (the tool registry with use policy and sandboxed runs over trees).
+        # tool contributes fifteen verbs, including tool.policy_delete, and
+        # exec nine (the tool registry with use policy and sandboxed runs over trees);
+        # knowledge contributes knowledge.lint for graph hygiene inspection;
+        # comm contributes comm.withheld_body, the recipient's or maintainer's
+        # read of a withheld external message's original (ADR-200 Amendment 1);
+        # kg contributes apply_changeset, the atomic apply of one canonical
+        # NDJSON change-set; attach records a rendition of a record and
+        # hydrates the selected roles; gtd contributes gtd.counts, one assignee's
+        # task counts by status without task bodies; memory contributes
+        # memory.apply_batch, checked and resumable memory rewrites (ADR-021).
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 144, (
-            f"expected 144 user-facing verbs from the 14 default packs "
+        assert verbs_result["total"] == 163, (
+            f"expected 163 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083 plus dependency-gated transcript search, stats and vacuum; "
             f"context is the 17th kg-substrate bare verb per ADR-089; "
@@ -321,9 +343,9 @@ def main():
             f"kg-substrate bare verb (ADR-091 read-only-by-intent operator "
             f"diagnostics); scan is the kg-substrate bare verb answering the "
             f"secret gate without a write; comm.health is #606; comm.probe is #644; "
-            f"brain.event_counts is #724/ADR-103; git contributes git.digest plus "
+            f"brain.event_counts is #724/ADR-103; brain.event_page is #4118; git contributes git.digest plus "
             f"git.commit/git.branch/git.update_ref/git.push (ADR-108 and ADR-182); "
-            f"code contributes code.ingest per ADR-085 Amendment 2 (PR #1039); "
+            f"code contributes code.ingest and three registered-map reads (ADR-139); "
             f"workspace (#873) contributes zero verbs; "
             f"blob contributes put/get/stat, begin/put_part/commit/abort per ADR-173, "
             f"and opt-in import/export; "
@@ -331,17 +353,25 @@ def main():
             f"comm.unread lists unread inbound messages; comm.mark_read is the "
             f"named atomic-capable mark-read surface; comm.delivered confirms "
             f"the internal inbound sibling after an ambiguous atomic write), "
-            f"kg also carries stream.append/stream.batch/stream.read/stream.stat "
+            f"kg also carries stream.append/stream.batch/stream.read/stream.stat/stream.truncate "
             f"(ADR-174); "
             f"git contributes seventeen verbs with the ADR-182 dev-loop surface "
             f"and git.ingest_cursor; "
-            f"tool contributes fourteen verbs including tool.policy_delete "
+            f"tool contributes fifteen verbs including tool.policy_delete "
             f"(ADR-180 Amendment 3), and exec nine; "
+            f"knowledge contributes knowledge.lint; "
+            f"kg contributes attach, which records a rendition of a record and "
+            f"hydrates the selected roles; "
+            f"gtd contributes gtd.counts; "
+            f"memory contributes memory.apply_batch; "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]
         assert "gtd.repair" in verb_names, (
             f"'gtd.repair' (ADR-019 Amendment 7) must appear in verbs listing: {verb_names}"
+        )
+        assert "gtd.counts" in verb_names, (
+            f"'gtd.counts' must appear in verbs listing: {verb_names}"
         )
         assert "tool.policy_delete" in verb_names, (
             f"'tool.policy_delete' must appear in verbs listing: {verb_names}"
@@ -352,18 +382,25 @@ def main():
         assert "code.ingest" in verb_names, (
             f"'code.ingest' (ADR-085 Amendment 2, PR #1039) must appear in verbs listing: {verb_names}"
         )
+        for code_read_verb in ("code.list", "code.search", "code.deps"):
+            assert code_read_verb in verb_names, (
+                f"'{code_read_verb}' (ADR-139) must appear in verbs listing: {verb_names}"
+            )
         assert "comm.delivered" in verb_names, (
             f"'comm.delivered' (#1447) must appear in verbs listing: {verb_names}"
+        )
+        assert "comm.transport_status" in verb_names, (
+            f"comm.transport_status must appear in verbs listing: {verb_names}"
         )
         assert "comm.mark_read" in verb_names, (
             f"'comm.mark_read' (#1387) must appear in verbs listing: {verb_names}"
         )
-        # each entry carries verb, pack, description, category per handler_defs.rs:735-742
+        # Keep the handler_defs::handle_verbs entry shape, including its compact signature.
         first = verbs_result["verbs"][0]
-        for key in ("verb", "pack", "description", "category"):
+        for key in ("verb", "pack", "description", "category", "signature"):
             assert key in first, f"verb entry missing key {key!r}: {first}"
-        # pack= filter: handler_defs.rs:729 applies pack_name.eq_ignore_ascii_case(pk);
-        # each returned entry carries its "pack" field (handler_defs.rs:736).
+        # handle_verbs applies pack_name.eq_ignore_ascii_case to the pack filter;
+        # each returned entry carries its "pack" field.
         # Assertions must be non-vacuous: a pack=kg filter that was ignored would
         # return the full 74-verb list, so we verify the filter returns only kg verbs.
         kg_verbs = call_verb(proc, "verbs", {"pack": "kg"})

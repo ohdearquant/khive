@@ -9,8 +9,6 @@
 //! `--dry-run` runs the same validation and existence checks but performs
 //! no writes.
 
-use crate::sql::sql;
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -24,10 +22,12 @@ use khive_db::StorageBackend;
 use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
 use khive_pack_code::{ingest_findings_json, CodeIngestBatch, CodeIngestOptions};
 use khive_runtime::{
-    entity_fts_document, note_fts_document, secret_gate, GateRef, IngestAuditStore,
-    InterceptedDispatchResult, KhiveRuntime, Namespace, PackRegistry, RuntimeError, VerbRegistry,
+    entity_fts_document, note_fts_document, secret_gate, EntityCandidateAdmission,
+    EntityCandidateContext, EntityCandidateMutation, EntityCandidateOrigin,
+    EntityCandidatePrepared, GateRef, IngestAuditStore, InterceptedDispatchResult, KhiveRuntime,
+    Namespace, NamespaceToken, PackRegistry, RuntimeError, VerbRegistry,
 };
-use khive_storage::{Entity, EntityStore, Note, NoteStore, SqlStatement, SqlValue, SubstrateKind};
+use khive_storage::{Entity, Note, NoteStore, SubstrateKind};
 
 /// Upper bound on how long the real ingest path waits for the pool's writer
 /// task to exit after the last write returned. Generous relative to any
@@ -180,6 +180,23 @@ async fn code_ingest_batch_with_config_runtime_setup_and_gate<F>(
 where
     F: FnOnce(&KhiveRuntime) -> Result<()>,
 {
+    code_ingest_batch_with_provider_setup(args, config, gate_override, |_| Ok(()), runtime_setup)
+        .await
+}
+
+// Host providers must be installed before registry finalization. The separate
+// runtime_setup callback remains inside the allowed gate's direct-write section.
+async fn code_ingest_batch_with_provider_setup<P, F>(
+    args: CodeIngestArgs,
+    config: Option<&Path>,
+    gate_override: Option<GateRef>,
+    provider_setup: P,
+    runtime_setup: F,
+) -> Result<CodeIngestReport>
+where
+    P: FnOnce(&KhiveRuntime) -> Result<()>,
+    F: FnOnce(&KhiveRuntime) -> Result<()>,
+{
     let bytes = std::fs::read(&args.findings)
         .with_context(|| format!("failed to read {}", args.findings.display()))?;
 
@@ -225,21 +242,17 @@ where
     )
     .with_context(|| format!("{} failed validation", args.findings.display()))?;
 
-    // Preflight every entity/note content and nested property value through
-    // the same secret gate the shared `create` verb path applies
-    // (`crate::secret_gate::check`/`check_json`). This path writes directly
-    // through the storage traits rather than `registry.dispatch("create",
-    // ...)` — explicit-id creation (required for the content-derived UUIDv5
-    // identity that makes re-ingest idempotent) has no dispatch-level
-    // equivalent today — so the gate has to run here instead of being
-    // inherited for free from the shared create handler.
-    preflight_secret_gate(&batch)?;
+    // Prepare entity admission before opening a database, retaining each
+    // candidate's immutable manifest snapshot through its eventual write.
+    // Notes retain their ordinary blocking scanner on this direct path.
+    let entity_candidates = preflight_secret_gate(&batch)?;
 
     if args.dry_run {
         return dry_run_report(cfg.db_path.as_deref(), &batch).await;
     }
 
     let runtime = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    provider_setup(&runtime)?;
     let registry = build_code_ingest_registry(&runtime)?;
     let gate_args = json!({
         "input_kind": "findings_json",
@@ -279,7 +292,7 @@ where
         let entities = runtime
             .entities(&token)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        for entity in &batch.entities {
+        for (entity, prepared) in batch.entities.iter().zip(entity_candidates) {
             let existing = entities
                 .get_entity_including_deleted(entity.id)
                 .await
@@ -288,18 +301,27 @@ where
                 report.entities_skipped_existing += 1;
                 continue;
             }
+            let finalized = match persist_ingest_entity(&runtime, &token, prepared).await? {
+                EntityCandidateAdmission::Conflict => {
+                    report.entities_skipped_existing += 1;
+                    continue;
+                }
+                EntityCandidateAdmission::Committed(_) => true,
+                EntityCandidateAdmission::Legacy(_) => false,
+            };
             report.entities_created += 1;
-            persist_ingest_entity(entities.as_ref(), entity).await?;
 
             let doc = entity_fts_document(entity);
             let embed_body = doc.body.clone();
-            if let Ok(fts) = runtime.text(&token) {
-                if let Err(e) = fts.upsert_document(doc).await {
-                    tracing::warn!(
-                        entity_id = %entity.id,
-                        error = %e,
-                        "code-ingest: entity FTS indexing failed (non-fatal)"
-                    );
+            if !finalized {
+                if let Ok(fts) = runtime.text(&token) {
+                    if let Err(e) = fts.upsert_document(doc).await {
+                        tracing::warn!(
+                            entity_id = %entity.id,
+                            error = %e,
+                            "code-ingest: entity FTS indexing failed (non-fatal)"
+                        );
+                    }
                 }
             }
             for model_name in &embedding_model_names {
@@ -469,15 +491,30 @@ where
     settle_writer_drain(ingest_result, writer_join, WRITER_DRAIN_TIMEOUT).await
 }
 
-// ADR-115 requires each direct write to check its final candidate, independently
-// of the earlier whole-batch preflight that protects the no-filesystem-effect path.
-async fn persist_ingest_entity(store: &dyn EntityStore, entity: &Entity) -> Result<()> {
-    secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    store
-        .upsert_entity(entity.clone())
+// The runtime consumes the same prepared candidate that passed the pre-database
+// check. Only its unchanged legacy decision reaches the ordinary store writer.
+async fn persist_ingest_entity(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    prepared: EntityCandidatePrepared,
+) -> Result<EntityCandidateAdmission> {
+    let admission = runtime
+        .try_commit_manifest_entity_candidate(
+            token,
+            prepared,
+            EntityCandidateMutation::CreateIfAbsent,
+        )
         .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if let EntityCandidateAdmission::Legacy(entity) = &admission {
+        runtime
+            .entities(token)
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .upsert_entity(entity.clone())
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
+    Ok(admission)
 }
 
 async fn persist_ingest_note(store: &dyn NoteStore, note: &Note) -> Result<()> {
@@ -560,45 +597,52 @@ async fn settle_writer_drain(
     ingest_result
 }
 
-/// Scan every entity/note content field and nested property value in `batch`
-/// through the runtime secret gate, before any storage write is attempted.
-/// Mirrors the fields `khive-runtime/src/operations.rs`'s `create_entity`/
-/// `create_note_inner` scan (name/description/properties for entities,
-/// content/name/properties for notes) so a credential embedded in finding
-/// evidence is rejected here exactly as it would be on the shared `create`
-/// verb path, rather than persisting verbatim.
-fn preflight_secret_gate(batch: &CodeIngestBatch) -> Result<()> {
+/// Scan a final entity before database construction and retain its snapshot.
+fn prepare_ingest_entity(entity: &Entity, record: &str) -> Result<EntityCandidatePrepared> {
+    let context =
+        EntityCandidateContext::new(&entity.namespace, EntityCandidateOrigin::CodeFindingsIngest);
+    secret_gate::locate(context.check_name_description(&entity.name), record, "name")
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if let Some(description) = &entity.description {
+        secret_gate::locate(
+            context.check_name_description(description),
+            record,
+            "description",
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
+    secret_gate::locate(
+        context.check_properties(entity.properties.as_ref()),
+        record,
+        "properties",
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    secret_gate::locate(context.check_tags(&entity.tags), record, "tags")
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    context
+        .prepare(entity.clone())
+        .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+/// Validate the complete batch before any storage construction or write.
+fn preflight_secret_gate(batch: &CodeIngestBatch) -> Result<Vec<EntityCandidatePrepared>> {
+    let mut prepared = Vec::with_capacity(batch.entities.len());
     for (index, entity) in batch.entities.iter().enumerate() {
-        let record = format!("entity[{index}]");
-        secret_gate::check_at(&entity.name, &record, "name").map_err(|e| anyhow::anyhow!("{e}"))?;
-        if let Some(description) = &entity.description {
-            secret_gate::check_at(description, &record, "description")
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-        if let Some(properties) = &entity.properties {
-            secret_gate::check_json_at(properties, &record, "properties")
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-        secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        secret_gate::check_tags_at(&entity.tags, &record, "tags")
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        prepared.push(prepare_ingest_entity(entity, &format!("entity[{index}]"))?);
     }
     for (index, note) in batch.notes.iter().enumerate() {
         let record = format!("note[{index}]");
-        secret_gate::check_at(&note.content, &record, "content")
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if let Some(name) = &note.name {
-            secret_gate::check_at(name, &record, "name").map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-        if let Some(properties) = &note.properties {
-            secret_gate::check_json_at(properties, &record, "properties")
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
+        secret_gate::check_note_fields_at(
+            &note.content,
+            note.name.as_deref(),
+            note.properties.as_ref(),
+            &record,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
         secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    Ok(())
+    Ok(prepared)
 }
 
 /// Report what `code_ingest_batch` would create/skip without writing
@@ -642,49 +686,39 @@ async fn dry_run_report(
     };
 
     let (backend, _snapshot_dir) = open_read_only_snapshot(db_path)?;
-    let sql = backend.sql();
-    let mut reader = sql.reader().await.map_err(|e| anyhow::anyhow!("{e}"))?;
-
+    // A UUID collision includes tombstones and rows stamped in another namespace.
+    // Typed reads also refuse malformed stored records instead of hiding decode errors.
+    let entities = backend.entities().map_err(|e| anyhow::anyhow!("{e}"))?;
     for entity in &batch.entities {
-        let row = reader
-            .query_scalar(SqlStatement {
-                sql: sql!("entities_exists").to_string(),
-                params: vec![SqlValue::Uuid(entity.id)],
-                label: Some("code-ingest dry-run entity existence".to_string()),
-            })
+        let existing = entities
+            .get_entity_including_deleted(entity.id)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if row.is_some() {
+        if existing.is_some() {
             report.entities_skipped_existing += 1;
         } else {
             report.entities_created += 1;
         }
     }
+    let notes = backend.notes().map_err(|e| anyhow::anyhow!("{e}"))?;
     for note in &batch.notes {
-        let row = reader
-            .query_scalar(SqlStatement {
-                sql: sql!("notes_exists").to_string(),
-                params: vec![SqlValue::Uuid(note.id)],
-                label: Some("code-ingest dry-run note existence".to_string()),
-            })
+        let existing = notes
+            .get_note_including_deleted(note.id)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if row.is_some() {
+        if existing.is_some() {
             report.notes_skipped_existing += 1;
         } else {
             report.notes_created += 1;
         }
     }
+    let graph = backend.graph().map_err(|e| anyhow::anyhow!("{e}"))?;
     for edge in &batch.edges {
-        let row = reader
-            .query_scalar(SqlStatement {
-                sql: sql!("graph_edges_exists").to_string(),
-                params: vec![SqlValue::Uuid(uuid::Uuid::from(edge.id))],
-                label: Some("code-ingest dry-run edge existence".to_string()),
-            })
+        let existing = graph
+            .get_edge_including_deleted(edge.id)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if row.is_some() {
+        if existing.is_some() {
             report.edges_skipped_existing += 1;
         } else {
             report.edges_created += 1;
@@ -778,6 +812,18 @@ fn shm_sidecar_path(db_path: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
+#[path = "code_ingest/entity_admission_tests.rs"]
+mod entity_admission_tests;
+
+#[cfg(test)]
+#[path = "code_ingest/note_fields_tests.rs"]
+mod note_fields_tests;
+
+#[cfg(test)]
+#[path = "code_ingest/dry_run_collision_tests.rs"]
+mod dry_run_collision_tests;
+
+#[cfg(test)]
 mod tests {
 
     #[test]
@@ -787,7 +833,7 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         let db = root.path().join("source.db");
-        let seed = StorageBackend::sqlite(&db).unwrap();
+        let seed = StorageBackend::sqlite_for_test(&db).unwrap();
         seed.prepare_core_schema().unwrap();
         drop(seed);
         let before = std::fs::read(&db).unwrap();
@@ -796,7 +842,7 @@ mod tests {
             .err()
             .expect("SNAPSHOT_INVALID_ENV");
         assert!(
-            matches!(error.downcast_ref::<khive_runtime::RuntimeError>(), Some(khive_runtime::RuntimeError::Sqlite(khive_db::SqliteError::InvalidConfig(message))) if message.contains("KHIVE_SQLITE_WAL_CEILING_BYTES"))
+            matches!(error.downcast_ref::<khive_runtime::RuntimeError>(), Some(khive_runtime::RuntimeError::Storage(khive_storage::StorageError::Driver { source, .. })) if matches!(source.downcast_ref(), Some(khive_db::SqliteError::InvalidConfig(message)) if message.contains("KHIVE_SQLITE_WAL_CEILING_BYTES")))
         );
         for raw in ["0", "8192"] {
             std::env::set_var("KHIVE_SQLITE_WAL_CEILING_BYTES", raw);
@@ -825,6 +871,7 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+    use khive_storage::{SqlStatement, SqlValue};
 
     struct WriteQueueEnvGuard {
         previous: Option<std::ffi::OsString>,
@@ -988,7 +1035,7 @@ mod tests {
     fn install_test_embedders(runtime: &KhiveRuntime) -> Result<()> {
         for name in runtime.registered_embedding_model_names() {
             let dimensions = runtime.resolve_embedding_model(Some(&name))?.dimensions();
-            runtime.register_embedder(FixedEmbeddingProvider { name, dimensions });
+            runtime.try_register_embedder(FixedEmbeddingProvider { name, dimensions })?;
         }
         Ok(())
     }
@@ -1025,10 +1072,13 @@ mod tests {
                 .parent()
                 .expect("findings fixture must have a parent directory"),
         );
-        super::code_ingest_batch_with_config_and_runtime_setup(args, Some(&config), |runtime| {
-            install_test_embedders(runtime)?;
-            runtime_setup(runtime)
-        })
+        super::code_ingest_batch_with_provider_setup(
+            args,
+            Some(&config),
+            None,
+            install_test_embedders,
+            runtime_setup,
+        )
         .await
     }
 
@@ -1164,7 +1214,7 @@ mod tests {
     /// Resolves through [`resolve_runtime_config`] exactly like the ingest
     /// path itself rather than opening `db` directly: ADR-170 routes event
     /// persistence to a sidecar database beside the main store, so a raw
-    /// `StorageBackend::sqlite(db).events()` read (the main store's own,
+    /// `StorageBackend::sqlite_for_test(db).events()` read (the main store's own,
     /// pre-ADR-170 event table) silently finds nothing.
     async fn only_findings_ingest_event(db: &Path, config: &Path) -> khive_storage::Event {
         let cfg = resolve_runtime_config(RuntimeConfigInputs {
@@ -1272,10 +1322,11 @@ mod tests {
         let setup_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let setup_called_in_closure = Arc::clone(&setup_called);
 
-        let err = super::code_ingest_batch_with_config_runtime_setup_and_gate(
+        let err = super::code_ingest_batch_with_provider_setup(
             base_args(findings, db.clone()),
             Some(&config),
             Some(Arc::clone(&gate) as GateRef),
+            install_test_embedders,
             move |_| {
                 setup_called_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
@@ -1307,7 +1358,7 @@ mod tests {
             assert_eq!(request.args["record_counts"]["edges"], 1);
         }
 
-        let backend = StorageBackend::sqlite(&db).expect("open denied-ingest database");
+        let backend = StorageBackend::sqlite_for_test(&db).expect("open denied-ingest database");
         let sql = backend.sql();
         let mut reader = sql.reader().await.expect("acquire denied-ingest reader");
         for table in ["entities", "notes", "graph_edges"] {
@@ -1345,11 +1396,12 @@ mod tests {
         let config = write_test_config_with_packs(tmp.path(), ALL_PACKS);
         let gate = Arc::new(AllowFindingsIngestGate);
 
-        let report = super::code_ingest_batch_with_config_runtime_setup_and_gate(
+        let report = super::code_ingest_batch_with_provider_setup(
             base_args(findings, db.clone()),
             Some(&config),
             Some(gate as GateRef),
             install_test_embedders,
+            |_| Ok(()),
         )
         .await
         .expect("an allowing gate must let the batch proceed");
@@ -1380,10 +1432,11 @@ mod tests {
         let setup_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let setup_called_in_closure = Arc::clone(&setup_called);
 
-        let err = super::code_ingest_batch_with_config_runtime_setup_and_gate(
+        let err = super::code_ingest_batch_with_provider_setup(
             base_args(findings, db.clone()),
             Some(&config),
             Some(gate as GateRef),
+            install_test_embedders,
             move |_| {
                 setup_called_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
@@ -1401,7 +1454,7 @@ mod tests {
             "gate error must occur before the direct-write section begins"
         );
 
-        let backend = StorageBackend::sqlite(&db).expect("open errored-ingest database");
+        let backend = StorageBackend::sqlite_for_test(&db).expect("open errored-ingest database");
         let sql = backend.sql();
         let mut reader = sql.reader().await.expect("acquire errored-ingest reader");
         for table in ["entities", "notes", "graph_edges"] {
@@ -1441,7 +1494,7 @@ mod tests {
     }
 
     async fn soft_delete_mapped_batch(db: &Path, batch: &CodeIngestBatch) {
-        let backend = StorageBackend::sqlite(db).expect("open tombstone writer");
+        let backend = StorageBackend::sqlite_for_test(db).expect("open tombstone writer");
         let sql = backend.sql();
         let mut writer = sql.writer().await.expect("acquire tombstone writer");
 
@@ -1490,7 +1543,7 @@ mod tests {
     /// satisfies that guard by snapshot-copying and freezing sidecars; this
     /// assertion needs only three scalar reads on the live fixture file.
     async fn assert_mapped_batch_remains_tombstoned(db: &Path, batch: &CodeIngestBatch) {
-        let backend = StorageBackend::sqlite(db).expect("open tombstone reader");
+        let backend = StorageBackend::sqlite_for_test(db).expect("open tombstone reader");
         let sql = backend.sql();
         let mut reader = sql.reader().await.expect("acquire tombstone reader");
 
@@ -1522,6 +1575,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_creates_once_then_skips_on_rerun() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("scratch.db");
@@ -1551,6 +1608,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_never_reactivates_consumed_tombstone_ids() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("tombstones.db");
@@ -1629,6 +1690,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_dry_run_writes_nothing() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("scratch.db");
@@ -1654,6 +1719,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_rejects_invalid_document_before_any_write() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let path = tmp.path().join("bad.json");
         std::fs::write(
@@ -1692,6 +1761,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_dry_run_against_nonexistent_db_creates_no_file() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("does-not-exist.db");
@@ -1713,6 +1786,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_dry_run_against_existing_db_does_not_mutate_it() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("scratch.db");
@@ -1811,6 +1888,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_dry_run_against_existing_wal_db_leaves_sidecars_untouched() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("wal_scratch.db");
@@ -1826,7 +1907,7 @@ mod tests {
         // Dry run of the "existing WAL database" scenario
         // reproduced against (e.g. a live daemon holding the db open while
         // an admin separately runs `code-ingest --dry-run`).
-        let pin = StorageBackend::sqlite(&db).expect("open pin backend");
+        let pin = StorageBackend::sqlite_for_test(&db).expect("open pin backend");
         {
             let sql = pin.sql();
             let mut writer = sql.writer().await.expect("pin writer");
@@ -1894,6 +1975,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_rejects_secret_bearing_evidence_before_any_write() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let path = tmp.path().join("secret.json");
         std::fs::write(
@@ -1988,6 +2073,10 @@ mod tests {
 
     #[tokio::test]
     async fn direct_ingest_writers_reject_reserved_properties_before_storage() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let mut batch = mapped_batch(&findings);
@@ -2007,9 +2096,8 @@ mod tests {
             .as_object_mut()
             .expect("entity properties object");
         entity_properties.insert("khive:secret_gate".into(), serde_json::json!("forged"));
-        let entity_error = persist_ingest_entity(entities.as_ref(), &entity)
-            .await
-            .expect_err("the entity writer must reject the reserved key");
+        let entity_error = prepare_ingest_entity(&entity, "entity")
+            .expect_err("the entity writer's preparation must reject the reserved key");
         assert!(entity_error.to_string().contains("khive:secret_gate"));
         assert!(entities.get_entity(entity.id).await.unwrap().is_none());
         entity
@@ -2019,7 +2107,11 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("khive:secret_gate");
-        persist_ingest_entity(entities.as_ref(), &entity)
+        let token = runtime
+            .authorize(Namespace::parse(&entity.namespace).unwrap())
+            .unwrap();
+        let prepared = prepare_ingest_entity(&entity, "entity").unwrap();
+        persist_ingest_entity(&runtime, &token, prepared)
             .await
             .expect("the ordinary entity candidate must persist");
         assert!(entities.get_entity(entity.id).await.unwrap().is_some());
@@ -2090,6 +2182,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_entity_vector_uses_canonical_body_field_label() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("scratch.db");
@@ -2100,10 +2196,6 @@ mod tests {
                 !model_names.is_empty(),
                 "test requires at least one configured embedding model"
             );
-            for name in model_names {
-                let dimensions = runtime.resolve_embedding_model(Some(&name))?.dimensions();
-                runtime.register_embedder(FixedEmbeddingProvider { name, dimensions });
-            }
             Ok(())
         })
         .await
@@ -2175,6 +2267,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn code_ingest_reports_actual_embedding_truncation_by_model() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("scratch.db");
@@ -2192,15 +2288,9 @@ mod tests {
         )
         .expect("write long findings fixture");
 
-        let report = code_ingest_batch_with_runtime_setup(base_args(findings, db), |runtime| {
-            for name in runtime.registered_embedding_model_names() {
-                let dimensions = runtime.resolve_embedding_model(Some(&name))?.dimensions();
-                runtime.register_embedder(FixedEmbeddingProvider { name, dimensions });
-            }
-            Ok(())
-        })
-        .await
-        .expect("ingest with bounded embedding input must succeed");
+        let report = code_ingest_batch_with_runtime_setup(base_args(findings, db), |_| Ok(()))
+            .await
+            .expect("ingest with bounded embedding input must succeed");
 
         assert!(
             !report.truncation_by_model.is_empty(),
@@ -2338,7 +2428,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let pool = khive_db::ConnectionPool::new(khive_db::PoolConfig {
             path: Some(dir.path().join("already_taken.db")),
-            ..khive_db::PoolConfig::default()
+            ..khive_db::PoolConfig::for_test()
         })
         .expect("file-backed pool should open");
         assert!(
@@ -2413,11 +2503,13 @@ mod tests {
                     .try_writer()
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 writer
-                    .execute_batch(
-                        "CREATE TRIGGER code_ingest_test_block_notes \
+                    .autocommit(|conn| {
+                        Ok(conn.execute_batch(
+                            "CREATE TRIGGER code_ingest_test_block_notes \
                      BEFORE INSERT ON notes \
                      BEGIN SELECT RAISE(ABORT, 'synthetic notes insert failure'); END",
-                    )
+                        )?)
+                    })
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 Ok(())
             })

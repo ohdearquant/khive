@@ -1,7 +1,7 @@
 //! Insert operations for HNSW index.
 
 use crate::NodeId;
-use rand::Rng;
+use rand::RngExt;
 
 use super::HnswIndex;
 use crate::config::MAX_LEVEL;
@@ -213,7 +213,7 @@ impl HnswIndex {
     /// Generate random level for a new node using exponential distribution.
     /// Uses seeded RNG when `config.seed` is set for reproducible builds.
     pub(super) fn random_level(&mut self) -> usize {
-        let r: f64 = self.rng.gen::<f64>().max(f64::MIN_POSITIVE);
+        let r: f64 = self.rng.random::<f64>().max(f64::MIN_POSITIVE);
         let level = (-r.ln() * self.config.ml).floor() as usize;
         level.min(MAX_LEVEL)
     }

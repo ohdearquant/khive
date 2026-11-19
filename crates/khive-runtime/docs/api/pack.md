@@ -49,6 +49,36 @@ row, or provenance record and leaving the draft and its review history unchanged
 kinds keep their default admission, and this seam never narrows what shared `create` already
 accepts, only what the proposal route accepts.
 
+## context_contributor
+
+`PackRuntime::context_contributor` defaults to `None`. A pack may return an instance-owned
+`Arc<dyn ContextContributor>`; `VerbRegistry::context_contributors` collects these capabilities
+in the registry's topological pack order, omitting `None` without deduplicating or caching them.
+Discovery calls the accessor only: it does not invoke `contribute` or dispatch a verb.
+
+```ignore
+fn context_contributor(&self) -> Option<Arc<dyn ContextContributor>> {
+    Some(self.context_source.clone())
+}
+```
+
+`ContextContributor::contribute` borrows a `ContextRequest` and the caller's authorized
+`NamespaceToken`, returning owned `ContextSlice` records or the original `RuntimeError`.
+Implementations must honor token visibility and release all read snapshots before returning.
+The request owns its query, entity IDs, consumer kind and relation filters; its traversal
+fields use the existing `Direction` vocabulary. The type supplies no defaults, parsing,
+clamping or profile resolution. `budget_hint` is advisory for the total assembly, not a
+per-contributor allocation.
+
+A slice owns its kind, ID and JSON content and carries static pack attribution. Scores retain
+source-partition semantics: `decay_weighted`, `rerank`, `graph_proximity`, `relevance` or `none`.
+A score is optional and is neither normalized nor made comparable across packs. Slice and score
+semantics support serialization; they do not introduce a request wire parser.
+
+This is the capability foundation requested by #4735 under Proposed ADR-092. No composer,
+contributor implementation, context verb, profile consumer, timeout, budget allocator or
+serve-ledger integration is activated by this API.
+
 ## brain_consumer_kinds
 
 Packs that request brain profile resolution declare their exact wire-level consumer values in
@@ -60,6 +90,31 @@ declarations, deduplicating shared uses such as `recall` while preserving first-
 at the binding boundary but is registry-owned and must not appear in a pack declaration. An enum
 variant or ADR mention alone does not make a kind bindable: a loaded pack must declare that it
 actually consumes the kind.
+
+## note_property_policies
+
+Packs declare exact `(kind, key, policy)` entries in `Pack::NOTE_PROPERTY_POLICIES` and mirror
+that slice from `PackRuntime::note_property_policies`. Both default to empty. Implement the
+runtime method explicitly alongside `pack_runtime_metadata!`; the macro does not emit it.
+`khive_types::NotePropertyPolicySpec` uses `PropertyPolicy::Derived` for values derived by the
+substrate or owning pack from trusted runtime context, and `PropertyPolicy::OwnerOnly` for
+values established by a specialized owning-pack writer.
+There is no `Free` variant: an unlisted key carries no declared restriction.
+
+Both serving and metadata-only registry builds read each pack's slice once, after existing
+metadata validation and before configuration activation. A declaration must name a kind in
+that same pack's `note_kinds()`. Duplicate `(kind, key)` pairs, even with equal policies, fail
+with `InvalidInput` naming the pack, kind and key. Keys are exact strings, without normalization
+or new grammar restrictions.
+
+`VerbRegistry::all_note_property_policies` copies the immutable boot snapshot in topological
+pack order and then declaration order. Registry clones share the snapshot; later accessor calls
+do not query packs, dispatch handlers, access storage or install validators. Comm declares the
+nine existing kind-specific protected keys for `message` and `channel_health` as `OwnerOnly`.
+
+This is the declaration foundation of Proposed ADR-125 (#4940). Declarations do not grant
+writer authority, alter existing generic create/update/merge enforcement, or prove that every
+semantic property has been declared. Adoption by those write paths remains separate work.
 
 ## register_embedders
 
@@ -181,6 +236,84 @@ successfully-resolved dispatch, or `crate::cost_unit::base_resource_payload` (`{
 ...}`, no `cost_unit` key) for denied calls, errored dispatches, and the no-pack-owns-this-verb
 case. `None` is reserved for a caller with no `work_class` to stamp at all (none exist today); it
 must never be used to omit `cost_unit` alone.
+
+### Retention class
+
+Generic dispatch receipts whose kind is `Audit` and whose persisted canonical verb
+is exactly one of `comm.inbox`, `comm.cleanup_expired_quarantine`, `whoami`,
+`comm.probe`, `comm.cursor_get`, or `comm.heartbeat` carry this top-level payload
+field:
+
+```json
+{
+  "retention": {
+    "class": "expendable",
+    "policy": "poll-dispatch-v1",
+    "horizon_seconds": 604800
+  }
+}
+```
+
+The runtime assigns it at event construction, before batch admission, for success,
+denied, and error outcomes, including sampled and forced success rows. Caller
+arguments never set or change it. Readers and deletion paths do not use this
+marker yet.
+
+### Successful search query shape
+
+Successful `search` dispatch audit payloads additionally contain `match_mode`
+(`all_terms` or `any_term`), `arms` (`text`, `vector`, `both`, or `none`), `effective_limit`
+(the effective public limit: default 10, capped at 100), and `result_count`
+(the final returned array length, including zero). These are top-level payload
+fields beside `resource`; the executed-work counter vocabulary is unchanged.
+No query text, hit content, identifiers, or embeddings are copied into them.
+
+`arms` records retrieval arms entered by the dispatch, including a vector arm
+that later degrades. It is independent of the `source` result filter and whether
+an arm found any hits. A text-store call that short-circuits an empty lexical query
+still entered the text arm; this is distinct from counting executed FTS statements.
+`none` means no arm started, such as an empty coordinator backend set. The
+coordinator unions facts from request-owned spawned children before publishing the
+audit. Nested and concurrent dispatches are isolated; detached work is excluded.
+
+The fields are absent from other verbs and unsuccessful search dispatches. Ordinary
+and intercepted dispatches use the same enrichment; response shapes are unchanged.
+
+### Failed dispatch error class
+
+Non-success dispatch audit rows carry a top-level `error_class`. Its closed tokens
+come from the typed error and the dispatch boundary that raised it, never from
+message text. The class adds no error message, request contents, or new resource
+units and does not change the error returned to the caller, retry policy, or
+whether domain effects may have committed.
+
+| Class                        | Meaning                                                                                                                                                                                                                                             |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gate_refusal`               | The registry gate denied the call before its handler ran.                                                                                                                                                                                           |
+| `policy_refusal`             | A handler returned `PermissionDenied` (including outbound recipient policy), secret detection, a cross-namespace write refusal, a write-budget refusal, a receipt-bearing refusal, or another typed policy refusal.                                 |
+| `invalid_params`             | Invalid or ambiguous caller arguments, an unknown verb/model/remote, query parsing/validation errors, or a caller buffer limit. This includes the existing self-send-without-flag and not-addressed message errors, which are typed `InvalidInput`. |
+| `not_found_or_not_addressed` | A typed missing record/cache or namespace mismatch; this makes no claim that an inaccessible record exists.                                                                                                                                         |
+| `deadline_exceeded`          | A typed operation, storage, audit-resolution, or read-transaction-age deadline elapsed.                                                                                                                                                             |
+| `admission_exhausted`        | A typed storage slot, writer queue, writer begin, or audit admission could not admit the request.                                                                                                                                                   |
+| `conflict`                   | A typed existing-record, precondition, guarded-write, or identity conflict.                                                                                                                                                                         |
+| `unsupported`                | A typed unsupported operation or capability.                                                                                                                                                                                                        |
+| `configuration`              | A missing or incompatible runtime/pack configuration or absent required writer runtime.                                                                                                                                                             |
+| `storage`                    | A typed storage failure, integrity mismatch, terminal writer failure, audit-store failure, or exhausted audit retry.                                                                                                                                |
+| `unavailable`                | Gate evaluation, remote fetch, embedding service, or another typed dependency-unavailable failure.                                                                                                                                                  |
+| `internal`                   | An explicitly mapped internal/fusion/driver-control failure. This is never a default for an unknown variant.                                                                                                                                        |
+
+Evidence wrappers retain their original typed cause. The runtime, storage, query,
+structured error-kind, and audit-terminal matches are exhaustive, so a new variant
+requires an explicit mapping at compile time. A gate-denied row is distinguished
+from a handler's `PermissionDenied` by its existing dispatch location, not its
+reason string.
+
+Success rows have no `error_class`. Historical rows without it keep that absence;
+readers must not invent `internal` or any other default. `brain.event_counts`
+counts recognized classes only on non-success audit rows and separately reports
+unclassified non-success rows. Unknown future tokens are unclassified too.
+This enrichment does not create audit rows for paths that previously had none,
+and cannot record a failure to persist the audit row into that same missing row.
 
 ## persist_git_digest_receipt
 

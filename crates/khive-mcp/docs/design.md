@@ -170,8 +170,9 @@ delivery and acknowledgement rules.
 - The `daemon.rs` module provides the client side: `forward_or_spawn` connects
   to a warm daemon, auto-spawns it on first use, and maps responses to MCP
   error types. Ordinary fallback paths return `None` so the caller dispatches
-  locally. `KHIVE_DAEMON_STRICT=1` (#947) turns a recordable fallback into a
-  caller-visible per-op error instead of completing it locally; `KHIVE_NO_DAEMON`
+  locally. Strict mode (#947; `KHIVE_DAEMON_STRICT=1`, or unset while a daemon
+  socket or PID file is on disk, ADR-049 Amendment 14) turns a recordable
+  fallback into a caller-visible per-op error instead of completing it locally; `KHIVE_NO_DAEMON`
   and the `request` tool's `save_to` bypass remain intentional local paths,
   unaffected by strict mode.
 - The daemon is bound to `~/.khive/khived.sock`. Namespace mismatches trigger

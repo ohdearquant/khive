@@ -87,18 +87,14 @@ fn list_items(response: &Value) -> &[Value] {
 
 // ---- PackRuntime trait: verbs() and unknown-verb dispatch ----
 
-// ADR-046 (cluster-22) added propose, review, and withdraw — bringing the
-// handler count from 11 to 14, then 15 with verbs introspection, then 16
-// with stats, then 17 with context (ADR-089), then 18 with resolve
-// (unified-verb draft ADR Slice 1), then 19 with whoami, then 20 with
-// db_diagnostics (ADR-091 operator surface), then restore, then scan.
+// KG includes the schema introspection verb and the five stream verbs.
 #[test]
-fn pack_verbs_returns_twenty_six() {
+fn pack_verbs_returns_thirty_one() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        26,
-        "KgPack must expose exactly 26 verbs including ordered streams, restore, and scan"
+        31,
+        "KgPack must expose exactly 31 verbs including attach, schema and canonical change-set apply"
     );
 }
 
@@ -107,10 +103,13 @@ fn pack_verbs_names_are_correct() {
     let pack = pack();
     let names: Vec<&str> = pack.verbs().iter().map(|v| v.name).collect();
     for expected in &[
+        "apply_changeset",
+        "attach",
         "create",
         "get",
         "list",
         "stats",
+        "count",
         "update",
         "delete",
         "merge",
@@ -123,6 +122,7 @@ fn pack_verbs_names_are_correct() {
         "review",
         "withdraw",
         "verbs",
+        "schema",
         "context",
         "resolve",
         "whoami",
@@ -132,6 +132,7 @@ fn pack_verbs_names_are_correct() {
         "stream.batch",
         "stream.read",
         "stream.stat",
+        "stream.truncate",
     ] {
         assert!(names.contains(expected), "verbs() missing {expected:?}");
     }
@@ -14826,20 +14827,64 @@ async fn list_edge_limit_over_cap_truncates_with_metadata_in_both_modes() {
         "must have seeded exactly 1001 edges for this test's premise"
     );
 
-    // Offset mode.
-    let resp = pack
-        .dispatch("list", json!({"kind": "edge", "limit": 1500}))
-        .await
-        .expect("#894: list edges must succeed even when the cap binds");
-    let items = resp["items"].as_array().expect("items must be an array");
-    assert_eq!(
-        items.len(),
-        1000,
-        "must truncate to EDGE_LIST_MAX_LIMIT (1000) exactly"
-    );
-    assert_eq!(resp["requested_limit"], 1500);
-    assert_eq!(resp["effective_limit"], 1000);
-    assert_eq!(resp["limit_clamped"], true);
+    let edge_ids = |response: &Value| {
+        let items = list_items(response);
+        let ids: std::collections::HashSet<uuid::Uuid> = items
+            .iter()
+            .map(|item| {
+                item["id"]
+                    .as_str()
+                    .expect("edge must expose its id")
+                    .parse()
+                    .expect("edge id must be a complete UUID")
+            })
+            .collect();
+        assert_eq!(ids.len(), items.len(), "page must not duplicate edge ids");
+        ids
+    };
+    for requested in [1000u32, 1500] {
+        let first = pack
+            .dispatch(
+                "list",
+                json!({"kind": "edge", "limit": requested, "offset": 0}),
+            )
+            .await
+            .expect("offset edge list at the cap must succeed");
+        assert_eq!(list_items(&first).len(), 1000);
+        assert_eq!(
+            first["has_more"], true,
+            "requested={requested}: capped first page must disclose more edges"
+        );
+        assert_eq!(first["requested_limit"], requested);
+        assert_eq!(first["effective_limit"], 1000);
+        assert_eq!(first["limit_clamped"], requested > 1000);
+
+        let tail = pack
+            .dispatch(
+                "list",
+                json!({"kind": "edge", "limit": requested, "offset": 1000}),
+            )
+            .await
+            .expect("terminal offset edge page must succeed");
+        assert_eq!(list_items(&tail).len(), 1);
+        assert_eq!(
+            tail["has_more"], false,
+            "requested={requested}: terminal page must be complete"
+        );
+        assert_eq!(tail["requested_limit"], requested);
+        assert_eq!(tail["effective_limit"], 1000);
+        assert_eq!(tail["limit_clamped"], requested > 1000);
+
+        let mut stitched = edge_ids(&first);
+        let tail_ids = edge_ids(&tail);
+        assert!(stitched.is_disjoint(&tail_ids), "pages must not overlap");
+        stitched.extend(tail_ids);
+        assert_eq!(
+            stitched.len(),
+            created,
+            "pages must cover all 1001 seeded edges"
+        );
+    }
 
     // Cursor mode retains its cursor metadata and adds the limit metadata.
     let cursor_resp = pack
@@ -15409,7 +15454,7 @@ async fn search_entity_hyphenated_adr_id_with_plain_terms_matches() {
 /// two independent reads of the same counters.
 ///
 /// The guarantee holds only because the audit row's `freeze()` runs during
-/// dispatch, before the envelope's `frozen_or_snapshot()`. Nothing in the
+/// dispatch, before the envelope's `shipping_snapshot()`. Nothing in the
 /// suite pinned that, so a refactor or a new envelope-assembly path could
 /// invert the order: the envelope would silently return a live snapshot, the
 /// two would disagree, and no test would fail — on numbers a customer can
@@ -15424,7 +15469,7 @@ async fn search_entity_hyphenated_adr_id_with_plain_terms_matches() {
 /// object, the late increment leaks into it and this fails.
 ///
 /// Limit, stated rather than implied: the envelope value is read through the
-/// same expression `stamp_usage` uses (`ctx.frozen_or_snapshot()`) rather than
+/// same expression `stamp_usage` uses (`ctx.shipping_snapshot()`) rather than
 /// by driving the MCP server, because the audit row is only reachable from the
 /// pack surface. That one-line wrapper is not covered here.
 #[tokio::test]
@@ -15455,7 +15500,7 @@ async fn envelope_usage_equals_audit_row_resource_units() {
     ctx.add(UsageUnit::DbRoundTrips, LATE);
 
     // Exactly what the response envelope stamps.
-    let envelope_usage = ctx.frozen_or_snapshot();
+    let envelope_usage = ctx.shipping_snapshot().expect("known committed usage");
 
     let events = pack
         .dispatch(
@@ -15823,127 +15868,7 @@ async fn query_page_size_validation_alias_and_hard_cap_are_explicit() {
     assert_eq!(legacy.get("page_size").and_then(Value::as_u64), Some(7));
 }
 
-// ---- db_diagnostics: ADR-165 reader + ADR-133 writer contention fields ----
-
-#[tokio::test]
-async fn db_diagnostics_runtime_audit_fields_are_additive() {
-    let pack = pack();
-
-    let report = pack
-        .dispatch("db_diagnostics", json!({}))
-        .await
-        .expect("db_diagnostics must succeed against an in-memory backend");
-
-    let reader_contention = report
-        .get("reader_contention")
-        .expect("reader_contention section must be present");
-    for field in [
-        "reader_admission_capacity",
-        "available_reader_admission_slots",
-        "reader_acquisitions",
-        "pooled_reader_checkouts",
-        "standalone_reader_opens",
-        "infrastructure_standalone_reader_opens",
-        "reader_checkout_timeouts",
-        "reader_busy_timeouts",
-        "active_pooled_reader_checkouts",
-        "peak_active_pooled_reader_checkouts",
-        "completed_pooled_reader_checkouts",
-        "max_completed_reader_hold_micros",
-        "reader_replacement_open_failures",
-    ] {
-        let value = reader_contention.get(field).unwrap_or_else(|| {
-            panic!("reader_contention.{field} must be present in the wire payload")
-        });
-        assert!(
-            value.is_u64(),
-            "reader_contention.{field} must be a non-negative integer, got {value:?}"
-        );
-    }
-
-    // The hold attribution is the one field here that is not a counter: it
-    // names the operation behind `max_completed_reader_hold_micros`, or null
-    // when that hold came through a route carrying no operation name (#2793).
-    // Asserted separately because the loop above requires an integer, and a
-    // field left out of both checks is a field that can disappear unnoticed.
-    let attribution = reader_contention
-        .get("max_completed_reader_hold_operation")
-        .expect("reader_contention.max_completed_reader_hold_operation must be in the payload");
-    assert!(
-        attribution.is_null() || attribution.is_string(),
-        "the hold attribution must be an operation name or null, got {attribution:?}"
-    );
-
-    let writer_contention = report
-        .get("writer_contention")
-        .expect("writer_contention section must be present");
-
-    // Pool-sourced counters (ADR-133 D8): always concrete integers, never
-    // Option, regardless of whether the caller is the runtime or a direct
-    // khive-db user — they come straight off the pool.
-    for field in [
-        "writer_task_begin_busy",
-        "writer_task_begin_busy_absorbed",
-        "writer_task_request_failures",
-        "writer_task_side_effects_unknown",
-    ] {
-        let value = writer_contention.get(field).unwrap_or_else(|| {
-            panic!("writer_contention.{field} must be present in the wire payload")
-        });
-        assert!(
-            value.is_u64(),
-            "writer_contention.{field} must serialize as a plain non-negative integer, got {value:?}"
-        );
-    }
-
-    // Legacy field: population is unchanged by this additive change. Every
-    // dispatch through the runtime supplies its process-wide swallowed-audit
-    // count, so this remains a concrete number with no unavailable reason —
-    // exactly today's behavior, unperturbed by the new fields.
-    assert!(
-        writer_contention
-            .get("audit_append_failures")
-            .is_some_and(Value::is_u64),
-        "audit_append_failures must retain its existing store-operation population semantics: \
-         {writer_contention:?}"
-    );
-    assert!(writer_contention
-        .get("audit_append_failures_unavailable_reason")
-        .map(Value::is_null)
-        .unwrap_or(false));
-
-    // Runtime audit-batch fields (ADR-133 D8 wire additions): additive and,
-    // with no audit-batch control registered yet, unavailable with a reason
-    // rather than a silently fabricated value.
-    for (field, reason_field) in [
-        (
-            "audit_batch_flush_failures",
-            "audit_batch_flush_failures_unavailable_reason",
-        ),
-        (
-            "audit_degraded_rows",
-            "audit_degraded_rows_unavailable_reason",
-        ),
-        ("audit_degraded", "audit_degraded_unavailable_reason"),
-    ] {
-        assert!(
-            writer_contention
-                .get(field)
-                .map(Value::is_null)
-                .unwrap_or(false),
-            "writer_contention.{field} must be null until an audit-batch control is wired: \
-             {writer_contention:?}"
-        );
-        assert!(
-            writer_contention
-                .get(reason_field)
-                .and_then(Value::as_str)
-                .is_some(),
-            "writer_contention.{reason_field} must explain the unavailable field: \
-             {writer_contention:?}"
-        );
-    }
-}
+include!("integration/diagnostics.rs");
 
 #[tokio::test]
 async fn update_empty_string_property_survives_agent_echo_and_readback() {
@@ -17465,4 +17390,270 @@ async fn create_bulk_best_effort_commit_fault_fails_only_its_item() {
     assert_eq!(results[2]["ok"], true);
     assert_eq!(count_in(&pack, &namespace, "concept").await, 2);
     assert_eq!(count_in(&pack, &namespace, "observation").await, 0);
+}
+
+// Grouped counts exercise the public registry and real SQLite aggregation.
+fn event_count_fixture() -> (KhiveRuntime, VerbRegistry) {
+    use khive_runtime::{RuntimeConfig, WalCeilingSource};
+    let config = RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: Vec::new(),
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_env_raw: None,
+        wal_ceiling_source: WalCeilingSource::Default,
+        disk_guard_config: None,
+        disk_guard_environment: Default::default(),
+        volume_lock_dir: None,
+        visibility_receipts: None,
+        credentials: Vec::new(),
+        actor_id: None,
+        visible_namespaces: Vec::new(),
+        allowed_outbound_namespaces: Vec::new(),
+        brain_profile: None,
+        brain: Default::default(),
+        events_split: None,
+        mounts: Vec::new(),
+        blob: Default::default(),
+        packs: vec!["kg".into()],
+        ..RuntimeConfig::no_embeddings()
+    };
+    let runtime = KhiveRuntime::new(config).expect("isolated memory runtime");
+    assert!(!runtime.backend().is_file_backed());
+    let mut builder = VerbRegistryBuilder::new();
+    // The composition root registers built-in packs through the trusted path;
+    // an untrusted registration is skipped and the degrade-safe probe is false.
+    builder.register_trusted(KgPack::new(runtime.clone()));
+    let registry = builder.build().unwrap();
+    assert!(registry.admission_degrade_safe_probe("count"));
+    (runtime, registry)
+}
+
+async fn seed_count_event(
+    runtime: &KhiveRuntime,
+    namespace: &str,
+    verb: &str,
+    kind: khive_types::EventKind,
+    actor: &str,
+    at: i64,
+    outcome: khive_types::EventOutcome,
+) {
+    let mut event = khive_storage::Event::new(
+        namespace,
+        verb,
+        kind,
+        khive_types::SubstrateKind::Note,
+        actor,
+    )
+    .with_outcome(outcome);
+    event.created_at = at;
+    // Seed historical attribution directly; public reads still use the sealed
+    // identity and its attributed EventStore wrapper.
+    runtime
+        .backend()
+        .events_for_namespace(namespace)
+        .unwrap()
+        .append_event(event)
+        .await
+        .unwrap();
+}
+
+async fn grouped_count(registry: &VerbRegistry, visible: &[&str], args: Value) -> Value {
+    registry
+        .dispatch_with_identity(
+            "count",
+            args,
+            Some(khive_runtime::RequestIdentity {
+                namespace: "local".into(),
+                visible_namespaces: visible.iter().map(|ns| (*ns).to_owned()).collect(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("public grouped count")
+}
+
+#[tokio::test]
+async fn event_count_groups_only_visible_rows_inside_exclusive_time_bounds() {
+    use khive_types::{EventKind, EventOutcome};
+    let (runtime, registry) = event_count_fixture();
+    for (namespace, verb, kind, actor, at, outcome) in [
+        (
+            "local",
+            "verb_a",
+            EventKind::Audit,
+            "actor:a",
+            101,
+            EventOutcome::Success,
+        ),
+        (
+            "local",
+            "verb_a",
+            EventKind::Audit,
+            "actor:a",
+            102,
+            EventOutcome::Success,
+        ),
+        (
+            "local",
+            "verb_a",
+            EventKind::Refusal,
+            "actor:b",
+            103,
+            EventOutcome::Denied,
+        ),
+        (
+            "local",
+            "verb_b",
+            EventKind::Audit,
+            "actor:b",
+            104,
+            EventOutcome::Success,
+        ),
+        (
+            "local",
+            "verb_b",
+            EventKind::Refusal,
+            "actor:a",
+            105,
+            EventOutcome::Error,
+        ),
+        (
+            "local",
+            "at_lower_bound",
+            EventKind::Audit,
+            "actor:a",
+            100,
+            EventOutcome::Success,
+        ),
+        (
+            "local",
+            "at_upper_bound",
+            EventKind::Audit,
+            "actor:a",
+            200,
+            EventOutcome::Success,
+        ),
+        (
+            "visible",
+            "verb_a",
+            EventKind::Audit,
+            "actor:c",
+            106,
+            EventOutcome::Success,
+        ),
+        (
+            "hidden",
+            "secret",
+            EventKind::Audit,
+            "actor:hidden",
+            107,
+            EventOutcome::Success,
+        ),
+    ] {
+        seed_count_event(&runtime, namespace, verb, kind, actor, at, outcome).await;
+    }
+    let args = json!({"kind":"event", "group_by":"verb", "since":100, "until":200});
+    assert_eq!(
+        grouped_count(&registry, &[], args.clone()).await,
+        json!({"verb_a":3, "verb_b":2})
+    );
+    assert_eq!(
+        grouped_count(&registry, &["visible", "visible"], args.clone()).await,
+        json!({"verb_a":4, "verb_b":2})
+    );
+    let mut by_kind = args.clone();
+    by_kind["group_by"] = json!("kind");
+    assert_eq!(
+        grouped_count(&registry, &[], by_kind).await,
+        json!({"audit":3, "refusal":2})
+    );
+    let mut by_actor = args.clone();
+    by_actor["group_by"] = json!("actor");
+    assert_eq!(
+        grouped_count(&registry, &["visible"], by_actor).await,
+        json!({"actor:a":3, "actor:b":2, "actor:c":1})
+    );
+    let mut filtered = args.clone();
+    filtered["verb"] = json!("verb_a");
+    filtered["verbs"] = json!(["verb_b"]);
+    filtered["event_kind"] = json!("refusal");
+    filtered["event_kinds"] = json!(["audit"]);
+    filtered["actor"] = json!("actor:b");
+    filtered["outcome"] = json!("denied");
+    filtered["substrate"] = json!("note");
+    assert_eq!(
+        grouped_count(&registry, &[], filtered.clone()).await,
+        json!({"verb_a":1})
+    );
+    filtered["actor"] = json!("actor:b' OR 1=1 --");
+    assert_eq!(grouped_count(&registry, &[], filtered).await, json!({}));
+    let mut empty = args;
+    empty["since"] = json!(201);
+    assert_eq!(
+        grouped_count(&registry, &["visible"], empty).await,
+        json!({})
+    );
+}
+
+#[tokio::test]
+async fn event_count_is_not_truncated_to_the_event_list_page_limit() {
+    use khive_types::{EventKind, EventOutcome};
+    let (runtime, registry) = event_count_fixture();
+    let events = (0..1101)
+        .map(|_| {
+            let mut event = khive_storage::Event::new(
+                "local",
+                "many",
+                EventKind::Audit,
+                khive_types::SubstrateKind::Note,
+                "actor:a",
+            )
+            .with_outcome(EventOutcome::Success);
+            event.created_at = 150;
+            event
+        })
+        .collect();
+    runtime
+        .backend()
+        .events_for_namespace("local")
+        .unwrap()
+        .append_events(events)
+        .await
+        .unwrap();
+    assert_eq!(
+        grouped_count(
+            &registry,
+            &[],
+            json!({"kind":"event", "group_by":"verb", "since":100, "until":200})
+        )
+        .await,
+        json!({"many":1101})
+    );
+}
+
+#[tokio::test]
+async fn event_count_rejects_unknown_groups_kinds_and_filter_values() {
+    let (_, registry) = event_count_fixture();
+    for args in [
+        json!({"kind":"note", "group_by":"verb"}),
+        json!({"kind":"event", "group_by":"verb; DROP TABLE events"}),
+        json!({"kind":"event", "group_by":"verb", "event_kind":"not_registered"}),
+        json!({"kind":"event", "group_by":"verb", "event_kinds":["audit", "not_registered"]}),
+        json!({"kind":"event", "group_by":"verb", "substrate":"edge"}),
+        json!({"kind":"event", "group_by":"verb", "outcome":"maybe"}),
+        json!({"kind":"event", "group_by":"verb", "since":"100"}),
+        json!({"kind":"event", "group_by":"verb", "limit":1}),
+    ] {
+        let error = registry.dispatch("count", args.clone()).await.unwrap_err();
+        assert!(is_invalid_input(&error), "{args}: {error:?}");
+    }
+    assert_eq!(
+        registry
+            .dispatch("count", json!({"kind":"event", "group_by":"verb"}))
+            .await
+            .unwrap(),
+        json!({})
+    );
 }

@@ -1,6 +1,6 @@
 # Vamana Persistence
 
-**Scope:** `crates/khive-vamana/src/index.rs` — `VamanaIndex::save`, `VamanaIndex::load`, `VamanaIndex::to_snapshot`, `VamanaIndex::from_snapshot`
+**Scope:** `crates/khive-vamana/src/index/index_load_save.rs` — `VamanaIndex::save`, `VamanaIndex::load`, `VamanaIndex::to_snapshot`, `VamanaIndex::from_snapshot`
 **ADR refs:** ADR-048 (persistence and snapshot validation requirements)
 **Last reviewed:** 2026-06-06
 
@@ -57,8 +57,15 @@ Each node record: `degree: u32` followed by `degree` neighbor IDs as `u32`.
 
 ### `vectors.bin`
 
-Raw `f32` values in little-endian IEEE 754 format, row-major:
-`num_vectors × dimensions × 4` bytes. Loaded via `memmap2` as a read-only mapping.
+Raw `f32` values in the host's native byte order, row-major:
+`num_vectors × dimensions × 4` bytes. Directory checkpoints are loaded via
+`memmap2` as a read-only native-float mapping; their payload and corpus hashes
+are not a cross-endian format. This applies to both v1 and v2 directories.
+
+The portable `to_bytes` / `from_bytes` container instead encodes its vector
+segment as little-endian IEEE 754 values. Reframing a directory without decoding
+its native payload does not convert its byte order. Existing directory payloads,
+mmap readers and fingerprints are unchanged.
 
 ---
 
@@ -131,6 +138,16 @@ continuous availability of the previous snapshot. See
 [ADR-052 Amendment 1](../../../../docs/adr/ADR-052-ann-production-lifecycle.md#amendment-1-2026-09-27-v2-segment-promotion-after-metadata)
 and [ADR-079 Amendment 3](../../../../docs/adr/ADR-079-ann-persistence-warm-path-integration.md#amendment-3-2026-09-27-interrupted-v2-save-can-require-coldrebuild).
 
+The checkpoint directory owns this publication boundary. On Unix it publishes
+metadata through the shared descriptor-relative atomic helper with the existing
+stale-entry refusal policy, including file sync, rename and directory sync, then
+promotes the four already-staged segments in vectors/graph/lifecycle/codes order
+and syncs the directory again. The caller holds `.checkpoint.lock` across all
+staging and publication. If promotion fails partway through, retrying
+`save_atomic` stages all four segments again before publishing a fresh commit;
+the private publication method does not resume an incomplete generation. Windows
+retains its existing handle-relative metadata staging and publication sequence.
+
 File-backed commits append a 16-byte random publication nonce after the existing
 41-byte watermark/codes trailer. Readers accept all three layouts: the original base
 record, the 41-byte trailer record, and the trailer-plus-nonce record. Portable
@@ -157,10 +174,45 @@ mismatch, or an inconsistent lifecycle segment) rather than rebuilding — `load
 is the entry point that decides whether to fall back to a rebuild; `VamanaIndex::load`
 surfaces the error directly to callers that don't hold a corpus to rebuild from.
 
+File-backed v2 reads hash `vectors.bin` through a fixed 64 KiB buffer. Graph and
+lifecycle checksum reads and parsing use temporary read-only mappings; v1 graph
+loads use the same mapped reader, and the save-time sequence guard also maps the
+codes segment. Empty temporary segments
+reach the same checksum and format checks as empty byte buffers. Temporary views
+close before a recovery rebuild publishes replacements. Segment files must not
+be modified or truncated outside the publication-lock protocol, as already
+required for the retained vector and code mappings.
+
+A checksum-valid empty `codes.bin` maps as an empty slice and reaches the codes
+parser, which returns `InvalidFormat`. Strict `load` refuses it;
+`load_or_build` rebuilds it from the corpus, and the sequence guard treats the
+malformed incumbent as repairable. Ordinary file or mapping I/O errors retain
+their existing error path. After a mapping succeeds, a page read fault is
+outside the Rust `Result` path: on Linux, filesystem or device I/O failure can
+raise `SIGBUS` during hashing or parsing and terminate the process. Load-time
+codes mappings already had this exposure; mapped graph and lifecycle reads,
+including v1 graph loads, and the sequence guard's codes read now share it. There
+is no signal recovery in these paths.
+
+The parsed graph and lifecycle retain their owned adjacency lists. Structural
+validation checks the inverse through per-node incoming counts and membership in
+the forward lists, with one sorted medoid forward-list copy for its potentially
+larger degree. Successful validation does not build another full reverse
+adjacency or clone each reverse list, and it preserves their stored order.
+
+Checkpoint regression tests measure live requested heap bytes in a separate
+process running one exact test. Allocation, deallocation and successful resize
+deltas are counted from process start; each operation reports its high-water
+increase above the live baseline, including a loaded index retained by the
+caller. This is neither RSS nor allocator-internal transient memory. Fixtures
+exercise public `load` and `save_atomic` with the same graph and four times the
+vector payload, allowing owned graph/codec state and save-time SQ8 serialization
+while refusing an additional incumbent vector-sized heap copy.
+
 ## lifecycle.bin format
 
-Written by `write_lifecycle` (`index.rs`) as part of the v2 segmented save. All
-fields little-endian:
+Written by `encode_lifecycle` (`index/v2_commit.rs`) as part of the v2 segmented
+save. All fields little-endian:
 
 | Field               | Size                 | Type                                    |
 | ------------------- | -------------------- | --------------------------------------- |
@@ -182,7 +234,7 @@ derived from `tombstone_words`; the caller already knows `num_vectors` from
 
 `VamanaGraph::restore_reverse_adj` installs a previously serialized in-neighbor list
 as `reverse_adj` in O(1) (a move). This is safe to call without redoing the O(N×R)
-rebuild because the v2 fast-load path (`load_v2_fast` in `index.rs`) has already paid
+rebuild because the v2 fast-load path (`load_v2_fast` in `index/index_load_save.rs`) has already paid
 that cost validating bidirectional consistency between the loaded `reverse_adj` and
 the forward `adjacency` before calling it — the O(N×R) work isn't skipped, it just
 happens in the validation step rather than in `restore_reverse_adj` itself.
@@ -191,7 +243,9 @@ happens in the validation step rather than in `restore_reverse_adj` itself.
 
 ## Safety note (mmap)
 
-The single `unsafe` block in `mmap_vectors` maps `vectors.bin` read-only.
+Read-only mappings cover retained vector and code segments and temporary graph,
+lifecycle and sequence-guard code segments. Each unsafe mapping requires the
+publication protocol to preserve the mapped inode and bytes during access.
 The contract: callers must not mutate or truncate the file while the index
 is live. Legacy `save` writes fresh temporary inodes and renames them over
 canonical names, so an existing reader's mapped inode is not truncated.

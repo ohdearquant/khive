@@ -15,6 +15,23 @@ consequences (#2724 proposed it; accepted 2026-09-18).
 **Amended**: 2026-09-22, [memory admission at the proposal-note route withdraws the AddNote
 exception](#amendment-memory-admission-at-the-proposal-note-route-withdraws-the-addnote-exception-2026-09-22)
 (#2057, #2967).
+**Amended**: 2026-11-01, [attributed semantic writes and caller properties](#amendment-attributed-semantic-writes-and-caller-properties-2026-11-01) routes a semantic write with no
+namespace to the caller's actor namespace, replacing the shared-pool default in §10 that the 2026-06-19 entry
+records, and adds `properties` to `memory.remember` (#6356; accepted 2026-11-02).
+**Amended**: 2026-11-02, [batch apply for memory rewrites](#amendment-batch-apply-for-memory-rewrites-2026-11-02)
+adds `memory.apply_batch`, and its
+[Delta 1](#delta-1-old-rows-in-namespaces-the-caller-owns-2026-11-02) admits old rows in namespaces the caller
+declares as owned (#6358, #6362, #6369; accepted 2026-11-02, #6374).
+**Amended**: 2026-11-03, [Delta 2](#delta-2-supersedes-reads-cover-the-namespaces-the-reader-can-see-2026-11-03) of
+the batch-apply amendment: recall reads `supersedes` edges in every namespace the reader can see, and
+`memory.remember` reserves the `supersedes` property (#6386; accepted 2026-11-15, #6390).
+**Amended**: 2026-11-04, [Delta 3](#delta-3-an-edge-between-memory-rows-lives-in-its-source-rows-namespace-2026-11-04) of
+the batch-apply amendment: an edge between two memory rows is written in the source row's namespace by every verb,
+and edge reads report how many such edges they left out (#6380; accepted 2026-11-05, except the amendment to rule
+1's refusal text, which is proposed).
+**Amended**: 2026-11-14, [Delta 4](#delta-4-every-writer-of-a-supersede-applies-the-old-row-namespace-rule-2026-11-14) of
+the batch-apply amendment: every writer of a `supersedes` edge or property applies the old-row namespace rule
+(#6607; accepted 2026-11-15).
 
 ## Context
 
@@ -338,8 +355,9 @@ per-actor-episodic plus shared-semantic model. The prior contract stamped both m
 This is attribution plus view-layer visibility, not storage isolation:
 
 - The store performs no `record.namespace == caller_namespace` check (ADR-007 Rule 2). By-ID ops
-  on a memory note (`get`, `update`, `delete`, `merge` by UUID) are namespace-agnostic regardless
-  of which actor wrote the memory. `delete(id=<memory_uuid>)` (§6) works across actors.
+  on a memory note (`get`, `update`, `delete` by UUID) are namespace-agnostic regardless
+  of which actor wrote the memory. `merge` resolves its ids the same way but keeps its same-namespace guard
+  (ADR-007 Rule 5): both notes must be in the caller's namespace. `delete(id=<memory_uuid>)` (§6) works across actors.
 - Recall reads operate over the caller's read visible-set,
   `{local} ∪ {actor.id} ∪ {actor.visible_namespaces}` (ADR-007 Rule 3b). An actor's own episodic
   memories are visible to its default recall because the set always includes `{actor.id}`. Another
@@ -720,3 +738,641 @@ The pack's `StorageProfile` (from [ADR-003](ADR-003-system-architecture.md) /
 - [ADR-019](ADR-019-gtd-pack.md): GTD pack — the lifecycle-shape pack contrasting with
   the decay-shape pack defined here
 - `crates/khive-pack-memory/`: implementation
+
+## Amendment: declared recall-event correlation (2026-10-06)
+
+**Status**: Proposed\
+**Companion**: [ADR-081 Amendment 1](ADR-081-recall-retune-driver.md#amendment-1-2026-10-06-declared-recall-event-correlation)
+defines the feedback, validation, authority and acceptance contract. This section has
+its own Proposed status; it does not change the Accepted status of the preceding
+record or implement the new field.
+
+For each successful nonempty `memory.recall`, add one fresh canonical lowercase dashed
+UUIDv4 `recall_event_id` to every actual returned hit object. The value is shared within
+that invocation and differs between otherwise identical recalls. Preserve result
+order, profile stamps, bare arrays and existing verbose/degraded/truncated `results`
+envelopes. Diagnostic candidate lists are not returned hits. Human-oriented
+presentations may omit metadata; correlation consumers forward structured results.
+Empty responses retain their current shape with no top-level ID, and failed calls
+return no correlation identifier.
+
+Allocate the ID before response projection/background handoff. When the existing
+best-effort `RecallExecuted` append succeeds, its physical `Event.id` is that exact
+UUID. Existing zero-result telemetry may generate an unreturned ID. Task admission,
+timeouts and telemetry failures remain off the response path: the returned ID declares
+an intended event identity, not a committed receipt. Feedback may arrive before the
+event or refer to an event that never persists; a missing row is unknown. Duplicate
+physical event IDs refuse append, including identical replays, without overwriting
+the event or its projections or retrying with a replacement ID.
+
+Automatic feedback forwards only the uniquely selected result's optional correlation.
+The shared feedback handler also accepts it directly under the ADR-081 validation
+rules. Missing/null remains compatible; no-signal abstention does not validate
+correlation. The value is unverified caller context, never authority to read an event,
+change a namespace/profile, or bypass scorer/dedup/clamp rules. No recall lookup,
+synchronous durability, backfill or new storage schema is introduced.
+
+Both Proposed sections require formal acceptance before dependent implementation
+merges. Implementation and its acceptance use actual `main` after #4277 and #4279
+land, with their changes preserved. ADR-081's real-path acceptance includes physical
+event-ID equality across repeated recalls, selected-result forwarding, legacy and
+malformed inputs, namespace isolation, task/append failures and duplicate-ID refusal.
+No implementation or executed acceptance is claimed by this documentation change.
+
+## Amendment: attributed semantic writes and caller properties (2026-11-01)
+
+**Status**: Accepted 2026-11-02 (Proposed 2026-11-01). Amends §4 (the `memory.remember` arguments), §5 (the recall hit
+shape) and §10 (the semantic row of the routing table).
+
+### Problem
+
+Two gaps make it impossible to tell from a memory row who wrote it and where its fact came from.
+
+1. §10 routes a semantic write that names no namespace to the token namespace, which is `local` for every caller. The
+   fields a memory row stores carry no writer other than its namespace, so a store shared by several actors
+   accumulates semantic rows whose writer is lost for good.
+2. `memory.remember` accepts `tags` but no structured metadata. A caller that needs to record provenance (who, when,
+   where, what kind of fact, which records it came from, which row it replaces) writes it into the content. That text
+   is embedded and indexed with the fact, so provenance competes with meaning in vector and lexical ranking, and none
+   of it can be read back as a field.
+
+### Decision
+
+1. **Default write namespace.** With no `namespace=` argument, both memory types write to the caller's actor namespace
+   (`token.actor().id`). The §10 table's semantic row becomes `token.actor().id`. An explicit `namespace=X` still wins
+   for both types, `local` included: shared knowledge is written to the shared pool by choice, not by default.
+2. **Anonymous callers.** An anonymous caller's actor id is `local` (`ActorRef::anonymous`), so its writes of either
+   type land in `local` as before, and they are flagged: the runtime stores `properties.attribution = "unresolved"`
+   on the row and returns `"attribution": "unresolved"` in the response. An attributed write carries no
+   `attribution` key. Refusing anonymous writes was considered and rejected as the default, because a fresh
+   single-user install with no actor configured makes every write anonymous.
+3. **`properties` on `memory.remember`.** An optional JSON object, stored in `note.properties` beside `memory_type` and
+   `tags`. Each rule below refuses with an invalid-input error that names the key and the rule; nothing is truncated.
+   - At most 32 keys. A key is 1 to 64 characters: an ASCII lowercase letter, then lowercase letters, digits or `_`.
+   - `memory_type` and `tags` have their own parameters, `attribution` is written by the runtime, and `supersedes` is written by `memory.apply_batch`; use `link(relation="supersedes")` to add a supersedes edge.
+   - A value is a string, a finite number, a boolean, or an array of strings. Null, nested objects and arrays holding
+     anything but strings are refused.
+   - The serialized object is at most 8192 bytes; the refusal reports the measured size and the limit.
+
+   Conventional keys for provenance, not enforced: `who`, `when`, `where`, `kind`, `source_ids`, `supersedes`.
+   Changing a memory's properties later uses the generic `update` verb, whose `properties` argument already
+   shallow-merges into the note.
+4. **Recall hit shape.** Every returned hit adds `namespace`, `tags` (`[]` when none) and `properties` (the stored
+   object, `{}` when none). Existing fields keep their names and meaning.
+
+### Consequences
+
+- **Read visibility.** A semantic memory written by actor A is in A's default recall view. Actor B reads it when B's
+  `visible_namespaces` lists A ([ADR-007](ADR-007-namespace.md) Rule 3b), as episodic memories are read today. A
+  deployment that relied on every actor seeing semantic rows through `local` either lists the writers in
+  `visible_namespaces` or writes shared facts with `namespace="local"`.
+- **Existing rows stay where they are.** Rows already in `local` keep their namespace; re-attributing them is a data
+  migration outside this amendment.
+- **Prune.** `memory.prune` keeps its default namespace filter, `local`; pruning an actor's semantic memories passes
+  `namespace=<actor id>`.
+- **Trust.** Properties are caller-asserted context, never verified attribution; the write namespace remains the
+  runtime's attribution.
+- **Keyed replay.** A replay under an idempotency key compares content only, as it does for tags: a replay with the
+  same content and different properties returns the stored memory unchanged with `replayed=true`.
+- **Recall budget.** `token_budget_chars` keeps counting memory content only. A hit can carry up to 8192 bytes of
+  properties that the budget does not count; the limit is the bound.
+
+### Alternatives considered
+
+| Alternative                                                            | Disposition                                                                                                                          |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Keep semantic writes in `local` and stamp a writer key into properties | Rejected: two attribution channels for one fact, and `local` stays the default home of rows nobody owns.                             |
+| Refuse anonymous memory writes                                         | Rejected as the default: it breaks a single-user install with no actor configured.                                                   |
+| Nested, free-form properties                                           | Rejected: flat scalar and string-list values are what filters and recall output need; nesting invites storing documents in metadata. |
+
+### Validation
+
+The implementing change carries, for each rule in Decision 3, a refusing test and a passing boundary test (32 keys
+pass and 33 refuse; a 64-character key passes and 65 refuses; 8192 bytes pass and 8193 refuse); a remember with
+properties read back through `get` and through a recall hit; an attributed semantic write with no namespace landing in
+the actor namespace; an explicit `namespace="local"` semantic write landing in `local`; anonymous semantic and
+episodic writes landing in `local` with `attribution: "unresolved"` in the row and the response; anonymous semantic and
+episodic writes naming `namespace="local"` flagged the same way; and an attributed write with no `attribution` key.
+
+## Amendment: batch apply for memory rewrites (2026-11-02)
+
+**Status**: Accepted 2026-11-02 (Proposed 2026-11-02). Adds the `memory.apply_batch` verb. Builds on the amendment of
+2026-11-01 (caller properties and the actor-namespace default).
+
+### Problem
+
+This amendment serves the project owner's instruction of 2026-11-01, rendered: "No, that won't do: every memory has to
+be updated, without exception. This can go a little at a time; as far as possible, each agent reads its own rows
+itself." A few minutes later the same instruction set out the program, rendered: "All memory entries must be updated
+by the agents that wrote them ... as they go through, they keep records, a jsonl file for batch operations ... execute
+all these updates ... then, at rest, reindex all memory." This verb keeps and executes those records; Decision 7 names
+the reindex.
+
+Rewriting a store's memories means writing one new row per fact, linking it to the row it replaces, and keeping the
+old row. Done as separate `memory.remember` and `link` calls, a rewrite of thousands of rows has no dry run, no single
+place that checks each row against the rules before anything is written, and no safe way to resume after a failure:
+an unkeyed re-run writes duplicates. The kg `apply_changeset` verb is atomic but has no dry run, refuses a `tags` key in
+properties, refuses a replayed create as an error, and does not go through the memory write path.
+
+### Decision
+
+1. **The verb.** `memory.apply_batch(batch, rows, dry_run = true)`. `batch` is a name of at most 128 characters; `rows`
+   holds 1 to 200 rows; `dry_run` is true unless the caller passes `false`. An anonymous caller is refused before any
+   row is read, since every write would land in the shared namespace with no writer.
+2. **Row shape.** `{id?, part = 1, action, content?, memory_type?, salience?, properties?, tags?}`; unknown fields are
+   refused. `action` is one of:
+   - `supersede`: `id` names the old row. Writes a new memory and a `supersedes` edge from it to the old row. The old
+     row is not changed.
+   - `create`: no `id`. Writes a new memory with no edge, for a fact found in records that no memory holds.
+   - `skip`: `id` names the old row; nothing is written.
+   - `delete-candidate`: `id` names the old row; nothing is written, and the row is listed for a person to decide.
+3. **Writes.** A `supersede` or `create` row is written through the `memory.remember` path (embedding, text index,
+   decay) in the caller's own namespace; no row can name another namespace. The verb adds three properties, which a
+   row may not supply itself: `batch` (the batch name), `supersedes` (the old row's full id, `supersede` only) and
+   `batch_row` (the SHA-256 of the row's canonical JSON: action, id, part, content, memory_type, salience, properties,
+   tags). The remember idempotency key is `<batch>:<old id>:<part>` for `supersede` and `<batch>:create:<part>` for
+   `create`; two rows of one call with the same key are both refused.
+4. **Re-runs.** When the key is already taken in the caller's namespace and the stored `batch_row` equals the row's,
+   the row is `deduped` and its `supersedes` edge is asserted again (linking is idempotent), so a run that stopped
+   between the write and the edge completes. When the stored `batch_row` differs, the row is refused as
+   `dedupe-name-taken`; a corrected row needs a new `part` or a new batch name. Nothing is overwritten.
+5. **Checks, per row, identical in a dry run and a real run.** A batch name whose required row-key shapes fail the
+   content gate is refused at intake, including in a dry run. A failing row is refused with a reason and never stops
+   the others:
+   - `id` missing for `supersede`, `skip` or `delete-candidate`, or present for `create`;
+   - the old row does not resolve, is not a memory, or sits in a namespace that is neither the caller's nor the shared
+     one (the reason names the namespace found);
+   - `content` empty, or any check `memory.remember` applies to content, memory_type, tags or properties fails (the
+     reason carries remember's message);
+   - the salience the row would be stored with (the supplied `salience`, or the memory type's default when the row
+     gives none: 0.5 for semantic, 0.3 for episodic) outside [0, 1], or above 0.4 while `properties.verified` is
+     absent, `false` or empty; `verified` is `true` or a non-empty string naming what was checked;
+   - `properties.who` absent or empty on a `supersede` or `create` row;
+   - `properties.source_ids` absent or empty on a `supersede` row whose old row sits in the shared namespace;
+   - a supplied `batch`, `supersedes` or `batch_row` property;
+   - credential-shaped text in the idempotency key, the content, the properties or the tags, found by the same
+     scans the write path runs (the reason names the detector and the field, never the matched text).
+6. **Result.** One entry per row, in input order: `{id, part, action, outcome, old_namespace, new_id, reason}`, with
+   `outcome` one of `planned`, `written`, `deduped`, `skipped`, `listed`, `refused`, `failed`. `old_namespace` is the
+   old row's namespace as read; `new_id` comes from the write itself. `failed` means the store refused a write that
+   passed every check; the row is re-runnable. Counts per outcome follow the entries. A dry run returns `planned` or
+   `deduped` where a real run would write or dedupe.
+7. **Reindex.** Rows written by the verb are embedded and indexed at write and are recallable at once. Superseded rows
+   stay stored and recall's supersedes suppression (on by default) drops any candidate with an incoming `supersedes`
+   edge the reader can see. A full re-embed after a store-wide rewrite is `kkernel reindex --namespace <ns>`, which
+   re-embeds entities, notes (memories included) and knowledge with each kind's embedding policy and fills missing
+   vectors; `--id <uuid>` repairs one record.
+
+### Consequences
+
+- A rewrite is resumable chunk by chunk: re-running a chunk writes only what is missing and refuses a changed row
+  instead of silently keeping the first version.
+- The old row is never modified or deleted by this verb; deletion stays a separate, human decision.
+- A chunk is not atomic: a storage failure leaves the rows before it written. That is the price of resumability, and the
+  result names every row's outcome.
+
+### Alternatives considered
+
+| Alternative                               | Disposition                                                                                                 |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| kg `apply_changeset`                      | Rejected: no dry run, `tags` refused in properties, replayed create is an error, not the memory write path. |
+| Caller loops `memory.remember` and `link` | Rejected: no dry run, no per-row check before writing, and an unkeyed re-run writes duplicates.             |
+| Atomic chunk                              | Rejected: a single bad row would void 199 good ones, and a re-run would still need the dedupe rule above.   |
+| Overwrite on a changed re-run             | Rejected: a corrected row would silently replace a row other readers may already have recalled and judged.  |
+
+### Validation
+
+Tests for: dry run writing nothing and reporting the same refusals as a real run; each refusal reason above, including
+a semantic row with no salience and no `verified`; a `supersede` writing one row in the caller's namespace with the
+three added properties and one `supersedes` edge, the old row unchanged; a `create` writing no edge; a re-run of the
+same chunk returning `deduped` for every written row and writing nothing; a re-run with one row's properties changed
+refusing that row as `dedupe-name-taken`; a deduped row whose edge was missing getting its edge; an anonymous caller
+refused; 201 rows refused; the new row recalled at once and the old row suppressed by the edge.
+
+### Follow-ups
+
+- The dedupe name is held only by a live row: the unique index on `(namespace, kind, key)` excludes deleted rows
+  (migration 028). After the holder is pruned, a re-run of its chunk writes one new live row with the same `batch_row`.
+  That is the intended direction: the fact is written again, never lost and never duplicated among live rows.
+- #6361: compare `batch_row` when the remember write replays an existing row.
+- #6359: version the `batch_row` digest before the row shape changes.
+
+### Delta 1: old rows in namespaces the caller owns (2026-11-02)
+
+**Status**: Accepted 2026-11-02 (Proposed 2026-11-02). Changes Decision 5's namespace check only.
+
+**Problem.** An actor that runs helper agents often gives them their own namespace, so their memories stay apart
+from the actor's own until they are checked. Under a store-wide rewrite those rows belong to the actor that ran the
+helpers, yet Decision 5 refuses them as `old-namespace`: their namespace is neither the caller's nor the shared one.
+Measured on one deployment's export: 369 rows sit in four such namespaces, one per actor.
+
+**Decision.**
+
+1. **Declaration.** The `[actor]` table takes `owned_namespaces`, a list of namespaces, empty by default. Loading the
+   configuration refuses an empty entry, an entry that does not parse as a namespace, the shared namespace `local`,
+   the actor's own id, a duplicate, and a non-empty list with no `[actor] id`. Ownership is declared by name and never inferred:
+   `visible_namespaces` grants read access, and configurations list other actors there for reading, so it says
+   nothing about ownership; a namespace that shares the actor's id as a prefix is not owned unless it is listed.
+2. **Carriage.** The list travels with the caller's identity, the same way as `actor_id` and `visible_namespaces`:
+   from the configuration in process, and on the daemon request frame as `owned_namespaces`, omitted when empty. A
+   daemon that predates the field ignores it, so an owned row is refused there as `old-namespace`: a missing
+   declaration produces a refusal, never an admission. When the caller pins an actor other than the configured
+   one, the client's configuration resolver drops the list, because it was declared for the configured actor. The
+   daemon takes the list on the frame as sent and does not check it against the frame's `actor_id`.
+3. **The check.** Decision 5's namespace rule becomes: the old row's namespace is the caller's own, the shared one,
+   or one listed in the caller's `owned_namespaces`; anything else is refused as `old-namespace`, and the reason
+   names the namespace found. An owned row is checked like a row in the caller's own namespace, so the shared-row
+   `source_ids` rule does not apply to it. The new row is written in the caller's namespace as before, and the old
+   row is not changed.
+4. **Scope.** The declaration is read by this check alone. It grants no write into the owned namespace, widens no
+   read, and no other verb consults it. (Delta 4 makes the supersede writes it names read the same list.)
+
+**Consequences.** A caller's declaration is its own claim, carried at the same trust as its `actor_id`. On one
+machine, any client running as the same user can therefore declare another actor's namespace as owned, and a
+supersede there hides that actor's old rows from recall while keeping them in the store. The hiding reaches only a
+reader whose recall covers both that namespace and the caller's: the new row and its `supersedes` edge are written in
+the caller's namespace, and recall reads `supersedes` edges in the namespaces the reader can see
+([Delta 2](#delta-2-supersedes-reads-cover-the-namespaces-the-reader-can-see-2026-11-03)), so a reader scoped to the
+owning actor's namespace alone still recalls the old rows. The check is a rule of this
+verb, not an access control: by-ID operations stay namespace-agnostic ([ADR-007](ADR-007-namespace.md) Rule 2) and
+isolation is a storage-layer property (Rule 9), so the declaration only bounds what `memory.apply_batch` agrees to
+supersede: more than with no declaration, which refuses every row outside the caller's namespace and the shared `local` one, and less than a
+by-ID operation reaches. It protects no row from a caller that holds its id. An owned namespace has to be listed by every configuration that rewrites its rows. A row in an undeclared namespace keeps the
+refusal it has today.
+
+**Alternatives considered.** Reading ownership from `visible_namespaces` (rejected: read access, and it lists other
+actors). An `<actor id>:` prefix rule (rejected: an actor's sub-actors under its prefix can be separate writers that
+rewrite their own rows, and some helper namespaces do not share the prefix). A per-call argument naming the owned
+namespaces (rejected: a choice made per call rather than once in configuration, and invisible in the configuration a
+reviewer reads).
+
+**Validation.** Tests for: each load-time refusal above and an accepted list; a dry run admitting an old row in an
+owned namespace with `old_namespace` naming it; the same row refused as `old-namespace` when the list is empty; a
+namespace that shares the actor's prefix but is not listed refused; a daemon request frame without the field
+decoding to an empty list and a frame with an empty list omitting it; a pinned actor other than the configured one
+carrying no owned namespaces.
+
+### Delta 2: supersedes reads cover the namespaces the reader can see (2026-11-03)
+
+**Status**: Accepted 2026-11-15 (Proposed 2026-11-03), implemented by #6390. Changes how recall's supersedes
+suppression (Decision 7) reads, and the reserved
+`properties` keys of the 2026-11-01 amendment.
+
+**Problem.** Decision 7 says recall drops any candidate with an incoming `supersedes` edge the reader can see, but the
+edge lookup read only the request's primary namespace. A request with no `namespace` argument has `local` as its
+primary namespace and sees more than `local`, so an edge that `memory.apply_batch` wrote in the caller's namespace was
+not read, and the old row was returned unless the new row was also among the candidates (#6386). Recall also drops a
+candidate named by another candidate's `properties.supersedes`. `memory.remember` accepted that key from any caller,
+while `memory.apply_batch` writes it itself after its namespace check and refuses it from a caller; and a value that
+did not parse as a UUID was used as an id prefix, so an empty or one-character value hid a candidate whose id the
+writer never named.
+
+**Decision.**
+
+1. **Edge reads.** Recall reads incoming `supersedes` edges in every namespace of the request's visible set and drops a
+   candidate that has one in any of them. A request with an explicit `namespace` sees that namespace, so it reads there
+   as before.
+2. **Reserved key.** `supersedes` joins `memory_type`, `tags` and `attribution` as a key `memory.remember` refuses in
+   `properties`; the refusal names `memory.apply_batch` and `link(relation="supersedes")`. Rows already stored keep
+   the property.
+3. **Property values.** The property path honors a full UUID, or an id prefix of at least 8 characters, each a
+   lowercase hex digit or a hyphen. Any other value hides nothing.
+
+**Consequences.** A supersede written by `memory.apply_batch` hides the old row from every recall that sees the
+caller's namespace, the default request included, which is what Decision 7 already said. The Delta 1 bound holds: a
+reader scoped to the owning actor's namespace alone does not see the caller's namespace and still recalls the old rows.
+A recall reads one batched edge query per visible namespace instead of one. A row that relied on a short or upper-case
+id prefix in `properties.supersedes` no longer hides its target; a `supersedes` edge does.
+
+**Validation.** Tests for: a default-path recall dropping a `local` memory whose `supersedes` edge sits in another
+visible namespace, with the new row outside the candidates; an explicit-namespace recall returning what it returned
+before; `memory.remember` refusing `properties.supersedes` with the refusal above; stored rows whose
+`properties.supersedes` is empty or one hex character hiding nothing, and a full UUID and an 8-character prefix still
+hiding their targets.
+
+### Delta 3: an edge between memory rows lives in its source row's namespace (2026-11-04)
+
+**Status**: Accepted 2026-11-05 (Proposed 2026-11-04), except the amendment to rule 1's refusal text, which is Proposed
+(2026-11-05): a refusal names the source row's namespace only when the caller can read it. Changes where Decision 7's
+`supersedes` edges, and every other edge between two memory rows, are written, and what an edge read reports when it
+leaves edges out.
+
+**Problem.** Two writers put the same kind of edge in different namespaces (#6380). `memory.apply_batch` writes the
+`supersedes` edge from a new row to the row it replaces in the caller's namespace. `link` writes in `local`, because the
+kg pack dispatches it with the registry write identity, which ADR-007 Rule 0 pins to `local`. ADR-007 Rev 6 Rule 0's scope
+note says every non-memory write, edges included, keeps the `local` default, and neither it nor the 2026-11-01
+amendment for semantic writes treats an edge between two memory rows differently. This delta narrows that sentence for
+edges whose source and target are both memory rows, and ADR-007 Rule 9's qualifications and Rule 8 constraints 1
+and 4 now name the placement rule below beside `restore`'s ownership comparison. A second reader of one measured row sees five of its six outgoing `supersedes` edges, and nothing in the
+`neighbors` response says that one is missing.
+
+**Decision.**
+
+1. **Namespace rule.** An edge whose source and target are both memory rows is written in the source row's namespace,
+   whichever verb writes it. Three verbs write such an edge: `memory.apply_batch`, `link`, and a link op in
+   `apply_changeset`, and `restore` revives one. Each of the three writers reads the source row and compares its stored namespace with the request's write namespace,
+   the one the gate checked: the caller's own, or the explicit `namespace` argument, or for `apply_changeset` the op's
+   own `namespace` field. The two must be equal. A mismatch is refused before anything is written. When the source
+   row's namespace is one of the namespaces the request can read, the refusal names it as the namespace to retry with.
+   When it is not, the refusal says that the source row is in a namespace the caller cannot read and that the edge
+   cannot be written under the request's namespace, and it names no namespace. A refused `restore` and a refused
+   `apply_changeset` link op follow the same split. The edge is never redirected and an op's namespace is never
+   overridden.
+   `memory.apply_batch` writes the edge from the row it has just written in the caller's namespace, so its two
+   namespaces always agree. `restore` of a soft-deleted edge between memory rows compares the edge's stored namespace
+   with its source row's and refuses a mismatch, so a tombstone the move leaves in place cannot come back live in the
+   wrong namespace. This is a placement rule and grants nothing: who may write a namespace stays the gate's decision on
+   the request (ADR-007 Rev 8 Rule 9). It refuses no read; the only by-id effect it changes is where an edge between
+   memory rows may be written or revived, recorded as an ADR-007 Rule 9 qualification.
+2. **Reads report filtering.** `neighbors` and recall's supersedes read return every edge in the namespaces the reader
+   can see. For the row whose edges the read lists (recall: each returned row; `neighbors`: the anchor row), and for each
+   relation, the response also carries the number of edges between memory rows that arrive at that row and that the
+   read leaves out because they are stored in a namespace outside that set. Each such edge is one the reader would
+   have been given if it could see that namespace, so an edge with a soft-deleted endpoint, which no read returns,
+   is not counted. The field is present on every filtered read, with `0` when nothing was left out, so a missing field
+   means the producer is broken, never that nothing was hidden. Under rule 1 an edge is stored in its source row's
+   namespace, so after the move in rule 3 the counted edges are exactly those from rows outside the reader's
+   namespaces, and a reader already sees every outgoing edge of a row it can see; the edges this count covers are
+   the incoming ones. The count discloses three things: that such edges exist, how many there are, and their relation. It
+   withholds three: which rows they come from, which namespace those rows are in, and what the rows contain.
+   The field is `hidden_incoming_edges`, shaped `{"total": n, "by_relation": {"<relation>": n}}`; `total` is always
+   present. Recall carries it on every returned row, for `supersedes`. A `neighbors` call anchored on a memory row always
+   returns the object-shaped response and carries the field once, at the top; `by_relation` lists each relation of the
+   request's filter, or with no filter each relation whose count is above zero. This is a breaking change for that
+   anchor kind only: a call anchored on a memory row with no `limit` used to return a bare array. A `neighbors` call
+   anchored on any other record keeps its current shape. The count comes from one storage query that is given the
+   reader's visible namespaces and returns numbers only; no read is opened in a namespace the reader cannot see.
+3. **Existing edges.** A one-time move rewrites each live edge between memory rows whose namespace differs from its
+   source row's namespace, keeping the edge's id. Soft-deleted edges stay where they are: no read returns them, and
+   edge listing does not enumerate them. Before its first write the move computes the destination of every edge it
+   would move, as (source row's namespace, source, target, relation), over the whole set. If an edge already holds one
+   of those destinations, live or soft-deleted, or two moving edges share one, the whole run is refused and nothing is
+   written. The applying run is not one transaction: it replaces each edge only if the edge's stored `updated_at` and
+   `deleted_at` still equal what the preflight read, so an edge changed by another writer stops the run instead of
+   being overwritten. If another write takes an edge's destination after the preflight, that edge's update fails on the
+   unique (namespace, source, target, relation) index and the run stops there in the same way. After it stops or
+   finishes, it counts the misplaced edges again from the store rather than subtracting what it moved. A run that
+   stops part way reports how many edges it moved and how many remain; every run, a re-run included, repeats the whole
+   preflight before its first write and moves only the edges still misplaced. Other writers are stopped while it runs. The move has a dry run
+   that prints per-namespace edge counts before and after and writes nothing; the applying run prints the same counts.
+
+**Consequences.** A reader who can see a row sees all of that row's outgoing edges between memory rows, so a supersede
+chain is either whole or reported as partial with a count. `link` gains one read of its source record when both
+endpoints are memory rows. Edges from a memory row to a non-memory record, and edges between non-memory records, keep
+their current rule.
+
+**Known limit.** A reader who can see the target row but not the source row learns how many edges of each relation
+arrive from rows it cannot see, never which rows, which namespace, or their content. Learning the identity of the
+superseding row remains a follow-up, not solved here. A refused write names the source row's namespace only when the
+caller can already read that namespace, so rule 1 discloses no namespace that rule 2 withholds. The refusal still tells
+a caller holding a row's id that the row exists, that it is a memory row (the rule applies only when both endpoints are
+memory rows, so a missing or non-memory endpoint is not refused by it), and that its namespace is one the caller cannot
+read. Rule 1 does not stop the namespace being learned another way: by-id `get` returns any live note, its namespace
+included, without a visibility check. That read is the remaining namespace disclosure, and closing it is a separate
+decision. One further disclosure follows from the design: the count covers only edges whose endpoints are live, so it
+falls when a hidden source row is soft-deleted, which shows a reader that a row it cannot see was deleted.
+
+**Validation.** Tests for: `memory.apply_batch` and `link` writing a `supersedes` edge between the same two rows into
+the same namespace (the source row's); a `link` and an `apply_changeset` link op whose write namespace differs from the source row's refused with no edge
+written; the same refusal, for `link`, an `apply_changeset` link op and `restore`, naming the source row's namespace
+when the caller can read it and carrying no namespace other than the request's when it cannot; `restore` of a soft-deleted edge between memory rows whose namespace differs from its source row's refused
+with the edge left soft-deleted; a move whose set holds two edges with one destination refused whole before any write; `neighbors` and recall from a second reader returning the visible edges plus, per row and relation, a count equal to the incoming
+edges it cannot see, with no hidden row's id or namespace in the response; the same reads with nothing hidden carrying the count as `0`, not omitting it; the bare-array `neighbors` response unchanged for a non-memory anchor, and a memory-row anchor with no `limit` carrying the count; the move's dry run on a fixture holding the issue's shape (one row with six outgoing `supersedes` edges,
+one in the caller's namespace and five in `local`), printing counts and leaving every edge in place, then the applying
+run leaving all six in the source row's namespace.
+
+### Delta 4: every writer of a supersede applies the old-row namespace rule (2026-11-14)
+
+**Status**: Accepted 2026-11-15 (#6607). Changes which writes of a `supersedes` edge or a `supersedes` property are refused.
+The ADR lands before its code: on the day of acceptance no writer applies rule 1 yet, and the implementing change does.
+Recall and Delta 2 are unchanged. It amends Delta 1 rule 4 in one respect: the `owned_namespaces` declaration is also
+read by rule 1 below. It still grants no write into an owned namespace and widens no read. Who sets the
+declaration does not change: it comes only from the `[actor]` table of the caller's configuration (Delta 1 rule 1)
+and travels as Delta 1 rule 2 says. No verb sets or changes it.
+
+**Basis.** The 2026-11-01 amendment (Decision 1) writes every memory with no `namespace` argument to its writer's
+actor namespace, and Decision 5 with Delta 1 bounds which other namespaces' rows a batch may supersede. This delta
+applies that bound to every other way a supersede is written, so a write in one namespace does not change what is
+recalled from another unless the bound admits it.
+
+**Problem.** Decision 5, as Delta 1 states it, decides which old rows `memory.apply_batch` may supersede: a row in the
+caller's namespace, a row in the shared `local` namespace, or a row in a namespace the caller lists in
+`owned_namespaces`. Any other row is refused as `old-namespace`. The same supersede can be written in other ways,
+and none of them applies that rule:
+
+- `link(relation="supersedes")`. Delta 3 checks only the source row's namespace, and only when both endpoints are memory
+  rows. A source that is not a memory row skips the check entirely.
+- A `link` op in `apply_changeset`, with the same gap at preparation, and the legacy `AddEdge` proposal change-set,
+  which an approved proposal applies through the same `link` preparation.
+- `update` of an existing edge, directly or as an edge update in a change-set, that changes its `relation` to
+  `supersedes`. It runs the same endpoint check as `link` and nothing else, so an edge stored with another relation
+  can become a supersede.
+- `update` of a memory row whose `properties` carry `supersedes`. Delta 2 made `memory.remember` refuse that key, but
+  `update` still writes it.
+
+Recall honors each of these exactly as it honors a batch supersede (Delta 2). A write in one namespace therefore
+hides a row in another namespace that `memory.apply_batch` would have refused to supersede. The hiding applies to
+every reader whose visible set covers both namespaces. A reader scoped to the target row's own namespace is not
+affected, because the edge or property sits outside its visible set.
+
+**Decision.**
+
+1. **The rule.** A write that would make recall treat a memory row as superseded is checked against Decision 5's rule
+   (Delta 1). The superseded row's stored namespace must be one of:
+   - the namespace the supersede is written in (below);
+   - the shared `local` namespace;
+   - a namespace in the caller's `owned_namespaces`.
+
+   The namespace the supersede is written in is, for `link`, the request's write namespace, the one the gate checked:
+   the explicit `namespace` argument when the call carries one, and otherwise the registry's write namespace: the
+   namespace the deployment resolved, an explicit `--namespace` or `KHIVE_NAMESPACE`, else `local` (ADR-007 Rule 0;
+   Delta 3, Problem). For a change-set link op it is the op's own `namespace` field, and for the legacy `AddEdge`
+   change-set, which carries none, it is the write namespace of the request that approves it. For `update` of an edge
+   and for `restore` of an edge it is the edge's stored namespace; an edge update changes neither endpoint nor the
+   edge's namespace. For the property, on `update` and on `restore`, it is the namespace of the row that carries the
+   property. So on a deployment that resolves no namespace, a `link` with no `namespace` argument can supersede only
+   rows in `local` (or an owned namespace), and a caller superseding a row in its own actor namespace passes
+   `namespace=<that namespace>`, which Delta 3 already requires when the source is a memory row in that namespace.
+
+   Anything else is refused before anything is written. The refusal names the row's namespace only when the caller can
+   read it, the same split as Delta 3 rule 1, and it never redirects the write.
+2. **Which writes.** The rule applies to these writes, whatever kind of row the source is:
+   - `link` with `relation="supersedes"` onto a memory row;
+   - a `link` op with that relation in a change-set, at preparation, whether it arrives through `apply_changeset` or
+     through an approved `propose` (ADR-046), which applies through the same preparation;
+   - the legacy `AddEdge` proposal change-set with `relation="supersedes"` onto a memory row, at preparation when an
+     approved proposal is applied;
+   - `update` of an edge, and an edge update in a change-set, when the patch sets `relation` to `supersedes` and the
+     edge's target is a memory row, checked against the edge's stored namespace. A patch that leaves the relation
+     unchanged, or changes it away from `supersedes`, is not checked;
+   - `restore` of a soft-deleted `supersedes` edge onto a memory row, checked against the edge's stored namespace. The
+     target is looked up among stored memory rows, live or soft-deleted, and checked by rule 1 against its stored
+     namespace, for the reason given for `restore` below: a soft-deleted target can become live after the edge is
+     restored;
+   - `update`, and a note update in a change-set, when the patch sets `properties.supersedes` on a memory row;
+   - `restore` of a soft-deleted memory row whose stored `properties.supersedes` is a value Delta 2 rule 3 honors,
+     checked against the restored row's namespace. A refused restore leaves the row soft-deleted. A stored value
+     recall does not honor is not checked, because restoring it hides nothing.
+
+   On `update` and on a change-set note update, a new value must be a complete UUID naming a live memory row, and that
+   row is checked by rule 1. Any other new value is refused, naming `memory.apply_batch` and
+   `link(relation="supersedes")`. On every edge write in the list (a `link`, a change-set link op, the legacy
+   `AddEdge` change-set and an edge relation update), the target is looked up among stored memory rows, live or
+   soft-deleted, and checked by rule 1 against its stored namespace, as on `restore` below. The check does not rely on
+   any path's endpoint resolution refusing a soft-deleted target, so a supersede cannot be stored onto a row in a
+   refused namespace that becomes live later. A patch that leaves the stored value unchanged is not checked. A patch
+   that removes the key or sets it to null is admitted and not checked: it can only stop a row from being hidden.
+
+   **Approved proposals.** An approved proposal's change-set is applied with the approving reviewer's request token
+   (ADR-046 `review`), and that token carries the reviewer's own `owned_namespaces` declaration. A stored proposal
+   records no declaration, and the reviewer's declaration is a claim about the reviewer's writes, not about the
+   proposal's content. So the apply of an approved proposal clears the token's `owned_namespaces` list before
+   preparation, and every supersede in it is checked by rule 1 with an empty list: the target must be in the
+   supersede's own namespace or in `local`. Neither the proposer's list nor the reviewer's applies.
+
+   On `restore`, the stored value is not rewritten and is checked as recall would honor it, now and after any later
+   write. A row the value names can become live after the carrier is restored: by-id `restore` is open to that row's
+   own namespace (ADR-007), and a change-set can store a row under a given id. The check therefore does not depend on
+   whether the named row is live. A complete UUID is looked up among stored memory rows, live or soft-deleted, and the
+   row it names is checked by rule 1 against its stored namespace. An id prefix (Delta 2 rule 3) can hide any memory
+   row whose id starts with it, because recall hides the first ranked candidate that matches. The restore therefore
+   resolves the prefix to every stored memory row, live or soft-deleted, whose id starts with it, and checks each by
+   rule 1. One refused row refuses the restore, and the refusal names the refused row's case. A complete UUID that
+   names no stored memory row, and a prefix that matches none, are admitted: no stored row can be checked, a live
+   carrier holding the same value keeps its effect untouched by rule 4, and a refusal would strand the carrier for
+   good, because `update` reads a note only while it is live and cannot clear the key on a soft-deleted row. Every
+   row `memory.apply_batch` rewrote carries the old row's id, so a rewritten row soft-deleted after its old row was
+   hard-deleted is in this case. A row later stored under that id is seen through rule 4's dry run, as it is for a
+   live carrier. A refused restore leaves the carrier soft-deleted with its stored value unchanged.
+
+   `merge` is not checked, because it cannot change what rule 1 decides. A note merge (ADR-039) requires both notes to
+   be in the caller's namespace (ADR-007 Rule 5; `ensure_namespace` on both notes in the runtime's note merge). It
+   moves every edge incident to the merged-away note onto the survivor, in whatever namespace each edge is stored, and
+   keeps each edge's stored namespace; any properties it carries over land on the survivor. For each moved
+   `supersedes` edge and carried property, the supersede's own namespace is unchanged and the superseded row's
+   namespace is unchanged (both notes are in the caller's namespace), so rule 1 gives the same answer after the merge
+   as before. A supersede stored before this delta that rule 1 would refuse is therefore carried onto the survivor as
+   stored; rule 4's dry run lists it before the merge and after it.
+3. **What it is.** This is a rule of the write that supersedes a memory row, the same kind of rule as
+   `memory.apply_batch`'s. It is not an access control. Under ADR-007 Rule 9, `link(target_id)` resolves its id without
+   a namespace check. This delta extends the second of the two write-effect comparisons that ADR-007 permits (Rule 8
+   constraint 1, Rule 9's qualifications): the memory-edge placement rule of Delta 3, which compares stored namespaces
+   with each other or with the gate-checked write namespace. It now also compares the superseded row's namespace, and
+   for the property path the named row's namespace. It decides only whether that write is refused. It never decides
+   whether a record can be read, and the gate still decides the request.
+4. **Stored rows.** Edges and properties already stored are not moved, changed or deleted. A dry run lists them by
+   one rule: rule 1 with no `owned_namespaces` list. A supersede is listed when its target is a memory row whose
+   namespace is neither the supersede's own namespace nor `local`. For an edge, the supersede's namespace is the edge's
+   stored namespace. For a property, it is the namespace of the live memory row that carries `properties.supersedes`,
+   and only a value Delta 2 rule 3 honors is considered, because recall honors exactly those. The targets of an id
+   prefix are every stored memory row, live or soft-deleted, whose id starts with it, each considered on its own, as on
+   `restore`, and a complete UUID is looked up the same way, so a target its owner can restore later is listed. A target in `local` is
+   not listed. A target in an owned namespace is listed, and the output says that a supersede a Delta 1 caller wrote
+   into a declared owned namespace appears in the list too.
+
+   The dry run scans only edges and carrier rows stored in namespaces the caller can read. For each listed edge it
+   prints the edge id, the edge namespace, the source namespace and the target namespace; for each listed property
+   target it prints the carrier row id, the carrier namespace, the stored value and the target namespace, so a prefix
+   carrier with two listed targets prints two lines. A source or target namespace the caller
+   cannot read is printed as `unreadable`, never by name, the same split as Delta 3 rule 1 and rule 1 above give
+   refusals. The supersede is still listed, because the owner of the readable namespace that stores it can remove it.
+
+   It reads in id order and returns a cursor. A page is at most 1,000 rows read, counting every edge and memory row it
+   examines, whether or not it is listed, so a page can list nothing and still return a cursor. One call's cost is
+   bounded by the page, and a full pass grows with the number of live memory rows and `supersedes` edges in the
+   readable namespaces. It writes nothing. The change that implements this delta names the verb and arguments that
+   carry the dry run.
+   A soft-deleted carrier row is not listed: recall does not read it, and its restore is one of the writes rule 2 lists. Whether a
+   listed supersede was meant is the target owner's question. Removing the edge or clearing the property is done by a
+   caller who can read the namespace that stores it; when that is not the target's owner, the owner is asked.
+
+**Consequences.**
+
+- `link`, the change-set link op and the property path now apply `memory.apply_batch`'s old-row rule, with the write
+  namespace in the place of the batch's caller namespace. `memory.apply_batch` takes no `namespace` argument; these
+  verbs do, so a caller that passes `namespace=<V>` may supersede an unowned row in V, which the batch would refuse.
+  Whether the caller may write in V is the gate's decision, and only the gate bounds that case.
+- A caller writing from `local` can supersede only rows in `local` or in a namespace it declares as owned, which is
+  what the batch rule already gives that caller.
+- `link` gains one read of the target row when the relation is `supersedes`.
+- Other relations onto a memory row (`annotates`, `supports`, `refutes`) keep their current rule, because recall reads
+  only `supersedes`.
+- Supersedes written before this delta keep their effect on recall. Their listing is the only change rule 4 makes.
+
+**Known limit.** As in Delta 1, `owned_namespaces` is the caller's own claim, carried with its identity, so this rule
+bounds what these verbs agree to supersede. It protects no row from a caller that holds the row's id and uses
+`update(id)` or `delete(id)` (ADR-007 Rule 2). A target that is hard-deleted and then stored again under the same id in
+another namespace is hidden by a carrier or edge stored before it: rule 1 never ran against that row, and rule 4's dry
+run is what lists it.
+
+**Alternatives considered.**
+
+- _Recall honors a supersede only when its namespace is the target's own or `local`._ Rejected. `owned_namespaces` is
+  configuration carried on the writer's request and is not stored, so recall cannot apply Delta 1, and supersedes that
+  Delta 1 admits would stop hiding their targets. This rule would also make every supersede already stored across
+  namespaces reappear, including ones their owners meant.
+- _A stored ownership record that recall consults._ Not opened: it needs a schema change and its own decision.
+- _Refuse `properties.supersedes` on `update` outright, as `memory.remember` does._ Rejected for this delta: a full-UUID
+  value checked by rule 1 matches the batch rule. Outright refusal could follow in a later delta if a caller needs
+  nothing beyond the edge.
+
+**Validation.** Tests on today's code must fail for each subject, with its control in the same test:
+
+- `link` of a `supersedes` edge from a caller's memory onto a memory row in another, not owned, namespace is refused,
+  with no edge stored. Control: the same link between two of the caller's own rows, with `namespace=<own>`, succeeds.
+- The same `link` from a non-memory note in the caller's namespace is refused. Control: the same note superseding one
+  of the caller's own memory rows with `namespace=<own>` succeeds. With no `namespace` argument, on a deployment that
+  resolves no namespace, the same control is refused, because the write namespace is then `local`.
+- `apply_changeset` refuses the same link op at preparation. Control: an op linking the caller's own two rows
+  prepares.
+- `update` of an edge from the caller's memory row onto another, not owned, namespace's memory row, changing its
+  relation from `annotates` to `supersedes`, is refused, the edge keeps `annotates`, and the target stays in a
+  two-namespace reader's recall. The same patch as an edge update in `apply_changeset` is refused at preparation.
+  Control: the same relation change on an edge between two of the caller's own rows, stored in the caller's
+  namespace, is admitted and hides the target; a weight-only patch on the refused edge is admitted unchecked.
+- `update` setting `properties.supersedes` to another namespace's memory row is refused, and that row stays in a
+  two-namespace reader's recall. Control: the same update naming the caller's own row hides that row.
+- `update` removing `properties.supersedes`, and one setting it to null, are admitted on a row whose stored value names
+  a row in another namespace, and the named row returns to recall.
+- Targets in `local` and in an owned namespace are admitted on each path, as `memory.apply_batch` admits them.
+- The refusal names the target namespace only when the caller can read it.
+- `restore` of a soft-deleted `supersedes` edge onto a refused target is refused, and the edge stays soft-deleted.
+- `restore` of a soft-deleted `supersedes` edge whose target is a soft-deleted memory row in a refused namespace is
+  refused, and the edge stays soft-deleted; when that row's owner later restores it, it stays in a two-namespace
+  reader's recall. Control: the same edge onto a soft-deleted row in the edge's own namespace restores.
+- `link(relation="supersedes")` onto a soft-deleted memory row is refused by endpoint resolution, and no edge is
+  stored.
+- `restore` of a soft-deleted memory row whose stored `properties.supersedes` names a refused target is refused, the
+  row stays soft-deleted and the named row stays in a two-namespace reader's recall. Control: restoring a carrier
+  whose value names a row in its own namespace succeeds and hides that row; a carrier whose value recall does not
+  honor restores unchecked.
+- `restore` of a soft-deleted carrier whose stored value is an 8-character id prefix matching a memory row in a
+  refused namespace is refused and the row stays soft-deleted, even when the prefix also matches a row in the
+  carrier's own namespace. Control: a prefix that matches only rows in the carrier's own namespace restores.
+- `restore` of a soft-deleted carrier whose stored value is the complete UUID of a soft-deleted memory row in a
+  refused namespace is refused. When that row's owner later restores it, it stays in a two-namespace reader's recall.
+  Control: a carrier naming a soft-deleted row in its own namespace restores.
+- `restore` of a soft-deleted carrier is refused when its stored prefix matches only a soft-deleted row in a refused
+  namespace; the refusal names its case, and the carrier stays soft-deleted with its value unchanged.
+- `restore` of a soft-deleted carrier whose complete UUID names no stored memory row restores it, and so does one whose
+  prefix matches none, with the stored value unchanged. A memory row then stored under that id in a refused namespace
+  is listed by rule 4's dry run. Control: the same carrier with a refused target stays soft-deleted.
+- `update` setting `properties.supersedes` to an id prefix is refused, even when the prefix matches only the caller's
+  own rows.
+- A link op with `relation="supersedes"` onto another namespace's memory row, in a proposal, is refused when the
+  approved proposal is applied, and no edge is stored. Control: the same op between the caller's own rows applies.
+- A legacy `AddEdge` proposal with `relation="supersedes"` onto another namespace's memory row is refused when the
+  approved proposal is applied, and no edge is stored. Control: the same `AddEdge` onto a memory row in the approving
+  request's write namespace applies.
+- A link op with `relation="supersedes"` onto a row in namespace `V`, in a proposal whose proposer and reviewer both
+  list `V` in `owned_namespaces`, is refused when the approved proposal is applied, and no edge is stored. This holds
+  although the apply runs with the reviewer's request token, which carries the reviewer's list. Control: the same op
+  through `apply_changeset` by the proposer applies.
+- A note merge whose merged-away note is the target of a `supersedes` edge stored in another namespace leaves that
+  edge, with its stored namespace, on the survivor; the dry run lists it before and after the merge.
+- The dry run lists a fixture's cross-namespace supersede edges and cross-namespace `properties.supersedes` rows,
+  including one line per refused target of a prefix carrier and a target that is soft-deleted, and leaves the store byte-identical. It does not list a supersede whose target is in `local`, and it lists one whose
+  target is in an owned namespace.
+- A fixture edge stored in a readable namespace whose target row is in a namespace the caller cannot read is listed
+  with target namespace `unreadable`, and the unreadable namespace's name appears nowhere in the output.
+- A page over a fixture with more than 1,000 rows and no listed supersede returns no rows and a cursor.

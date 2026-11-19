@@ -2,6 +2,7 @@
 
 - Status: accepted (2026-08-01)
 - Date: 2026-07-30
+- Requirement (2026-08-09): the writer architecture is delegated to the maintainers, with one requirement: hundreds of processes must be able to run together against one store without problems. What this ADR gives against it: the number of connected processes is not the limit, writer demand is. Hundreds of processes are inside the design envelope while aggregate writer utilization stays under the F7 thresholds; past them, in strict queue mode a write that cannot be admitted gets a typed refusal after a bounded wait (F5), and a write whose commit cannot be confirmed reports an outcome-unknown result (F6) instead of being silently repeated. Whether a given deployment's hundreds of processes fit is decided by the F7 measurement, not by this text.
 
 ## Context
 
@@ -139,6 +140,16 @@ task's one-time lifetime connection are infrastructure opens and do not enter th
 This is counter-level observability only; it does not claim the full per-attempt timing matrix in
 F7 is implemented.
 
+Implementation note (2026-11-17, writer outcomes and strict routing): `write_outcome_unknown` is
+the narrower of two outcome-unknown results. The writer gives that code only when the request issued
+COMMIT and then lost its reply with no retained typed failure. A loss with no evidence that COMMIT
+was issued keeps the earlier `writer_task_terminated` code. Both carry
+`request_state: side_effects_unknown` and neither is retryable, so a caller asking whether the
+write may have happened reads the request state; the code says only whether COMMIT was reached.
+Strict routing's `writer_owner_unavailable` and `writer_route_violation` report
+`request_state: not_started`. The full contract, with precedence and the closed lifecycle owners,
+is in `crates/khive-storage/docs/api/error-taxonomy.md` and `crates/khive-db/docs/api/pool.md`.
+
 Strongest case against this decision: expanding public error variants creates compatibility work and invites callers to bind to low-level implementation stages. The decision flips only if a stable higher-level taxonomy can distinguish safe retry, unsafe retry, overload, and outcome-unknown without losing the stage needed for incident attribution. It does not flip to preserving the current misleading string. During compatibility rollout, old codes may remain as aliases while structured stage fields are added.
 
 ### F7. Experiments and decision gates
@@ -254,3 +265,11 @@ F7's current-versus-disabled comparison from the production topology matrix. An 
 may still issue a raw pragma to construct a historical control, but neither `PoolConfig` nor an
 environment variable selects the posture in a shipped connection constructor — only the ownership
 claim does.
+
+## Clarification (2026-10-14): best-effort comm mark result details
+
+Status: **Accepted** (2026-10-15). The dependent response-shape change merged in #5359. The existing Accepted F6 decision and the ADR's Accepted status are unchanged.
+
+For an error while marking a message read, the existing best-effort result gains an additive wire field, `mark_error_details`, produced by the shared runtime error serializer. This applies to single `comm.read`, each bulk `comm.read` result, and each best-effort `comm.mark_read` result. Its object preserves available typed `code`/`stage` and native `sqlite_write_stage`, `sqlite_primary_code` and `sqlite_extended_code` metadata. Those fields are optional by error; not every error has a stage or native codes. Stages without native evidence do not synthesize native result codes. The serializer retains terminal writer-outcome precedence over attached SQLite-stage evidence.
+
+The object's `domain_disposition` describes the mark operation. A failed mark is `not_committed` unless writer-request or native settlement evidence leaves its outcome unknown; unknown evidence remains `unknown`. The compatibility `mark_error` text and `status`, `read`, `properties` and body-exposure behavior do not change, including when the compatibility status is `failed` while the richer settlement evidence is unknown. Successful marks and the no-live-row `Ok(false)` outcome omit `mark_error_details`. Validation errors, atomic mark-read refusals, aggregate statuses, admission order and retry behavior are unchanged.

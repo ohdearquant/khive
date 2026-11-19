@@ -10,6 +10,9 @@ on:
   # too — a filtered trigger leaves them mergeStateStatus=CLEAN with zero checks,
   # and a base retarget after the parent merges does not re-fire the workflow.
   pull_request:
+    # ready_for_review starts the full run when a draft is marked ready: a draft runs the lint and
+    # classify jobs only (see DRAFT below).
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       main_sha:
@@ -23,12 +26,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Main pushes share one group and run the newest commit only. The run in progress
-# is never cancelled; a newer push replaces any run still waiting in the group, so
-# at most one main run waits. A replaced run's commit is contained in the later
-# run's tree, and the newest main head always reaches a completed run. Commits that
-# land while a run is in progress get no result of their own: a regression between
-# two completed runs is attributed by running CI on the commits in between (#3071).
+# Main pushes share one group and run the newest commit only: a newer push cancels
+# the run in progress and replaces any run still waiting, so a burst of merges
+# leaves one main run, at its newest head, and frees the runners the cancelled runs
+# held for pull request runs. A cancelled run's commit is contained in the later
+# run's tree. While merges keep landing faster than a run completes, main has no
+# completed result; it gets one once merges pause, so a merge batch waits for main
+# to go green before the next batch starts. Commits without a result of their own
+# are attributed by running CI on the commits in between (#3071).
 # https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency
 #
 # PR synchronize events keep the same refs/pull/<number>/merge group and cancel
@@ -37,7 +42,7 @@ env:
 # running. Inspect concurrency-group membership and jobs when diagnosing a queue.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.event_name == 'push' && github.ref == 'refs/heads/main' && github.ref || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
 
 jobs:
   # Replay uses the current workflow against historical source, without a temporary ref:
@@ -101,6 +106,266 @@ jobs:
             printf 'Validated checkout: `%s`\n\n' "$candidate"
             printf 'Main tip: `%s`\n' "$(git rev-parse refs/remotes/origin/main)"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # A change that touches only Markdown files no code names runs the documentation lane: docs formatting,
+  # the ADR lints, the marketplace validator, the data-leak guard and the secret scan. The Rust, Python,
+  # web, coverage and portability jobs skip, and the gate accepts those skips only when this job succeeded
+  # and reported docs_only=true (scripts/ci-docs-only.sh states the rule). Pull requests compare the merge
+  # ref with its base parent. Pushes to main and to integration branches compare with the newest main
+  # commit whose CI run concluded successfully, passed the Linux test shard and recorded a full-suite scope
+  # (the Record step), so a documentation commit that replaces a waiting run cannot carry an untested code
+  # commit past main CI, and a train whose members change only Markdown skips the suites main already
+  # passed. Every other event, and any failed lookup, runs the full suite. So does a change to either
+  # classifier script (scripts/ci-docs-only.sh, scripts/ci-test-scope.py): neither decides whether its own
+  # change is tested.
+  #
+  # A pull request that is not documentation-only also gets a test scope (ADR-205): `full`, or the crates
+  # it changed plus every crate that depends on them. scripts/ci-test-scope.py states the rules.
+  changed-paths:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Classify changed paths
+    needs: resolve-revision
+    runs-on: ubuntu-latest
+    # The Scope step fetches a binary and ingests the workspace map. Its own bounds (60 s of path rules, up to
+    # ten 120 s downloads, a 300 s ingest) can add up to more than this job's limit; a job that reaches the limit
+    # fails, and the gate reads a failed changed-paths job as a red run, never as a pass.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+      test_scope: ${{ steps.scope.outputs.test_scope }}
+    steps:
+      - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/integration/')))
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
+      - name: Classify
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          HEAD_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          DEFAULT_BRANCH: ${{ github.event.pull_request.base.repo.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A change to either path classifier runs the full suite: the classifier a commit carries never decides
+          # whether that commit is tested. A range that cannot be compared counts as such a change.
+          classifiers_changed() {
+            local changed
+            if [[ -z "$1" ]] || ! changed=$(git diff --name-only "$1" "$HEAD_SHA" -- scripts/ci-docs-only.sh scripts/ci-test-scope.py \
+              scripts/ci-inert-docs-data.txt tests/documented_verb_counts.py); then
+              echo "full suite: the path classifiers could not be compared with $1"
+              return 0
+            fi
+            if [[ -n "$changed" ]]; then
+              echo "full suite: the change edits a path classifier: ${changed//$'\n'/, }"
+              return 0
+            fi
+            return 1
+          }
+          docs_only=false
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base=$(git rev-parse --verify "${HEAD_SHA}^1")
+            classifier_base=""
+            if [[ -n "${DEFAULT_BRANCH:-}" ]] \
+                && git fetch --no-tags --filter=blob:none origin \
+                  "+refs/heads/${DEFAULT_BRANCH}:refs/ci-classifier-default/${HEAD_SHA}"; then
+              classifier_base="refs/ci-classifier-default/${HEAD_SHA}"
+            else
+              echo "full suite: the default branch could not be fetched for classifier comparison"
+            fi
+            if ! classifiers_changed "$classifier_base"; then
+              docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
+            fi
+          elif [[ "$EVENT_NAME" == "push" && ( "$REF" == "refs/heads/main" || "$REF" == refs/heads/integration/* ) ]]; then
+            base=""
+            runs=""
+            # The checkout is one commit deep. The ancestry test below needs main's history, and the
+            # comparison reads paths only, so fetch main's commits and trees without file contents.
+            # An integration branch's own commits sit between its head and main, so its ref is fetched too.
+            # A full-depth checkout fetches every branch and tag, and its time grows with their count.
+            # A repository that already holds its history is used as it is.
+            history=true
+            refspecs=("+refs/heads/main:refs/remotes/origin/main")
+            if [[ "$REF" != "refs/heads/main" ]]; then
+              refspecs+=("+${REF}:refs/remotes/origin/${REF#refs/heads/}")
+            fi
+            if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]] \
+                && ! git fetch --no-tags --filter=blob:none --unshallow origin "${refspecs[@]}"; then
+              history=false
+              echo "fetching main's history failed"
+            fi
+            if [[ "$history" == "true" ]]; then
+              runs=$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=30" \
+                --jq '.workflow_runs[] | select(.event == "push" or .event == "schedule") | "\(.id) \(.head_sha) \(.conclusion)"') || runs=""
+            fi
+            # A tested base is a run that concluded successfully as a whole, passed Linux shard 1, recorded
+            # that it ran the full suite (the test-scope-full artifact the Record step below uploads), and
+            # is an ancestor of this head (ADR-205 D3a, Amendment 1). A run without the record is skipped.
+            while read -r run_id run_sha conclusion; do
+              [[ -n "$run_id" ]] || continue
+              [[ "$conclusion" == "success" ]] || continue
+              shard=$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100" \
+                --jq '[.jobs[] | select(.name == "CI (ubuntu-latest, shard 1/2)" and .conclusion == "success")] | length') || shard=0
+              [[ "$shard" -ge 1 ]] || continue
+              recorded=$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}/artifacts?per_page=100" \
+                --jq '[.artifacts[] | select(.name == "test-scope-full")] | length') || recorded=0
+              [[ "$recorded" -ge 1 ]] || continue
+              if git merge-base --is-ancestor "$run_sha" "$HEAD_SHA" 2>/dev/null; then
+                base=$run_sha
+                break
+              fi
+            done <<< "$runs"
+            if [[ -n "$base" ]]; then
+              echo "Compared with $base, the newest main commit with a completed full run"
+              echo "base=$base" >> "$GITHUB_OUTPUT"
+              if ! classifiers_changed "$base"; then
+                docs_only=$(bash scripts/ci-docs-only.sh "$base" "$HEAD_SHA")
+              fi
+            else
+              echo "full suite: no main commit with a completed full run was found"
+            fi
+          else
+            echo "full suite: $EVENT_NAME runs on ${REF} always run every job"
+          fi
+          if [[ "$docs_only" != "true" ]]; then
+            docs_only=false
+          fi
+          echo "docs_only=$docs_only" | tee -a "$GITHUB_OUTPUT"
+      # After the classifier guard, the path rules use changed paths alone (--paths-only prints `full` or `map`).
+      # Only a change to crate source and Markdown reaches the binary: the kkernel debug build that the newest
+      # successful push run on main published, which ingests this checkout's map and resolves the changed
+      # crates' dependents. This step always writes test_scope and never fails: every error, every timeout
+      # and every event other than a pull request or an integration push writes `full`. An integration push
+      # compares with the newest fully tested main commit that is its ancestor (the Classify step's base).
+      - name: Scope
+        id: scope
+        if: steps.classify.outputs.docs_only != 'true'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          HEAD_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          TESTED_BASE: ${{ steps.classify.outputs.base }}
+          DEFAULT_BRANCH: ${{ github.event.pull_request.base.repo.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          # A change to either path classifier runs the full suite: the classifier a commit carries never decides
+          # whether that commit is tested. A range that cannot be compared counts as such a change.
+          classifiers_changed() {
+            local changed
+            if [[ -z "$1" ]] || ! changed=$(git diff --name-only "$1" "$HEAD_SHA" -- scripts/ci-docs-only.sh scripts/ci-test-scope.py \
+              scripts/ci-inert-docs-data.txt tests/documented_verb_counts.py); then
+              echo "full suite: the path classifiers could not be compared with $1"
+              return 0
+            fi
+            if [[ -n "$changed" ]]; then
+              echo "full suite: the change edits a path classifier: ${changed//$'\n'/, }"
+              return 0
+            fi
+            return 1
+          }
+          test_scope=full
+          base=""
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base=$(git rev-parse --verify "${HEAD_SHA}^1") || base=""
+            [[ -n "$base" ]] || echo "full suite: the merge ref has no base parent"
+          elif [[ "$EVENT_NAME" == "push" && "${REF:-}" == refs/heads/integration/* ]]; then
+            # An integration push compares with the newest fully tested main commit the Classify step found.
+            base="${TESTED_BASE:-}"
+            [[ -n "$base" ]] || echo "full suite: no fully tested main commit is an ancestor of this push"
+          else
+            echo "full suite: $EVENT_NAME runs on ${REF:-an unnamed ref} are never scoped"
+          fi
+          classifier_base="$base"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            classifier_base=""
+            if [[ -n "${DEFAULT_BRANCH:-}" ]] \
+                && git fetch --no-tags --filter=blob:none origin \
+                  "+refs/heads/${DEFAULT_BRANCH}:refs/ci-classifier-default/${HEAD_SHA}"; then
+              classifier_base="refs/ci-classifier-default/${HEAD_SHA}"
+            else
+              echo "full suite: the default branch could not be fetched for classifier comparison"
+            fi
+          fi
+          if [[ -n "$base" ]] && classifiers_changed "$classifier_base"; then
+            base=""
+          fi
+          if [[ -n "$base" ]]; then
+            mode=$(timeout 60 python3 -P scripts/ci-test-scope.py "$base" "$HEAD_SHA" --paths-only) || mode=full
+            if [[ "$mode" == "map" ]]; then
+              binary=""
+              runs=$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=10" \
+                --jq '.workflow_runs[].id') || runs=""
+              for run_id in $runs; do
+                dir="$RUNNER_TEMP/kkernel-main-$run_id"
+                if timeout 120 gh run download "$run_id" -R "$REPOSITORY" -n kkernel-debug-linux -D "$dir" \
+                    && [[ -f "$dir/kkernel" ]]; then
+                  chmod +x "$dir/kkernel"
+                  binary="$dir/kkernel"
+                  echo "kkernel from main push run $run_id"
+                  break
+                fi
+              done
+              if [[ -z "$binary" ]]; then
+                echo "full suite: no successful main push run among the newest 10 published kkernel-debug-linux"
+              else
+                test_scope=$(timeout 300 python3 -P scripts/ci-test-scope.py "$base" "$HEAD_SHA" --kkernel "$binary") \
+                  || test_scope=full
+              fi
+            fi
+          fi
+          if [[ -z "$test_scope" ]]; then
+            test_scope=full
+          fi
+          echo "test_scope=$test_scope" | tee -a "$GITHUB_OUTPUT"
+      # ADR-205 D3a: every run other than a pull request's records the scope its suites ran, and the
+      # tested-base lookup in the Classify step reads that record. The artifact's name carries the value
+      # (test-scope-full, test-scope-scoped or test-scope-docs), so a reader lists names and never
+      # downloads. The value follows the expression the test jobs use (an empty scope runs the full
+      # suite). A failed upload leaves the run without a record, so the lookup skips it rather than
+      # turning the run red.
+      - name: Record the test scope
+        id: record
+        if: github.event_name != 'pull_request'
+        env:
+          DOCS_ONLY: ${{ steps.classify.outputs.docs_only }}
+          TEST_SCOPE: ${{ steps.scope.outputs.test_scope }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${DOCS_ONLY:-}" == "true" ]]; then
+            recorded=docs
+          elif [[ "${TEST_SCOPE:-full}" == "full" ]]; then
+            recorded=full
+          else
+            recorded=scoped
+          fi
+          mkdir -p "$RUNNER_TEMP/test-scope"
+          if [[ "$recorded" == "docs" ]]; then
+            echo docs > "$RUNNER_TEMP/test-scope/test_scope"
+          else
+            printf '%s\n' "${TEST_SCOPE:-full}" > "$RUNNER_TEMP/test-scope/test_scope"
+          fi
+          echo "recorded=$recorded" | tee -a "$GITHUB_OUTPUT"
+      - name: Upload the test scope record
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-scope-${{ steps.record.outputs.recorded }}
+          path: ${{ runner.temp }}/test-scope/test_scope
+          retention-days: 90
+          if-no-files-found: error
 
   # timeout-minutes starts after a runner is assigned; it bounds stuck execution,
   # but GitHub does not apply it while a job is still queued.
@@ -183,7 +448,8 @@ jobs:
 
   ci:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}CI (${{ matrix.os }}, shard ${{ matrix.shard }}/2)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ${{ matrix.os }}
     # 45 left a 4% margin over the macOS shard-1 healthy duration (~43 min),
     # so any slow runner day converted a green run into a timeout cancellation.
@@ -195,10 +461,12 @@ jobs:
       fail-fast: false
       # The workspace test suite is nextest-partitioned 2-way per OS (see the
       # "Workspace tests" step below). Non-partitioned phases run exactly once
-      # per OS: forward-deployed checks, Clippy, and channel feature tests run
-      # on shard 2, while the release build and its dependent checks remain on
-      # shard 1. The split follows measured step durations; dividing the test
-      # count alone leaves the complete jobs badly unbalanced.
+      # per OS: the daemon recovery flake gate and the production audit batch
+      # run on shard 2, the lints and the no-default-features check on shard 1.
+      # The release build with the checks that run its binary, the channel
+      # feature tests, and Clippy with the forward-deployed checks run in their
+      # own jobs (release-checks, channel-tests, clippy-checks) beside the
+      # shards, so none of them sits on a shard's critical path.
       #
       # On a pull request CI_SUITE is `macos-pr` for macos-latest, and every
       # macos-pr step is gated `matrix.shard == 1`, so there is no second
@@ -210,10 +478,37 @@ jobs:
       # dispatched runs are CI_SUITE == 'full', where macOS shard 2 does carry
       # a real partition, so they keep all four.
       #
+      # Pull requests opened from this repository's own `codex/` branches run
+      # the two Linux shards only. Their changes are integrated through a later
+      # pull request that runs the three-job matrix above, so the macOS lane
+      # runs there, and the many draft pull requests on that prefix no longer
+      # hold macOS slots that integration runs wait for.
+      # Pull requests from this repository's `split/` and `docs/` branches run
+      # the two Linux shards only as well. They carry verbatim moves of code
+      # between files and documentation changes; the Linux shards test them,
+      # and the push to main that lands them runs both macOS shards.
+      # The head-repository check keeps the rule to branches of this
+      # repository: a pull request from a fork runs the three-job matrix
+      # whatever its branch is called.
+      # A push to an `integration/train-*` branch runs the two Linux shards
+      # only, the same job set as those pull requests. A train's run is the
+      # merge gate for its members, and both macOS shards on it waited for a
+      # runner longer than the Linux lanes took. The push to main that lands
+      # each member still runs both macOS shards.
+      #
       # Written as an explicit include list rather than an `exclude` expression
-      # so both branches name every job they produce.
+      # so every branch names every job it produces.
       matrix:
         include: ${{ fromJSON(github.event_name == 'pull_request'
+          && (startsWith(github.head_ref, 'codex/')
+            || startsWith(github.head_ref, 'split/')
+            || startsWith(github.head_ref, 'docs/'))
+          && github.event.pull_request.head.repo.full_name == github.repository
+          && '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2}]'
+          || github.event_name == 'push'
+          && startsWith(github.ref, 'refs/heads/integration/train-')
+          && '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2}]'
+          || github.event_name == 'pull_request'
           && '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2},{"os":"macos-latest","shard":1}]'
           || '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2},{"os":"macos-latest","shard":1},{"os":"macos-latest","shard":2}]') }}
     defaults:
@@ -228,14 +523,21 @@ jobs:
       # footprint that filled the ubuntu runner disk (ENOSPC surfaces as
       # `ld terminated with signal 7 [Bus error]`, e.g. run 28604091732).
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # `full`, or the crates this pull request changed plus their dependents (ADR-205); scripts/ci.sh
+      # passes them to the test and clippy phases as -p arguments. An unset scope runs the full suite.
+      TEST_SCOPE: ${{ needs.changed-paths.outputs.test_scope || 'full' }}
       # The model cache below is load-bearing, not an optimisation: with this
       # set, a phase whose model is missing fails naming the directory instead
       # of fetching from huggingface.co.
       LATTICE_OFFLINE: "1"
     steps:
+      # Steps before the checkout cannot use the job's default working directory: `crates` does
+      # not exist until the repository is checked out.
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+      - name: Test scope
+        run: echo "TEST_SCOPE=$TEST_SCOPE"
       # ubuntu-latest runners start with ~21GB free on /. The workspace's
       # check + clippy + test + release passes exceed that, and ld's mmap'd
       # writes turn ENOSPC into SIGBUS. Purge preinstalled toolchains this
@@ -257,14 +559,21 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          # Only main writes caches. A pull request's cache is scoped to its
+          # own merge ref, so no other pull request can restore it, but it
+          # still counts against the repository's cache quota. Pull request
+          # saves pushed the total past the quota and evicted main's entries
+          # (the macOS entry first), which left later runs compiling every
+          # dependency from scratch. Pull requests restore main's cache and
+          # save nothing.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           # Cache key bump: artifacts built with full debuginfo predate the
           # line-tables-only profile; restoring them would defeat the disk cap.
-          # Deliberately NOT sharded into the key: both shards of the same OS
-          # build the same workspace, so sharing one key avoids doubling the
-          # cache footprint. The two shards' save-cache calls race at the end
-          # of the job; the first to finish wins and the second is a no-op
-          # (actions/cache skips saving over an existing key), which is fine.
-          key: line-tables
+          # Sharded into the key: the shards build different profiles and
+          # features (the no-default-features check runs on shard 1). With
+          # one shared key the first shard to finish saved and the other's
+          # artifacts never reached the cache.
+          key: line-tables-shard${{ matrix.shard }}
       # EMBEDDING MODEL CACHE. The embedder fetches its weights from
       # huggingface.co the first time it is built. Fetching per run made this
       # workflow depend on a third-party CDN's rate limiter, which on
@@ -302,44 +611,14 @@ jobs:
         if: steps.model-cache.outputs.cache-hit != 'true'
         working-directory: ${{ github.workspace }}
         run: scripts/warm-model-cache.sh all-minilm-l6-v2
+      # The lint phase on shard 1 runs the ADR anchor lint under deno and the contract harness self-test
+      # under uv.
       - uses: denoland/setup-deno@v2
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         with:
           deno-version: v2.x
       - uses: astral-sh/setup-uv@v5
         if: env.CI_SUITE == 'full' && matrix.shard == 1
-      # The identifier-ban contract performs a repo-wide ripgrep scan and
-      # fails (rather than skips) when CI lacks rg (#1636). ubuntu-latest does
-      # not include it, so provision the instrument in every full-suite shard
-      # that runs khive-contract.
-      - name: Install khive-contract scan dependency (Linux)
-        if: env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'Linux'
-        run: |
-          # The runner image carries third-party apt lists this job needs
-          # nothing from, and `apt-get update` exits 100 when any one of them
-          # serves a bad index. Google's chrome list did exactly that on
-          # 2026-09-09 (Hash Sum mismatch) and reddened every full-suite
-          # shard. ripgrep comes from the Ubuntu archive, so disable that list
-          # instead of retrying into the same mismatch. apt reads only .list
-          # and .sources files, so a renamed copy is inert, and the Ubuntu
-          # archive itself lives in ubuntu.sources and is untouched. A different
-          # third-party list failing this way needs its own line here, by
-          # name: this is deliberately not a blanket sweep of the directory.
-          for f in /etc/apt/sources.list.d/google-chrome.list \
-                   /etc/apt/sources.list.d/google-chrome.sources; do
-            if [ -e "$f" ]; then sudo mv "$f" "$f.disabled"; fi
-          done
-          # Print what still points at the chrome repo: empty is the pass, a
-          # non-empty line says the rename missed a filename this does not know.
-          sudo grep -rl 'dl[.]google[.]com/linux/chrome' /etc/apt/ || true
-          sudo apt-get update
-          sudo apt-get install --yes ripgrep
-          rg --version
-      - name: Install khive-contract scan dependency (macOS)
-        if: env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'macOS'
-        run: |
-          brew install ripgrep
-          rg --version
       # SECURITY ORDERING (#560): the placeholder-stub scan runs before any cargo
       # phase so no PR-controlled build script or proc-macro executes before the
       # guard; it reads the pristine checkout. Keep this step ahead of every cargo
@@ -356,18 +635,12 @@ jobs:
       - name: Lockfile freshness
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh lockfile
-      - name: Forward-deployed crate checks
-        if: env.CI_SUITE == 'full' && matrix.shard == 2
-        run: ../scripts/ci.sh forward-deployed
       - name: Format, SQL, and ADR lints
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh lint
       - name: No-stub guard
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh no-stubs
-      - name: Clippy
-        if: env.CI_SUITE == 'full' && matrix.shard == 2
-        run: ../scripts/ci.sh clippy
       # Rustdoc is already the separately gated doc-build job below; keep it in
       # ci.sh's local all-mode without paying for duplicate per-OS CI builds.
       - name: Install cargo-nextest
@@ -389,9 +662,9 @@ jobs:
       - name: Workspace doctests
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh tests-doc
-      - name: Channel-email feature tests
-        if: env.CI_SUITE == 'full' && matrix.shard == 2
-        run: ../scripts/ci.sh channel-email
+      - name: Audit batch with production features
+        if: runner.os == 'Linux' && matrix.shard == 2
+        run: sh ../scripts/ci-audit-production.sh
       # Run this 25-repeat gate once per OS on shard 2. It is independent of
       # the workspace test partition, and its placement contributes to the
       # balance of the two complete jobs.
@@ -415,28 +688,295 @@ jobs:
       - name: No-default-features check
         if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh no-default-features
+      # The pull-request scope step runs this kkernel to ingest the workspace map (ADR-205 D4). It is the
+      # debug build the workspace tests just ran, published only by a main push run whose shard 1 passed
+      # every step above, with its debug sections stripped.
+      - name: Strip the kkernel binary for pull-request scoping
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'Linux'
+        run: |
+          mkdir -p "$RUNNER_TEMP/kkernel-scope"
+          strip --strip-debug -o "$RUNNER_TEMP/kkernel-scope/kkernel" target/debug/kkernel
+          ls -l target/debug/kkernel "$RUNNER_TEMP/kkernel-scope/kkernel"
+      - name: Publish the kkernel binary for pull-request scoping
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.CI_SUITE == 'full' && matrix.shard == 1 && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kkernel-debug-linux
+          path: ${{ runner.temp }}/kkernel-scope/kkernel
+          retention-days: 7
+          if-no-files-found: error
+
+  # The release build and the checks that run its binary. They ran at the end of shard 1, where the release
+  # build alone took about 8 of the shard's 41 minutes; here they run beside the shards on the same
+  # operating systems, against the same commit, and the gate requires this job like any other.
+  release-checks:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Release build and release checks (${{ matrix.os }})
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # The operating systems on which the ci job's full suite ran these steps: ubuntu on every pull
+      # request (a macOS pull-request job runs the focused macos-pr lane) and on train pushes, and
+      # macOS as well on every other run.
+      matrix:
+        os: ${{ fromJSON((github.event_name == 'pull_request'
+          || github.event_name == 'push' && startsWith(github.ref, 'refs/heads/integration/train-'))
+          && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest"]') }}
+    defaults:
+      run:
+        working-directory: crates
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # The scope the ci job runs under (ADR-205); each phase skips itself when its crate is out of scope.
+      TEST_SCOPE: ${{ needs.changed-paths.outputs.test_scope || 'full' }}
+      # With this set the embedding model cache below is load-bearing: a missing model fails by name.
+      LATTICE_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+      - name: Test scope
+        run: echo "TEST_SCOPE=$TEST_SCOPE"
+      - name: Free runner disk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+          # Pull requests restore main's cache and save nothing, as in the ci job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: line-tables-release
+      - name: Resolve the embedding model cache key
+        id: model-cache-key
+        working-directory: ${{ github.workspace }}
+        run: |
+          version=$(awk '/^name = "lattice-inference"$/{found=1; next} found && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' crates/Cargo.lock)
+          # An empty version would silently produce a key that never matches and
+          # a cache that never restores, which reads exactly like a cold runner.
+          if [ -z "$version" ]; then
+            echo "could not read the locked lattice-inference version from crates/Cargo.lock" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "resolved lattice-inference $version"
+      - name: Restore the embedding model cache
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models
+          key: lattice-models-${{ runner.os }}-all-minilm-l6-v2-${{ steps.model-cache-key.outputs.version }}
+      - name: Warm the embedding model cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}
+        run: scripts/warm-model-cache.sh all-minilm-l6-v2
+      # SECURITY ORDERING (#560), as in the ci job: the scan reads the pristine checkout before any
+      # PR-controlled build script or proc-macro runs.
+      - name: No-stub placeholder scan (before any cargo)
+        run: ../scripts/ci.sh no-stubs-scan
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - uses: astral-sh/setup-uv@v5
+      # The identifier-ban contract performs a repo-wide ripgrep scan and
+      # fails (rather than skips) when CI lacks rg (#1636). ubuntu-latest does
+      # not include it, so provision the instrument before khive-contract runs.
+      - name: Install khive-contract scan dependency (Linux)
+        if: runner.os == 'Linux'
+        run: ../scripts/ci-install-ripgrep.sh
+      - name: Install khive-contract scan dependency (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ripgrep
+          rg --version
       - name: Release build
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh release
       - name: Contract tests
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh contract-tests
       - name: Deno tests
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh deno-tests
       - name: Smoke tests
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh smoke-tests
       - name: Vector smoke test
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh vector-smoke
       - name: khive-contract suite
-        if: env.CI_SUITE == 'full' && matrix.shard == 1
         run: ../scripts/ci.sh contract-suite
+
+  # The email and Telegram channel and retrieval executor feature tests, moved off shard 2 for the same
+  # reason: about 10 of that shard's 41 minutes.
+  channel-tests:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Channel feature tests (${{ matrix.os }})
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # The operating systems on which the ci job's full suite ran these steps: ubuntu on every pull
+      # request (a macOS pull-request job runs the focused macos-pr lane) and on train pushes, and
+      # macOS as well on every other run.
+      matrix:
+        os: ${{ fromJSON((github.event_name == 'pull_request'
+          || github.event_name == 'push' && startsWith(github.ref, 'refs/heads/integration/train-'))
+          && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest"]') }}
+    defaults:
+      run:
+        working-directory: crates
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # The scope the ci job runs under (ADR-205); each phase skips itself when its crate is out of scope.
+      TEST_SCOPE: ${{ needs.changed-paths.outputs.test_scope || 'full' }}
+      # With this set the embedding model cache below is load-bearing: a missing model fails by name.
+      LATTICE_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+      - name: Test scope
+        run: echo "TEST_SCOPE=$TEST_SCOPE"
+      - name: Free runner disk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+          # Pull requests restore main's cache and save nothing, as in the ci job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: line-tables-channels
+      - name: Resolve the embedding model cache key
+        id: model-cache-key
+        working-directory: ${{ github.workspace }}
+        run: |
+          version=$(awk '/^name = "lattice-inference"$/{found=1; next} found && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' crates/Cargo.lock)
+          # An empty version would silently produce a key that never matches and
+          # a cache that never restores, which reads exactly like a cold runner.
+          if [ -z "$version" ]; then
+            echo "could not read the locked lattice-inference version from crates/Cargo.lock" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "resolved lattice-inference $version"
+      - name: Restore the embedding model cache
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models
+          key: lattice-models-${{ runner.os }}-all-minilm-l6-v2-${{ steps.model-cache-key.outputs.version }}
+      - name: Warm the embedding model cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}
+        run: scripts/warm-model-cache.sh all-minilm-l6-v2
+      # SECURITY ORDERING (#560), as in the ci job: the scan reads the pristine checkout before any
+      # PR-controlled build script or proc-macro runs.
+      - name: No-stub placeholder scan (before any cargo)
+        run: ../scripts/ci.sh no-stubs-scan
+      - name: Channel-email feature tests
+        run: ../scripts/ci.sh channel-email
+
+  # Clippy (default and all features) and the forward-deployed crate checks, moved off shard 2: about 10
+  # of that shard's 37 minutes, compiled in check mode, so they share no artifacts with the test build.
+  clippy-checks:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Clippy and forward-deployed checks (${{ matrix.os }})
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # The operating systems on which the ci job's full suite ran these steps: ubuntu on every pull
+      # request (a macOS pull-request job runs the focused macos-pr lane) and on train pushes, and
+      # macOS as well on every other run.
+      matrix:
+        os: ${{ fromJSON((github.event_name == 'pull_request'
+          || github.event_name == 'push' && startsWith(github.ref, 'refs/heads/integration/train-'))
+          && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest"]') }}
+    defaults:
+      run:
+        working-directory: crates
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # The scope the ci job runs under (ADR-205); each phase skips itself when its crate is out of scope.
+      TEST_SCOPE: ${{ needs.changed-paths.outputs.test_scope || 'full' }}
+      # With this set the embedding model cache below is load-bearing: a missing model fails by name.
+      LATTICE_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+      - name: Test scope
+        run: echo "TEST_SCOPE=$TEST_SCOPE"
+      - name: Free runner disk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+          # Pull requests restore main's cache and save nothing, as in the ci job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: line-tables-clippy
+      - name: Resolve the embedding model cache key
+        id: model-cache-key
+        working-directory: ${{ github.workspace }}
+        run: |
+          version=$(awk '/^name = "lattice-inference"$/{found=1; next} found && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' crates/Cargo.lock)
+          # An empty version would silently produce a key that never matches and
+          # a cache that never restores, which reads exactly like a cold runner.
+          if [ -z "$version" ]; then
+            echo "could not read the locked lattice-inference version from crates/Cargo.lock" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "resolved lattice-inference $version"
+      - name: Restore the embedding model cache
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models
+          key: lattice-models-${{ runner.os }}-all-minilm-l6-v2-${{ steps.model-cache-key.outputs.version }}
+      - name: Warm the embedding model cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}
+        run: scripts/warm-model-cache.sh all-minilm-l6-v2
+      # SECURITY ORDERING (#560), as in the ci job: the scan reads the pristine checkout before any
+      # PR-controlled build script or proc-macro runs.
+      - name: No-stub placeholder scan (before any cargo)
+        run: ../scripts/ci.sh no-stubs-scan
+      - name: Forward-deployed crate checks
+        run: ../scripts/ci.sh forward-deployed
+      - name: Clippy
+        run: ../scripts/ci.sh clippy
 
   khive-py:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Python client tests
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -457,6 +997,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: line-tables
       - uses: actions/setup-python@v6
         with:
@@ -510,7 +1051,8 @@ jobs:
 
   kg-editor:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}KG Studio (Next.js)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     # Allow the browser download's four-minute retry budget and the OS
     # dependency install's eight-minute backstop, with eight minutes remaining
@@ -578,6 +1120,30 @@ jobs:
           key: playwright-${{ runner.os }}-${{ hashFiles('apps/kg-editor/package-lock.json') }}
       - name: Install browser for repository dogfood
         run: timeout 120 npx playwright install chromium || timeout 120 npx playwright install chromium
+      # The OS dependency install downloads about 26 MB of archives from the
+      # Ubuntu mirror on every run, and a slow mirror can spend the whole step
+      # bound on that download while still making progress. Keep the archives
+      # between runs. apt checks every restored file against the current index
+      # and downloads only what is missing or changed, so a stale entry costs a
+      # download, never a wrong package. The key carries the runner image,
+      # whose preinstalled packages decide which archives are needed, and the
+      # lock file, which pins the Playwright version that names them.
+      - name: Resolve the browser OS dependency cache key
+        id: apt-cache-key
+        run: echo "image=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+      - name: Restore browser OS dependency archives
+        id: apt-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/playwright-apt-archives
+          key: playwright-apt-${{ runner.os }}-${{ steps.apt-cache-key.outputs.image }}-${{ hashFiles('apps/kg-editor/package-lock.json') }}
+          restore-keys: |
+            playwright-apt-${{ runner.os }}-
+      - name: Stage restored archives for apt
+        run: |
+          mkdir -p ~/.cache/playwright-apt-archives
+          find ~/.cache/playwright-apt-archives -maxdepth 1 -name '*.deb' -exec sudo cp -t /var/cache/apt/archives/ {} +
+          echo "apt archive cache: $(find /var/cache/apt/archives -maxdepth 1 -name '*.deb' | wc -l)"
       - name: Install browser OS dependencies
         # Deliberately NO timeout(1) wrapper: killing the wrapper mid-install
         # orphans apt-get with the dpkg lock held (the unsound pattern the
@@ -590,12 +1156,30 @@ jobs:
         # package downloads can exceed the former four-minute backstop.
         timeout-minutes: 8
         run: npx playwright install-deps chromium || npx playwright install-deps chromium
+      # Save only after a successful install and only on an exact-key miss, so
+      # a cache entry always holds a complete set. An empty set is never saved:
+      # it would occupy the exact key and stop the next run from filling it.
+      - name: Collect browser OS dependency archives
+        id: apt-archives
+        if: steps.apt-cache.outputs.cache-hit != 'true'
+        run: |
+          find /var/cache/apt/archives -maxdepth 1 -name '*.deb' -exec cp -t ~/.cache/playwright-apt-archives/ {} +
+          count=$(find ~/.cache/playwright-apt-archives -maxdepth 1 -name '*.deb' | wc -l)
+          echo "collected archives: $count"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+      - name: Save browser OS dependency archives
+        if: steps.apt-cache.outputs.cache-hit != 'true' && steps.apt-archives.outputs.count != '0'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/playwright-apt-archives
+          key: ${{ steps.apt-cache.outputs.cache-primary-key }}
       - name: Repository showcase dogfood
         run: npx playwright test
 
   supply-chain:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Supply-chain (cargo-deny)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -619,6 +1203,23 @@ jobs:
         run: |
           test "$(cargo-deny --version)" = "cargo-deny 0.19.9"
           cargo deny --manifest-path crates/Cargo.toml --all-features check bans licenses sources advisories
+      # crates/deny.toml ignores RUSTSEC-2026-0457 and RUSTSEC-2026-0462 only
+      # because the rmcp features carrying them are off. This step fails the
+      # moment one of them is enabled, so the ignore cannot outlive its reason.
+      - name: rmcp advisory features stay disabled
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --locked --manifest-path crates/Cargo.toml -e features -i rmcp --workspace --all-features)
+          features=$(printf '%s\n' "$tree" | grep -o 'rmcp feature "[^"]*"' | sort -u || true)
+          printf '%s\n' "$features"
+          if ! printf '%s\n' "$features" | grep -qx 'rmcp feature "server"'; then
+            echo "::error::could not read the resolved rmcp feature set"
+            exit 1
+          fi
+          if printf '%s\n' "$features" | grep -E '^rmcp feature "(auth|transport-streamable-http-client-reqwest|transport-streamable-http-client-unix-socket)"$'; then
+            echo "::error::an rmcp feature covered by an ignored advisory is enabled; remove the ignore from crates/deny.toml and move rmcp to 3.9 or later"
+            exit 1
+          fi
 
   data-leak-guard:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}JSON/JSONL data-leak guard
@@ -635,12 +1236,21 @@ jobs:
         run: bash scripts/tests/check-json-data-test.sh
       - name: Cargo hook fixture tests
         run: python3 scripts/tests/test_hook_cargo.py
+      - name: Coverage profile forwarder tests
+        run: python3 scripts/tests/test_coverage_profile_diagnostics.py
+      - name: Local artifact verifier and install target tests
+        run: python3 scripts/tests/test_verify_local_artifact.py
 
   secret-scan:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Secret scan (gitleaks)
     needs: resolve-revision
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The nightly run scans every ref and a replay scans its commit's whole history. Measured on the
+    # scheduled runs: the full-history checkout took 2.5 to 4.2 minutes; the scan finished 12,304
+    # commits in 5m50s on the one night it completed and was still running at 6m00s to 6m50s on the
+    # nights the 10-minute limit cancelled it (9 of 10). Pull request and push runs scan their own
+    # range whenever one resolves, and keep 10.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 30 || 10 }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -746,11 +1356,30 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+          # The reference renderer dates each baseline from its commit. A
+          # shallow checkout can contain the document but not the baseline commit.
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Benchmark reference renderer tests
+        run: python3 -m unittest scripts.tests.test_render_bench_reference -v
+      - name: Check benchmark reference blocks
+        run: python3 scripts/render-bench-reference.py --check
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
       - name: Check markdown formatting
         run: scripts/ci.sh docs-fmt
+      - name: ADR reference and status lints
+        run: scripts/ci.sh adr-lint
+      # The repository-wide identifier ban reads Markdown too, and the documentation lane skips the
+      # contract suite that holds it, so it runs here on every change.
+      - uses: astral-sh/setup-uv@v5
+      - name: Install repository scan dependency
+        run: scripts/ci-install-ripgrep.sh
+      - name: Repository identifier ban
+        run: scripts/ci.sh content-sweeps
 
   marketplace:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Marketplace example validator
@@ -769,7 +1398,8 @@ jobs:
 
   doc-build:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Doc build (-D warnings)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -784,14 +1414,15 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build docs (deny warnings)
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
   dependency-review:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Dependency review
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
     # Admit the job so GitHub evaluates its check name even when no PR work applies.
-    if: always()
+    if: always() && needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Declare the read scope the action needs explicitly so the gate does not
@@ -846,7 +1477,8 @@ jobs:
 
   wasm-parity:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}wasm-parity (khive-changeset)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -865,6 +1497,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Pinned exact version (same rationale as the cargo-deny/gitleaks pins
       # above): a wasm-parity gate's tooling must not silently drift.
       - name: Cache wasmtime
@@ -909,6 +1542,68 @@ jobs:
           fi
           echo "$actual_output"
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+      - name: Rule evaluator wasm32 compile check (ADR-101 D5)
+        run: cargo check --locked -p khive-rule-evaluator --target wasm32-unknown-unknown
+      - name: Rule evaluator native suite and result transcripts
+        run: |
+          set -o pipefail
+          cargo test --locked -p khive-rule-evaluator -- --nocapture --test-threads=1 2>&1 | tee /tmp/rules-native.log
+      - name: Rule evaluator wasm32-wasip1 suite and result transcripts
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: "wasmtime run --wasi preview2 --"
+        run: |
+          set -o pipefail
+          cargo test --locked -p khive-rule-evaluator --target wasm32-wasip1 -- --nocapture --test-threads=1 2>&1 | tee /tmp/rules-wasm.log
+      - name: Assert full rule-result bytes match on native and wasm32
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          prefix = "RULE_EVALUATOR_GOLDEN:"
+          expected = {"full", "partial"}
+
+          def transcripts(log):
+              rows = [line for line in log.splitlines() if line.startswith(prefix)]
+              if len(rows) != 2:
+                  raise ValueError("expected exactly two nonempty result transcripts")
+              values = {}
+              for line in rows:
+                  label, payload = line[len(prefix):].split(":", 1)
+                  if label in values or label not in expected:
+                      raise ValueError("duplicate or unexpected result transcript")
+                  decoded = json.loads(payload)
+                  if not isinstance(decoded, list) or not decoded:
+                      raise ValueError("empty or invalid result transcript")
+                  values[label] = payload
+              if set(values) != expected:
+                  raise ValueError("missing named result transcript")
+              return values
+
+          def compare(native, wasm):
+              if transcripts(native) != transcripts(wasm):
+                  raise ValueError("native and wasm32 rule-result bytes differ")
+
+          native = Path("/tmp/rules-native.log").read_text()
+          wasm = Path("/tmp/rules-wasm.log").read_text()
+          compare(native, wasm)
+          # Comparator controls: status-only, missing and two-empty captures
+          # must never make a parity gate vacuously pass.
+          changed = native.replace('"passed":false', '"passed":true', 1)
+          if changed == native:
+              raise ValueError("fixture lost its failing-rule positive control")
+          missing = "\n".join(line for line in native.splitlines()
+                              if not line.startswith(prefix + "partial:"))
+          for left, right in [(native, changed), (native, missing), ("", "")]:
+              try:
+                  compare(left, right)
+              except ValueError:
+                  pass
+              else:
+                  raise AssertionError("parity comparator accepted a negative control")
+          print("native and wasm32: two complete rule-result JSON transcripts match")
+          PY
+
       - name: wasm32-unknown-unknown compile check (ADR-101 D5)
         run: cargo check -p khive-changeset --target wasm32-unknown-unknown
       # ADR-101 D5 requires CI to run the SAME test suite against native and
@@ -941,9 +1636,61 @@ jobs:
           fi
           echo "native and wasm32-wasip1: $(wc -l < /tmp/native.sorted) tests, identical pass/fail results"
 
+      # Pure graph-state diff uses the same native/WASM suite, plus a separate
+      # nocapture invocation of its golden fixture for actual result-byte parity.
+      - name: Graph diff wasm32-unknown-unknown build (ADR-101 D5)
+        run: cargo build --locked -p khive-graph-diff --target wasm32-unknown-unknown
+      - name: Graph diff native suite and golden bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p khive-graph-diff --test graph_diff -- --test-threads=1 2>&1 | tee /tmp/graph-diff-native.log
+          cargo test --locked -p khive-graph-diff --test graph_diff parity_golden -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/graph-diff-native-golden.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/graph-diff-native-golden.log" 1
+      - name: Graph diff wasm32-wasip1 suite and golden bytes
+        shell: bash
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: "wasmtime run --wasi preview2 --"
+        run: |
+          set -euo pipefail
+          cargo test --locked -p khive-graph-diff --test graph_diff --target wasm32-wasip1 -- --test-threads=1 2>&1 | tee /tmp/graph-diff-wasm.log
+          cargo test --locked -p khive-graph-diff --test graph_diff --target wasm32-wasip1 parity_golden -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/graph-diff-wasm-golden.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/graph-diff-wasm-golden.log" 1
+      - name: Assert graph diff suite and result-byte parity
+        run: |
+          set -euo pipefail
+          for platform in native wasm; do
+            grep -E '^test .* \.\.\. (ok|FAILED)$' "/tmp/graph-diff-${platform}.log" | sort > "/tmp/graph-diff-${platform}.sorted"
+            test -s "/tmp/graph-diff-${platform}.sorted"
+            grep '^GRAPH_DIFF_PARITY:' "$RUNNER_TEMP/graph-diff-${platform}-golden.log" > "/tmp/graph-diff-${platform}.bytes"
+          done
+          diff -u /tmp/graph-diff-native.sorted /tmp/graph-diff-wasm.sorted
+          assert_graph_diff_bytes() {
+            test "$(wc -l < "$1")" -eq 2 || return 1
+            test "$(wc -l < "$2")" -eq 2 || return 1
+            cmp -s "$1" "$2"
+          }
+          assert_graph_diff_bytes /tmp/graph-diff-native.bytes /tmp/graph-diff-wasm.bytes
+          # The exact comparator used above must reject changed result bytes,
+          # missing fixtures and a vacuous pair of empty transcripts.
+          sed '1s/$/ /' /tmp/graph-diff-wasm.bytes > /tmp/graph-diff-mutated.bytes
+          head -n 1 /tmp/graph-diff-wasm.bytes > /tmp/graph-diff-missing.bytes
+          : > /tmp/graph-diff-empty.bytes
+          for invalid in mutated missing empty; do
+            if assert_graph_diff_bytes /tmp/graph-diff-native.bytes "/tmp/graph-diff-${invalid}.bytes"; then
+              echo "graph diff parity accepted ${invalid} fixture bytes" >&2
+              exit 1
+            fi
+          done
+          if assert_graph_diff_bytes /tmp/graph-diff-empty.bytes /tmp/graph-diff-empty.bytes; then
+            echo "graph diff parity accepted empty fixture transcripts" >&2
+            exit 1
+          fi
+
   vamana-portability:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}vamana portability (ADR-110 Layer A)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -960,6 +1707,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: wasm32 core compile check
         run: cargo check --target wasm32-unknown-unknown -p khive-quant -p khive-vamana --no-default-features
       - name: Native sequential and owned-storage tests
@@ -967,7 +1715,8 @@ jobs:
 
   minio-blob-compat:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}MinIO BlobStore compatibility (ADR-111 Amendment 2)
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -1034,6 +1783,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # MinIO no longer publishes prebuilt server images or binaries that an
       # anonymous CI job can fetch. quay.io answers 401 for minio/minio (its
       # tags and the digest this job used to pin), dl.min.io answers 410 Gone
@@ -1114,7 +1864,7 @@ jobs:
           KHIVE_S3_TEST_REGION: us-east-1
           AWS_ACCESS_KEY_ID: khive-ci
           AWS_SECRET_ACCESS_KEY: khive-ci-secret
-        run: cargo test -p khive-db --test blob_conformance
+        run: cargo test -p khive-db --features blob-s3 --test blob_conformance
       # The suite counts only if the server started above served all of it:
       # the same process must still be alive and still own the port.
       - name: Confirm the suite ran against the started server
@@ -1133,7 +1883,8 @@ jobs:
 
   msrv-check:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}MSRV compile check
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:
@@ -1148,13 +1899,194 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: msrv-1.95
       - name: Check workspace on the declared minimum Rust version
         run: cargo +1.95.0 check --workspace --locked
 
+  # Required by ci-gate after the successful main observation week.
+  # Sequential feature checks reuse one Linux runner without hiding later failures.
+  core-only:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Core-only feature set build and tests
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
+      # See the model cache steps below: with this set the cache is load-bearing.
+      LATTICE_OFFLINE: "1"
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The same embedding model cache the ci job restores, under the same key. With
+      # LATTICE_OFFLINE set above, a library test that needs the model fails naming
+      # the missing directory instead of fetching from huggingface.co.
+      - name: Resolve the embedding model cache key
+        id: model-cache-key
+        working-directory: ${{ github.workspace }}
+        run: |
+          version=$(awk '/^name = "lattice-inference"$/{found=1; next} found && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' crates/Cargo.lock)
+          # An empty version would silently produce a key that never matches and
+          # a cache that never restores, which reads exactly like a cold runner.
+          if [ -z "$version" ]; then
+            echo "could not read the locked lattice-inference version from crates/Cargo.lock" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "resolved lattice-inference $version"
+      - name: Restore the embedding model cache
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models
+          key: lattice-models-${{ runner.os }}-all-minilm-l6-v2-${{ steps.model-cache-key.outputs.version }}
+      - name: Warm the embedding model cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}
+        run: scripts/warm-model-cache.sh all-minilm-l6-v2
+      - name: Compile every target without the optional packs
+        run: cargo check -p kkernel -p khive-mcp --no-default-features --all-targets --locked
+      - name: Keep Git's normal dependency graph independent of Exec and Tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo tree --locked -p khive-pack-git --edges normal --target all --prefix none --format '{p}' > "$RUNNER_TEMP/git-normal-deps.txt"
+          awk '{print $1}' "$RUNNER_TEMP/git-normal-deps.txt" > "$RUNNER_TEMP/git-normal-packages.txt"
+          grep -Fxq 'khive-pack-git' "$RUNNER_TEMP/git-normal-packages.txt"
+          if grep -Ex 'khive-pack-exec|khive-pack-tool' "$RUNNER_TEMP/git-normal-packages.txt"; then
+            echo 'Git must not normally depend on Exec or Tool; dev fixtures may use both' >&2
+            exit 1
+          fi
+      - name: Run the library tests without the optional packs
+        run: cargo test -p kkernel -p khive-mcp --no-default-features --lib --locked
+      # These integration tests assert which packs are linked and selectable. Their
+      # feature-off branches are what catch a core crate linking an optional pack.
+      - name: Run the pack composition tests without the optional packs
+        run: cargo test -p kkernel --no-default-features --locked --test optional_pack_features --test gate_operation_census --test descriptions_are_written_for_callers
+      # The default features leave the agent, telemetry and web packs out, so the ci
+      # job runs only their feature-off branches. These three steps run the
+      # feature-on branches and the suites that need an optional pack.
+      - name: Run the library tests with every optional pack
+        run: cargo test -p kkernel -p khive-mcp --features pack-agent,pack-telemetry,pack-web --lib --locked
+      - name: Run the pack composition tests with every optional pack
+        run: cargo test -p kkernel --features pack-agent,pack-telemetry,pack-web --locked --test optional_pack_features --test gate_operation_census --test descriptions_are_written_for_callers --test pack_schema_scope --test pack_metadata_accessors --test mount_fixture --test mounts
+      - name: Run the server suites that need an optional pack
+        run: cargo test -p khive-mcp --features pack-agent,pack-telemetry,pack-web --locked --test mcp_mount_fixture --test mounts --test telemetry_activation --test web_backend_routing
+      # kg-adapters and repo-showcase are off by default, so the ci job runs only the
+      # refusal side of kg import and none of the repo commands. This step runs the
+      # import adapter and repository showcase suites with both features on.
+      - name: Run the kg import adapter and repository showcase suites
+        run: cargo test -p kkernel --features kg-adapters,repo-showcase --locked --lib --test kg_import_csv --test kg_import_bibtex --test kg_import_schema --test kg_import_conflicts --test repo_showcase_cli
+      # The install gate probes the operator build with an isolated config, and a pack
+      # that refuses to register under that config fails every install. This step
+      # builds kkernel with the build-local feature set and runs the same probe on it,
+      # so that refusal fails the pull request instead.
+      - name: Probe a kkernel built with the operator feature set
+        run: |
+          cargo build -p kkernel --bin kkernel --locked --features channel-email,channel-telegram,pack-agent,pack-telemetry,pack-web,pack-formal,pack-moodboard,kg-adapters,repo-showcase
+          make -C .. fleet-check FLEET_ARTIFACT="$PWD/target/debug/kkernel"
+
+      - name: Check each optional pack independently
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          status=0
+          for feature in pack-agent pack-telemetry pack-web pack-formal pack-moodboard; do
+            started=$SECONDS
+            if cargo check -p kkernel --no-default-features --features "$feature" --locked; then
+              result=passed
+            else
+              result=failed
+              status=1
+            fi
+            printf '%s: %s (%s seconds)\n' "$feature" "$result" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"
+          done
+          exit "$status"
+
+  # The S3 store library tests, moved out of the core-only job: about 13 of its 40 minutes, compiled under
+  # a feature set no other core-only step uses.
+  s3-blob-tests:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}S3 blob store library tests
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
+      # See the model cache steps below: with this set the cache is load-bearing.
+      LATTICE_OFFLINE: "1"
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The same embedding model cache the ci job restores, under the same key. With
+      # LATTICE_OFFLINE set above, a library test that needs the model fails naming
+      # the missing directory instead of fetching from huggingface.co.
+      - name: Resolve the embedding model cache key
+        id: model-cache-key
+        working-directory: ${{ github.workspace }}
+        run: |
+          version=$(awk '/^name = "lattice-inference"$/{found=1; next} found && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' crates/Cargo.lock)
+          # An empty version would silently produce a key that never matches and
+          # a cache that never restores, which reads exactly like a cold runner.
+          if [ -z "$version" ]; then
+            echo "could not read the locked lattice-inference version from crates/Cargo.lock" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "resolved lattice-inference $version"
+      - name: Restore the embedding model cache
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models
+          key: lattice-models-${{ runner.os }}-all-minilm-l6-v2-${{ steps.model-cache-key.outputs.version }}
+      - name: Warm the embedding model cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}
+        run: scripts/warm-model-cache.sh all-minilm-l6-v2
+      # SECURITY ORDERING (#560), as in the ci job: the scan reads the pristine checkout before any
+      # PR-controlled build script or proc-macro runs.
+      - name: No-stub placeholder scan (before any cargo)
+        run: ../scripts/ci.sh no-stubs-scan
+      # blob-s3 is off by default, so the ci job runs only the refusal side of an S3
+      # store configuration, and the MinIO job runs only the conformance suite. This
+      # step runs the S3 store, configuration and server library tests.
+      - name: Run the S3 blob store library tests
+        run: cargo test -p khive-db -p khive-runtime -p khive-mcp --features blob-s3 --locked --lib
+
   check-windows:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Windows compile check
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    if: needs.changed-paths.outputs.docs_only != 'true' && github.event.pull_request.draft != true
     runs-on: windows-latest
     timeout-minutes: 30
     defaults:
@@ -1169,8 +2101,9 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # 0.5.0 release blocker: khive-runtime/khive-mcp's daemon subsystem must
-      # compile on x86_64-pc-windows-msvc (the npm package's Windows target).
+      # compile on x86_64-pc-windows-msvc.
       # Not (yet) a required check in branch protection — plain `cargo check`
       # (no --all-targets) keeps this fast while the Windows lane is new;
       # widen once it has proven stable.
@@ -1207,6 +2140,23 @@ jobs:
         run: |
           cargo test -p khive-db --lib windows_read_only_legacy_reader_rejects_different_opened_file_identity 2>&1 | tee "$RUNNER_TEMP/windows-legacy-reader-identity.log"
           ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/windows-legacy-reader-identity.log" 1
+      # #5722: a code-map pool's post-open identity check asks the custom VFS for the native
+      # handle; only a Windows run exercises that file control.
+      - name: khive-db Windows code-map handle identity
+        shell: bash
+        run: |
+          cargo test -p khive-db --lib windows_code_map_pool_reports_retained_main_identity 2>&1 | tee "$RUNNER_TEMP/windows-code-map-handle-identity.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/windows-code-map-handle-identity.log" 1
+      - name: khive-db Windows handle lock mechanism
+        shell: bash
+        run: |
+          cargo test -p khive-db --test lock_mechanism_probe windows::windows_handle_interaction_does_not_release_another_handles_lock -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/lock-mechanism-windows-handle.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/lock-mechanism-windows-handle.log" 1
+      - name: khive-db Windows stale-path lock mechanism
+        shell: bash
+        run: |
+          cargo test -p khive-db --test lock_mechanism_probe stale_path::stale_path_truncate_after_rename_changes_the_replacement_while_original_lock_survives -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/lock-mechanism-stale-path.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/lock-mechanism-stale-path.log" 1
       # #2149: exercise real Windows sharing/reparse semantics and Git's
       # consumption of the pinned path; a compile check cannot prove either.
       - name: khive-pack-git Windows cache slot pins
@@ -1227,18 +2177,24 @@ jobs:
 
   coverage-measurement:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage measurement
-    needs: resolve-revision
+    needs: [resolve-revision, changed-paths]
+    # Coverage runs on main pushes, the nightly run and manual dispatches only. Pull requests and
+    # integration trains skip it: it held a Linux runner for 40 minutes on every pull request run, and
+    # a regression is caught by the main push that lands it (fixed forward or reverted). A scoped run
+    # also skips it: a number over a subset is not comparable with the baseline (ADR-205 D5).
+    if: needs.changed-paths.outputs.docs_only != 'true' && (needs.changed-paths.outputs.test_scope == 'full' || needs.changed-paths.outputs.test_scope == '') && github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/heads/integration/')
     runs-on: ubuntu-latest
     # The measuring step carries its own budget below. A job-level timeout
     # cancels the job, and a cancelled job is neither success nor skipped, so
     # the gate would read the timeout as a cancellation while the
     # no-measurement step never ran and never reported why. This job-level
     # value only bounds setup around the step, so it stays above it.
-    timeout-minutes: 75
+    timeout-minutes: 90
     outputs:
       available: ${{ steps.compute_coverage.outcome == 'success' }}
       current: ${{ steps.compute_coverage.outputs.current }}
     env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # See the model cache steps below: with this set the cache is load-bearing.
       LATTICE_OFFLINE: "1"
     steps:
@@ -1264,6 +2220,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-targets: false
       # Pinned to a commit SHA, not the mutable @v2 tag (same rationale as the
       # #215 cargo-deny installer pin): a required gate's tooling must not drift.
@@ -1316,15 +2273,16 @@ jobs:
         #
         # THE BUDGET IS SET FROM A MEASUREMENT, NOT FROM A ROUND NUMBER. The
         # original completed measurement was 29m15s, with a 1.37x margin giving
-        # 40 minutes. Recent successful Compute coverage runs reached 39 minutes
-        # (#3808), and a 40-minute run was cut just after producing its coverage
-        # value. Preserve that margin against the slower successful measurement:
-        # ceil(39 x 1.37) = ceil(53.43) = 54 minutes.
+        # 40 minutes. Successful Compute coverage runs later reached 39 minutes
+        # (#3808), giving ceil(39 x 1.37) = 54 minutes. They then reached 53m18s
+        # on main, and a 54m04s run was cut 0.1 s after printing its coverage
+        # value (#6363). Preserve the same margin against that measurement:
+        # ceil(54.07 x 1.37) = ceil(74.07) = 75 minutes.
         #
         # A miss is a red required check rather than a silent skip. The step
-        # must still expire before the 75-minute job budget so the reporting and
+        # must still expire before the 90-minute job budget so the reporting and
         # failing steps below can run; the job continues to bound genuine hangs.
-        timeout-minutes: 54
+        timeout-minutes: 75
         working-directory: crates
         # Keep #705's instrumented replay-test margin local to that test.
         # A global checkout override made unrelated recall tests wait 300s
@@ -1337,10 +2295,57 @@ jobs:
           # in field 4 and Lines% in field 10, so the prior `awk '{print $4}'`
           # silently gated on REGION coverage while logs claimed line coverage.
           # `.data[0].totals.lines.percent` is unambiguous and format-stable.
+          # Observing profdata must not turn a coverage failure into success.
+          # Older replay checkouts may not have the diagnostic helper.
+          HELPER="$GITHUB_WORKSPACE/scripts/coverage-profile-diagnostics.py"
+          if [[ -x "$HELPER" ]] && \
+             DIAGNOSTICS=$(mktemp -d "$RUNNER_TEMP/coverage-profiles.XXXXXX") && \
+             RUST_LIBDIR=$(rustc --print target-libdir); then
+            export COVERAGE_PROFILE_DIAGNOSTICS="$DIAGNOSTICS"
+            export COVERAGE_PROFILE_DIAGNOSTICS_MODE=forward
+            export COVERAGE_REAL_PROFDATA="${LLVM_PROFDATA-$RUST_LIBDIR/../bin/llvm-profdata}"
+            PROFILE_TARGET="${CARGO_LLVM_COV_TARGET_DIR-${CARGO_TARGET_DIR-$PWD/target}/llvm-cov-target}"
+            printf 'profile_diagnostics=%s\n' "$DIAGNOSTICS" >> "$GITHUB_OUTPUT" || true
+            printf 'real_profdata=%s\n' "$COVERAGE_REAL_PROFDATA" >> "$GITHUB_OUTPUT" || true
+            printf 'profile_target=%s\n' "$PROFILE_TARGET" >> "$GITHUB_OUTPUT" || true
+            export COVERAGE_PROFILE_TARGET="$PROFILE_TARGET"
+            # EXIT cleanup cannot change the original status and never signals a PID.
+            trap '{ : > "$DIAGNOSTICS/observer.stop"; } 2>/dev/null || true' EXIT
+            { : > "$DIAGNOSTICS/observer.requested"; } 2>/dev/null || true
+            COVERAGE_PROFILE_DIAGNOSTICS_MODE=observe "$HELPER" </dev/null >/dev/null 2>&1 &
+            export LLVM_PROFDATA="$HELPER"
+          else
+            echo "coverage profile diagnostics unavailable; running the original coverage command" >&2
+          fi
           cargo llvm-cov --workspace --summary-only --json > /tmp/cov.json
           CURRENT=$(jq -r '.data[0].totals.lines.percent' /tmp/cov.json)
           echo "Current line coverage: ${CURRENT}%"
           echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
+      - name: Collect failed coverage profiles
+        if: always() && steps.compute_coverage.outcome == 'failure' && steps.compute_coverage.outputs.profile_diagnostics != ''
+        continue-on-error: true
+        timeout-minutes: 5
+        working-directory: crates
+        env:
+          COVERAGE_PROFILE_DIAGNOSTICS_MODE: collect
+          COVERAGE_PROFILE_DIAGNOSTICS: ${{ steps.compute_coverage.outputs.profile_diagnostics }}
+          COVERAGE_REAL_PROFDATA: ${{ steps.compute_coverage.outputs.real_profdata }}
+          COVERAGE_PROFILE_TARGET: ${{ steps.compute_coverage.outputs.profile_target }}
+        run: ../scripts/coverage-profile-diagnostics.py
+      - name: Upload failed coverage profile diagnostics
+        if: always() && steps.compute_coverage.outcome == 'failure' && steps.compute_coverage.outputs.profile_diagnostics != ''
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-profiles-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.compute_coverage.outputs.profile_diagnostics }}/profiles.jsonl
+            ${{ steps.compute_coverage.outputs.profile_diagnostics }}/merge-stderr.txt
+            ${{ steps.compute_coverage.outputs.profile_diagnostics }}/tool-versions.txt
+            ${{ steps.compute_coverage.outputs.profile_diagnostics }}/corrupt/*.profraw
+          retention-days: 7
+          if-no-files-found: warn
       - name: Report unavailable coverage measurement
         if: steps.compute_coverage.outcome != 'success'
         continue-on-error: true
@@ -1363,9 +2368,9 @@ jobs:
 
   coverage-ratchet:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage ratchet
-    needs: [resolve-revision, coverage-measurement]
+    needs: [resolve-revision, coverage-measurement, changed-paths]
     # Missing inputs must produce a named failure, not an unevaluated skipped name.
-    if: always()
+    if: always() && needs.changed-paths.outputs.docs_only != 'true' && (needs.changed-paths.outputs.test_scope == 'full' || needs.changed-paths.outputs.test_scope == '') && github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/heads/integration/')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Read-only gate: fails a PR whose measured line coverage regresses below the
@@ -1414,6 +2419,7 @@ jobs:
     timeout-minutes: 5
     needs:
       - resolve-revision
+      - changed-paths
       - automerge-push-guard
       - ci
       - khive-py
@@ -1431,21 +2437,57 @@ jobs:
       - vamana-portability
       - minio-blob-compat
       - msrv-check
+      - core-only
+      - release-checks
+      - channel-tests
+      - s3-blob-tests
+      - clippy-checks
     if: always()
     steps:
+      # DRAFT. A draft pull request runs the lint and classify jobs only; the heavy jobs skip until it is
+      # marked ready, and the ready_for_review event runs them. The gate refuses a draft by name rather
+      # than reading those skips as a pass.
+      - name: Refuse a draft pull request
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft == true
+        run: |
+          echo "Gate failure: draft pull request. The full job set runs when it is marked ready for review."
+          exit 1
       - name: Check aggregated job results
         env:
           NEEDS: ${{ toJSON(needs) }}
+          COVERAGE_SKIPS: ${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/integration/') }}
         run: |
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-          # Only the push guard may skip on run shape. Dependency review now
+          # The push guard may skip on run shape. Dependency review
           # completes an explicit no-work step outside PRs; missing coverage
-          # inputs fail the ratchet. An unexpected skip must not pass the gate.
+          # inputs fail the ratchet. The lane jobs may skip only when the
+          # classifier succeeded and reported docs_only=true. The coverage
+          # jobs may also skip when the classifier succeeded with a crate-list
+          # test scope (ADR-205 D6), and on every pull request and integration
+          # push, where coverage does not run. Any other skip fails the gate.
+          echo "$NEEDS" | jq -r '"documentation lane: \(.["changed-paths"].result) docs_only=\(.["changed-paths"].outputs.docs_only // "unset")"'
+          echo "$NEEDS" | jq -r '"test scope: \(.["changed-paths"].result) test_scope=\(.["changed-paths"].outputs.test_scope // "unset")"'
           bad=$(echo "$NEEDS" | jq -r '
             ["automerge-push-guard"] as $allowed_skips
+            | (if .["changed-paths"].result == "success"
+                  and .["changed-paths"].outputs.docs_only == "true"
+               then ["ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
+                     "dependency-review", "coverage-measurement", "coverage-ratchet",
+                     "wasm-parity", "vamana-portability", "minio-blob-compat",
+                     "msrv-check", "core-only", "release-checks", "channel-tests",
+                     "s3-blob-tests", "clippy-checks"]
+               else [] end) as $docs_lane_skips
+            | (.["changed-paths"].outputs.test_scope // "") as $scope
+            | (if .["changed-paths"].result == "success"
+                  and $scope != "" and ($scope | ascii_downcase) != "full"
+               then ["coverage-measurement", "coverage-ratchet"]
+               else [] end) as $scoped_skips
+            | (if env.COVERAGE_SKIPS == "true"
+               then ["coverage-measurement", "coverage-ratchet"] else [] end) as $event_skips
             | to_entries[] | .key as $job
             | select(.value.result != "success" and
-                (.value.result != "skipped" or ($allowed_skips | index($job) | not)))
+                (.value.result != "skipped"
+                  or (($allowed_skips + $docs_lane_skips + $scoped_skips + $event_skips) | index($job) | not)))
             | .key')
           if [ -n "$bad" ]; then
             echo "Gate failure — jobs not green: $bad"

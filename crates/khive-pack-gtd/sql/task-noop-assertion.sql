@@ -1,0 +1,1 @@
+SELECT 1 FROM notes WHERE id = ?1 AND updated_at = ?2 AND deleted_at IS ?3 AND CASE WHEN json_type(properties, '$.status') = 'text' THEN json_extract(properties, '$.status') ELSE 'inbox' END = ?4 AND version = ?5

@@ -1119,3 +1119,152 @@ test fails when the corresponding behavior is removed.
 Acceptance applies to the final reviewed text and its conformant implementation.
 This proposal changes neither git.receipts pagination nor event-plane WAL
 configuration; those have separate contracts.
+
+## Proposed amendment: count-free entity list pages (2026-10-05)
+
+**Status: Proposed.**
+
+`EntityStore` adds the provided method
+`query_entities_count_free(&self, namespace: &str, filter: EntityFilter, page: PageRequest) -> StorageResult<Page<Entity>>`.
+An implementation returns the same filtered row projection and page order as
+`query_entities`, with `total: None`, without computing an exact matching count.
+Callers that need `has_more` request one lookahead row. An absent total does not
+mean the population is empty or exhausted.
+
+The default returns `StorageError::Unsupported` for the Entities capability and
+this operation. It must not call `query_entities` or `count_entities` as a
+fallback. Existing implementors remain source-compatible, but a custom backend
+must implement this operation to serve runtime entity lists. Storage failures
+from an implemented operation remain errors rather than capability absence or
+an empty successful page.
+
+Runtime scalar, composed and tagged entity lists use the count-free operation.
+Reference resolution and callers that require an exact total retain
+`query_entities`; explicit entity count operations retain `count_entities`.
+Existing complete-ID and candidate-name total exceptions on the exact query
+operation remain unchanged. The SQLite implementation preserves filter
+intersections, alias membership, namespace selection, live-row filtering,
+attachment content references, name ranking and pagination validation.
+
+This is a single-backend read capability. It adds no vocabulary, namespace
+authority, placement rule, maintained count or snapshot-isolation promise.
+Count-free paging does not itself bound skipped offset entries, residual-filter
+work or payload sizes. SQLite access paths and their measured acceptance are
+specified by ADR-015's proposed ordered entity-list amendment.
+
+## Amendment: count-free compound event pages (2026-10-06, #4118)
+
+**Status: Accepted (2026-10-06).** Acceptance is required before dependent implementation merges.
+This is an additive capability; the preceding streaming-walk proposal and existing
+`query_events`/`count_events` contracts remain unchanged.
+
+`EventStore::query_event_page(EventPageQuery)` returns an `EventPageWindow` containing
+`EventPageRow { event, order_key }` values and an optional `budget_stop` order key.
+Its default is an explicit
+`Unsupported(Events, "query_event_page")` error. There is no offset-query fallback.
+The query carries inclusive `since_us`, exclusive `until_us`, canonical kind and
+actor lists, namespace exclusions, an optional compound `after` key, and `max_rows`.
+The scoped store supplies the namespace. Empty kind/actor lists impose no predicate.
+Every predicate, including exclusions and strict seek, applies before ordering and
+the row limit. The operation performs no count or offset query.
+
+Order is ascending signed microsecond `created_at`, then the exact physical event
+ID text in binary collation. `EventOrderKey` preserves that text before UUID decoding;
+normalizing UUID spelling before seeking can skip or repeat rows. Returned physical
+IDs must parse as complete UUIDs equal to their decoded `Event.id`. The wire event ID
+remains the canonical UUID. Existing producer identity and split-plane multiset
+semantics are unchanged; this method introduces no deduplication or repair policy.
+If a returned leaf or merged prefix contains equal physical time/ID keys, the page
+must refuse before truncation. A strict cursor cannot resume between such rows;
+silently returning only one would lose data. Existing query/count behavior is unchanged.
+
+A leaf accepts 1 through 4096 rows. SQLite checks borrowed source text lengths before
+decoding each event and never returns a cumulative raw-text window above 1 MiB. When a
+row would pass that budget, the leaf stops before it and returns the rows already read
+with `budget_stop`, the order key of the row it did not return, so the refusal names
+the blocking row. A window shorter than `max_rows` without `budget_stop` means the
+leaf is exhausted. A stopped window is never presented to a caller as a short
+successful page, and no payload is truncated. Existing reader
+admission and cancellation remain applicable. Runtime normally requests `limit + 1`
+(at most 1001), over at most 16 namespaces and two event planes. The resulting 32 MiB
+raw-input bound is neither a measured RSS bound nor a bound on SQLite execution work.
+The public handler separately checks its actual serialized JSON against 4 MiB.
+
+Acceptance includes more than 4096 equal-time rows, physical UUID spelling order,
+predicate-removal controls with exact successful output oracles, no COUNT/OFFSET
+query observations, and explicit row/byte-budget refusals. The public live-window
+semantics are specified in [ADR-022](ADR-022-events-query-surface.md)'s compound-page
+amendment; transport composition is specified in
+[ADR-133](ADR-133-incidental-writes-off-the-request-hot-path.md) Amendment 8.
+
+## Amendment: guarded partial note property updates (2026-10-09, #5069)
+
+**Status: Accepted (2026-10-17).** This amendment was reviewed with its implementation.
+
+`NoteStore` adds the provided method
+`try_patch_note_properties(&self, id: Uuid, namespace: &str, kind: &str, patch: &NotePropertyPatch) -> StorageResult<bool>`.
+The default returns `Unsupported(Notes, "try_patch_note_properties")` without
+reading or mutating storage. Existing implementations remain source-compatible.
+There is no read-and-replace or unguarded upsert fallback.
+
+`NotePropertyPatch` contains an AND-combined vector of
+`NotePropertyPrecondition`, a `BTreeMap<String, serde_json::Value>` named `set`,
+`extend_expires_at: Option<i64>` and `updated_at: i64`. Both timestamps are signed
+microseconds since the Unix epoch. The map must contain 1-32 writes; there may be
+0-32 preconditions. Keys denote literal top-level properties, not JSON paths;
+U+0000 is refused before writer acquisition.
+
+The preconditions have four explicit comparison contracts:
+
+| Variant                 | Fields                         | Match                                                                                                                           |
+| ----------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| `ExtractEquals`         | `key: String, value: SqlValue` | Extracted value equals the bound scalar using the existing storage scalar comparison. SQL NULL does not equal a bound SQL NULL. |
+| `AbsentOrExtractEquals` | `key: String, value: SqlValue` | The property is absent, or the extracted equality matches.                                                                      |
+| `AbsentOrTextEquals`    | `key: String, value: String`   | The property is absent, or is JSON text equal to the supplied string.                                                           |
+| `TrueOrTextTrue`        | `key: String`                  | JSON boolean true or the exact JSON string `"true"`; numeric 1 is excluded.                                                     |
+
+In SQLite, extracted equality is `json_extract(properties, path) = value`, and
+absence is `json_type(properties, path) IS NULL`. Explicit JSON null is present
+and never gains the absent branch. Preconditions are combined with the supplied
+ID, exact namespace, exact kind and live-row predicate in the mutation itself.
+The namespace is a requested equality guard, not an authorization boundary; the
+namespace-agnostic contracts of other by-ID operations are unchanged.
+
+All writes apply together to the current stored object, preserving their JSON
+types, including explicit JSON null. SQL-NULL properties initialize as an empty
+object; other non-object documents do not match. Unmentioned properties and note
+columns remain unchanged. An absent expiry extension leaves `expires_at`
+unchanged. A supplied extension installs a missing expiry or advances an earlier
+one, never shortening a later deadline. `updated_at` becomes the maximum of its
+stored and supplied values. The ordinary matched-update version behavior remains
+in force. Missing, deleted or nonmatching rows return false without modification;
+storage errors do not become false.
+
+The SQLite implementation binds paths and values into one UPDATE. When the map
+contains `next_attempt_at`, that same statement maintains `strict_due_key` and
+`due_source` with the existing strict timestamp parser. Other patches omit those
+columns from the SET list. It executes through `SqlBridge::writer().execute()`
+over the note store's existing pool, preserving queued admission, standalone
+file fallback, in-memory settlement and storage error context. The method adds
+no private retry, alternate pool, queue or error taxonomy.
+
+Runtime's public note-store decorator applies its existing reserved-target and
+provenance protections before forwarding. A separate
+`KhiveRuntime::try_repair_quarantined_note_retention` entry point requires
+`ChannelIngestCapability` and constructs a fixed two-property patch for a live
+message in the token's namespace. It sets only `channel_slug` and
+`quarantine_content_ref`. The guards require an absent or equal content reference,
+the exact channel kind, an absent or text-equal slug, and a boolean-or-text true
+quarantine marker. It retains the original runtime backend and does not route a
+secondary note mutation to the main backend. The original attachment ownership
+checks and their ordering remain outside this single-note mutation.
+
+Acceptance covers missing/null/type distinctions, stale preconditions, unrelated
+concurrent property changes, expiry and timestamp boundaries, version behavior,
+typed writes, retry-deadline projection maintenance, invalid input before writer
+admission, default refusal, public policy refusal and capability routing. Writer
+route tests cover queue, standalone fallback and in-memory behavior with existing
+error/settlement fixtures. A duplicate replay whose quarantine precondition changes
+after lookup must retain the existing refusal and leave the current note untouched;
+matching replay remains a positive control. No schema, wire verb, general JSON
+path mutation or attachment-transaction contract is added.

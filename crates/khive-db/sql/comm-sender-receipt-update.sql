@@ -1,0 +1,1 @@
+UPDATE comm_sender_transport SET state=?4,receipt=?5,next_retry_at=NULL,hold_reason=NULL,policy_mode=NULL,policy_revision=NULL,updated_at=?6 WHERE logical_message_id=?1 AND recipient_device_id=?2 AND recipient_key_epoch=?3

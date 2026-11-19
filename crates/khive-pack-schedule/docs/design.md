@@ -116,9 +116,8 @@ payload runs under the immutable creator identity and inside the namespace
 bound to the scheduled event. Both authority dimensions are preserved, so
 delaying a payload cannot grant daemon authority or cross a namespace boundary.
 
-**Pack-auxiliary indexes.** The `idx_schedule_trigger` index is declared via
-`SchemaPlan` as idempotent DDL (`CREATE INDEX IF NOT EXISTS`) outside the core
-versioned migration chain. It uses `WHERE deleted_at IS NULL` rather than
+**Core-table indexes.** Migration V51 creates `idx_schedule_trigger` with
+idempotent DDL (`CREATE INDEX IF NOT EXISTS`), independently of which packs load. It uses `WHERE deleted_at IS NULL` rather than
 `WHERE kind = 'scheduled_event'` so that the parameterized `kind = ?N` predicate
 in `build_note_filter_where` can use this index. A literal-value partial condition
 on `kind` is invisible to the SQLite planner when the query uses a bound parameter.
@@ -134,9 +133,10 @@ Creator replay additionally uses `idx_schedule_creator_provenance` on
 `events(namespace, verb, target_id, outcome)` so the immutable binding lookup is
 bounded by the scheduled note rather than scanning the event history per fire.
 
-Pack-auxiliary DDL (the schedule indexes) uses idempotent
-`CREATE INDEX IF NOT EXISTS` and is NOT part of the core versioned migration
-chain. It is declared via `schema_plan()` on `PackRuntime`.
+Both indexes are on core tables and belong to numbered migration V51
+(`schedule_core_indexes`). Existing installations retain their index names,
+definitions and btrees; databases without the schedule pack gain the same indexes
+when migrated. Schedule has no auxiliary tables, so its pack schema plan is empty.
 
 ### ADR-016: Request DSL
 
@@ -165,17 +165,42 @@ persisting a reminder; the other three schedule verbs do not require `comm`.
   fetching all pending events and sorting. This is correct behavior (efficiency
   at large scale) but is not explicitly specified in ADR-040 — it is an
   implementation detail.
-- The `idx_schedule_trigger` index in ADR-040's `schema_plan` example uses
-  `WHERE kind = 'scheduled_event'` as the partial condition. The implementation
-  uses `WHERE deleted_at IS NULL` instead for SQLite planner compatibility with
-  parameterized queries. The ADR example is illustrative; the implementation is
-  correct.
+- The `idx_schedule_trigger` core index uses `WHERE deleted_at IS NULL` for
+  SQLite planner compatibility with parameterized `kind` predicates. Migration
+  V51 preserves this definition when moving ownership from the pack to the core
+  migration chain (ADR-015 / ADR-017).
 - `cancel` enforces a namespace check (`note.namespace != token.namespace()`)
   before modifying the event. This is the standard namespace isolation gate and
   is consistent with the pattern in other packs.
+- Cancellation uses `NoteStore::replace_note_if_unchanged` with the revision and
+  deletion marker from the validated pending note. A concurrent edit, fire,
+  cancellation or deletion refuses the write with a typed conflict; the caller
+  must read fresh state before retrying. Already non-pending notes retain their
+  existing invalid-input refusal. Cancellation advances `updated_at` strictly,
+  including when the stored timestamp is ahead of the clock; an exhausted
+  `i64::MAX` timestamp fails before any write. Other note fields and properties
+  are retained. See the proposed cancellation amendment in ADR-040.
 - Pagination in `agenda` uses `u64` offsets (not `u32`) to prevent overflow on
   very large stores. This is a defensive coding choice beyond ADR-040's spec.
 - The direct pack handler returns schedule intent only (`events` and `count`).
   `khive-mcp`, which owns the daemon tick loop, decorates successful
   `schedule.agenda` results with process-local `ticker.last_tick_at` per ADR-106
   Amendment D. The heartbeat is not pack data and is never persisted.
+
+## Per-event missed occurrences
+
+Both creation verbs accept optional `misfire_policy` and `max_lateness` under
+ADR-106 Amendment H. Omission preserves the existing `skip` behavior and stores
+no new policy fields. Explicit `skip` may be stored but cannot carry a bound.
+`catch_up_once` always requires a positive integer bound in seconds, including
+one-shots; no recurrence period supplies a default. Creation and the executor
+share `misfire::parse_misfire_policy`, including strict stored-value validation.
+
+The executor considers only the latest due occurrence within the explicit bound,
+including equality. Repeating rows retain the armed trigger as an occurrence and
+use the shared recurrence parser and original monthly anchor. Older due
+occurrences collapse into `missed_at`; they are never dispatched individually.
+An opted-in repeating row restored from an old backup can still invoke once when
+its latest occurrence is recent, so this is not a restore-wide zero-firing rule.
+The executor persists a v2 receipt distinguishing the exact source trigger from
+the selected occurrence. Legacy skip rows keep their v1 receipt behavior.

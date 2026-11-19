@@ -45,6 +45,7 @@ use khive_pack_kg::KgPack;
 use khive_runtime::audit_batch::{AuditBatchConfig, AuditBatchControl};
 use khive_runtime::pack::{
     audit_admission_refused_obligation_count, audit_admission_unresolved_obligation_count,
+    AuditSuccessRowsMode,
 };
 use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
 use khive_storage::event::{EventAppendDisposition, IdempotentEventBatchResult};
@@ -172,6 +173,9 @@ async fn db_diagnostics_verb_reports_real_admission_refused_obligations() {
         max_pending_rows: std::num::NonZeroUsize::new(1).unwrap(),
         ..AuditBatchConfig::default()
     });
+    // Reduced mode omits `whoami`'s success row before admission, and this
+    // test needs that row to reach the saturated lane and be refused.
+    builder.with_audit_success_rows_mode(AuditSuccessRowsMode::All);
     // The real composition root registers built-in packs through the trusted
     // path; this test stands in for it, so `whoami` keeps its best-effort
     // audit obligation under admission pressure. The ordinary `register`

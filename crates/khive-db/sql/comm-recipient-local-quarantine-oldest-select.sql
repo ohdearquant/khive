@@ -1,0 +1,1 @@
+SELECT sender_agent_id,logical_message_id,reason FROM comm_recipient_quarantine WHERE recipient_agent_id=?1 AND reason<>'policy_rejected' ORDER BY created_at,sender_agent_id,logical_message_id LIMIT ?2

@@ -18,11 +18,11 @@ fn kkernel_bin() -> &'static str {
 
 fn envelope(family: &str) -> String {
     serde_json::json!({
-        "schema_version": 1,
-        "producer": "lambda:atlas",
+        "schema_version": khive_changeset::CURRENT_SCHEMA_VERSION,
+        "producer": "lambda:bob",
         "producer_model_family": family,
         "staged_at": 2_000_000_u64,
-        "batch_id": "atlas-batch-7",
+        "batch_id": "bob-batch-7",
     })
     .to_string()
 }
@@ -74,7 +74,11 @@ fn entity_update(id: &str, before: &str, after: &str) -> String {
 }
 
 fn write_case(dir: &Path, family: &str, ops: &[String]) -> (PathBuf, PathBuf) {
-    let mut content = envelope(family);
+    write_case_with_envelope(dir, &envelope(family), ops)
+}
+
+fn write_case_with_envelope(dir: &Path, envelope: &str, ops: &[String]) -> (PathBuf, PathBuf) {
+    let mut content = envelope.to_owned();
     content.push('\n');
     for op in ops {
         content.push_str(op);
@@ -92,6 +96,7 @@ fn run_review(changeset: &Path, rules: &Path, reviewer_model_family: Option<&str
     let home = TempDir::new().expect("private child HOME");
     let mut command = Command::new(kkernel_bin());
     command.env("HOME", home.path());
+    command.env("KHIVE_VOLUME_LOCK_DIR", home.path().join("volume-locks"));
     command.args([
         "kg",
         "review",
@@ -139,12 +144,17 @@ fn directory_entries(dir: &Path) -> BTreeSet<String> {
 #[test]
 fn json_report_is_ordered_versioned_and_read_only() {
     let temp = TempDir::new().expect("temp dir");
+    let mut golden: serde_json::Value =
+        serde_json::from_str(CHANGESET_REVIEW_GOLDEN).expect("parse shared review golden");
+    golden["change_set"]["envelope"]["schema_version"] =
+        serde_json::json!(khive_changeset::CURRENT_SCHEMA_VERSION);
+
     let alpha = "10000000-0000-4000-8000-000000000001";
     let beta = "10000000-0000-4000-8000-000000000002";
     let edge = "10000000-0000-4000-8000-000000000003";
-    let (changeset, rules) = write_case(
+    let (changeset, rules) = write_case_with_envelope(
         temp.path(),
-        "family:atlas",
+        &golden["change_set"]["envelope"].to_string(),
         &[
             create(alpha, "Alpha"),
             create(beta, "Beta"),
@@ -163,9 +173,6 @@ fn json_report_is_ordered_versioned_and_read_only() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report = parse_stdout(&output);
-    let golden: serde_json::Value =
-        serde_json::from_str(CHANGESET_REVIEW_GOLDEN).expect("parse shared review golden");
-
     assert_eq!(
         report, golden,
         "Rust `kg review --format json` drifted from the shared khive.review.v1 changeset vector"
@@ -179,7 +186,7 @@ fn json_report_is_ordered_versioned_and_read_only() {
     assert_eq!(report["capability"]["wasm"], false);
     assert_eq!(
         report["change_set"]["envelope"]["batch_id"],
-        "atlas-batch-7"
+        golden["change_set"]["envelope"]["batch_id"]
     );
 
     let operations = report["change_set"]["operations"].as_array().unwrap();
@@ -209,7 +216,7 @@ fn same_family_reviewer_is_refused_with_machine_readable_gate() {
     let beta = "20000000-0000-4000-8000-000000000002";
     let (changeset, rules) = write_case(
         temp.path(),
-        "family:atlas",
+        "family:bob",
         &[
             create(alpha, "Alpha"),
             create(beta, "Beta"),
@@ -223,7 +230,7 @@ fn same_family_reviewer_is_refused_with_machine_readable_gate() {
         ],
     );
 
-    let output = run_review(&changeset, &rules, Some("family:atlas"));
+    let output = run_review(&changeset, &rules, Some("family:bob"));
     assert!(
         !output.status.success(),
         "same-family review must fail closed"
@@ -247,9 +254,9 @@ fn strict_changeset_parse_rejects_unknown_fields() {
         format!(
             "{}\n",
             serde_json::json!({
-                "schema_version": 1,
-                "producer": "lambda:atlas",
-                "producer_model_family": "family:atlas",
+                "schema_version": khive_changeset::CURRENT_SCHEMA_VERSION,
+                "producer": "lambda:bob",
+                "producer_model_family": "family:bob",
                 "staged_at": 2_000_000_u64,
                 "invented": true,
             })
@@ -272,7 +279,7 @@ fn error_rule_findings_are_reported_sorted_and_block_approval() {
     let duplicate = "30000000-0000-4000-8000-000000000001";
     let (changeset, rules) = write_case(
         temp.path(),
-        "family:atlas",
+        "family:bob",
         &[create(duplicate, "Alpha"), create(duplicate, "Beta")],
     );
 
@@ -299,7 +306,7 @@ fn uncovered_update_rules_fail_closed_in_partial_view() {
     let target = "40000000-0000-4000-8000-000000000001";
     let (changeset, rules) = write_case(
         temp.path(),
-        "family:atlas",
+        "family:bob",
         &[entity_update(target, "Old name", "New name")],
     );
 
@@ -322,3 +329,9 @@ fn uncovered_update_rules_fail_closed_in_partial_view() {
     assert_eq!(report["review_gate"]["status"], "blocked_by_findings");
     assert_eq!(report["review_gate"]["approval_ready"], false);
 }
+
+#[path = "kg_review/configurable_tiers.rs"]
+mod configurable_tiers;
+
+#[path = "kg_review/restore_controls.rs"]
+mod restore_controls;

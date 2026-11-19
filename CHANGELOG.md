@@ -7,6 +7,1873 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `KhiveRuntime::read_brain_events` exposes the existing namespace-scoped recent brain-event
+  reader to embedding hosts (#4554).
+- `KhiveRuntime::read_event_counts` and `read_event_page_response` expose the existing event count and
+  page readers to embedding hosts with their actor scope, read budgets and response contracts (#4554).
+- GQL canonical paths can combine fixed steps and bounded variable segments. The sum of
+  variable-segment maxima is capped at ten; traversal depth and weight exclude fixed steps.
+  Mixed WHERE expressions run on complete matches, including OR across bindings (#6686).
+- GQL supports typed RETURN paths below node properties and edge metadata, explicit DISTINCT,
+  and binding counts grouped by the other returned values. Grouping and deduplication precede
+  ordering and paging; null zero-hop edges contribute zero to counts (#6687, #6689).
+- GQL supports correlated fixed canonical `NOT EXISTS` paths, including intermediate-node
+  correlations in mixed paths, with visibility filtering before grouping and paging (#6688).
+- Hosts can register caller-owned channels, resident components, `[channel.<name>]` configuration
+  validators and `comm.send` routes for custom address kinds before serving, through
+  `ServeRegistrations` and `run_with_registrations`. Built-in loops read the same channel registry;
+  duplicate and reserved registrations refuse before startup. On Unix, a host carrying validators
+  or send routes must be the daemon or set `KHIVE_NO_DAEMON=1`, since a non-daemon host forwards
+  its requests to the daemon (#6739).
+- With the `native-rerank` feature, `NativeCrossEncoderReranker::rerank_with_hook` and
+  `CrossEncoderScorer::score_batch_with_hook` take a borrowed adaptation hook for one call, and
+  `NativeRerankResult` reports whether the hook's `apply` ran. Scorers without hook support refuse
+  a supplied hook; the existing methods are unchanged (#6741).
+
+### Changed
+
+- `memory.recall_candidates` returns the executed collection `plan` beside its existing raw
+  arrays; recall ranking, hydration and scoring are unchanged (#6737).
+- GQL query-text LIMIT applies after SKIP on each page. Existing terminal-page and sentinel
+  rules remain unchanged (#6691).
+- Zero-hop query matches retain the same substrate and UUID at both endpoints, zero traversal
+  metrics and null final-edge fields, including isolated visible nodes (#6690).
+- A `[channel]` key other than `node` is no longer refused at load. Each `[channel.<name>]` table
+  is kept and passed to the component registered under that name; a table with no registered
+  component, including a misspelt name, is kept with no error (#6739).
+
+### Breaking (Rust crates)
+
+- Scheduled for 0.21.0: the exhaustive `khive_storage::StorageError` enum gains
+  `SecretDetected` for credential-shaped note keys. Downstream exhaustive matches must handle
+  the new variant. The shared detector and `SecretMatch` live in
+  `khive_storage::secret_scan`; existing `khive_runtime::secret_gate` imports remain available.
+  Conversion to `RuntimeError` preserves typed secret refusals and the source chain of ordinary
+  storage errors.
+
+- `khive_query::GqlQuery` adds `distinct: bool`; direct constructors set it to false for legacy
+  behavior. Exhaustive `ReturnItem` matches must handle `Path(String, PropertyRef)` and
+  `Count(String)`. Exhaustive `WhereExpr` matches must handle `NotExists(MatchPattern)`;
+  `conditions()` and `for_each_condition_mut()` continue to visit only outer scalar conditions.
+
+- `khive_retrieval::execute_hybrid` and `execute_memory_hybrid` take a `PlanProgram` in place of
+  the opaque fusion closure, and run the `query_ir` plan it names. The executor now resolves and
+  validates the plan before the empty-namespace early return, so a caller with no namespaces
+  and an invalid plan gets an error where it used to get an empty outcome (#6737).
+
+- The exhaustive `khive_storage::StorageError` enum gains `WriteOutcomeUnknown` (COMMIT was
+  issued and the reply was lost; side effects unknown, not retryable), `WriterOwnerUnavailable`
+  (strict routing found no writer owner; not started) and `WriterRouteViolation` (strict routing
+  refused a write that bypassed the owner; not started). Downstream exhaustive matches must
+  handle all three (#6740).
+
+- `khive_runtime::node_config` is renamed `channel_section`; `ChannelSectionConfig` holds opaque
+  per-component values (`get`, `iter`) in place of the `node` field, and
+  `ConfigError::InvalidNodeConfig` becomes `InvalidChannelConfig` (#6739).
+
+### Fixed
+
+- Property strings are checked with their owning credential labels, including inherited labels
+  through nested objects and arrays. Context-bound manifest identities prevent a property
+  exemption from being reused after its context, path or role changes (#6562).
+- Note-key creation, replay admission and direct assignment use the shared secret detector on
+  the raw key. Existing keys remain readable, and read/fence selectors retain their shape-only
+  validation (#6273).
+- A write whose reply is lost after COMMIT reports `write_outcome_unknown` with
+  `request_state: side_effects_unknown`; a loss before COMMIT stays `writer_task_terminated`. With
+  `write_routing_strict`, a missing or stopped writer owner fails as `writer_owner_unavailable`
+  and a write that bypasses the owner fails as `writer_route_violation`, both before any work
+  runs (#6740).
+
+## [0.20.0] - 2026-11-16
+
+### Added
+
+- `search` accepts `created_after` and `created_before` for entities and notes: inclusive RFC3339
+  instants on `created_at`, combined with the kind, tag and entity-type filters. The bounds apply to
+  the ranked candidates each backend returns (limit × 50, at most 500), so a narrow window can
+  return fewer results than the limit; this is not an exhaustive time-range scan.
+- GQL returns edge metadata and orders results: `RETURN e.id, e.metadata ORDER BY e.metadata.order`.
+  Metadata paths work in the existing scalar predicates, and an optional `ORDER BY` precedes
+  `SKIP`/`LIMIT`, with the existing deterministic tie order appended.
+- `kkernel mcp --catalog-verbosity compact` shortens each verb's line in the request tool
+  description to its first-line summary (at most 160 characters), keeping every callable verb, its
+  contributor labels and the full-help pointer. `full` stays the default and its text is unchanged.
+- Channel health reports the undelivered rows waiting in retry backoff (count, earliest retry,
+  oldest creation time, highest attempt count, total backlog), and inbound health reports the time
+  since the last successful poll while a channel is in backoff.
+- `brain.profile` lists the visible bindings that still resolve to an inactive profile and reports
+  `serving_through_visible_binding_while_inactive`.
+- Opt-in native cross-encoder reranking of entities through `lattice-inference` 0.15. Scores are
+  sigmoid probabilities; the inference dependency stays disabled by default.
+- `khive_runtime::attachment_cutover` is now public: `coordinate_attachment_cutover`,
+  `coordinate_empty_secondary_attachment_cutover`, `require_secondary_attachment_empty` and
+  `legacy_preference_model_count`. An embedding host can bring a V20 database to V21 without
+  depending on `khive-mcp`, provided that, when the database holds legacy moodboard preference
+  models, it passes a legacy-preference verifier and a blob hydrator; without them the call fails
+  closed. `RuntimeError` gains `AttachmentCutoverRequired`.
+- `khive_db::migrations::attachment_cutover_would_defer` answers, read-only, whether a store would
+  stop at the V21 attachment cutover.
+- GQL accepts connected comma-separated `MATCH` paths with one global filter, projection, ordering
+  and paging tail. Shared nodes retain all occurrence constraints; matches preserve tuple
+  multiplicity. Each edge must be canonical and fixed at one hop.
+- `tool.unregister` retires an owned tool registration with its exact namespace-local policies and
+  grants in one transaction. Shared pattern rules and other namespaces' pins stay stored, and those
+  pins stop matching once the registration is retired. A retired registration is not restored.
+- Telegram records each completed poll in channel health, including empty, filtered and held
+  pages, and a failed poll keeps the last success time, so `no_success_age_secs` stays available.
+
+### Changed
+
+- `gtd.tasks` returns an object with `tasks` and `has_more: true`, instead of a bare array, when
+  more matching tasks remain past the page, so a chain such as `gtd.tasks() | get(id=$prev[0].id)`
+  that works on a short queue fails with `substitution_error` once the queue passes the limit: read
+  the object's `tasks`, or read the page first and pass the id in a separate call.
+- `KhiveRuntime::new` refuses a database below the V21 attachment cutover with the typed
+  `RuntimeError::AttachmentCutoverRequired`, whose message names
+  `khive_runtime::coordinate_attachment_cutover`, instead of an untyped storage error that pointed
+  at `khive-mcp` boot.
+- Short-token keyword signals count a one- or two-character word only when it carries a digit (`2`,
+  `v2`) or is two uppercase letters (`KV`), so function words such as `a`, `in` and `of` no longer
+  change the keyword order of a natural-language query.
+- `knowledge.eval_retrieval` reports a query set that does not parse by line and column only, and a
+  path it cannot open as `cannot open query set <path>`, so no file content or OS error reaches the
+  caller.
+- Migration V66 rebuilds the outbox due index without delivered rows, so due-page and backlog reads
+  no longer revisit delivered history.
+- `tool.register` on an existing name corrects it in place and keeps its identity, source and kind:
+  a different source or kind is refused, so register it under a new name. Description and schema
+  corrections are accepted, and a schema replaces the whole object. Side-effect and trust
+  corrections can only move to a stricter class. The result says whether the row was created,
+  updated or unchanged, and an admitted definition change appends one `tool_registration_changed`
+  event.
+- Tool policy and grant matching folds ASCII case the same way registry identity does, so a policy
+  or grant written with another spelling matches the stored tool name.
+- Registry construction refuses a public verb whose name belongs to another pack: a bare name only
+  from `kg` and only on its allowlist, a dotted name only under the declaring pack's own prefix, and
+  `stream.<name>` only from `kg`. No pack may be named `stream`, and a mounted tool source cannot
+  register under `stream.`.
+- `kkernel` does not load the per-user `.env` file in the khive home directory when an agent actor
+  (`agent:` prefix) is named by `KHIVE_ACTOR`, `KHIVE_NAMESPACE`, `--actor` or `--namespace`, or when
+  `KHIVE_LOAD_DOTENV` is `0`, `false`, `no` or `off`. An unrecognized value also skips the file. The
+  check runs before configuration is read, so an agent named only in a config file needs
+  `KHIVE_LOAD_DOTENV=0`.
+- SMTP sends try each resolved relay address with a 10-second limit on connect, greeting, EHLO and
+  TLS, inside a 120-second limit for the whole transaction. A permanent refusal stops the address
+  walk and is reported as permanent.
+- Commit ingestion retries a commit whose message the secret gate refuses once, as a replacement
+  that keeps only the Git-generated fields (sha, commit date, parents), so the cursor advances past
+  it.
+- With `KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL` enabled, email-channel startup states its preconditions:
+  the mailbox is hosted by Exchange Online, and its receiving boundary strips sender-supplied
+  `X-MS-Exchange-Organization-AuthAs` headers.
+- GitHub ingest keeps the first 20 annotation warning details per item with a total count, and
+  re-checks the annotation of an item it has already ingested, at most 128 per source per run.
+- A failed daemon respawn advises checking the daemon configuration and the installed `kkernel`
+  version before retrying.
+
+### Fixed
+
+- `propose` refuses a `supersede_entity` whose operands are not both live entities, naming the
+  operand, and apply checks the operands again, so an approved proposal whose operand was deleted or
+  merged since is refused instead of applied.
+- A search stopped by cancellation returns the typed request-stop error from every phase instead of
+  a short page or partial metadata, and its MCP error carries `domain_disposition: "not_committed"`
+  and `retryable: true`.
+- `comm.send` refusing a non-local self recipient and `memory.remember` refusing its parameters
+  report `domain_disposition: "not_committed"`.
+- A daemon client refuses an oversized socket path (primary or events) before connecting, recovering
+  or spawning a daemon, naming the path, its byte length and the platform limit.
+- A channel heartbeat persists again after its `channel_health` note was soft-deleted.
+- An events-prune backup receipt authorizes deletion only from the store it copied: the receipt's
+  source and the apply target must resolve to the same canonical path.
+- `memory.remember` names the parameter or operation to use when it refuses a reserved property.
+- `git.digest` reports, in its warnings, an existing issue or pull-request note whose project
+  annotation is missing.
+- Compact verb catalogs log the same duplicate-contribution warning as full catalogs.
+- Brain event-count and event-page refusals mask credentials in an invalid event kind.
+- The content secret gate decodes an escaped JSON fragment that follows a stray backslash in prose.
+- A server or daemon that never polls external email boots without the comm pack when external email
+  is configured; a polling host without comm is still refused.
+- KG validation annotations in GitHub format name the NDJSON file that produced each finding.
+- A chained `$prev` error after an array result suggests `$prev[0]` and `$prev[0].id`.
+- Empty text tables record their FTS rowid-map backfill and sparse schema checks are cached, so
+  those reads no longer take the writer on every fetch.
+- A search whose required record or metadata read fails returns the error instead of a successful
+  page with missing metadata.
+- `kkernel mcp --catalog-verbosity compact` is kept when the server is assembled over several
+  backends; it came back as `full`.
+- Message sender and recipient list filters match stored actor names, so a query by actor finds
+  messages sent through comm.
+- The secret gate scans an escaped credential at the end of a field whose closing quote is missing,
+  and keeps valid escaped spans on either side of a malformed escape.
+- A GitHub issue or pull-request number held by more than one note resolves to the same note every
+  time (lowest stored id), with one warning.
+- A read on a pooled SQLite connection stays cancellable after a progress callback panics; the
+  progress handler is reinstalled on unwind.
+
+### Breaking (Rust crates)
+
+- Public structs gained fields, so direct struct literals must set them: `khive_mcp::args::Args`
+  adds `catalog_verbosity`, `khive_query::GqlQuery` adds `order_by` (a `Vec` of
+  `khive_query::ast::OrderItem`), `khive_rule_evaluator::Violation` adds `source` (an
+  `Option<NdjsonSource>`, not serialized), and `khive_pack_git::ingest::IngestReport` adds
+  `existing_project_annotation_warning_count` (a `u64`).
+- Enum variants gained fields: `khive_db::SqliteError::Migration` keeps the failed migration's cause
+  as `source`, and `khive_pack_comm::OutboxScanOutcome::Success` adds `backlog`, so patterns and
+  constructors naming every field must include them.
+- Enums gained variants, so an exhaustive match must handle them: `khive_query::ast::PropertyRef`
+  adds `MetadataPath`, `khive_runtime::RuntimeError` adds `AttachmentCutoverRequired` and
+  `SearchRead`, and `khive_types::event::EventKind` and `khive_types::event::EventPayload` add
+  `ToolRegistrationChanged`.
+- `EventKind::ToolRegistrationChanged` is declared before `LinkCreated`, so every later variant's
+  implicit discriminant, from `LinkCreated` through `GrantChange`, rises by one. Code that casts an
+  `EventKind` to an integer gets new values; the event names (`EventKind::name` and its `FromStr`)
+  are unchanged.
+- `khive_db::ProgressConn` is now hidden from the documentation. It stays exported for use inside
+  the workspace and is no longer part of the documented API.
+- Coordinated search returns its stop error instead of a partial result:
+  `khive_mcp::coordinator::CoordinatorService::fan_out_search` and `fan_out_search_scoped` return
+  `Result<CoordSearchResult, RuntimeError>`, and `kkernel::coordinator::SubstrateCoordinator`'s
+  `fan_out_search`, `fan_out_search_with_visibility`, `fan_out_search_with_token` and
+  `fan_out_search_with_token_and_count` return `RuntimeResult<...>`. An implementation of
+  `CoordinatorService` must change its signatures to match.
+- `khive_query::GqlQuery` adds `additional_patterns: Vec<MatchPattern>`; direct Rust constructors
+  must initialize it, using an empty vector for a single path. `patterns()` and `patterns_mut()`
+  iterate the required first path and the additional paths in textual order.
+
+## [0.19.0] - 2026-11-11
+
+### Added
+
+- `[actor] require_attributed = true` turns on strict attributed-actor mode, the same as
+  `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`. Unlike other keys it is ORed across every discovery-tier config
+  file, so a project file without it cannot shadow a home config that sets it; an explicit
+  `--config`/`KHIVE_CONFIG` file is the only one read. `RuntimeConfig` gains
+  `require_attributed_actor` and `ActorConfig` gains `require_attributed`.
+- `db_diagnostics` reports `disk_guard.lease_hold_seconds`: how long each volume lease was held, from
+  grant to release, as one process-wide histogram per operation class (`writer_task`, `pooled`,
+  `standalone`, `bootstrap`, `migration`, `maintenance`). `DiskGuardDiagnostics` gains
+  `lease_hold_seconds`.
+
+### Changed
+
+- The workspace moves to rusqlite 0.41.1 (bundled SQLite 3.54.1). Read cancellation is now scoped to
+  the connection the read runs on, so a write on another connection of the same thread is never
+  interrupted by a read's cancel.
+
+### Fixed
+
+- A warm daemon in strict attributed-actor mode refuses each request frame whose actor is absent,
+  empty, whitespace or `local`, before any op in the frame runs, so a batch frame is refused whole.
+  Before, only the server and `kkernel exec` checked their own actor.
+- The content secret gate scans the decoded value of every escaped string literal inside JSON text, so
+  a credential written with one JSON escape is refused. Nested JSON text is decoded up to 8 levels;
+  deeper nesting is refused.
+- The content secret gate also decodes escaped string runs that appear as JSON fragments inside prose
+  or inside a larger value, so an escaped credential in a fragment is refused. A knowledge-graph
+  proposal whose changeset carries an escaped credential is now refused when it is proposed.
+- A config file that is not the file in use, but is read to look for `[actor] require_attributed`,
+  now fails with an error naming that file and the file in use, instead of a bare parse error.
+
+### Breaking (Rust crates)
+
+- Public structs gained fields, so direct struct literals must set them:
+  `khive_runtime::RuntimeConfig` adds `require_attributed_actor`,
+  `khive_runtime::engine_config::ActorConfig` adds `require_attributed`, and
+  `khive_db::diagnostics::DiskGuardDiagnostics` adds `lease_hold_seconds`, whose type
+  `khive_db::diagnostics::LeaseHoldDiagnostics` is new.
+- `khive_mcp::serve::enforce_strict_actor_mode` takes the configured `require_attributed` value as a
+  third argument.
+- `khive_runtime::ConfigError` gains the variant `ShadowedTier`, so an exhaustive match on it must
+  handle the new arm.
+
+## [0.18.0] - 2026-11-08
+
+### Added
+
+- `kkernel exec --read-only` runs inline DSL against an existing file-backed database through a
+  read-only runtime. It runs in process, never forwards to a daemon, and does not prepare or upgrade
+  the schema, so a database whose core or pack schema is not already compatible is refused. Every
+  operation must be a declared read: a write, an unclassified operation or a side-effecting assertion
+  is refused before dispatch. An explicit `--save-file` is still written. The flag is refused with
+  in-memory storage, a missing database, declared backends, configured mounts, `--plan`, `--ops-file`,
+  `--pending-events`, `--dry-run`, `--serial`, `--atomic` and `--atomic-max-ops`.
+- `kkernel memory-edge-namespace-move` reports, and with `--apply` repairs, live edges between two
+  memory rows that are stored outside their source row's namespace. The default is a dry run that
+  reads a private snapshot and writes nothing. `--db` and `--config` select the database and the
+  configuration. It is an offline repair, so stop other writers while it runs. Apply is refused before
+  its first edge write when the projected keys collide, moves each edge under a revision guard, leaves
+  soft-deleted edges alone, and reports partial progress when it stops early.
+- `memory.recall` hits report `hidden_incoming_edges`, `{"total": n, "by_relation": {"supersedes": n}}`,
+  the number of incoming `supersedes` edges from memory rows in namespaces the caller cannot read. It
+  is 0 when there are none and discloses no id, namespace or content of those rows. Migration 065 adds
+  an index on `graph_edges(target_id, relation)` that serves the count.
+- `memory.recall` breakdowns add `fused_score`, the fused score before normalization, and `composite`,
+  the factors of the multiplicative composite that ranks the hit: `relevance_term`, `temporal_boost`,
+  `salience_boost` and `adjustment_factor`. With no reranker weights configured their product is
+  `pre_entity_score`. `adjustment_factor` is null when the other three do not multiply to a positive
+  number, and `composite` is absent from a hit whose composite arithmetic fell back to a zero score.
+  `memory.recall_score` breakdowns add `fused_score` and carry no `composite`.
+- `memory.recall` with `include_timings=true` adds `hidden_incoming_us` to its timings, the time spent
+  counting hidden incoming `supersedes` edges after ranking. It is null when no ranked hit needed a
+  count and a number otherwise, including when the count is zero.
+- `brain.unbind` replies add `removed_by_namespace`, an object mapping the namespace of each removed
+  binding to its count, which is empty when nothing matched. `removed` and `unbound` are unchanged.
+  With no `namespace` argument the call matches bindings of every namespace, subject to its other
+  filters.
+- `git.digest` replies report issue and pull request notes that lack their project annotation:
+  `missing_project_annotation_count` (null when the census is unavailable),
+  `missing_project_annotation_note_ids` (at most 20 ids), `project_annotation_census_complete` and
+  `project_annotation_notes_scanned`. Each ingest pass counts notes whose `project_id` names the
+  repository anchor but that have no live `annotates` edge to it, including notes older than the remote
+  ingest floor or already acknowledged by a checkpoint. It classifies at most 1000 notes, the ones with
+  the lowest ids, and changes no edge or cursor. A failed census adds a warning to the reply and does
+  not fail the pass.
+- `khive_storage::SqlReader::query_consume` and the `khive_storage::SqlRowConsumer` trait consume a
+  read-only statement one row at a time into caller-owned state without collecting the rows. The
+  provided method returns an unsupported error and never falls back to `query_all`; the SQLite readers
+  implement it and keep their transaction and cancellation handling. The memory and knowledge ANN
+  corpus loads decode their rows through it.
+- `khive_storage::GraphStore::count_hidden_incoming_memory_edges` counts live incoming edges between
+  live memory rows, by target and relation, that sit outside a given set of visible namespaces, and
+  returns no source id or namespace. The provided method returns an unsupported error and the SQLite
+  store implements it. `khive_db::backend::StorageBackend::list_edge_namespaces` lists the distinct
+  namespaces that hold edges.
+- `khive_mcp::serve::resolve_runtime_config_with_actor_ownership` and
+  `khive_mcp::serve::ConfiguredActorOwnership` resolve a configuration and defer the
+  `[actor] owned_namespaces` decision. The configuration it returns has no owned namespaces until
+  `ConfiguredActorOwnership::finalize` keeps them, which it does only when the final actor is the actor
+  whose configuration declared them.
+
+### Changed
+
+- An edge between two memory rows now lives in the namespace of its source row. `link` and an
+  `apply_changeset` link operation refuse to write such an edge under any other namespace, before
+  anything is written, and a bulk `link` that mixes namespaces fails before its first write. Restoring
+  a soft-deleted memory-to-memory edge is refused when the stored edge's namespace differs from its
+  source row's, with advice to leave the tombstone deleted and create a replacement link in the source
+  namespace. A restore whose preconditions change before it commits now returns an invalid-input error
+  that asks for a retry, where it returned an internal error. A refusal names the source row's
+  namespace as the one to use only when the request can read that namespace, and otherwise says that
+  the source row is in a namespace the caller cannot read. Edges with a non-memory endpoint are
+  unchanged. `kkernel memory-edge-namespace-move` repairs edges already stored elsewhere.
+- `neighbors` anchored on a memory row always returns an object with `neighbors`, `next_after` and
+  `hidden_incoming_edges`. Without `limit` it used to return a bare array of hits, and `next_after`
+  is now null in that case. `hidden_incoming_edges` is `{"total": n, "by_relation": {...}}`, the
+  count of incoming memory edges stored in namespaces the caller cannot read, with no id, namespace
+  or content. It is 0 for direction `outgoing`. `by_relation` lists each relation of the filter, or
+  with no filter each relation above zero. Other anchors keep their reply shapes.
+- `memory.remember` now also reserves the `properties` key `supersedes`, which `memory.apply_batch`
+  writes. The refusal points to `link(relation="supersedes")`. `memory.apply_batch` still writes the
+  key on the rows it creates and refuses a batch row that supplies it, with `reserved-property`.
+  Stored rows keep the property.
+- `memory.apply_batch` refuses, before any lookup or write and in a dry run as well as a real run, a
+  batch name whose row keys the content gate would refuse. The error names the batch name as the
+  cause and gives the detector, and it does not show the derived key. Only the key shapes that valid
+  writing rows of the call would use are checked, so create-only batches keep their key format.
+- A cold-miss `memory.recall` on a writable store now runs its detached ANN build as admitted warm
+  work, so shutdown can wait for it, cancel it or report it like other admitted work. The build used
+  to run outside warm admission. Warm admission is one permit pool for the runtime
+  (`[runtime] warm_concurrency`, default 1), so a cold recall for one embedding model can queue behind
+  another embedding model's build and, past `ann_ready_timeout_ms`, return the degraded reply while
+  its own build stays queued. A build that is cancelled, refused or times out in finalization also
+  returns the degraded reply, each with its own reason.
+- `brain.profiles`, `brain.profile` and `brain.bindings` replies include `namespace`, the namespace
+  the call ran in. `brain.bind` of an unknown profile now names that namespace in its not-found error
+  and says that a profile created with `namespace=X` is bound with `namespace=X`. Binding matching is
+  unchanged: with no `namespace`, `brain.bind` stores the binding with `*`, `brain.resolve` matches
+  only bindings stored with `*`, and `brain.bindings` and `brain.unbind` apply no namespace filter.
+- A full `knowledge.index` pass (no `ids`) selects atom ids first and reloads each batch's payloads by
+  id just before embedding. An atom edited after selection is indexed from its updated payload, an atom
+  deleted after selection counts as skipped, and an atom created after selection waits for the next
+  run. Progress counts processed ids, including batches in which every selected atom is gone.
+
+### Performance
+
+- A full `knowledge.index` pass reads the atom catalogue by seeking past the last row of the previous
+  page instead of using `OFFSET`, so reading a page no longer walks and discards the rows before it.
+  It also keeps only atom ids while selecting, so it no longer holds the whole catalogue's text across
+  embedding calls.
+
+### Fixed
+
+- A full `knowledge.index` pass no longer skips live atoms when atoms earlier in the catalogue order
+  are deleted while it runs. An atom that stays live with unchanged ordering keys is visited once; one
+  that is created, deleted, restored or moved to another namespace during the pass may or may not be
+  visited.
+- A reminder created with an explicit `namespace` is delivered to its creator's default `comm.inbox`.
+  It fired and its receipt read `succeeded`, but the message was stored in the reminder's namespace,
+  which a default `comm.inbox` call does not read. The delivery now goes out as the verified creator on
+  the default path, and a gate policy sees it as a default-path `comm.send` in `local`. Scheduled
+  actions other than reminders still run in the event's namespace, and the claim and outcome receipt
+  stay in the event's namespace.
+- `memory.recall` hides a row that a `supersedes` edge names when the edge sits in any namespace the
+  caller can read. The lookup used to read only the request's primary namespace, so a default recall
+  returned the old row after `memory.apply_batch` wrote the edge in the caller's own namespace. A
+  recall with an explicit `namespace` reads where it did before.
+- A `supersedes` property now hides a recall candidate only when it is a full UUID or an id prefix of
+  at least 8 lowercase hexadecimal or hyphen characters. It used to match any prefix, so an empty or
+  one-character value hid an unrelated candidate.
+- `memory.recall` with `include_breakdown=true` reports the relevance a hit was ranked with. The value
+  was normalized a second time, so a hit under the default reciprocal-rank fusion read 1.0 where its
+  ranked relevance was lower. Ranking and scores are unchanged, and `weighted.*_contribution` is now
+  computed from the ranked relevance.
+- `memory.apply_batch` refuses a row whose key is held by a memory with a different stored
+  `batch_row`, with `dedupe-name-taken`, when that holder appears after the up-front check. It used to
+  report such a replay as deduped and assert its `supersedes` edge. The row now reports `refused` and
+  no edge is written.
+- `memory.apply_batch` refuses a later `supersede` row that carries the same typed payload as an
+  earlier row with a different `part`, with `duplicate-payload` naming the earlier row's index and
+  part. One call could store the same successor twice. A row that replays an existing stored key wins
+  over a new row wherever it sits, and rows whose typed payloads differ in any field stay separate
+  writes.
+- A task written with a `due` deadline refuses a `properties.timezone` that is not an IANA zone name
+  or null, even when a valid zone was chosen elsewhere, as with a `stream.append` task record. The
+  stored task keeps the canonical `due_timezone` and no longer keeps the raw `timezone` property.
+- `[actor] owned_namespaces` follows one rule in `kkernel exec` and the MCP entry point: the list is
+  kept only when the final actor, after any `--actor` pin, is the actor whose configuration declared
+  it. `kkernel exec --actor` naming the declaring actor after a project configuration selected a
+  different actor used to drop the list and now keeps it. Any other final actor, including an
+  anonymous caller, gets none of it.
+- The events server cancels an in-flight `QueryEvents` or `QueryEventPage` read when its client
+  disconnects, as it already did for count reads. The read used to run to completion while it held a
+  reader and an admission slot.
+- Dropping a `khive_db::maintenance::DeclarationWriter` releases its claim even while a duplicate or
+  inherited descriptor of the claim file stays open, so a new claim on the same root no longer reports
+  `Busy` after the writer is gone. A process that only reuses the process id does not release a claim
+  it did not take.
+
+### Breaking (Rust crates)
+
+- Public structs gained fields, so direct struct literals must set them:
+  `khive_pack_memory::config::ScoreBreakdown` adds `fused_score` and `composite`, whose type
+  `khive_pack_memory::config::CompositeFactors` is new; `khive_pack_git::ingest::IngestReport` adds
+  `missing_project_annotation_count`, `missing_project_annotation_note_ids`,
+  `project_annotation_census_complete` and `project_annotation_notes_scanned`; and
+  `kkernel::exec::ExecArgs` adds `read_only`.
+
+## [0.17.0] - 2026-11-04
+
+### Added
+
+- `kkernel db import-notes` restores exported note rows (JSONL, one note per line) into an existing
+  database with their original ids, namespaces and timestamps. A row whose id is already present is left
+  unchanged and counted; `--verify` reads every row back and fails when any differs. A row carrying a
+  runtime-owned property key is refused before any row of its file is written. Restored keyed memories
+  carry no write-epoch marker, so an exact replay of one's key returns the unavailable receipt error with
+  reason `receipt_epoch_unknown`; recall is unchanged.
+- `kkernel reindex --fts-only` rebuilds entity and note FTS documents without any embedding model, so no
+  vector is dropped or written and the knowledge pass is skipped.
+- `memory.apply_batch` rewrites a chunk of memories in one checked call. A call carries a batch
+  name and 1 to 200 rows. A `supersede` row writes a new memory with a `supersedes` edge to the
+  old row and leaves the old row unchanged. A `create` row writes a new memory. A `skip` row
+  writes nothing, and a `delete-candidate` row writes nothing and is listed in the reply. Every
+  row is checked before anything is written, and a refused row does not stop the others. The
+  call is a dry run unless `dry_run` is `false`. Each written row stores the batch name and an
+  idempotency key derived from the batch, the old id and `part`, so re-running a chunk writes
+  only what is missing. An anonymous caller is refused.
+- `memory.remember` takes an optional `properties` object, stored beside `memory_type` and
+  `tags`. It holds at most 32 keys. Each key is 1 to 64 characters: a lowercase ASCII letter,
+  then lowercase letters, digits or `_`. Each value is a string, a finite number, a boolean or
+  an array of strings. The serialized object may be at most 8192 bytes, and a larger object is
+  refused, not truncated. The keys `memory_type`, `tags` and `attribution` are reserved.
+- `memory.recall` hits report `namespace`, `tags` (`[]` when none) and `properties` (`{}` when
+  none). Existing hit fields keep their names and meanings.
+- `memory.recall` breakdowns add `weights_served`, `namespace`, `pre_entity_score`,
+  `entity_term`, `local_factor` and `duplicate_penalty`.
+- `[actor] owned_namespaces` in `khive.toml` lists namespaces the actor owns, such as the
+  namespaces its helper processes write into. Each entry must be a valid namespace other than
+  `local` and the actor's own `id`, and entries must be unique. A non-empty list requires an
+  explicit `id`. An invalid list is refused when the configuration loads. `memory.apply_batch`
+  accepts an old row in an owned namespace. Ownership grants no write access and widens no read.
+- `brain.create_profile` takes an optional `local_factor`, a finite number from 0.5 to 1. Any
+  other value is refused. `brain.profile` reports the factor beside `posterior_means`. Recall
+  scales hits from the shared `local` namespace by a served profile's factor. A profile without
+  one applies no factor.
+- `moodboard.search` takes an optional `rerank` argument in the opt-in moodboard pack.
+  `"visual"`, the default, is the exact image-embedding cosine ranking, and its reply is
+  unchanged. `"fused"` also ranks assets by how well their captions match the query asset's
+  name and caption, then combines both rankings with weighted reciprocal-rank fusion.
+  `descriptor_weight` (default 0.5, strictly between 0 and 1) sets the caption share of the
+  score. `rrf_k` (default 60, from 1 to 10000) sets the fusion constant. Both are refused unless
+  `rerank` is `"fused"`, and an unknown `rerank` value is refused. A fused reply adds a `rerank`
+  block. Each hit reports its visual and caption rank and score, each null when the asset is
+  absent from that ranking. A query asset with no caption returns the visual ranking.
+
+### Changed
+
+- `memory.remember` without a `namespace` argument writes semantic memories to the caller's
+  actor namespace, as episodic memories already did. Semantic memories used to go to `local`.
+  A caller with no configured actor still writes to `local`. An explicit `namespace` still
+  wins, and rows already in `local` stay where they are. A
+  deployment that reads shared facts through `local` must list the writing actors in
+  `visible_namespaces` or pass `namespace="local"`. `memory.prune` still defaults to `local`.
+- A `memory.remember` write from a caller with no configured actor stores
+  `attribution: "unresolved"` in its properties, with or without a `namespace` argument. The
+  reply then includes `"attribution": "unresolved"`.
+- `memory.recall` with a served brain profile ranks hits with the configured default weights.
+  The weights the profile's posterior means project to are reported per hit as
+  `profile_component` in the breakdown and no longer change the ranking.
+- Per-entity brain posteriors move only on explicit feedback sent through `memory.feedback`. A
+  recall hit still moves the entity-blind relevance and temporal posteriors, but no per-entity
+  posterior. A note read moves no per-entity posterior. On restart, replay routes each stored
+  event to the profile that served it, as the live path does.
+
+### Fixed
+
+- `comm.thread` answers a root message or `after` cursor outside the caller's mailbox view the
+  same way it answers an unknown id. The not-found error no longer names the requested id, and
+  a hidden cursor gets the invalid-input error an unknown cursor gets. Visible replies still
+  resolve to their thread.
+- Tool policy and grant timestamps stored as fractional or out-of-range numbers are no longer
+  truncated or silently treated as absent. A numeric timestamp is accepted only when it converts
+  to an integer without loss. A malformed row that the check consults is reported as an internal
+  error that names the row and the column.
+- The secret gate no longer refuses a note that cites a line with a backtick-quoted reference
+  such as `:1324`, followed by a later `path:line` citation near a trigger word. Assignments next
+  to a quoted reference are still refused.
+- A client whose configuration has no `[visibility_receipts]` section now matches any daemon
+  with a current receipt policy, so its requests reach the daemon instead of falling back to
+  local dispatch. A client that declares a receipt ring still needs the daemon's ring.
+
+### Security
+
+- The supervisor's marker ownership lock is opened through the checked opener the daemon locks
+  use. A symlink at the lock path is refused without touching its target. An existing lock file
+  loses its group and other permission bits, and a new one is created with mode 0600.
+
+### Breaking (Rust crates)
+
+- Public structs gained fields, so direct struct literals must set them:
+  `khive_runtime::RuntimeConfig`, `khive_runtime::RequestIdentity`,
+  `khive_runtime::DaemonRequestFrame` and `khive_runtime::engine_config::ActorConfig` add
+  `owned_namespaces`; `khive_brain_core::ProfileRecord` adds `local_factor`;
+  `khive_pack_memory::config::ScoreBreakdown` adds `weights_served`, `namespace`,
+  `pre_entity_score`, `entity_term`, `local_factor` and `duplicate_penalty`; and
+  `kkernel::reindex::ReindexArgs` adds `fts_only`.
+
+## [0.16.0] - 2026-11-01
+
+### Added
+
+- `gtd.counts`, a read-only count of one assignee's live tasks by status that loads no task
+  bodies. `by_status` has an entry for every task status, zeros included; `open` sums the
+  non-terminal statuses and `total` sums all of them. With `tag`, the reply adds the
+  assignee's open tasks carrying exactly that tag: at most `limit` rows (default 50, 1 to
+  200) of `id`, `title`, `status`, `priority` and `updated_at`, ordered by priority and then
+  oldest update, with `truncated` true when more are open. The gtd pack now has eight
+  verbs, 161 in total.
+- `khive_storage::note::NoteTimeOrder::UpdatedAt` (`updated_at ASC, id ASC`).
+- `KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL` (default `false`): for a mailbox hosted by Exchange
+  Online, a message from a maintainer on the mailbox's own domain that arrives with a single
+  Exchange same-tenant `AuthAs: Internal` stamp and no authentication-results header is
+  attributed to that maintainer instead of reading as `auth-absent`. Every other message keeps its
+  existing result. Use it only for Exchange Online mailboxes: the rule relies on Exchange removing
+  organization authentication headers from mail arriving from outside the tenant and stamping its
+  own. Before enabling it, confirm on the mailbox that outside mail carrying a forged
+  `AuthAs: Internal` arrives with a different stamp or with a second copy of the field. Other mail
+  hosts may keep sender-supplied headers and must leave it off (ADR-056, Amendment 2026-11-01).
+- A routing seam for node addresses in `comm.send`. An embedder installs a
+  `khive_pack_comm::node_route::NodeSendRoute` with `CommPack::with_node_route`; a recipient
+  written as a node address (`khive1:`, scheme matched case-insensitively) is then sealed by
+  that route and stored as a sender transport row, and two racing sends with the same
+  idempotency key replay the first result. `khive_runtime` keeps the history of confirmed
+  node public keys (`retain_confirmed_node_pins`, `NodePinKey`, `NodePinRecord`) in a new
+  `comm_node_confirmed_pin` table (migration 064); a retained key is never overwritten or
+  deleted. This release installs no route.
+- The configuration file accepts a `[channel]` section whose only key is a `[channel.node]`
+  table. The table is held as given and is not read; any other key under `[channel]` is
+  rejected.
+
+### Changed
+
+- `comm.send` to a node address (`khive1:`) is refused before anything is written when no
+  node route is installed, which is the default. Such a recipient never falls through to a
+  local mailbox, and a node address with surrounding whitespace is refused, never trimmed.
+
+### Performance
+
+- Consolidating a memory-mapped vector index no longer copies the whole mapped corpus into
+  owned memory first. Inserting into a mapped index still does.
+
+### Fixed
+
+- A keyed `memory.remember` that matches a stored memory returns the stored note even when
+  the replay names a source record that was never created or has since been deleted. A new
+  key still refuses a missing source and writes nothing.
+- Entity `search` drops a candidate that is deleted or hidden between candidate retrieval
+  and the metadata fetch, instead of returning it with null metadata. A page can therefore
+  hold fewer hits than `limit`.
+- When an MCP session starts a daemon, the bridge now passes the session's `--config` and
+  `--db` overrides to it, so the started daemon opens the store the session named.
+- Stale daemon cleanup keeps a reachable or ambiguous socket when the PID file is missing,
+  invalid or unreadable, and removes a socket or PID file only after confirming it is the
+  same file it inspected.
+- The exec pack's run-directory capture skips an entry whose name is not valid UTF-8 and
+  reports it by its escaped bytes and parent path, instead of replacing the name lossily.
+
+### Removed
+
+- The unpublished `khive-channel-node` crate. The hosted service builds the node client;
+  this repository keeps the routing seam described under Added.
+
+### Security
+
+- Daemon lock files that are written to are opened relative to a validated parent
+  directory. Unsafe paths, such as a symlinked lock, an unsafe ancestor directory or a
+  directory another user owns, are refused, and owned lock files have their permissions
+  tightened through the opened file. An owned default lock directory is repaired to mode 0700.
+
+### Breaking (Rust crates)
+
+- `khive_runtime::KhiveConfig` adds `channel`, the `[channel]` section. Direct struct literals
+  must set it or use `Default`.
+- `khive_channel_email::EmailChannelConfig` adds `trust_exchange_internal`. Direct struct
+  literals must set it.
+- New enum variants: `khive_runtime::ConfigError::InvalidNodeConfig` and
+  `khive_storage::note::NoteTimeOrder::UpdatedAt`. Neither enum is `#[non_exhaustive]`, so
+  downstream exhaustive matches must handle them.
+
+## [0.15.0] - 2026-10-31
+
+### Added
+
+- `embedding_truncation_report` replies may now include `discarded_tokens` and
+  `token_reporting_unavailable` counters. Both new counters are omitted when zero.
+  Document embeddings report provider token cuts alongside the existing byte limit,
+  and truncation refusals include provider-token counts when available.
+- `khive_runtime::KhiveRuntime::prepare_link_metadata` applies the shared
+  dependency-kind defaults to caller-resolved entity kinds without I/O.
+- Writer contention diagnostics now report per-pool FIFO admission depth, its
+  high-water mark, capacity rejections and bounded lifetime duration histograms.
+  Snapshots identify the FIFO stage and report unavailable call/rotation metrics
+  explicitly. Reading them never starts a writer or changes admission routing.
+- `db_diagnostics` reports a process-wide `code_map_vfs` block: `quarantine_occupancy`,
+  `quarantine_cap`, `registrations` and `registration_cap`, each read under its ledger's
+  lock without retiring entries. The block is observe-only and has no stability contract.
+- Add the CLI operator `kg.proposal_cleanup(older_than="30d")` to archive old
+  applied and rejected proposals in the selected namespace. The duration uses
+  positive whole seconds, minutes, hours or days, and retention follows the last
+  projection activity. Ordinary lists hide archived proposals; proposal identity,
+  lookups, parent references and lifecycle event history remain available.
+  The operator follows normal write policy and is unavailable through MCP or
+  multi-operation atomic requests. Migration V58 follows V57 from #5185.
+- `khive_query::compile_with_mailbox` compiles a GQL or SPARQL query with a caller-derived
+  `QueryMailboxScope`, filtering every note source, synthetic observation target and graph
+  edge in the compiled SQL by the note store's mailbox rule. `khive_query::compile` keeps
+  its unscoped behavior for callers that supply no scope.
+- Add `stream.truncate` to remove a stream prefix atomically while preserving its sequence
+  floor. `stream.read` and `stream.stat` report the floor, and empty streams retain their
+  sequence position.
+- KG archive imports now support explicit conflict handling, a dry-run preflight and forced
+  skipping of invalid edges. Dry runs report the planned counts without writing; force only
+  relaxes endpoint validation.
+- Change sets add `RestoreOp` for active entities, notes and edges, and soft-delete inversion
+  now produces restore operations. Restore cannot yet be applied, and schema-version 1
+  change sets no longer decode.
+- `attach(id, role, bytes, media_type?)` stores a role-keyed attachment on an existing entity or
+  note on the main backend, replacing any earlier attachment in that role. Representations a pack
+  protects stay with that pack, and inline input keeps the 64 MiB limit. `get` returns role-keyed
+  attachment metadata and hydrates only the roles a caller requests, with verified base64 bytes;
+  an unknown role is refused. Soft deletion keeps attachment rows and hard deletion removes them.
+- `RuntimeCloseOwner` closes a quiescent single-backend runtime slot explicitly. A successful close
+  waits for the audit tasks, drains the writer and joins the final store's timeout sink. Progress
+  survives cancellation, and while other holders keep pool, backend or audit roots alive the close
+  reports `Incomplete` with the observed strong counts so the host can release them and retry.
+  Runtimes with embeddings, ANN, blob hydration, split events, host background loops or several
+  backends are refused at preflight. Ordinary `Drop` remains best effort.
+- Add `charter.*` verbs to compile and publish workflow definitions, start and advance
+  runs from recorded or sampled observations, inspect status, and cancel open runs.
+  Definitions use registered vocabularies; `request_id` makes writes safe to retry.
+  Phase revisits include new evidence, and only declared triggers advance generation.
+- New crate `khive-capability`: sealed process-local grants, authenticated durable grant
+  envelopes and attenuating capability delegation. With its `authority-store` feature,
+  authority records, typed change history and replay receipts are stored in `khive-db`
+  transactions, and bootstrap state is written atomically.
+- `khive-db` records edge-governance decisions and invalidations in a new dormant
+  schema. The tables preserve decision history and native edge changes, without
+  activating governance checks or changing ordinary edge writes.
+- Failed dispatch audit events carry a typed `error_class`. `brain.event_counts`
+  groups recognized classes and counts missing, malformed or unknown classes as
+  unclassified, without changing caller errors or retry behavior.
+- Audit success retention supports `reduced` and `all` through
+  `KHIVE_AUDIT_SUCCESS_ROWS`. Reduced mode omits or samples successful rows for
+  selected trusted handlers; `db_diagnostics` reports the decisions and
+  `brain.event_counts` includes stored sampling metadata.
+- Add `kkernel db events-prune` to preview and remove eligible polling-dispatch audit
+  events. Applying a plan requires a verified backup and digest, uses bounded batches,
+  and can resume after interruption.
+- Add `kkernel kg export --ndjson` to write sorted `entities.ndjson` and `edges.ndjson`
+  files for a project.
+- `kkernel kg init` creates a versioned `.khive/kg/schema.yaml` when it is absent and
+  publishes its default files atomically; it can also offer to install a pre-commit hook.
+- Add `NoteStore::assign_note_key_if_unset` to assign a key once to an existing live
+  note that does not have one.
+- Add explicit workspace mirroring with `WorkspaceMirrorConfig` for polling intervals
+  and include/exclude path globs. Each mirror pass atomically commits its document,
+  index and edge changes, and cursor.
+- Background warm-up and maintenance work can be bounded with
+  `runtime.warm_concurrency` and `runtime.maintenance_concurrency`.
+- Register the document subtypes `note`, `summary`, `handoff`, `transcript` and `other`
+  as accepted values.
+- `db_diagnostics` reports note-search routes for each opened backend.
+- Add `grant_is_active_on` to `khive-pack-tool::policy` to check whether a held grant
+  is active at a supplied time.
+
+### Changed
+
+- khive builds on lattice 0.15.0 (`lattice-embed`, `lattice-inference` and `lattice-fann`).
+  `kkernel` keeps the BERT vocab-size and tokenizer truncation warnings out of its log at the
+  default level, as before; truncation is still reported per write through
+  `embedding_truncation_report`. Moodboard descriptors now report inference version 0.15.0, so
+  their fingerprints and model keys change and existing moodboard vectors need reindexing;
+  preference bundles trained under 0.12.0 fail closed on load and need retraining. The
+  moodboard pack also pins every lattice crate those three resolve to at `=0.15.0`, so a fresh
+  resolution cannot pick a newer patch release of a transitive lattice crate under an unchanged
+  descriptor fingerprint.
+- **Breaking:** `exec.events` returns every event `id` as a string: a UUID for new
+  lifecycle events and a decimal string for legacy rows. New lifecycle events use
+  the shared event store with the caller's canonical actor attribution. Legacy
+  rows remain visible in the same oldest-first list, ordered by timestamp and
+  string ID before applying the requested limit.
+- The knowledge suggest verb now admits unspaced Chinese, Japanese and Korean queries by counting
+  every two supported letters as one word, while retaining the existing whitespace-piece
+  count for other scripts.
+- Successful search audit records include the retrieval arms actually started, lexical match
+  mode, effective limit and result count, including for empty results.
+- `kkernel reindex` reads `[embed].batch_size` from the selected config file when the option
+  is omitted; `--batch-size` takes precedence and the configured value is bounded to 1 to 500.
+- Quarantined email records now retain the parsed To recipients in `quarantine_claimed_to`.
+  Empty recipient lists and malformed-message envelopes omit the field.
+- `comm.thread` renders only the selected visible message owners when building message JSON
+  and previews, avoiding rendering discarded rows.
+- Atom weights are applied to knowledge search results after embedding blending and status
+  normalization. Missing weights use 1.0, and unavailable weight reads preserve results with
+  a degradation reason.
+- Event-count cursor reads now preserve typed `Timeout` and `AdmissionTimeout` refusals from
+  storage, including failures while checking page-boundary completeness.
+- When `KHIVE_SEARCH_PROFILE` is enabled, deadline phase records now carry the same search
+  call and backend identifiers as their profile records, distinguishing timeout and late
+  completion observations.
+- Legacy quarantine cleanup now has a partial index for its typed quarantine and blank-slug
+  filters, while keeping the existing expiry-or-creation ordering.
+- MCP instructions now direct clients to the `request` tool's verb list for linked packs
+  that are not loaded.
+- MCP server instructions no longer repeat the verb catalog already present in the `request`
+  tool description.
+- Entity vector searches exclude knowledge atom vectors before candidate limits are applied,
+  so nearby atoms cannot crowd entities out of entity search results. Other vector searches
+  retain their existing populations.
+- SQLite vector batch searches now use one admitted reader and one read transaction per batch,
+  so every query sees the same snapshot. Per-query failures remain isolated.
+- Writable cached SQL queries on standalone writers and pools with the write queue disabled
+  now take write admission immediately before execution and retain the connection through
+  settlement. Queued writer queries retain their existing read-only behavior.
+- Standalone database writes now use consuming write owners that keep the connection and
+  volume lease through settlement, including when an async observer is cancelled.
+- Malformed active tool-grant rows now return an authorization error naming the row and
+  invalid column, instead of falling through to policy or the default decision.
+- Windows code-map pools can now obtain the native handle for an opened main database file,
+  allowing the post-open identity check to succeed without reopening the path.
+- Event-daemon supervision retains a child handle after transient exit-poll errors, allowing
+  a later poll to reap it and preventing a second daemon from starting beside it.
+- On Unix, dropping a volume lease explicitly unlocks its file before closing it, so a
+  duplicated descriptor cannot keep the old lease locked.
+- Refusal diagnostics now mask credential-shaped values before including them in error messages:
+  brain profile lifecycle and feedback signals; comm inbox box and status values and thread order;
+  scheduled-action `kind`, `entity_kind` and `note_kind`; session export formats, resume and export
+  ids, list timestamps and search sources and timestamps; memory types, fusion strategies and
+  feedback signals; knowledge feedback signals and section keys; knowledge import `chunk_strategy`
+  and `format`; and tool argument values. Ordinary invalid values, accepted-value lists, validation
+  order and error variants are unchanged.
+- Invalid KG search `text_mode`, `source` and `order_by` values are now named in the diagnostic,
+  masked when credential-shaped, and an invalid tool string-list argument identifies the refused
+  element.
+- `kkernel reindex` warns once when the selected configuration sets `embed.batch_size` above the
+  500 cap, naming the file, the configured value and the effective value. An explicit
+  `--batch-size`, an in-range value, a validation-only run and single-record repair do not warn.
+- Bounded FTS ranking (`RankWithinCap`) materializes the bounded candidate rows before ranking,
+  avoiding a second id lookup, and duplicate ids outside the exact filters no longer expand the
+  gather cap. Default ranked search is unchanged.
+- The default `kkernel` and `khive-mcp` builds no longer link the agent, telemetry and web
+  packs; enable `pack-agent`, `pack-telemetry` and `pack-web` to include them.
+- S3 blob storage is linked only when the `blob-s3` feature is enabled. A build
+  without that feature refuses S3 configuration during load.
+- `kkernel kg import` reads native khive archives without extra features. Enable
+  `kg-adapters` for JSON, NDJSON, CSV, TSV or BibTeX imports; unsupported formats
+  are refused before the source is read.
+- Published `kkernel` binaries strip symbol tables; panic file and line information
+  remains, while backtrace frame names are omitted.
+- Refusal diagnostics mask credential-shaped caller values across `gtd`, `blob`,
+  `memory`, `runtime`, `git`, `comm`, `schedule`, `brain`, `kg` and `knowledge`.
+  Invalid values still receive the existing validation result without echoing a
+  credential-shaped value.
+- `knowledge.suggest` and `knowledge.compose` now share the same query admission
+  counting rules.
+- `khive-fs::read_link_at_bounded` returns complete symlink target bytes within a
+  caller-supplied cap, or an explicit too-large result. `khive-pack-exec` uses this
+  shared bounded read when capturing symlink targets.
+- Ordinary KG note lists and searches now default to active notes. Set `note_status` to
+  `archived` or `any` to include other live statuses.
+- Integer request parameters accept exact whole-number JSON floats; fractional or
+  inexact values remain refused.
+- `brain.feedback` and `memory.feedback` accept canonical `id` parameters and retain
+  `target_id` as a legacy alias.
+- Outbound mail tagged `traffic:list` can use a separate footer selected by
+  `KHIVE_EMAIL_LIST_FOOTER_FILE`; list mail is refused if the configured footer cannot
+  be read.
+- Edge property updates now shallow-merge patches, preserving omitted values and
+  treating `null` as a value.
+- `comm.health` reports current resident memory as `rss_bytes` separately from the
+  lifetime peak `max_rss_bytes`.
+- Entity updates persist unfinished indexing targets and report indexing status with
+  post-commit degradation details.
+- Audit events for `comm.inbox`, `comm.cleanup_expired_quarantine`, `whoami`,
+  `comm.probe`, `comm.cursor_get` and `comm.heartbeat` now include a `retention` object
+  with the class, policy and seven-day horizon.
+- `traverse` advertises `ids` as its canonical root parameter while retaining the
+  legacy input.
+
+### Performance
+
+- `khive-fold`: the diversity selector keeps one indexed queue per category (#5856).
+  `selector/diversity_scale` grows 7.1x from 1,000 to 5,000 candidates (scaling exponent
+  1.22, previously 2.07), with output identical to the previous selection loop.
+- `khive-db`: edge inserts and updates are faster (#5962). Against the same tree with the
+  change reverted, `edge_mutation/bulk_insert_100` takes 0.20x the time, `bulk_insert_1000`
+  0.28x, `update_weight_metadata` 0.43x and `update_endpoint` 0.44x, and the dormant
+  edge-governance triggers no longer add a measurable cost to inserts and updates (#5922).
+  Interleaved A/B, 8 rounds per arm, x86-64 Linux.
+
+### Fixed
+
+- `neighbors` now declares its `include_entity_type` parameter, so `verbs()` and `help` list
+  it. The handler already accepted it; only the declaration was missing.
+- `query` now applies the caller's mailbox view inside the compiled SQL, before matching,
+  ordering and pagination, as `get`, `search`, `list`, `neighbors` and `context` already
+  did, so another actor's message copies and quarantine records can no longer be read
+  through a query. An edge whose endpoint is a hidden message is dropped.
+- Idle ANN checkpoint tasks now release their runtime and storage handles when the final
+  ANN owner is dropped, without waiting for the checkpoint interval.
+- Updates rustls-webpki and webpki-roots to patched releases addressing RUSTSEC-2026-0381
+  and RUSTSEC-2026-0382.
+- Knowledge search recovers eligible rows from the namespace index before checking FTS
+  membership when the bounded global FTS window contains foreign or ineligible rows.
+- `brain.resolve` now returns a successful absence result when a loaded consumer has no
+  eligible profile, without adding an error audit row.
+- Ordinary runtime builds no longer retain per-generation audit history that is only read by
+  instrumentation; cumulative counters and health metrics remain available.
+- Non-Unix builds no longer compile Unix-only event forwarder and server exports.
+- `RankWithinCap` text search keeps every exact filter when a candidate id occurs in more than one
+  namespace.
+- `kg.restore` refuses tool registry records, preserving the registry's retired
+  entries from restoration through the KG update path.
+- Coordinated `link` requests validate the ordinary link parameters after admission
+  and before the coordinated write. Invalid weights, resurrection types and unknown
+  arguments receive the same refusal as a direct link request.
+- Vamana medoid selection now averages the sampled rows, so ordered inputs do not
+  bias the graph's starting point toward early rows.
+- Event lookup by identifier now searches across namespaces while preserving the
+  caller's visibility rules.
+- Entity `create` refuses the note-only `content` field and directs callers to use
+  `description`; note content remains accepted.
+- Cached single-statement writes reject transaction-control SQL before choosing a
+  writer route. Use `atomic_unit` for statements that must run in one transaction.
+- Updates `ctutils` to 0.4.4 to address RUSTSEC-2026-0385.
+- Updates `tokio` to 1.53.3 to address RUSTSEC-2026-0386.
+- Startup validates pack declarations and reports all missing dependencies for selected
+  packs in one error.
+- `kkernel kg init` skips existing scaffold leaves without following links.
+- Resuming `kkernel db events-prune` keeps every previously batched ID in the authorized
+  digest, including rows skipped or still present after an interrupted batch.
+- `kg validate --fix` pairs results by source path and rule ID, and reports results after
+  fixes are applied.
+- Generic edge-rule violations now identify the edge record that failed validation.
+- MCP stdio remains open for requests received before initialization.
+- Workspace mirroring reads the current document head and superseding edges from one
+  statement.
+- `exec` shutdown settles admitted recall-ledger work before closing audit writers and
+  shares the bounded storage-settle deadline across recall and writer tasks.
+- Git document suffix matching now requires a path boundary, and exact document URI
+  matches rank ahead of basename fallbacks.
+- `khive-wire-protocol` enforces positive request deadlines and object event payloads;
+  clients follow the required handshake sequence and reject errors with invalid scopes.
+- `neighbors` advertises the canonical `id` parameter and retains `node_id` as an alias;
+  `verbs()` and `help` list the supported inputs.
+- Knowledge operations preserve indexed refusal details and known atomic settlement
+  outcomes in their responses.
+- Text search now prefers eligible matches for one- and two-character query tokens
+  without narrowing the query.
+- Credential trigger words in ordinary path references no longer cause unrelated values
+  to be refused.
+
+### Removed
+
+- `khive_storage::graph::CommitAnnotationCursorValue`,
+  `khive_storage::graph::CommitAnnotationGuard`, and
+  `khive_storage::graph::CommitAnnotationInsertOutcome`.
+- `khive_storage::GraphStore::insert_commit_annotation_if_absent` and
+  `khive_runtime::KhiveRuntime::link_commit_annotation_if_absent`.
+  Git reconciliation uses pack-owned predicates and the existing generic
+  create-only graph insertion instead.
+- `khive_db::stores::graph::GraphMutationRequest::CommitAnnotation` and
+  `khive_db::stores::graph::GraphMutationOutcome::CommitAnnotation`.
+- The npm distribution is no longer built or published. Use [khive cloud](https://khive.ai)
+  or build `kkernel` from source.
+
+### Security
+
+- Memory writes refuse keys that contain credential-shaped values.
+- Refusal diagnostics now mask credential-shaped values in `exec` string-type errors.
+- GitHub ingestion settles secret-refused records with safe replacements so processing
+  can continue without retaining the refused values.
+- Code-map opens are refused when a map path reaches its eight-handle quarantine limit.
+
+### Breaking (Rust crates)
+
+- `khive_retrieval` re-exports `EmbedError`, `EmbeddingModel`, `EmbeddingService`,
+  `CachedEmbeddingService`, `NativeEmbeddingService` and `EmbedResult` from lattice-embed, so they
+  now carry lattice 0.15's definitions. `EmbedError` no longer has the `AttestationReportSize` and
+  `ResourceBudgetOverflow` variants.
+- `khive_runtime::DocumentEmbeddingOutcome` adds `provider_token_count`; direct
+  struct literals must set it. `EmbeddingTruncationReport` adds `discarded_tokens`
+  and `token_reporting_unavailable`; literals must set them or use `Default`.
+- `khive_db::diagnostics::WriterContentionDiagnostics` adds `writer_admission`,
+  `writer_admission_unavailable_reason`, `audit_success_rows_omitted`,
+  `audit_success_rows_sampled_out` and `audit_success_rows_forced`.
+  `khive_db::diagnostics::RuntimeAuditBatchMetrics` adds `audit_success_rows_omitted`,
+  `audit_success_rows_sampled_out` and `audit_success_rows_forced`. Direct struct literals must set them.
+- `khive_db::diagnostics::DbDiagnostics` adds `code_map_vfs` and `note_search_routes`. Direct struct literals
+  must set them.
+- `khive_db::WriterGuard` no longer hands out its connection: `conn`, `conn_mut` and the
+  `Deref`/`DerefMut` impls to `rusqlite::Connection` are removed, and `transaction` now
+  takes the guard by value. Write through the consuming `WriterGuard::autocommit` or
+  `WriterGuard::transaction`, which admit the write before it runs and settle the
+  connection before the guard is released.
+- `khive_db::ConnectionPool::open_standalone_writer` is removed. Use the consuming
+  `standalone_autocommit` or `standalone_transaction` operations, or the restricted
+  `open_standalone_checkpoint` handle.
+- `khive_changeset::Op` adds `Restore`, and `khive_changeset::InvertError` adds
+  `InverseRestore`, which also moves the implicit discriminant of `InverseUpdate`.
+  Exhaustive matches on either enum must handle the new variant.
+- `khive_runtime::KhiveConfig` adds `embed`, the `[embed]` table that carries the
+  reindex batch size. Direct struct literals must set it or use `Default`.
+- `khive_runtime::RuntimeError` adds `CanonicalUnsupportedOperation` and `BatchWrite`. Exhaustive
+  matches must handle them.
+- `khive_runtime::RuntimeConfig` and `khive_runtime::engine_config::RuntimeSectionConfig` add
+  `warm_concurrency` and `maintenance_concurrency`; direct struct literals must set them or use `Default`.
+- `khive_runtime::PackLoadError` adds `MissingDependencies`; exhaustive matches must
+  handle it.
+- `khive_runtime::ConfigError` adds `BlobS3FeatureDisabled`, returned when S3 blob
+  storage is configured in a build without `blob-s3`, and `InvalidRuntimeConfig`. Exhaustive matches must
+  handle them.
+- `kkernel::kg::ImportArgs` adds `on_conflict`, `force`, `dry_run` and
+  `continue_on_error`, and `kkernel::kg::ExportArgs` adds `ndjson`. Direct struct literals must set them.
+- `khive_types::EventKind` adds `GrantChange`; downstream exhaustive matches must handle it.
+- `khive_runtime::ProcessResourceUsage` replaces `rss_bytes` with `max_rss_bytes`, the lifetime peak.
+  Direct struct literals must use the new field; for the current resident size call
+  `khive_runtime::resource::current_rss_bytes()`.
+- `khive_runtime::secret_gate::RedactionSurface` adds `WorkspaceMirror`, which moves the implicit
+  discriminants of `McpDiagnostic` and `GateProbe`. Exhaustive matches must handle the new variant, and code
+  that relies on the cast values must be updated.
+- `khive_runtime::config_ledger::record_config_locked` is removed; use `KhiveRuntime::record_config_locked`,
+  which takes the value as a closure.
+- `KhiveRuntime::link_commit_annotation_if_absent` is removed, and `khive_storage::graph` removes
+  `CommitAnnotationCursorValue`, `CommitAnnotationGuard`, `CommitAnnotationInsertOutcome` and
+  `GraphStore::insert_commit_annotation_if_absent`. Historical commit-annotation repair goes through
+  `khive_pack_git::reconcile::run_reconciliation`.
+- `khive_storage::NoteFilter` adds `note_status`; direct struct literals must set it or use `Default`.
+- `khive_pack_git::ingest::IngestWriteRefusal` adds `redacted`. Direct struct literals must set it.
+- `khive_pack_charter::CharterPack` is now a struct that owns its runtime instead of a unit struct, and it no
+  longer implements `UnwindSafe` or `RefUnwindSafe`. Construct it with `CharterPack::new(runtime)`.
+- `khive_pack_charter::transition::RunState` adds `Terminated`, which moves the implicit discriminants of
+  `Cancelled`, `Superseded`, `Invalidated` and `Failed`. Exhaustive matches and code that relies on the cast
+  values must be updated.
+- `kkernel` and `khive-mcp` no longer enable `pack-agent`, `pack-telemetry` or `pack-web`
+  by default, nor the optional pack dependencies behind them. Crates that depend on
+  `kkernel` or `khive-mcp` and use those packs must enable the features.
+
+### Upgrade note
+
+- Change sets now use schema version 2. Change sets stored at schema version 1 no longer decode,
+  so a canonical proposal stored before this release must be proposed again.
+- `cargo install kkernel` now builds without the agent, telemetry and web packs, S3 blob
+  storage and the JSON, CSV and BibTeX KG import formats. To keep them, install with
+  `--features pack-agent,pack-telemetry,pack-web,blob-s3,kg-adapters`.
+- This release adds database migrations V58 to V63: the proposal archive, the legacy
+  quarantine index, the stream truncation floor, the edge-governance tables and the
+  authority store, and pending entity indexes.
+- Qwen3Embedding4B log lines that lattice 0.12 kept out of the `kkernel` log now appear at warn:
+  - `Metal forward failed (seq_len=...), falling back to CPU`, when the Metal forward pass fails
+    and the model runs on CPU instead (target `lattice_model_qwen3_embedding`).
+  - `failed to parse inference_config.json, using defaults`, when the model directory's
+    `inference_config.json` does not parse (target `lattice_model_qwen3_embedding`).
+  - `persistent Qwen cache not restored: model or tokenizer revision is unknown`, new in lattice
+    0.15, once at model load when the model directory records no model or tokenizer revision
+    (target `lattice_embed`).
+- khive does not save lattice's persistent Qwen embedding cache, so the cache file-name change
+  in lattice 0.15 needs no action.
+- Moodboard: assets indexed under lattice 0.12 are not found until they are indexed again, and
+  a preference bundle trained under 0.12 is refused at load with "moodboard preference model has
+  the wrong FANN identity" until it is trained again.
+
+### Known issues
+
+- Edge deletes and product merges still carry the dormant edge-governance trigger cost,
+  about 13 to 15 percent on `edge_mutation/delete_hard` and `delete_soft` and 11 to 12
+  percent on the 8-edge product merges (#6118).
+
+## [0.14.0] - 2026-10-18
+
+### Added
+
+- `NoteStore::try_patch_note_properties` applies guarded partial property writes,
+  forward-only expiry and a monotonic update timestamp in one storage operation.
+  Its provided default returns `Unsupported`; existing implementations remain
+  source-compatible. Comm duplicate-quarantine repair now uses this typed operation
+  through a channel-ingest capability, preserving its property guards and writer
+  admission while removing the pack's repair SQL.
+- `KHIVE_EMAIL_EXTERNAL_INBOUND=enabled` receives authenticated mail from outside senders
+  (delivered as untrusted external messages and routed as with external senders configured)
+  without setting `KHIVE_EMAIL_EXTERNAL_SENDERS`, so outbound external sending stays disabled.
+  Start-up fails while it is enabled and `KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR` is unset or
+  empty, and on any other non-empty value.
+- With `KHIVE_EMAIL_SUPPRESSION_MIRROR_URL`, `KHIVE_EMAIL_SUPPRESSION_MIRROR_TOKEN` and
+  `KHIVE_EMAIL_SUPPRESSION_MIRROR_MAX_AGE_SECS` set, the email outbox reads the complete set of
+  remote one-click suppressions and records every missing key in the local suppression list
+  before an external message is sent (ADR-200 section 6, Amendment 4). A failed read keeps
+  external messages pending, and external admission refuses with `suppression mirror stale`
+  once the last successful read is older than the maximum age. Each outbox cycle also reads
+  the mirror when its stamp is half the maximum age old, so an idle deployment stays fresh.
+- Configured embedding engines may name custom pack providers. MCP, ingest and downstream
+  host composition register providers before binding ordered peers and their declared
+  dimensions, without loading models. Missing providers fail startup; explicit no-embedding
+  runtimes keep no configured default while explicit manual named access remains available.
+- `khive-lion-core` copies Apache-2.0 `lion-core` 0.4.0 and adds `Kernel::with_key`
+  for caller-supplied seal keys. All-zero keys are refused; initialization starts
+  at epoch zero with no previous key and the same empty, deny-all state.
+- Add `schema()` for loaded vocabulary and attributed endpoint declarations, including
+  entity subtypes, counts and a stable content hash. The proposed ADR-084 contract
+  remains pending acceptance and conformance validation.
+- `apply_changeset` applies a complete canonical NDJSON change-set as one bounded, ordered
+  writer transaction. Staged create and link identifiers survive application, updates
+  compare the captured values of the fields they touch, and deletes compare the whole
+  captured record except `updated_at`. `kkernel kg apply` submits the delta through the
+  daemon, and reviewed canonical proposals use the same path. Merge is refused.
+- When a coordinated kg search hits its deadline, the `backend search task timed out` and
+  `backend search task completed after the shared request deadline` warnings add
+  `in_flight_phase`, `phase_elapsed_ms`, `active_phases` and `completed_phases`, naming
+  what the backend search was doing. `khive-storage` gains
+  `request_context::SearchPhaseTrace`. Deadlines, budgets, retries, ordering and results
+  are unchanged.
+- `comm.health` reports an outbox scan health snapshot for the email and Telegram
+  transports: completion and success times of the pending-row query and observations of
+  the bounded eligible page. A failed scan keeps the previous success time.
+- Explicit KG imports honor `[schema].strict`, which defaults to true. Strict mode refuses
+  an unknown entity kind before the destination is set up; relaxed mode keeps its spelling
+  and warns once per distinct kind. Local VCS sync degrades unknown kinds to `concept` and
+  records `khive:degraded_kind`.
+- `code_map_root` and `[[code_maps]]` entries (`name`, `path`, `source_root`) in
+  `config.toml` are validated entry by entry and loaded once into a runtime registry of
+  code maps (ADR-139). A malformed entry is rejected by name without stopping the
+  configuration from loading.
+- `code.list`, `code.search` and `code.deps` read operator-registered code maps: list and
+  search paginate deterministically with a cursor bound to the map registration and
+  filters, search ranks exact, then prefix, then interior name matches, and dependency
+  traversal returns nodes breadth-first with incoming normal, dev and build dependencies,
+  accurate node-limit truncation and every dependency edge among the returned nodes. The
+  three verbs are classified as reads.
+- `link` responses disclose a `dependency_kind` the server inferred, with a hint for each
+  inferred value; a caller-supplied `dependency_kind` suppresses it. Bulk hints keep the
+  caller's input indices across skips and failures, and an atomic link response carries
+  the hint captured while the plan was prepared.
+- The code pack's source ingest records the literal source-file inputs a module names:
+  `include!`, `include_str!` and `include_bytes!` arguments, `#[path]` attributes,
+  `#[doc = include_str!(...)]`, and filesystem read calls whose argument is a string
+  literal.
+- Guarded create-only edge insertion: `khive-storage` adds `GraphStatementGuard`,
+  `GraphStatementGuardFailure` and `EdgeInsertIfAbsentOutcome`; `khive-db` evaluates each
+  read-only guard statement inside the edge's writer transaction; `khive-runtime` adds
+  `link_if_absent_with_guards`.
+- `khive_types::app` declares a khive app as plain data (ADR-203): name, version, signer,
+  the verb inventory with a rights class per handler, and the kinds it contributes.
+  `AppManifest::validate` and `AppManifest::admit` refuse incomplete or conflicting
+  manifests, naming the conflicting owner.
+
+### Changed
+
+- `RetrievalPersistence::new` now accepts `Arc<dyn SqlAccess>`. Snapshot writes and
+  namespace clears use the backend writer route; loads and statistics use its
+  reader. Core migrations install the snapshot table and namespace index. The
+  existing `init_schema` compatibility bootstrap now uses the admitted writer.
+- `khive-retrieval` weight updates and batch reads now accept `&dyn SqlAccess`
+  instead of a raw SQLite connection. Pass the migrated backend's SQL access handle;
+  updates and audit rows commit together through its writer route, and read-only
+  handles refuse updates. Storage failures use `PersistError::Storage`.
+  Core migrations now install `atom_weights` and `weight_events`; the standalone
+  `init_weight_schema` bootstrap remains available for compatibility.
+- Edge-weight validators use the shared `khive-types` predicate,
+  preserving numeric boundaries and validation diagnostics.
+- With a configured runtime actor, a message the email channel quarantines, whatever its
+  reason, is addressed to that actor (the maintainer) instead of the routed landing actor, so
+  the mailbox recipient check keeps the quarantine record and its content reference out of
+  every other actor's inbox, thread, read, get and search results. This applies to records
+  ingested after the upgrade: a quarantine record already stored keeps the landing actor it
+  was written with, and nothing re-addresses it. A runtime with no configured actor keeps the
+  landing actor.
+- The email opt-out label (ADR-200 Amendment 2) now reads the first non-quoted paragraph of a
+  reply rather than its first line, so a phrase a mail client wrapped onto the second line still
+  counts, and the phrase list gains the plain asks for no more email ("don't email me",
+  "do not contact me", "no more emails" and their spellings). The bare words "email me" are not a
+  phrase: a reply asking us to email the docs is delivered without the label.
+- Email quarantine distinguishes `auth-untrusted`, a message whose authentication results
+  headers were present but not trusted, from `auth-absent`. The record carries the anchor
+  mode, the header family and the identifier as an escaped string of at most 128 bytes.
+- Bulk `link` responses report `inferred_count` instead of repeating an inference
+  explanation for every edge; `verbose=true` keeps the indexed hints and per-edge
+  explanations. Singleton `create` edge results disclose inferred dependency kinds.
+- `context` charges anchor-to-anchor edges against the response budget and returns an
+  anchor edge only when both of its anchors were admitted (ADR-140 Amendment 1).
+- A best-effort mark-read failure carries `mark_error_details` (typed code and stage, and
+  the native SQLite write stage and result codes where present) beside `mark_error`.
+- On Linux with glibc, the runtime returns the transient heap of a native embedding
+  model load to the operating system once the built-in embedder has loaded.
+
+### Fixed
+
+- SQLite volume-lock refusals name the directory or lock file that could not be used and the
+  underlying I/O error, and name both ways to choose another directory: `KHIVE_VOLUME_LOCK_DIR`
+  for the default directory resolver, or the caller-supplied lock directory setting. Headless and containerized deployments require a writable home
+  directory or an absolute, writable lock directory shared by all cooperating khive processes
+  of the deployment; an unusable directory still refuses the open rather than falling back to
+  a database-specific directory.
+- An authenticated opt-out in a message that screening quarantines as `screened` now records
+  the reply-stop suppression for its sender before the quarantine is acknowledged, as a
+  delivered opt-out already did. No other quarantine reason records an opt-out, and ingest
+  refuses one claimed on them.
+- A registered code map whose main database file has more than one link is refused at
+  registration and on every read, and the guarded read-only file system checks the link
+  count on the file SQLite reads before any row is read (ADR-139 Amendment 2). A
+  wrong-typed `code_maps` or `code_map_root` value fails the configuration load with the
+  key named. `khive_db::file_identity::file_link_count` reads the link count from an open
+  file.
+- `db_diagnostics` collects `size_composition` only when the read snapshot holds at most
+  8,192 pages and 32 MiB, checking both in the same snapshot; a larger store gets no
+  composition and `size_composition_error` names the observed footprint and the limits.
+  The limits bound the work admitted, not elapsed time. `size_composition=false` still
+  skips the walk.
+- The write-path secret gate treats `head=<40-hex>`, `head <40-hex>` and the equals form
+  of the other revision markers (`sha=`, `commit=`, `revision=`, `rev=`) as revision
+  labels instead of refusing them as credential tokens.
+- The web pack's disk ingestion encodes each file name as a URL path segment, so `#`, `?`,
+  `%` and `\` in a name no longer turn into a fragment or query and collapse two files onto
+  one document.
+- `khive-pack-brain` builds without the `lattice-router` feature no longer fail clippy
+  with unused imports.
+
+### Breaking (Rust crates)
+
+- `khive_runtime::KhiveConfig` adds `schema`, `code_map_root` and `code_maps`, and
+  `khive_runtime::RuntimeConfig` adds `code_map_root`, `code_maps` and
+  `code_map_protected_database_paths`. Direct struct literals must set them.
+- `khive_pack_code::CodeSourceIngestReport` adds `source_reads`,
+  `khive_types::ProposalAppliedPayload` adds `preimage`, and `kkernel::kg::ImportArgs` adds
+  `config`. Direct struct literals must set them.
+- New enum variants: `khive_runtime::AtomicOpFailure::{OwnerSnapshotConflict,
+  PreimageMismatch}`, `khive_runtime::AtomicOpPlan::Canonical`,
+  `khive_runtime::RuntimeError::CanonicalAdmission`, `khive_runtime::ConfigError::SchemaParse`,
+  `khive_types::ProposalChangeset::Canonical` and `kkernel::kg::KgCommand::Apply`. None of
+  these enums is `#[non_exhaustive]`, so downstream exhaustive matches must handle them.
+  `ProposalChangeset::Canonical` precedes `Compound`, whose implicit discriminant moves from
+  6 to 7.
+- `khive_runtime::AtomicOpPlan` is no longer `UnwindSafe` or `RefUnwindSafe`.
+- `khive_pack_brain::persist::PersistenceTracker` no longer has the public
+  `increment_dirty` and `reset_dirty` methods.
+
+## [0.13.0] - 2026-10-15
+
+### Documentation
+
+- Accept ADR-200, the external email policy: sender scope, suppression, unsubscribe and
+  screened inbound delivery.
+- Accept ADR-106 Amendment H, a per-event missed-schedule policy in which `catch_up_once`
+  requires an explicit `max_lateness`.
+- Accept ADR-140, the context graph payload budget rule; ADR-089 now points to it.
+- Accept the ADR-102 and ADR-046 2026-10-14 amendments: a staged change-set lands through one
+  atomic `apply_changeset` verb, and canonical change-set proposals land through the same path.
+  Neither is implemented yet.
+
+### Added
+
+- `knowledge.lint` inspects the caller-visible graph against the thirteen built-in hygiene
+  rules and returns typed violations, with statistics taken before any fix. Requested fixes
+  soft-delete unchanged dangling edges, propose questions about duplicate groups and mark
+  unchanged superseded entities deprecated, each checked inside its own transaction; the
+  receipt keeps earlier committed fixes when a later one conflicts or fails. The gate
+  classifies the verb as Write. Custom rules (`knowledge.lint_config`) remain deferred.
+
+- With `KHIVE_EMAIL_EXTERNAL_SENDERS` set, authenticated mail from outside senders passes
+  deterministic screening and routes to a verified thread owner, a configured recipient alias
+  or a fallback actor. Delivered messages read back marked `origin: external` and
+  `trust: untrusted` with the rule IDs that matched. A screening rule can withhold the body:
+  the message is delivered with a rule-ID placeholder, and its `quarantine-original` attachment
+  owns the original MIME bytes, which the recipient actor or the configured maintainer reads
+  through `comm.withheld_body`. A reply asking to stop records an address suppression
+  before the message is acknowledged. With the variable unset, startup and mail handling are
+  unchanged.
+
+- `schedule.remind` and `schedule.schedule` accept `misfire_policy` (`skip` or
+  `catch_up_once`) and `max_lateness` (positive seconds, required with `catch_up_once`). An
+  overdue `catch_up_once` event dispatches its latest due occurrence once when that occurrence
+  is no older than `max_lateness`; older occurrences are recorded as missed and never
+  dispatched. Events without a policy keep the existing skip behaviour and the
+  `KHIVE_FIRE_GRACE_SECS` window.
+
+- `kkernel kg review` reads Tier 1 eligibility from the same rules snapshot it validates
+  with. An optional `[tier]` section configures the operation kinds, link relations, mutable
+  entity fields and minimum link weight eligible for Tier 1. Empty lists narrow eligibility,
+  and judgment relations, destructive operations, existing-edge updates, low weights and
+  error findings still require Tier 2. `khive-rule-evaluator` now depends on
+  `khive-changeset`.
+
+- `comm.withheld_body` reads the original RFC 5322 bytes of a delivered withheld external
+  message, base64-encoded with their size. Only the message's recipient actor and the
+  configured maintainer may read it; any other caller is refused before the original is read,
+  and an id that is not a delivered withheld message is refused. Every call writes an audit
+  event naming the caller, the message id and the outcome. The response never carries a
+  content reference.
+
+- `EntityPosteriors::fold_evidence` applies weighted `supports` and `refutes` evidence
+  to a claim's posterior, rejecting invalid relations and weights before changing values
+  or eviction order. Either signed zero is a mutation-free no-op.
+
+- Inbound email follows one disposition order. A malformed or oversized message is quarantined
+  first. A subject of the form `unsubscribe <token>` whose token verifies records an outbound
+  `recipient_key` suppression entry (source `mailto_token`) and the message is neither delivered
+  nor quarantined. With external senders configured, an inbound suppression entry matching the
+  authenticated sender address or its exact domain quarantines the message with reason `blocked`.
+
+- `KHIVE_EMAIL_AUTHSERV_ID` accepts `!topmost:<authserv-id>` (`TrustAnchor::TopmostWithAuthservId`).
+  Only the topmost `Authentication-Results` header is considered, as with `!topmost-no-authserv-id`,
+  and it is trusted when it carries the configured `authserv-id` or none. This covers Exchange
+  Online, which stamps `mx.microsoft.com 1` on its own header for some senders and no `authserv-id`
+  for others. An empty or malformed id after the prefix fails configuration. Adding the variant to
+  the public `TrustAnchor` enum is a breaking change for exhaustive matches.
+
+- With `KHIVE_SEARCH_PROFILE` set, each search the coordinator runs across configured backends
+  writes one JSON line per stage to stderr (`backend`, `merge`, `fanout`, `finalize`, `hydrate`
+  and `search`), grouped by a call id that a nested search shares with its outer call. A
+  `backend` line names the backend, its hit count and its outcome (`ok`, `error` or `timeout`).
+  With the variable unset nothing is written and no stage timer reads the clock.
+
+### Changed
+
+- With no configured floor, the filesystem blob store's free-space floor is 2% of the volume
+  holding the blob root, never less than 5 GiB, instead of a fixed 100 GB. A configured
+  `floor_bytes` is used as given, including `0`. `FsBlobStore::DEFAULT_FLOOR_BYTES` remains,
+  deprecated.
+- Event counts keep the caller's request-read budget (`KHIVE_REQUEST_READ_TIMEOUT_SECS`)
+  instead of the fixed 10-second RPC timeout, and typed read and admission timeouts cross the
+  events wire intact. The events protocol version is now 6, so clients and daemons must be
+  upgraded together.
+- Configurable graph rules share the pure `khive-rule-evaluator` crate between
+  `kg validate` and `kg commit`, using captured NDJSON inputs and explicit citation
+  time. Runtime and offline checks share the canonical endpoint table and matcher.
+- Name the distinct query admission policies `khive_text::is_meaningful_text_query`
+  and `khive_pack_memory::scoring::is_meaningful_recall_query`, preserving their
+  existing behavior. Both `is_meaningful_query` functions remain as deprecated
+  compatibility wrappers for one release; callers should use the replacement names.
+
+### Fixed
+
+- A daemon that supervises an events daemon now holds each request until that child's socket
+  answers for the first time, instead of dispatching while the child is still starting. A write
+  sent in that window could commit its domain change and then report a failed audit commit. If the
+  socket has not answered within 10 seconds of startup, requests are refused before dispatch with
+  `events_daemon_unavailable`, `retryable: true` and `domain_disposition: not_committed`, naming
+  the socket, until it answers. Probe frames are answered without waiting.
+
+- The email poll loop no longer holds its IMAP page without bound. Every cause that holds a page,
+  a `comm.ingest` refusal or a quarantined message's original that cannot be stored, now counts
+  toward one bound per message: the message is recorded as quarantined on its 60th failed poll
+  while the store refuses it as retryable, and on its 5th for every other cause. If the original
+  cannot be stored, or the record that references it is refused, the record is written without it
+  and names the reason. `comm.health` reports `consecutive_held_polls`, `held_messages`,
+  `last_held_at` and `last_quarantined_after_hold_at` per channel.
+
+- External inbound email no longer routes on an unproven thread UUID. A sender-asserted
+  `X-Khive-Thread-ID` that names a thread routes only when that thread holds an outbound email
+  whose Message-ID verifies under the configured mailbox domains, the same proof the
+  `In-Reply-To`/`References` Message-ID path already requires. A UUID naming any other thread
+  falls through to the recipient aliases and then the external inbound actor. Maintainer mail
+  keeps its existing resolution.
+
+- A new quarantine record's `comm.ingest` receipt now reports whether the record kept its original:
+  `quarantine_original_retained` (a boolean) and, when it is false,
+  `quarantine_original_not_retained_reason` naming the stored reason. A non-quarantine message and a
+  deduplicated acknowledgement carry neither. The success heartbeat gains `originals_not_retained`
+  (a running total of records written without their original, with `original_not_retained_reason`),
+  `original_retention_state` (`retained` or `failing`), `notices_failed` (a running total) and
+  `notice_config_error` (cleared by a later success that omits it); a failure heartbeat refuses all
+  of them. `comm.health` reports each per channel, `null` for a writer that does not report them and
+  for quarantine-only entries.
+
+- Brain verbs report storage timeouts and admission refusals as typed storage errors instead
+  of internal errors, so callers keep the retryable classification.
+
+- A note update whose model reindex fails after the commit returns the typed committed
+  degradation error, naming each failed model and stage, instead of reporting success.
+
+- A verified mailto opt-out received while the email host has no comm store is kept for retry
+  instead of being consumed as already recorded.
+
+- With `KHIVE_RECALL_PROFILE=1`, each memory recall labels its stage records with its own call
+  ID and writes exactly one `total` record on every exit, including empty results, errors and
+  cancellation.
+
+- Events store directory refusals name the database path and the ownership, permission or
+  location remedy.
+
+### Performance
+
+- Reindex writes each page of notes or entities to the full-text index as one batch, keeping
+  successful documents when one in the page is refused.
+- Vamana insertion reuses pooled visited-node scratch instead of allocating it per insert.
+
+### Breaking (Rust crates)
+
+- `khive_channel::ChannelEnvelope` adds `inbound_delivery`, the host-verified routing for an
+  inbound message (never serialized). Direct struct literals must set it, usually to `None`.
+- `khive_runtime::events_split::EventsRequest::CountEvents` and `CountEventsGrouped` add
+  `operator_read_budget_secs`, and `EventsResponse::Error` adds `read_failure`. Direct
+  constructors and exhaustive destructurings of these variants must account for them.
+- `khive_runtime::RuntimeError` adds the `LintFix` variant, which keeps a lint fix's typed
+  cause and its confirmed receipts. The enum is not `#[non_exhaustive]`, so downstream
+  exhaustive matches must handle it.
+- `khive_channel_email::config::TrustAnchor` adds the `TopmostWithAuthservId` variant for
+  `!topmost:<authserv-id>`. The enum is not `#[non_exhaustive]`, so downstream exhaustive
+  matches must handle it.
+
+## [0.12.0] - 2026-10-13
+
+### Documentation
+
+- Accept the ADR-048 graph lint contract for #4813: thirteen built-in rules, typed
+  reports and statistics, and guarded fix receipts. The verb remains unimplemented.
+- Accept the `kg.proposal_cleanup` operator contract: hide old applied or rejected
+  proposals using an archive marker while retaining their identity and event history.
+  Retention follows last projection activity. The handler remains unimplemented.
+- Accept ADR-037 configuration-bound namespace and project-root rules for remote
+  cached-entity reads, preserving origin and refusing remote mutations. The read
+  remains unimplemented.
+- Accept ADR-035 embedding pipeline configuration, legacy-key compatibility and
+  import strictness rules, with an ADR-001 companion distinguishing explicit import
+  from VCS snapshot degradation; edge relations remain closed. The configuration
+  remains unimplemented.
+
+### Added
+
+- Weighted memory reranking recognizes a precomputed `graph_proximity` feature.
+  `RerankFeatures` gains the public field and a zero-valued `Default`; direct struct
+  constructors must supply it. Recall handlers supply zero pending graph gathering,
+  default weights remain empty, and rerank provenance records the recognized feature.
+- `khive-brain-core` exposes evidence-only posteriors with explicit event/read clocks,
+  checked half-lives, decay-before-add and a fixed read-time prior. Regressed writes
+  preserve the entry; invalid or overflowing updates refuse atomically. Existing
+  posterior storage, folds and serving paths remain unchanged.
+- Packs can declare note property policies and discover the validated registry boot snapshot.
+  Comm declares its nine existing kind-specific protected properties; writer enforcement is unchanged.
+- `db_diagnostics` accepts `backend=<name>` to inspect only the opened database serving that
+  backend, and `size_composition=false` to skip the `dbstat` walk, which reads every page of
+  each file. Every file-backed report now carries `page_accounting` (`page_size_bytes`,
+  `page_count`, `freelist_pages`), three pragma reads that are reported either way.
+- `memory.recall` accepts `include_timings=true`, which returns this call's retrieval stage
+  wall times (`embed_us`, `fts_us`, `ann_us`, `fresh_tail_us`, `hydrate_us`, `null` for a
+  stage that did not run), `total_us`, `retrieval_rounds`, and per-round `candidate_limit`,
+  `text_hits`, `vector_hits`, `hydrated` and `eligible` counts. An array response becomes
+  `{results, timings}`; an object response gains `timings`. No environment variable or
+  restart is needed; `KHIVE_RECALL_PROFILE` keeps working as before.
+
+- `khive-retrieval` adds pure query-variant normalization and bounded RRF-60 admission
+  merging. Original-query fallback preserves its bytes, generated variants are validated
+  as a whole, and admitted IDs retain variant and retrieval-source attribution.
+- `kkernel kg update <remote> [--ref <ref>]` resolves a Git ref to a full commit SHA
+  and atomically updates that remote in an existing schema.yaml, reporting both old
+  and new commits while preserving archive-content pins and other YAML values.
+  Rust clients with exhaustive `KgCommand` matches must handle the new `Update` variant.
+- Runtime packs may expose an optional `ContextContributor` capability with owned request
+  and slice types and explicit score semantics. Registry discovery preserves pack order;
+  context composition and execution remain separate.
+- `EmbeddingCosineReranker` scores every supplied entity candidate in a named engine,
+  preserves missing vectors with their incoming scores and an explicit flag, and implements
+  the retrieval `Reranker` trait without a namespace-wide candidate cut.
+- `khive-graph-diff` compares in-memory entity, edge and note NDJSON states with
+  deterministic additions, removals and field changes, preserving missing versus null.
+- Add explicit event sink declarations in `khive-types`. All existing event kinds
+  retain `caller_event_store`; the closed metadata API requires each new kind to
+  declare its sink. Event routing and storage behavior are unchanged.
+- A standalone session raw-value codec writes level-3 zstd frames with BLOB
+  prefix `0x01`, borrows legacy TEXT unchanged, and refuses unknown formats or
+  malformed data. Callers select the decoded BLOB size bound; mirror storage
+  paths and dictionaries remain unchanged.
+- `VectorStore::scan_vectors` enumerates persisted vectors in UUID-ordered pages
+  with exact metadata filters and an explicit row limit. SQLite reads stored bytes
+  through reader admission; pages do not form a cross-request snapshot.
+- The opt-in `charter` pack installs the seven recording tables from ADR-193 and
+  provides revision-and-state checked transaction helpers. This schema foundation
+  exposes no verbs, grants no action admission, and does not enforce merges.
+- `khive_runtime::hooks::refuse_shared_create` provides a kind-owned creation refusal hook.
+  Memory and channel-health hooks share its `InvalidInput` diagnostic, naming the specialized
+  writer while retaining their update and proposal guards.
+- `KhiveRuntime::resolve_prefix_in` resolves UUID prefixes in a named pack-owned table,
+  reporting distinct-ID ambiguity and storage failures. A `PrefixScope` argument states which
+  rows count: one namespace or all of them, and live rows only or soft-deleted ones too. Rows
+  outside the scope neither match nor make a prefix ambiguous; any other selection policy stays
+  with the caller.
+- `khive-retrieval::fuse_two_stage` combines ordered engine arms before vector/text fusion,
+  checks both strategies even on empty input, preserves the candidate union without a final
+  limit, and accepts an async custom-executor adapter without a runtime dependency.
+- Runtime `vector_search_in`, `knn_in` and `rerank_in` bind queries to an explicit engine,
+  checking its dimensions and finite coordinates even for empty requests. Existing methods
+  remain single-engine compatibility delegates to the configured first/default engine.
+- `khive-fs` adds bounded directory-name listing and descriptor-relative tree enumeration with
+  caller filters, explicit depth and entry caps, and optional within-root symlink following.
+  Caps count hidden and non-UTF-8 entries and refuse overflow instead of truncating results.
+- `kkernel kg import` accepts `--format bibtex` and `.bib` files, streaming bounded
+  entries into document/paper records with authors properties, `@string` expansion
+  and crossref edges. Malformed entries report skip counts and optional warnings;
+  fatal source errors refuse the import before the target database opens.
+- `khive-runtime::BackendHandle` provides five required core capabilities and optional per-binding
+  vector, sparse, and text factories. SQLite construction performs no storage operation; first use
+  retains existing readiness and repair, and unavailable retrieval tiers return named errors (#4706).
+- `brain.auto_feedback(signal="unjudged")` records attributed serve telemetry
+  without training or consuming a serve-ledger grade. Later caller-judged
+  auto-feedback with the same scorer/serve pair commits its grade and posterior
+  update exactly once; manual feedback behavior is unchanged.
+
+### Changed
+
+- `memory.recall` with `fusion_strategy="keyword_only"` no longer embeds the query or searches
+  the vector index, and `fusion_strategy="vector_only"` no longer runs the full-text search.
+  The saved work was most of the cost of a `keyword_only` recall that finds no text match.
+  `keyword_only` no longer applies the vector `min_raw_relevance` floor; its hits carry
+  `raw_score: null` and `score` is the composite; rank order is unchanged. Widening re-runs
+  only the arm the strategy keeps and stops when that arm is exhausted. A `keyword_only`
+  recall therefore never reports `degraded`, and a verbose `keyword_only` request on a
+  multi-model store returns the ordinary shapes instead of the `vector_candidates_per_model`
+  envelope, since no vector recall ran.
+
+- A `keyword_only` recall whose query the embedder cannot embed now returns its text hits
+  instead of failing with `recall: all embedding engines failed`, and a `vector_only` recall
+  whose full-text table is unreadable now returns its vector hits instead of failing.
+
+- `memory.recall` leaves an English-only embedding model's vector list out of fusion when the
+  query is CJK-dominant (its CJK characters outnumber its other letters). Today that model is
+  `all-minilm-l6-v2`, which maps most CJK characters to `[UNK]`, so its candidates for such
+  queries carry no signal. The list gets weight zero under every strategy that fuses
+  per-model vector lists, but only when another model contributed a candidate and the request
+  does not name `embedding_model`. English and mixed queries fuse as before. The
+  `enable_cjk_fts_bypass` documentation now states what the flag does: it skips term selection
+  in the FTS gather path and is read only when FTS gather is enabled.
+- `db_diagnostics` no longer fails as a whole when the request's read deadline arrives. The
+  backends already inspected are returned, every remaining backend's `error` starts with
+  `not inspected: request deadline`, and the new root field `complete` is `false`. Backend
+  inspections stop slightly before the deadline (a tenth of the remaining time, at most two
+  seconds) so the partial report reaches a client whose own deadline started first. A
+  cancelled request still fails. When `backend` selects a database, the root fields describe
+  that database rather than main.
+- `khive_db::diagnostics::collect_with_runtime_audit_metrics_for_process_interruptibly` and
+  `KhiveRuntime::db_diagnostics_for_opened_backend_with_audit_metrics` take a trailing
+  `collect_size_composition: bool`; pass `true` for the previous behavior.
+  `khive_db::diagnostics::DbDiagnostics` gains the public fields `page_accounting` and
+  `page_accounting_error`; direct struct constructors must supply them.
+- A stdio MCP host that forwards to the daemon is now strict by default whenever a daemon
+  socket or PID file exists, or existed when the request arrived: a request that would
+  have fallen back to local dispatch is refused with its reason code (`no_socket`,
+  `config_mismatch` and the rest), as under `KHIVE_DAEMON_STRICT=1`. `KHIVE_DAEMON_STRICT=0`
+  (or `false`, `no`, `off`) restores the fallback; with neither file on disk the quiet
+  fallback is unchanged; `KHIVE_NO_DAEMON=1` remains the way to run without a daemon.
+- A daemon that is alive but does not answer in time now returns `reason: "daemon_slow"`
+  with `phase: "before_dispatch"` (nothing sent, `not_committed`, retry is safe) or
+  `phase: "after_write"` (`unknown`; read state before any re-send) and the elapsed wait.
+  A connection lost after the request was sent returns `daemon_connection_lost`, and an
+  unreadable response `parse_failure`; all three post-write outcomes stay terminal.
+  `bridge.diagnostics` reports `daemon_slow` counts per phase, outside `fallback_total`.
+- Client daemon recovery acts on one rendezvous. With exactly one of `KHIVE_SOCKET` /
+  `KHIVE_PID` set and a socket that does not answer, a request is refused with
+  `reason: "rendezvous_split"` (`not_committed`) instead of reading the other half's PID
+  file and signalling the daemon it names. A client also never signals a live daemon on a
+  rendezvous a supervisor marker claims: it returns `supervised_daemon_unresponsive`
+  (`not_committed`) naming the pid, the marker's job and the marker path.
+- The daemon writes `<pid file>.exit` (`running` after it claims the PID file, `exited`
+  with the reason and the pid that sent the shutdown signal), logs the previous record and
+  the effective `RLIMIT_NOFILE` at WARN on every boot, and logs its shutdown at WARN.
+- Each pooled SQLite connection now keeps an 8 MiB page cache instead of 64 MiB. The
+  cache is per connection and on the heap, so a process with many connections paid the
+  old size many times over. `KHIVE_SQLITE_CACHE_KIB` (512 to 1048576) and
+  `KHIVE_SQLITE_MMAP_BYTES` (0 to 2^40, `0` disables memory-mapped reads; default 1 GiB)
+  override the two settings; a value outside its range is logged and ignored.
+
+- A stdio MCP host that forwards to the daemon no longer runs the legacy quarantine
+  original repair at boot, whether it serves one store or several. The daemon runs
+  it before it serves; the census read every message row on every backend, so each
+  client start spent seconds pulling the stores through the page cache. The repair
+  itself now stops after its first census when nothing is unowned, instead of
+  reading the roster twice more to change nothing, and reports how many passes it
+  made.
+- Upgrade the shared `rmcp` dependency to 2.2, including its security and transport
+  cancellation fixes. MCP, mounted tools and CLI consumers keep their existing
+  feature configuration; MCP result tests use the renamed `ContentBlock` API.
+- An oversized stdio line now receives Invalid Request (-32600, no id) instead of
+  Parse Error (-32700): rmcp 2.2 ignores syntactically invalid JSON without
+  replying. The line cap, drain and next-request recovery are unchanged.
+- `khive-retrieval` weight updates and batch reads now accept `&dyn SqlAccess`
+  instead of a raw SQLite connection. Pass the migrated backend's SQL access handle;
+  updates and audit rows commit together through its writer route, and read-only
+  handles refuse updates. Storage failures use `PersistError::Storage`.
+  Core migrations now install `atom_weights` and `weight_events`; the standalone
+  `init_weight_schema` bootstrap remains available for compatibility.
+- Lattice dependencies move from 0.9.0 to 0.12.0 (`lattice-embed`, `lattice-inference`,
+  `lattice-fann`). Moodboard descriptors now report inference version 0.12.0, so their
+  fingerprints and model keys change and existing moodboard vectors need reindexing;
+  preference bundles trained under 0.9.0 fail closed on load and need retraining. BLAKE3
+  no longer runs with the `pure` backend: std members enable `blake3/std` directly.
+- `khive-vamana` greedy search keeps its candidate list sorted and bounded: each neighbor is
+  placed by binary search and the next candidate to expand is read from a cursor, instead of
+  re-sorting the whole list and scanning it for the nearest unexpanded entry after every
+  expansion. Candidates with equal SQ8 distance now order by node id rather than by exact f32
+  distance; the exact f32 re-score of the final list still decides the returned top-k. An
+  index built after this change can differ from one built before it where SQ8 distances tie.
+
+- Public brain posterior folds use the shared filter and map combinators, preserving
+  reducer state, standalone section-feedback handling and offered-event counts.
+- Pool configuration, WAL ceiling policy and test-store guards move into an internal
+  configuration module while preserving public paths, defaults and refusal behavior.
+- Vamana v2 saves use one checkpoint-owned publication boundary: metadata is
+  published and synced through the shared Unix helper before the four staged
+  segments are promoted. Sidecar reads and cleanup share component-name conversion,
+  preserving their refusal policy and native I/O errors (Refs #4498).
+- Blob and WAL-pin publication use the shared descriptor-relative rename helper; blob-root
+  verification uses the shared file identity type, preserving held handles and durability barriers.
+- Vamana checkpoint staging, auxiliary sidecars and external-ID sidecars share Unix
+  descriptor-relative atomic publication helpers. Checkpoints retain their separate metadata
+  commit and segment promotion boundaries, stale-entry policies and I/O diagnostics.
+- Git cursor inspection and annotation repair now share the bounded snapshot query, preserving
+  their separate size limits, refusal messages and exact stored cursor bytes.
+- Session mirror enable flags now use the shared boolean parser: `on` and surrounding
+  whitespace on recognized true values enable the configured source. All four flags still
+  default to disabled; the separately default-enabled backfill flag keeps its existing parser.
+  Session maintenance uses shared typed SQL row accessors while preserving its error messages
+  and rejection of negative counts.
+- MCP configuration fingerprinting and verb catalog helpers now live together in the server
+  config module, preserving public entry points, daemon identity values, and catalog output.
+- Extract blob garbage-collection ownership and database lock handling into a
+  private module while retaining the existing public API and lock behavior.
+- `khive-db` moves checkpoint escalation and transaction-age state into a dedicated
+  module, preserving the public `khive_db::checkpoint` paths and state-machine behavior.
+- Extract runtime daemon wire frames and framing into a private module while preserving public paths,
+  protocol constants, error normalization, and source-reader coverage.
+- Move MCP server state, registration errors, and stdio settings into a dedicated
+  core module, preserving public server entry points and existing function bodies.
+- Split the `kkernel exec` run paths into a private module while preserving the public entry point,
+  test module paths, and tracing targets.
+- Entity create, claim, ordinary update, bulk, and direct code ingest now share manifest-aware
+  candidate admission. For an admitted candidate, the entity, runtime stamp, required indexes,
+  attachments and exemption audit commit together. Production manifests remain empty; non-empty
+  fixtures are test-only. Notes and administrative/atomic updates retain their existing gates.
+
+### Fixed
+
+- The secret gate treats a label ending in `_token` as a credential label, so a UUID or opaque
+  value assigned to `access_token`, `refresh_token`, `session_token` or any other `*_token` label
+  is refused the way one assigned to `token` is. Pagination and sync cursors (`next_token`,
+  `next_page_token`, `page_token`, `pagination_token`, `continuation_token`, `resume_token`,
+  `sync_token` and a few others, matched as the whole label) stay allowed, as does the sealed
+  `visibility_token` receipt in a quoted `memory.remember` response. The label directly before a
+  repository revision URL or a LaTeX fragment follows the same rule.
+- The daemon registers its signal-sender recorder before its shutdown signal streams, so the
+  exit record names the sender of a SIGTERM or SIGINT instead of intermittently writing
+  `sender_pid=unknown`. Registering the recorder for a signal that already has a handler is
+  logged on `khive.boot`.
+- On a database without `sqlite_stat1`, an ID-filtered event read (including the events-split
+  store's check of each new audit batch against the legacy store) and the schedule
+  creator-provenance lookup now seek the primary key and `idx_schedule_creator_provenance`.
+  Before, both walked every event of the namespace in `created_at` order.
+- Volume-lease waiters acquire in FIFO order without changing deadline or re-entry errors.
+  File-backed kkernel test fixtures use private lock directories to avoid unrelated contention
+  (#5087).
+- `kkernel kg export` checks file sync and removes its own temporary after a write, sync or
+  rename failure. On Unix it publishes through shared atomic publication: it refuses an existing
+  temporary instead of replacing it, keeps the original filename bytes, creates the file with
+  mode 0666 under the umask and syncs the parent directory after the rename. Existing shared
+  staging policies keep mode 0644 and their behavior (#5068).
+- Named-vector and memory session exact search select equal-distance boundary hits by
+  subject UUID before limiting candidates, keeping their order stable across database reopen.
+
+- `kkernel kg init` now creates the canonical `.khive/config.toml` with valid engine settings,
+  preserves existing project configurations, and refuses the obsolete config path before writing
+  scaffolding. Only the exact old generated ignore file is migrated to the canonical filename.
+
+- Identifier splitting restores acronym boundaries in `DBUsers` and `APIUsage` while keeping
+  terminal plural suffixes in `APIs`, `IDs`, `URLs`, and `APIsFoo`. `URLsafe` now splits as
+  `ur`, `lsafe`; `XMLIsEmpty` follows the dictionary-free rule as `xmlis`, `empty` (#5103).
+- `comm.read` preserves typed storage errors from its initial message lookup, including
+  admission-timeout code, stage, and retry guidance. Bulk read and mark-read validation
+  retain the same error source without marking messages after a failed lookup. (#4958)
+- GTD status and priority refusals now mask credential-shaped values with the existing secret
+  masker. Plain invalid values, accepted-value hints, and error kinds remain unchanged.
+- `kg_name` and `IdentifierTokenizer` keep plural acronyms such as `APIs`, `IDs` and `URLs`
+  whole (a terminal lowercase `s` after an acronym), while still splitting acronym-to-word
+  boundaries such as `XMLParser`, `HTTPServer` and `XMLToJSON`.
+- Knowledge atom list, count, cursor, coverage, and search now share import/delete's exact
+  decoded domain-tag rule, preserving legacy malformed-tag handling. Near-marker atom tags
+  remain visible, and an additive migration rebuilds the cursor index without rewriting rows.
+- `git.push` accepts the optional boolean `force` validation field and refuses
+  `true` with `force_denied` before transport. False and omission retain ordinary
+  push behavior; null and non-boolean values return `invalid_params`.
+- Pack schema registration now checks table ownership in every statement of a schema entry,
+  refusing collisions before applying any DDL. Semicolons inside quoted names, strings, and
+  comments remain part of those tokens.
+- Pack-version regressions compare each linked pack with its factory's declared version and cover
+  independent factory versions through the production JSON and human list formatter (#5086).
+- Finding create/update and findings-file ingestion mask credential-shaped rejected enum values
+  while retaining ordinary values, error kinds, and accepted-value lists (Refs #4585).
+
+### Breaking (Rust crates)
+
+- Memory's `RecallFtsGatherMode` now re-exports the canonical storage `TextGatherMode` instead of
+  declaring a separate enum. Its public path, variant imports, `Copy` behavior, serialized config,
+  and search options remain supported; code depending on the old nominal type identity must adapt.
+
+- `khive-runtime` removes `RuntimeError::Sqlite`; concrete backend failures now use
+  `RuntimeError::Storage`, retaining typed driver sources and the existing capacity,
+  retry, and writer-settlement wire codes. Callers matching the removed variant
+  should inspect `StorageError` instead. Typed policy reasons now report `Storage`,
+  rendered backend messages use the storage envelope, and direct writer-checkout
+  failures carry `sql`/`runtime` capability/operation context instead of nulls.
+- `khive-runtime` accepts ordered peer `[[engines]]` entries with `name`, unit-default
+  `weight`, and checked `dims`. `EngineConfig` replaces `model`, `default`, and
+  `fusion_weight`; `RuntimeConfig` adds an authoritative optional peer list and
+  `KhiveConfig` records an explicit empty list. Legacy TOML is converted with its
+  former default first and canonical provider/index names preserved. Duplicate aliases,
+  storage-key collisions, mixed schemas, invalid dimensions, and weights that are not
+  applied by every retrieval path fail explicitly. Startup checks built-in provider
+  dimensions; custom provider binding remains unavailable pending its startup integration.
+  Direct struct literals and exhaustive `ConfigError` matches must be updated.
+  Use `disable_embedding_models()` to clear peers and legacy projections together.
+  Daemon reuse now requires the same ordered engine configuration.
+- `khive_db::diagnostics::ReaderContentionDiagnostics` adds `reader_discards`; direct struct
+  constructors and exhaustive destructurings must account for it. The `db_diagnostics` response
+  now exposes this cumulative pool counter beside `reader_replacement_open_failures`, including
+  successful reader recycling without changing pool behavior.
+- `khive-retrieval`'s `fuse_search_results`, `hybrid::fuse_labelled_scored`, and
+  `DualIndexRouter::merge_results` now return `Result<Vec<_>, khive_fusion::FuseError>`;
+  callers must handle or propagate failures. Invalid weighted-RRF parameters, source counts and
+  score overflow now propagate through memory recall instead of appearing as no results, including
+  empty candidate sets. The checked helper keeps its `RetrievalError` result type, and existing
+  unchecked `Weighted`/`Custom` fallback behavior is preserved.
+- `khive_storage::NoteFilter` adds `max_created_at`, `max_expires_at`,
+  `include_deleted`, `expiry_fallback` and `time_order`; exhaustive struct literals
+  must add them or use `..Default::default()`. `FilterOp` adds
+  `MissingNullOrSpaceEmptyText` and `TrueOrTextTrue`; exhaustive matches must handle
+  both. Typed expiry fallback and native timestamp ordering preserve complete
+  legacy cleanup predicates before LIMIT. The `created_before` / `expires_before` builders use
+  inclusive Unix-microsecond bounds, and `include_deleted` affects reads only.
+  Existing serialized filters retain live-only, unbounded defaults.
+  `AttachmentStore::delete_attachment_if` adds a conditional ID/role/substrate/ref
+  delete with an `Unsupported` default and an atomic SQLite implementation;
+  comm cleanup adoption remains separate.
+
+- `KhiveRuntime::list_embedding_models` now returns runtime-owned `EmbeddingModelRecord`
+  values with all twelve persisted registry fields. Rust callers use `dim` instead of
+  `dimensions` and the `EmbeddingModelStatus` enum instead of a status string. Status serde
+  values remain lowercase; `kkernel engine list/status` retain their seven-field JSON shape.
+  Invalid required fields, unknown statuses and invalid non-NULL optional dimensions/UUIDs
+  are skipped with a warning. Existing optional timestamp decoding still maps non-integers
+  to `None`; reads never fabricate missing identity or lifecycle history.
+- Symmetric-edge runtime updates now use the guarded `GraphStore` capability. Direct-fallback
+  backend failures carry `graph`/`update_edge` operation context, and blocking-task join failures
+  return `RuntimeError::Storage` instead of `Internal`; reasons and rendered prefixes on those paths
+  change. Concrete causes and writer-settlement distinctions are retained. Backends without the new
+  transaction method explicitly return `Unsupported`.
+- `khive_runtime::AtomicOpPlan` adds `FinalizeEntity` for runtime-owned entity admission.
+  Downstream exhaustive matches must handle the new variant. Its plan has no public constructor;
+  direct ingest uses `EntityCandidateContext` and `try_commit_manifest_entity_candidate`.
+- `khive-fusion` adds `WeightedRrf { k, weights }`, positive-weight validation, and weighted-RRF
+  fusion errors. This is source-breaking for consumers with exhaustive matches on
+  `FusionStrategy`, `FusionStrategyError`, or `FuseError`; update those matches to handle the new
+  rank-based strategy and its validation errors. Weighted RRF checks positive finite weights and
+  source-count alignment, preserves empty source slots, and errors when a fused score exceeds the
+  finite deterministic-score range.
+- Breaking Rust API change: `khive_types::RerankExecutedPayload::model_id` is now
+  optional, and the payload adds `reranker`, `query_id`, `tiers`, `ignored_weights`
+  and `unidentified_candidates`. Direct constructors and exhaustive destructurings
+  must account for those fields. Stored events without a discriminator still decode
+  as native reranks; weighted memory reranking does not invent a model identity.
+- `khive-storage` adds `StorageError::SqliteWrite` and `khive-db` adds
+  `SqliteError::{Write, WriteSettlementUnknown}`, carrying native SQLite write evidence
+  (`SqliteWriteFailure`: stage, primary and extended codes, settlement flag). Exhaustive matches
+  must handle the new variants, `SqliteWriteFailure` literals must include every field, and
+  `EventsResponse::Error` literals need the new optional `sqlite_write_failure` field. On the
+  wire, a native `BEGIN` refusal now reports `code`/`stage` `sqlite_begin_busy` instead of
+  `writer_task_begin_busy`, with retryability unchanged; without native evidence the code stays
+  `writer_task_begin_busy`. A definite native write failure reports its stage as `code` and
+  `stage`, with `sqlite_write_stage`, `sqlite_primary_code` and `sqlite_extended_code` beside it.
+
+## [0.11.0] - 2026-10-08
+
+### Changed
+
+- Breaking Rust API change: `khive_vamana::VisitedSet` (also `khive_vamana::graph::VisitedSet`) is
+  now a re-export of `khive_types::vector::VisitedSet`, the visited-node tracker shared with the
+  HNSW index. The path still resolves, but it names a different type than 0.10.0 did, so a consumer
+  that implemented a trait for the old type or depended on its crate identity adjusts to the shared
+  one.
+- Breaking Rust API change: `khive_storage::StorageError::WriterTaskTerminated` and
+  `khive_runtime::events_split::WireWriterTaskFailure::TaskTerminated` each gain a field,
+  `sqlite_full_codes: Option<(i32, i32)>`. Neither enum is `#[non_exhaustive]`, so a downstream
+  pattern that names either variant without `..`, and a literal that builds either variant, no
+  longer compiles. Add `..` to the pattern. Build the storage variant with the new
+  `StorageError::writer_task_terminated(request_state)`, which leaves the field `None`, or set the
+  field in the literal. On the events socket the field is omitted when it is `None` and defaults to
+  `None` when absent.
+- Breaking Rust API change: `khive_storage::entity::EntityFilter` gains `property_equalities` and
+  `tombstones`, and `khive_storage::event::EventFilter` gains `outcome` and `payload_equalities`.
+  Neither struct is `#[non_exhaustive]`, so an external struct literal that lists every field no
+  longer compiles; end it with `..Default::default()`. A serialized filter from 0.10.0 still
+  deserializes, and the new fields default to the earlier behavior: live rows only, with no outcome
+  or JSON restriction.
+- The `kkernel` git annotation repair preview now reads commit notes and project links for the
+  acknowledged SHAs in batches of up to 900 SHAs, where it ran two queries per SHA. The class
+  assigned to each SHA and the preview hash are preserved; 2,000 SHAs take six lookup reads.
+- Entity updates now distinguish an omitted `description` from an explicit `null`: omission
+  keeps the stored value, `null` clears it, and an empty string stays a concrete value. Before,
+  `description: null` was a no-op. Canonical and atomic updates also refuse a present `salience`
+  or `decay_factor`, `null` included, on an entity or edge target, where it used to be ignored;
+  the record is left unchanged and the refusal comes before any sibling field is applied.
+
+### Added
+
+- `khive_types::vector` adds explicit f32 byte codecs: `encode_f32_le` and `decode_f32_le` for
+  portable little-endian bytes, `encode_f32_native` and `decode_f32_native` for the host-order
+  layout that sqlite-vec stores, and `VectorCodecError`, which the decoders return when the input
+  is not a whole number of 4-byte values. `khive-storage` re-exports all five.
+  `VamanaIndex::to_bytes` now writes the vectors segment of its portable container as
+  little-endian on every target; the bytes are unchanged on little-endian hosts.
+- `khive_fs::fd_relative::FileIdentity` reports the device and inode of an open file
+  (`FileIdentity::of`) or of an entry under a held directory (`FileIdentity::at`, which identifies
+  a final symlink itself). Equality compares the objects seen by each call and does not guard
+  against later replacement or inode reuse. Unix only.
+- `khive_fs::fd_relative::unlink_at` removes a file or symlink entry under a held directory
+  without following it and refuses a directory. `rename_at` renames an entry between two held
+  directories with the kernel's ordinary replacement semantics. Neither syncs the directory. Unix
+  only.
+- `khive_fs::directory_walk::open_dir_nofollow` opens a directory read-only and refuses a symlink
+  as the final component. `khive_fs::opened_file::open_regular_file_nofollow` does the same for a
+  regular file, and refuses a FIFO or other non-regular file without waiting on it.
+  `directory_walk::read_link_at` is now public, returns a `PathBuf`, and reports a target that
+  fills the `PATH_MAX` buffer as `InvalidData`. Unix only.
+- `khive_fs::fd_relative::open_file_at` opens one writable entry, write-only or read-write, under
+  a borrowed directory descriptor. `OpenFileOptions` sets the creation policy through `Create`
+  (`No`, `IfMissing` or `Exclusive`), an optional non-blocking flag, and the creation mode, which
+  the umask filters. It always refuses a final symlink and the names `.` and `..`, sets
+  close-on-exec, and never truncates existing contents. Unix only.
+- Entity and event filters in `khive-storage` can match stored JSON and liveness.
+  `EntityFilter::property_eq` and `EventFilter::payload_eq` require SQL JSON equality on the
+  stored properties or payload for a `$.field[.subfield]` path, and the SQLite stores refuse any
+  other path as invalid input. `EventFilter::outcome` matches one event outcome.
+  `EntityFilter::include_tombstones` and `EntityFilter::tombstoned_only` select
+  `EntityTombstones::All` or `EntityTombstones::Only`; the default stays live rows. `khive-db`
+  adds `StorageBackend::list_namespaces(kind, NamespaceLiveness)`, which lists the sorted, distinct
+  namespaces that hold records of one exact kind across entities, notes and events.
+- `khive_storage::SqlStatement::new(sql, params)` builds a statement without a diagnostic label,
+  and `SqlStatement::labelled(label)` sets or replaces the label.
+- `khive_storage::SqlRow` adds typed accessors. `uuid` and `opt_uuid` read a native UUID or UUID
+  text. `f64` and `opt_f64` read a float or convert an integer. Each returns `SqlColumnError` for
+  an absent column, an invalid value or another SQL variant, and the `opt_` forms return `None`
+  for SQL NULL. `text_or_none` and `i64_or_none` return `None` for anything that is not text or an
+  integer.
+- `SqlReader::count(statement)` runs a count statement and returns its nonnegative integer scalar
+  as `u64`. A negative value, a missing row, NULL or a non-integer scalar returns
+  `StorageError::Internal`. It is a provided method, so existing `SqlReader` implementors need no
+  change.
+- `khive_db::env` is a new public module of environment readers. `env_parse_or` parses a variable
+  into any `FromStr` type and falls back to a default when the variable is missing, not Unicode or
+  unparseable. `env_flag` reads a trimmed, case-insensitive boolean (`1`, `true`, `yes`, `on` and
+  their opposites) with a default. `cached_env_flag` fixes a flag at its first read in a
+  caller-supplied `OnceLock`. The pool settings and the drain timeout read their environment
+  variables through it with the same parsing as before.
+
+### Fixed
+
+- `kkernel reindex` now walks entities and notes with a stable cursor instead of a numeric offset.
+  A record written during the run is visited once, and the pass continues after a record is
+  soft-deleted at a batch boundary.
+- When SQLite reports a full disk (`SQLITE_FULL`) and the failure ends an admitted write
+  transaction and retires the writer task, the error now carries `sqlite_disk_full` with the
+  primary and extended SQLite result codes. It still reports `request_state`
+  `side_effects_unknown`, `task_terminated: true` and `retryable: false`. Before, the same failure
+  reported a generic `writer_task_terminated` with no SQLite codes. A commit failure whose rollback
+  succeeds keeps its existing request-failed form.
+- Bulk `link` now validates every entry, including one that repeats an earlier entry's source,
+  target and relation. Before, such a repeat was counted as skipped without checking its weight,
+  metadata or endpoint rules. In the default atomic mode an invalid repeat now refuses the whole
+  batch. With `atomic=false` it is reported in `errors` and counted as failed, and an entry that
+  failed no longer reserves its key, so a later valid entry for the same edge, such as one with
+  `resurrect=true`, is applied.
+- `kkernel kg validate` exits with status 2 when the rules file is malformed TOML or uses the
+  unsupported YAML format (`.yaml` or `.yml`), as ADR-034 specifies. Before, both exited with
+  status 1, the same as a graph rule violation. An unreadable rules file and graph rule violations
+  keep status 1.
+- `exec.tree_put` now rejects an edit whose `delete` is not a boolean with
+  `edits[N].delete must be a boolean`, and publishes nothing. Before, any value other than `true`,
+  such as the string `"true"`, counted as not deleting. An omitted or `null` `delete` still means
+  no delete.
+- A task update that sets `due` together with both `due_timezone` and `timezone` now validates
+  both zone names, and a malformed one refuses the whole update. Before, a valid `due_timezone`
+  hid an invalid `timezone` and the update succeeded. When both are valid, `due_timezone` still
+  wins.
+- `knowledge.upsert_atoms` no longer treats an atom as a domain mirror because one of its tags
+  merely contains the text `type:domain`. Tags such as `type:domain-extra` or `prefix:type:domain`
+  now allow both the slug upsert and the properties-only update, while an exact `type:domain` tag
+  still refuses the update. Tag text that is not a JSON array of strings keeps the earlier
+  substring check.
+- Code source ingest (`code.ingest`) of a folder with no governing manifest, reached by a path
+  that ends in `..`, now names the project after the folder it resolves to. Before, the project
+  name came from the literal path text, so the same folder spelled `project/child/..` and
+  `project` recorded a different `source_project`. Both spellings now agree.
+- `schedule.schedule` now checks the `entity_kind` and `note_kind` of a scheduled singleton
+  `create` action by the rule `create` itself applies. An empty string, or a value that is neither
+  a string nor null, is refused with the same error `create` returns, even when the other kind is
+  the one being created. Before, a non-string value was ignored when the action was scheduled. The
+  refusal comes before any schedule is written.
+- `git.digest` now refuses a `project` argument that is not a string, with
+  `project must be a string when provided`, and writes nothing to the graph. Before, a non-string
+  value was ignored and the digest ran against an automatically resolved or created project
+  anchor. An omitted or `null` `project` still resolves the anchor automatically.
+- `comm.thread` now refuses an `after` cursor that resolves to a note which is not a message, with
+  the existing `does not resolve to a message` error. Before, any note id was accepted as a cursor.
+- Errors from opening the database backend now name it. A failure to create the database
+  directory, or to open the in-memory store, begins with `backend main:`.
+
+### Restored
+
+- The retrieval surfaces removed in 0.10.0 are back, unchanged from 0.9.x, as the base for
+  their integration work: `KhiveRuntime::hybrid_search_with_strategy`;
+  `khive_retrieval::hybrid::dual_index` (`DualIndexRouter`, `DualIndexConfig`,
+  `DualIndexStrategy`); `khive_retrieval::query_ir` (`QueryNode`, `FuseStrategy`,
+  `FilterPredicate`, `RerankMethod`); `khive_retrieval::metrics` (`MetricEvent`,
+  `MetricValue`, `MetricsSink`, `NoopSink`, `RecordingSink`); and the `persist` feature with
+  the `persist`, `replay` and `weights` modules (`RetrievalPersistence`, `PersistenceStats`,
+  `PersistError`, `ShadowValidationConfig`, `ShadowValidationResult`, `ShadowMetrics`). A
+  0.10.0 consumer that migrated away from any of these keeps working; the removal entries
+  below describe 0.10.0 only.
+
+## [0.10.0] - 2026-10-07
+
 ### Removed
 
 - Five public `khive-runtime` methods that returned only a vector or a record and so hid
@@ -21,6 +1888,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Breaking Rust API change: `khive-channel-node::ReceiptRejection` now aliases
+  `khive_channel::ReceiptRejectionReason`; local `PinUnavailable` and `SourceUnavailable`
+  failures use `ReceiptVerification::Unhandled(ReceiptReadFailure)` instead of rejection.
+  Poll/status callers must retain the receipt cursor for those read failures. Submission
+  pin or outbound-record read failures return transient transport errors; retain the
+  pending message and retry when local state is available.
+- Breaking Rust API change: `khive-channel::SendOutcome::RecipientStored` and
+  `RecipientQuarantined` now carry `VerifiedRecipientReceipt` instead of
+  `DeliveryReceipt`. Verify with the pinned recipient key through
+  `VerifiedRecipientReceipt::verify` and inspect the payload through `receipt()`.
+  `VerifiedRecipientReceipt` and `ReceiptVerificationError` move from
+  `khive_runtime::comm_transport` to `khive_channel`; update those imports.
 - Legacy write methods that previously returned `Ok(record)` when the embedder bounded their input
   now return an error that carries `committed=true`, the committed `record_id` and the serialized
   truncation report, with `retryable=false`. The stored record is complete, so reconcile by
@@ -48,6 +1927,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `[actor].mailbox_readers` and select that mailbox, or explicitly set
   `KHIVE_EMAIL_DEFAULT_ACTOR=local` to retain the previous routing. Correlated
   replies still route to the original sender.
+- `khive-retrieval` no longer compiles `khive-hnsw`, `khive-bm25` or `khive-db` by default. The
+  `khive-hnsw` and `khive-bm25` types it re-exports at the crate root (`HnswIndex`, `HnswConfig`,
+  `Bm25Index`, `Bm25Config` and the rest) are now behind the new `hnsw` and `bm25` features, so a
+  Rust consumer that uses them must enable the matching feature. `persist` implies both and
+  `checkpoint` implies `hnsw`, so those consumers need no change. `khive-db` is now a
+  dev-dependency only.
 
 ## [0.9.0] - 2026-09-27
 

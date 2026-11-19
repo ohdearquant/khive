@@ -8,10 +8,11 @@
 | `benches/fusion_bench.rs` | `fuse/weighted`      | input sizes 50 / 100 / 250 / 500                   | `fuse_search_results` with weighted strategy   |
 | `benches/fusion_bench.rs` | `fuse/union`         | input sizes 50 / 100 / 250 / 500                   | `fuse_search_results` with union strategy      |
 | `benches/fusion_bench.rs` | `fuse/three_sources` | input sizes 50 / 200 / 500                         | three-source RRF fusion                        |
-| `benches/fusion_bench.rs` | `hybrid_config`      | new / builder_rrf / builder_weighted               | `HybridConfig` construction and builder chains |
-| `benches/fusion_bench.rs` | `config/search`      | default / preset_vector_only / preset_keyword_only | `SearchConfig` construction                    |
-| `benches/fusion_bench.rs` | `policy`             | by_policy / by_predicate                           | policy filtering over 1000-item result sets    |
-| `benches/fusion_bench.rs` | `eval`               | compute_all_100 / compute_all_1000                 | retrieval eval metric computation              |
+| `benches/fusion_bench.rs` | `hybrid_config`      | new / builder_rrf / builder_weighted / normalized_weights | `HybridConfig` construction, builder chains and weight normalization |
+| `benches/fusion_bench.rs` | `search_config`      | default / vector_only / keyword_only / hybrid_balanced / candidate_pool_size | `SearchConfig` construction and candidate-pool lookup |
+| `benches/fusion_bench.rs` | `policy_filter`      | filter_by_policy_public / filter_by_policy_mixed / filter_by_predicate | policy/predicate filtering over 50 / 200 / 500 results |
+| `benches/fusion_bench.rs` | `eval_metrics`       | compute_all / recall_at_k_5 / ndcg_at_k_10 / mrr | eval metrics over 10 / 50 / 100 / 500 labeled results |
+| `benches/fusion_bench.rs` | `label_scoring`      | gain_all_variants / is_relevant_all_variants | `RetrievalLabel` gain/relevance across five variants |
 
 ## Run command
 
@@ -88,3 +89,115 @@ HTML reports are written to `target/criterion/`.
 - Noise floor: record machine load and CPU governor state when seeding baselines.
 
 Last reviewed: v0.2.8 (2026-06-08)
+
+## Persistence and lifecycle coverage
+
+The preceding release ledger is historical. The following suite adds generated workloads;
+its measurements and execution metadata are pending. Its timing guarantees are advisory
+trends, not the fixed-percentage rule in the historical regression notes.
+
+| Group             | Scenario names                                                                 | Timed work and input                                                                       | Baseline |
+| ----------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------ | -------- |
+| `materialization` | `limits_500`, `drop_counts_500`, `prefix_500`                                  | Validate limits; inspect precomputed drop counters; materialize all 500 candidates         | pending  |
+| `orchestration`   | `dual_index_2x500`, `two_stage_fusion_2x500_plus_text500`                      | Primary/legacy RRF; engine RRF followed by vector/text RRF, k=60 in each stage             | pending  |
+| `persistence`     | `bm25/new_save_load_500`, `hnsw/new_save_load_500`                             | Construct the persistence wrapper, serialize/save/load a 500-item index                    | pending  |
+| `persistence`     | `bm25/namespace_replace_save_load_500`, `hnsw/namespace_replace_save_load_500` | Replace a different 500-item snapshot in one namespace and reload it                       | pending  |
+| `persistence`     | `bm25/namespace_shadow_500`, `hnsw/namespace_shadow_500`                       | Save and fully sampled shadow load/validation of 500 items                                 | pending  |
+| `ann_registry`    | `register_raise_compact/100`, `register_raise_compact/500`                     | Execute register + activation for every consumer, then compact a 100/500-entry log         | pending  |
+| `ann_registry`    | `recover_raise_compact/100`, `recover_raise_compact/500`                       | Execute recovery fence + recovery-authorized raise for every active consumer, then compact | pending  |
+| `ann_registry`    | `compact_only/100`, `compact_only/500`                                         | Execute only compaction with all consumers already active at the midpoint                  | pending  |
+
+### Fixture and timing protocol
+
+In ordinary modes, these three targets construct runtimes and generated corpora only
+after Criterion selects a scene. `--list` and filters matching no scene do not build
+indexes, materialize results or open databases. Selected correctness runs still execute
+their full workload and checks; the limits-only scene needs no generated fixture.
+Selected scenes reuse their target's initialized inputs. Initialization remains outside
+recorded operation intervals. Profiling (`--bench --profile-time`, including the `=value`
+form) preserves eager initialization of the shared runtimes and generated corpora before
+each group, including for unmatched filters, so only that construction stays outside the
+external profiler's callback. Per-iteration fixtures still run inside it:
+`retrieval_persistence` builds a fresh store in every iteration (and saves the prior
+indexes for the replace and shadow scenes), and `retrieval_ann_registry` builds and seeds
+a memory backend in every iteration. That setup is outside the recorded interval but is
+sampled by the profiler. Criterion rejects
+`--list` combined with `--profile-time`; options after `--` are literal filter text.
+
+- HNSW uses 500 vectors of 384 dimensions, an LCG corpus seed of 42 and HNSW level seed 42,
+  fixed insertion order and deterministic IDs. BM25 indexes 500 generated documents. The
+  old/sentinel corpus uses seed 43 and disjoint IDs, also with 500 items. No files or models
+  are downloaded and no optional fixture is silently skipped.
+- Each persistence iteration creates one private WAL SQLite database with two readers and
+  a private volume-lock directory, using the existing test-support constructor. Opening,
+  migrations, starting the writer, generating indexes, prior/sentinel writes and checking
+  exact restored content are outside timing. `RetrievalPersistence::new` wraps an existing
+  SQL capability; its scenario does not measure database opening. Replacement verifies the
+  sentinel namespace and exactly one snapshot row per namespace/index kind.
+- Shadow validation uses `sample_rate=1`. An outer successful result alone is insufficient:
+  the benchmark also requires a present, passed validation, exact counts and no discrepancies.
+  The wrapper performs its load inside timing; an additional exact-content check is untimed.
+  No distinct shadow-index or namespace-rotation API exists: replacement is the measured operation.
+  Private generic persistence and validator helpers are reached through public wrappers.
+- All persistence owners and reader leases are dropped before taking/awaiting the writer task
+  exit and deleting the directory. Cleanup is untimed and failures are fatal. Iterations are
+  sequential, including Criterion warmup, with one working database at a time. One current-thread
+  Tokio runtime with at most two blocking threads is reused for each storage target.
+- ANN uses a fresh private in-memory database per iteration, with N log entries and N consumers
+  for N=100/500. Each consumer raises to N/2; exactly N/2 rows are deleted and the upper half
+  remains. Every mutation must affect its intended row. Recovery starts from active watermark 0.
+  Schema/log creation and recovery/compaction-only registration are untimed. The timed region
+  includes public statement construction, writer admission and SQL execution, not just SQL builders.
+  Compaction-only excludes register/raise. A forced memory write-queue override fails loudly;
+  run with `KHIVE_WRITE_QUEUE` unset or disabled. No durable pending-age retirement is measured.
+- Materialization has 500 unique ordered candidates, batch size 64, output limit 500 and
+  diagnostic cap 64. Missing every fifth row and filtering the next yields 300 accepted rows
+  and 100 drops of each reason. `count`/`total` are `DropCounts` methods, not limits methods:
+  the counter scene reads already-computed counters (total sums 32 slots), not 500 rows.
+- Dual-index fusion uses two ranked 500-item sources with 250 shared IDs, returning 500 unique
+  results. Two-stage fusion adds 500 text hits, preserves the full 1,000-ID union and has no
+  downstream truncation. It measures fusion, not model reranking. Vec cloning and output
+  identity/order checks are untimed; materialization and two-stage timings include `block_on`.
+- Small limits/counter scenes use Criterion's ordinary loop. Other scenes use sequential custom
+  loops summing individual operation intervals, with preparation, result checks/drop and cleanup
+  excluded. Criterion reports statistics over its samples; these are timing trends, not request
+  service-level percentiles. Persistence and registry groups use sample size 10 (quick mode may
+  choose its own sampling). No timing result is a correctness gate.
+
+### Execution and baseline metadata
+
+```sh
+cd crates
+cargo bench -p khive-retrieval --features persist,ann --benches -- --quick --noplot
+```
+
+`retrieval_lifecycle` uses default features. `retrieval_persistence` requires `persist` and
+`retrieval_ann_registry` requires `ann`; Cargo intentionally omits these optional targets
+without those features. The default-feature command alone cannot exercise the full suite.
+Existing `fusion_bench` remains registered and unchanged. Workflow wiring is handled separately.
+
+| Metadata                | New suite                            |
+| ----------------------- | ------------------------------------ |
+| Measured commit         | pending                              |
+| Toolchain/profile       | pending / Criterion release          |
+| Machine, OS, load       | pending                              |
+| Feature flags           | `persist,ann`                        |
+| Median timing baselines | pending                              |
+| Comparison references   | pending rolling and fixed references |
+
+## Performance guarantees
+
+| Operation                        | Input                     | Metric         | Bound                                        |
+| -------------------------------- | ------------------------- | -------------- | -------------------------------------------- |
+| `fuse_search_results`            | 2 sources × 500, RRF k=60 | median latency | Advisory trend against the recorded baseline |
+| `filter_by_policy`               | 500 results               | median latency | Advisory trend against the recorded baseline |
+| `RetrievalPersistence` save+load | 500-item snapshot         | median latency | Advisory trend against the recorded baseline |
+| `pathless_compact_log`           | 500 entries               | median latency | Advisory trend against the recorded baseline |
+| `dual_index` fusion              | 2 sources × 500           | median latency | Advisory trend against the recorded baseline |
+
+These timing rows are advisory trends against recorded rolling and fixed references. Historical
+values are observations, not promises. The existing fusion/policy scenes supply the first two
+rows; `persistence/*/new_save_load_500`, `ann_registry/compact_only/500` and
+`orchestration/dual_index_2x500` supply the remaining rows. No new deterministic allocation,
+count or quality guarantee is introduced. The benchmark assertions establish valid fixtures;
+ordinary correctness tests and any future guarantee checks remain separate.

@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::brain_signal::{entity_signal, is_recall_positive, BrainSignal};
+use crate::brain_signal::{is_recall_positive, BrainSignal};
 use crate::posterior::{BetaPosterior, EntityPosteriors};
 use crate::signal::{FeedbackEventKind, FeedbackSignal};
 
@@ -81,6 +81,14 @@ pub struct ProfileRecord {
     /// `reset_epoch` is a versioned output-shape change deferred to the
     /// posterior-serving lane (ADR-104 follow-up).
     pub exploration_epoch: u64,
+    /// Fixed multiplier a recall served by this profile applies to the rank
+    /// score of every candidate in the shared pool (namespace `local`); all
+    /// other candidates are multiplied by 1. A finite number in `[0.5, 1]`,
+    /// stored as given and converted to `f32` when applied. It is set only
+    /// when the profile is created and no operation edits it. `None` (a
+    /// record written without the field) means no factor, equivalent to 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_factor: Option<f64>,
 }
 
 impl ProfileRecord {
@@ -97,6 +105,7 @@ impl ProfileRecord {
             state_snapshot: serde_json::to_value(snapshot).ok(),
             total_events: 0,
             exploration_epoch: 0,
+            local_factor: None,
         }
     }
 }
@@ -234,6 +243,10 @@ impl BalancedRecallState {
 
     /// Apply a brain signal to update posteriors in place.
     /// This is the core profile update logic — pure, deterministic, no IO.
+    ///
+    /// Per-entity posteriors move only through `apply_feedback_posteriors`, that
+    /// is, only for judgment-bearing signals. Recall hits and note accesses never
+    /// touch the entity map.
     pub fn apply_signal(&mut self, signal: &BrainSignal) {
         self.total_events += 1;
 
@@ -246,40 +259,7 @@ impl BalancedRecallState {
             }
         }
 
-        // Salience posterior — driven by explicit feedback signal
-        if let BrainSignal::Feedback { signal: ref fb, .. } = signal {
-            match fb {
-                FeedbackSignal::Useful => self.salience.update_success(),
-                FeedbackSignal::NotUseful | FeedbackSignal::Wrong => self.salience.update_failure(),
-            }
-        }
-
-        // Semantic feedback: weighted posterior updates.
-        //
-        // ADR-081 §2: `effective_weight` can be `0.0` when the fold gate clamps
-        // an over-cap implicit event. `update_*_weighted` requires a strictly
-        // positive weight (it asserts), so a zero-weight event still counts
-        // toward `total_events` (above) — it happened and was folded — but
-        // contributes no posterior movement at all, matching "folded at zero
-        // weight" literally rather than passing 0 into the weighted update.
-        if let BrainSignal::SemanticFeedback {
-            event_kind: ref ek,
-            effective_weight,
-            ..
-        } = signal
-        {
-            let w = *effective_weight;
-            if w > 0.0 {
-                if ek.is_positive() {
-                    self.salience.update_success_weighted(w);
-                } else {
-                    self.salience.update_failure_weighted(w);
-                }
-                if *ek == FeedbackEventKind::Correction {
-                    self.relevance.update_failure_weighted(w);
-                }
-            }
-        }
+        self.apply_feedback_posteriors(signal);
 
         // Temporal posterior — driven by recall latency
         const FAST_US: i64 = 50_000;
@@ -294,35 +274,55 @@ impl BalancedRecallState {
             BrainSignal::RecallMiss => self.temporal.update_failure(),
             _ => {}
         }
+    }
 
-        // Per-entity posterior updates
-        if let BrainSignal::SemanticFeedback {
-            target_id: eid,
-            event_kind: ref ek,
-            effective_weight,
-            ..
-        } = signal
-        {
-            let w = *effective_weight;
-            if w > 0.0 {
+    /// Update feedback posteriors without changing counters or exploration state.
+    /// Non-feedback signals and nonpositive semantic weights leave them untouched.
+    pub fn apply_feedback_posteriors(&mut self, signal: &BrainSignal) {
+        match signal {
+            BrainSignal::Feedback {
+                target_id, signal, ..
+            } => {
+                let positive = matches!(signal, FeedbackSignal::Useful);
+                if positive {
+                    self.salience.update_success();
+                } else {
+                    self.salience.update_failure();
+                }
                 let posterior = self
                     .entity_posteriors
-                    .get_or_insert(*eid, || BetaPosterior::new(1.0, 1.0));
-                if ek.is_positive() {
-                    posterior.update_success_weighted(w);
+                    .get_or_insert(*target_id, || BetaPosterior::new(1.0, 1.0));
+                if positive {
+                    posterior.update_success();
                 } else {
-                    posterior.update_failure_weighted(w);
+                    posterior.update_failure();
                 }
             }
-        } else if let Some((entity_id, positive)) = entity_signal(signal) {
-            let posterior = self
-                .entity_posteriors
-                .get_or_insert(entity_id, || BetaPosterior::new(1.0, 1.0));
-            if positive {
-                posterior.update_success();
-            } else {
-                posterior.update_failure();
+            BrainSignal::SemanticFeedback {
+                target_id,
+                event_kind,
+                effective_weight,
+                ..
+            } if *effective_weight > 0.0 => {
+                let weight = *effective_weight;
+                if event_kind.is_positive() {
+                    self.salience.update_success_weighted(weight);
+                } else {
+                    self.salience.update_failure_weighted(weight);
+                }
+                if *event_kind == FeedbackEventKind::Correction {
+                    self.relevance.update_failure_weighted(weight);
+                }
+                let posterior = self
+                    .entity_posteriors
+                    .get_or_insert(*target_id, || BetaPosterior::new(1.0, 1.0));
+                if event_kind.is_positive() {
+                    posterior.update_success_weighted(weight);
+                } else {
+                    posterior.update_failure_weighted(weight);
+                }
             }
+            _ => {}
         }
     }
 }
@@ -348,139 +348,5 @@ pub struct BalancedRecallSnapshot {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// ADR-058 amendment (#542): each variant's wire string is exact and stable.
-    #[test]
-    fn consumer_kind_as_str_matches_wire_vocabulary() {
-        assert_eq!(ConsumerKind::Recall.as_str(), "recall");
-        assert_eq!(ConsumerKind::KnowledgeCompose.as_str(), "knowledge_compose");
-        assert_eq!(ConsumerKind::Rerank.as_str(), "rerank");
-    }
-
-    /// ADR-058 amendment (#542): `as_str()` and `FromStr` round-trip for every variant.
-    #[test]
-    fn consumer_kind_from_str_round_trips() {
-        for kind in [
-            ConsumerKind::Recall,
-            ConsumerKind::KnowledgeCompose,
-            ConsumerKind::Rerank,
-        ] {
-            assert_eq!(kind.as_str().parse::<ConsumerKind>().unwrap(), kind);
-        }
-    }
-
-    #[test]
-    fn consumer_kind_from_str_rejects_unknown() {
-        assert!("bogus".parse::<ConsumerKind>().is_err());
-    }
-
-    /// ADR-048 Phase-1 gate: profile save/load round-trip must produce identical
-    /// posteriors (snapshot == restored state).
-    #[test]
-    fn adr048_snapshot_roundtrip_equality() {
-        let mut state = BalancedRecallState::new(100);
-        let id = Uuid::new_v4();
-        for _ in 0..50 {
-            state.apply_signal(&crate::brain_signal::BrainSignal::RecallHit {
-                target_id: id,
-                latency_us: 10_000,
-                served_by_profile_id: None,
-                serve_attribution: crate::brain_signal::ServeAttribution::Unspecified,
-            });
-        }
-        let snap = state.to_snapshot();
-        let restored = BalancedRecallState::from_snapshot(snap.clone(), 100);
-        let restored_snap = restored.to_snapshot();
-
-        // Full structural equality — covers every field including entity_posteriors.
-        // If any field (including a newly-added one) is not preserved by the
-        // round-trip, this assertion will catch it.
-        assert_eq!(
-            snap, restored_snap,
-            "ADR-048 Phase-1: snapshot != restored state"
-        );
-    }
-
-    /// ADR-048 Phase-1 gate: ESS cap convergence must shift the mean by ≥0.3.
-    /// See crates/khive-brain-core/docs/testing-strategy.md#profilersadr048_ess_cap_mean_shift_ge_0_3-adr-048-phase-1-gate
-    #[test]
-    fn adr048_ess_cap_mean_shift_ge_0_3() {
-        let mut state = BalancedRecallState::new(200);
-        let id = Uuid::new_v4();
-
-        for _ in 0..200 {
-            state.apply_signal(&BrainSignal::Feedback {
-                target_id: id,
-                signal: FeedbackSignal::Useful,
-                served_by_profile_id: None,
-                section_signals: None,
-            });
-        }
-        let mean_after_positive = state.salience.mean();
-
-        for _ in 0..200 {
-            state.apply_signal(&BrainSignal::Feedback {
-                target_id: id,
-                signal: FeedbackSignal::NotUseful,
-                served_by_profile_id: None,
-                section_signals: None,
-            });
-        }
-        let mean_after_opposing = state.salience.mean();
-
-        let shift = (mean_after_positive - mean_after_opposing).abs();
-        assert!(
-            shift >= 0.3,
-            "ESS cap convergence: mean shift {shift:.4} < 0.3 (positive={mean_after_positive:.4}, opposing={mean_after_opposing:.4})"
-        );
-    }
-
-    /// BRAINCORE-AUD-001: legacy (version 0) oversized restore is bounded.
-    /// See crates/khive-brain-core/docs/testing-strategy.md#profilerslegacy_entity_posteriors_restore_uses_deterministic_order_and_capacity-braincore-aud-001
-    #[test]
-    fn legacy_entity_posteriors_restore_uses_deterministic_order_and_capacity() {
-        let capacity = 2;
-        let mut ids = vec![
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-        ];
-        ids.sort();
-
-        let mut entity_posteriors = HashMap::new();
-        for id in &ids {
-            entity_posteriors.insert(*id, BetaPosterior::default());
-        }
-
-        let legacy = BalancedRecallSnapshot {
-            relevance: BetaPosterior::default(),
-            salience: BetaPosterior::default(),
-            temporal: BetaPosterior::default(),
-            entity_posteriors,
-            entity_posteriors_version: 0,
-            entity_posterior_order: Vec::new(),
-            total_events: 0,
-            exploration_epoch: 0,
-        };
-
-        let restored = BalancedRecallState::from_snapshot(legacy, capacity);
-
-        assert_eq!(restored.entity_posteriors.len(), capacity);
-        assert_eq!(restored.entity_posteriors.order(), ids[..capacity].to_vec());
-        for id in ids.iter().take(capacity) {
-            assert!(
-                restored.entity_posteriors.get(id).is_some(),
-                "deterministic sort prefix id {id} must be retained"
-            );
-        }
-        for id in ids.iter().skip(capacity) {
-            assert!(
-                restored.entity_posteriors.get(id).is_none(),
-                "id {id} beyond the deterministic sort prefix must be dropped"
-            );
-        }
-    }
-}
+#[path = "profile_tests.rs"]
+mod tests;

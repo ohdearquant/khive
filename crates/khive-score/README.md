@@ -5,6 +5,12 @@ Deterministic fixed-point scoring: `f64` relevance scores are converted to a
 fusion give bit-identical results across platforms. Also provides sum/avg/min/max
 aggregation, weighted sum, distance-to-score conversion, and ID-tiebreak comparators.
 
+Checked scalar helpers cover unit-interval parsing, terminal bounded boosts,
+time decay, scaled weight normalization, keyed weighted means, and min–max bands.
+They are pure arithmetic: callers choose time units, score domains, configuration
+defaults and filtering. Float results do not have the fixed-point API's
+cross-platform bit-reproducibility guarantee.
+
 ## Usage
 
 ```rust
@@ -42,6 +48,48 @@ hits.sort_by(|(sa, ia), (sb, ib)| cmp_desc_then_id(*sa, ia, *sb, ib));
   first, lower ID breaks ties). Its `Ord` impl is not a plain ascending sort
   order — use `cmp_desc_then_id` / `cmp_asc_then_id` when calling `sort()`
   directly on a `Vec`.
+
+## Checked scalar arithmetic
+
+`UnitScore::try_new` accepts finite values in `[0,1]`, while
+`from_fraction_or_percent` accepts `[0,100]`: `1` means a fraction of one,
+and values above one are percentages. `clamp01` clamps finite inputs but
+rejects NaN and infinity. `UnitScore::boost` clamps once, after evaluating
+the complete multiplication; it is a terminal operation, so inserting it
+inside a longer adjustment chain can change the result.
+
+`boost_factor` and `affine_clamped` return raw `f64` values that can exceed
+one or be negative. Their `_f32` variants retain `f32` arithmetic. Invalid
+inputs and nonfinite intermediates return `ArithmeticError`; the helpers
+do not substitute a default or clamp overflow into a valid score.
+
+`HalfLife` accepts every finite positive duration, including subnormals.
+`Decay` supports exponential, hyperbolic, rational power-law and identity
+forms. Rate and half-life constructors retain distinct evaluation forms.
+Elapsed time must use the same unit as the parameters; finite nonpositive
+time returns the input unchanged. Invalid time still refuses for identity
+and zero-value inputs. Scalar application accepts nonunit masses and signed
+values. Power-law application retains the ordered `value*h/(h+t)`
+expression when its intermediates are finite, including its rounding and
+underflow; multiplying by the separately exposed factor is not bit-equivalent.
+
+`ValidatedWeights` preserves a nonempty ordered sequence of finite
+nonnegative weights with positive support. Normalization scales by the
+largest weight before summing, so equal maximum or subnormal weights remain
+usable. `NamedWeights` also permits empty and all-zero maps. Its weighted
+mean uses the caller's unique feature order, ignores unknown configured
+keys and zero-weight features, and rejects active nonfinite features.
+It returns raw signed values rather than a unit score.
+
+`min_max_band` and `min_max_band_f32` retain input order and precision,
+with explicit span tolerance and a `DegenerateSpan` policy. `Ceiling`
+returns the upper bound, `UpperEndpoint` evaluates the separately rounded
+`floor + (ceiling - floor)`, and `ClampMaximum` clamps the observed maximum.
+Filters and signal-strength factors belong to callers. The separate
+`min_max_band_fixed` uses integer arithmetic for `[0,1]` normalization;
+equal inputs map to one without a float round trip.
+
+Existing fixed-point operations and callers retain their original behavior.
 
 ## Where this sits
 

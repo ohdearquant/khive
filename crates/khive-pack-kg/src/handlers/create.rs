@@ -3,6 +3,7 @@
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+use khive_runtime::operations::dependency_kind_inference_hint;
 use khive_runtime::{
     run_atomic_unit, runtime_error_value, AtomicOpPlan, AtomicRunOutcome, DomainDisposition,
     EntityCreateSpec, KhiveRuntime, KindHook, NamespaceToken, NoteCreateSpec, RuntimeError,
@@ -38,7 +39,11 @@ fn required_singleton_kind(params: &Value) -> Result<String, RuntimeError> {
         None => Err(RuntimeError::InvalidInput("create requires 'kind'".into())),
         Some(Value::String(kind)) => Ok(kind.clone()),
         Some(value) => Err(RuntimeError::InvalidInput(format!(
-            "create: `kind` must be a string; got {value}"
+            "create: `kind` must be a string; got {}",
+            khive_runtime::secret_gate::mask_for_redaction_surface(
+                khive_runtime::secret_gate::RedactionSurface::GateProbe,
+                &value.to_string(),
+            )
         ))),
     }
 }
@@ -54,7 +59,11 @@ fn optional_singleton_kind_alias(
         )),
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(value) => Err(RuntimeError::InvalidInput(format!(
-            "create: `{field}` must be a string or null; got {value}"
+            "create: `{field}` must be a string or null; got {}",
+            khive_runtime::secret_gate::mask_for_redaction_surface(
+                khive_runtime::secret_gate::RedactionSurface::GateProbe,
+                &value.to_string(),
+            )
         ))),
     }
 }
@@ -851,7 +860,11 @@ impl KgPack {
                 Value::Array(items) => items.clone(),
                 other => {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "create: `items` must be an array; got {other}"
+                        "create: `items` must be an array; got {}",
+                        khive_runtime::secret_gate::mask_for_redaction_surface(
+                            khive_runtime::secret_gate::RedactionSurface::GateProbe,
+                            &other.to_string(),
+                        )
                     )));
                 }
             };
@@ -866,7 +879,11 @@ impl KgPack {
                 Some(Value::Bool(b)) => *b,
                 Some(other) => {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "create: `atomic` must be a boolean; got {other}"
+                        "create: `atomic` must be a boolean; got {}",
+                        khive_runtime::secret_gate::mask_for_redaction_surface(
+                            khive_runtime::secret_gate::RedactionSurface::GateProbe,
+                            &other.to_string(),
+                        )
                     )));
                 }
             };
@@ -875,7 +892,11 @@ impl KgPack {
                 Some(Value::Bool(b)) => *b,
                 Some(other) => {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "create: `verbose` must be a boolean; got {other}"
+                        "create: `verbose` must be a boolean; got {}",
+                        khive_runtime::secret_gate::mask_for_redaction_surface(
+                            khive_runtime::secret_gate::RedactionSurface::GateProbe,
+                            &other.to_string(),
+                        )
                     )));
                 }
             };
@@ -992,6 +1013,14 @@ impl KgPack {
         // unknown fields, so this validates the shared subset without
         // precluding pack-specific input.
         let mut fields: CreateParams = deser(params.clone())?;
+        // Keep malformed shared-field errors at the existing typed boundary,
+        // then refuse a note-only field before hooks or any entity write.
+        // The bulk path has already returned above.
+        if matches!(&spec, KindSpec::Entity { .. }) && params.get("content").is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "create: `content` is a note-only field; use `description` for an entity".into(),
+            ));
+        }
         let required_entity_type = match &spec {
             KindSpec::Entity { entity_type, .. } => entity_type.as_deref(),
             _ => None,
@@ -1326,7 +1355,16 @@ impl KgPack {
                         .await
                     {
                         Ok(edge) => match to_json(&edge) {
-                            Ok(v) => edge_results.push(v),
+                            Ok(mut value) => {
+                                if let Some(hint) = dependency_kind_inference_hint(
+                                    relation,
+                                    None,
+                                    edge.metadata.as_ref(),
+                                ) {
+                                    value["hint"] = json!(hint);
+                                }
+                                edge_results.push(value);
+                            }
                             Err(e) => edge_errors.push(json!({
                                 "index": idx,
                                 "error": format!("serialize: {e}"),

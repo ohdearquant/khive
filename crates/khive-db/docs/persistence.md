@@ -6,15 +6,15 @@ the concrete persistence for all data substrates.
 
 ## What it stores
 
-| Substrate | Table         | Store module        | Capability trait |
-| --------- | ------------- | ------------------- | ---------------- |
-| Entities  | `entities`    | `stores/entity.rs`  | `EntityStore`    |
-| Notes     | `notes`       | `stores/note.rs`    | `NoteStore`      |
-| Edges     | `graph_edges` | `stores/graph.rs`   | `GraphStore`     |
-| Events    | `events`      | `stores/event.rs`   | `EventStore`     |
-| Vectors   | vec0 virtual  | `stores/vectors.rs` | `VectorStore`    |
-| FTS index | FTS5 virtual  | `stores/text.rs`    | `TextSearch`     |
-| Sparse    | --            | `stores/sparse.rs`  | `SparseStore`    |
+| Substrate | Table         | Store module                 | Capability trait |
+| --------- | ------------- | ---------------------------- | ---------------- |
+| Entities  | `entities`    | `stores/entity.rs`           | `EntityStore`    |
+| Notes     | `notes`       | `stores/note.rs`             | `NoteStore`      |
+| Edges     | `graph_edges` | `stores/graph/store_impl.rs` | `GraphStore`     |
+| Events    | `events`      | `stores/event.rs`            | `EventStore`     |
+| Vectors   | vec0 virtual  | `stores/vectors.rs`          | `VectorStore`    |
+| FTS index | FTS5 virtual  | `stores/text.rs`             | `TextSearch`     |
+| Sparse    | --            | `stores/sparse.rs`           | `SparseStore`    |
 
 ## StorageBackend
 

@@ -119,6 +119,10 @@ impl Fixture {
             .env_clear()
             .env("HOME", self.home.path())
             .env("TMPDIR", self.home.path())
+            .env(
+                "KHIVE_VOLUME_LOCK_DIR",
+                self.home.path().join("volume-locks"),
+            )
             .env("KHIVE_NO_DAEMON", "1")
             .env("KHIVE_SOCKET", self.home.path().join("unused.sock"))
             .env("KHIVE_PACKS", "kg,gtd")

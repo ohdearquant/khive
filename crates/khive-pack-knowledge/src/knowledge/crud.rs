@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{
     micros_to_iso, uuid_prefix_bounds, KhiveRuntime, NamespaceToken, RuntimeError,
 };
@@ -18,8 +19,8 @@ use super::search::HYDRATION_ID_CHUNK;
 use super::sections::{section_from_row, section_to_json};
 use super::util::{
     atom_from_row, atom_to_json, compute_embedding_coverage, deser, domain_from_row,
-    domain_to_json, new_id, now_us, row_i64, row_str, sql_err, status_sql_clause, status_values,
-    tags_to_json, validate_atom_content,
+    domain_to_json, has_domain_mirror_tag, new_id, now_us, row_i64, row_str, sql_err,
+    status_sql_clause, status_values, tags_to_json, validate_atom_content,
 };
 use super::KnowledgeHandlers;
 
@@ -67,11 +68,7 @@ fn invalidate_section_vectors_for_atom_rename(
     now: i64,
 ) -> SqlStatement {
     SqlStatement {
-        sql: "UPDATE knowledge_sections SET embedding=NULL, updated_at=?1 \
-              WHERE atom_id=?2 AND namespace=?3 AND embedding IS NOT NULL \
-              AND EXISTS (SELECT 1 FROM knowledge_atoms a \
-                          WHERE a.id=?2 AND a.namespace=?3 AND a.name<>?4)"
-            .into(),
+        sql: khive_runtime::sql!("knowledge_sections_invalidate_atom_rename").into(),
         params: vec![
             SqlValue::Integer(now),
             SqlValue::Text(id.to_string()),
@@ -109,10 +106,16 @@ fn parse_list_after(raw: &str) -> Result<Option<Uuid>, RuntimeError> {
         return Ok(None);
     }
     Uuid::parse_str(raw).map(Some).map_err(|error| {
-        RuntimeError::InvalidInput(format!(
-            "knowledge.list: `after` must be a full UUID returned as `next_after`; \
-             prefixes are unsafe for keyset pagination; got {raw:?}: {error}"
-        ))
+        RuntimeError::InvalidInput(
+            mask_for_redaction_surface(
+                RedactionSurface::GateProbe,
+                &format!(
+                    "knowledge.list: `after` must be a full UUID returned as `next_after`; \
+                     prefixes are unsafe for keyset pagination; got {raw:?}: {error}"
+                ),
+            )
+            .into_owned(),
+        )
     })
 }
 
@@ -132,11 +135,17 @@ fn validate_list_fields(
         .iter()
         .find(|field| !kind.projection_fields().contains(&field.as_str()))
     {
-        return Err(RuntimeError::InvalidInput(format!(
-            "knowledge.list: unknown {} projection field {unknown:?}; expected one of: {}",
-            kind.name(),
-            kind.projection_fields().join(", ")
-        )));
+        return Err(RuntimeError::InvalidInput(
+            mask_for_redaction_surface(
+                RedactionSurface::GateProbe,
+                &format!(
+                    "knowledge.list: unknown {} projection field {unknown:?}; expected one of: {}",
+                    kind.name(),
+                    kind.projection_fields().join(", ")
+                ),
+            )
+            .into_owned(),
+        ));
     }
     Ok(())
 }
@@ -220,13 +229,7 @@ fn knowledge_get_prefix_statement(prefix: &str) -> Option<SqlStatement> {
         // A domain's FTS mirror atom has the same UUID. UNION (rather than
         // UNION ALL) deduplicates that legitimate cross-table duplicate so
         // one domain is not reported as an ambiguous prefix.
-        sql: "SELECT id FROM knowledge_domains \
-              WHERE id >= ?1 AND id < ?2 AND deleted_at IS NULL \
-              UNION \
-              SELECT id FROM knowledge_atoms \
-              WHERE id >= ?1 AND id < ?2 AND deleted_at IS NULL \
-              ORDER BY id LIMIT 2"
-            .into(),
+        sql: khive_runtime::sql!("knowledge_get_prefix").into(),
         params: vec![SqlValue::Text(lower), SqlValue::Text(upper)],
         label: Some("knowledge.get.resolve_prefix".into()),
     })
@@ -350,106 +353,217 @@ impl KnowledgeHandlers {
         params: Value,
         preserve_content_whitespace: bool,
     ) -> Result<Value, RuntimeError> {
-        let p: UpsertAtomsParams = deser(params)?;
-        if p.chunk_size.is_some() {
-            tracing::warn!(
-                chunk_size = ?p.chunk_size,
-                "upsert_atoms: chunk_size is accepted but not yet implemented; \
-                 server-side chunking is not performed"
-            );
-        }
-        if p.atoms.is_empty() {
-            return Err(RuntimeError::InvalidInput(
-                "atoms list must not be empty".into(),
-            ));
-        }
-        if p.atoms.len() > 5000 {
-            return Err(RuntimeError::InvalidInput(
-                "max 5000 atoms per request".into(),
-            ));
-        }
+        Self::upsert_atoms_with_sql(
+            runtime,
+            token,
+            params,
+            preserve_content_whitespace,
+            runtime.sql(),
+        )
+        .await
+    }
 
-        if p.dry_run {
+    async fn upsert_atoms_with_sql(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        params: Value,
+        preserve_content_whitespace: bool,
+        sql: std::sync::Arc<dyn khive_storage::SqlAccess>,
+    ) -> Result<Value, RuntimeError> {
+        use khive_runtime::error::{BatchAdmissionReport, BatchRefusal};
+        let prewrite = |error: RuntimeError| {
+            if preserve_content_whitespace {
+                error
+            } else {
+                error.before_requested_write()
+            }
+        };
+        let mut failures = Vec::new();
+        let mut refusals = Vec::new();
+        let (atoms, dry_run, chunk_size): (Vec<Option<AtomWrite>>, bool, Option<usize>) =
+            if preserve_content_whitespace {
+                let p: UpsertAtomsParams = deser(params)?;
+                failures.resize_with(p.atoms.len(), || None);
+                refusals.resize_with(p.atoms.len(), || None);
+                (
+                    p.atoms.into_iter().map(Some).collect(),
+                    p.dry_run,
+                    p.chunk_size,
+                )
+            } else {
+                let p: super::schema::UpsertAtomsAdmissionParams =
+                    deser(params).map_err(prewrite)?;
+                let atoms = p
+                    .atoms
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, value)| match deser::<AtomWrite>(value) {
+                        Ok(atom) => {
+                            failures.push(None);
+                            refusals.push(None);
+                            Some(atom)
+                        }
+                        Err(error) => {
+                            refusals.push(Some(BatchRefusal {
+                                index,
+                                field: "item",
+                                reason: "invalid_input",
+                            }));
+                            failures.push(Some(error));
+                            None
+                        }
+                    })
+                    .collect();
+                (atoms, p.dry_run, p.chunk_size)
+            };
+        if chunk_size.is_some() {
+            tracing::warn!(?chunk_size, "upsert_atoms: chunk_size is accepted but not yet implemented; server-side chunking is not performed");
+        }
+        if atoms.is_empty() {
+            return Err(prewrite(RuntimeError::InvalidInput(
+                "atoms list must not be empty".into(),
+            )));
+        }
+        if atoms.len() > 5000 {
+            return Err(prewrite(RuntimeError::InvalidInput(
+                "max 5000 atoms per request".into(),
+            )));
+        }
+        if dry_run {
+            if let Some(error) = failures.into_iter().flatten().next() {
+                return Err(prewrite(error));
+            }
+            let atoms: Vec<_> = atoms.into_iter().flatten().collect();
             return super::atom_validation::dry_run(
                 runtime,
                 token,
-                &p.atoms,
+                &atoms,
                 preserve_content_whitespace,
             )
             .await;
         }
-
-        let ns = token.namespace().as_str().to_owned();
-        let sql = runtime.sql();
-        let now = now_us();
-
-        let failures: Vec<_> = p
-            .atoms
-            .iter()
-            .enumerate()
-            .map(|(index, atom)| {
-                super::refusal::validate_submission(atom, index, preserve_content_whitespace).err()
-            })
-            .collect();
-        if failures.iter().any(Option::is_some) {
-            return Err(super::refusal::refuse_batch(
-                runtime,
-                token,
-                &p.atoms,
-                failures,
+        for (index, atom) in atoms.iter().enumerate() {
+            let Some(atom) = atom else {
+                continue;
+            };
+            if let Err(failure) = super::refusal::validate_submission_located(
+                atom,
+                index,
                 preserve_content_whitespace,
-            )
-            .await);
+            ) {
+                let reason = match failure.source.refusal_source() {
+                    RuntimeError::SecretDetected(_) => "secret_detected",
+                    _ => "invalid_input",
+                };
+                refusals[index] = Some(BatchRefusal {
+                    index,
+                    field: failure.field,
+                    reason,
+                });
+                failures[index] = Some(failure.source);
+            }
         }
-
-        let mut reader = sql
-            .reader()
-            .await
-            .map_err(|e| sql_err("upsert_atoms reader", e))?;
+        if preserve_content_whitespace && failures.iter().any(Option::is_some) {
+            return Err(super::refusal::refuse_batch(runtime, token, &atoms, failures, true).await);
+        }
+        let ns = token.namespace().as_str().to_owned();
+        let now = now_us();
         let mut ids_by_slug: HashMap<String, String> = HashMap::new();
-        let mut operations = Vec::with_capacity(p.atoms.len());
-        let mut failed_index = 0;
-        let preparation: Result<(), RuntimeError> = async {
-            for (index, atom_in) in p.atoms.iter().enumerate() {
-                failed_index = index;
-                if let AtomWrite::Upsert(input) = atom_in {
+        let mut operations = vec![None; atoms.len()];
+        let mut checked: Vec<bool> = failures.iter().map(Option::is_some).collect();
+        let report = |checked: &[bool], refusals: &[Option<BatchRefusal>]| BatchAdmissionReport {
+            refused: refusals.iter().flatten().cloned().collect(),
+            validation_complete: checked.iter().all(|checked| *checked),
+            unchecked_indices: checked
+                .iter()
+                .enumerate()
+                .filter_map(|(index, checked)| (!checked).then_some(index))
+                .collect(),
+        };
+        if checked.iter().any(|checked| !checked) {
+            let mut reader = sql.reader().await.map_err(|error| {
+                if preserve_content_whitespace {
+                    sql_err("upsert_atoms reader", error)
+                } else {
+                    RuntimeError::Storage(error).with_batch_admission(report(&checked, &refusals))
+                }
+            })?;
+            for (index, atom) in atoms.iter().enumerate() {
+                if checked[index] {
+                    continue;
+                }
+                let atom = atom
+                    .as_ref()
+                    .expect("unchecked admission has a decoded item");
+                if let AtomWrite::Upsert(input) = atom {
                     if let Some(id) = ids_by_slug.get(input.slug.trim()) {
-                        operations.push((id.clone(), false));
+                        operations[index] = Some((id.clone(), false));
+                        checked[index] = true;
                         continue;
                     }
                 }
-                let target = super::atom_validation::target(reader.as_mut(), &ns, atom_in).await?;
-                let (id, insert) = match target {
-                    Some(id) => (id, false),
-                    None => (new_id(), true),
+                let target = if preserve_content_whitespace {
+                    super::atom_validation::target(reader.as_mut(), &ns, atom).await
+                } else {
+                    super::atom_validation::target_for_admission(reader.as_mut(), &ns, atom).await
                 };
-                if let AtomWrite::Upsert(input) = atom_in {
-                    ids_by_slug.insert(input.slug.trim().to_owned(), id.clone());
+                match target {
+                    Ok(target) => {
+                        let (id, insert) =
+                            target.map_or_else(|| (new_id(), true), |id| (id, false));
+                        if let AtomWrite::Upsert(input) = atom {
+                            ids_by_slug.insert(input.slug.trim().to_owned(), id.clone());
+                        }
+                        operations[index] = Some((id, insert));
+                        checked[index] = true;
+                    }
+                    Err(error @ (RuntimeError::InvalidInput(_) | RuntimeError::NotFound(_))) => {
+                        if preserve_content_whitespace {
+                            return Err(error);
+                        }
+                        let field = match atom {
+                            AtomWrite::Upsert(_) => "slug",
+                            AtomWrite::PropertiesOnly(_) => "id",
+                        };
+                        let reason = if matches!(error, RuntimeError::NotFound(_)) {
+                            "not_found"
+                        } else {
+                            "invalid_input"
+                        };
+                        refusals[index] = Some(BatchRefusal {
+                            index,
+                            field,
+                            reason,
+                        });
+                        failures[index] = Some(error);
+                        checked[index] = true;
+                    }
+                    Err(error) => {
+                        if preserve_content_whitespace {
+                            return Err(error);
+                        }
+                        return Err(error.with_batch_admission(report(&checked, &refusals)));
+                    }
                 }
-                operations.push((id, insert));
             }
-            Ok(())
         }
-        .await;
-        drop(reader);
-        if let Err(error) = preparation {
-            if matches!(
-                error,
-                RuntimeError::InvalidInput(_) | RuntimeError::NotFound(_)
-            ) {
-                let mut failures: Vec<_> = (0..p.atoms.len()).map(|_| None).collect();
-                failures[failed_index] = Some(error);
-                return Err(super::refusal::refuse_batch(
-                    runtime,
-                    token,
-                    &p.atoms,
-                    failures,
-                    preserve_content_whitespace,
-                )
-                .await);
-            }
-            return Err(error);
+        if failures.iter().any(Option::is_some) {
+            let admission = report(&checked, &refusals);
+            let error = super::refusal::refuse_batch(runtime, token, &atoms, failures, false).await;
+            return Err(error.with_batch_admission(admission));
         }
+        let p = UpsertAtomsParams {
+            atoms: atoms
+                .into_iter()
+                .map(|atom| atom.expect("successful admission decoded every item"))
+                .collect(),
+            dry_run,
+            chunk_size,
+        };
+        let operations: Vec<_> = operations
+            .into_iter()
+            .map(|operation| operation.expect("successful admission prepared every target"))
+            .collect();
 
         let mut created = 0usize;
         let mut updated = 0usize;
@@ -459,8 +573,7 @@ impl KnowledgeHandlers {
                 AtomWrite::Upsert(atom_in) => atom_in,
                 AtomWrite::PropertiesOnly(atom_in) => {
                     statements.push(SqlStatement {
-                        sql: "UPDATE knowledge_atoms SET properties=?1, updated_at=?2 WHERE id=?3"
-                            .into(),
+                        sql: khive_runtime::sql!("knowledge_atom_properties_update").into(),
                         params: vec![
                             if atom_in.properties.is_null() {
                                 SqlValue::Null
@@ -511,26 +624,28 @@ impl KnowledgeHandlers {
 
             if insert {
                 statements.push(SqlStatement {
-                        sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, tags, properties, source_uri, source_type, status, finalized, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)".into(),
-                        params: vec![
-                            SqlValue::Text(id),
-                            SqlValue::Text(ns.clone()),
-                            SqlValue::Text(slug.clone()),
-                            SqlValue::Text(atom_in.name.clone()),
-                            SqlValue::Text(content.clone()),
-                            SqlValue::Text(tags_json.clone()),
-                            props_json.as_ref().map_or(SqlValue::Null, |p| SqlValue::Text(p.clone())),
-                            source_uri.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
-                            source_type.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
-                            // status mirrors the lifecycle backfill (finalized => reviewed) so a
-                            // freshly-finalized atom is never left at the 'draft' default.
-                            SqlValue::Text(if finalized { "reviewed" } else { "draft" }.to_string()),
-                            SqlValue::Integer(finalized as i64),
-                            SqlValue::Integer(now),
-                            SqlValue::Integer(now),
-                        ],
-                        label: None,
-                    });
+                    sql: khive_runtime::sql!("knowledge_atom_insert").into(),
+                    params: vec![
+                        SqlValue::Text(id),
+                        SqlValue::Text(ns.clone()),
+                        SqlValue::Text(slug.clone()),
+                        SqlValue::Text(atom_in.name.clone()),
+                        SqlValue::Text(content.clone()),
+                        SqlValue::Text(tags_json.clone()),
+                        props_json
+                            .as_ref()
+                            .map_or(SqlValue::Null, |p| SqlValue::Text(p.clone())),
+                        source_uri.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
+                        source_type.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
+                        // status mirrors the lifecycle backfill (finalized => reviewed) so a
+                        // freshly-finalized atom is never left at the 'draft' default.
+                        SqlValue::Text(if finalized { "reviewed" } else { "draft" }.to_string()),
+                        SqlValue::Integer(finalized as i64),
+                        SqlValue::Integer(now),
+                        SqlValue::Integer(now),
+                    ],
+                    label: None,
+                });
                 created += 1;
             } else {
                 statements.push(invalidate_section_vectors_for_atom_rename(
@@ -544,7 +659,7 @@ impl KnowledgeHandlers {
                     // null. Finalized is non-nullable, so its null value is bound as
                     // false. Only true promotes draft -> reviewed; clearing the flag
                     // does not demote an independent lifecycle status.
-                    sql: "UPDATE knowledge_atoms SET name=?1, content=?2, tags=?3, properties=?4, source_uri=CASE WHEN ?5 = 1 THEN ?6 ELSE source_uri END, source_type=CASE WHEN ?7 = 1 THEN ?8 ELSE source_type END, finalized=CASE WHEN ?9 = 1 THEN ?10 ELSE finalized END, status=CASE WHEN ?9 = 1 AND ?10 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?11 WHERE id=?12 AND namespace=?13".into(),
+                    sql: khive_runtime::sql!("knowledge_atom_content_update").into(),
                     params: vec![
                         SqlValue::Text(atom_in.name.clone()),
                         SqlValue::Text(content),
@@ -566,14 +681,20 @@ impl KnowledgeHandlers {
             }
         }
 
-        let mut writer = sql
-            .writer()
-            .await
-            .map_err(|e| sql_err("upsert_atoms writer", e))?;
-        writer
-            .execute_batch(statements)
-            .await
-            .map_err(|e| sql_err("upsert_atoms batch", e))?;
+        let mut writer = sql.writer().await.map_err(|error| {
+            if preserve_content_whitespace {
+                sql_err("upsert_atoms writer", error)
+            } else {
+                RuntimeError::Storage(error).before_requested_write()
+            }
+        })?;
+        writer.execute_batch(statements).await.map_err(|error| {
+            if preserve_content_whitespace {
+                sql_err("upsert_atoms batch", error)
+            } else {
+                RuntimeError::atomic_write_failure(error)
+            }
+        })?;
         Ok(json!({
             "created": created,
             "updated": updated,
@@ -586,11 +707,12 @@ impl KnowledgeHandlers {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
-        let p: UpsertDomainsParams = deser(params)?;
+        let p: UpsertDomainsParams = deser(params).map_err(RuntimeError::before_requested_write)?;
         if p.domains.is_empty() {
-            return Err(RuntimeError::InvalidInput(
-                "domains list must not be empty".into(),
-            ));
+            return Err(
+                RuntimeError::InvalidInput("domains list must not be empty".into())
+                    .before_requested_write(),
+            );
         }
 
         let ns = token.namespace().as_str().to_owned();
@@ -600,36 +722,48 @@ impl KnowledgeHandlers {
         let mut updated = 0usize;
 
         for domain_in in &p.domains {
+            let prewrite = |error: RuntimeError| {
+                if created == 0 && updated == 0 {
+                    error.before_requested_write()
+                } else {
+                    error
+                }
+            };
             let slug = domain_in.slug.trim().to_string();
             let name = domain_in.name.trim().to_string();
             if slug.is_empty() {
-                return Err(RuntimeError::InvalidInput(
+                return Err(prewrite(RuntimeError::InvalidInput(
                     "domain slug must not be empty".into(),
-                ));
+                )));
             }
             if name.is_empty() {
-                return Err(RuntimeError::InvalidInput(
+                return Err(prewrite(RuntimeError::InvalidInput(
                     "domain name must not be empty".into(),
-                ));
+                )));
             }
             // Secret gate: scan slug and name first (before content-length validation)
             // so security violations short-circuit before business logic errors.
-            khive_runtime::secret_gate::check_at(&slug, "domain", "slug")?;
-            khive_runtime::secret_gate::check_at(&name, "domain", "name")?;
+            khive_runtime::secret_gate::check_at(&slug, "domain", "slug").map_err(prewrite)?;
+            khive_runtime::secret_gate::check_at(&name, "domain", "name").map_err(prewrite)?;
             // Domain mirror atoms are written to knowledge_atoms with the description
             // as content. Enforce the same 20-word minimum that normal atoms must satisfy
             // so the FTS and embedding surfaces receive adequate content.
             let mirror_content = domain_in.description.as_deref().unwrap_or("").trim();
             validate_atom_content(mirror_content).map_err(|e| {
-                RuntimeError::InvalidInput(format!("domain {slug:?}: description {e}"))
+                prewrite(RuntimeError::InvalidInput(format!(
+                    "domain {slug:?}: description {e}"
+                )))
             })?;
             // Secret gate: scan remaining caller-supplied text.
-            khive_runtime::secret_gate::check_at(mirror_content, "domain", "description")?;
+            khive_runtime::secret_gate::check_at(mirror_content, "domain", "description")
+                .map_err(prewrite)?;
             if let Some(ref tags_vec) = domain_in.tags {
-                khive_runtime::secret_gate::check_tags_at(tags_vec, "domain", "tags")?;
+                khive_runtime::secret_gate::check_tags_at(tags_vec, "domain", "tags")
+                    .map_err(prewrite)?;
             }
             if let Some(ref members_vec) = domain_in.members {
-                khive_runtime::secret_gate::check_tags_at(members_vec, "domain", "members")?;
+                khive_runtime::secret_gate::check_tags_at(members_vec, "domain", "members")
+                    .map_err(prewrite)?;
             }
 
             let mut tags: Vec<String> = domain_in.tags.clone().unwrap_or_default();
@@ -658,7 +792,7 @@ impl KnowledgeHandlers {
             // the insert path runs, instead of leaking a raw unique-constraint error.
             let existing = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT id, deleted_at FROM knowledge_domains WHERE namespace = ?1 AND slug = ?2 LIMIT 1".into(),
+                    sql: khive_runtime::sql!("knowledge_domain_slug_probe").into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(slug.clone())],
                     label: None,
                 })
@@ -666,9 +800,9 @@ impl KnowledgeHandlers {
                 .map_err(|e| sql_err("upsert_domains lookup", e))?;
             if let Some(row) = &existing {
                 if row_i64(row, "deleted_at").is_some() {
-                    return Err(RuntimeError::InvalidInput(format!(
+                    return Err(prewrite(RuntimeError::InvalidInput(format!(
                         "domain slug {slug:?} was previously deleted; choose a new slug"
-                    )));
+                    ))));
                 }
             }
 
@@ -687,9 +821,7 @@ impl KnowledgeHandlers {
             // partially-committed domain row behind.
             let atom_collision = reader
                 .query_row(SqlStatement {
-                    sql:
-                        "SELECT id FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 LIMIT 1"
-                            .into(),
+                    sql: khive_runtime::sql!("knowledge_atom_slug_probe").into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(slug.clone())],
                     label: None,
                 })
@@ -700,9 +832,9 @@ impl KnowledgeHandlers {
                     RuntimeError::Internal("missing id in colliding atom row".into())
                 })?;
                 if collision_id != id {
-                    return Err(RuntimeError::InvalidInput(format!(
+                    return Err(prewrite(RuntimeError::InvalidInput(format!(
                         "domain slug {slug:?} collides with an existing atom of the same slug"
-                    )));
+                    ))));
                 }
             }
 
@@ -710,9 +842,7 @@ impl KnowledgeHandlers {
             // ON CONFLICT(namespace, slug) would blind-overwrite an unrelated atom
             // that merely happens to share this slug.
             let mirror_stmt = SqlStatement {
-                sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, tags, properties, status, finalized, created_at, updated_at) \
-                      VALUES (?1,?2,?3,?4,?5,?6,?7,'reviewed',1,?8,?9) \
-                      ON CONFLICT(id) DO UPDATE SET slug=?3, name=?4, content=?5, tags=?6, properties=?7, status='reviewed', finalized=1, updated_at=?9".into(),
+                sql: khive_runtime::sql!("knowledge_domain_mirror_upsert").into(),
                 params: vec![
                     SqlValue::Text(id.clone()),
                     SqlValue::Text(ns.clone()),
@@ -733,10 +863,13 @@ impl KnowledgeHandlers {
                 .map_err(|e| sql_err("upsert_domains writer", e))?;
             if existing.is_some() {
                 let domain_stmt = SqlStatement {
-                    sql: "UPDATE knowledge_domains SET name=?1, description=?2, tags=?3, members=?4, updated_at=?5 WHERE id=?6 AND namespace=?7".into(),
+                    sql: khive_runtime::sql!("knowledge_domain_update").into(),
                     params: vec![
                         SqlValue::Text(name.clone()),
-                        domain_in.description.as_ref().map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
+                        domain_in
+                            .description
+                            .as_ref()
+                            .map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
                         SqlValue::Text(tags_json.clone()),
                         SqlValue::Text(members_json.clone()),
                         SqlValue::Integer(now),
@@ -759,13 +892,16 @@ impl KnowledgeHandlers {
                 updated += 1;
             } else {
                 let domain_stmt = SqlStatement {
-                    sql: "INSERT INTO knowledge_domains (id, namespace, slug, name, description, tags, members, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)".into(),
+                    sql: khive_runtime::sql!("knowledge_domain_insert").into(),
                     params: vec![
                         SqlValue::Text(id.clone()),
                         SqlValue::Text(ns.clone()),
                         SqlValue::Text(slug.clone()),
                         SqlValue::Text(name.clone()),
-                        domain_in.description.as_ref().map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
+                        domain_in
+                            .description
+                            .as_ref()
+                            .map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
                         SqlValue::Text(tags_json.clone()),
                         SqlValue::Text(members_json.clone()),
                         SqlValue::Integer(now),
@@ -821,7 +957,7 @@ impl KnowledgeHandlers {
             // their same-slug mirror atoms.
             let row = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT * FROM knowledge_domains WHERE namespace = ?1 AND slug = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                    sql: khive_runtime::sql!("knowledge_domain_get_slug").into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(id.clone())],
                     label: Some("knowledge.get.domain_by_slug".into()),
                 })
@@ -835,7 +971,7 @@ impl KnowledgeHandlers {
 
             let row = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                    sql: khive_runtime::sql!("knowledge_atom_get_slug").into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(id.clone())],
                     label: Some("knowledge.get.atom_by_slug".into()),
                 })
@@ -892,7 +1028,7 @@ impl KnowledgeHandlers {
             // its own mirror atom instead of the canonical domain record.
             let row = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT * FROM knowledge_domains WHERE id = ?1 AND deleted_at IS NULL LIMIT 1".into(),
+                    sql: khive_runtime::sql!("knowledge_domain_get_id").into(),
                     params: vec![SqlValue::Text(resolved_id.clone())],
                     label: Some("knowledge.get.domain_by_id".into()),
                 })
@@ -905,9 +1041,7 @@ impl KnowledgeHandlers {
             }
             let row = reader
                 .query_row(SqlStatement {
-                    sql:
-                        "SELECT * FROM knowledge_atoms WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
-                            .into(),
+                    sql: khive_runtime::sql!("knowledge_atom_get_id").into(),
                     params: vec![SqlValue::Text(resolved_id)],
                     label: Some("knowledge.get.atom_by_id".into()),
                 })
@@ -947,9 +1081,13 @@ impl KnowledgeHandlers {
             Some("domain") => KnowledgeListKind::Domain,
             Some("atom") | None => KnowledgeListKind::Atom,
             Some(other) => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "unknown type {other:?}; valid: atom | domain"
-                )))
+                return Err(RuntimeError::InvalidInput(
+                    mask_for_redaction_surface(
+                        RedactionSurface::GateProbe,
+                        &format!("unknown type {other:?}; valid: atom | domain"),
+                    )
+                    .into_owned(),
+                ))
             }
         };
         let cursor_mode = p.after.is_some();
@@ -966,11 +1104,28 @@ impl KnowledgeHandlers {
             .transpose()?
             .flatten();
 
+        if matches!(kind, KnowledgeListKind::Atom) {
+            if let Some(status) = p.status.as_ref() {
+                let valid = match status {
+                    Value::String(_) => true,
+                    Value::Array(items) => items.iter().all(Value::is_string),
+                    _ => false,
+                };
+                if !valid {
+                    return Err(RuntimeError::InvalidInput(
+                        "status must be a string or an array of strings".into(),
+                    ));
+                }
+            }
+        }
+
         let ns = token.namespace().as_str().to_owned();
         let sql = runtime.sql();
         let limit_usize = p.limit.unwrap_or(20).clamp(1, 500);
         let limit = limit_usize as i64;
-        let offset = p.offset.unwrap_or(0) as i64;
+        let offset = i64::try_from(p.offset.unwrap_or(0)).map_err(|_| {
+            RuntimeError::InvalidInput("knowledge.list offset exceeds the supported range".into())
+        })?;
         let select_columns = list_select_columns(p.fields.as_deref());
 
         let mut reader = sql.reader().await.map_err(|e| sql_err("list reader", e))?;
@@ -981,10 +1136,10 @@ impl KnowledgeHandlers {
         let cursor_key = if let Some(after_id) = after_id {
             let cursor_sql = match kind {
                 KnowledgeListKind::Atom => {
-                    "SELECT created_at, id FROM knowledge_atoms WHERE namespace = ?1 AND id = ?2 AND tags NOT LIKE '%type:domain%' LIMIT 1"
+                    khive_runtime::sql!("knowledge_atom_cursor_key")
                 }
                 KnowledgeListKind::Domain => {
-                    "SELECT created_at, id FROM knowledge_domains WHERE namespace = ?1 AND id = ?2 LIMIT 1"
+                    khive_runtime::sql!("knowledge_domain_cursor_key")
                 }
             };
             let row = reader
@@ -1081,18 +1236,14 @@ impl KnowledgeHandlers {
                         "next_after": next_after,
                     }))
                 } else {
-                    let total_row = reader
-                        .query_scalar(SqlStatement {
-                            sql: "SELECT COUNT(*) FROM knowledge_domains WHERE namespace = ?1 AND deleted_at IS NULL".into(),
+                    let total = reader
+                        .count(SqlStatement {
+                            sql: khive_runtime::sql!("knowledge_domain_count").into(),
                             params: vec![SqlValue::Text(ns)],
                             label: None,
                         })
                         .await
                         .map_err(|e| sql_err("list domains count", e))?;
-                    let total = match total_row {
-                        Some(SqlValue::Integer(n)) => n,
-                        _ => 0,
-                    };
                     Ok(json!({
                         "results": items,
                         "total": total,
@@ -1166,7 +1317,7 @@ impl KnowledgeHandlers {
                         format!(
                             "SELECT {select_columns} FROM knowledge_atoms \
                              WHERE namespace = ?1 AND deleted_at IS NULL \
-                             AND tags NOT LIKE '%type:domain%'{} \
+                             AND NOT khive_tag_contains(tags, 'type:domain'){} \
                              ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3",
                             data_status_clause
                         ),
@@ -1174,7 +1325,7 @@ impl KnowledgeHandlers {
                     )
                 };
                 let count_sql = format!(
-                    "SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'{}",
+                    "SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND NOT khive_tag_contains(tags, 'type:domain'){}",
                     count_status_clause
                 );
 
@@ -1211,18 +1362,14 @@ impl KnowledgeHandlers {
                 } else {
                     let mut count_params = vec![SqlValue::Text(ns)];
                     count_params.extend(count_status_params);
-                    let total_row = reader
-                        .query_scalar(SqlStatement {
+                    let total = reader
+                        .count(SqlStatement {
                             sql: count_sql,
                             params: count_params,
                             label: Some("knowledge.list.atom_count".into()),
                         })
                         .await
                         .map_err(|e| sql_err("list atoms count", e))?;
-                    let total = match total_row {
-                        Some(SqlValue::Integer(n)) => n,
-                        _ => 0,
-                    };
                     Ok(json!({
                         "results": items,
                         "total": total,
@@ -1297,7 +1444,7 @@ impl KnowledgeHandlers {
                     .map_err(|e| sql_err("delete_atoms mirror preflight", e))?;
                 for row in &rows {
                     let tags = row_str(row, "tags").unwrap_or_default();
-                    if tags.contains("type:domain") {
+                    if has_domain_mirror_tag(&tags) {
                         mirrors.extend(row_str(row, "id"));
                         mirrors.extend(row_str(row, "slug"));
                     }
@@ -1362,32 +1509,25 @@ impl KnowledgeHandlers {
         // slice rather than two sequential scans (#2218).
         let atom_stats = reader
             .query_row(SqlStatement {
-                sql: "SELECT COUNT(*) AS total_atoms, \
-                             COALESCE(SUM(CASE WHEN finalized = 1 THEN 1 ELSE 0 END), 0) \
-                                 AS finalized_atoms \
-                      FROM knowledge_atoms \
-                      WHERE namespace = ?1 AND deleted_at IS NULL \
-                        AND tags NOT LIKE '%type:domain%'"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_atom_stats").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: Some("knowledge.stats.atom_aggregates".into()),
             })
             .await
             .map_err(|e| sql_err("stats atom aggregates", e))?;
 
-        let domain_count = reader
-            .query_scalar(SqlStatement {
-                sql: "SELECT COUNT(*) FROM knowledge_domains WHERE namespace = ?1 AND deleted_at IS NULL".into(),
+        let total_domains = reader
+            .count(SqlStatement {
+                sql: khive_runtime::sql!("knowledge_domain_count").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: None,
             })
             .await
             .map_err(|e| sql_err("stats domains", e))?;
 
-        let event_count = reader
-            .query_scalar(SqlStatement {
-                sql: "SELECT COUNT(*) FROM events WHERE namespace = ?1 AND verb LIKE 'knowledge.%'"
-                    .into(),
+        let total_events = reader
+            .count(SqlStatement {
+                sql: khive_runtime::sql!("knowledge_event_count").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: Some("knowledge.stats.event_count".into()),
             })
@@ -1395,8 +1535,8 @@ impl KnowledgeHandlers {
             .map_err(|e| sql_err("stats events", e))?;
 
         let retrieval_eval_run_count = reader
-            .query_scalar(SqlStatement {
-                sql: "SELECT COUNT(*) FROM knowledge_eval_runs WHERE namespace = ?1".into(),
+            .count(SqlStatement {
+                sql: khive_runtime::sql!("knowledge_eval_run_count").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: Some("knowledge.stats.eval_run_count".into()),
             })
@@ -1405,9 +1545,7 @@ impl KnowledgeHandlers {
 
         let latest_retrieval_eval = reader
             .query_row(SqlStatement {
-                sql: "SELECT run_at, precision_at_5, mrr FROM knowledge_eval_runs \
-                      WHERE namespace = ?1 ORDER BY run_at DESC, rowid DESC LIMIT 1"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_eval_latest").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: Some("knowledge.stats.latest_eval_run".into()),
             })
@@ -1418,45 +1556,20 @@ impl KnowledgeHandlers {
             .as_ref()
             .and_then(|row| row_i64(row, "total_atoms"))
             .unwrap_or(0);
-        let total_domains = match domain_count {
-            Some(SqlValue::Integer(n)) => n,
-            _ => 0,
-        };
         let finalized = atom_stats
             .as_ref()
             .and_then(|row| row_i64(row, "finalized_atoms"))
             .unwrap_or(0);
-        let total_events = match event_count {
-            Some(SqlValue::Integer(n)) => n,
-            _ => 0,
-        };
-        let retrieval_eval_run_count = match retrieval_eval_run_count {
-            Some(SqlValue::Integer(n)) => n,
-            _ => 0,
-        };
         let retrieval_eval_coverage = latest_retrieval_eval
             .as_ref()
-            .and_then(|row| match row.get("precision_at_5") {
-                Some(SqlValue::Float(value)) => Some(*value),
-                Some(SqlValue::Integer(value)) => Some(*value as f64),
-                _ => None,
-            })
+            .and_then(|row| row.f64("precision_at_5").ok())
             .unwrap_or(0.0);
-        let retrieval_eval_last_run_at =
-            latest_retrieval_eval
-                .as_ref()
-                .and_then(|row| match row.get("run_at") {
-                    Some(SqlValue::Integer(value)) => Some(*value),
-                    _ => None,
-                });
-        let retrieval_eval_last_mrr =
-            latest_retrieval_eval
-                .as_ref()
-                .and_then(|row| match row.get("mrr") {
-                    Some(SqlValue::Float(value)) => Some(*value),
-                    Some(SqlValue::Integer(value)) => Some(*value as f64),
-                    _ => None,
-                });
+        let retrieval_eval_last_run_at = latest_retrieval_eval
+            .as_ref()
+            .and_then(|row| row.i64_or_none("run_at"));
+        let retrieval_eval_last_mrr = latest_retrieval_eval
+            .as_ref()
+            .and_then(|row| row.f64("mrr").ok());
 
         let eval_coverage = if total_atoms > 0 {
             finalized as f64 / total_atoms as f64
@@ -1498,10 +1611,7 @@ async fn fetch_sections(
 
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT * FROM knowledge_sections \
-                  WHERE atom_id = ?1 AND namespace = ?2 \
-                  ORDER BY sort_order ASC, created_at ASC, id ASC"
-                .into(),
+            sql: khive_runtime::sql!("knowledge_sections_for_atom").into(),
             params: vec![
                 SqlValue::Text(atom_id.to_owned()),
                 SqlValue::Text(ns.to_owned()),
@@ -1529,182 +1639,5 @@ async fn fetch_sections(
 }
 
 #[cfg(test)]
-mod tests {
-    // Gate wiring tests: confirm that the secret check integrated into
-    // upsert_atoms fires on credential-shaped atom content and passes on
-    // allowlisted content (sha256 hex, UUIDs).  Tests call
-    // `khive_runtime::secret_gate::check` directly with the same inputs
-    // that the handler would pass — this proves the gate is reachable without
-    // requiring a live DB connection.
-
-    use khive_runtime::secret_gate::check;
-    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
-    use khive_storage::SqlValue;
-
-    #[test]
-    fn key_only_list_projection_does_not_select_atom_content() {
-        let fields = vec!["id".to_string(), "slug".to_string()];
-        let columns = super::list_select_columns(Some(&fields));
-        assert_eq!(columns, "id, slug, created_at");
-        assert!(!columns.contains("content"));
-    }
-
-    #[tokio::test]
-    async fn get_prefix_query_plan_uses_primary_key_range_seeks() {
-        let runtime = KhiveRuntime::memory().expect("memory runtime");
-        let mut builder = VerbRegistryBuilder::new();
-        builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-        builder.register(crate::KnowledgePack::new(runtime.clone()));
-        let registry = builder.build().expect("registry builds");
-        registry.apply_schema_plans(runtime.backend());
-
-        let mut reader = runtime.sql().reader().await.expect("prefix plan reader");
-        let rows = reader
-            .explain(
-                super::knowledge_get_prefix_statement("0b6cf134")
-                    .expect("valid compact UUID prefix"),
-            )
-            .await
-            .expect("explain knowledge prefix query");
-        let details: Vec<String> = rows
-            .iter()
-            .filter_map(|row| match row.get("detail") {
-                Some(SqlValue::Text(detail)) => Some(detail.clone()),
-                _ => None,
-            })
-            .collect();
-
-        assert!(
-            ["knowledge_domains", "knowledge_atoms"]
-                .iter()
-                .all(|table| {
-                    details.iter().any(|detail| {
-                        detail.contains(&format!("SEARCH {table}"))
-                            && detail.contains("id>?")
-                            && detail.contains("id<?")
-                    }) && !details
-                        .iter()
-                        .any(|detail| detail.contains(&format!("SCAN {table}")))
-                }),
-            "knowledge.get short-id tables must use primary-key range seeks: {details:?}"
-        );
-    }
-
-    /// `delete_atoms` matches ids and slugs with one statement per column. A
-    /// single `id IN (..) OR slug IN (..)` predicate makes the no-statistics
-    /// planner scan the namespace, so a full chunk must still seek an index.
-    #[tokio::test]
-    async fn delete_atoms_key_statements_seek_an_index_at_a_full_chunk() {
-        let runtime = KhiveRuntime::memory().expect("memory runtime");
-        let keys: Vec<String> = (0..super::HYDRATION_ID_CHUNK)
-            .map(|i| format!("key-{i}"))
-            .collect();
-        let mut reader = runtime.sql().reader().await.expect("plan reader");
-
-        for table in ["knowledge_atoms", "knowledge_domains"] {
-            let head = format!("SELECT id, slug FROM {table}");
-            let lead = vec![SqlValue::Text("local".into())];
-            let [by_id, by_slug] = super::key_match_statements(&head, lead, &keys);
-            assert_eq!(by_id.params.len(), super::HYDRATION_ID_CHUNK + 1);
-            assert_eq!(by_slug.params.len(), super::HYDRATION_ID_CHUNK + 1);
-
-            for (statement, index) in [
-                (by_id, format!("sqlite_autoindex_{table}_1")),
-                (by_slug, format!("idx_{table}_ns_slug")),
-            ] {
-                let rows = reader.explain(statement).await.expect("explain statement");
-                let details: Vec<String> = rows
-                    .iter()
-                    .filter_map(|row| match row.get("detail") {
-                        Some(SqlValue::Text(detail)) => Some(detail.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                assert!(
-                    details
-                        .iter()
-                        .any(|detail| detail.contains(&format!("USING INDEX {index}"))),
-                    "{table} key match must seek {index}: {details:?}"
-                );
-                assert!(
-                    !details.iter().any(|detail| detail.contains("SCAN")),
-                    "{table} key match must not scan: {details:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn atom_body_with_fake_aws_key_is_blocked() {
-        // Fake AWS access key ID in an atom body — must be blocked.
-        let body = "provider: aws\naccess_key_id: AKIAFAKE000000000000\nregion: us-east-1";
-        assert!(
-            check(body).is_err(),
-            "atom body containing fake AWS key must be blocked"
-        );
-    }
-
-    #[test]
-    fn atom_body_with_sha256_hash_passes() {
-        // A manifest-style line containing a sha256 digest — must pass the allowlist.
-        let body =
-            "checksum = \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"";
-        assert!(
-            check(body).is_ok(),
-            "atom body with sha256 manifest hash must pass; fired: {:?}",
-            check(body).err()
-        );
-    }
-
-    #[test]
-    fn atom_name_with_fake_openai_key_is_blocked() {
-        // A credential accidentally used as an atom name — must be blocked.
-        let name = format!("sk-proj-{}", "A".repeat(80));
-        assert!(
-            check(&name).is_err(),
-            "atom name containing fake OpenAI key must be blocked"
-        );
-    }
-
-    #[test]
-    fn normal_atom_name_passes() {
-        let name = "FlashAttention-2: efficient transformer self-attention";
-        assert!(
-            check(name).is_ok(),
-            "normal atom name must pass; fired: {:?}",
-            check(name).err()
-        );
-    }
-
-    // Ignored-param warning coverage: verify that chunk_size and cascade are still
-    // accepted by the param structs (no deserialization error) and that the fields
-    // are Some when supplied, confirming the warning branch precondition is satisfiable.
-
-    #[test]
-    fn upsert_atoms_chunk_size_accepted_and_detectable() {
-        use crate::knowledge::schema::UpsertAtomsParams;
-        let p: UpsertAtomsParams = serde_json::from_value(serde_json::json!({
-            "atoms": [{"slug": "s", "name": "n", "content": "placeholder content for test"}],
-            "chunk_size": 100,
-        }))
-        .expect("upsert_atoms params with chunk_size must deserialize without error");
-        assert!(
-            p.chunk_size.is_some(),
-            "chunk_size must be Some when supplied so the warning branch precondition is satisfiable"
-        );
-    }
-
-    #[test]
-    fn delete_atoms_cascade_accepted_and_detectable() {
-        use crate::knowledge::schema::DeleteAtomsParams;
-        let p: DeleteAtomsParams = serde_json::from_value(serde_json::json!({
-            "ids": ["some-atom-id"],
-            "cascade": true,
-        }))
-        .expect("delete_atoms params with cascade must deserialize without error");
-        assert!(
-            p.cascade.is_some(),
-            "cascade must be Some when supplied so the warning branch precondition is satisfiable"
-        );
-    }
-}
+#[path = "crud_tests.rs"]
+mod tests;

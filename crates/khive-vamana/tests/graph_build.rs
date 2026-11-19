@@ -27,7 +27,9 @@ fn build_creates_bounded_degree_graph() {
     let mut rng = StdRng::seed_from_u64(42);
     let n = 50usize;
     let dim = 8usize;
-    let mut raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let mut raw: Vec<f32> = (0..n * dim)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
     normalize_rows(&mut raw, dim);
 
     let cfg = VamanaConfig::with_dimensions(dim)
@@ -45,7 +47,9 @@ fn build_is_deterministic_for_same_input() {
     let mut rng = StdRng::seed_from_u64(77);
     let n = 30usize;
     let dim = 4usize;
-    let mut raw: Vec<f32> = (0..n * dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let mut raw: Vec<f32> = (0..n * dim)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
     normalize_rows(&mut raw, dim);
 
     let cfg = VamanaConfig::with_dimensions(dim)

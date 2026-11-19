@@ -1,6 +1,7 @@
 use super::*;
 use crate::migrations::run_migrations;
 use crate::pool::PoolConfig;
+use crate::test_hooks::TestHooks;
 use khive_storage::{Attachment, AttachmentSubstrate, ContentRef};
 use rusqlite::StatementStatus;
 use std::time::Duration;
@@ -76,7 +77,7 @@ fn assert_entity_id_seek(plan: &[String]) {
 
 #[test]
 fn id_filtered_entity_count_page_cursor_and_candidate_use_primary_key() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
     conn.execute_batch(ENTITIES_DDL).unwrap();
     conn.execute_batch(TEST_ATTACHMENTS_DDL).unwrap();
     let filter = EntityFilter {
@@ -150,7 +151,7 @@ fn id_filtered_entity_count_page_cursor_and_candidate_use_primary_key() {
 }
 
 fn id_filtered_page_steps(unrelated: usize) -> (Vec<String>, i32) {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
     conn.execute_batch(ENTITIES_DDL).unwrap();
     conn.execute_batch(TEST_ATTACHMENTS_DDL).unwrap();
     conn.execute_batch("BEGIN").unwrap();
@@ -241,7 +242,7 @@ fn content_attachment(record_uuid: Uuid, digest: &str) -> Attachment {
 
 #[test]
 fn case_insensitive_candidate_lookup_uses_one_partial_index_seek_per_candidate() {
-    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
     run_migrations(&mut conn).unwrap();
 
     let filter = EntityFilter {
@@ -419,286 +420,9 @@ async fn case_insensitive_candidate_lookup_caps_folded_names_not_duplicate_rows(
     assert!(folded_names.contains(&"crowdbeta".to_string()));
 }
 
-#[tokio::test]
-async fn test_upsert_and_get_entity() {
-    let store = setup_memory_store();
+include!("entity_tests/basic_record_crud_tests.rs");
 
-    let entity = make_entity("default", "concept", "LoRA");
-    let id = entity.id;
-
-    store.upsert_entity(entity).await.unwrap();
-
-    let fetched = store.get_entity(id).await.unwrap();
-    assert!(fetched.is_some());
-    let fetched = fetched.unwrap();
-    assert_eq!(fetched.id, id);
-    assert_eq!(fetched.name, "LoRA");
-    assert_eq!(fetched.kind, "concept");
-}
-
-#[tokio::test]
-async fn test_upsert_with_builder() {
-    let store = setup_memory_store();
-
-    let props = serde_json::json!({"domain": "fine-tuning", "type": "technique"});
-    let entity = Entity::new("default", "concept", "QLoRA")
-        .with_description("Quantized LoRA")
-        .with_properties(props.clone())
-        .with_tags(vec!["fine-tuning".to_string(), "quantization".to_string()]);
-    let id = entity.id;
-
-    store.upsert_entity(entity).await.unwrap();
-
-    let fetched = store.get_entity(id).await.unwrap().unwrap();
-    assert_eq!(fetched.description.as_deref(), Some("Quantized LoRA"));
-    assert_eq!(fetched.properties, Some(props));
-    assert_eq!(fetched.tags, vec!["fine-tuning", "quantization"]);
-}
-
-#[tokio::test]
-async fn test_soft_delete() {
-    let store = setup_memory_store();
-
-    let entity = make_entity("default", "concept", "to-delete");
-    let id = entity.id;
-    store.upsert_entity(entity).await.unwrap();
-
-    let deleted = store.delete_entity(id, DeleteMode::Soft).await.unwrap();
-    assert!(deleted);
-
-    let fetched = store.get_entity(id).await.unwrap();
-    assert!(fetched.is_none());
-}
-
-#[tokio::test]
-async fn test_hard_delete() {
-    let store = setup_memory_store();
-
-    let entity = make_entity("default", "concept", "to-hard-delete");
-    let id = entity.id;
-    store.upsert_entity(entity).await.unwrap();
-
-    let deleted = store.delete_entity(id, DeleteMode::Hard).await.unwrap();
-    assert!(deleted);
-
-    let fetched = store.get_entity(id).await.unwrap();
-    assert!(fetched.is_none());
-}
-
-#[tokio::test]
-async fn test_query_entities_basic() {
-    let store = setup_memory_store_ns("ns1");
-
-    for name in &["Alpha", "Beta", "Gamma"] {
-        store
-            .upsert_entity(make_entity("ns1", "concept", name))
-            .await
-            .unwrap();
-    }
-    store
-        .upsert_entity(make_entity("ns1", "document", "Paper1"))
-        .await
-        .unwrap();
-
-    let page = store
-        .query_entities(
-            "ns1",
-            EntityFilter::default(),
-            PageRequest {
-                offset: 0,
-                limit: 10,
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(page.items.len(), 4);
-    assert_eq!(page.total, Some(4));
-
-    // Filter by kind
-    let concepts = store
-        .query_entities(
-            "ns1",
-            EntityFilter {
-                kinds: vec!["concept".to_string()],
-                ..Default::default()
-            },
-            PageRequest::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(concepts.items.len(), 3);
-}
-
-#[tokio::test]
-async fn test_query_by_name_prefix() {
-    let store = setup_memory_store_ns("ns1");
-
-    // "Alpha" and "AlphaGo" both start with "Alpha"; "Beta" does not
-    for &name in &["Alpha", "AlphaGo", "Beta"] {
-        store
-            .upsert_entity(make_entity("ns1", "concept", name))
-            .await
-            .unwrap();
-    }
-
-    let result = store
-        .query_entities(
-            "ns1",
-            EntityFilter {
-                name_prefix: Some("Alpha".to_string()),
-                ..Default::default()
-            },
-            PageRequest::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.items.len(), 2);
-    let names: Vec<&str> = result.items.iter().map(|e| e.name.as_str()).collect();
-    assert!(names.contains(&"Alpha"), "Alpha not found in {names:?}");
-    assert!(names.contains(&"AlphaGo"), "AlphaGo not found in {names:?}");
-    assert!(!names.contains(&"Beta"));
-}
-
-#[tokio::test]
-async fn test_query_by_name_prefix_escapes_underscore_wildcard() {
-    let store = setup_memory_store_ns("ns1");
-
-    // The real entity's name contains a literal underscore.
-    store
-        .upsert_entity(make_entity("ns1", "concept", "a_b"))
-        .await
-        .unwrap();
-
-    // 150 decoys that would match the *unescaped* LIKE pattern "a_b%"
-    // (`_` as a wildcard matches any single character) but must not match
-    // once the wildcard is escaped. Created after "a_b" so a page ordered
-    // by created_at DESC with LIMIT 100 would push "a_b" out unless exact
-    // matches are also ranked first.
-    for i in 0..150 {
-        store
-            .upsert_entity(make_entity("ns1", "concept", &format!("aXb-{i:03}")))
-            .await
-            .unwrap();
-    }
-
-    let result = store
-        .query_entities(
-            "ns1",
-            EntityFilter {
-                name_prefix: Some("a_b".to_string()),
-                ..Default::default()
-            },
-            PageRequest {
-                offset: 0,
-                limit: 100,
-            },
-        )
-        .await
-        .unwrap();
-
-    let names: Vec<&str> = result.items.iter().map(|e| e.name.as_str()).collect();
-    assert!(
-        names.contains(&"a_b"),
-        "exact match 'a_b' must survive escaping and page ordering despite 150 wildcard-matching decoys; got {names:?}"
-    );
-    assert!(
-        !names.iter().any(|n| n.starts_with("aXb")),
-        "escaped '_' must not match decoy names like 'aXb-000'; got {names:?}"
-    );
-}
-
-#[tokio::test]
-async fn test_query_by_name_prefix_escapes_percent_wildcard() {
-    let store = setup_memory_store_ns("ns1");
-
-    // The real entity's name contains a literal percent sign.
-    store
-        .upsert_entity(make_entity("ns1", "concept", "50%off"))
-        .await
-        .unwrap();
-
-    // 150 decoys that would match the *unescaped* LIKE pattern "50%off%"
-    // (`%` as a wildcard matches any sequence, including across "-") but
-    // must not match once the wildcard is escaped.
-    for i in 0..150 {
-        store
-            .upsert_entity(make_entity("ns1", "concept", &format!("50-off-{i:03}")))
-            .await
-            .unwrap();
-    }
-
-    let result = store
-        .query_entities(
-            "ns1",
-            EntityFilter {
-                name_prefix: Some("50%off".to_string()),
-                ..Default::default()
-            },
-            PageRequest {
-                offset: 0,
-                limit: 100,
-            },
-        )
-        .await
-        .unwrap();
-
-    let names: Vec<&str> = result.items.iter().map(|e| e.name.as_str()).collect();
-    assert!(
-        names.contains(&"50%off"),
-        "exact match '50%off' must survive escaping and page ordering despite 150 wildcard-matching decoys; got {names:?}"
-    );
-    assert!(
-        !names.iter().any(|n| n.starts_with("50-off-")),
-        "escaped '%' must not match decoy names like '50-off-000'; got {names:?}"
-    );
-}
-
-// Regression for a gap on #818/#834: the two tests above prove
-// escaping keeps decoys out of the WHERE clause entirely, so they pass even
-// without the exact-match-first ORDER BY CASE. This test isolates that
-// ordering: every decoy genuinely matches the LIKE pattern "Base%" (no
-// wildcard characters, escaping plays no role) and is newer than the exact
-// match, so a page ordered only by `created_at DESC` would fill entirely with
-// decoys and strand "Base" past the LIMIT 100 boundary. It fails if the
-// `ORDER BY CASE WHEN LOWER(name) = ... THEN 0 ELSE 1 END` clause is removed.
-#[tokio::test]
-async fn test_query_by_name_prefix_exact_match_ranked_before_many_matching_decoys() {
-    let store = setup_memory_store_ns("ns1");
-
-    store
-        .upsert_entity(make_entity("ns1", "concept", "Base"))
-        .await
-        .unwrap();
-
-    for i in 0..150 {
-        store
-            .upsert_entity(make_entity("ns1", "concept", &format!("Base-{i:03}")))
-            .await
-            .unwrap();
-    }
-
-    let result = store
-        .query_entities(
-            "ns1",
-            EntityFilter {
-                name_prefix: Some("Base".to_string()),
-                ..Default::default()
-            },
-            PageRequest {
-                offset: 0,
-                limit: 100,
-            },
-        )
-        .await
-        .unwrap();
-
-    let names: Vec<&str> = result.items.iter().map(|e| e.name.as_str()).collect();
-    assert!(
-        names.contains(&"Base"),
-        "exact match 'Base' must be ranked ahead of 150 newer, genuinely prefix-matching \
-         decoys within a LIMIT 100 page; got {names:?}"
-    );
-}
+include!("entity_tests/name_prefix_query_tests.rs");
 
 #[tokio::test]
 async fn test_count_entities() {
@@ -903,114 +627,7 @@ async fn test_namespace_isolation() {
     assert_eq!(page_b.items[0].name, "EntityB");
 }
 
-#[tokio::test]
-async fn test_query_by_tags() {
-    let store = setup_memory_store_ns("tags_ns");
-
-    let mut e1 = make_entity("tags_ns", "concept", "Tagged1");
-    e1.tags = vec!["rust".to_string(), "systems".to_string()];
-    let mut e2 = make_entity("tags_ns", "concept", "Tagged2");
-    e2.tags = vec!["python".to_string(), "ml".to_string()];
-    let mut e3 = make_entity("tags_ns", "concept", "Tagged3");
-    e3.tags = vec!["rust".to_string(), "ml".to_string()];
-
-    store.upsert_entity(e1).await.unwrap();
-    store.upsert_entity(e2).await.unwrap();
-    store.upsert_entity(e3).await.unwrap();
-
-    // Filter by "rust" tag — should match Tagged1 and Tagged3
-    let result = store
-        .query_entities(
-            "tags_ns",
-            EntityFilter {
-                tags_any: vec!["rust".to_string()],
-                ..Default::default()
-            },
-            PageRequest::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.items.len(), 2);
-    let names: Vec<&str> = result.items.iter().map(|e| e.name.as_str()).collect();
-    assert!(names.contains(&"Tagged1"));
-    assert!(names.contains(&"Tagged3"));
-    assert!(!names.contains(&"Tagged2"));
-
-    // Filter by "ml" tag — should match Tagged2 and Tagged3
-    let result = store
-        .query_entities(
-            "tags_ns",
-            EntityFilter {
-                tags_any: vec!["ml".to_string()],
-                ..Default::default()
-            },
-            PageRequest::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.items.len(), 2);
-
-    // Filter by both "rust" and "python" (union) — should match all three
-    let result = store
-        .query_entities(
-            "tags_ns",
-            EntityFilter {
-                tags_any: vec!["rust".to_string(), "python".to_string()],
-                ..Default::default()
-            },
-            PageRequest::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.items.len(), 3);
-}
-
-#[tokio::test]
-async fn test_query_by_ids() {
-    let store = setup_memory_store_ns("ns1");
-
-    let e1 = make_entity("ns1", "concept", "E1");
-    let e2 = make_entity("ns1", "concept", "E2");
-    let e3 = make_entity("ns1", "concept", "E3");
-    let ids = vec![e1.id, e3.id];
-
-    store.upsert_entity(e1).await.unwrap();
-    store.upsert_entity(e2).await.unwrap();
-    store.upsert_entity(e3).await.unwrap();
-
-    let result = store
-        .query_entities(
-            "ns1",
-            EntityFilter {
-                ids,
-                ..Default::default()
-            },
-            PageRequest::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.items.len(), 2);
-    let names: Vec<&str> = result.items.iter().map(|e| e.name.as_str()).collect();
-    assert!(names.contains(&"E1"));
-    assert!(names.contains(&"E3"));
-    assert!(!names.contains(&"E2"));
-}
-
-#[tokio::test]
-async fn test_entity_type_roundtrip() {
-    let store = setup_memory_store();
-
-    let entity =
-        Entity::new("default", "document", "ResearchPaper").with_entity_type(Some("paper"));
-    let id = entity.id;
-
-    store.upsert_entity(entity).await.unwrap();
-
-    let fetched = store.get_entity(id).await.unwrap().unwrap();
-    assert_eq!(fetched.entity_type, Some("paper".to_string()));
-    assert_eq!(fetched.kind, "document");
-    assert_eq!(fetched.name, "ResearchPaper");
-}
+include!("entity_tests/tag_id_and_type_value_tests.rs");
 
 #[tokio::test]
 async fn insert_entity_if_absent_preserves_the_winning_row() {
@@ -1057,7 +674,7 @@ async fn test_query_by_kind_and_entity_type() {
 
 #[test]
 fn legacy_entity_type_fallback_seeks_both_type_indexes() {
-    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
     run_migrations(&mut conn).unwrap();
     for filter in [
         EntityFilter {
@@ -2490,7 +2107,7 @@ async fn pooled_entity_read_counts_busy_handler_timeouts() {
     assert!(store.get_entity(Uuid::new_v4()).await.unwrap().is_none());
     assert_eq!(pool.reader_acquisition_snapshot().busy_timeouts, 0);
 
-    let holder = rusqlite::Connection::open(&path).unwrap();
+    let holder = crate::test_hooks::registered(rusqlite::Connection::open(&path).unwrap());
     holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
     let refused = store.get_entity(Uuid::new_v4()).await.unwrap_err();
     assert!(
@@ -2603,4 +2220,196 @@ async fn issue2673_entity_versions_cover_typed_storage_writers() {
         store.get_entity(fresh.id).await.unwrap().unwrap().version,
         1
     );
+}
+
+#[tokio::test]
+async fn entity_count_free_page_never_calls_count() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+    fn deny_count(ctx: AuthContext<'_>) -> Authorization {
+        match ctx.action {
+            AuthAction::Function { function_name }
+                if function_name.eq_ignore_ascii_case("count") =>
+            {
+                Authorization::Deny
+            }
+            _ => Authorization::Allow,
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("entity-count-free.db")),
+            max_readers: 1,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+            .unwrap();
+        for i in 1..=2_000 {
+            writer.conn().execute(
+                "INSERT INTO entities(id,namespace,kind,entity_type,name,description,properties,\
+                    tags,created_at,updated_at) VALUES(?1,'local','concept','algorithm',?2,\
+                    'description','{\"type\":\"algorithm\"}','[\"Tag\"]',?3,?3)",
+                rusqlite::params![Uuid::from_u128(i).to_string(), format!("row{i}"), i as i64],
+            ).unwrap();
+        }
+        writer.conn().execute(
+            "INSERT INTO attachments(record_uuid,substrate,role,content_ref,created_at) VALUES(?1,\
+                'entity','content',?2,1)",
+            rusqlite::params![Uuid::from_u128(2_000).to_string(), "a".repeat(64)],
+        ).unwrap();
+    }
+    // max_readers=1 keeps both control and count-free queries on the authorized reader.
+    assert_eq!(pool.max_readers(), 1, "exercise the pooled reader path");
+    let store = SqlEntityStore::new(Arc::clone(&pool), false);
+    let filters = [
+        EntityFilter::default(),
+        EntityFilter {
+            kinds: vec!["concept".into()],
+            entity_types: vec!["algorithm".into()],
+            legacy_entity_type_fallback: true,
+            tags_any: vec!["tag".into()],
+            ..Default::default()
+        },
+        EntityFilter {
+            kinds: vec!["absent".into()],
+            ..Default::default()
+        },
+    ];
+    for filter in filters {
+        for (limit, offset) in [(6, 0), (4, 9), (0, 0), (4, 3_000)] {
+            let request = PageRequest { limit, offset };
+            let expected = store
+                .query_entities("local", filter.clone(), request.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                expected.total,
+                Some(
+                    if filter.kinds.first().is_some_and(|kind| kind == "absent") {
+                        0
+                    } else {
+                        2_000
+                    }
+                )
+            );
+            pool.reader()
+                .unwrap()
+                .conn()
+                .test_authorizer(Some(deny_count))
+                .unwrap();
+            let control = store
+                .query_entities(
+                    "local",
+                    filter.clone(),
+                    PageRequest {
+                        limit: 6,
+                        offset: 0,
+                    },
+                )
+                .await;
+            assert!(
+                control.is_err(),
+                "exact-total control must exercise the denied COUNT"
+            );
+            let actual = store
+                .query_entities_count_free("local", filter.clone(), request.clone())
+                .await
+                .expect("count-free paging must not execute COUNT");
+            assert_eq!(actual.total, None);
+            assert_eq!(
+                serde_json::to_value(&actual.items).unwrap(),
+                serde_json::to_value(&expected.items).unwrap(),
+                "complete projection, limit={limit}, offset={offset}"
+            );
+            pool.reader()
+                .unwrap()
+                .conn()
+                .test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                .unwrap();
+            let restored = store
+                .query_entities("local", filter.clone(), request)
+                .await
+                .unwrap();
+            assert_eq!(
+                restored.total, expected.total,
+                "exact totals must remain available"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn count_free_entity_pages_preserve_candidates_ids_and_multi_namespace_rows() {
+    let store = setup_memory_store();
+    let mut entities = Vec::new();
+    for (i, namespace, name) in [
+        (1, "local", "Alpha"),
+        (2, "local", "alphabet"),
+        (3, "team", "ALPHA"),
+        (4, "local", "Beta"),
+    ] {
+        let mut entity = make_entity(namespace, "concept", name);
+        entity.id = Uuid::from_u128(i);
+        entity.created_at = i as i64;
+        entity.description = Some(format!("description{i}"));
+        entity.properties = Some(serde_json::json!({"type":"algorithm"}));
+        entity.tags = vec!["Tag".into()];
+        store.upsert_entity(entity.clone()).await.unwrap();
+        entities.push(entity);
+    }
+    let filters = [
+        EntityFilter {
+            namespaces: vec!["local".into(), "team".into(), "local".into()],
+            ..Default::default()
+        },
+        EntityFilter {
+            names_ci: vec!["alpha".into(), "ALPHA".into(), "beta".into()],
+            ..Default::default()
+        },
+        EntityFilter {
+            name_prefix: Some("Alpha".into()),
+            ..Default::default()
+        },
+        EntityFilter {
+            name_exact: Some("Alpha".into()),
+            ..Default::default()
+        },
+        EntityFilter {
+            ids: entities.iter().map(|e| e.id).collect(),
+            ..Default::default()
+        },
+        EntityFilter {
+            ids: entities.iter().map(|e| e.id).collect(),
+            tags_any: vec!["tag".into()],
+            ..Default::default()
+        },
+    ];
+    for filter in filters {
+        for (limit, offset) in [(4, 0), (2, 1), (0, 0), (2, 20)] {
+            let request = PageRequest { limit, offset };
+            let expected = store
+                .query_entities("local", filter.clone(), request.clone())
+                .await
+                .unwrap();
+            let actual = store
+                .query_entities_count_free("local", filter.clone(), request)
+                .await
+                .unwrap();
+            assert_eq!(actual.total, None);
+            assert_eq!(
+                serde_json::to_value(&actual.items).unwrap(),
+                serde_json::to_value(&expected.items).unwrap(),
+                "{filter:?}, limit={limit}, offset={offset}"
+            );
+        }
+    }
 }

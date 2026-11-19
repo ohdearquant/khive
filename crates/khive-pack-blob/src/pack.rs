@@ -170,12 +170,8 @@ pub(crate) static BLOB_HANDLERS: [HandlerDef; 9] = [
 struct BlobPackFactory;
 
 impl khive_runtime::PackFactory for BlobPackFactory {
-    fn name(&self) -> &'static str {
-        PACK_NAME
-    }
-    fn requires(&self) -> &'static [&'static str] {
-        &[]
-    }
+    khive_runtime::pack_factory_metadata!(BlobPack);
+
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(BlobPack::new(runtime))
     }
@@ -185,21 +181,7 @@ inventory::submit! { khive_runtime::PackRegistration(&BlobPackFactory) }
 
 #[async_trait]
 impl PackRuntime for BlobPack {
-    fn name(&self) -> &str {
-        <BlobPack as khive_types::Pack>::NAME
-    }
-    fn note_kinds(&self) -> &'static [&'static str] {
-        <BlobPack as khive_types::Pack>::NOTE_KINDS
-    }
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        <BlobPack as khive_types::Pack>::ENTITY_KINDS
-    }
-    fn handlers(&self) -> &'static [HandlerDef] {
-        &BLOB_HANDLERS
-    }
-    fn requires(&self) -> &'static [&'static str] {
-        <BlobPack as khive_types::Pack>::REQUIRES
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     fn host_state(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
         if self.runtime().is_read_only() || self.runtime().blob_store().is_none() {

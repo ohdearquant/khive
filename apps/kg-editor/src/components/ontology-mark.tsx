@@ -231,7 +231,7 @@ function dimClass(present: Set<string> | null, value: string): string | undefine
 }
 
 /**
- * Renders the complete closed ontology (9 entity kinds, 17 relations, 5 note
+ * Renders the complete closed ontology (9 entity kinds, 20 relations, 5 note
  * kinds, plus the derived-edge mark) per ADR-153 D1/D5 — the legend is a
  * permanent, complete on-canvas affordance, not a per-graph subset. Passing
  * `presentEntityKinds` / `presentNoteKinds` / `presentRelations` highlights

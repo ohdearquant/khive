@@ -1,11 +1,12 @@
 use khive_runtime::{NamespaceToken, RequestIdentity, RuntimeError, VerbRegistry};
-use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
+use khive_storage::types::{SqlRow, SqlValue};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::sql::sql;
 use crate::GitPack;
+
+pub(crate) mod snapshot;
 
 const MAX_VALUE_BYTES: i64 = 256 * 1024;
 
@@ -77,16 +78,13 @@ impl GitPack {
             .sql()
             .reader()
             .await?
-            .query_all(SqlStatement {
-                sql: sql!("ingest_cursor_snapshot_select").into(),
-                params: vec![
-                    SqlValue::Text(project_id.clone()),
-                    SqlValue::Text(kind.into()),
-                    SqlValue::Text(checkpoint_kind.clone()),
-                    SqlValue::Integer(MAX_VALUE_BYTES),
-                ],
-                label: Some("git.ingest_cursor.snapshot".into()),
-            })
+            .query_all(snapshot::statement(
+                &project_id,
+                kind,
+                &checkpoint_kind,
+                MAX_VALUE_BYTES,
+                "git.ingest_cursor.snapshot",
+            ))
             .await?;
         let mut cursor = Value::Null;
         let mut checkpoint = Value::Null;
@@ -118,18 +116,11 @@ fn render_row(row: &SqlRow) -> Result<Value, RuntimeError> {
     if !matches!(row.get("value_type"), Some(SqlValue::Text(t)) if t == "text" || t == "null") {
         return Err(invalid_row());
     }
-    let value_bytes = match row.get("value_bytes") {
-        Some(SqlValue::Integer(n)) if *n >= 0 => Some(*n),
-        Some(SqlValue::Null) => None,
-        _ => return Err(invalid_row()),
-    };
+    let value_bytes = snapshot::value_bytes(row).map_err(|_| invalid_row())?;
     let truncated = value_bytes.is_some_and(|n| n > MAX_VALUE_BYTES);
-    let value = match row.get("value") {
-        Some(SqlValue::Blob(bytes)) => {
-            Value::String(String::from_utf8(bytes.clone()).map_err(|_| invalid_row())?)
-        }
-        Some(SqlValue::Null) => Value::Null,
-        _ => return Err(invalid_row()),
+    let value = match snapshot::value(row).map_err(|_| invalid_row())? {
+        Some(bytes) => Value::String(String::from_utf8(bytes.to_vec()).map_err(|_| invalid_row())?),
+        None => Value::Null,
     };
     let updated_at = match row.get("updated_at") {
         Some(SqlValue::Integer(n)) => *n,

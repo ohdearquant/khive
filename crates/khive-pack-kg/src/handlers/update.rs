@@ -286,18 +286,18 @@ impl KgPack {
                 };
                 let (entity, report) = self
                     .runtime
-                    .update_entity_with_expected_version_and_embedding_report(
-                        token,
-                        id,
-                        patch,
-                        p.expected_version,
-                    )
+                    .update_entity_with_index_report(token, id, patch, p.expected_version)
                     .await?;
                 let mut response = normalize_entity_timestamps(to_json(&entity)?);
                 super::create::add_embedding_truncation_warning(
                     &mut response,
-                    report.any_truncated(),
+                    report.embedding.any_truncated(),
                 );
+                response["indexing"] = to_json(&report.indexing)?;
+                if !report.post_commit_degradations.is_empty() {
+                    response["post_commit_degradations"] =
+                        to_json(&report.post_commit_degradations)?;
+                }
                 Ok(response)
             }
             KindSpec::Edge => {
@@ -434,7 +434,7 @@ impl KgPack {
                             // The row is already absent, so this retry only
                             // reports the attachment cleanup it performed.
                             return Ok(serde_json::json!({
-                                "deleted": false, "id": p.id, "kind": "entity",
+                                "deleted": false, "id": id.to_string(), "kind": "entity",
                                 "attachment_cleanup": true,
                             }));
                         }
@@ -471,7 +471,7 @@ impl KgPack {
                                 .await?
                             {
                                 return Ok(serde_json::json!({
-                                    "deleted": false, "id": p.id, "kind": "entity",
+                                    "deleted": false, "id": id.to_string(), "kind": "entity",
                                     "attachment_cleanup": true,
                                 }));
                             }
@@ -510,7 +510,7 @@ impl KgPack {
                         .await?;
                 }
                 let mut response = to_json(
-                    &serde_json::json!({ "deleted": deleted, "id": p.id, "kind": resolved_kind }),
+                    &serde_json::json!({ "deleted": deleted, "id": id.to_string(), "kind": resolved_kind }),
                 )?;
                 if !degradations.is_empty() {
                     response["post_commit_degradations"] = serde_json::json!(degradations);
@@ -554,7 +554,7 @@ impl KgPack {
                     return Err(RuntimeError::NotFound(format!("note {}", p.id)));
                 }
                 let mut response = to_json(
-                    &serde_json::json!({ "deleted": deleted, "id": p.id, "kind": resolved_kind }),
+                    &serde_json::json!({ "deleted": deleted, "id": id.to_string(), "kind": resolved_kind }),
                 )?;
                 if !degradations.is_empty() {
                     response["post_commit_degradations"] = serde_json::json!(degradations);
@@ -563,7 +563,9 @@ impl KgPack {
             }
             KindSpec::Edge => {
                 let deleted = target.runtime.delete_edge(token, id, hard).await?;
-                to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": "edge" }))
+                to_json(
+                    &serde_json::json!({ "deleted": deleted, "id": id.to_string(), "kind": "edge" }),
+                )
             }
             KindSpec::Event => Err(immutable_event_error()),
             KindSpec::Proposal => Err(RuntimeError::InvalidInput(
@@ -610,6 +612,7 @@ impl KgPack {
                 if existing.namespace != token.namespace().as_str() {
                     return Err(foreign_restore_target(&p.id));
                 }
+                refuse_pack_registry_row(&existing, "restore")?;
                 if let Some(expected) = specific.as_ref() {
                     if existing.kind != *expected {
                         return Err(RuntimeError::InvalidInput(format!(
@@ -683,3 +686,7 @@ fn foreign_restore_target(id: &str) -> RuntimeError {
         "restore requires a tombstone in the caller's namespace: {id}"
     ))
 }
+
+#[cfg(test)]
+#[path = "update_pending_index_tests.rs"]
+mod pending_index_tests;

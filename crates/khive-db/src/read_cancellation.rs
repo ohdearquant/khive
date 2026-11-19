@@ -14,6 +14,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant as WallInstant};
 
 use khive_storage::error::StorageError;
+
+use crate::progress_conn::ProgressConn;
 use khive_storage::types::StorageResult;
 use khive_storage::{
     capture_request_read_context, RequestReadContext, RequestReadStopReason, StorageCapability,
@@ -25,12 +27,15 @@ pub const DEFAULT_SQLITE_INTERRUPT_GRACE_MS: u64 = 500;
 
 /// Resolve the validated SQLite interrupt-settlement grace.
 pub fn sqlite_interrupt_grace_from_env() -> Duration {
-    let millis = std::env::var("KHIVE_SQLITE_INTERRUPT_GRACE_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|millis| (10..=5_000).contains(millis))
-        .unwrap_or(DEFAULT_SQLITE_INTERRUPT_GRACE_MS);
-    Duration::from_millis(millis)
+    let millis = crate::env::env_parse_or(
+        "KHIVE_SQLITE_INTERRUPT_GRACE_MS",
+        DEFAULT_SQLITE_INTERRUPT_GRACE_MS,
+    );
+    Duration::from_millis(if (10..=5_000).contains(&millis) {
+        millis
+    } else {
+        DEFAULT_SQLITE_INTERRUPT_GRACE_MS
+    })
 }
 
 /// Second-stage bound applied once the grace window in
@@ -45,12 +50,15 @@ pub const DEFAULT_SQLITE_INTERRUPT_HARD_CAP_MS: u64 = 5_000;
 
 /// Resolve the validated hard cap on post-grace join waiting.
 pub fn sqlite_interrupt_hard_cap_from_env() -> Duration {
-    let millis = std::env::var("KHIVE_SQLITE_INTERRUPT_HARD_CAP_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|millis| (100..=60_000).contains(millis))
-        .unwrap_or(DEFAULT_SQLITE_INTERRUPT_HARD_CAP_MS);
-    Duration::from_millis(millis)
+    let millis = crate::env::env_parse_or(
+        "KHIVE_SQLITE_INTERRUPT_HARD_CAP_MS",
+        DEFAULT_SQLITE_INTERRUPT_HARD_CAP_MS,
+    );
+    Duration::from_millis(if (100..=60_000).contains(&millis) {
+        millis
+    } else {
+        DEFAULT_SQLITE_INTERRUPT_HARD_CAP_MS
+    })
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -63,6 +71,36 @@ struct DbReadTestContext {
     settlement_bounds: Option<(Duration, Duration)>,
     #[cfg(test)]
     bounded_wait_probe: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    diagnostic_graph_probe: Option<Arc<DiagnosticGraphTestProbe>>,
+}
+
+/// Request-local synchronization and lifecycle witnesses for diagnostic tests.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct DiagnosticGraphTestProbe {
+    pub(crate) armed: AtomicBool,
+    pub(crate) entered: AtomicBool,
+    pub(crate) release: AtomicBool,
+    pub(crate) fail_safe: AtomicBool,
+    pub(crate) interrupt_latched: AtomicBool,
+    pub(crate) progress_returned_stop: AtomicBool,
+    pub(crate) graph_returned: AtomicBool,
+    pub(crate) connection_dropped: AtomicBool,
+    pub(crate) worker_exited: AtomicBool,
+}
+
+#[cfg(test)]
+pub(crate) async fn scope_test_diagnostic_graph_probe<F>(
+    probe: Arc<DiagnosticGraphTestProbe>,
+    future: F,
+) -> F::Output
+where
+    F: Future,
+{
+    let mut context = current_test_context();
+    context.diagnostic_graph_probe = Some(probe);
+    DB_READ_TEST_CONTEXT.scope(context, future).await
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -170,6 +208,8 @@ struct ReadControl {
     fail_progress_clear: bool,
     #[cfg(test)]
     bounded_wait_probe: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    diagnostic_graph_probe: Option<Arc<DiagnosticGraphTestProbe>>,
 }
 
 impl ReadControl {
@@ -204,6 +244,8 @@ impl ReadControl {
             fail_progress_clear: test_context.fail_progress_clear,
             #[cfg(test)]
             bounded_wait_probe: test_context.bounded_wait_probe,
+            #[cfg(test)]
+            diagnostic_graph_probe: test_context.diagnostic_graph_probe,
         });
         if let Some(reason) = context.stop_reason() {
             control.cancel(stop_reason_code(reason));
@@ -233,6 +275,12 @@ impl ReadControl {
         self.stopped.store(true, Ordering::Release);
         if let RegistrationState::Running(interrupt) = &*state {
             interrupt.interrupt();
+            #[cfg(test)]
+            if let Some(probe) = &self.diagnostic_graph_probe {
+                if probe.armed.load(Ordering::Acquire) {
+                    probe.interrupt_latched.store(true, Ordering::Release);
+                }
+            }
         }
     }
 
@@ -300,12 +348,18 @@ impl ReadControl {
         }
     }
 
-    fn register<'a>(
+    fn register(
         self: &Arc<Self>,
-        conn: &'a rusqlite::Connection,
+        conn: &ProgressConn,
         capability: StorageCapability,
         blocking_context: Option<RequestReadContext>,
-    ) -> StorageResult<ActiveRead<'a>> {
+    ) -> StorageResult<ActiveRead> {
+        if !conn.armed() {
+            return Err(StorageError::Internal(format!(
+                "{} ({capability:?}): connection has no read progress handler",
+                self.operation
+            )));
+        }
         if self.progress_should_stop() {
             return Err(self.timeout_error());
         }
@@ -328,41 +382,64 @@ impl ReadControl {
             }
         }
 
-        let callback = Arc::clone(self);
-        if let Err(error) = conn.progress_handler(
-            1_000,
-            Some(move || {
-                #[cfg(any(test, feature = "test-support"))]
-                if let Some(probe) = &callback.progress_probe {
-                    probe.fetch_add(1, Ordering::Relaxed);
-                }
-                // Only the synchronous borrowed lease has no async waiter to
-                // latch its watch signal. Keep watch polling off the ordinary
-                // async progress path (its predicate remains lock-free).
-                if let Some(context) = &blocking_context {
-                    callback.poll_blocking_request(context);
-                }
-                callback.progress_should_stop()
-            }),
-        ) {
-            self.cleanup_failed.store(true, Ordering::Release);
-            self.finish();
-            return Err(StorageError::driver(capability, self.operation, error));
-        }
-
-        let previous = CURRENT_READ_CONTROL.with(|current| current.replace(Some(Arc::clone(self))));
+        let previous = CURRENT_READ.with(|current| {
+            current.replace(Some(Registered {
+                conn: conn.id(),
+                control: Arc::clone(self),
+                blocking_context,
+            }))
+        });
         if self.progress_should_stop() {
             if let RegistrationState::Running(interrupt) = &*self.state.lock() {
                 interrupt.interrupt();
             }
         }
         Ok(ActiveRead {
-            conn,
             control: Arc::clone(self),
             previous,
-            capability,
             finished: false,
         })
+    }
+
+    /// The registered read's verdict at one progress callback of its own connection.
+    fn on_progress(&self, blocking_context: Option<&RequestReadContext>) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(probe) = &self.progress_probe {
+            probe.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(test)]
+        if let Some(gate) = &self.diagnostic_graph_probe {
+            if gate.armed.load(Ordering::Acquire) {
+                gate.entered.store(true, Ordering::Release);
+                let started = WallInstant::now();
+                while !gate.release.load(Ordering::Acquire)
+                    && !gate.interrupt_latched.load(Ordering::Acquire)
+                {
+                    if started.elapsed() >= Duration::from_secs(5) {
+                        gate.fail_safe.store(true, Ordering::Release);
+                        gate.release.store(true, Ordering::Release);
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        }
+        // Only the synchronous borrowed lease has no async waiter to
+        // latch its watch signal. Keep watch polling off the ordinary
+        // async progress path (its predicate remains lock-free).
+        if let Some(context) = blocking_context {
+            self.poll_blocking_request(context);
+        }
+        let stop = self.progress_should_stop();
+        #[cfg(test)]
+        if stop {
+            if let Some(gate) = &self.diagnostic_graph_probe {
+                if gate.armed.load(Ordering::Acquire) {
+                    gate.progress_returned_stop.store(true, Ordering::Release);
+                }
+            }
+        }
+        stop
     }
 
     fn finish(&self) {
@@ -380,74 +457,98 @@ impl ReadControl {
     }
 }
 
-thread_local! {
-    static CURRENT_READ_CONTROL: RefCell<Option<Arc<ReadControl>>> = const { RefCell::new(None) };
+/// A read registered on this thread, naming the one connection its predicate may stop.
+struct Registered {
+    conn: u64,
+    control: Arc<ReadControl>,
+    blocking_context: Option<RequestReadContext>,
 }
 
-/// Predicate for a specialized SQLite progress callback (currently bounded
-/// graph traversal) to compose with the common request signal.
+/// A bounded traversal's own stop predicate, naming its connection.
+type TraversalStop = (u64, Box<dyn Fn() -> bool>);
+
+thread_local! {
+    static CURRENT_READ: RefCell<Option<Registered>> = const { RefCell::new(None) };
+    static CURRENT_TRAVERSAL: RefCell<Option<TraversalStop>> = const { RefCell::new(None) };
+}
+
+/// The permanent progress handler's verdict for connection `conn` (see `ProgressConn`): stop only
+/// when the read or traversal registered on this thread names that connection, so a statement on
+/// any other connection of the thread is never stopped by them.
+pub(crate) fn progress_stop(conn: u64) -> bool {
+    let read = CURRENT_READ.with(|current| match &*current.borrow() {
+        Some(read) if read.conn == conn => read.control.on_progress(read.blocking_context.as_ref()),
+        _ => false,
+    });
+    read || CURRENT_TRAVERSAL.with(
+        |current| matches!(&*current.borrow(), Some((owner, stop)) if *owner == conn && stop()),
+    )
+}
+
+/// Whether the read registered on this thread has been told to stop, whatever its connection.
+#[cfg(test)]
 pub(crate) fn current_read_should_interrupt() -> bool {
-    CURRENT_READ_CONTROL.with(|current| {
+    CURRENT_READ.with(|current| {
         current
             .borrow()
             .as_ref()
-            .is_some_and(|control| control.progress_should_stop())
+            .is_some_and(|read| read.control.progress_should_stop())
     })
 }
 
-struct ActiveRead<'a> {
-    conn: &'a rusqlite::Connection,
+/// Runs `body` with `stop` consulted at every progress callback of `conn`, beside any read
+/// registered on this thread, and removes it afterwards, on unwind too.
+pub(crate) fn with_traversal_stop<R>(
+    conn: &ProgressConn,
+    stop: impl Fn() -> bool + 'static,
+    body: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<TraversalStop>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURRENT_TRAVERSAL.with(|current| current.replace(self.0.take()));
+        }
+    }
+    let previous =
+        CURRENT_TRAVERSAL.with(|current| current.replace(Some((conn.id(), Box::new(stop)))));
+    let _restore = Restore(previous);
+    body()
+}
+
+struct ActiveRead {
     control: Arc<ReadControl>,
-    previous: Option<Arc<ReadControl>>,
-    capability: StorageCapability,
+    previous: Option<Registered>,
     finished: bool,
 }
 
-impl ActiveRead<'_> {
+impl ActiveRead {
+    /// Ends the registration. The handler stays on the connection and stops nothing once the
+    /// slot no longer names it, so only the injected test failure can make this fail.
     fn clear(&mut self) -> StorageResult<()> {
-        #[cfg(test)]
-        if self.control.fail_progress_clear {
-            self.control.cleanup_failed.store(true, Ordering::Release);
-            CURRENT_READ_CONTROL.with(|current| {
-                current.replace(self.previous.take());
-            });
-            self.control.finish();
-            self.finished = true;
-            return Err(StorageError::Internal(format!(
-                "{}: injected SQLite progress-handler clear failure",
-                self.control.operation
-            )));
-        }
-        let clear = self
-            .conn
-            .progress_handler(0, None::<fn() -> bool>)
-            .map_err(|error| {
-                self.control.cleanup_failed.store(true, Ordering::Release);
-                StorageError::driver(self.capability, self.control.operation, error)
-            });
-        CURRENT_READ_CONTROL.with(|current| {
+        CURRENT_READ.with(|current| {
             current.replace(self.previous.take());
         });
         self.control.finish();
         self.finished = true;
-        clear
+        #[cfg(test)]
+        if self.control.fail_progress_clear {
+            self.control.cleanup_failed.store(true, Ordering::Release);
+            return Err(StorageError::Internal(format!(
+                "{}: injected read registration clear failure",
+                self.control.operation
+            )));
+        }
+        Ok(())
     }
 }
 
-impl Drop for ActiveRead<'_> {
+impl Drop for ActiveRead {
     fn drop(&mut self) {
         if !self.finished {
-            // Panic/unwind fallback. The ordinary path calls `clear`
-            // explicitly so a failure is returned to the caller. Marking the
-            // control lets every connection owner fail closed instead of
-            // recycling a connection whose callback could not be removed.
-            if let Err(error) = self.clear() {
-                tracing::warn!(
-                    operation = self.control.operation,
-                    error = %error,
-                    "failed to clear SQLite read progress handler"
-                );
-            }
+            // Unwind: the registration is still cleared, so the handler stops nothing on this
+            // connection afterwards. A failed clear marks the control, and every connection owner
+            // then discards or retires the connection.
+            let _ = self.clear();
         }
     }
 }
@@ -472,21 +573,26 @@ impl Drop for QuarantinePooledReaderOnDrop<'_, '_> {
     }
 }
 
-struct QuarantinePooledWriterOnDrop<'guard, 'pool_ref, 'guard_pool> {
+struct QuarantinePooledWriterOnDrop<'conn, 'pool_ref> {
     pool: &'pool_ref crate::pool::ConnectionPool,
-    guard: &'guard crate::pool::WriterGuard<'guard_pool>,
+    conn: &'conn mut ProgressConn,
     control: Arc<ReadControl>,
 }
 
-impl Drop for QuarantinePooledWriterOnDrop<'_, '_, '_> {
+impl Drop for QuarantinePooledWriterOnDrop<'_, '_> {
     fn drop(&mut self) {
         if self.control.cleanup_failed.load(Ordering::Acquire) {
-            self.pool.retire_pooled_writer(self.guard.conn());
+            self.pool.retire_pooled_writer(self.conn);
         }
     }
 }
 
 impl InterruptibleReadScope {
+    #[cfg(test)]
+    pub(crate) fn diagnostic_graph_probe(&self) -> Option<Arc<DiagnosticGraphTestProbe>> {
+        self.control.diagnostic_graph_probe.clone()
+    }
+
     /// Refuse to acquire another read resource after this request stopped.
     pub(crate) fn ensure_active(&self) -> StorageResult<()> {
         if self.control.progress_should_stop() {
@@ -494,6 +600,13 @@ impl InterruptibleReadScope {
         } else {
             Ok(())
         }
+    }
+
+    /// Whether this request has been told to stop, readable from another closure.
+    #[cfg(test)]
+    pub(crate) fn stop_probe(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let control = Arc::clone(&self.control);
+        move || control.stopped.load(Ordering::Acquire)
     }
 
     /// Predicate for cooperative reader-pool checkout.
@@ -522,7 +635,7 @@ impl InterruptibleReadScope {
     }
 
     /// Run one read closure with interrupt and progress-handler ownership.
-    pub(crate) fn run<R, F>(&self, conn: &rusqlite::Connection, read: F) -> StorageResult<R>
+    pub(crate) fn run<R, F>(&self, conn: &ProgressConn, read: F) -> StorageResult<R>
     where
         F: FnOnce() -> StorageResult<R>,
     {
@@ -535,7 +648,7 @@ impl InterruptibleReadScope {
     /// this seam to roll back an interrupted snapshot in teardown order.
     pub(crate) fn run_with_interrupted_cleanup<R, F, C>(
         &self,
-        conn: &rusqlite::Connection,
+        conn: &ProgressConn,
         read: F,
         interrupted_cleanup: C,
     ) -> StorageResult<R>
@@ -548,7 +661,7 @@ impl InterruptibleReadScope {
 
     fn run_with_cleanup_and_context<R, F, C>(
         &self,
-        conn: &rusqlite::Connection,
+        conn: &ProgressConn,
         read: F,
         interrupted_cleanup: C,
         blocking_context: Option<RequestReadContext>,
@@ -602,7 +715,7 @@ impl InterruptibleReadScope {
         read: F,
     ) -> StorageResult<R>
     where
-        F: FnOnce(&rusqlite::Connection) -> StorageResult<R>,
+        F: FnOnce(&ProgressConn) -> StorageResult<R>,
     {
         self.with_pooled_reader(guard, |conn| self.run(conn, || read(conn)))
     }
@@ -616,7 +729,7 @@ impl InterruptibleReadScope {
         read: F,
     ) -> R
     where
-        F: FnOnce(&rusqlite::Connection) -> R,
+        F: FnOnce(&ProgressConn) -> R,
     {
         let quarantine = QuarantinePooledReaderOnDrop {
             guard,
@@ -634,18 +747,37 @@ impl InterruptibleReadScope {
     pub(crate) fn with_pooled_writer<R, F>(
         &self,
         pool: &crate::pool::ConnectionPool,
-        guard: &crate::pool::WriterGuard<'_>,
+        guard: &mut crate::pool::WriterGuard<'_>,
         read: F,
     ) -> R
     where
-        F: FnOnce(&rusqlite::Connection) -> R,
+        F: FnOnce(&ProgressConn) -> R,
     {
         let quarantine = QuarantinePooledWriterOnDrop {
             pool,
-            guard,
+            conn: guard.conn_mut(),
             control: Arc::clone(&self.control),
         };
-        read(quarantine.guard.conn())
+        read(quarantine.conn)
+    }
+
+    /// Keep callback-cleanup quarantine inside the owner of an admitted
+    /// pooled query. The write unit outlives both this guard and settlement.
+    pub(crate) fn with_pooled_write_unit<R, F>(
+        &self,
+        pool: &crate::pool::ConnectionPool,
+        unit: &mut crate::pool::PooledAutocommitWriteUnit<'_>,
+        query: F,
+    ) -> R
+    where
+        F: FnOnce(&ProgressConn) -> R,
+    {
+        let quarantine = QuarantinePooledWriterOnDrop {
+            pool,
+            conn: unit.conn_mut(),
+            control: Arc::clone(&self.control),
+        };
+        query(quarantine.conn)
     }
 }
 
@@ -706,7 +838,7 @@ where
 /// `None` for every other storage error and for driver errors that are not
 /// SQLite failures.
 pub(crate) fn storage_error_sqlite_code(error: &StorageError) -> Option<rusqlite::ErrorCode> {
-    let StorageError::Driver { source, .. } = error else {
+    let StorageError::Driver { source, .. } = error.without_sqlite_write_stage() else {
         return None;
     };
     if let Some(error) = source.downcast_ref::<rusqlite::Error>() {
@@ -715,7 +847,8 @@ pub(crate) fn storage_error_sqlite_code(error: &StorageError) -> Option<rusqlite
     source
         .downcast_ref::<crate::error::SqliteError>()
         .and_then(|error| match error {
-            crate::error::SqliteError::Rusqlite(error) => error.sqlite_error_code(),
+            crate::error::SqliteError::Rusqlite(error)
+            | crate::error::SqliteError::Write { source: error, .. } => error.sqlite_error_code(),
             _ => None,
         })
 }
@@ -741,6 +874,18 @@ impl Drop for CancelReadOnDrop {
     }
 }
 
+#[cfg(test)]
+struct TestDiagnosticWorkerWitness(Option<Arc<DiagnosticGraphTestProbe>>);
+
+#[cfg(test)]
+impl Drop for TestDiagnosticWorkerWitness {
+    fn drop(&mut self) {
+        if let Some(probe) = &self.0 {
+            probe.worker_exited.store(true, Ordering::Release);
+        }
+    }
+}
+
 /// Run blocking read work under the current request cancellation/deadline.
 async fn run_interruptible_read_inner<R, F>(
     capability: StorageCapability,
@@ -756,6 +901,9 @@ where
     let control = ReadControl::new(&context, operation);
     let worker_control = Arc::clone(&control);
     let mut worker = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _worker_witness =
+            TestDiagnosticWorkerWitness(worker_control.diagnostic_graph_probe.clone());
         let scope = InterruptibleReadScope {
             control: Arc::clone(&worker_control),
             capability,
@@ -912,6 +1060,61 @@ where
 mod tests {
     use super::*;
     use khive_storage::scope_request_read_cancellation;
+
+    #[test]
+    fn sqlite_interrupt_environment_bounds_remain_fresh() {
+        const GRACE: &str = "KHIVE_SQLITE_INTERRUPT_GRACE_MS";
+        const HARD_CAP: &str = "KHIVE_SQLITE_INTERRUPT_HARD_CAP_MS";
+        if crate::test_process::run_in_child(|command| {
+            command.env_remove(GRACE).env_remove(HARD_CAP);
+        }) {
+            return;
+        }
+        for (key, read, fallback, cases) in [
+            (
+                GRACE,
+                sqlite_interrupt_grace_from_env as fn() -> Duration,
+                500,
+                [
+                    ("10", 10),
+                    ("5000", 5000),
+                    ("9", 500),
+                    ("5001", 500),
+                    ("invalid", 500),
+                    (" 10 ", 500),
+                    ("18446744073709551616", 500),
+                ],
+            ),
+            (
+                HARD_CAP,
+                sqlite_interrupt_hard_cap_from_env as fn() -> Duration,
+                5000,
+                [
+                    ("100", 100),
+                    ("60000", 60000),
+                    ("99", 5000),
+                    ("60001", 5000),
+                    ("invalid", 5000),
+                    (" 100 ", 5000),
+                    ("18446744073709551616", 5000),
+                ],
+            ),
+        ] {
+            assert_eq!(read(), Duration::from_millis(fallback));
+            for (value, expected) in cases {
+                crate::test_process::set_var(key, value);
+                assert_eq!(read(), Duration::from_millis(expected), "{key}={value:?}");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                crate::test_process::set_var(key, std::ffi::OsStr::from_bytes(b"\xff"));
+                assert_eq!(read(), Duration::from_millis(fallback));
+            }
+            crate::test_process::remove_var(key);
+            assert_eq!(read(), Duration::from_millis(fallback));
+        }
+    }
 
     #[test]
     fn sqlite_progress_fast_path_never_locks_registration_state() {
@@ -1145,3 +1348,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "read_cancellation_identity_tests.rs"]
+mod identity_tests;

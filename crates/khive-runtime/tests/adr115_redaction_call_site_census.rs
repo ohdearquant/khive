@@ -1,27 +1,34 @@
 //! ADR-115 Amendment 2: named redaction surfaces close the `mask_secrets`
-//! call-site population outside `secret_gate.rs` itself. Every caller that
-//! needs the canonical detector reaches it through
+//! call-site population outside the shared storage scanner owners and their
+//! exact regression tests after the Amendment 9 extraction.
+//! Every caller that needs the canonical detector reaches it through
 //! `secret_gate::mask_for_redaction_surface`, never the raw `mask_secrets`
 //! primitive directly — a truncation-before-masking bug at a raw call site
 //! is exactly what let a credential's terminating span survive past a fixed
 //! input window on two prior call sites.
 //!
 //! This test re-derives the population from live source at test time: it
-//! walks every `.rs` file under `crates/` outside `secret_gate.rs` (which
-//! owns the primitive and its sole in-module wrapper) and asserts none of
+//! walks every `.rs` file under `crates/` outside `secret_scan.rs` (which
+//! owns the surface wrapper) and `secret_scan/masking.rs` (which owns the
+//! primitive), plus the explicit test exemptions below, and asserts none of
 //! them calls `mask_secrets(` directly. A future direct caller fails this
 //! test instead of silently joining the population.
 
 use std::path::{Path, PathBuf};
 
 /// Files exempt from the census, relative to the Cargo workspace root
-/// (`crates/` — see [`find_workspace_root`]): the primitive's owning file
-/// (which also defines the `mask_for_redaction_surface` wrapper every other
-/// caller must go through), and this census test itself, which necessarily
-/// quotes the literal string `mask_secrets(` in its own controls and panic
-/// message.
+/// (`crates/` — see [`find_workspace_root`]): the primitive's `masking.rs`
+/// owning file, the storage parent `secret_scan.rs` defining the
+/// `mask_for_redaction_surface` wrapper every other caller must go through,
+/// its extracted regression tests, and this
+/// census test itself, which quotes the literal string `mask_secrets(` in its
+/// controls and panic message.
 const EXEMPT_FILES: &[&str] = &[
-    "khive-runtime/src/secret_gate.rs",
+    "khive-storage/src/secret_scan.rs",
+    "khive-storage/src/secret_scan/masking.rs",
+    "khive-storage/src/secret_scan/tests.rs",
+    "khive-storage/src/secret_scan/issue_2655_tests.rs",
+    "khive-storage/src/secret_scan/entropy/issue_6100_tests.rs",
     "khive-runtime/tests/adr115_redaction_call_site_census.rs",
 ];
 
@@ -188,7 +195,7 @@ fn mask_secrets_has_no_direct_caller_outside_its_owning_file() {
 
     assert!(
         offending_sites.is_empty(),
-        "mask_secrets( must only be called from crates/khive-runtime/src/secret_gate.rs; \
+        "mask_secrets( callers must stay within the shared scanner's exact owner/test allow-list; \
          every other caller must route through secret_gate::mask_for_redaction_surface so \
          its mask-then-truncate contract applies instead of re-implementing (and potentially \
          getting wrong) the same bounding logic. Found direct callers outside the allow-list: \

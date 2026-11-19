@@ -1,0 +1,41 @@
+use super::*;
+
+#[cfg(test)]
+crate::writer_busy_fixture::direct_busy_case!(
+    direct_busy_graph_composition_begin,
+    |pool: std::sync::Arc<ConnectionPool>, standalone| async move {
+        tokio::task::spawn_blocking(move || {
+            if standalone {
+                run_standalone_graph_mutation_transaction(&pool, |conn| {
+                    crate::writer_busy_fixture::insert(conn)
+                        .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))
+                })
+            } else {
+                let mut guard = pool.try_writer().unwrap();
+                run_graph_mutation_transaction(&pool, guard.conn_mut(), true, |conn| {
+                    crate::writer_busy_fixture::insert(conn)
+                        .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))
+                })
+            }
+        })
+        .await
+        .unwrap()
+    }
+);
+
+#[cfg(test)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_busy_graph_composition_body_error_counts_once() {
+    crate::writer_busy_fixture::assert_transaction_body_busy(|pool, path| async move {
+        tokio::task::spawn_blocking(move || {
+            let mut guard = pool.try_writer().unwrap();
+            run_graph_mutation_transaction(&pool, guard.conn_mut(), true, |conn| {
+                crate::writer_busy_fixture::insert_blocked(conn, &path)
+                    .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))
+            })
+        })
+        .await
+        .unwrap()
+    })
+    .await;
+}

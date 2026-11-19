@@ -55,12 +55,42 @@ than depend on the operator's home directory.
 
 Individual targets: `make check`, `make clippy`, `make test`, `make fmt`.
 
+A pull request that changes only crate source under `crates/` and Markdown runs its build, test and
+clippy phases for the crates it changed and every crate that depends on them, and skips the coverage
+jobs; `CI gate` reports the scope it took. The dependents come from the workspace's own code map, and
+`scripts/ci-test-scope.py` states the rules. A change to a workflow, a CI script (including
+`scripts/ci.sh`), a `Cargo.toml` or `Cargo.lock`, cargo and toolchain configuration, or any path
+outside crate source runs the full suite, and so does every push to `main`.
+
+Pull requests from this repository's own `codex/` branches are built and tested on a dedicated host
+before review, and reach `main` through an `integration/**` branch whose push run executes every CI
+job on the merged tree. The optional benchmark and audit workflows skip every pull request from those
+branches and run on the integration push instead (the benchmark trend workflow on `main`).
+
 ## Pull Request Workflow
 
 1. Fork the repository and create a feature branch from `main`.
 2. Make your changes. All new public APIs require tests.
 3. Ensure `cargo test --workspace` and `cargo clippy --workspace -- -D warnings` pass.
 4. Open a pull request against `main`. Describe what changed and why.
+
+### Verb Contract Changes
+
+A pull request that adds, removes, or changes a verb's request or response field must
+name its governing ADR change in the PR body. The same rule applies to documented
+response behavior, including budgets and ordering. Link the ADR amendment in the
+same diff or the separate amendment PR, and identify the clauses it changes. Use the
+verb's API documentation and architecture records to identify the governing ADRs.
+
+Do not merge a contract change without that reference. The governing amendment must
+be accepted before its dependent implementation merges; preparing an implementation
+does not accept a Proposed amendment. For a refactor or fix that preserves the
+contract, explicitly state that the contract is unchanged and give the relevant
+evidence in the PR body.
+
+If this rule catches a second contract drift incident, file a separate issue for a
+lint that maps verbs to their governing ADRs and checks the PR's changes and stated
+contract preservation.
 
 ## Architecture
 

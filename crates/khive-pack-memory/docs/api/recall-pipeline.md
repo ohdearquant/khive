@@ -22,11 +22,11 @@ This deadline differs from `ann_ready_timeout_ms`: the former returns a typed `D
 
 ## Query validation and routing
 
-Noise-only queries are rejected before expensive embedding work. `is_meaningful_query` requires alphabetic or CJK content, rejects empty/symbol-only input, rejects a lone non-CJK meaningful character, and filters repeated-character gibberish.
+Noise-only queries are rejected before expensive embedding work. `is_meaningful_recall_query` requires alphabetic or CJK content, rejects empty/symbol-only input, rejects a lone non-CJK meaningful character, and filters repeated-character gibberish. The deprecated `is_meaningful_query` function delegates to this unchanged recall policy for one release; it is distinct from the text crate's `is_meaningful_text_query` policy.
 
-FTS CJK bypass uses `contains_cjk` to route the text leg through the CJK-bypass tokenizer. The dense/vector leg has no separate query-language routing: it always searches every configured embedding engine and fuses the results (issue #1115), whether or not the query contains CJK.
+`contains_cjk` (more than 15% CJK characters) sets the FTS CJK bypass, which skips document-frequency term selection in FTS gather mode and sends the first `term_k` query terms, in query order, to the ranked FTS search. The flag is read only when FTS gather is enabled, which it is not by default, and it never removes the FTS leg. The dense/vector leg has no separate query-language routing: it always searches every configured embedding engine (issue #1115), whether or not the query contains CJK. The query's script matters at fusion; see "Script-aware model weighting" below.
 
-`embed_query_model` checks the pack-local LRU by `(model, query)` and embeds on the blocking pool when absent. It uses the runtime's query-side instruction prefix, which preserves the trained retrieval space for instruction-tuned models such as multilingual-e5. Cache hits clone the stored vector result.
+`embed_query_model` checks the pack-local LRU by `(model, query)` and awaits query embedding on a miss. Dropping the request cancels a built-in model's query embedding only while its job is still queued for the embedding worker; once the worker has started it, inference runs to completion and its result is discarded. A pack-registered provider's embedding runs inline and is dropped with the request. Shared cold model initialization and its initialization event continue independently. It uses the runtime's query-side instruction prefix, which preserves the trained retrieval space for instruction-tuned models such as multilingual-e5. Cache hits clone the stored vector result.
 
 ## FTS candidate collection
 
@@ -40,13 +40,50 @@ FTS uses the unified `fts_notes` table and filters `kind = "memory"` plus visibl
 
 Every selected model is embedded concurrently. The vector leg prefers the global ANN graph and uses sqlite-vec as an exact fallback when ANN cannot serve.
 
+Per-model vector collection also runs concurrently. Each model independently checks its durable epoch, searches a warm cache, may wait for detached readiness work, and may fall back to an exact scan. Running these independent I/O paths concurrently avoids paying their latency serially, using the same single-model versus multiple-model dispatch pattern as query embedding. A retrieval failure degrades the affected model rather than aborting recall across every engine (ADR-031 engine-failure isolation).
+
 On a current warm graph, search begins with an over-fetch window. ANN results cover all namespaces, so IDs are hydrated and post-filtered to the token's visible set before returning. The initial window is `max(candidate_limit * 4, candidate_limit + 32)` and is capped by corpus size.
 
 When too few visible candidates survive, the loop doubles the fetch window per retry for a configured number of rounds, bounded by corpus exhaustion rather than a candidate cap. Widening only runs when the installed graph contains namespaces outside the caller's visible set; otherwise a larger search cannot recover namespace-filtered candidates. The loop also stops at corpus exhaustion. `ann_overfetch_max_rounds = 1` disables widening.
 
-A cold or stale graph enters `ensure_ann_for_model` under a bounded `ann_ready_timeout_ms` (default 8 seconds). A snapshot restore normally fits inside that window; a from-scratch production rebuild has exceeded 300 seconds. If another caller holds the model warm lock, or this recall begins the build itself and misses the bound, the model contributes zero vector hits, sets `ann_degraded`, and lets FTS continue. The build remains tracked and may finish for later requests. An ANN error likewise degrades rather than panicking.
+A writable cold or stale miss registers a tracked detached Warm attempt through `submit_recall_miss`. Its `ann_ready_timeout_ms` receiver budget (default 8 seconds) includes queued admission. Expiry drops only the receiver: the attempt still owns admission and supervisor joining and can finish for later requests. Expiry, a lost result sender, or received `Cancelled`, `Refused` or `FinalizationTimedOut` selects the existing degraded FTS/bounded fresh-tail path and sets `ann_degraded`; each received not-ready variant emits one WARN with its distinct reason. A completed attempt error retains the existing typed error path.
 
-When no installed graph is available after the readiness attempt — except when `ann_ready_timeout_ms` expired, where the model deliberately contributes no vector hits rather than paying an O(corpus) exact scan — sqlite-vec performs an exact query with namespace predicates in SQL. ANN post-filtering is repeated after hydration as defense in depth.
+When no installed graph is available on a path without a degradation reason, the existing sqlite-vec exact query uses namespace predicates in SQL. Readiness expiry, sender loss and received not-ready outcomes instead use the degraded path above and avoid that O(corpus) fallback. ANN post-filtering is repeated after hydration as defense in depth.
+
+## Executed raw collection plan
+
+Candidate collection uses the shared query interpreter's raw `Collect` boundary.
+The keyword slot is declared before its work starts. Model discovery remains in
+the concurrent vector branch; that branch declares its model slots before
+embedding or model retrieval starts. The returned tree orders the keyword slot
+first, then models in their existing registry/request order. Its `Keyword` text
+and `Vector` embeddings are the actual interpreted provider inputs. A disabled
+keyword arm or withheld model embedding contributes `Empty`; a completed model
+that degraded to zero hits still contributes `Vector` and its original evidence.
+
+The tree is not a standalone authorization or model-routing document. Namespace
+tokens, visible namespaces, physical model/engine bindings, session proofs,
+lexical mode, snippet policy, and ANN readiness/widening policy remain explicit
+adapter inputs. Ordinary vector nodes retain the logical candidate limit;
+provider-internal ANN overfetch and fresh-tail merging can return more raw rows.
+Raw collection preserves those rows and records the actual returned count. A
+session exact-read node carries its actual wider `max(k * 4, k + 32)` bound.
+Neither path truncates or deduplicates a provider stream at `Collect`.
+
+The memory scheduler retains its zero-, one-, two-, and more-than-two-model
+branches. One model runs inline; two model searches both settle before their
+results are checked in model order; larger groups spawn all jobs and await them
+in that same order. Request-stop and task-panic sibling cleanup retain their
+existing behavior. The interpreter neither discovers models earlier nor replaces
+these branches with its generic scheduler.
+
+`memory.recall_candidates` adds this executed `plan` beside its existing raw
+arrays. Existing hydration and namespace filters still govern those diagnostic
+arrays, retaining each surviving hit's score, rank, title, and snippet. This
+diagnostic continues to use no session fence. Ordinary serving uses the same
+collector and discards only the plan; fusion, hydration, scoring, projection,
+and telemetry remain downstream. The raw plan contains no invented `Fuse` or
+`Rerank` step.
 
 ## Fusion
 
@@ -56,11 +93,13 @@ Retrieval sources are labeled `text`, `vector`, or `both`. How per-model vector 
 - `weighted` first unions all per-model vector hits into one combined vector source by UUID (retaining the best score per duplicate), then fuses `[combined_vector, text]` under the configured vector/keyword weights.
 - `vector_only` and `keyword_only` union per-model vector hits the same way as `weighted` and route only the relevant arm; the unused arm is passed as an explicit empty source so the two-arm `[vector, keyword]` positions stay stable rather than being rebound.
 
+A strategy that discards an arm never runs it. `keyword_only` does not embed the query and does not enter ANN, the fresh-tail leg, or sqlite-vec, so it never degrades; `vector_only` does not run FTS. Under a session fence (`consistency` or a `visibility_token`), a `keyword_only` recall still waits for the fence's ANN watermark before it searches. The handler-level widening loop re-runs only the kept arm and judges corpus exhaustion on that arm alone, so a `keyword_only` query whose text arm comes back short stops after one round however many vector rows the corpus holds. `rrf`, `weighted`, and `union` run both arms as before. The diagnostic subhandlers always run both arms.
+
 Supported strategies are:
 
 | Request value  | Behavior                                                            |
 | -------------- | ------------------------------------------------------------------- |
-| `rrf`          | Reciprocal-rank fusion with `k = 60`.                               |
+| `rrf`          | Reciprocal-rank fusion with the configured `k`, or `60` if none.    |
 | `weighted`     | Weighted text/vector fusion; configured pack weights govern values. |
 | `union`        | Union candidate sets.                                               |
 | `vector_only`  | Ignore text candidates.                                             |
@@ -68,11 +107,27 @@ Supported strategies are:
 
 Unknown strategy names return `InvalidInput`. Candidate count defaults to `max(limit * candidate_multiplier, 40)` unless `candidate_limit` is explicit.
 
+### Script-aware model weighting
+
+A query is CJK-dominant when its CJK characters (`is_cjk_char`) outnumber its other letters. Digits, whitespace, and punctuation count for neither side, and a tie is not dominant, so `世界 hi` is not dominant while `世界你好 hi` is.
+
+For a CJK-dominant query, recall fuses no candidates from an English-only embedding model (`ENGLISH_ONLY_EMBEDDING_MODELS` in `config.rs`, currently `all-minilm-l6-v2`). The model is searched as usual, but its list enters fusion empty, so its weight is zero under `rrf`, `weighted`, `union`, `vector_only`, and weighted-RRF configurations. The empty list keeps its source slot, so the per-source weights of a weighted strategy stay aligned. An English WordPiece vocabulary maps most CJK characters to the unknown token and scores unrelated CJK texts as near-duplicates, so its candidates otherwise outrank correct hits from a model that can read the query.
+
+Three conditions keep the list:
+
+- No other embedding model contributed a candidate. A store whose only model is English-only keeps its vector leg.
+- The request names `embedding_model`. An explicit model choice is never overridden.
+- The query is not CJK-dominant. English and mixed queries fuse exactly as before.
+
+The rule changes fusion only. A result's reported raw `score` still takes the best similarity over every model searched, and the per-model candidate diagnostics still list each model's own hits.
+
 ## Serving-profile projection
 
 Profile resolution happens before candidate scoring. An explicit `profile_id` wins; otherwise recall resolves an actor-plus-namespace binding for consumer kind `recall`. An explicit unknown ID is an error. An absent or malformed optional profile snapshot degrades to configured defaults rather than failing recall.
 
-Every result carries `serve_attribution`: `profile` with `served_by_profile_id` when a readable profile actually served it, `unattributed` when a selected profile record could not be read, or `unspecified` when no profile resolved. The latter two omit the profile id; only `unspecified` permits later binding/default fallback. The resolved `BalancedRecallState` projects posterior means into request-local recall weights. The configured pack state is not mutated by serving another profile.
+Every result carries `serve_attribution`: `profile` with `served_by_profile_id` when a readable profile actually served it, `unattributed` when a selected profile record could not be read, or `unspecified` when no profile resolved. The latter two omit the profile id; only `unspecified` permits later binding/default fallback. A served profile scores with the configured default weights. The resolved `BalancedRecallState` supplies the per-entity posterior term; the shared-pool factor comes from the profile record's `local_factor`. The weights the profile's posterior means project to are computed only for the `profile_component` breakdown field and never enter `rank_score`. The configured pack state is not mutated by serving another profile.
+
+When a profile with a `local_factor` serves the request, each candidate whose namespace is `local` has its rank score multiplied by that factor at the point where the entity term is applied, before the first `min_score` admission; every other candidate is multiplied by 1. The returned `score` is taken before the factor. The duplicate-prefix penalty, supersedes suppression, the second `min_score` admission, the sort, the `limit` and the character budget then run on the adjusted rank scores.
 
 Per-entity posterior lookup is bounded to a 10,000-entry reconstructed LRU. The entity term is neutral for candidates without a learned posterior and is clamped to a ±15% multiplier; details are in `crates/khive-pack-memory/docs/api/scoring.md`.
 
@@ -86,7 +141,7 @@ Entity-anchored notes are loaded in one batch and merged with retrieval candidat
 
 Candidate UUIDs are hydrated in batches. Deleted notes, non-memory notes, disallowed namespaces, memory-type mismatches, tag mismatches, creation instants outside the requested `created_after`/`created_before` window, and values below raw-salience or final-score floors are removed. The handler-level re-gather loop counts only window-eligible candidates when deciding whether to widen, so strong out-of-window rows cannot satisfy the stop condition and starve eligible rows deeper in the corpus.
 
-Recall resolves legacy missing properties at read time: memory type defaults to episodic, and salience and decay factor use the same type-specific defaults as `memory.remember`. Age never goes below zero. Fusion relevance, decayed salience, independent temporal recency, profile weight projection, and the per-entity posterior term feed the final score.
+Recall resolves legacy missing properties at read time: memory type defaults to episodic, and salience and decay factor use the same type-specific defaults as `memory.remember`. Age never goes below zero. Fusion relevance, decayed salience, independent temporal recency, the per-entity posterior term and the serving profile's shared-pool factor feed the final score.
 
 Results sort deterministically by descending score with stable tie behavior. Optional score breakdowns expose component contributions and profile effects. `full_content = false` truncates returned content to 200 characters; ranking always uses full stored content.
 
@@ -111,6 +166,24 @@ the maximum ANN and fresh-tail duration. Sequential handler-level widening
 rounds and their hydration passes are accumulated. The opt-in
 `KHIVE_RECALL_PROFILE` stream remains available for higher-volume local
 profiling and is not required for this production warning.
+
+The ten-second threshold follows the `knowledge.compose` precedent (#887 / PR #915). The selection rationale placed it above the expected subsecond common recall path and inside the default thirty-second recall deadline, so slow but completing requests would become visible in the daemon log before a deadline or client timeout.
+
+## Per-call stage timings
+
+`include_timings = true` returns the same stage attribution for one call, in
+microseconds, without any environment variable. The response gains a `timings`
+object: an array response becomes `{results, timings}` and an object response
+(truncated, degraded, or verbose multi-model) keeps its fields and gains
+`timings`. The object carries `total_us` (handler time up to the response),
+`embed_us`, `fts_us`, `ann_us`, `fresh_tail_us`, and `hydrate_us` accumulated
+over all rounds with the same concurrency rules as the slow-request warning,
+`retrieval_rounds`, and `rounds[]`. Each round reports its `candidate_limit`,
+`text_hits`, `vector_hits` (summed over models, as gathered before hydration),
+`hydrated` (visible memory rows after hydration), `eligible` (rows the strategy
+and creation window can keep, the widening stop count), and its own stage
+times. A stage that did not run is `null`, never zero. Under a session fence
+the round reports the attempt that produced the candidates.
 
 ## Subhandlers
 

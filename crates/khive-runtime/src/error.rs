@@ -15,7 +15,8 @@ pub type RuntimeResult<T> = Result<T, RuntimeError>;
 pub enum DomainDisposition {
     /// The handler returned its canonical success value before a later failure.
     Committed,
-    /// The operation was refused before its handler was invoked.
+    /// No requested domain write committed, established by pre-dispatch refusal
+    /// or an explicit handler/write proof.
     NotCommitted,
     /// The handler failed, so its domain effects are not established here.
     Unknown,
@@ -54,14 +55,14 @@ impl DispatchError {
     }
 
     pub(crate) fn after_handler(source: RuntimeError, domain_succeeded: bool) -> Self {
-        Self::new(
-            source,
-            if domain_succeeded {
-                DomainDisposition::Committed
-            } else {
-                DomainDisposition::Unknown
-            },
-        )
+        let disposition = if domain_succeeded {
+            DomainDisposition::Committed
+        } else {
+            source
+                .batch_write_disposition()
+                .unwrap_or(DomainDisposition::Unknown)
+        };
+        Self::new(source, disposition)
     }
 
     /// Borrow the original error without changing its classification.
@@ -186,6 +187,13 @@ pub const WRITER_TASK_REQUEST_FAILED_STAGE: &str = "writer_task_request_failed";
 /// Stable wire code/stage for a request reported by a permanently retired
 /// writer seam.
 pub const WRITER_TASK_TERMINATED_STAGE: &str = "writer_task_terminated";
+
+/// COMMIT was issued but its caller cannot establish the outcome (ADR-135 F6).
+pub const WRITE_OUTCOME_UNKNOWN_STAGE: &str = "write_outcome_unknown";
+/// Strict routing could not reach its writer before execution (ADR-135 F6).
+pub const WRITER_OWNER_UNAVAILABLE_STAGE: &str = "writer_owner_unavailable";
+/// Strict routing refused an attempted direct logical write (ADR-135 F6).
+pub const WRITER_ROUTE_VIOLATION_STAGE: &str = "writer_route_violation";
 
 /// Stable wire code/stage for a bounded storage-admission wait (a
 /// reader/writer handle slot or a pooled reader checkout) that elapsed
@@ -559,6 +567,42 @@ pub enum RefusalEventRecording {
     },
 }
 
+/// Value-free admission evidence for one original input position.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BatchRefusal {
+    pub index: usize,
+    pub field: &'static str,
+    pub reason: &'static str,
+}
+
+/// Complete or explicitly interrupted record-list admission.
+#[derive(Debug)]
+pub struct BatchAdmissionReport {
+    pub refused: Vec<BatchRefusal>,
+    pub validation_complete: bool,
+    pub unchecked_indices: Vec<usize>,
+}
+
+/// Operation-local proof, independent of any separately recorded refusal events.
+#[derive(Debug)]
+pub struct BatchWriteContext {
+    pub source: Box<RuntimeError>,
+    pub disposition: DomainDisposition,
+    pub admission: Option<BatchAdmissionReport>,
+}
+
+impl fmt::Display for BatchWriteContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self.source.as_ref(), formatter)
+    }
+}
+
+impl std::error::Error for BatchWriteContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Original refusal and the independent evidence of recording it.
 ///
 /// The runtime variant transparently forwards this context's error source, which
@@ -612,11 +656,97 @@ impl std::error::Error for ResolutionFailureContext {
     }
 }
 
+/// The substrate whose required search metadata could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchReadSubstrate {
+    Entity,
+    Note,
+}
+
+impl SearchReadSubstrate {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Entity => "entity",
+            Self::Note => "note",
+        }
+    }
+}
+
+/// Search context with an intact typed cause that is never rendered publicly.
+#[derive(Debug)]
+pub struct SearchReadContext {
+    backend: crate::BackendId,
+    substrate: SearchReadSubstrate,
+    source: Box<RuntimeError>,
+}
+
+impl SearchReadContext {
+    pub fn backend(&self) -> &crate::BackendId {
+        &self.backend
+    }
+
+    pub fn substrate(&self) -> SearchReadSubstrate {
+        self.substrate
+    }
+
+    pub fn source(&self) -> &RuntimeError {
+        &self.source
+    }
+
+    pub(crate) fn into_source(self) -> RuntimeError {
+        *self.source
+    }
+}
+
+impl fmt::Display for SearchReadContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "search metadata read failed on backend {} ({})",
+            self.backend,
+            self.substrate.as_str()
+        )
+    }
+}
+
+impl std::error::Error for SearchReadContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Variants cover storage, query, validation, namespace isolation, and permission failures.
 /// Callers should match on `InvalidInput` for bad arguments, `NotFound` for missing records,
 /// and `NamespaceMismatch` (reported as not-found) for cross-namespace access attempts.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    /// A required search read failed; public context excludes source contents.
+    #[error(transparent)]
+    SearchRead { context: SearchReadContext },
+    /// A decoded canonical operation has no live apply implementation.
+    #[error(
+        "canonical operation {op_index}: {operation} is KnownUnimplemented for canonical apply"
+    )]
+    CanonicalUnsupportedOperation {
+        op_index: usize,
+        operation: &'static str,
+    },
+    /// A constituent was refused before canonical writer admission. Retain
+    /// its typed source without rendering submitted or captured contents.
+    #[error("canonical operation {op_index} refused")]
+    CanonicalAdmission {
+        op_index: usize,
+        #[source]
+        source: Box<RuntimeError>,
+    },
+    /// A lint fix stopped, retaining its exact typed cause and confirmed receipts.
+    #[error("{source}")]
+    LintFix {
+        #[source]
+        source: Box<RuntimeError>,
+        detail: Box<crate::graph_lint::LintFixFailureDetail>,
+    },
+
     /// The domain handler succeeded, but its post-dispatch obligation did not.
     #[error("{failure}")]
     AuditObligation {
@@ -628,10 +758,7 @@ pub enum RuntimeError {
     },
 
     #[error("storage: {0}")]
-    Storage(#[from] khive_storage::StorageError),
-
-    #[error("sqlite: {0}")]
-    Sqlite(khive_db::SqliteError),
+    Storage(#[source] khive_storage::StorageError),
 
     #[error("query: {0}")]
     Query(#[from] khive_query::QueryError),
@@ -744,6 +871,10 @@ pub enum RuntimeError {
     /// an unchanged, unadorned refusal.
     #[error(transparent)]
     RefusedWithEvents { context: RefusalEventContext },
+
+    /// A batch boundary's typed admission or atomic-write settlement evidence.
+    #[error(transparent)]
+    BatchWrite { context: Box<BatchWriteContext> },
 
     /// Preserve the original typed failure while carrying facts established
     /// before a `git.digest` ingest failed.
@@ -878,18 +1009,186 @@ pub enum RuntimeError {
         budget_ms: u64,
         elapsed_ms: u64,
     },
+
+    /// The database schema is below the V21 attachment cutover, so a runtime
+    /// cannot be constructed over it yet.
+    ///
+    /// Bring the database forward with
+    /// [`coordinate_attachment_cutover`](crate::coordinate_attachment_cutover)
+    /// (or
+    /// [`coordinate_empty_secondary_attachment_cutover`](crate::coordinate_empty_secondary_attachment_cutover)
+    /// for a secondary store) and construct the runtime afterwards. The cutover
+    /// state can be read beforehand, without migrating past V21, through
+    /// `StorageBackend::attachment_cutover_status`.
+    #[error(
+        "database is at schema V{schema_version} and requires the V{required_version} attachment \
+         cutover; run khive_runtime::coordinate_attachment_cutover before constructing \
+         KhiveRuntime"
+    )]
+    AttachmentCutoverRequired {
+        /// Schema version the database reports.
+        schema_version: u32,
+        /// First schema version that includes the attachment cutover.
+        required_version: u32,
+    },
 }
 
-impl From<khive_db::SqliteError> for RuntimeError {
-    fn from(error: khive_db::SqliteError) -> Self {
+impl From<khive_storage::StorageError> for RuntimeError {
+    fn from(error: khive_storage::StorageError) -> Self {
         match error {
-            khive_db::SqliteError::RequestReadStopped(error) => Self::Storage(error),
-            error => Self::Sqlite(error),
+            khive_storage::StorageError::SecretDetected { matched, .. } => {
+                Self::SecretDetected(*matched)
+            }
+            other => Self::Storage(other),
         }
     }
 }
 
+#[cfg(test)]
+mod secret_storage_conversion_tests {
+    use super::RuntimeError;
+    use khive_storage::{StorageCapability, StorageError};
+    use std::error::Error;
+
+    #[test]
+    fn storage_secret_conversion_preserves_safe_match_and_runtime_refusal() {
+        let key = format!("ghp_{}", "A".repeat(40));
+        let storage =
+            khive_storage::note::validate_note_key_for_store(&key, "assign_note_key_if_unset")
+                .expect_err("storage must refuse the incoming key");
+        let display = storage.to_string();
+        let runtime: RuntimeError = storage.into();
+        let RuntimeError::SecretDetected(matched) = &runtime else {
+            panic!("typed storage secret must become the existing runtime refusal: {runtime:?}");
+        };
+        assert_eq!(matched.detector, "github-token");
+        assert_eq!(matched.trigger, None);
+        assert_eq!(matched.masked, "ghp_AA...44chars");
+        assert_eq!(matched.location.as_deref(), Some("note.key"));
+        assert_eq!(runtime.to_string(), display);
+        let direct = crate::secret_gate::check_at(&key, "note", "key").unwrap_err();
+        let RuntimeError::SecretDetected(direct_match) = direct else {
+            panic!("runtime scanner must retain its typed refusal");
+        };
+        assert_eq!(matched, &direct_match);
+        assert!(!runtime.to_string().contains(&key));
+        assert!(!format!("{runtime:?}").contains(&key));
+        assert!(runtime.source().is_none());
+    }
+
+    #[test]
+    fn ordinary_storage_conversion_and_direct_wrapper_keep_the_typed_source() {
+        for converted in [false, true] {
+            let storage = StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "source-chain-fixture".into(),
+                message: "ordinary refusal".into(),
+            };
+            let expected = storage.to_string();
+            let runtime = if converted {
+                RuntimeError::from(storage)
+            } else {
+                RuntimeError::Storage(storage)
+            };
+            assert_eq!(runtime.to_string(), format!("storage: {expected}"));
+            let source = runtime
+                .source()
+                .expect("ordinary storage wrapper must retain Error::source");
+            assert!(
+                matches!(source.downcast_ref::<StorageError>(),
+                Some(StorageError::InvalidInput { capability: StorageCapability::Notes, operation, message })
+                    if operation == "source-chain-fixture" && message == "ordinary refusal"),
+                "the source must be the original typed StorageError"
+            );
+        }
+    }
+}
+
+// Compatibility bridge for concrete backend callers while ADR-071's raw-SQL
+// and backend-handle migrations remain in progress. Classification belongs to
+// the database boundary; the runtime exposes only the storage error envelope.
+impl From<khive_db::SqliteError> for RuntimeError {
+    fn from(error: khive_db::SqliteError) -> Self {
+        Self::Storage(match error {
+            khive_db::SqliteError::RequestReadStopped(error) => error,
+            error => error.into_storage_error(khive_storage::StorageCapability::Sql, "runtime"),
+        })
+    }
+}
+
 impl RuntimeError {
+    /// Attach the owning backend and substrate without exposing the cause text.
+    pub fn with_search_read_context(
+        self,
+        backend: crate::BackendId,
+        substrate: SearchReadSubstrate,
+    ) -> Self {
+        Self::SearchRead {
+            context: SearchReadContext {
+                backend,
+                substrate,
+                source: Box::new(self),
+            },
+        }
+    }
+
+    /// Certify that this operation refused before attempting requested data writes.
+    pub fn before_requested_write(self) -> Self {
+        Self::BatchWrite {
+            context: Box::new(BatchWriteContext {
+                source: Box::new(self),
+                disposition: DomainDisposition::NotCommitted,
+                admission: None,
+            }),
+        }
+    }
+
+    /// Attach admission evidence established before any requested data write.
+    pub fn with_batch_admission(self, admission: BatchAdmissionReport) -> Self {
+        Self::BatchWrite {
+            context: Box::new(BatchWriteContext {
+                source: Box::new(self),
+                disposition: DomainDisposition::NotCommitted,
+                admission: Some(admission),
+            }),
+        }
+    }
+
+    /// Preserve a single atomic write's actual typed settlement, never its rendered text.
+    pub fn atomic_write_failure(error: khive_storage::StorageError) -> Self {
+        use khive_storage::{StorageError, WriterTaskRequestState};
+        let disposition = match error.writer_request_state() {
+            Some(request_state) => match request_state {
+                WriterTaskRequestState::NotStarted
+                | WriterTaskRequestState::TransactionRolledBack => DomainDisposition::NotCommitted,
+                WriterTaskRequestState::SideEffectsUnknown => DomainDisposition::Unknown,
+            },
+            None => match error.without_sqlite_write_stage() {
+                StorageError::WriterTaskBusy { .. }
+                | StorageError::WriteQueueFull { .. }
+                | StorageError::AdmissionTimeout { .. } => DomainDisposition::NotCommitted,
+                _ => DomainDisposition::Unknown,
+            },
+        };
+        Self::BatchWrite {
+            context: Box::new(BatchWriteContext {
+                source: Box::new(Self::Storage(error)),
+                disposition,
+                admission: None,
+            }),
+        }
+    }
+
+    /// Read only this operation's proof, never a nested earlier action's finality.
+    pub fn batch_write_disposition(&self) -> Option<DomainDisposition> {
+        match self {
+            Self::BatchWrite { context } => Some(context.disposition),
+            Self::RefusedWithEvents { context } => context.source.batch_write_disposition(),
+            Self::SearchRead { context } => context.source.batch_write_disposition(),
+            _ => None,
+        }
+    }
+
     /// Attach established repo-anchor facts without changing the source error.
     pub fn with_resolution(self, resolution: ResolutionFacts) -> Self {
         Self::WithResolution {
@@ -927,7 +1226,11 @@ impl RuntimeError {
         loop {
             error = match error {
                 Self::RefusedWithEvents { context } => &context.source,
+                Self::BatchWrite { context } => &context.source,
                 Self::WithResolution { context } => context.source.as_ref(),
+                Self::SearchRead { context } => context.source.as_ref(),
+                Self::LintFix { source, .. } => source.as_ref(),
+                Self::CanonicalAdmission { source, .. } => source.as_ref(),
                 _ => return error,
             };
         }
@@ -955,6 +1258,14 @@ impl RuntimeError {
         }
     }
 
+    /// An [`Internal`](Self::Internal) error whose message is `context: source`.
+    ///
+    /// Storage and SQL failures that have no typed variant of their own use
+    /// this shape, so the rendered text is defined here once.
+    pub fn internal_with_context(context: impl fmt::Display, source: impl fmt::Display) -> Self {
+        Self::Internal(format!("{context}: {source}"))
+    }
+
     /// Classify a failed inbound channel write without inspecting rendered
     /// error text.
     ///
@@ -979,7 +1290,6 @@ impl RuntimeError {
         match self {
             Self::AuditObligation { .. } => "AuditObligation",
             Self::Storage(_) => "Storage",
-            Self::Sqlite(_) => "Sqlite",
             Self::Query(_) => "Query",
             Self::NotFound(_) => "NotFound",
             Self::InvalidInput(_) => "InvalidInput",
@@ -1012,10 +1322,16 @@ impl RuntimeError {
             Self::WriteBudgetExceeded { .. } => "WriteBudgetExceeded",
             Self::SecretDetected(_) => "SecretDetected",
             Self::DeadlineExceeded { .. } => "DeadlineExceeded",
+            Self::AttachmentCutoverRequired { .. } => "AttachmentCutoverRequired",
             Self::IncompatibleEventStore(_) => "IncompatibleEventStore",
             Self::RefusedWithReceipt { .. } => "RefusedWithReceipt",
             Self::RefusedWithEvents { context } => context.source.variant_name(),
+            Self::BatchWrite { context } => context.source.variant_name(),
             Self::WithResolution { context } => context.source.variant_name(),
+            Self::SearchRead { context } => context.source.variant_name(),
+            Self::LintFix { source, .. } => source.variant_name(),
+            Self::CanonicalAdmission { source, .. } => source.variant_name(),
+            Self::CanonicalUnsupportedOperation { .. } => "CanonicalUnsupportedOperation",
         }
     }
 
@@ -1024,11 +1340,9 @@ impl RuntimeError {
     ///
     /// Store implementations retain [`khive_db::SqliteError`] as the typed
     /// source of `StorageError::Driver`; this method carries that structure
-    /// through the runtime wrapper for the MCP wire serializer. A direct
-    /// `RuntimeError::Sqlite` follows the same classification path.
+    /// through the runtime wrapper for the MCP wire serializer.
     pub fn writer_pool_checkout_timeout_context(&self) -> Option<WriterPoolCheckoutTimeoutContext> {
         let (sqlite_error, capability, operation) = match self.refusal_source() {
-            Self::Sqlite(error) => (error, None, None),
             Self::Storage(khive_storage::StorageError::Driver {
                 capability,
                 operation,
@@ -1105,7 +1419,31 @@ impl RuntimeError {
         let Self::Storage(error) = self.refusal_source() else {
             return None;
         };
-        match error {
+        match error.without_sqlite_write_stage() {
+            khive_storage::StorageError::WriteOutcomeUnknown { .. } => {
+                Some(WriterTaskFailureContext {
+                    stage: WRITE_OUTCOME_UNKNOWN_STAGE,
+                    request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                    task_terminated: false,
+                    retryable: false,
+                })
+            }
+            khive_storage::StorageError::WriterOwnerUnavailable { source, .. } => {
+                Some(WriterTaskFailureContext {
+                    stage: WRITER_OWNER_UNAVAILABLE_STAGE,
+                    request_state: khive_storage::WriterTaskRequestState::NotStarted,
+                    task_terminated: false,
+                    retryable: source.is_retryable(),
+                })
+            }
+            khive_storage::StorageError::WriterRouteViolation { .. } => {
+                Some(WriterTaskFailureContext {
+                    stage: WRITER_ROUTE_VIOLATION_STAGE,
+                    request_state: khive_storage::WriterTaskRequestState::NotStarted,
+                    task_terminated: false,
+                    retryable: false,
+                })
+            }
             khive_storage::StorageError::WriterTaskRequestFailed {
                 request_state,
                 source,
@@ -1115,7 +1453,7 @@ impl RuntimeError {
                 task_terminated: false,
                 retryable: source.is_retryable(),
             }),
-            khive_storage::StorageError::WriterTaskTerminated { request_state } => {
+            khive_storage::StorageError::WriterTaskTerminated { request_state, .. } => {
                 Some(WriterTaskFailureContext {
                     stage: WRITER_TASK_TERMINATED_STAGE,
                     request_state: *request_state,
@@ -1130,20 +1468,51 @@ impl RuntimeError {
     /// Recover every typed failure for which this process can prove that
     /// retrying the one failed operation cannot duplicate a side effect.
     pub fn retryable_failure_context(&self) -> Option<RetryableFailureContext> {
+        let mut enclosing = self;
+        loop {
+            match enclosing {
+                Self::LintFix { .. } => return None,
+                Self::RefusedWithEvents { context } => enclosing = &context.source,
+                Self::BatchWrite { context } => enclosing = &context.source,
+                Self::WithResolution { context } => enclosing = &context.source,
+                Self::SearchRead { context } => enclosing = &context.source,
+                _ => break,
+            }
+        }
+
         let source = self.refusal_source();
         if let Some(context) = self.admission_failure_context() {
             return Some(context.into());
         }
-        if let Self::Storage(khive_storage::StorageError::WriterTaskBusy { timeout_ms }) = source {
-            return Some(RetryableFailureContext {
-                stage: WRITER_TASK_BEGIN_BUSY_STAGE,
-                timeout: Duration::from_millis(*timeout_ms),
-                capability: None,
-                operation: Some("writer_task_begin".to_string()),
-                pool_identity: None,
-                scope: None,
-                retry_after_ms: None,
-            });
+        if let Self::Storage(error) = source {
+            if let khive_storage::StorageError::WriterOwnerUnavailable { operation, source } =
+                error.without_sqlite_write_stage()
+            {
+                if source.is_retryable() {
+                    return Some(RetryableFailureContext {
+                        stage: WRITER_OWNER_UNAVAILABLE_STAGE,
+                        timeout: Duration::ZERO,
+                        capability: source.capability(),
+                        operation: Some(operation.to_string()),
+                        pool_identity: None,
+                        scope: None,
+                        retry_after_ms: None,
+                    });
+                }
+            }
+            if let khive_storage::StorageError::WriterTaskBusy { timeout_ms } =
+                error.without_sqlite_write_stage()
+            {
+                return Some(RetryableFailureContext {
+                    stage: WRITER_TASK_BEGIN_BUSY_STAGE,
+                    timeout: Duration::from_millis(*timeout_ms),
+                    capability: None,
+                    operation: Some("writer_task_begin".to_string()),
+                    pool_identity: None,
+                    scope: None,
+                    retry_after_ms: None,
+                });
+            }
         }
         if let Self::Storage(khive_storage::StorageError::ReadTransactionAgeEvicted {
             operation,
@@ -1234,479 +1603,162 @@ impl From<khive_types::KhiveError> for RuntimeError {
 }
 
 #[cfg(test)]
-mod refusal_event_context_tests {
+#[path = "error_refusal_event_context_tests.rs"]
+mod refusal_event_context_tests;
+
+#[cfg(test)]
+#[path = "error_stream_policy_refusal_tests.rs"]
+mod stream_policy_refusal_tests;
+
+#[cfg(test)]
+#[path = "error_channel_ingest_failure_class_tests.rs"]
+mod channel_ingest_failure_class_tests;
+
+#[cfg(test)]
+mod batch_write_proof_tests {
     use super::*;
+    use crate::runtime_error_value;
 
-    fn failed() -> Vec<RefusalEventRecording> {
-        vec![RefusalEventRecording::Failed {
-            item_index: 2,
-            subject: Uuid::from_u128(11),
-            error_class: RefusalRecordingErrorClass::EventAppendFailed,
-        }]
+    fn proof() -> RuntimeError {
+        RuntimeError::InvalidInput("fixture-prewrite-refusal".into()).before_requested_write()
+    }
+
+    fn project_failed(source: RuntimeError) -> (DomainDisposition, serde_json::Value) {
+        let error = DispatchError::after_handler(source, false);
+        let borrowed = error.disposition();
+        let (source, disposition) = error.into_parts();
+        assert_eq!(borrowed, disposition);
+        let value = runtime_error_value(source, disposition);
+        assert_eq!(value["domain_disposition"], disposition.as_str());
+        (disposition, value)
     }
 
     #[test]
-    fn refusal_events_preserve_the_source_type_display_and_policy_class() {
-        let original = RuntimeError::SecretDetected(crate::secret_gate::SecretMatch {
-            detector: "fixture",
-            trigger: None,
-            masked: "never-in-display".into(),
-            location: Some("atoms[2].content".into()),
-        });
-        let message = original.to_string();
-        let wrapped = original.with_refusal_events(failed());
-        assert_eq!(wrapped.to_string(), message);
-        assert!(matches!(
-            wrapped.refusal_source(),
-            RuntimeError::SecretDetected(_)
-        ));
-        assert!(std::error::Error::source(&wrapped)
-            .unwrap()
-            .downcast_ref::<RuntimeError>()
-            .is_some_and(|error| matches!(error, RuntimeError::SecretDetected(_))));
+    fn rejected_before_write_preserves_enclosing_disposition_and_error_class() {
+        let message = "decoding refused";
+        let (disposition, value) =
+            project_failed(RuntimeError::InvalidInput(message.into()).before_requested_write());
+        assert_eq!(disposition, DomainDisposition::NotCommitted);
+        assert_eq!(value["kind"], "runtime_error");
+        assert_eq!(value["message"], format!("invalid input: {message}"));
         assert_eq!(
-            wrapped.channel_ingest_failure_class(),
-            ChannelIngestFailureClass::Permanent {
-                reason: "SecretDetected"
-            }
+            RuntimeError::InvalidInput(message.into())
+                .before_requested_write()
+                .audit_error_class(),
+            crate::audit_error::AuditErrorClass::InvalidParams
         );
-        assert!(wrapped.retryable_failure_context().is_none());
+        let (ordinary, _) = project_failed(RuntimeError::InvalidInput(message.into()));
+        assert_eq!(ordinary, DomainDisposition::Unknown);
 
-        let lookalike = RuntimeError::InvalidInput(message).with_refusal_events(failed());
-        assert_eq!(
-            lookalike.channel_ingest_failure_class(),
-            ChannelIngestFailureClass::Unknown {
-                reason: "InvalidInput"
-            }
+        let enclosing = RuntimeError::InvalidInput(message.into())
+            .before_requested_write()
+            .with_resolution(ResolutionFacts {
+                project_id: Uuid::new_v4(),
+                duplicate_anchor_ids: vec![],
+                slug_backfilled: false,
+                project_created: true,
+                orphaned_project_id: None,
+                orphaned_note_count: 0,
+            });
+        let (disposition, _) = project_failed(enclosing);
+        assert_eq!(disposition, DomainDisposition::Unknown);
+        let committed = DispatchError::after_handler(
+            RuntimeError::InvalidInput(message.into()).before_requested_write(),
+            true,
         );
-        let policy = RuntimeError::Khive(
-            khive_types::KhiveError::conflict("immutable")
-                .with_details(khive_types::Details::new([("reason", "stream_member")])),
-        )
-        .with_refusal_events(failed());
-        assert!(policy.is_stream_policy_refusal());
+        assert_eq!(committed.disposition(), DomainDisposition::Committed);
+        let (source, disposition) = committed.into_parts();
+        assert_eq!(
+            runtime_error_value(source, disposition)["domain_disposition"],
+            "committed"
+        );
     }
 
     #[test]
-    fn refusal_events_preserve_retry_and_writer_finality_contexts() {
-        let checkout = RuntimeError::Sqlite(khive_db::SqliteError::WriterPoolCheckoutTimeout {
-            timeout: Duration::from_millis(17),
-        })
-        .with_refusal_events(failed());
-        assert_eq!(
-            checkout
-                .writer_pool_checkout_timeout_context()
-                .unwrap()
-                .timeout,
-            Duration::from_millis(17)
-        );
-        assert_eq!(
-            checkout.admission_failure_context().unwrap().stage,
-            WRITER_POOL_CHECKOUT_TIMEOUT_STAGE
-        );
-        assert_eq!(
-            checkout.retryable_failure_context().unwrap().stage,
-            WRITER_POOL_CHECKOUT_TIMEOUT_STAGE
-        );
-
-        let queued =
-            RuntimeError::Storage(khive_storage::StorageError::WriteQueueFull { timeout_ms: 23 })
-                .with_refusal_events(failed());
-        assert_eq!(
-            queued.retryable_failure_context().unwrap().stage,
-            WRITER_QUEUE_SATURATED_STAGE
-        );
-        assert_eq!(
-            queued.channel_ingest_failure_class(),
-            ChannelIngestFailureClass::Retryable { reason: "Storage" }
-        );
-
-        let busy =
-            RuntimeError::Storage(khive_storage::StorageError::WriterTaskBusy { timeout_ms: 31 })
-                .with_refusal_events(failed());
-        assert_eq!(
-            busy.retryable_failure_context().unwrap().stage,
-            WRITER_TASK_BEGIN_BUSY_STAGE
-        );
-
-        let stopped = RuntimeError::Storage(khive_storage::StorageError::WriterTaskTerminated {
-            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-        })
-        .with_refusal_events(failed());
-        let context = stopped.writer_task_failure_context().unwrap();
-        assert_eq!(
-            context.request_state,
-            khive_storage::WriterTaskRequestState::SideEffectsUnknown
-        );
-        assert!(context.task_terminated);
-        assert!(!context.retryable);
-        assert!(stopped.retryable_failure_context().is_none());
-    }
-
-    #[test]
-    fn refusal_events_preserve_the_original_error_and_its_underlying_source_chain() {
-        let original = RuntimeError::Storage(khive_storage::StorageError::driver(
-            khive_storage::StorageCapability::Notes,
-            "refusal-context-fixture",
-            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "fixture refusal"),
-        ));
-        let message = original.to_string();
-        let wrapped = original.with_refusal_events(failed());
-        assert_eq!(wrapped.to_string(), message);
-
-        let runtime = std::error::Error::source(&wrapped)
+    fn batch_proof_reaches_dispatch_owned_parts_and_projection() {
+        let (disposition, value) = project_failed(proof());
+        assert_eq!(disposition, DomainDisposition::NotCommitted);
+        assert!(value["message"]
+            .as_str()
             .unwrap()
-            .downcast_ref::<RuntimeError>()
-            .expect("the first source must retain the runtime classification");
-        assert!(matches!(runtime, RuntimeError::Storage(_)));
-        let storage = std::error::Error::source(runtime)
-            .unwrap()
-            .downcast_ref::<khive_storage::StorageError>()
-            .expect("the original runtime error must retain its storage source");
-        let driver = std::error::Error::source(storage)
-            .unwrap()
-            .downcast_ref::<std::io::Error>()
-            .expect("the storage source chain must remain traversable");
-        assert_eq!(driver.kind(), std::io::ErrorKind::PermissionDenied);
-    }
-
-    #[test]
-    fn refusal_events_with_no_eligible_targets_do_not_wrap_or_grow_metadata() {
-        let error = RuntimeError::InvalidInput("unchanged".into()).with_refusal_events(vec![]);
-        assert!(matches!(error, RuntimeError::InvalidInput(ref message) if message == "unchanged"));
-        let error = error
-            .with_refusal_events(failed())
-            .with_refusal_events(vec![RefusalEventRecording::Recorded {
-                item_index: 3,
-                subject: Uuid::from_u128(12),
-                event_id: Uuid::from_u128(13),
-            }]);
-        let source = std::error::Error::source(&error)
-            .unwrap()
-            .downcast_ref::<RuntimeError>()
-            .expect("appending recordings must not add another error wrapper");
-        assert!(matches!(source, RuntimeError::InvalidInput(_)));
-        assert!(std::error::Error::source(source).is_none());
-        let RuntimeError::RefusedWithEvents { context } = error else {
-            panic!("recordings must accompany the original typed source");
-        };
-        let RefusalEventContext { source, recordings } = context;
-        assert!(matches!(*source, RuntimeError::InvalidInput(_)));
-        assert_eq!(recordings.len(), 2);
-        assert_eq!(recordings[0], failed()[0]);
-    }
-
-    #[test]
-    fn refusal_recording_classes_serialize_only_the_closed_safe_spellings() {
-        for (class, name) in [
-            (
-                RefusalRecordingErrorClass::EventStoreUnavailable,
-                "event_store_unavailable",
-            ),
-            (
-                RefusalRecordingErrorClass::EventAppendFailed,
-                "event_append_failed",
-            ),
+            .contains("fixture-prewrite-refusal"));
+        for source in [
+            RuntimeError::InvalidInput("ordinary".into()),
+            RuntimeError::Storage(khive_storage::StorageError::Internal(
+                "ordinary-storage".into(),
+            )),
         ] {
-            assert_eq!(class.as_str(), name);
-            assert_eq!(
-                serde_json::to_value(class).unwrap(),
-                serde_json::json!(name)
-            );
+            assert_eq!(project_failed(source).0, DomainDisposition::Unknown);
         }
     }
-}
-
-#[cfg(test)]
-mod stream_policy_refusal_tests {
-    use super::RuntimeError;
-    use khive_types::{Details, KhiveError};
 
     #[test]
-    fn stream_policy_refusal_uses_structured_kind_and_marker() {
-        let policy = RuntimeError::Khive(
-            KhiveError::conflict("changed diagnostic wording")
-                .with_details(Details::new([("reason", "stream_member")])),
-        );
-        assert!(policy.is_stream_policy_refusal());
-
-        let wrong_kind = RuntimeError::Khive(
-            KhiveError::invalid_input("stream entries are immutable")
-                .with_details(Details::new([("reason", "stream_member")])),
-        );
-        assert!(!wrong_kind.is_stream_policy_refusal());
-    }
-
-    #[test]
-    fn stream_policy_refusal_excludes_other_conflicts_and_message_lookalikes() {
-        for marker in [
-            None,
-            Some("seq_conflict"),
-            Some("key_conflict"),
-            Some("version_conflict"),
-            Some("fence_conflict"),
-            Some("identity_conflict"),
-            Some("expired"),
-            Some("live_until_unreadable"),
-            Some("key_ambiguous"),
-            Some("unknown_op"),
-            Some("stream_member_extra"),
-        ] {
-            let mut error = KhiveError::conflict("stream entries are immutable");
-            if let Some(marker) = marker {
-                error = error.with_details(Details::new([("reason", marker)]));
-            }
-            assert!(
-                !RuntimeError::Khive(error).is_stream_policy_refusal(),
-                "unrelated conflict marker {marker:?}"
-            );
-        }
-
-        let internal = RuntimeError::Internal("conflict: stream entries are immutable".into());
-        assert!(!internal.is_stream_policy_refusal());
-        let driver = RuntimeError::Storage(khive_storage::StorageError::driver(
-            khive_storage::StorageCapability::Sql,
-            "inline.execute",
-            std::io::Error::other("stream_member"),
-        ));
-        assert!(!driver.is_stream_policy_refusal());
-    }
-}
-
-#[cfg(test)]
-mod channel_ingest_failure_class_tests {
-    use super::{ChannelIngestFailureClass, ResolutionFacts, RuntimeError};
-    use crate::secret_gate::SecretMatch;
-    use std::time::Duration;
-    use uuid::Uuid;
-
-    #[test]
-    fn secret_detected_is_permanent_by_typed_variant_not_display_text() {
-        let first = RuntimeError::SecretDetected(SecretMatch {
-            detector: "fixture",
-            trigger: None,
-            masked: "first-rendering".to_string(),
-            location: None,
-        });
-        let second = RuntimeError::SecretDetected(SecretMatch {
-            detector: "fixture",
-            trigger: Some("token"),
-            masked: "completely-different-rendering".to_string(),
-            location: None,
-        });
-
-        assert_ne!(first.to_string(), second.to_string());
+    fn enclosing_success_and_unknown_contexts_protect_prior_effects() {
+        let error = DispatchError::after_handler(proof(), true);
+        assert_eq!(error.disposition(), DomainDisposition::Committed);
+        let (source, disposition) = error.into_parts();
         assert_eq!(
-            first.channel_ingest_failure_class(),
-            ChannelIngestFailureClass::Permanent {
-                reason: "SecretDetected"
-            }
+            runtime_error_value(source, disposition)["domain_disposition"],
+            "committed"
         );
         assert_eq!(
-            second.channel_ingest_failure_class(),
-            ChannelIngestFailureClass::Permanent {
-                reason: "SecretDetected"
-            },
-            "rendered error details must not participate in ingest classification"
+            runtime_error_value(proof(), DomainDisposition::Committed)["domain_disposition"],
+            "committed"
         );
-    }
-
-    #[test]
-    fn admission_failures_are_retryable_and_unclassified_errors_are_unknown() {
-        let retryable =
-            RuntimeError::Storage(khive_storage::StorageError::WriteQueueFull { timeout_ms: 25 });
-        assert_eq!(
-            retryable.channel_ingest_failure_class(),
-            ChannelIngestFailureClass::Retryable { reason: "Storage" }
-        );
-
-        let begin_busy =
-            RuntimeError::Storage(khive_storage::StorageError::WriterTaskBusy { timeout_ms: 175 });
-        let context = begin_busy
-            .retryable_failure_context()
-            .expect("contended BEGIN must remain typed and retryable");
-        assert_eq!(context.stage, "writer_task_begin_busy");
-        assert_eq!(context.timeout, Duration::from_millis(175));
-        assert_eq!(context.operation.as_deref(), Some("writer_task_begin"));
-        assert_eq!(context.scope, None);
-        assert_eq!(context.retry_after_ms, None);
-        assert_eq!(
-            begin_busy.channel_ingest_failure_class(),
-            ChannelIngestFailureClass::Retryable { reason: "Storage" }
-        );
-
-        let unknown = RuntimeError::InvalidInput(
-            "write blocked: SecretDetected text must not affect classification".to_string(),
-        );
-        assert_eq!(
-            unknown.channel_ingest_failure_class(),
-            ChannelIngestFailureClass::Unknown {
-                reason: "InvalidInput"
-            },
-            "a rendered message resembling SecretDetected must remain Unknown unless its typed variant is SecretDetected"
-        );
-    }
-
-    #[test]
-    fn resolution_wrapper_keeps_remote_fetch_retry_classification() {
-        let wrapped = RuntimeError::RemoteFetchError {
-            remote: "https://example.com/repo".into(),
-            message: "cache repair failed".into(),
-        }
-        .with_resolution(ResolutionFacts {
-            project_id: Uuid::from_u128(1),
+        let source = proof().with_resolution(ResolutionFacts {
+            project_id: Uuid::nil(),
             duplicate_anchor_ids: vec![],
             slug_backfilled: false,
-            project_created: false,
+            project_created: true,
             orphaned_project_id: None,
             orphaned_note_count: 0,
         });
-        let RuntimeError::WithResolution { context } = &wrapped else {
-            panic!("expected resolution context");
-        };
-        assert!(matches!(
-            std::error::Error::source(context)
-                .and_then(|source| source.downcast_ref::<RuntimeError>()),
-            Some(RuntimeError::RemoteFetchError { .. })
-        ));
-        assert!(matches!(
-            wrapped.refusal_source(),
-            RuntimeError::RemoteFetchError { .. }
-        ));
-        assert!(wrapped.retryable_failure_context().is_none());
         assert_eq!(
-            wrapped.channel_ingest_failure_class(),
-            ChannelIngestFailureClass::Unknown {
-                reason: "RemoteFetchError"
-            }
+            source.batch_write_disposition(),
+            None,
+            "enclosing earlier work blocks an inner no-write proof"
         );
+        let (disposition, value) = project_failed(source);
+        assert_eq!(disposition, DomainDisposition::Unknown);
+        assert_eq!(value["details"]["resolution"]["project_created"], true);
     }
 
     #[test]
-    fn writer_task_failure_context_separates_request_finality_from_task_liveness() {
-        use khive_storage::{StorageError, WriterTaskRequestState};
-
-        let rolled_back = RuntimeError::Storage(StorageError::WriterTaskRequestFailed {
-            request_state: WriterTaskRequestState::TransactionRolledBack,
-            source: Box::new(StorageError::Pool {
-                operation: "writer_task_commit".into(),
-                message: "commit refused".into(),
-            }),
-        });
-        let rolled_back_context = rolled_back
-            .writer_task_failure_context()
-            .expect("proven rollback must remain typed through RuntimeError");
-        assert_eq!(
-            rolled_back_context.request_state,
-            WriterTaskRequestState::TransactionRolledBack
-        );
-        assert_eq!(
-            rolled_back_context.stage,
-            super::WRITER_TASK_REQUEST_FAILED_STAGE
-        );
-        assert!(!rolled_back_context.task_terminated);
-        assert!(rolled_back_context.retryable);
-
-        let unknown = RuntimeError::Storage(StorageError::WriterTaskTerminated {
-            request_state: WriterTaskRequestState::SideEffectsUnknown,
-        });
-        let unknown_context = unknown
-            .writer_task_failure_context()
-            .expect("ambiguous finality must remain typed through RuntimeError");
-        assert_eq!(
-            unknown_context.request_state,
-            WriterTaskRequestState::SideEffectsUnknown
-        );
-        assert_eq!(unknown_context.stage, super::WRITER_TASK_TERMINATED_STAGE);
-        assert!(unknown_context.task_terminated);
-        assert!(!unknown_context.retryable);
-    }
-
-    #[test]
-    fn storage_admission_timeout_is_a_retryable_admission_failure() {
-        let admission = RuntimeError::Storage(khive_storage::StorageError::AdmissionTimeout {
-            operation: "sql_bridge.writer_handle".into(),
-            timeout_ms: 30_000,
-            pool_identity: None,
-        });
-        let context = admission
-            .admission_failure_context()
-            .expect("a storage admission timeout happens before the operation starts");
-        assert_eq!(context.stage, super::STORAGE_ADMISSION_TIMEOUT_STAGE);
-        assert_eq!(context.timeout, Duration::from_millis(30_000));
-        assert_eq!(
-            context.operation.as_deref(),
-            Some("sql_bridge.writer_handle")
-        );
-        assert_eq!(context.scope, None);
-        assert_eq!(context.retry_after_ms, None);
-        assert_eq!(
-            admission.channel_ingest_failure_class(),
-            ChannelIngestFailureClass::Retryable { reason: "Storage" }
-        );
-
-        // The general mid-flight timeout stays unclassified: it proves
-        // nothing about whether work was in flight when the deadline expired.
-        let mid_flight = RuntimeError::Storage(khive_storage::StorageError::Timeout {
-            operation: "sql_bridge.reader_open".into(),
-        });
-        assert!(mid_flight.admission_failure_context().is_none());
-        assert!(mid_flight.retryable_failure_context().is_none());
-    }
-
-    /// Binds both age-eviction outcomes a cached-reader rollback can produce
-    /// (clean rollback vs. failed/denied cleanup) to the same retryable wire
-    /// stage: a regression that reverted either branch back to generic
-    /// `StorageError::Transaction` would drop this match arm entirely and
-    /// fail here, since `Transaction` does have a `retryable_failure_context`
-    /// mapping distinct from `super::READ_TX_AGE_EVICTED_STAGE`.
-    #[test]
-    fn both_read_tx_age_eviction_outcomes_map_to_the_same_retryable_stage() {
-        let clean = RuntimeError::Storage(khive_storage::StorageError::ReadTransactionAgeEvicted {
-            operation: "query_all".into(),
-            max_age_secs: 120,
-        });
-        let clean_context = clean
-            .retryable_failure_context()
-            .expect("a clean age eviction must be typed-retryable");
-        assert_eq!(clean_context.stage, super::READ_TX_AGE_EVICTED_STAGE);
-        assert_eq!(clean_context.timeout, Duration::from_secs(120));
-        assert_eq!(clean_context.operation.as_deref(), Some("query_all"));
-        assert_eq!(
-            clean_context.capability,
-            Some(khive_storage::StorageCapability::Sql)
-        );
-
-        let cleanup_failed = RuntimeError::Storage(
-            khive_storage::StorageError::ReadTransactionAgeEvictionCleanupFailed {
-                operation: "query_all".into(),
-                max_age_secs: 120,
-                message: "rollback failed: disk I/O error".into(),
+    fn batch_evidence_preserves_original_source_and_writer_finality() {
+        let source = RuntimeError::atomic_write_failure(
+            khive_storage::StorageError::WriterTaskRequestFailed {
+                request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                source: Box::new(khive_storage::StorageError::Internal(
+                    "fixture-original-cause".into(),
+                )),
             },
-        );
-        let cleanup_failed_context = cleanup_failed
-            .retryable_failure_context()
-            .expect("a failed cleanup rollback must remain typed-retryable");
+        )
+        .with_refusal_events(vec![RefusalEventRecording::Recorded {
+            item_index: 0,
+            subject: Uuid::nil(),
+            event_id: Uuid::nil(),
+        }]);
+        assert!(matches!(source.refusal_source(), RuntimeError::Storage(_)));
         assert_eq!(
-            cleanup_failed_context.stage,
-            super::READ_TX_AGE_EVICTED_STAGE
+            source.writer_task_failure_context().unwrap().request_state,
+            khive_storage::WriterTaskRequestState::TransactionRolledBack
         );
-        assert_eq!(cleanup_failed_context.timeout, Duration::from_secs(120));
-        assert_eq!(
-            cleanup_failed_context.operation.as_deref(),
-            Some("query_all")
+        let mut cause: &(dyn std::error::Error + 'static) = &source;
+        let mut retained = false;
+        while let Some(next) = cause.source() {
+            retained |= next.to_string().contains("fixture-original-cause");
+            cause = next;
+        }
+        assert!(retained, "typed cause remains below the outer error");
+        let (disposition, value) = project_failed(source);
+        assert_eq!(disposition, DomainDisposition::NotCommitted);
+        assert_eq!(value["request_state"], "transaction_rolled_back");
+        assert_eq!(value["refusal_recorded"], true);
+        let source = RuntimeError::atomic_write_failure(
+            khive_storage::StorageError::writer_task_terminated(
+                khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+            ),
         );
-        assert_eq!(
-            cleanup_failed_context.capability,
-            Some(khive_storage::StorageCapability::Sql)
-        );
-
-        assert_ne!(
-            clean.to_string(),
-            cleanup_failed.to_string(),
-            "the rendered message must distinguish a clean eviction from a failed cleanup even \
-             though both map to the same wire stage"
-        );
-        assert!(cleanup_failed.to_string().contains("rollback failed"));
+        assert_eq!(project_failed(source).0, DomainDisposition::Unknown);
     }
 }

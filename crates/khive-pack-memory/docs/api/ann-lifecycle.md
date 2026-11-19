@@ -91,9 +91,17 @@ The task runs a bounded sequence of rebuild attempts. A write that lands during 
 
 The RAII `WarmingGuard` owns guard release on every exit path. Benign shutdown cancellation is logged at debug level; genuine build errors remain warnings.
 
-## `ensure_ann_for_model`
+Idle checkpoint timers retain ANN state weakly and use a runtime clone without pack callbacks,
+so a timer cannot keep its own note-search provider alive. Dropping the last strong ANN owner
+cancels the idle timer and releases its runtime/storage handles without waiting for the checkpoint
+interval. Dropping an intermediate clone does not cancel it. Once a timer upgrades its weak owner
+and starts a checkpoint, that strong owner covers the existing attempt; last-owner cancellation
+does not interrupt an admitted publication. Process-wide daemon shutdown keeps its existing
+cancellation behavior. Checkpoint intervals, rebuild debounce, and claim coalescing are unchanged.
 
-`ensure_ann_for_model` is the shared warm chokepoint for boot, background work, and cold recall. It:
+## Admitted ANN warming
+
+Writable cold recall registers a tracked `submit_recall_miss` attempt before detached handoff and submits it through existing Warm admission and supervision. The admitted Background pathway shares the model preparation, single-flight lock and restore/build flow used by warm work:
 
 1. Reads the wildcard consumer registry before any cache fast path. An absent row is registered
    pending at `-2`; pending or other closed state evicts the cache and forces a full rebuild.
@@ -112,7 +120,7 @@ of regressing to `S = 0`. Pending, recovery, and absent registry states contribu
 
 Only one concurrent caller emits the phase start/completion pair. Resource accounting snapshots cumulative CPU at entry and exit and reports the delta, while an RAII active-phase guard lets health reporting observe `ann_warm` during execution. The phase-start event carries no corpus count: the Hot adoption path performs zero corpus I/O, and a diagnostic COUNT on every warm would defeat that; vector counts are attributed at build completion. Phase-event append failures are best effort and never change the warm result.
 
-The function returns an `AnnEnsureStatus` distinguishing already loaded, restored snapshot, built graph, empty corpus, and a build discarded because the corpus changed during scanning.
+A completed attempt returns an `AnnEnsureStatus` distinguishing already loaded, restored snapshot, built graph, empty corpus, and a build discarded because the corpus changed during scanning. Recall receives this result inside `JobOutcome`; its readiness budget includes queued admission and only bounds the receiver wait. The tracked attempt can continue after that receiver is dropped. Warm admission is one permit pool for the whole runtime, not one per model: `[runtime] warm_concurrency` sets its size and defaults to 1. With the default, a cold recall for one model can queue behind another model's warm build; when that wait outlasts the readiness budget, the recall degrades as described below while its attempt stays queued and installs the graph for later requests. Received `Cancelled`, `Refused` and `FinalizationTimedOut` outcomes each emit one WARN and select degraded FTS/bounded fresh-tail recall with a distinct variant-name reason. Completed attempt errors keep the existing typed error path.
 
 The pending row carries a durable registration timestamp. Compaction may retire it after 24 hours
 only if no checkpoint ever activated it. Retirement and log deletion share one writer transaction;

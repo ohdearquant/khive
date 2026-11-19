@@ -33,6 +33,7 @@ jobs:
           workspaces: ${{ runner.temp }}/khive-unlocked/crates
           shared-key: unlocked-dependencies
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Resolve latest compatible dependencies
         id: update

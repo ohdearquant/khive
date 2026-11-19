@@ -1358,3 +1358,221 @@ it does not imply an exemption from this new aggregate bound.
    preparation error. No member commits in either case. The at-cap control
    establishes that the preparation error is reachable and the fixture is not
    refused by an earlier admission check.
+
+## Amendment 11 (2026-10-19): a lost reply to an atomic `stream.batch` reconciles through one witness member
+
+**Status**: Proposed.
+
+### The gap
+
+§4 reconciles a lost reply to one `stream.append(expected_seq=N)`: retry, read the record at `N`,
+compare. Amendment 1 added the atomic batch and said nothing about its lost reply. A client that
+sent an atomic batch over several streams and heads, and did not get the answer, has no stated way
+to learn whether it committed. The obvious reading of §4 applied member by member re-reads every
+stream and every head the batch touched, and a head that another writer moved since cannot be
+compared at all. A request to close this with a server-side idempotency key and a stored receipt per
+batch (issue #2958) is answered here without one.
+
+### A11.1 One member witnesses the batch
+
+An atomic batch commits in one writer transaction or writes nothing (A1.1, Amendment 1 acceptance
+2). So any one of its members, found committed, proves every member committed. The client:
+
+1. Sends the batch with `atomic=true`. Without a fence the default is per-member (A1.1), and the
+   rule below holds only for a batch that commits as one unit. Before the first attempt the client
+   fixes the batch's member list and gives it an operation token: at least 122 random bits from a
+   cryptographically secure generator (a version 4 UUID qualifies), drawn once per operation and never
+   derived from the batch's content. A digest of the member list would let a reader who may read the
+   stream, but not the documents the batch writes, confirm a guessed document from the record at `N`.
+   The client writes the token nowhere else until the reply is settled, so another client cannot
+   produce it or plant it at `N` ahead of the batch. The token is the client's operation identity. It
+   does not replace any event id the records already carry.
+2. Puts the token inside the record of one `append` member that carries `expected_seq=N` on stream
+   `S`. A batch with no append member adds one witness append for the token; that costs one record.
+3. On a lost reply, reads `stream.read(stream=S, after=N-1, limit=1)`. Only an entry whose `seq` is
+   `N` is the record at `N`; after truncation the read can return the first retained entry above `N`
+   instead. The client compares the record at `N` with the token:
+   - the token is there: the whole batch committed;
+   - a different record is at `N`: this batch cannot commit at `N`; its own writes did not happen;
+   - nothing is at `N` (no entry, or the entry returned has a `seq` above `N`): not established.
+     The first attempt may still be in flight, so the read is a snapshot, not a proof of rollback.
+     The client retries the identical batch with the same `expected_seq` values, or waits, and
+     never assigns new numbers because a read came back empty.
+
+This is §4's read path applied to an atomic unit: one read, whatever the number of streams and heads
+in the batch.
+
+### A11.2 What the store guarantees, and what it does not
+
+- **Guaranteed, and now stated as contract:** a committed atomic batch is visible to every later read
+  as a whole until truncation removes any of its members: no snapshot of the store shows some of its
+  members committed and others not. A read of one stream sees only that stream's members, which is not
+  a partial view of the batch. A refused atomic batch is visible to no read.
+- **Removal exception:** truncation (A3.2) removes entries per stream, below that stream's
+  `before_seq`, with no knowledge of batches. After it, a read can show a batch's members on one stream
+  and not its members on another, and on one stream it can show the members above the floor and not
+  those below (same-stream members take consecutive numbers, Amendment 1). The `floor_seq` each read
+  returns is the signal that a prefix is gone; a missing member below the floor is not evidence that
+  the batch was partial.
+- **Not provided:** the original per-member results. The witness proves that the batch happened; it
+  does not return the `version` and `updated_at` the batch's head writes produced (Amendment 5 A5.2).
+  After another writer changes such a head, those values cannot be read back from the store. A client
+  that needs them keeps them from the reply. Only the version can be derived from what it sent: a
+  `write` member sent once in the batch with `expected_version=V` is at `V+1` after commit. `updated_at`
+  is stamped by the server inside the batch's transaction and cannot be derived.
+- **Retention:** under the truncation contract (A3.2), a witness below `floor_seq` is gone, which is
+  not evidence that the batch did not commit. A client that relies on the witness keeps it above the
+  floor until its reply is settled.
+- **Side effects:** a commit verdict is a domain verdict. Post-commit effects run after the
+  transaction and are reported by the reply's disposition, which a lost reply also loses.
+
+### A11.3 Consequence for a client that also writes heads
+
+A client that wrote a head in the batch and lost the reply learns from the witness that the batch
+landed even when another writer has moved that head since. Its next write at `V+1` then refuses with
+`version_conflict`, which is the correct stop. Re-reading the head instead would find neither the
+client's value nor its version and leave the outcome unresolved.
+
+### Alternatives considered
+
+| Alternative                                                                                    | Why not                                                                                                                                                                                                                                                                                                                                                                                     |
+| ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A caller-chosen idempotency key with a stored receipt and an expiry                            | Once an expired receipt is removed, a key never used and a key whose batch committed and was pruned are the same state, so "an unknown or expired key refuses" cannot be enforced without keeping a marker for every key forever.                                                                                                                                                           |
+| Server-issued, never-reissued reservation keys with a receipt written in the batch transaction | Coherent: a reservation is positive evidence for every keyed submission, and one issuer high-water mark replaces the per-key markers. It costs a reservation call per batch, a new table and a client-side journal of outstanding batches. It returns the original per-member results, which the first consumer does not use after a lost reply. Revisit if a consumer needs those results. |
+| A batch-level read verb ("did this batch land")                                                | Adds a server surface to answer what one `stream.read` already answers once the client carries a token.                                                                                                                                                                                                                                                                                     |
+| Re-read every member                                                                           | Costs one read per stream and head, and a moved head cannot be compared.                                                                                                                                                                                                                                                                                                                    |
+
+### Acceptance
+
+1. **Witness after commit.** An atomic batch (`atomic=true`) of two appends on two streams and one
+   head write, the first append carrying a token at `expected_seq=N`, commits;
+   `stream.read(stream=S, after=N-1, limit=1)` returns the token record at `N`.
+2. **Witness after refusal.** The same batch with a stale `expected_seq` on its second member is
+   refused (Amendment 1 arm 2); the read at `N` on `S` returns no record, and a control append by
+   another writer at `N` makes the read return that writer's record, not the token.
+3. **No partial visibility.** While one process commits atomic batches of K appends across K
+   streams, a second process reads the K streams' last entries inside one store read transaction,
+   repeatedly (a store-level test, so that the K reads share one snapshot); every reading
+   shows either all K members of a batch or none of them. A control that commits the same members as
+   a per-member batch (`atomic=false`) must produce at least one partial reading in the same harness,
+   so the arm is known to be able to see one.
+4. **Mutation.** With the atomic batch committed in two transactions split after its first member,
+   arm 3 goes red; its per-member control is unaffected.
+
+## Amendment 12 (2026-10-20): the top of the sequence range, and the truncation-row control
+
+**Status**: Proposed.
+
+### The gap
+
+A3.2 clips a `before_seq` above `head_seq + 1` to `head_seq + 1`, and a whole-prefix truncation persists
+that value as the floor. The allocator assigns every number up to `i64::MAX` and refuses only the next
+one (`crates/khive-runtime/src/streams.rs`, lines 587 and 588). A stream whose head is `i64::MAX`,
+truncated whole, would need a floor of `i64::MAX + 1`, which neither the allocator's `i64` nor a SQLite
+`INTEGER` holds. A3.2 names no bound for the head, `before_seq` or the floor, and its reader rule ("a
+reader whose `after + 1` is below the floor") overflows for `after = i64::MAX`, a cursor `stream.read`
+admits today. Issue #5805, which implements A3.2, needs both settled.
+
+Two more facts at the top of the range are not stated anywhere. An exhausted append inside a
+per-member `stream.batch` ends the whole request with an error today (the exhaustion error is not a
+member refusal, so the member loop propagates it), although A1.1 says a failing member returns as that
+member's value and its siblings stand. And the order of the two checks an append makes, `expected_seq`
+first or exhaustion first, decides what §4's retry receives at the last number.
+
+Separately, the third mutation of Amendment 3 acceptance 9 cannot go red as written (A12.3).
+
+### A12.1 The last assignable sequence number is `i64::MAX - 1`
+
+An append computes its next number as `head_seq + 1`, as today. If the append carries an
+`expected_seq` that differs from that number, it refuses with `seq_conflict` and `next_seq` set to that
+number, as §2 and §4 say, including when the number is `i64::MAX`. Otherwise, if the number is
+`i64::MAX`, the append refuses as exhausted and writes nothing. So the conflict check comes first, and a
+retry of the append that took `i64::MAX - 1` receives `seq_conflict` with `next_seq = i64::MAX`, the same
+response §4 gives any retry at a lower number; §4's comparison of the record at that number still decides
+whether the retried append is the one that committed, since another writer taking `i64::MAX - 1` first
+produces the same response.
+
+The bound applies to every number an append computes, including each number a batch allocates from its
+transaction-local cache (A1.1): the second of two appends to one stream in one batch is checked against
+`i64::MAX` as the first is.
+
+§3's insert trigger, which the A3.2 migration rewrites for the floor in any case, also refuses
+`seq = 9223372036854775807`, so the bound holds for a writer that bypasses the verbs, as density does.
+`head_seq` is then at most `i64::MAX - 1`, `head_seq + 1` is representable, and every floor A3.2 can
+persist fits in an `i64`. `before_seq` is an `i64` on the wire, and any value above `head_seq + 1`,
+`i64::MAX` included, clips to it as A3.2 says. The number given up cannot be reached by appends in
+practice: a stream is dense from its floor, and at one append per nanosecond it takes about 292 years to
+number that far.
+
+### A12.2 Exhaustion inside a batch, and the reader at the top
+
+In an atomic batch an exhausted member refuses the whole batch, which writes nothing, as any refused
+member does (A1.1): members before it that had already written are rolled back, and the refusal carries
+A1.1's `member` index and `domain_disposition: not_committed`. In a per-member batch an exhausted member
+is that member's refusal, returned as its value with the message `stream sequence exhausted` and
+`domain_disposition: not_committed`; the members before and after it stand, as A1.1 promises for every
+failing member. This changes today's behavior, where the exhaustion error ends the request. "Writes
+nothing" covers notes as well as ledger rows: a refused append leaves no note behind (§2).
+
+The reader rule of A3.2 is evaluated without overflow: a reader is behind the floor when `after` is
+below `floor_seq - 1`, which is representable because `floor_seq` is at least 1. `stream.read` keeps
+selecting entries whose `seq` is above `after`, so every admitted cursor, `i64::MAX` included, reads as
+it does today, and a reader at or past the head receives no entries.
+
+### A12.3 Amendment 3 acceptance 9, third mutation, corrected
+
+The third mutation says that with the truncation row left in place after commit, a later direct ledger
+delete succeeds. It does not. The row authorizes deletes of `seq < before_seq` on its own stream, the
+truncation removed every such entry, and every later entry takes a number at or above `before_seq`,
+because A3.2 clips `before_seq` to `head_seq + 1`. No ledger row the leaked authorization covers can
+exist, so acceptance 7's refusal stays green under the mutation. The witness is the table itself:
+after a truncate call that removes entries, one that removes nothing and one that fails (acceptance 8),
+`note_stream_truncations` holds no row. Acceptance 7 stays, as a control of the guards, and no longer
+claims to detect the leaked row.
+
+### Acceptance
+
+1. **Top of the range.** In a store fixture whose stream `s` has a persisted floor of `i64::MAX - 1`
+   and no entries (head `i64::MAX - 2`): an append with `expected_seq = i64::MAX - 1` returns that
+   `seq`; repeating it refuses with `seq_conflict` and `next_seq` `i64::MAX`; an append with no
+   `expected_seq`, and one with `expected_seq = i64::MAX`, each refuse with the exhausted error
+   (`stream sequence exhausted`), count and head unchanged. A direct ledger insert at `seq` `i64::MAX`
+   is refused by the schema.
+2. **Batches at the top.** "The same fixture" in arms 2 and 3 is the state arm 1 leaves: `s` holds its
+   entry at `i64::MAX - 1`, and two more streams `t` and `u` are below the top. An atomic batch of an
+   append on `s` and an append on `t` refuses whole, `t`'s count unchanged. An atomic batch of appends on
+   `t`, `s` and `u`, in that order, refuses whole with the exhausted refusal, `member` 1 and
+   `domain_disposition: not_committed`: `t` and `u` keep their counts and heads, and the store's note
+   count is unchanged, so the append on `t` that ran before the refusal left nothing. A per-member batch
+   of the same three appends returns three values: `t` and `u` committed, `s` the exhausted refusal with
+   `domain_disposition: not_committed`; `t` and `u` each hold one more entry, `s` is unchanged, and the
+   note count rises by two.
+
+   Exhaustion reached inside one batch: on a fresh copy of arm 1's starting fixture (floor
+   `i64::MAX - 1`, no entries), an atomic batch of two appends on `s`, with `expected_seq`
+   `i64::MAX - 1` and then `i64::MAX`, refuses whole with the exhausted refusal and `member` 1, not with
+   the schema's error; `s` keeps count 0 and head `i64::MAX - 2`, and the note count is unchanged. On a
+   second fresh copy, a per-member batch of the same two appends followed by an append on `u` returns
+   three values: the first committed at `i64::MAX - 1`, the second the exhausted refusal, and `u`
+   committed.
+3. **Reader at the top.** On the same fixture, `read(after=i64::MAX)` returns no entries and
+   `read(after=i64::MAX - 2)` returns the entry at `i64::MAX - 1`. Then `truncate(before_seq=i64::MAX)`
+   returns `removed 1, floor_seq i64::MAX, head_seq i64::MAX - 1`, `stat` count 0, `read(after=0)` and
+   `read(after=i64::MAX)` return no entries with `floor_seq` `i64::MAX`, and a following append refuses
+   as exhausted.
+4. **No truncation row survives a call.** After each of the three calls named in A12.3,
+   `note_stream_truncations` has zero rows.
+5. **Mutation.** With the allocator's bound moved back to `i64::MAX`, arm 1's exhaustion arms refuse
+   with the schema's error instead of the exhausted error (red), since the trigger still refuses the
+   insert; with the trigger's bound removed, arm 1's direct insert succeeds (red). With the exhaustion
+   check placed before the conflict check, arm 1's repeated append refuses as exhausted instead of
+   `seq_conflict` (red). With per-member exhaustion left as a request error, arm 2's per-member batch
+   returns an error and `u` is unchanged (red). With an atomic batch keeping the writes of members that
+   ran before an exhausted one, arm 2's atomic `[t, s, u]` leaves `t` one entry longer (red), while its
+   atomic `[s, t]` stays green, which is the reason for the three-member case. With the bound checked
+   only for the first number a batch allocates on a stream, arm 2's two-append atomic batch refuses with
+   the schema's error instead of the exhausted error (red). With the reader rule computed as `after + 1` in wrapping
+   arithmetic and the read starting from the larger of that value and the floor, arm 3's first
+   `read(after=i64::MAX)`, taken while the entry at `i64::MAX - 1` is retained, returns that entry or
+   panics (red). With the truncation row's delete omitted, arm 4 reads one row (red), while
+   acceptance 7 of Amendment 3 stays green under the same mutation, which is the reason for arm 4.

@@ -6,7 +6,7 @@ pub(super) fn cursor_query(
     status_clause: &str,
 ) -> String {
     let atom_filter = if table == "knowledge_atoms" {
-        " AND tags NOT LIKE '%type:domain%'"
+        " AND NOT khive_tag_contains(tags, 'type:domain')"
     } else {
         ""
     };

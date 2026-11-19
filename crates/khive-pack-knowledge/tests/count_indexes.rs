@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 
 const EVENT_COUNT: &str =
     "SELECT COUNT(*) FROM events WHERE namespace = ?1 AND verb LIKE 'knowledge.%'";
-const ATOM_COUNT: &str = "SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'";
-const LIST_COUNT: &str = "SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%' AND (status IS NULL OR status != 'deprecated')";
+const ATOM_COUNT: &str = "SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND NOT khive_tag_contains(tags, 'type:domain')";
+const LIST_COUNT: &str = "SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND NOT khive_tag_contains(tags, 'type:domain') AND (status IS NULL OR status != 'deprecated')";
 
 const SEED_EVENTS: &str =
     "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<?1) \
@@ -65,12 +65,13 @@ async fn seed(runtime: &KhiveRuntime, events: i64, atoms: i64) {
 fn set_indexes(runtime: &KhiveRuntime, indexed: bool) {
     let writer = runtime.backend().pool().writer().unwrap();
     writer
-        .conn()
-        .execute_batch(if indexed {
-            include_str!("../../khive-db/sql/032-knowledge-count-indexes.sql")
-        } else {
-            "DROP INDEX IF EXISTS idx_events_ns_verb; \
+        .autocommit(|conn| {
+            Ok(conn.execute_batch(if indexed {
+                include_str!("../../khive-db/sql/032-knowledge-count-indexes.sql")
+            } else {
+                "DROP INDEX IF EXISTS idx_events_ns_verb; \
              DROP INDEX IF EXISTS idx_knowledge_atoms_ns_live_counts;"
+            })?)
         })
         .unwrap();
 }

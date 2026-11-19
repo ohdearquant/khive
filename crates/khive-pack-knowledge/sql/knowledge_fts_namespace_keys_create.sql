@@ -1,0 +1,4 @@
+CREATE TABLE knowledge_fts_namespace_keys (
+    slot INTEGER PRIMARY KEY AUTOINCREMENT CHECK(slot BETWEEN 1 AND 262143999999),
+    namespace_value TEXT NOT NULL UNIQUE
+);

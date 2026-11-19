@@ -138,6 +138,9 @@ pub struct NamespaceToken {
     visible: Vec<Namespace>,
     actor: ActorRef,
     process_ref: Option<String>,
+    /// Namespaces the caller declared it owns (`[actor] owned_namespaces`).
+    /// Read only through [`NamespaceToken::owns`]; it never widens visibility.
+    owned: Vec<Namespace>,
     _sealed: private::Sealed,
 }
 
@@ -167,6 +170,7 @@ impl NamespaceToken {
             visible,
             actor,
             process_ref: None,
+            owned: Vec::new(),
             _sealed: private::Sealed,
         }
     }
@@ -272,6 +276,27 @@ impl NamespaceToken {
         self
     }
 
+    /// Return whether the caller declared that it owns `namespace`.
+    ///
+    /// The declaration is the `[actor] owned_namespaces` list carried on the
+    /// caller's identity. It is consulted by the `memory.apply_batch` old-row
+    /// namespace check alone: ownership grants no write into the namespace and
+    /// widens no read.
+    pub fn owns(&self, namespace: &str) -> bool {
+        self.owned.iter().any(|owned| owned.as_str() == namespace)
+    }
+
+    /// The caller's declared owned namespaces, for carrying the declaration
+    /// onto a re-minted token or a nested dispatch identity.
+    pub(crate) fn owned_namespaces(&self) -> &[Namespace] {
+        &self.owned
+    }
+
+    pub(crate) fn with_owned_namespaces(mut self, owned: Vec<Namespace>) -> Self {
+        self.owned = owned;
+        self
+    }
+
     /// Return a new token with the same actor but a different namespace.
     /// The Gate namespace metadata is reset to the new primary namespace.
     ///
@@ -282,8 +307,13 @@ impl NamespaceToken {
     /// the intended narrow scope (e.g. a single `create_note` call). A future
     /// security model should replace this pattern with a type-enforced
     /// append-only capability that goes through the Gate.
+    ///
+    /// The owned-namespace declaration describes the caller, not the target
+    /// namespace, so it is kept on the new token.
     pub fn with_namespace(&self, ns: Namespace) -> Self {
-        Self::mint_authorized(ns, self.actor.clone()).with_process_ref(self.process_ref.clone())
+        Self::mint_authorized(ns, self.actor.clone())
+            .with_process_ref(self.process_ref.clone())
+            .with_owned_namespaces(self.owned.clone())
     }
 }
 
@@ -312,11 +342,29 @@ pub fn process_ref_from_env() -> Option<String> {
 /// supported async khive-mcp/kkernel host builders. Direct backend assembly is
 /// reserved for an already-coordinated database; use
 /// [`crate::KhiveRuntime::from_prepared_backend`] when that precondition has
-/// been established. `embedding_model` remains as the primary-model config
-/// shorthand beside the provider registry.
+/// been established. `engines` is the ordered peer configuration; absent peers
+/// retain the legacy programmatic model shorthand until startup preparation.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
+    /// Maximum simultaneous background warm jobs in the host's shared domain.
+    /// Must be positive and fit Tokio's semaphore capacity.
+    pub warm_concurrency: usize,
+    /// Maximum simultaneous background maintenance jobs; interactive is unbounded.
+    pub maintenance_concurrency: usize,
+    /// Named custody references; secret material stays inside credential providers.
+    pub credentials: Vec<crate::credentials::CredentialConfig>,
+    /// Configured receipt key ring. Absence never generates a replacement key.
+    pub visibility_receipts: Option<crate::credentials::VisibilityReceiptConfig>,
+
     pub mounts: Vec<crate::mount_config::MountConfig>,
+
+    /// Opaque values retained from `[channel.*]` without interpretation.
+    pub channel: crate::channel_section::ChannelSectionConfig,
+    /// Host-supplied validators installed before pack registry construction.
+    pub channel_config_validators: crate::channel_section::ChannelConfigValidators,
+    /// Trusted host routes for custom communication address kinds. These
+    /// process-local callbacks must be installed in the dispatching host.
+    pub channel_send_routes: crate::channel_send::ChannelSendRoutes,
 
     /// Path to the SQLite database file. `None` = in-memory (tests).
     ///
@@ -324,6 +372,12 @@ pub struct RuntimeConfig {
     /// builders, which coordinate V21 before constructing runtimes. Tests and
     /// already-current single-backend callers may still use it directly.
     pub db_path: Option<std::path::PathBuf>,
+    /// Canonicalization boundary for registered code-map database files.
+    pub code_map_root: Option<String>,
+    /// Operator-declared code maps loaded into the runtime registry at construction.
+    pub code_maps: Vec<crate::engine_config::CodeMapConfig>,
+    /// Declared SQLite backend paths protected from code-map registration.
+    pub code_map_protected_database_paths: Vec<std::path::PathBuf>,
     /// The WAL ceiling applied to this runtime's implicit main backend.
     /// Zero means disabled, including for a read-only backend that retains a
     /// nonzero configured value only for operator reporting.
@@ -336,9 +390,22 @@ pub struct RuntimeConfig {
     /// this same value to resolve every named backend before forwarding or
     /// opening it, without rereading mutable process environment.
     pub wal_ceiling_env_raw: Option<String>,
+    /// One snapshot for named backend resolution and daemon compatibility.
+    pub disk_guard_environment: khive_db::DiskGuardEnvironment,
+    /// Captured implicit-main policy, or an explicit caller-supplied policy.
+    pub disk_guard_config: Option<khive_db::EffectiveDiskGuardConfig>,
+    /// Directory for the SQLite volume lock files, captured with the rest of
+    /// boot configuration from [`crate::daemon::volume_lock_dir`]. `None` means
+    /// no directory could be resolved; every writable file-backed open then
+    /// fails with a configuration error naming `KHIVE_VOLUME_LOCK_DIR`.
+    pub volume_lock_dir: Option<std::path::PathBuf>,
     /// Namespace used when no explicit namespace is provided.
     pub default_namespace: Namespace,
-    /// Local embedding model. `None` alone does not disable embedding: setting
+    /// Ordered participating engines. `Some`, including an empty list, is
+    /// authoritative; `None` converts the legacy model fields at startup.
+    pub engines: Option<Vec<crate::engine_config::EngineConfig>>,
+    /// Legacy local embedding model, used when `engines` is absent and otherwise
+    /// projected from its first peer at startup. `None` alone does not disable embedding: setting
     /// only this field to `None` while `additional_embedding_models` is
     /// non-empty still registers those models. Both `embedding_model` and
     /// `additional_embedding_models` must be empty to disable built-in
@@ -351,7 +418,8 @@ pub struct RuntimeConfig {
     /// This field persists for backward compatibility until the embedder registry
     /// is fully plumbed.
     pub embedding_model: Option<EmbeddingModel>,
-    /// Additional embedding models to make available by request name.
+    /// Legacy additional embedding models, used when `engines` is absent and
+    /// otherwise projected from its remaining peers at startup.
     ///
     /// `embedding_model` remains the default used by existing `embed()` and
     /// `embed_batch()` callers. This list adds non-default models that can be
@@ -400,6 +468,12 @@ pub struct RuntimeConfig {
     /// escape and is not widened. Populated from `actor.visible_namespaces`
     /// in `khive.toml`.
     pub visible_namespaces: Vec<Namespace>,
+    /// Namespaces this actor declared it owns (ADR-021 Delta 1). Populated from
+    /// `actor.owned_namespaces` in `khive.toml`. Empty by default. Ownership is
+    /// read by the `memory.apply_batch` old-row namespace check alone: it grants
+    /// no write into the namespace and widens no read, and it is NOT folded into
+    /// `visible_namespaces`.
+    pub owned_namespaces: Vec<Namespace>,
     /// Namespaces this actor's comm.send/reply may deliver messages INTO
     /// (outbound, sender-side). Populated from `actor.allowed_outbound_namespaces`
     /// in `khive.toml`. Empty by default — cross-namespace delivery denied
@@ -416,6 +490,11 @@ pub struct RuntimeConfig {
     /// `ActorRef::anonymous()` and inbox is scoped to party-line messages —
     /// those addressed to `"local"` or carrying no `to_actor` stamp.
     pub actor_id: Option<String>,
+    /// Strict attributed-actor mode requested by configuration: `[actor]
+    /// require_attributed = true` in the database-anchored or the project
+    /// config. The `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` environment flag is read
+    /// separately by the enforcing seam; either one turns the refusal on.
+    pub require_attributed_actor: bool,
     /// Resolved `[brain]` policy from the serving process's configuration.
     pub brain: crate::engine_config::BrainSectionConfig,
     /// Resolved `[git_write]` policy allowlist (ADR-108 Amendment), populated
@@ -466,15 +545,22 @@ const ANN_REBUILD_THRESHOLD_DEFAULT: f64 = 0.20;
 
 /// Read the ANN tail-rebuild fraction on each invocation (ADR-079 Amendment 2).
 ///
+/// ADR-079's `ann_rebuild_threshold` default rationale describes the raw-row
+/// policy, its workload assumptions and its coupled maintenance/visibility roles.
+///
 /// The exact environment value must parse as `f64` and lie in `(0, 1]`;
 /// unset, non-Unicode, malformed and out-of-range values use `0.20`.
 /// This reader deliberately does not trim or cache the value.
 pub fn ann_rebuild_threshold_from_env() -> f64 {
-    std::env::var("KHIVE_ANN_REBUILD_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| *v > 0.0 && *v <= 1.0)
-        .unwrap_or(ANN_REBUILD_THRESHOLD_DEFAULT)
+    let value = khive_types::env::env_parse_or(
+        "KHIVE_ANN_REBUILD_THRESHOLD",
+        ANN_REBUILD_THRESHOLD_DEFAULT,
+    );
+    if value > 0.0 && value <= 1.0 {
+        value
+    } else {
+        ANN_REBUILD_THRESHOLD_DEFAULT
+    }
 }
 
 #[cfg(test)]
@@ -516,10 +602,10 @@ impl Default for RuntimeConfig {
         let db_path = std::env::var("HOME")
             .ok()
             .map(|h| std::path::PathBuf::from(h).join(".khive/khive.db"));
-        let embedding_model = std::env::var("KHIVE_EMBEDDING_MODEL")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .or(Some(EmbeddingModel::AllMiniLmL6V2));
+        let embedding_model = Some(khive_types::env::env_parse_or(
+            "KHIVE_EMBEDDING_MODEL",
+            EmbeddingModel::AllMiniLmL6V2,
+        ));
         // Ships single-engine. A second engine is embedded on every write and
         // searched on every read, which is cost a deployment should opt into
         // rather than inherit: set KHIVE_ADDITIONAL_EMBEDDING_MODELS to add one.
@@ -539,13 +625,24 @@ impl Default for RuntimeConfig {
             .ok()
             .filter(|s| !s.trim().is_empty());
         Self {
+            warm_concurrency: DEFAULT_WARM_CONCURRENCY,
+            maintenance_concurrency: DEFAULT_MAINTENANCE_CONCURRENCY,
+            credentials: Vec::new(),
+            visibility_receipts: None,
             db_path,
+            code_map_root: None,
+            code_maps: Vec::new(),
+            code_map_protected_database_paths: Vec::new(),
             wal_ceiling_bytes: 0,
             wal_ceiling_configured_bytes: 0,
             wal_ceiling_source: WalCeilingSource::Default,
             wal_ceiling_env_raw: std::env::var_os("KHIVE_SQLITE_WAL_CEILING_BYTES")
                 .map(|value| value.to_string_lossy().into_owned()),
+            disk_guard_environment: khive_db::DiskGuardEnvironment::capture(),
+            disk_guard_config: None,
+            volume_lock_dir: crate::daemon::volume_lock_dir().ok(),
             default_namespace: Namespace::local(),
+            engines: None,
             embedding_model,
             additional_embedding_models,
             gate: Arc::new(AllowAllGate),
@@ -554,8 +651,10 @@ impl Default for RuntimeConfig {
             backend_id: BackendId::main(),
             brain_profile,
             visible_namespaces: vec![],
+            owned_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id,
+            require_attributed_actor: false,
             brain: crate::engine_config::BrainSectionConfig::default(),
             git_write: crate::engine_config::GitWriteSectionConfig::default(),
             blob: crate::engine_config::BlobSectionConfig {
@@ -566,6 +665,9 @@ impl Default for RuntimeConfig {
             exec: crate::engine_config::ExecSectionConfig::default(),
             telemetry: crate::telemetry_config::TelemetryConfig::default(),
             mounts: Vec::new(),
+            channel: crate::channel_section::ChannelSectionConfig::default(),
+            channel_config_validators: crate::channel_section::ChannelConfigValidators::default(),
+            channel_send_routes: crate::channel_send::ChannelSendRoutes::default(),
             display_timezone: resolve_default_display_timezone(),
             events_split: None,
             web: crate::engine_config::WebSectionConfig::default(),
@@ -574,6 +676,61 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// Effective ordered peers with canonical built-in names, without binding
+    /// providers or mutating the configuration. Startup must still validate them.
+    pub fn configured_engines(&self) -> Vec<crate::engine_config::EngineConfig> {
+        match &self.engines {
+            Some(engines) => engines
+                .iter()
+                .cloned()
+                .map(|mut engine| {
+                    engine.name = crate::engine_config::canonical_engine_name(&engine.name);
+                    engine
+                })
+                .collect(),
+            None => configured_embedding_models(self)
+                .into_iter()
+                .map(|model| crate::engine_config::EngineConfig {
+                    name: model.to_string(),
+                    weight: 1.0,
+                    dims: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Validate and canonicalize ordered peers without resolving providers.
+    ///
+    /// Legacy programmatic model fields remain accepted when `engines` is
+    /// absent. Once prepared, those fields are projections of the peer list.
+    /// Hosts finalize provider binding after registering their custom providers.
+    pub fn prepare_engines(&mut self) -> RuntimeResult<()> {
+        let mut engines = self.configured_engines();
+        crate::engine_config::validate_peer_engines(self.engines.as_deref().unwrap_or(&engines))
+            .map_err(|error| crate::RuntimeError::InvalidInput(error.to_string()))?;
+
+        for engine in &mut engines {
+            engine.name = crate::engine_config::canonical_engine_name(&engine.name);
+        }
+        self.embedding_model = engines
+            .first()
+            .and_then(|engine| parse_embedding_model_alias(&engine.name));
+        self.additional_embedding_models = engines
+            .iter()
+            .skip(1)
+            .filter_map(|engine| parse_embedding_model_alias(&engine.name))
+            .collect();
+        self.engines = Some(engines);
+        Ok(())
+    }
+
+    /// Disable configured vector participation, including legacy model seeds.
+    pub fn disable_embedding_models(&mut self) {
+        self.engines = Some(Vec::new());
+        self.embedding_model = None;
+        self.additional_embedding_models.clear();
+    }
+
     /// The WAL ceiling policy this config asks its implicit main backend to
     /// open with. Preserves a configured ceiling for read-only reporting while
     /// ensuring a directly constructed config cannot silently drop a nonzero
@@ -624,14 +781,47 @@ impl RuntimeConfig {
         Ok(self.wal_ceiling_policy())
     }
 
+    /// Resolve the implicit backend's disk reserve and guard deadline from the
+    /// config's captured environment, unless a caller already supplied a policy.
+    /// Read-only and in-memory backends have no writer to guard.
+    pub fn resolve_disk_guard_policy(
+        &mut self,
+        read_only: bool,
+    ) -> RuntimeResult<Option<khive_db::EffectiveDiskGuardConfig>> {
+        if self.db_path.is_none() {
+            if self
+                .disk_guard_config
+                .is_some_and(|policy| policy.reserve_bytes != 0)
+            {
+                return Err(khive_db::SqliteError::InvalidConfig(
+                    "nonzero disk_reserve_bytes requires a file-backed SQLite backend".into(),
+                )
+                .into());
+            }
+            return Ok(None);
+        }
+        if read_only {
+            return Ok(None);
+        }
+        let policy = match self.disk_guard_config {
+            Some(policy) => {
+                policy.validate()?;
+                policy
+            }
+            None => self.disk_guard_environment.resolve(None, None)?,
+        };
+        self.disk_guard_config = Some(policy);
+        Ok(Some(policy))
+    }
+
     /// Pack-registry discovery has no file-backed writer to govern.
     pub fn for_metadata_registry(mut self) -> Self {
         self.db_path = None;
         self.wal_ceiling_bytes = 0;
         self.wal_ceiling_configured_bytes = 0;
         self.wal_ceiling_source = WalCeilingSource::BackendField;
-        self.embedding_model = None;
-        self.additional_embedding_models.clear();
+        self.disk_guard_config = None;
+        self.disable_embedding_models();
         self
     }
 
@@ -812,15 +1002,33 @@ pub fn resolve_project_actor_id(
         .filter(|s| !s.trim().is_empty()))
 }
 
+/// Read `[actor].require_attributed` from the explicit config, or with none from
+/// every existing discovery tier (the one anchored at `db_path` included), ORed.
+///
+/// The database-anchored load already carries the key into
+/// [`RuntimeConfig::require_attributed_actor`]; callers OR the two, so a request
+/// for strict mode in any file holds and a higher-precedence file without the key
+/// cannot shadow one that sets it. `Ok(false)` when no file sets it.
+pub fn resolve_project_requires_attributed_actor(
+    config_path: Option<&std::path::Path>,
+    db_path: Option<&std::path::Path>,
+) -> Result<bool, crate::engine_config::ConfigError> {
+    crate::engine_config::KhiveConfig::require_attributed_in_any_tier(config_path, db_path)
+}
+
 // ---- Embedding model helpers ----
 
 /// Sanitize an embedding model name into a valid SQL table suffix.
 /// e.g. `bge-small-en-v1.5` -> `bge_small_en_v1_5`
+#[cfg(test)]
 pub(crate) fn vec_model_key(model: EmbeddingModel) -> String {
     sanitize_key(&model.to_string())
 }
 
-pub(crate) fn sanitize_key(s: &str) -> String {
+/// Preserve ASCII letters and digits; replace every other Unicode character with `_`.
+/// Used for model-name table suffixes; this mapping does not preserve uniqueness.
+#[doc(hidden)]
+pub fn sanitize_key(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
@@ -835,13 +1043,20 @@ pub(crate) fn build_embedder_registry(
         registry.register_builtin(LatticeEmbedderProvider::new(model));
     }
     let default_embedder_name = config
-        .embedding_model
-        .map(|model| Arc::<str>::from(model.to_string()))
+        .configured_engines()
+        .first()
+        .map(|engine| Arc::<str>::from(engine.name.as_str()))
         .unwrap_or_else(|| Arc::<str>::from(""));
     (registry, default_embedder_name)
 }
 
 fn configured_embedding_models(config: &RuntimeConfig) -> Vec<EmbeddingModel> {
+    if let Some(engines) = &config.engines {
+        return engines
+            .iter()
+            .filter_map(|engine| parse_embedding_model_alias(&engine.name))
+            .collect();
+    }
     let mut models: Vec<EmbeddingModel> = Vec::new();
     if let Some(model) = config.embedding_model {
         models.push(model);
@@ -871,16 +1086,13 @@ pub(crate) fn register_configured_embedding_models(
 
 /// Build a `RuntimeConfig` from a parsed `KhiveConfig`.
 ///
-/// For each `[[engines]]` entry:
-/// - The engine flagged `default = true` becomes `RuntimeConfig::embedding_model`.
-/// - All other engines become `RuntimeConfig::additional_embedding_models`.
-///
-/// `KhiveConfig::validate()` rejects an unrecognized engine model at load time.
-/// A caller-constructed config that bypasses validation still skips an invalid
-/// engine with a warning here.
-///
-/// If `khive_cfg.engines` is empty, the returned `RuntimeConfig` uses the
-/// env-var-derived defaults from `RuntimeConfig::default()`.
+/// Declared engines preserve their order and dimension assertions. The first
+/// peer is projected into the legacy single-model field when it is built-in;
+/// hosts bind the complete list after provider registration, before serving.
+/// An explicit empty list disables participation; an absent list preserves
+/// the caller's base configuration, including environment-derived defaults.
+/// Load file input with [`crate::KhiveConfig::load`] to preserve that distinction
+/// and convert legacy declarations before calling this function.
 ///
 /// When both a config file and `KHIVE_EMBEDDING_MODEL` env var are present,
 /// the caller is responsible for emitting a warning that env vars are overridden.
@@ -893,6 +1105,22 @@ pub fn runtime_config_from_khive_config(
     // `local`); it only widens the read visible-set below.
     let default_namespace = base.default_namespace.clone();
     let mounts = khive_cfg.mounts.clone();
+    let channel = khive_cfg.channel.clone();
+    let credentials = khive_cfg.credentials.clone();
+    let visibility_receipts = khive_cfg.visibility_receipts.clone();
+    let code_map_root = khive_cfg.code_map_root.clone();
+    let code_maps = khive_cfg.code_maps.clone();
+    let code_map_protected_database_paths = khive_cfg
+        .backends
+        .iter()
+        .filter(|backend| backend.kind == crate::engine_config::BackendKind::Sqlite)
+        .filter_map(|backend| {
+            backend
+                .path
+                .as_deref()
+                .map(|path| expand_tilde(std::path::Path::new(path)))
+        })
+        .collect();
 
     // base.brain_profile must carry only the explicit CLI tier, never an env
     // value: env sits below toml in precedence and is applied later by the MCP resolver.
@@ -937,6 +1165,24 @@ pub fn runtime_config_from_khive_config(
         visible_namespaces
     };
 
+    // `[actor] owned_namespaces` (ADR-021 Delta 1). KhiveConfig::validate()
+    // guarantees every entry parses, so a parse failure here is unreachable for
+    // a validated config; filter_map+warn guards against a validation bug
+    // panicking instead. A dropped entry can only shrink what the actor owns.
+    // The list is deliberately not folded into `visible_namespaces`.
+    let owned_namespaces: Vec<Namespace> = khive_cfg
+        .actor
+        .owned_namespaces
+        .iter()
+        .filter_map(|s| match Namespace::parse(s) {
+            Ok(ns) => Some(ns),
+            Err(e) => {
+                tracing::warn!(ns = %s, error = %e, "actor.owned_namespaces: invalid namespace; skipped");
+                None
+            }
+        })
+        .collect();
+
     // KhiveConfig::validate() guarantees these are valid Namespace strings, so
     // parse failures here are unreachable for validated configs; filter_map+warn
     // guards against a validation bug panicking instead.
@@ -964,6 +1210,8 @@ pub fn runtime_config_from_khive_config(
         .clone()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| base.actor_id.clone());
+    let require_attributed_actor =
+        khive_cfg.actor.require_attributed || base.require_attributed_actor;
 
     let gate = khive_cfg
         .gate
@@ -986,6 +1234,14 @@ pub fn runtime_config_from_khive_config(
     let exec = khive_cfg.exec.clone();
     let telemetry = khive_cfg.telemetry.clone();
     let web = khive_cfg.web.clone();
+    let warm_concurrency = khive_cfg
+        .runtime
+        .warm_concurrency
+        .unwrap_or(base.warm_concurrency);
+    let maintenance_concurrency = khive_cfg
+        .runtime
+        .maintenance_concurrency
+        .unwrap_or(base.maintenance_concurrency);
     let blob_hydration_bytes = khive_cfg
         .runtime
         .blob_hydration_bytes
@@ -1002,13 +1258,17 @@ pub fn runtime_config_from_khive_config(
         .and_then(|s| s.parse::<chrono_tz::Tz>().ok())
         .unwrap_or(base.display_timezone);
 
-    if khive_cfg.engines.is_empty() {
+    if khive_cfg.engines.is_empty() && !khive_cfg.engines_declared {
         return RuntimeConfig {
+            credentials,
+            visibility_receipts,
             default_namespace,
             brain_profile,
             visible_namespaces,
+            owned_namespaces,
             allowed_outbound_namespaces,
             actor_id,
+            require_attributed_actor,
             gate,
             brain,
             git_write,
@@ -1016,6 +1276,12 @@ pub fn runtime_config_from_khive_config(
             exec,
             telemetry,
             mounts,
+            channel,
+            code_map_root,
+            code_maps,
+            code_map_protected_database_paths,
+            warm_concurrency,
+            maintenance_concurrency,
             blob_hydration_bytes,
             display_timezone,
             web,
@@ -1023,36 +1289,29 @@ pub fn runtime_config_from_khive_config(
         };
     }
 
-    let mut embedding_model: Option<EmbeddingModel> = None;
-    let mut additional: Vec<EmbeddingModel> = Vec::new();
-
-    for engine in &khive_cfg.engines {
-        match parse_embedding_model_alias(&engine.model) {
-            Some(model) => {
-                if engine.default {
-                    embedding_model = Some(model);
-                } else {
-                    additional.push(model);
-                }
-            }
-            None => {
-                tracing::warn!(
-                    engine = %engine.name,
-                    model = %engine.model,
-                    "engine config: unknown model name; engine will be skipped"
-                );
-            }
-        }
-    }
+    let engines = khive_cfg.engines.clone();
+    let embedding_model = engines
+        .first()
+        .and_then(|engine| parse_embedding_model_alias(&engine.name));
+    let additional = engines
+        .iter()
+        .skip(1)
+        .filter_map(|engine| parse_embedding_model_alias(&engine.name))
+        .collect();
 
     RuntimeConfig {
+        credentials,
+        visibility_receipts,
+        engines: Some(engines),
         embedding_model,
         additional_embedding_models: additional,
         default_namespace,
         brain_profile,
         visible_namespaces,
+        owned_namespaces,
         allowed_outbound_namespaces,
         actor_id,
+        require_attributed_actor,
         gate,
         brain,
         git_write,
@@ -1060,6 +1319,12 @@ pub fn runtime_config_from_khive_config(
         exec,
         telemetry,
         mounts,
+        channel,
+        code_map_root,
+        code_maps,
+        code_map_protected_database_paths,
+        warm_concurrency,
+        maintenance_concurrency,
         blob_hydration_bytes,
         display_timezone,
         web,
@@ -1283,6 +1548,52 @@ mod no_embeddings_tests {
     use serial_test::serial;
 
     #[test]
+    fn default_embedding_model_environment_keeps_typed_fallbacks() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        const PRIMARY: &str = "KHIVE_EMBEDDING_MODEL";
+        const ADDITIONAL: &str = "KHIVE_ADDITIONAL_EMBEDDING_MODELS";
+        assert_eq!(
+            RuntimeConfig::default().embedding_model,
+            Some(EmbeddingModel::AllMiniLmL6V2)
+        );
+        std::env::set_var(ADDITIONAL, "paraphrase-multilingual-minilm-l12-v2");
+        for (value, expected) in [
+            ("invalid", EmbeddingModel::AllMiniLmL6V2),
+            ("", EmbeddingModel::AllMiniLmL6V2),
+            ("bge-small-en-v1.5", EmbeddingModel::BgeSmallEnV15),
+            (" BAAI/BGE_SMALL_EN_V1.5 ", EmbeddingModel::BgeSmallEnV15),
+            ("all-minilm", EmbeddingModel::AllMiniLmL6V2),
+        ] {
+            std::env::set_var(PRIMARY, value);
+            let config = RuntimeConfig::default();
+            assert_eq!(config.embedding_model, Some(expected), "{value:?}");
+            assert_eq!(
+                config.additional_embedding_models,
+                vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2]
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            std::env::set_var(PRIMARY, std::ffi::OsStr::from_bytes(b"\xff"));
+            assert_eq!(
+                RuntimeConfig::default().embedding_model,
+                Some(EmbeddingModel::AllMiniLmL6V2)
+            );
+        }
+        std::env::remove_var(PRIMARY);
+        let config = RuntimeConfig::default();
+        assert_eq!(config.embedding_model, Some(EmbeddingModel::AllMiniLmL6V2));
+        assert_eq!(
+            config.additional_embedding_models,
+            vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2]
+        );
+        std::env::remove_var(ADDITIONAL);
+    }
+
+    #[test]
     fn no_embeddings_clears_both_fields() {
         let config = RuntimeConfig::no_embeddings();
         assert_eq!(config.embedding_model, None);
@@ -1432,3 +1743,13 @@ mod configured_embedding_models_order_tests {
         );
     }
 }
+
+/// Policy from the 2026-10-20 00:00Z through 2026-10-27 04:40Z event window:
+/// completed warm spans peaked at one with no observed overlap. Configured
+/// knowledge warm was unobserved. This is a conservative policy, not capacity.
+pub(crate) const DEFAULT_WARM_CONCURRENCY: usize = 1;
+
+/// Maintenance policy uses the same 2026-10-20 00:00Z through 2026-10-27 04:40Z
+/// observation: warm peak one, no overlaps, configured knowledge warm absent.
+/// Checkpoint work has warm attribution; other WAL/Vamana work was uninstrumented.
+pub(crate) const DEFAULT_MAINTENANCE_CONCURRENCY: usize = 1;

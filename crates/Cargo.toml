@@ -1,13 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
+    "khive-lion-core",
     "khive-types",
+    "khive-capability",
+    "khive-rule-evaluator",
     "khive-changeset",
+    "khive-graph-diff",
     "khive-score",
     "khive-quant",
     "khive-fold",
     "khive-storage",
     "khive-text",
+    "khive-fs",
     "khive-db",
     "khive-query",
     "khive-gate",
@@ -17,6 +22,7 @@ members = [
     "khive-hnsw",
     "khive-vamana",
     "khive-runtime",
+    "khive-runtime-production-tests",
     "khive-mounts",
     "khive-wire-protocol",
     "khive-request",
@@ -28,6 +34,7 @@ members = [
     "khive-pack-comm",
     "khive-pack-schedule",
     "khive-pack-formal",
+    "khive-subject",
     "khive-pack-code",
     "khive-pack-web",
     "khive-pack-telemetry",
@@ -41,6 +48,7 @@ members = [
     "khive-pack-exec",
     "khive-pack-git",
     "khive-pack-workspace",
+    "khive-pack-charter",
     "khive-mcp",
     "khive-vcs",
     "khive-vcs-adapters",
@@ -48,7 +56,6 @@ members = [
     "khive-retrieval",
     "khive-repo-showcase",
     "khive-channel",
-    "khive-channel-node",
     "khive-channel-email",
     "khive-channel-telegram",
 ]
@@ -61,7 +68,7 @@ exclude = ["khive-merge"]
 # keep this exclusion from members.
 
 [workspace.package]
-version = "0.9.0"
+version = "0.20.0"
 edition = "2021"
 # The locked libsqlite3-sys build script uses `cfg_select!`, which Rust 1.93 rejects as
 # unstable; the workspace MSRV is the CI toolchain, 1.95.
@@ -79,21 +86,22 @@ inventory = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 encoding_rs = "0.8.35"
-serde_yaml = "0.9"
+yaml_serde = "0.10.7"
 schemars = "1.2"
-jsonschema = "0.46.10"
+jsonschema = { version = "0.46.10", default-features = false }
 tokio = { version = "1.40", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt", "compat"] }
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder", "pool"] }
 async-imap = "0.9"
 async-native-tls = "0.5"
 mail-parser = "0.9"
-rusqlite = { version = "0.40" }
+rusqlite = { version = "0.41.1" }
 anyhow = "1.0.103"
 thiserror = "2.0"
+zstd = "0.14.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
+uuid = { version = "1.10", features = ["v4", "v5", "v7", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 chrono-tz = "0.10"
 croner = { version = "4.0", default-features = false, features = ["chrono"] }
@@ -101,12 +109,28 @@ iana-time-zone = "0.1"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
-lattice-embed = "=0.9.0"
-lattice-inference = { version = "=0.9.0", default-features = false }
-lattice-fann = "=0.9.0"
+lattice-embed = "=0.15.0"
+lattice-inference = { version = "=0.15.0", default-features = false }
+lattice-fann = "=0.15.0"
+# Pinned exactly so the moodboard descriptor's lattice version names the code that computes it.
+lattice-arch = { version = "=0.15.0", default-features = false }
+lattice-compute = { version = "=0.15.0", default-features = false }
+lattice-forecast = { version = "=0.15.0", default-features = false }
+lattice-grammar = { version = "=0.15.0", default-features = false }
+lattice-inference-core = { version = "=0.15.0", default-features = false }
+lattice-lora = { version = "=0.15.0", default-features = false }
+lattice-model-bert = { version = "=0.15.0", default-features = false }
+lattice-model-embeddinggemma2 = { version = "=0.15.0", default-features = false }
+lattice-model-io = { version = "=0.15.0", default-features = false }
+lattice-model-qwen3-embedding = { version = "=0.15.0", default-features = false }
+lattice-model-qwen35 = { version = "=0.15.0", default-features = false }
+lattice-quant = { version = "=0.15.0", default-features = false }
+lattice-router = { version = "=0.15.0", default-features = false }
+lattice-simd = { version = "=0.15.0", default-features = false }
+lattice-tokenizer = { version = "=0.15.0", default-features = false }
+lattice-weights = { version = "=0.15.0", default-features = false }
 parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
-rand = "0.8"
-rand_distr = "0.4"
+rand = "0.10.3"
 toml = "0.8"
 regex = "1.10"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
@@ -120,9 +144,11 @@ tempfile = "3"
 lru = "0.18"
 sha2 = "0.10"
 hex = "0.4"
-# lattice-embed 0.9.0 activates `pure` for this shared instance. The measured
-# performance risk is accepted only while 0.9.0 is pinned; evidence and the
-# merged 0.10.0 exit are recorded in docs/benchmarks/blake3-pure-0.9.0.md.
+# Lattice no longer depends on BLAKE3, so nothing outside this workspace sets
+# its features. Members that run on std enable `std` themselves, which keeps
+# runtime SIMD detection; khive-types keeps the no_std form. The `pure`
+# acceptance that applied under the 0.9.0 lattice pins, and its exit, are
+# recorded in docs/benchmarks/blake3-pure-0.9.0.md.
 blake3 = { version = "1", default-features = false }
 # Cross-platform filesystem free-space query for BlobStore's fail-closed
 # floor check (khive#292). Pure Rust (rustix on Unix, windows-sys on
@@ -130,10 +156,13 @@ blake3 = { version = "1", default-features = false }
 # matrix's win32-x64 target.
 fs4 = "1.1"
 regorus = "0.10"
-rmcp = "1.7"
+rmcp = "2.2"
 futures = "0.3"
 serial_test = "3"
 libc = "0.2"
+# SA_SIGINFO actions registered beside tokio's own signal handlers (the
+# daemon exit record names the sender of its shutdown signal).
+signal-hook-registry = "1.4"
 proptest = "1"
 crossbeam-queue = "0.3"
 sqlite-vec = { version = "0.1.9" }
@@ -142,7 +171,7 @@ base64 = "0.22"
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 # S3-compatible BlobStore backend (ADR-111 Amendment 2). aws-only: no fs/azure/gcs
 # backends, no multipart-upload surface we don't use.
-object_store = { version = "=0.14.1", default-features = false, features = ["aws"] }
+object_store = { version = "=0.14.1", default-features = false }
 # Code pack L2 symbol tier (ADR-085 Amendment 2 B2): syn::parse_file +
 # syn::visit::Visit-based Rust declaration/call-graph scanner. quote is
 # direct (not transitive) — the scanner uses quote::ToTokens for stable
@@ -159,6 +188,14 @@ codegen-units = 1
 # strip = "symbols" a live-process sample yields anonymous offsets, which makes
 # post-hoc analysis of a stall or contention window impossible.
 strip = "debuginfo"
+
+# Binaries published by the release workflow. Same code generation as release,
+# with the symbol table removed as well (about 10 MiB). Panic messages keep their
+# file and line; only backtrace frame names are lost. Builds used for profiling
+# keep the release profile.
+[profile.dist]
+inherits = "release"
+strip = "symbols"
 
 # lattice 0.3.0 published — use crates.io directly. Restore [patch.crates-io]
 # block below to point at local lattice when iterating on lattice-side fixes.

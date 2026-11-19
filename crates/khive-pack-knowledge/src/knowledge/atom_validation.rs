@@ -6,7 +6,7 @@ use khive_storage::{SqlReader, SqlStatement, SqlValue};
 use serde_json::{json, Value};
 
 use super::schema::AtomWrite;
-use super::util::{row_i64, row_str, sql_err};
+use super::util::{has_domain_mirror_tag, row_i64, row_str, sql_err};
 
 /// Existing atom ID, or no row for a new slug. Reads never allocate a new identity.
 pub(super) async fn target(
@@ -14,18 +14,42 @@ pub(super) async fn target(
     namespace: &str,
     atom: &AtomWrite,
 ) -> Result<Option<String>, RuntimeError> {
+    target_inner(reader, namespace, atom, false).await
+}
+
+pub(super) async fn target_for_admission(
+    reader: &mut dyn SqlReader,
+    namespace: &str,
+    atom: &AtomWrite,
+) -> Result<Option<String>, RuntimeError> {
+    target_inner(reader, namespace, atom, true).await
+}
+
+async fn target_inner(
+    reader: &mut dyn SqlReader,
+    namespace: &str,
+    atom: &AtomWrite,
+    typed_storage: bool,
+) -> Result<Option<String>, RuntimeError> {
+    let storage_error = |context: &str, error: khive_storage::StorageError| {
+        if typed_storage {
+            RuntimeError::Storage(error)
+        } else {
+            sql_err(context, error)
+        }
+    };
     let input = match atom {
         AtomWrite::Upsert(input) => input,
         AtomWrite::PropertiesOnly(input) => {
             let id = input.id.to_string();
             let domain = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT id FROM knowledge_domains WHERE id = ?1".into(),
+                    sql: khive_runtime::sql!("knowledge_target_domain_probe").into(),
                     params: vec![SqlValue::Text(id.clone())],
                     label: None,
                 })
                 .await
-                .map_err(|error| sql_err("upsert_atoms domain lookup", error))?;
+                .map_err(|error| storage_error("upsert_atoms domain lookup", error))?;
             if domain.is_some() {
                 return Err(RuntimeError::InvalidInput(
                     "properties-only target is a domain; use domain verbs instead".into(),
@@ -33,18 +57,14 @@ pub(super) async fn target(
             }
             let row = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT tags FROM knowledge_atoms WHERE id = ?1 AND deleted_at IS NULL"
-                        .into(),
+                    sql: khive_runtime::sql!("knowledge_target_atom_tags").into(),
                     params: vec![SqlValue::Text(id.clone())],
                     label: None,
                 })
                 .await
-                .map_err(|error| sql_err("upsert_atoms id lookup", error))?
+                .map_err(|error| storage_error("upsert_atoms id lookup", error))?
                 .ok_or_else(|| RuntimeError::NotFound(format!("atom not found: {id}")))?;
-            if row_str(&row, "tags")
-                .unwrap_or_default()
-                .contains("type:domain")
-            {
+            if has_domain_mirror_tag(&row_str(&row, "tags").unwrap_or_default()) {
                 return Err(RuntimeError::InvalidInput(
                     "properties-only target is a domain mirror; use domain verbs instead".into(),
                 ));
@@ -54,18 +74,21 @@ pub(super) async fn target(
     };
     let slug = input.slug.trim();
     // Tombstones and domain mirrors still own the unique namespace/slug entry.
-    let existing = reader.query_row(SqlStatement {
-        sql: "SELECT id, deleted_at, tags FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 LIMIT 1".into(),
-        params: vec![SqlValue::Text(namespace.to_owned()), SqlValue::Text(slug.to_owned())],
-        label: None,
-    }).await.map_err(|error| sql_err("upsert_atoms lookup", error))?;
+    let existing = reader
+        .query_row(SqlStatement {
+            sql: khive_runtime::sql!("knowledge_target_atom_slug_probe").into(),
+            params: vec![
+                SqlValue::Text(namespace.to_owned()),
+                SqlValue::Text(slug.to_owned()),
+            ],
+            label: None,
+        })
+        .await
+        .map_err(|error| storage_error("upsert_atoms lookup", error))?;
     let Some(row) = existing else {
         return Ok(None);
     };
-    if row_str(&row, "tags")
-        .unwrap_or_default()
-        .contains("type:domain")
-    {
+    if has_domain_mirror_tag(&row_str(&row, "tags").unwrap_or_default()) {
         return Err(RuntimeError::InvalidInput(format!(
             "atom slug {slug:?} collides with a domain mirror; use upsert_domains instead"
         )));

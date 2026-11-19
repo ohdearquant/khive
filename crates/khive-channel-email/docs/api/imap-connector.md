@@ -34,7 +34,7 @@ Every UID that passed the size preflight must appear exactly once in `fetched_ra
   at startup. A quarantined message's original bytes are stored as one blob before the
   cursor advances past it, and a blob object holds at most 64 MiB, so a larger ceiling
   would admit a message whose quarantine could never be stored.
-- Quarantine storage is bounded in aggregate as well as per message.
+- Original retention is limited by the live quarantine record count and the per-message byte limit.
   `KHIVE_EMAIL_QUARANTINE_MAX_RETAINED` (default 256) caps how many live quarantine
   records in the ingest namespace may hold a stored original; the poller counts them
   before each `blob.put`, both for a message the adapter quarantined and for one it
@@ -45,7 +45,11 @@ Every UID that passed the size preflight must appear exactly once in `fetched_ra
   `quarantine_original_retained: "false"` with `quarantine_original_not_retained_reason:
   "retention-limit"`. `0` stores no originals. If the count cannot be read the page is
   held and retried; an original is never dropped silently. Records stored without an
-  original count toward the cap too, so it is conservative.
+  original count toward the cap too, so it is conservative. Expiry frees slots by deleting
+  records and detaching attachment ownership; it leaves the original blob bytes on disk.
+  Repeated expiry and refill can therefore accumulate detached originals, so this limit
+  is not a ceiling on accumulated blob storage. See the
+  [quarantine cleanup notes](../../../khive-pack-comm/docs/api/message-lifecycle.md).
 - Inbound polling also needs the blob pack's runtime to accept writes. When comm is
   writable but blob is read-only, the daemon does not start the poll and logs an error
   naming the blob pack runtime, rather than failing every `blob.put` and retrying the
@@ -54,7 +58,34 @@ Every UID that passed the size preflight must appear exactly once in `fetched_ra
   response) and is ignored with a `warn!`; it never affects page validity or the candidate
   high-water mark.
 
-See `crates/khive-channel-email/src/channel.rs`'s
+See `crates/khive-channel-email/src/channel/tests.rs`'s
 `poll_page_malformed_uid_produces_a_stable_external_id_and_quarantine_metadata` test for the
 end-to-end proof that a `Malformed` disposition survives into the `ChannelEnvelope` handed
 to `comm.ingest`, not just this function's intermediate value.
+
+## Authentication quarantine metadata
+
+An `auth-absent` quarantine has neither plain nor ARC authentication-results
+headers. If headers are present but no plain header matches the configured trust
+anchor, `quarantine_reason` is `auth-untrusted`. The latter also carries these
+string-valued diagnostic fields, so an operator does not need a retained original
+to identify an anchor mismatch:
+
+| Field                           | Values                                                                        |
+| ------------------------------- | ----------------------------------------------------------------------------- |
+| `quarantine_auth_anchor_mode`   | `authserv-id`, `topmost-no-authserv-id`, or `topmost-with-authserv-id`        |
+| `quarantine_auth_header_family` | `authentication-results` or `arc-authentication-results`                      |
+| `quarantine_auth_id_status`     | `present`, `no-authserv-id`, or `unparseable`                                 |
+| `quarantine_auth_id`            | Present only for `present`: a printable escaped identifier, at most 128 bytes |
+| `quarantine_auth_id_truncated`  | `true` or `false`                                                             |
+
+The topmost plain header is described when present, otherwise the topmost ARC
+header. These are observations of untrusted input, not evidence of a passing
+authentication method. ARC never supplies attribution. Only the configured mode
+is disclosed, not credentials or a newly learned anchor. Full raw headers,
+method properties and body text are omitted from the diagnostic fields.
+
+The envelope retains the fixed `email:quarantine` sender and no thread
+correlation. Normal quarantine replay, retention, secret validation and ingest
+gates still apply; these fields add no bypass. With quarantine storage disabled,
+the message is still dropped with only its UID and reason logged.

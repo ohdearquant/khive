@@ -31,9 +31,9 @@
 //!    `TruncateState`, may escalate to TRUNCATE, and double-counts the
 //!    ADR-091 process-global counters. A verb that reports state must not
 //!    perturb the state it reports.
-//! 2. The probe's connection comes from
-//!    `ConnectionPool::open_standalone_writer_untracked`, opened without
-//!    `SQLITE_OPEN_CREATE`. A missing database yields `checkpoint_probe:
+//! 2. The pool's complete diagnostic collector opens its private connection
+//!    without `SQLITE_OPEN_CREATE` and returns data rather than a SQL handle.
+//!    A missing database yields `checkpoint_probe:
 //!    null` plus a `checkpoint_probe_error`, never a freshly created file.
 //! 3. WAL-pin attribution combines the read-only OS holder census with
 //!    `walpin::inspect_live`, a separate bounded sidecar enumerator whose
@@ -60,10 +60,22 @@
 //! identify the main pool's counter window; a secondary pool's reader/writer
 //! counters have their own reconstruction window. Checkpoint counters remain global.
 
+#[path = "diagnostics/disk_guard.rs"]
+mod disk_guard;
+#[path = "diagnostics/size_composition.rs"]
+mod size_composition;
+#[path = "diagnostics/writer_admission.rs"]
+mod writer_admission;
+pub use writer_admission::WriterAdmissionDiagnostics;
+#[path = "diagnostics/writer_contention.rs"]
+mod writer_contention;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use khive_storage::error::StorageError;
 use khive_storage::types::StorageResult;
@@ -73,6 +85,8 @@ use serde::Serialize;
 
 use crate::checkpoint;
 use crate::pool::{ConnectionPool, WalCeilingSource};
+
+pub use disk_guard::{DiskGuardDiagnostics, LeaseHoldDiagnostics};
 
 /// Raw `PRAGMA wal_checkpoint(PASSIVE)` return row.
 ///
@@ -339,6 +353,7 @@ pub struct WalPinCensusProcessStart {
     pub process_start_time_unavailable_reason: Option<String>,
 }
 
+#[cfg(unix)]
 fn census_process_start_times(holder_pids: &[u32]) -> Vec<WalPinCensusProcessStart> {
     holder_pids
         .iter()
@@ -419,6 +434,7 @@ pub enum WalPinCensus {
 /// misbehaved. Describing both as "truncated" would make the report cry wolf
 /// on every bounded call, which is how the sentence that matters stops being
 /// read.
+#[cfg(any(unix, test))]
 fn census_truncation_cause(budget_exhausted: bool) -> String {
     if budget_exhausted {
         "the OS process walk stopped at its wall-clock budget (see          collection_cost.wal_pin_census_budget_ms)"
@@ -837,7 +853,8 @@ pub struct ReaderContentionDiagnostics {
     /// Queries on a checked-out pooled reader that SQLite refused with
     /// `SQLITE_BUSY` after `configured_busy_timeout_ms` elapsed. Counted after
     /// checkout succeeded, so it is disjoint from `reader_checkout_timeouts`.
-    /// Writer refusals are not included; see `writer_task_begin_busy`.
+    /// Writer refusals are not included; see `direct_writer_busy_refusals` and
+    /// `writer_task_begin_busy`.
     pub reader_busy_timeouts: u64,
     /// Pooled reader guards live when the snapshot was captured.
     pub active_pooled_reader_checkouts: u64,
@@ -852,6 +869,10 @@ pub struct ReaderContentionDiagnostics {
     /// operation name — the pool's own internal checkout — which is the
     /// answer to "which read was it", not a gap in the reading (#2793).
     pub max_completed_reader_hold_operation: Option<&'static str>,
+    /// Dedicated readers discarded on return for age, checkout count, failed
+    /// cleanup/health checks, or an explicitly non-reusable lease. Counts
+    /// replacement attempts, including failed opens; excludes pool shutdown.
+    pub reader_discards: u64,
     /// A disqualified pooled-reader return whose replacement connection then
     /// also failed to open, permanently shrinking the physical pool by one
     /// slot below `max_readers`. Non-zero here means the pool has fewer
@@ -883,6 +904,7 @@ impl ReaderContentionDiagnostics {
             completed_pooled_reader_checkouts: reader.completed_pooled_checkouts,
             max_completed_reader_hold_micros: reader.max_completed_hold_micros,
             max_completed_reader_hold_operation: reader.max_completed_hold_operation,
+            reader_discards: reader.reader_discards,
             reader_replacement_open_failures: reader.reader_replacement_open_failures,
         }
     }
@@ -904,6 +926,10 @@ impl ReaderContentionDiagnostics {
 /// receive `None` plus an explicit reason instead of a fabricated zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WriterContentionDiagnostics {
+    /// FIFO writer lifetime observations; reading never starts the writer.
+    pub writer_admission: Option<WriterAdmissionDiagnostics>,
+    /// Disabled, not initialized, unavailable writer, or invalid telemetry state.
+    pub writer_admission_unavailable_reason: Option<String>,
     /// Successful acquisitions across pooled, standalone, and writer-task
     /// connection classes.
     pub writer_acquisitions: u64,
@@ -915,6 +941,26 @@ pub struct WriterContentionDiagnostics {
     pub writer_task_acquisitions: u64,
     /// Main-pool writer checkouts that exhausted their finite deadline.
     pub writer_acquisition_timeouts: u64,
+    /// Writer acquisitions refused because another writer held the volume
+    /// lease past the guard deadline (`CapacityUnavailable`, phase `lock`).
+    /// Every writer class takes the lease before its connection, so ordinary
+    /// same-volume writer contention is counted here, not in
+    /// `writer_acquisition_timeouts`.
+    pub writer_lease_timeouts: u64,
+    /// The guard deadline a writer waits for the volume lease, in ms; `None`
+    /// when the pool takes no lease (in-memory or read-only).
+    pub configured_guard_deadline_ms: Option<u64>,
+    /// `checkout_timeout`, which bounds only the pool-mutex wait that comes
+    /// after the lease.
+    pub configured_checkout_timeout_ms: u64,
+    /// The effective pooled-writer wait bound under contention: the guard
+    /// deadline for the lease, then `checkout_timeout` for the pool mutex. A
+    /// pool configured with a 50 ms `checkout_timeout` and the default 2000 ms
+    /// guard deadline can wait about 2050 ms before refusing.
+    pub effective_writer_wait_bound_ms: u64,
+    /// Final instrumented direct execution refusals retaining primary SQLITE_BUSY,
+    /// once per operation; excludes SQLITE_LOCKED and task/reader/open/admission errors.
+    pub direct_writer_busy_refusals: u64,
     /// Every writer-task `BEGIN IMMEDIATE` attempt refused busy or locked,
     /// whether or not a subsequent bounded retry absorbed it. A refusal not
     /// absorbed by a retry also surfaces to the caller as the retryable
@@ -969,11 +1015,11 @@ pub struct WriterContentionDiagnostics {
     pub audit_degraded_rows: Option<u64>,
     /// Why `audit_degraded_rows` is unavailable to this caller.
     pub audit_degraded_rows_unavailable_reason: Option<String>,
-    /// Monotonic process-lifetime flag set once any accepted row has been
-    /// released without a commit: a pure-observability row released degraded,
-    /// or a generation that failed to flush, whose rows are absent from the
-    /// audit trail whether or not their callers were told. `None` under the
-    /// same conditions as `audit_batch_flush_failures`.
+    /// Monotonic process-lifetime flag set by a failed audit append or driver
+    /// failure, or by accepted pure-observability rows released without a commit.
+    /// Abandoned or shed generations containing only obligation-bearing rows
+    /// increment `audit_batch_flush_failures` without setting this flag.
+    /// `None` under the same conditions as `audit_batch_flush_failures`.
     pub audit_degraded: Option<bool>,
     /// Why `audit_degraded` is unavailable to this caller.
     pub audit_degraded_unavailable_reason: Option<String>,
@@ -1005,6 +1051,14 @@ pub struct WriterContentionDiagnostics {
     pub audit_admission_refused_obligations_last_at_ms: Option<u64>,
     /// Why `audit_admission_refused_obligations` is unavailable to this caller.
     pub audit_admission_refused_obligations_unavailable_reason: Option<String>,
+    /// Successful admission-degrade-safe reads whose audit generation exhausted
+    /// bounded transient retries. Cumulative since process start; these rows
+    /// received no commit acknowledgement (ADR-154 Amendment 2).
+    pub audit_retry_exhausted_obligations: Option<u64>,
+    /// Last increment in wall-clock milliseconds, or `None` before the first.
+    pub audit_retry_exhausted_obligations_last_at_ms: Option<u64>,
+    /// Why the retry-exhausted obligation count is unavailable to this caller.
+    pub audit_retry_exhausted_obligations_unavailable_reason: Option<String>,
     /// Per-dispatch audit rows for an explicitly allowlisted, domain-write-free
     /// read verb (`VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`) that were
     /// **already enqueued but had not resolved when the caller's admission
@@ -1033,9 +1087,15 @@ pub struct WriterContentionDiagnostics {
     /// Why `audit_admission_unresolved_obligations` is unavailable to this
     /// caller.
     pub audit_admission_unresolved_obligations_unavailable_reason: Option<String>,
+    /// Process-wide omitted success decisions by verb; unavailable without registry metrics.
+    pub audit_success_rows_omitted: Option<std::collections::BTreeMap<&'static str, u64>>,
+    /// Process-wide unselected, unforced success decisions by verb.
+    pub audit_success_rows_sampled_out: Option<std::collections::BTreeMap<&'static str, u64>>,
+    /// Process-wide force-only success decisions, including rows that do not commit.
+    pub audit_success_rows_forced: Option<std::collections::BTreeMap<&'static str, u64>>,
 }
 
-/// Process-wide audit-batch health counters, supplied by the runtime layer
+/// Process-wide audit health and success-row decision counters, supplied by the runtime layer
 /// that owns the audit-batch control. `khive-db` never produces these itself
 /// — a direct `khive-db` caller always sees the corresponding
 /// `WriterContentionDiagnostics` fields as `None` plus an explicit reason.
@@ -1056,6 +1116,10 @@ pub struct RuntimeAuditBatchMetrics {
     /// Wall-clock ms at which `admission_refused_obligations` last moved;
     /// `None` until it moves. A total cannot say when it was last earned.
     pub admission_refused_obligations_last_at_ms: Option<u64>,
+    /// Safe-read audit rows whose generation exhausted bounded transient retries.
+    pub retry_exhausted_obligations: u64,
+    /// Last increment in wall-clock milliseconds, or `None` before the first.
+    pub retry_exhausted_obligations_last_at_ms: Option<u64>,
     /// Admission-degrade-safe read verbs' audit rows that were already
     /// enqueued but had not resolved when the caller's admission wait
     /// deadline elapsed (ADR-103 Amendment 3, ADR-133 Amendment 1). Not a
@@ -1066,70 +1130,12 @@ pub struct RuntimeAuditBatchMetrics {
     /// Wall-clock ms at which `admission_unresolved_obligations` last moved;
     /// `None` until it moves.
     pub admission_unresolved_obligations_last_at_ms: Option<u64>,
-}
-
-impl WriterContentionDiagnostics {
-    fn snapshot(
-        pool: &ConnectionPool,
-        audit_append_failures: Option<u64>,
-        runtime_audit_batch_metrics: Option<RuntimeAuditBatchMetrics>,
-    ) -> Self {
-        let writer = pool.writer_acquisition_snapshot();
-        let unavailable_reason =
-            || Some("no audit-batch control is registered with this runtime instance".to_string());
-        Self {
-            writer_acquisitions: writer.acquisitions,
-            pooled_writer_acquisitions: writer.pooled_acquisitions,
-            standalone_writer_acquisitions: writer.standalone_acquisitions,
-            writer_task_acquisitions: writer.writer_task_acquisitions,
-            writer_acquisition_timeouts: writer.timeouts,
-            writer_task_begin_busy: writer.writer_task_begin_busy,
-            writer_task_begin_busy_absorbed: writer.writer_task_begin_busy_absorbed,
-            writer_task_begin_errors: writer.writer_task_begin_errors,
-            writer_task_request_failures: writer.writer_task_request_failures,
-            writer_task_side_effects_unknown: writer.writer_task_side_effects_unknown,
-            audit_append_failures,
-            audit_append_failures_unavailable_reason: audit_append_failures.is_none().then(|| {
-                "runtime audit instrumentation was not supplied to khive-db diagnostics".to_string()
-            }),
-            audit_obligation_append_failures: None,
-            audit_obligation_append_failures_unavailable_reason: Some(
-                "runtime obligation audit instrumentation was not supplied to khive-db diagnostics"
-                    .to_string(),
-            ),
-            audit_batch_flush_failures: runtime_audit_batch_metrics.map(|m| m.flush_failures),
-            audit_batch_flush_failures_unavailable_reason: runtime_audit_batch_metrics
-                .is_none()
-                .then(unavailable_reason)
-                .flatten(),
-            audit_degraded_rows: runtime_audit_batch_metrics.map(|m| m.degraded_rows),
-            audit_degraded_rows_unavailable_reason: runtime_audit_batch_metrics
-                .is_none()
-                .then(unavailable_reason)
-                .flatten(),
-            audit_degraded: runtime_audit_batch_metrics.map(|m| m.degraded),
-            audit_degraded_unavailable_reason: runtime_audit_batch_metrics
-                .is_none()
-                .then(unavailable_reason)
-                .flatten(),
-            audit_admission_refused_obligations: runtime_audit_batch_metrics
-                .map(|m| m.admission_refused_obligations),
-            audit_admission_refused_obligations_last_at_ms: runtime_audit_batch_metrics
-                .and_then(|m| m.admission_refused_obligations_last_at_ms),
-            audit_admission_refused_obligations_unavailable_reason: runtime_audit_batch_metrics
-                .is_none()
-                .then(unavailable_reason)
-                .flatten(),
-            audit_admission_unresolved_obligations: runtime_audit_batch_metrics
-                .map(|m| m.admission_unresolved_obligations),
-            audit_admission_unresolved_obligations_last_at_ms: runtime_audit_batch_metrics
-                .and_then(|m| m.admission_unresolved_obligations_last_at_ms),
-            audit_admission_unresolved_obligations_unavailable_reason: runtime_audit_batch_metrics
-                .is_none()
-                .then(unavailable_reason)
-                .flatten(),
-        }
-    }
+    /// Bounded per-verb decision snapshots (ADR-103 Amendment 7), independent of commits.
+    pub audit_success_rows_omitted: [(&'static str, u64); 4],
+    /// Sampled successes that produced no row.
+    pub audit_success_rows_sampled_out: [(&'static str, u64); 2],
+    /// Successes retained only by their forcing rule.
+    pub audit_success_rows_forced: [(&'static str, u64); 2],
 }
 
 /// Live graph-edge rows compared with the durable list-cursor ledger.
@@ -1242,6 +1248,28 @@ fn nonnegative_sqlite_integer(column: usize, value: i64) -> rusqlite::Result<u64
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
 }
 
+/// The file's page size, page count and free-list length: one pragma each, so
+/// the cost does not grow with the file. Reported for every file-backed
+/// database whether or not the `dbstat` size composition was collected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DatabasePageAccounting {
+    pub page_size_bytes: u64,
+    pub page_count: u64,
+    /// Pages later writes can reuse that stay in the file until a `VACUUM`.
+    pub freelist_pages: u64,
+}
+
+fn database_page_accounting(conn: &Connection) -> rusqlite::Result<DatabasePageAccounting> {
+    let read = |pragma: &str| -> rusqlite::Result<u64> {
+        nonnegative_sqlite_integer(0, conn.query_row(pragma, [], |row| row.get::<_, i64>(0))?)
+    };
+    Ok(DatabasePageAccounting {
+        page_size_bytes: read("PRAGMA page_size")?,
+        page_count: read("PRAGMA page_count")?,
+        freelist_pages: read("PRAGMA freelist_count")?,
+    })
+}
+
 fn declares_embedding_blob(sql: Option<&str>) -> bool {
     let Some(sql) = sql else {
         return false;
@@ -1286,19 +1314,17 @@ fn classify_database_object(
     (object_kind, storage_class)
 }
 
-fn database_size_composition(conn: &Connection) -> rusqlite::Result<DatabaseSizeComposition> {
-    let page_size = nonnegative_sqlite_integer(
-        0,
-        conn.query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))?,
-    )?;
-    let page_count = nonnegative_sqlite_integer(
-        0,
-        conn.query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))?,
-    )?;
-    let freelist_pages = nonnegative_sqlite_integer(
-        0,
-        conn.query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))?,
-    )?;
+fn database_size_composition(
+    conn: &Connection,
+    accounting: DatabasePageAccounting,
+) -> rusqlite::Result<DatabaseSizeComposition> {
+    let DatabasePageAccounting {
+        page_size_bytes: page_size,
+        page_count,
+        freelist_pages,
+    } = accounting;
+    #[cfg(test)]
+    size_composition::before_dbstat();
 
     let mut statement = conn.prepare(
         "SELECT d.name, COALESCE(s.type, 'internal'), s.tbl_name, s.sql, d.pageno, d.pgsize
@@ -1496,14 +1522,29 @@ impl WalCeilingDiagnostics {
     }
 }
 
+/// Process-wide code-map VFS counters, sampled independently under each ledger's
+/// mutex. This observe-only diagnostic block has no stability contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CodeMapVfsDiagnostics {
+    pub quarantine_occupancy: usize,
+    pub quarantine_cap: usize,
+    pub registrations: usize,
+    pub registration_cap: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DbDiagnostics {
     pub build: BuildIdentity,
     pub process: ProcessIdentity,
+    pub code_map_vfs: CodeMapVfsDiagnostics,
     /// Process-lifetime note-search vector route counts, independent of this
     /// report's database file and reset only with the serving process.
     pub note_search_ann_route_total: u64,
     pub note_search_fallback_route_total: u64,
+    /// Note-search route totals and fallback causes for this report's opened
+    /// pool. Shared by its runtime handles; reset on pool reconstruction.
+    /// Aliases report the representative pool; separate opens are not summed.
+    pub note_search_routes: crate::pool::NoteSearchRouteSnapshot,
     /// Pool-scoped, monotonic coordinator dispatch and note-candidate
     /// hydration counts used by ADR-166 G4/G5. Reset on pool reconstruction.
     pub search_mechanism: crate::pool::SearchMechanismSnapshot,
@@ -1512,6 +1553,7 @@ pub struct DbDiagnostics {
     pub db_path: Option<String>,
     /// Explicit WAL ceiling policy for this already-open database.
     pub wal_ceiling: WalCeilingDiagnostics,
+    pub disk_guard: DiskGuardDiagnostics,
     pub wal_file: Option<WalFileState>,
     pub checkpoint_counters: CheckpointCounters,
     pub checkpoint_probe: Option<CheckpointProbe>,
@@ -1525,6 +1567,10 @@ pub struct DbDiagnostics {
     pub writer_contention: WriterContentionDiagnostics,
     pub size_composition: Option<DatabaseSizeComposition>,
     pub size_composition_error: Option<String>,
+    /// Page size, page count and free-list length from three pragmas, present
+    /// whether or not `size_composition` was collected.
+    pub page_accounting: Option<DatabasePageAccounting>,
+    pub page_accounting_error: Option<String>,
     pub graph_edge_integrity: Option<GraphEdgeIntegrity>,
     pub graph_edge_integrity_error: Option<String>,
     /// Current FTS5 segment structure, decoded from each index's documented
@@ -1758,6 +1804,7 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
         sweep_interval,
         audit_append_failures,
         runtime_audit_batch_metrics,
+        true,
     )
     .await
 }
@@ -1765,6 +1812,11 @@ pub async fn collect_with_runtime_audit_metrics_interruptibly(
 /// Collect one already-open pool while retaining the main pool's process and
 /// generation identity. A secondary pool must not claim or advance the main
 /// pool generation when its pool-scoped counters are inspected.
+///
+/// `collect_size_composition = false` skips the `dbstat` walk, whose cost
+/// grows with the file because it reads every page; the report then carries
+/// [`SIZE_COMPOSITION_NOT_REQUESTED`] in `size_composition_error`, and
+/// `page_accounting` still reports the page counts.
 pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
     pool: Arc<ConnectionPool>,
     build: BuildIdentity,
@@ -1772,12 +1824,14 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
     sweep_interval: Duration,
     audit_append_failures: u64,
     runtime_audit_batch_metrics: Option<RuntimeAuditBatchMetrics>,
+    collect_size_composition: bool,
 ) -> StorageResult<DbDiagnostics> {
     crate::ensure_request_read_active("db_diagnostics")?;
     let started = Instant::now();
     let counters = checkpoint_counters();
     let reader_contention = ReaderContentionDiagnostics::snapshot(&pool);
     let search_mechanism = pool.search_mechanism_snapshot();
+    let note_search_routes = pool.note_search_route_snapshot();
     let writer_contention = WriterContentionDiagnostics::snapshot(
         &pool,
         Some(audit_append_failures),
@@ -1789,11 +1843,14 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
         return Ok(DbDiagnostics {
             build,
             process,
+            code_map_vfs: crate::code_map_vfs::diagnostics(),
             note_search_ann_route_total: 0,
             note_search_fallback_route_total: 0,
+            note_search_routes,
             search_mechanism,
             db_path: None,
             wal_ceiling: WalCeilingDiagnostics::from_pool(&pool),
+            disk_guard: DiskGuardDiagnostics::snapshot(&pool),
             wal_file: None,
             checkpoint_counters: counters,
             checkpoint_probe: None,
@@ -1810,6 +1867,10 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
             size_composition: None,
             size_composition_error: Some(
                 "in-memory database: no file-backed page composition to inspect".to_string(),
+            ),
+            page_accounting: None,
+            page_accounting_error: Some(
+                "in-memory database: no file-backed pages to count".to_string(),
             ),
             graph_edge_integrity: None,
             graph_edge_integrity_error: Some(
@@ -1832,7 +1893,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
     let inspection = crate::read_cancellation::run_interruptible_read(
         StorageCapability::Sql,
         "db_diagnostics.sqlite",
-        move |scope| inspect_pool_interruptibly(&inspection_pool, scope),
+        move |scope| inspect_pool_interruptibly(&inspection_pool, scope, collect_size_composition),
     )
     .await?;
     let sqlite_ms = elapsed_ms(sqlite_started);
@@ -1846,11 +1907,14 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
     Ok(DbDiagnostics {
         build,
         process,
+        code_map_vfs: crate::code_map_vfs::diagnostics(),
         note_search_ann_route_total: 0,
         note_search_fallback_route_total: 0,
+        note_search_routes,
         search_mechanism,
         db_path: Some(path.display().to_string()),
         wal_ceiling: WalCeilingDiagnostics::from_pool(&pool),
+        disk_guard: DiskGuardDiagnostics::snapshot(&pool),
         wal_file: Some(wal_file),
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
@@ -1860,6 +1924,8 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
         writer_contention,
         size_composition: inspection.size_composition,
         size_composition_error: inspection.size_composition_error,
+        page_accounting: inspection.page_accounting,
+        page_accounting_error: inspection.page_accounting_error,
         graph_edge_integrity: inspection.graph_edge_integrity,
         graph_edge_integrity_error: inspection.graph_edge_integrity_error,
         fts_segments: inspection.fts_segments,
@@ -1907,6 +1973,7 @@ fn collect_inner(
     let counters = checkpoint_counters();
     let reader_contention = ReaderContentionDiagnostics::snapshot(pool);
     let search_mechanism = pool.search_mechanism_snapshot();
+    let note_search_routes = pool.note_search_route_snapshot();
     let writer_contention = WriterContentionDiagnostics::snapshot(
         pool,
         audit_append_failures,
@@ -1917,11 +1984,14 @@ fn collect_inner(
         return DbDiagnostics {
             build,
             process,
+            code_map_vfs: crate::code_map_vfs::diagnostics(),
             note_search_ann_route_total: 0,
             note_search_fallback_route_total: 0,
+            note_search_routes,
             search_mechanism,
             db_path: None,
             wal_ceiling: WalCeilingDiagnostics::from_pool(pool),
+            disk_guard: DiskGuardDiagnostics::snapshot(pool),
             wal_file: None,
             checkpoint_counters: counters,
             checkpoint_probe: None,
@@ -1938,6 +2008,10 @@ fn collect_inner(
             size_composition: None,
             size_composition_error: Some(
                 "in-memory database: no file-backed page composition to inspect".to_string(),
+            ),
+            page_accounting: None,
+            page_accounting_error: Some(
+                "in-memory database: no file-backed pages to count".to_string(),
             ),
             graph_edge_integrity: None,
             graph_edge_integrity_error: Some(
@@ -1969,11 +2043,14 @@ fn collect_inner(
     DbDiagnostics {
         build,
         process,
+        code_map_vfs: crate::code_map_vfs::diagnostics(),
         note_search_ann_route_total: 0,
         note_search_fallback_route_total: 0,
+        note_search_routes,
         search_mechanism,
         db_path: Some(path.display().to_string()),
         wal_ceiling: WalCeilingDiagnostics::from_pool(pool),
+        disk_guard: DiskGuardDiagnostics::snapshot(pool),
         wal_file: Some(wal_file),
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
@@ -1983,6 +2060,8 @@ fn collect_inner(
         writer_contention,
         size_composition: inspection.size_composition,
         size_composition_error: inspection.size_composition_error,
+        page_accounting: inspection.page_accounting,
+        page_accounting_error: inspection.page_accounting_error,
         graph_edge_integrity: inspection.graph_edge_integrity,
         graph_edge_integrity_error: inspection.graph_edge_integrity_error,
         fts_segments: inspection.fts_segments,
@@ -2006,12 +2085,14 @@ fn collect_inner(
     }
 }
 
-struct PoolInspection {
+pub(crate) struct PoolInspection {
     checkpoint_probe: Option<CheckpointProbe>,
     checkpoint_probe_error: Option<String>,
     checkpoint_pin: CheckpointPinDiagnostics,
     size_composition: Option<DatabaseSizeComposition>,
     size_composition_error: Option<String>,
+    page_accounting: Option<DatabasePageAccounting>,
+    page_accounting_error: Option<String>,
     graph_edge_integrity: Option<GraphEdgeIntegrity>,
     graph_edge_integrity_error: Option<String>,
     fts_segments: Option<crate::FtsSegmentDiagnostics>,
@@ -2030,6 +2111,21 @@ fn split_fts_segments_result(
     }
 }
 
+fn split_page_accounting_result(
+    result: rusqlite::Result<DatabasePageAccounting>,
+) -> (Option<DatabasePageAccounting>, Option<String>) {
+    match result {
+        Ok(pages) => (Some(pages), None),
+        Err(error) => (None, Some(format!("page accounting query failed: {error}"))),
+    }
+}
+
+/// The `size_composition_error` of a report whose caller skipped the `dbstat`
+/// walk. The walk reads every page of the file; `page_accounting` still
+/// carries the page counts.
+pub const SIZE_COMPOSITION_NOT_REQUESTED: &str =
+    "not collected: size_composition=false skips the dbstat walk, which reads every page";
+
 fn record_diagnostic_checkpoint_probe(
     pool: &ConnectionPool,
     result: &rusqlite::Result<CheckpointProbe>,
@@ -2047,9 +2143,37 @@ fn record_diagnostic_checkpoint_probe(
 fn inspect_pool_interruptibly(
     pool: &ConnectionPool,
     scope: &crate::read_cancellation::InterruptibleReadScope,
+    collect_size_composition: bool,
+) -> StorageResult<PoolInspection> {
+    pool.inspect_diagnostic_connection_interruptibly(scope, collect_size_composition)
+}
+
+#[cfg(test)]
+struct DiagnosticConnectionDropWitness(
+    Option<Arc<crate::read_cancellation::DiagnosticGraphTestProbe>>,
+);
+
+#[cfg(test)]
+impl Drop for DiagnosticConnectionDropWitness {
+    fn drop(&mut self) {
+        if let Some(probe) = &self.0 {
+            probe.connection_dropped.store(true, Ordering::Release);
+        }
+    }
+}
+
+pub(crate) fn inspect_open_connection_interruptibly(
+    pool: &ConnectionPool,
+    opened: Result<rusqlite::Connection, crate::error::SqliteError>,
+    scope: &crate::read_cancellation::InterruptibleReadScope,
+    collect_size_composition: bool,
 ) -> StorageResult<PoolInspection> {
     scope.ensure_active()?;
-    let conn = match pool.open_standalone_writer_untracked() {
+    // Declared before `conn`, so this witness runs after the connection drops.
+    #[cfg(test)]
+    let _connection_witness = DiagnosticConnectionDropWitness(scope.diagnostic_graph_probe());
+    let opened = opened.and_then(|conn| crate::ProgressConn::new(conn).map_err(Into::into));
+    let conn = match opened {
         Ok(conn) => conn,
         Err(e) => {
             scope.ensure_active()?;
@@ -2060,6 +2184,8 @@ fn inspect_pool_interruptibly(
                 checkpoint_pin: checkpoint_pin_diagnostics(pool, None, Some(&reason)),
                 size_composition: None,
                 size_composition_error: Some(reason.clone()),
+                page_accounting: None,
+                page_accounting_error: Some(reason.clone()),
                 graph_edge_integrity: None,
                 graph_edge_integrity_error: Some(reason.clone()),
                 fts_segments: None,
@@ -2102,10 +2228,22 @@ fn inspect_pool_interruptibly(
     // connection. The scope deliberately refuses double registration, so
     // keep each query's ordinary SQLite result nested inside one guarded
     // execution while allowing the outer cancellation cause to remain typed.
-    let (integrity, size_composition, fts_segments) = scope.run(&conn, || {
+    let (integrity, pages, fts_segments) = scope.run(&conn, || {
+        #[cfg(test)]
+        let graph_probe = scope.diagnostic_graph_probe();
+        #[cfg(test)]
+        if let Some(probe) = &graph_probe {
+            probe.armed.store(true, Ordering::Release);
+        }
+        let integrity = graph_edge_integrity(&conn);
+        #[cfg(test)]
+        if let Some(probe) = &graph_probe {
+            probe.armed.store(false, Ordering::Release);
+            probe.graph_returned.store(true, Ordering::Release);
+        }
         Ok((
-            graph_edge_integrity(&conn),
-            database_size_composition(&conn),
+            integrity,
+            size_composition::collect(&conn, collect_size_composition),
             crate::fts_maintenance::inspect_fts_segments(&conn),
         ))
     })?;
@@ -2117,14 +2255,12 @@ fn inspect_pool_interruptibly(
         ),
     };
     let (fts_segments, fts_segments_error) = split_fts_segments_result(fts_segments);
-
-    let (size_composition, size_composition_error) = match size_composition {
-        Ok(composition) => (Some(composition), None),
-        Err(error) => (
-            None,
-            Some(format!("database size composition query failed: {error}")),
-        ),
-    };
+    let size_composition::PageInspection {
+        page_accounting,
+        page_accounting_error,
+        size_composition,
+        size_composition_error,
+    } = pages;
 
     Ok(PoolInspection {
         checkpoint_probe,
@@ -2132,6 +2268,8 @@ fn inspect_pool_interruptibly(
         checkpoint_pin,
         size_composition,
         size_composition_error,
+        page_accounting,
+        page_accounting_error,
         graph_edge_integrity,
         graph_edge_integrity_error,
         fts_segments,
@@ -2290,7 +2428,15 @@ async fn inspect_file_state_interruptibly(
 /// pragma/query itself — comes back in its section's error field. Nothing
 /// here can create a file.
 fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
-    let conn = match pool.open_standalone_writer_untracked() {
+    pool.inspect_diagnostic_connection(true)
+}
+
+pub(crate) fn inspect_open_connection(
+    pool: &ConnectionPool,
+    opened: Result<rusqlite::Connection, crate::error::SqliteError>,
+    collect_size_composition: bool,
+) -> PoolInspection {
+    let conn = match opened {
         Ok(conn) => conn,
         Err(e) => {
             let reason = format!("guarded standalone open refused: {e}");
@@ -2300,6 +2446,8 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
                 checkpoint_pin: checkpoint_pin_diagnostics(pool, None, Some(&reason)),
                 size_composition: None,
                 size_composition_error: Some(reason.clone()),
+                page_accounting: None,
+                page_accounting_error: Some(reason.clone()),
                 graph_edge_integrity: None,
                 graph_edge_integrity_error: Some(reason.clone()),
                 fts_segments: None,
@@ -2330,13 +2478,12 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
             Some(format!("graph-edge integrity query failed: {e}")),
         ),
     };
-    let (size_composition, size_composition_error) = match database_size_composition(&conn) {
-        Ok(composition) => (Some(composition), None),
-        Err(error) => (
-            None,
-            Some(format!("database size composition query failed: {error}")),
-        ),
-    };
+    let size_composition::PageInspection {
+        page_accounting,
+        page_accounting_error,
+        size_composition,
+        size_composition_error,
+    } = size_composition::collect(&conn, collect_size_composition);
     let (fts_segments, fts_segments_error) =
         split_fts_segments_result(crate::fts_maintenance::inspect_fts_segments(&conn));
 
@@ -2346,6 +2493,8 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
         checkpoint_pin,
         size_composition,
         size_composition_error,
+        page_accounting,
+        page_accounting_error,
         graph_edge_integrity,
         graph_edge_integrity_error,
         fts_segments,
@@ -2354,1852 +2503,5 @@ fn inspect_pool(pool: &ConnectionPool) -> PoolInspection {
 }
 
 #[cfg(test)]
-mod tests {
-    use serial_test::serial;
-
-    use super::*;
-    use crate::pool::{ConnectionPool, PoolConfig, WalCeilingPolicy, WalCeilingSource};
-
-    #[test]
-    fn default_wal_ceiling_is_explicitly_disabled_in_diagnostics() {
-        let pool = ConnectionPool::new(PoolConfig::for_test()).expect("in-memory pool");
-        let report = collect(
-            &pool,
-            BuildIdentity::from_env("test", None),
-            Duration::from_secs(30),
-        );
-        let json = serde_json::to_value(report).expect("report serializes");
-        assert_eq!(
-            json.get("wal_ceiling"),
-            Some(&serde_json::json!({
-                "configured_bytes": 0,
-                "effective_bytes": 0,
-                "source": "default",
-                "enabled": false,
-                "status": "disabled"
-            })),
-            "zero is an explicit disabled policy, not an omitted field"
-        );
-    }
-
-    #[test]
-    fn read_only_wal_ceiling_keeps_configured_value_without_enforcement() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("read-only-ceiling.db");
-        rusqlite::Connection::open(&path)
-            .expect("create source database")
-            .execute_batch("CREATE TABLE seed (id INTEGER PRIMARY KEY)")
-            .expect("persist source database");
-        let pool = ConnectionPool::new(PoolConfig {
-            path: Some(path),
-            read_only: true,
-            write_queue_enabled: Some(false),
-            wal_ceiling: WalCeilingPolicy {
-                bytes: 8192,
-                source: WalCeilingSource::BackendField,
-            },
-            ..PoolConfig::for_test()
-        })
-        .expect("read-only backend must accept configured policy");
-        let report = collect(
-            &pool,
-            BuildIdentity::from_env("test", None),
-            Duration::from_secs(30),
-        );
-        let json = serde_json::to_value(report).expect("report serializes");
-        assert_eq!(
-            json["wal_ceiling"],
-            serde_json::json!({
-                "configured_bytes": 8192,
-                "effective_bytes": 0,
-                "source": "backend_field",
-                "enabled": false,
-                "status": "read_only_not_enforced"
-            })
-        );
-    }
-
-    /// The budget knob is read per request, so a wrong read is a wrong bound
-    /// on every call. `0` has to mean unbounded rather than "spend nothing",
-    /// because a zero-millisecond budget would truncate every census on the
-    /// first process and report a holder list of nothing at all.
-    #[test]
-    #[serial_test::serial(khive_walpin_census_budget_env)]
-    fn census_budget_reads_zero_as_unbounded_and_survives_a_malformed_value() {
-        let _guard = crate::walpin::EnvVarGuard::capture(CENSUS_BUDGET_ENV);
-
-        std::env::remove_var(CENSUS_BUDGET_ENV);
-        assert_eq!(
-            request_census_budget(),
-            Some(DEFAULT_CENSUS_BUDGET),
-            "an unset variable takes the default bound"
-        );
-
-        std::env::set_var(CENSUS_BUDGET_ENV, "0");
-        assert_eq!(
-            request_census_budget(),
-            None,
-            "0 restores the unbounded full-machine walk"
-        );
-
-        std::env::set_var(CENSUS_BUDGET_ENV, " 750 ");
-        assert_eq!(
-            request_census_budget(),
-            Some(Duration::from_millis(750)),
-            "a surrounding-whitespace value is still a number"
-        );
-
-        std::env::set_var(CENSUS_BUDGET_ENV, "soon");
-        assert_eq!(
-            request_census_budget(),
-            Some(DEFAULT_CENSUS_BUDGET),
-            "a malformed budget must not fail the request; the report states \
-             which budget was actually used"
-        );
-    }
-
-    /// A budget stop and an enumeration failure both set `truncated`, and an
-    /// operator reads one sentence. If that sentence is the same for both,
-    /// the bound makes the report cry wolf on every busy box.
-    #[test]
-    fn a_budget_stop_and_an_enumeration_failure_do_not_share_a_reason() {
-        let budget = census_truncation_cause(true);
-        let failure = census_truncation_cause(false);
-        assert_ne!(budget, failure);
-        assert!(
-            budget.contains("budget"),
-            "the budget reason must name the budget: {budget}"
-        );
-        assert!(
-            budget.contains("wal_pin_census_budget_ms"),
-            "and must point at the field carrying the value: {budget}"
-        );
-        assert!(
-            !failure.contains("budget"),
-            "an enumeration failure must not be described as a budget stop: {failure}"
-        );
-    }
-
-    /// `wal_pin_census_budget_ms` is an `Option` precisely so that a producer
-    /// which failed to record the budget cannot write the value that means
-    /// "unbounded". This pins the wire shape of both states.
-    #[test]
-    fn collection_cost_distinguishes_an_unbounded_census_from_a_zero_cost_one() {
-        let unbounded = CollectionCost {
-            total_ms: 9,
-            sqlite_ms: 4,
-            wal_file_stat_ms: 0,
-            wal_pin_census_ms: 5,
-            wal_pin_sidecar_ms: 0,
-            wal_pin_census_budget_ms: None,
-            wal_pin_census_budget_exhausted: false,
-        };
-        let bounded = CollectionCost {
-            wal_pin_census_budget_ms: Some(2000),
-            wal_pin_census_budget_exhausted: true,
-            ..unbounded
-        };
-
-        let unbounded = serde_json::to_value(unbounded).unwrap();
-        let bounded = serde_json::to_value(bounded).unwrap();
-        assert_eq!(
-            unbounded["wal_pin_census_budget_ms"],
-            serde_json::Value::Null
-        );
-        assert_eq!(bounded["wal_pin_census_budget_ms"], 2000);
-        assert_eq!(unbounded["wal_pin_census_budget_exhausted"], false);
-        assert_eq!(bounded["wal_pin_census_budget_exhausted"], true);
-    }
-
-    #[test]
-    fn process_identity_serializes_os_start_time_or_explicit_unavailability() {
-        let known = ProcessIdentity::from_start_time(42, Some(1_000_000_000), 3);
-        assert_eq!(
-            serde_json::to_value(known).unwrap(),
-            serde_json::json!({
-                "pid": 42,
-                "started_at": 1_000_000_000,
-                "started_at_unavailable_reason": null,
-                "pool_generation": 3
-            }),
-            "preserve the OS timestamp, not request time or a derived uptime"
-        );
-
-        let unknown = ProcessIdentity::from_start_time(42, None, 3);
-        let json = serde_json::to_value(unknown).unwrap();
-        assert_eq!(json["pid"], 42);
-        assert!(json["started_at"].is_null(), "never invent a start time");
-        let reason = json["started_at_unavailable_reason"].as_str().unwrap();
-        assert!(!reason.is_empty());
-        assert!(reason.contains(std::env::consts::OS));
-        assert_eq!(json["pool_generation"], 3);
-    }
-
-    #[tokio::test]
-    async fn process_identity_is_present_in_every_collector_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (file_pool, _) = seeded_pool(&dir);
-        let memory_pool = ConnectionPool::new(PoolConfig::default()).expect("in-memory pool");
-        for pool in [file_pool, memory_pool] {
-            let pool = Arc::new(pool);
-            let expected = ProcessIdentity::current(&pool);
-            let writer_before = pool.writer_acquisition_snapshot();
-            let sync = collect(
-                &pool,
-                BuildIdentity::from_env("test", None),
-                Duration::from_secs(30),
-            );
-            let asynchronous = collect_with_runtime_audit_metrics_interruptibly(
-                Arc::clone(&pool),
-                BuildIdentity::from_env("test", None),
-                Duration::from_secs(30),
-                0,
-                None,
-            )
-            .await
-            .expect("diagnostics");
-            for report in [sync, asynchronous] {
-                assert_eq!(report.process, expected);
-                let json = serde_json::to_value(report).unwrap();
-                assert_eq!(json["process"], serde_json::to_value(&expected).unwrap());
-                assert_eq!(json["build"]["version"], "test");
-            }
-            assert_eq!(
-                pool.writer_acquisition_snapshot(),
-                writer_before,
-                "diagnostics must not count its probes as write traffic"
-            );
-        }
-    }
-
-    #[test]
-    fn process_identity_survives_pool_reconstruction_with_reset_counters() {
-        let pool = ConnectionPool::new(PoolConfig::default()).expect("first pool");
-        drop(pool.try_writer().expect("writer acquisition"));
-        drop(pool.reader().expect("reader acquisition"));
-        let before = collect(
-            &pool,
-            BuildIdentity::from_env("test", None),
-            Duration::from_secs(30),
-        );
-        assert!(before.writer_contention.writer_acquisitions > 0);
-        assert!(before.reader_contention.reader_acquisitions > 0);
-        drop(pool);
-
-        let replacement = ConnectionPool::new(PoolConfig::default()).expect("replacement pool");
-        let after = collect(
-            &replacement,
-            BuildIdentity::from_env("test", None),
-            Duration::from_secs(30),
-        );
-        assert_eq!(after.process.pid, before.process.pid);
-        assert_eq!(after.process.started_at, before.process.started_at);
-        assert_eq!(
-            after.process.started_at_unavailable_reason,
-            before.process.started_at_unavailable_reason
-        );
-        assert!(after.process.pool_generation > before.process.pool_generation);
-        assert_eq!(after.writer_contention.writer_acquisitions, 0);
-        assert_eq!(after.reader_contention.reader_acquisitions, 0);
-    }
-
-    fn seeded_pool(dir: &tempfile::TempDir) -> (ConnectionPool, PathBuf) {
-        let path = dir.path().join("diag.db");
-        let pool = ConnectionPool::new(PoolConfig {
-            path: Some(path.clone()),
-            ..PoolConfig::for_test()
-        })
-        .expect("pool open");
-        {
-            let writer = pool.try_writer().expect("writer");
-            writer
-                .conn()
-                .execute_batch(
-                    "CREATE TABLE t (x INTEGER); \
-                     CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER, merged_into TEXT); \
-                     CREATE TABLE graph_edges (
-                         namespace TEXT NOT NULL,
-                         id TEXT NOT NULL,
-                         PRIMARY KEY (namespace, id)
-                     ); \
-                     CREATE TABLE graph_edges_seq (
-                         seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                         edge_id TEXT NOT NULL UNIQUE
-                     ); \
-                     CREATE VIRTUAL TABLE fts_entities USING fts5(
-                         namespace UNINDEXED, subject_id UNINDEXED, title, body,
-                         tokenize='trigram'
-                     ); \
-                     CREATE VIRTUAL TABLE fts_notes USING fts5(
-                         namespace UNINDEXED, subject_id UNINDEXED, title, body,
-                         tokenize='trigram'
-                     ); \
-                     INSERT INTO t VALUES (1), (2), (3); \
-                     INSERT INTO fts_entities(namespace, subject_id, title, body)
-                         VALUES('local', 'entity-1', 'entity title', 'entity diagnostic body'); \
-                     INSERT INTO fts_notes(namespace, subject_id, title, body)
-                         VALUES('local', 'note-1', 'note title', 'note diagnostic body');",
-                )
-                .expect("seed writes");
-        }
-        (pool, path)
-    }
-
-    #[test]
-    fn dropping_census_future_guard_requests_cooperative_stop() {
-        let stopped = Arc::new(AtomicBool::new(false));
-        let guard = StopCensusOnDrop {
-            stopped: Arc::clone(&stopped),
-            armed: true,
-        };
-
-        drop(guard);
-
-        assert!(
-            stopped.load(Ordering::SeqCst),
-            "dropping diagnostics while its census worker is live must stop the PID/fd walk"
-        );
-    }
-
-    #[tokio::test]
-    async fn runtime_audit_batch_fields_are_additive_and_unavailable_without_a_control() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (pool, _path) = seeded_pool(&dir);
-        let pool = Arc::new(pool);
-
-        let without_control = collect_with_audit_append_failures_interruptibly(
-            Arc::clone(&pool),
-            BuildIdentity::from_env("test", None),
-            Duration::from_secs(30),
-            0,
-        )
-        .await
-        .expect("diagnostics succeed");
-        assert!(without_control
-            .writer_contention
-            .audit_batch_flush_failures
-            .is_none());
-        assert!(
-            without_control
-                .writer_contention
-                .audit_batch_flush_failures_unavailable_reason
-                .is_some(),
-            "no audit-batch control was supplied, so the field must carry a reason, not a \
-             fabricated zero"
-        );
-        assert!(without_control
-            .writer_contention
-            .audit_degraded_rows
-            .is_none());
-        assert!(without_control.writer_contention.audit_degraded.is_none());
-
-        let with_control = collect_with_runtime_audit_metrics_interruptibly(
-            Arc::clone(&pool),
-            BuildIdentity::from_env("test", None),
-            Duration::from_secs(30),
-            0,
-            Some(RuntimeAuditBatchMetrics {
-                flush_failures: 3,
-                degraded_rows: 7,
-                degraded: true,
-                admission_refused_obligations: 5,
-                admission_refused_obligations_last_at_ms: Some(1_700_000_000_123),
-                admission_unresolved_obligations: 2,
-                admission_unresolved_obligations_last_at_ms: Some(1_700_000_000_456),
-            }),
-        )
-        .await
-        .expect("diagnostics succeed");
-        assert_eq!(
-            with_control.writer_contention.audit_batch_flush_failures,
-            Some(3)
-        );
-        assert!(with_control
-            .writer_contention
-            .audit_batch_flush_failures_unavailable_reason
-            .is_none());
-        assert_eq!(with_control.writer_contention.audit_degraded_rows, Some(7));
-        assert_eq!(with_control.writer_contention.audit_degraded, Some(true));
-        assert_eq!(
-            with_control
-                .writer_contention
-                .audit_admission_refused_obligations,
-            Some(5),
-            "an operator must be able to read the admission-refused obligation count from \
-             db_diagnostics without a test-only feature gate (ADR-103 Amendment 3)"
-        );
-        assert!(with_control
-            .writer_contention
-            .audit_admission_refused_obligations_unavailable_reason
-            .is_none());
-        assert_eq!(
-            with_control
-                .writer_contention
-                .audit_admission_unresolved_obligations,
-            Some(2),
-            "an operator must be able to distinguish enqueued-but-unresolved rows from \
-             confirmed-refused rows (ADR-103 Amendment 3)"
-        );
-        assert!(with_control
-            .writer_contention
-            .audit_admission_unresolved_obligations_unavailable_reason
-            .is_none());
-        assert!(without_control
-            .writer_contention
-            .audit_admission_refused_obligations
-            .is_none());
-        assert!(without_control
-            .writer_contention
-            .audit_admission_refused_obligations_unavailable_reason
-            .is_some());
-        assert!(without_control
-            .writer_contention
-            .audit_admission_unresolved_obligations
-            .is_none());
-        assert!(without_control
-            .writer_contention
-            .audit_admission_unresolved_obligations_unavailable_reason
-            .is_some());
-
-        // Existing fields must be unaffected by the new ones — additive, not
-        // a reshuffle.
-        assert_eq!(
-            with_control.writer_contention.writer_acquisitions,
-            without_control.writer_contention.writer_acquisitions
-        );
-    }
-
-    #[test]
-    fn writer_task_pool_sourced_counters_are_always_populated_directly() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (pool, _path) = seeded_pool(&dir);
-
-        let report = collect(
-            &pool,
-            BuildIdentity::from_env("9.9.9", None),
-            Duration::from_secs(30),
-        );
-
-        // Unlike the runtime-supplied audit-batch fields, these two come
-        // straight from the pool's own counters and are never `Option`.
-        assert_eq!(report.writer_contention.writer_task_request_failures, 0);
-        assert_eq!(report.writer_contention.writer_task_side_effects_unknown, 0);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial]
-    async fn request_cancellation_after_passive_stops_before_graph_and_census() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (pool, _) = seeded_pool(&dir);
-        let pool = Arc::new(pool);
-        TEST_REACHED_AFTER_PASSIVE.store(false, Ordering::SeqCst);
-        TEST_PAUSE_AFTER_PASSIVE.store(true, Ordering::SeqCst);
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let diagnostic_pool = Arc::clone(&pool);
-        let task = tokio::spawn(crate::scope_request_read_cancellation(
-            cancel_rx,
-            async move {
-                collect_with_audit_append_failures_interruptibly(
-                    diagnostic_pool,
-                    BuildIdentity::from_env("test", None),
-                    Duration::from_secs(30),
-                    0,
-                )
-                .await
-            },
-        ));
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !TEST_REACHED_AFTER_PASSIVE.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("diagnostics never completed its admitted PASSIVE phase");
-        cancel_tx.send(true).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .expect("cancelled diagnostics did not stop promptly")
-            .expect("diagnostics task panicked");
-        TEST_PAUSE_AFTER_PASSIVE.store(false, Ordering::SeqCst);
-        assert!(matches!(result, Err(StorageError::Timeout { .. })));
-
-        let one: i64 = pool
-            .reader()
-            .expect("diagnostics returned its connection")
-            .conn()
-            .query_row("SELECT 1", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(one, 1);
-    }
-
-    #[test]
-    fn checkpoint_probe_returns_a_well_formed_triple_on_a_file_backed_db() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (pool, _path) = seeded_pool(&dir);
-        let conn = pool
-            .open_standalone_writer_untracked()
-            .expect("standalone probe connection");
-
-        let probe = checkpoint_probe(&conn).expect("probe must succeed on a WAL database");
-
-        assert!(
-            probe.busy == 0 || probe.busy == 1,
-            "busy is a 0/1 flag, got {}",
-            probe.busy
-        );
-        assert!(
-            probe.log_frames >= 0,
-            "a WAL database must report a non-negative frame count, got {}",
-            probe.log_frames
-        );
-        assert!(
-            probe.checkpointed_frames >= 0,
-            "checkpointed frames must be non-negative, got {}",
-            probe.checkpointed_frames
-        );
-        assert!(
-            probe.checkpointed_frames <= probe.log_frames,
-            "a PASSIVE pass cannot checkpoint more frames than the WAL holds: {probe:?}"
-        );
-        assert!(
-            probe.backfill_gap_frames() >= 0,
-            "the one-row backfill gap clamps at 0: {probe:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn checkpoint_probe_reports_replaced_pool_file_instead_of_probing_it() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (pool, path) = seeded_pool(&dir);
-        let replacement = dir.path().join("replacement.db");
-        let replacement_conn = Connection::open(&replacement).expect("replacement database");
-        replacement_conn
-            .execute_batch("CREATE TABLE replacement_marker (value INTEGER)")
-            .expect("initialize replacement database");
-        drop(replacement_conn);
-        std::fs::rename(&replacement, &path).expect("replace the pool's path");
-
-        let inspection = inspect_pool(&pool);
-        assert!(inspection.checkpoint_probe.is_none());
-        assert!(
-            inspection
-                .checkpoint_probe_error
-                .as_deref()
-                .is_some_and(|error| error.contains("file identity changed")),
-            "replacement must be reported as a probe failure"
-        );
-    }
-
-    #[test]
-    fn checkpoint_probe_backfill_gap_is_a_row_difference_not_a_pin_claim() {
-        let probe = CheckpointProbe {
-            busy: 0,
-            log_frames: 12,
-            checkpointed_frames: 7,
-        };
-        assert_eq!(probe.backfill_gap_frames(), 5);
-        let no_wal = CheckpointProbe {
-            busy: 0,
-            log_frames: -1,
-            checkpointed_frames: -1,
-        };
-        assert_eq!(no_wal.backfill_gap_frames(), 0);
-        let busy = CheckpointProbe { busy: 1, ..probe };
-        assert_eq!(busy.backfill_gap_frames(), 5);
-    }
-
-    #[test]
-    fn pin_age_does_not_depend_on_the_wall_clock_epoch() {
-        let probe = CheckpointProbe {
-            busy: 0,
-            log_frames: 12,
-            checkpointed_frames: 7,
-        };
-        let future_epoch = checkpoint::CheckpointRunStatus::Observed(checkpoint::CheckpointRun {
-            frame: 7,
-            first_observed_at_unix_ms: 10_000,
-        });
-        let past_epoch = checkpoint::CheckpointRunStatus::Observed(checkpoint::CheckpointRun {
-            frame: 7,
-            first_observed_at_unix_ms: 1,
-        });
-        let young = checkpoint_pin_diagnostics_for_run(
-            Some(&probe),
-            None,
-            future_epoch,
-            Some(Duration::from_millis(10)),
-        );
-        let forward = checkpoint_pin_diagnostics_for_run(
-            Some(&probe),
-            None,
-            future_epoch,
-            Some(Duration::from_millis(1010)),
-        );
-        let backward = checkpoint_pin_diagnostics_for_run(
-            Some(&probe),
-            None,
-            past_epoch,
-            Some(Duration::from_millis(1010)),
-        );
-        assert_eq!(young.oldest_pinned_frame, None);
-        assert_eq!(forward.oldest_pinned_frame, Some(7));
-        assert_eq!(forward.pin_depth, Some(5));
-        assert_eq!(backward.oldest_pinned_frame, Some(7));
-        let busy = CheckpointProbe { busy: 1, ..probe };
-        let unavailable = checkpoint_pin_diagnostics_for_run(
-            Some(&busy),
-            None,
-            future_epoch,
-            Some(Duration::from_millis(1010)),
-        );
-        assert_eq!(unavailable.oldest_pinned_frame, None);
-        assert_eq!(unavailable.pin_depth, None);
-    }
-
-    #[test]
-    fn checkpoint_pin_report_waits_one_second_for_a_matching_run() {
-        let probe = CheckpointProbe {
-            busy: 0,
-            log_frames: 12,
-            checkpointed_frames: 7,
-        };
-        let run = checkpoint::CheckpointRunStatus::Observed(checkpoint::CheckpointRun {
-            frame: 7,
-            first_observed_at_unix_ms: 1_000,
-        });
-
-        let young = checkpoint_pin_diagnostics_for_run(
-            Some(&probe),
-            None,
-            run,
-            Some(Duration::from_millis(999)),
-        );
-        assert_eq!(young.backfill_ceiling, Some(7));
-        assert_eq!(young.oldest_pinned_frame, None);
-        assert!(young
-            .oldest_pinned_frame_unavailable_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("less than one second")));
-        assert_eq!(young.oldest_pinned_frame_run, None);
-        assert_eq!(young.pin_depth, None);
-        assert!(young.pin_depth_unavailable_reason.is_some());
-
-        let aged = checkpoint_pin_diagnostics_for_run(
-            Some(&probe),
-            None,
-            run,
-            Some(Duration::from_secs(1)),
-        );
-        assert_eq!(aged.backfill_ceiling, Some(7));
-        assert_eq!(aged.oldest_pinned_frame, Some(7));
-        assert_eq!(aged.pin_depth, Some(5));
-        assert_eq!(aged.pin_depth_unavailable_reason, None);
-        assert_eq!(
-            aged.oldest_pinned_frame_run,
-            Some(match run {
-                checkpoint::CheckpointRunStatus::Observed(value) => value,
-                _ => unreachable!(),
-            })
-        );
-    }
-
-    #[test]
-    fn checkpoint_pin_report_keeps_busy_probe_fields_null_even_with_an_aged_run() {
-        let run = checkpoint::CheckpointRunStatus::Observed(checkpoint::CheckpointRun {
-            frame: 7,
-            first_observed_at_unix_ms: 1,
-        });
-        for probe in [
-            Some(CheckpointProbe {
-                busy: 1,
-                log_frames: 12,
-                checkpointed_frames: 7,
-            }),
-            Some(CheckpointProbe {
-                busy: 0,
-                log_frames: -1,
-                checkpointed_frames: -1,
-            }),
-            Some(CheckpointProbe {
-                busy: 0,
-                log_frames: 12,
-                checkpointed_frames: 12,
-            }),
-        ] {
-            let result = checkpoint_pin_diagnostics_for_run(
-                probe.as_ref(),
-                None,
-                run,
-                Some(Duration::from_secs(1)),
-            );
-            assert_eq!(result.backfill_ceiling, None);
-            assert!(result.backfill_ceiling_unavailable_reason.is_some());
-            assert_eq!(result.oldest_pinned_frame, None);
-            assert!(result.oldest_pinned_frame_unavailable_reason.is_some());
-            assert_eq!(result.oldest_pinned_frame_run, None);
-            assert!(result.oldest_pinned_frame_run_unavailable_reason.is_some());
-            assert_eq!(result.pin_depth, None);
-            assert!(result.pin_depth_unavailable_reason.is_some());
-        }
-
-        let error = checkpoint_pin_diagnostics_for_run(
-            None,
-            Some("probe failed"),
-            run,
-            Some(Duration::from_secs(1)),
-        );
-        assert_eq!(error.backfill_ceiling, None);
-        assert_eq!(
-            error.backfill_ceiling_unavailable_reason.as_deref(),
-            Some("probe failed")
-        );
-        assert_eq!(error.oldest_pinned_frame, None);
-        assert!(error.oldest_pinned_frame_run_unavailable_reason.is_some());
-        assert_eq!(error.pin_depth, None);
-        assert!(error.pin_depth_unavailable_reason.is_some());
-    }
-
-    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-    #[test]
-    fn db_diagnostics_reports_start_times_for_all_holders_and_identifies_reporter() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (pool, _) = seeded_pool(&dir);
-
-        let report = collect(
-            &pool,
-            BuildIdentity::from_env("test", None),
-            Duration::from_secs(30),
-        );
-        let reporter = crate::walpin::reporting_pid();
-        let process = report
-            .wal_pin
-            .census_process_start_times
-            .iter()
-            .find(|process| process.pid == reporter)
-            .expect("the reporting process must remain in the census list");
-
-        assert_eq!(report.wal_pin.reporting_pid, reporter);
-        assert_eq!(report.wal_pin.reporting_process_is_holder, Some(true));
-        assert_eq!(
-            report.wal_pin.census_process_start_times.len(),
-            report.wal_pin.census_holder_pids.len(),
-            "every confirmed holder gets raw start-time data"
-        );
-        assert_eq!(
-            process.process_start_time_secs,
-            crate::walpin::process_start_time_secs(reporter)
-        );
-        assert_eq!(process.process_start_time_unavailable_reason, None);
-        #[cfg(target_os = "linux")]
-        assert_eq!(report.wal_pin.start_time_resolution_secs, Some(2));
-        #[cfg(target_os = "macos")]
-        assert_eq!(report.wal_pin.start_time_resolution_secs, Some(1));
-        assert_eq!(
-            serde_json::to_value(&report).unwrap()["wal_pin"]["census_process_start_times"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|entry| entry["pid"].as_u64())
-                .collect::<Vec<_>>(),
-            report
-                .wal_pin
-                .census_holder_pids
-                .iter()
-                .map(|pid| u64::from(*pid))
-                .collect::<Vec<_>>(),
-            "start-time reporting does not filter census holders"
-        );
-    }
-
-    /// The verb must not perturb the state it reports: the probe touches none
-    /// of the ADR-091 counters.
-    #[test]
-    #[serial(checkpoint_skip_metrics)]
-    fn checkpoint_probe_does_not_perturb_the_adr091_counters() {
-        crate::checkpoint::reset_checkpoint_metrics_for_tests();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (pool, _path) = seeded_pool(&dir);
-        let conn = pool
-            .open_standalone_writer_untracked()
-            .expect("standalone probe connection");
-
-        let before = checkpoint_counters();
-        for _ in 0..3 {
-            checkpoint_probe(&conn).expect("probe must succeed");
-        }
-        let after = checkpoint_counters();
-
-        assert_eq!(
-            before, after,
-            "checkpoint_probe must leave every ADR-091 counter untouched"
-        );
-    }
-
-    #[test]
-    fn wal_file_state_reports_the_sidecar_size_for_a_live_db() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (_pool, path) = seeded_pool(&dir);
-
-        let state = wal_file_state(&path);
-        assert!(
-            state.wal_path.ends_with("diag.db-wal"),
-            "WAL path is the db path plus a -wal suffix, got {}",
-            state.wal_path
-        );
-        assert!(
-            state.wal_size_bytes.is_some(),
-            "a seeded WAL database must have a stat-able -wal file: {state:?}"
-        );
-        assert!(state.unavailable_reason.is_none(), "{state:?}");
-    }
-
-    #[test]
-    fn wal_file_state_degrades_with_a_reason_when_the_sidecar_is_absent() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = wal_file_state(&dir.path().join("never-created.db"));
-        assert!(state.wal_size_bytes.is_none());
-        assert!(
-            state.unavailable_reason.is_some(),
-            "an absent WAL file must carry a reason, not a silent zero: {state:?}"
-        );
-    }
-
-    #[test]
-    fn collect_on_a_file_backed_db_carries_build_identity_and_every_counter() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (pool, _path) = seeded_pool(&dir);
-        let reader_admission_capacity = pool.max_readers().max(1);
-
-        let report = collect(
-            &pool,
-            BuildIdentity::from_env("9.9.9", Some("deadbeef")),
-            Duration::from_secs(30),
-        );
-
-        assert_eq!(report.build.version, "9.9.9");
-        assert_eq!(report.build.build_hash.as_deref(), Some("deadbeef"));
-        assert!(report.db_path.is_some());
-        assert!(
-            report.checkpoint_probe.is_some(),
-            "file-backed collect must land a probe; error was {:?}",
-            report.checkpoint_probe_error
-        );
-        assert!(
-            report.wal_file.as_ref().and_then(|w| w.wal_size_bytes) >= Some(0),
-            "wal_size_bytes must be a non-negative byte count when present"
-        );
-
-        let json = serde_json::to_value(&report).expect("report serializes");
-        let counters = json
-            .get("checkpoint_counters")
-            .expect("counters section present");
-        for key in [
-            "last_observed_wal_pages",
-            "truncate_attempts",
-            "truncate_consecutive_failures",
-            "checkpoint_skipped_ticks",
-            "checkpoint_consecutive_skips",
-            "checkpoint_last_skip_wal_pages",
-            "checkpoint_pressure_elevated_ticks",
-            "checkpoint_pressure_episodes_started",
-            "checkpoint_pressure_episodes_recovered",
-            "checkpoint_lifecycle_append_attempts",
-            "checkpoint_lifecycle_append_failures",
-            "checkpoint_lifecycle_enqueue_drops",
-            "read_tx_max_age_evictions",
-        ] {
-            assert!(counters.get(key).is_some(), "counter {key} must be present");
-        }
-        assert_eq!(
-            report.writer_contention.writer_acquisitions, 1,
-            "the seed write checked the finite-wait pooled writer out once"
-        );
-        assert_eq!(report.writer_contention.pooled_writer_acquisitions, 1);
-        assert_eq!(report.writer_contention.standalone_writer_acquisitions, 0);
-        assert_eq!(report.writer_contention.writer_task_acquisitions, 0);
-        assert_eq!(report.writer_contention.writer_acquisition_timeouts, 0);
-        assert_eq!(
-            report.reader_contention,
-            ReaderContentionDiagnostics {
-                configured_reader_cap: pool.config().max_readers,
-                configured_checkout_timeout_ms: u64::try_from(
-                    pool.config().checkout_timeout.as_millis(),
-                )
-                .unwrap_or(u64::MAX),
-                configured_busy_timeout_ms: u64::try_from(pool.config().busy_timeout.as_millis())
-                    .unwrap_or(u64::MAX),
-                reader_admission_capacity,
-                available_reader_admission_slots: reader_admission_capacity,
-                reader_acquisitions: 0,
-                pooled_reader_checkouts: 0,
-                standalone_reader_opens: 0,
-                infrastructure_standalone_reader_opens: 0,
-                reader_checkout_timeouts: 0,
-                reader_busy_timeouts: 0,
-                active_pooled_reader_checkouts: 0,
-                peak_active_pooled_reader_checkouts: 0,
-                completed_pooled_reader_checkouts: 0,
-                max_completed_reader_hold_micros: 0,
-                max_completed_reader_hold_operation: None,
-                reader_replacement_open_failures: 0,
-            },
-            "the diagnostics probe itself must not masquerade as request reader traffic"
-        );
-        assert_eq!(
-            report.graph_edge_integrity,
-            Some(GraphEdgeIntegrity {
-                duplicate_edge_id_groups: 0,
-                graph_edges_rows: 0,
-                graph_edges_seq_rows: 0,
-                pre_v14_duplicate_edge_state_detected: false,
-                live_entities_carrying_merged_into: 0,
-            })
-        );
-        assert!(report.graph_edge_integrity_error.is_none());
-        let fts_segments = report
-            .fts_segments
-            .as_ref()
-            .expect("file-backed diagnostics must decode both FTS structure rows");
-        assert_eq!(fts_segments.entities.segment_count, 1);
-        assert_eq!(fts_segments.notes.segment_count, 1);
-        assert_eq!(fts_segments.total_segments, 2);
-        assert!(report.fts_segments_error.is_none());
-        let fts_json = json
-            .get("fts_segments")
-            .expect("FTS segment diagnostics serialize");
-        assert_eq!(fts_json["entities"]["segment_count"], 1);
-        assert!(json.get("fts_maintenance").is_some());
-        assert!(
-            report.size_composition.is_some(),
-            "file-backed diagnostics must include page composition; error was {:?}",
-            report.size_composition_error
-        );
-        assert!(report.size_composition_error.is_none());
-        assert!(report.writer_contention.audit_append_failures.is_none());
-        assert!(report
-            .writer_contention
-            .audit_obligation_append_failures
-            .is_none());
-        assert!(report
-            .writer_contention
-            .audit_obligation_append_failures_unavailable_reason
-            .is_some());
-        assert!(json["writer_contention"]["audit_obligation_append_failures"].is_null());
-        assert!(
-            report
-                .writer_contention
-                .audit_append_failures_unavailable_reason
-                .is_some(),
-            "a direct khive-db snapshot must not fabricate a runtime audit count"
-        );
-    }
-
-    #[test]
-    fn diagnostics_exposes_reader_saturation_and_completed_hold_evidence() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // A pre-opened reader makes setup independent of the exhaustion timeout.
-        let pool = ConnectionPool::new(PoolConfig {
-            path: Some(dir.path().join("reader_saturation.db")),
-            max_readers: 1,
-            checkout_timeout: Duration::from_millis(2),
-            ..PoolConfig::default()
-        })
-        .expect("one-reader file-backed pool");
-        let held = pool.reader().expect("first reader checkout");
-        assert!(
-            pool.reader().is_err(),
-            "the live checkout must exhaust the one-slot reader budget"
-        );
-        drop(held);
-
-        let report = collect(
-            &pool,
-            BuildIdentity::from_env("9.9.9", None),
-            Duration::from_secs(30),
-        );
-        let reader = report.reader_contention;
-        assert_eq!(reader.reader_admission_capacity, 1);
-        assert_eq!(reader.available_reader_admission_slots, 1);
-        assert_eq!(reader.reader_acquisitions, 1);
-        assert_eq!(reader.pooled_reader_checkouts, 1);
-        assert_eq!(reader.standalone_reader_opens, 0);
-        assert_eq!(reader.infrastructure_standalone_reader_opens, 0);
-        assert_eq!(reader.reader_checkout_timeouts, 1);
-        assert_eq!(reader.active_pooled_reader_checkouts, 0);
-        assert_eq!(reader.peak_active_pooled_reader_checkouts, 1);
-        assert_eq!(reader.completed_pooled_reader_checkouts, 1);
-        assert!(reader.max_completed_reader_hold_micros > 0);
-
-        let json = serde_json::to_value(&report).expect("report serializes");
-        assert_eq!(
-            json.pointer("/reader_contention/reader_admission_capacity"),
-            Some(&serde_json::json!(1)),
-            "the operator wire payload must expose the reader admission budget"
-        );
-        assert_eq!(
-            json.pointer("/reader_contention/reader_checkout_timeouts"),
-            Some(&serde_json::json!(1)),
-            "the operator wire payload must expose the reader timeout phase"
-        );
-        assert!(
-            json.pointer("/reader_contention/max_completed_reader_hold_micros")
-                .is_some(),
-            "the operator wire payload must expose completed hold-time evidence"
-        );
-    }
-
-    /// A query refused with SQLITE_BUSY after the busy handler gives up shows up
-    /// in `reader_busy_timeouts`, apart from `reader_checkout_timeouts`. WAL
-    /// readers are never blocked by a writer, so the fixture uses a
-    /// rollback-journal database, where a connection holding an exclusive lock
-    /// refuses every other reader.
-    #[test]
-    fn diagnostics_counts_reader_busy_handler_timeouts_apart_from_checkout_timeouts() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("reader_busy_timeouts.db");
-        let pool = ConnectionPool::new(PoolConfig {
-            path: Some(path.clone()),
-            wal_mode: false,
-            write_queue_enabled: Some(false),
-            busy_timeout: Duration::from_millis(50),
-            ..PoolConfig::default()
-        })
-        .expect("rollback-journal file-backed pool");
-        pool.writer()
-            .expect("writer")
-            .conn()
-            .execute_batch("CREATE TABLE busy_fixture (id INTEGER PRIMARY KEY)")
-            .expect("fixture table");
-
-        // Control: with no lock held the read succeeds and nothing is counted.
-        let reader = pool.reader().expect("reader checkout");
-        let rows = reader
-            .query_row("SELECT count(*) FROM busy_fixture", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .expect("unlocked read");
-        assert_eq!(rows, 0);
-        drop(reader);
-        assert_eq!(
-            ReaderContentionDiagnostics::snapshot(&pool).reader_busy_timeouts,
-            0
-        );
-
-        let holder = Connection::open(&path).expect("second connection");
-        holder
-            .execute_batch("BEGIN EXCLUSIVE")
-            .expect("exclusive lock");
-        let reader = pool.reader().expect("reader checkout");
-        let refused = reader
-            .query_row("SELECT count(*) FROM busy_fixture", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .expect_err("a read behind an exclusive lock must be refused");
-        assert!(
-            matches!(
-                &refused,
-                crate::SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
-                    if code.code == rusqlite::ErrorCode::DatabaseBusy
-            ),
-            "the refusal must be SQLITE_BUSY: {refused}"
-        );
-        holder.execute_batch("ROLLBACK").expect("release lock");
-        drop(reader);
-
-        let snapshot = ReaderContentionDiagnostics::snapshot(&pool);
-        assert_eq!(snapshot.reader_busy_timeouts, 1);
-        assert_eq!(
-            snapshot.reader_checkout_timeouts, 0,
-            "a busy-handler refusal after checkout is not a checkout timeout"
-        );
-        let json = serde_json::to_value(snapshot).expect("snapshot serializes");
-        assert_eq!(
-            json.pointer("/reader_busy_timeouts"),
-            Some(&serde_json::json!(1)),
-            "the operator wire payload must expose the busy-handler count"
-        );
-    }
-
-    #[test]
-    fn diagnostics_reports_configured_reader_budget_and_both_deadlines() {
-        let pool = ConnectionPool::new(PoolConfig {
-            max_readers: 6,
-            checkout_timeout: Duration::from_millis(17),
-            busy_timeout: Duration::from_millis(31),
-            ..PoolConfig::default()
-        })
-        .expect("in-memory pool");
-        let report = collect(
-            &pool,
-            BuildIdentity::from_env("9.9.9", None),
-            Duration::from_secs(30),
-        );
-        let reader = report.reader_contention;
-        assert_eq!(reader.reader_admission_capacity, 1);
-
-        let json = serde_json::to_value(&report).expect("report serializes");
-        assert_eq!(
-            json.pointer("/reader_contention/configured_reader_cap"),
-            Some(&serde_json::json!(6))
-        );
-        assert_eq!(
-            json.pointer("/reader_contention/configured_checkout_timeout_ms"),
-            Some(&serde_json::json!(17))
-        );
-        assert_eq!(
-            json.pointer("/reader_contention/configured_busy_timeout_ms"),
-            Some(&serde_json::json!(31))
-        );
-    }
-
-    #[test]
-    fn diagnostics_composes_file_backed_standalone_acquisitions_without_counting_its_probe() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (pool, _path) = seeded_pool(&dir);
-
-        drop(
-            pool.open_standalone_writer()
-                .expect("write-traffic standalone connection"),
-        );
-
-        let report = collect_with_audit_append_failures(
-            &pool,
-            BuildIdentity::from_env("9.9.9", None),
-            Duration::from_secs(30),
-            0,
-        );
-        assert_eq!(report.writer_contention.writer_acquisitions, 2);
-        assert_eq!(report.writer_contention.pooled_writer_acquisitions, 1);
-        assert_eq!(report.writer_contention.standalone_writer_acquisitions, 1);
-        assert_eq!(report.writer_contention.writer_task_acquisitions, 0);
-        assert_eq!(report.writer_contention.writer_acquisition_timeouts, 0);
-
-        let second = collect_with_audit_append_failures(
-            &pool,
-            BuildIdentity::from_env("9.9.9", None),
-            Duration::from_secs(30),
-            0,
-        );
-        assert_eq!(
-            second.writer_contention, report.writer_contention,
-            "the diagnostics PASSIVE probe must not inflate write-traffic counters"
-        );
-    }
-
-    #[test]
-    fn runtime_aware_collect_exposes_the_supplied_audit_failure_counter() {
-        let pool = ConnectionPool::new(PoolConfig::default()).expect("in-memory pool");
-
-        let report = collect_with_audit_append_failures(
-            &pool,
-            BuildIdentity::from_env("9.9.9", None),
-            Duration::from_secs(30),
-            17,
-        );
-
-        assert_eq!(report.writer_contention.audit_append_failures, Some(17));
-        assert!(
-            report
-                .writer_contention
-                .audit_append_failures_unavailable_reason
-                .is_none(),
-            "a supplied runtime counter must not carry an unavailable reason"
-        );
-    }
-
-    #[test]
-    fn diagnostics_exposes_an_induced_writer_checkout_timeout() {
-        let pool = ConnectionPool::new(PoolConfig {
-            checkout_timeout: Duration::from_millis(1),
-            ..PoolConfig::default()
-        })
-        .expect("in-memory pool");
-
-        let held = pool.writer().expect("first writer checkout succeeds");
-        assert!(
-            matches!(
-                pool.writer(),
-                Err(crate::SqliteError::WriterPoolCheckoutTimeout { .. })
-            ),
-            "holding the sole writer must exercise the typed timeout path"
-        );
-        drop(held);
-
-        let report = collect_with_audit_append_failures(
-            &pool,
-            BuildIdentity::from_env("9.9.9", None),
-            Duration::from_secs(30),
-            0,
-        );
-        assert_eq!(report.writer_contention.writer_acquisitions, 1);
-        assert_eq!(report.writer_contention.pooled_writer_acquisitions, 1);
-        assert_eq!(report.writer_contention.standalone_writer_acquisitions, 0);
-        assert_eq!(report.writer_contention.writer_task_acquisitions, 0);
-        assert_eq!(report.writer_contention.writer_acquisition_timeouts, 1);
-    }
-
-    /// The `u64::MAX` never-observed sentinel must serialize as `null`, never
-    /// as a huge number an operator would read as a real page count.
-    #[test]
-    fn never_observed_sentinels_serialize_as_null() {
-        let counters = CheckpointCounters {
-            last_observed_wal_pages: None,
-            truncate_attempts: 0,
-            truncate_consecutive_failures: 0,
-            checkpoint_skipped_ticks: 0,
-            checkpoint_consecutive_skips: 0,
-            checkpoint_last_skip_wal_pages: None,
-            checkpoint_pressure_elevated_ticks: 0,
-            checkpoint_pressure_episodes_started: 0,
-            checkpoint_pressure_episodes_recovered: 0,
-            checkpoint_lifecycle_append_attempts: 0,
-            checkpoint_lifecycle_append_failures: 0,
-            checkpoint_lifecycle_enqueue_drops: 0,
-            read_tx_max_age_evictions: 0,
-        };
-        let json = serde_json::to_value(counters).expect("serializes");
-        assert!(json["last_observed_wal_pages"].is_null());
-        assert!(json["checkpoint_last_skip_wal_pages"].is_null());
-    }
-
-    #[test]
-    fn graph_edge_integrity_detects_the_pre_v14_duplicate_state() {
-        let conn = Connection::open_in_memory().expect("in-memory sqlite");
-        conn.execute_batch(
-            "CREATE TABLE graph_edges (
-                 namespace TEXT NOT NULL,
-                 id TEXT NOT NULL,
-                 PRIMARY KEY (namespace, id)
-             );
-             CREATE TABLE graph_edges_seq (
-                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                 edge_id TEXT NOT NULL UNIQUE
-             );
-             CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER, merged_into TEXT);
-             INSERT INTO graph_edges(namespace, id)
-             VALUES ('alpha', 'shared-edge'), ('beta', 'shared-edge');
-             INSERT INTO graph_edges_seq(edge_id) VALUES ('shared-edge');",
-        )
-        .expect("seed the state possible before the V14 uniqueness guard");
-
-        let integrity = graph_edge_integrity(&conn).expect("integrity query succeeds");
-
-        assert_eq!(integrity.duplicate_edge_id_groups, 1);
-        assert_eq!(integrity.graph_edges_rows, 2);
-        assert_eq!(integrity.graph_edges_seq_rows, 1);
-        assert!(integrity.pre_v14_duplicate_edge_state_detected);
-    }
-
-    #[test]
-    fn graph_edge_integrity_counts_only_live_rows_that_still_carry_merge_provenance() {
-        let conn = Connection::open_in_memory().expect("in-memory sqlite");
-        conn.execute_batch(
-            "CREATE TABLE graph_edges (
-                 namespace TEXT NOT NULL,
-                 id TEXT NOT NULL,
-                 PRIMARY KEY (namespace, id)
-             );
-             CREATE TABLE graph_edges_seq (
-                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                 edge_id TEXT NOT NULL UNIQUE
-             );
-             CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER, merged_into TEXT);
-             INSERT INTO entities(id, deleted_at, merged_into) VALUES
-                 ('kept', NULL, NULL),
-                 ('tombstoned-source', 1, 'kept'),
-                 ('left-live-by-an-old-restore', NULL, 'kept'),
-                 ('plain-soft-delete', 1, NULL);",
-        )
-        .expect("seed one row of each shape");
-
-        let integrity = graph_edge_integrity(&conn).expect("integrity query succeeds");
-
-        assert_eq!(
-            integrity.live_entities_carrying_merged_into, 1,
-            "a merge tombstone and a plain live row are both in order; only the live row \
-             carrying merged_into is the invariant violation"
-        );
-        assert_eq!(integrity.duplicate_edge_id_groups, 0);
-    }
-
-    #[test]
-    fn graph_edge_integrity_does_not_mislabel_retained_delete_history_as_a_duplicate() {
-        let conn = Connection::open_in_memory().expect("in-memory sqlite");
-        conn.execute_batch(
-            "CREATE TABLE graph_edges (
-                 namespace TEXT NOT NULL,
-                 id TEXT NOT NULL,
-                 PRIMARY KEY (namespace, id)
-             );
-             CREATE TABLE graph_edges_seq (
-                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                 edge_id TEXT NOT NULL UNIQUE
-             );
-             CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER, merged_into TEXT);
-             INSERT INTO graph_edges(namespace, id) VALUES ('local', 'live-edge');
-             INSERT INTO graph_edges_seq(edge_id)
-             VALUES ('deleted-edge'), ('live-edge');",
-        )
-        .expect("seed a retained sequence row for a hard-deleted edge");
-
-        let integrity = graph_edge_integrity(&conn).expect("integrity query succeeds");
-
-        assert_eq!(integrity.duplicate_edge_id_groups, 0);
-        assert_eq!(integrity.graph_edges_rows, 1);
-        assert_eq!(integrity.graph_edges_seq_rows, 2);
-        assert!(
-            !integrity.pre_v14_duplicate_edge_state_detected,
-            "ledger rows intentionally survive hard deletion; count mismatch alone is not the \
-             pre-V14 duplicate state"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unmeasured_sidecar_cleanup_fields_are_absent_from_the_wire_payload() {
-        let pin = wal_pin_attribution_from_census(crate::walpin::CensusResult {
-            holders: std::collections::HashSet::new(),
-            uninspectable_pids: Vec::new(),
-            truncated: false,
-            budget_exhausted: false,
-        });
-
-        assert_eq!(pin.sidecar_listing_truncated, None);
-        assert_eq!(pin.sidecar_entries_cleanup_would_reap, None);
-        let json = serde_json::to_value(pin).expect("attribution serializes");
-        assert!(
-            json.get("sidecar_listing_truncated").is_none(),
-            "a skipped enumeration must omit sidecar_listing_truncated, not fabricate false"
-        );
-        assert!(
-            json.get("sidecar_entries_cleanup_would_reap").is_none(),
-            "a skipped enumeration must omit sidecar_entries_cleanup_would_reap, not fabricate 0"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn wal_pin_census_serializes_only_under_the_nested_carrier() {
-        let pin = wal_pin_attribution_from_census(crate::walpin::CensusResult {
-            holders: std::collections::HashSet::from([41, 7]),
-            uninspectable_pids: vec![99],
-            truncated: true,
-            budget_exhausted: false,
-        });
-
-        let json = serde_json::to_value(pin).expect("attribution serializes");
-        assert_eq!(json["census"]["holder_pids"], serde_json::json!([7, 41]));
-        assert_eq!(
-            json["census"]["uninspectable_pids"],
-            serde_json::json!([99])
-        );
-        assert_eq!(json["census"]["truncated"], true);
-
-        for duplicate in [
-            "census_holder_pids",
-            "census_uninspectable_pids",
-            "census_truncated",
-            "census_is_complete",
-        ] {
-            assert!(
-                json.get(duplicate).is_none(),
-                "wal_pin.{duplicate} must not duplicate wal_pin.census: {json}"
-            );
-        }
-    }
-
-    /// A missing configured path must never be created by a diagnostic
-    /// request. The untracked standalone open omits `SQLITE_OPEN_CREATE`, so
-    /// the probe degrades to an error and the file stays absent.
-    #[test]
-    fn probe_refuses_a_missing_configured_path_without_creating_it() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (pool, path) = seeded_pool(&dir);
-
-        for suffix in ["", "-wal", "-shm"] {
-            let mut p = path.as_os_str().to_os_string();
-            p.push(suffix);
-            let _ = std::fs::remove_file(PathBuf::from(p));
-        }
-        assert!(!path.exists(), "precondition: the database file is gone");
-
-        let report = collect(
-            &pool,
-            BuildIdentity::from_env("0.0.0", None),
-            Duration::from_secs(30),
-        );
-
-        assert!(
-            report.checkpoint_probe.is_none(),
-            "a missing database must not yield a probe result: {report:?}"
-        );
-        assert!(
-            report.checkpoint_probe_error.is_some(),
-            "a missing database must say why there is no probe: {report:?}"
-        );
-        assert!(
-            !path.exists(),
-            "a diagnostics request must never create the database it was asked about"
-        );
-    }
-
-    /// In-memory backends have no WAL file and no census target: the report
-    /// still returns, with explicit reasons rather than missing sections.
-    #[test]
-    fn collect_degrades_gracefully_for_an_in_memory_backend() {
-        let pool = ConnectionPool::new(PoolConfig::default()).expect("in-memory pool");
-        let report = collect(
-            &pool,
-            BuildIdentity::from_env("0.0.0", None),
-            Duration::from_secs(30),
-        );
-
-        assert!(report.db_path.is_none());
-        assert!(report.wal_file.is_none());
-        assert!(report.checkpoint_probe.is_none());
-        assert!(report.fts_segments.is_none());
-        assert!(report.fts_segments_error.is_some());
-        assert!(
-            report.checkpoint_probe_error.is_some(),
-            "an in-memory report must say WHY there is no probe"
-        );
-        assert!(!report.wal_pin.available);
-        assert!(report.wal_pin.unavailable_reason.is_some());
-        assert_eq!(report.wal_pin.status, WalPinAttributionStatus::Unavailable);
-        assert!(matches!(
-            report.wal_pin.census,
-            WalPinCensus::Unavailable { .. }
-        ));
-        assert!(report.size_composition.is_none());
-        assert!(report
-            .size_composition_error
-            .as_deref()
-            .is_some_and(|reason| reason.contains("no file-backed page composition")));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn incomplete_holder_census_is_a_tagged_degraded_result() {
-        let census = crate::walpin::CensusResult {
-            holders: std::collections::HashSet::from([41, 7]),
-            uninspectable_pids: vec![99, 99],
-            truncated: true,
-            budget_exhausted: false,
-        };
-
-        let pin = wal_pin_attribution_from_census(census);
-
-        assert_eq!(pin.status, WalPinAttributionStatus::Degraded);
-        assert!(!pin.available);
-        assert!(!pin.census_is_complete);
-        assert_eq!(pin.census_holder_pids, vec![7, 41]);
-        assert_eq!(pin.census_uninspectable_pids, vec![99]);
-        assert!(
-            pin.unavailable_reason.as_deref().is_some_and(
-                |reason| reason.contains("additional database holders cannot be ruled out")
-            ),
-            "the legacy reason must also fail loud for old consumers: {pin:?}"
-        );
-        match &pin.census {
-            WalPinCensus::Incomplete {
-                holder_pids,
-                uninspectable_pids,
-                truncated,
-                reason,
-            } => {
-                assert_eq!(holder_pids, &vec![7, 41]);
-                assert_eq!(uninspectable_pids, &vec![99]);
-                assert!(*truncated);
-                assert!(reason.contains("additional database holders cannot be ruled out"));
-            }
-            other => panic!("incomplete scan must serialize as incomplete, got {other:?}"),
-        }
-
-        let json = serde_json::to_value(&pin).expect("serializes");
-        assert_eq!(json["status"], "degraded");
-        assert_eq!(json["census"]["status"], "incomplete");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn complete_holder_census_stays_explicit_while_attribution_is_degraded() {
-        let census = crate::walpin::CensusResult {
-            holders: std::collections::HashSet::from([7]),
-            uninspectable_pids: Vec::new(),
-            truncated: false,
-            budget_exhausted: false,
-        };
-
-        let pin = wal_pin_attribution_from_census(census);
-
-        assert_eq!(pin.status, WalPinAttributionStatus::Degraded);
-        assert!(pin.census_is_complete);
-        assert!(matches!(
-            pin.census,
-            WalPinCensus::Complete { ref holder_pids } if holder_pids == &vec![7]
-        ));
-        assert_eq!(
-            pin.status_reasons.len(),
-            1,
-            "only missing sidecar reconciliation degrades a complete OS census"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn complete_holder_and_read_only_sidecar_evidence_reconcile_to_complete() {
-        let census = crate::walpin::CensusResult {
-            holders: std::collections::HashSet::from([7]),
-            uninspectable_pids: Vec::new(),
-            truncated: false,
-            budget_exhausted: false,
-        };
-        let sidecar = crate::walpin::WalpinReport {
-            entries: vec![crate::walpin::WalpinPidHealth::RegisteredSilent { pid: 7 }],
-            sidecar_listing_truncated: false,
-            cleanup_would_reap: 0,
-            orphan_temps_reaped: 0,
-        };
-
-        let pin = wal_pin_attribution_from_evidence(census, sidecar);
-
-        assert_eq!(pin.status, WalPinAttributionStatus::Complete);
-        assert!(pin.available);
-        assert!(pin.fully_attributed);
-        assert!(pin.status_reasons.is_empty());
-        assert_eq!(pin.registered_silent_pids, vec![7]);
-        assert!(pin.census_pids_without_attribution.is_empty());
-        assert_eq!(pin.sidecar_listing_truncated, Some(false));
-        assert_eq!(pin.sidecar_entries_cleanup_would_reap, Some(0));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn complete_census_with_an_unregistered_holder_is_degraded_not_exonerated() {
-        let census = crate::walpin::CensusResult {
-            holders: std::collections::HashSet::from([7, 41]),
-            uninspectable_pids: Vec::new(),
-            truncated: false,
-            budget_exhausted: false,
-        };
-        let sidecar = crate::walpin::WalpinReport {
-            entries: vec![crate::walpin::WalpinPidHealth::RegisteredSilent { pid: 7 }],
-            sidecar_listing_truncated: false,
-            cleanup_would_reap: 0,
-            orphan_temps_reaped: 0,
-        };
-
-        let pin = wal_pin_attribution_from_evidence(census, sidecar);
-
-        assert_eq!(pin.status, WalPinAttributionStatus::Degraded);
-        assert!(!pin.available);
-        assert!(!pin.fully_attributed);
-        assert_eq!(pin.census_pids_without_attribution, vec![41]);
-        assert!(pin
-            .status_reasons
-            .iter()
-            .any(|reason| reason.contains("holder(s) have no sidecar attribution")));
-    }
-
-    #[test]
-    fn database_size_composition_reports_tables_indexes_fts_and_vectors_separately() {
-        let conn = Connection::open_in_memory().expect("in-memory sqlite");
-        conn.execute_batch(
-            "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT NOT NULL); \
-             CREATE INDEX idx_docs_body ON docs(body); \
-             CREATE TABLE fts_demo_data(id INTEGER PRIMARY KEY, block BLOB); \
-             CREATE TABLE vec_demo_chunks(id INTEGER PRIMARY KEY, vectors BLOB); \
-             CREATE TABLE knowledge_sections(id INTEGER PRIMARY KEY, embedding BLOB); \
-             INSERT INTO docs(body) VALUES (zeroblob(8192)); \
-             INSERT INTO fts_demo_data(block) VALUES (zeroblob(8192)); \
-             INSERT INTO vec_demo_chunks(vectors) VALUES (zeroblob(8192)); \
-             INSERT INTO knowledge_sections(embedding) VALUES (zeroblob(8192));",
-        )
-        .expect("seed size classes");
-
-        let composition = database_size_composition(&conn).expect("dbstat composition");
-        let class_for = |name: &str| {
-            composition
-                .objects
-                .iter()
-                .find(|object| object.name == name)
-                .map(|object| object.storage_class)
-        };
-
-        assert_eq!(class_for("docs"), Some(DatabaseStorageClass::RowTable));
-        assert_eq!(
-            class_for("idx_docs_body"),
-            Some(DatabaseStorageClass::Index)
-        );
-        assert_eq!(
-            class_for("fts_demo_data"),
-            Some(DatabaseStorageClass::FullText)
-        );
-        assert_eq!(
-            class_for("vec_demo_chunks"),
-            Some(DatabaseStorageClass::Vector)
-        );
-        assert_eq!(
-            class_for("knowledge_sections"),
-            Some(DatabaseStorageClass::MixedRowAndEmbedding)
-        );
-        assert!(composition.vector_bytes > 0);
-        assert!(composition.full_text_bytes > 0);
-        assert!(composition.mixed_embedding_bytes > 0);
-        assert_eq!(
-            composition
-                .accounted_bytes
-                .saturating_add(composition.freelist_bytes)
-                .saturating_add(composition.unaccounted_bytes),
-            composition.database_bytes
-        );
-    }
-
-    /// A holder with no sidecar registration remains degraded even though the
-    /// read-only sidecar pass itself completed successfully.
-    #[cfg(unix)]
-    #[test]
-    #[serial(khive_walpin_sidecar_env)]
-    fn wal_pin_attribution_degrades_when_a_holder_has_no_sidecar_registration() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (pool, path) = seeded_pool(&dir);
-        let _ = &pool;
-
-        let pin = wal_pin_attribution(&path, Duration::from_secs(30));
-
-        assert!(
-            !pin.fully_attributed,
-            "the pool's OS holder has no test sidecar registration"
-        );
-        assert!(
-            pin.unavailable_reason.is_some(),
-            "the missing holder attribution must be explained: {pin:?}"
-        );
-        assert!(pin.sidecar_entries.is_empty());
-        assert!(pin.reporting.is_empty());
-        assert_eq!(pin.sidecar_listing_truncated, Some(false));
-        assert_eq!(pin.sidecar_entries_cleanup_would_reap, Some(0));
-        assert_eq!(pin.status, WalPinAttributionStatus::Degraded);
-        assert!(matches!(
-            pin.census,
-            WalPinCensus::Complete { .. } | WalPinCensus::Incomplete { .. }
-        ));
-    }
-
-    /// `sidecar_dir_for` is a purely lexical derivation from whatever path it
-    /// is handed (`pool.rs`'s `sidecar_dir_for_alias_convergence` proves
-    /// this at the primitive level). Diagnostics must feed it
-    /// `pool.canonical_path()` — the same value the checkpoint sidecar
-    /// writers use — never the pool's raw configured path, or a symlinked
-    /// database misses its own sidecar evidence entirely.
-    #[cfg(unix)]
-    #[test]
-    #[serial(khive_walpin_sidecar_env)]
-    fn diagnostics_finds_sidecar_evidence_through_an_aliased_database_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let real_dir = dir.path().join("real");
-        std::fs::create_dir(&real_dir).expect("mkdir real dir");
-        let real_path = real_dir.join("diag.db");
-        std::fs::write(&real_path, b"").expect("create real file");
-        let alias_path = dir.path().join("alias.db");
-        std::os::unix::fs::symlink(&real_path, &alias_path).expect("symlink alias");
-
-        let pool = ConnectionPool::new(PoolConfig {
-            path: Some(alias_path.clone()),
-            ..PoolConfig::for_test()
-        })
-        .expect("pool open through symlinked path");
-        {
-            let writer = pool.try_writer().expect("writer");
-            writer
-                .conn()
-                .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
-                .expect("seed a write so the WAL file exists");
-        }
-
-        let canonical = pool
-            .canonical_path()
-            .expect("file-backed pool")
-            .to_path_buf();
-        assert_ne!(
-            canonical, alias_path,
-            "the alias must actually differ from the canonical path for this test to mean \
-             anything"
-        );
-
-        let pid = std::process::id();
-        let sidecar_dir = crate::walpin::sidecar_dir_for(&canonical);
-        let beacon = crate::walpin::WalpinBeacon {
-            pid,
-            process_role: "session".to_string(),
-            started_at: crate::walpin::process_start_time_secs(pid).unwrap_or(0),
-            sweep_interval_ms: 5_000,
-        };
-        crate::walpin::write_beacon(&sidecar_dir, &beacon).expect("seed this process's beacon");
-
-        let report = collect(
-            &pool,
-            BuildIdentity::from_env("test", None),
-            Duration::from_secs(30),
-        );
-
-        // The wider OS holder census can be legitimately incomplete in a
-        // sandboxed test environment (other, unrelated processes this test
-        // has no permission to inspect) — that variability is orthogonal to
-        // what this test checks. What must hold regardless is that the
-        // sidecar enumeration itself, which is keyed off the canonical
-        // path, actually ran, completed untruncated, and found this
-        // process's own beacon rather than missing it beside the wrong
-        // (aliased) directory.
-        assert_eq!(
-            report.wal_pin.sidecar_listing_truncated,
-            Some(false),
-            "the sidecar enumeration must run to completion: {:?}",
-            report.wal_pin
-        );
-        assert!(
-            report.wal_pin.registered_silent_pids.contains(&pid),
-            "the beacon written beside the canonical path must be found: {:?}",
-            report.wal_pin
-        );
-        assert!(
-            report.wal_pin.census_holder_pids.contains(&pid),
-            "the OS census must find this process holding its own database open: {:?}",
-            report.wal_pin
-        );
-        assert!(
-            !report
-                .wal_pin
-                .census_pids_without_attribution
-                .contains(&pid),
-            "this process's own holder entry must be attributed by its own sidecar evidence, \
-             not left unexplained: {:?}",
-            report.wal_pin
-        );
-    }
-
-    /// The async collector (`collect_with_audit_append_failures_interruptibly`)
-    /// resolves its operational path independently of the sync collector
-    /// (`collect`) — see `operational_db_path`. A regression that reintroduced
-    /// the raw configured path on only the async side would leave the sync
-    /// alias test above green while the async path silently missed its own
-    /// sidecar evidence; this exercises the same aliasing scenario through
-    /// the async entry point.
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial(khive_walpin_sidecar_env)]
-    async fn diagnostics_finds_sidecar_evidence_through_an_aliased_database_path_async() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let real_dir = dir.path().join("real");
-        std::fs::create_dir(&real_dir).expect("mkdir real dir");
-        let real_path = real_dir.join("diag.db");
-        std::fs::write(&real_path, b"").expect("create real file");
-        let alias_path = dir.path().join("alias.db");
-        std::os::unix::fs::symlink(&real_path, &alias_path).expect("symlink alias");
-
-        let pool = ConnectionPool::new(PoolConfig {
-            path: Some(alias_path.clone()),
-            ..PoolConfig::for_test()
-        })
-        .expect("pool open through symlinked path");
-        {
-            let writer = pool.try_writer().expect("writer");
-            writer
-                .conn()
-                .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
-                .expect("seed a write so the WAL file exists");
-        }
-
-        let canonical = pool
-            .canonical_path()
-            .expect("file-backed pool")
-            .to_path_buf();
-        assert_ne!(
-            canonical, alias_path,
-            "the alias must actually differ from the canonical path for this test to mean \
-             anything"
-        );
-
-        let pid = std::process::id();
-        let sidecar_dir = crate::walpin::sidecar_dir_for(&canonical);
-        let beacon = crate::walpin::WalpinBeacon {
-            pid,
-            process_role: "session".to_string(),
-            started_at: crate::walpin::process_start_time_secs(pid).unwrap_or(0),
-            sweep_interval_ms: 5_000,
-        };
-        crate::walpin::write_beacon(&sidecar_dir, &beacon).expect("seed this process's beacon");
-
-        let pool = Arc::new(pool);
-        let report = collect_with_audit_append_failures_interruptibly(
-            Arc::clone(&pool),
-            BuildIdentity::from_env("test", None),
-            Duration::from_secs(30),
-            0,
-        )
-        .await
-        .expect("diagnostics succeed");
-
-        // Same rationale as the sync test: the wider OS holder census can be
-        // legitimately incomplete in a sandboxed environment, but the sidecar
-        // enumeration itself — keyed off the canonical path — must run to
-        // completion and find this process's own beacon.
-        assert_eq!(
-            report.wal_pin.sidecar_listing_truncated,
-            Some(false),
-            "the sidecar enumeration must run to completion: {:?}",
-            report.wal_pin
-        );
-        assert!(
-            report.wal_pin.registered_silent_pids.contains(&pid),
-            "the beacon written beside the canonical path must be found: {:?}",
-            report.wal_pin
-        );
-        assert!(
-            report.wal_pin.census_holder_pids.contains(&pid),
-            "the OS census must find this process holding its own database open: {:?}",
-            report.wal_pin
-        );
-        assert!(
-            !report
-                .wal_pin
-                .census_pids_without_attribution
-                .contains(&pid),
-            "this process's own holder entry must be attributed by its own sidecar evidence, \
-             not left unexplained: {:?}",
-            report.wal_pin
-        );
-    }
-
-    /// ADR-091 Amendment 6: an operator who explicitly disables the sidecar
-    /// also disables its collection. Diagnostics must honor that rather than
-    /// running `inspect_live` regardless of the operator's setting.
-    #[cfg(unix)]
-    #[test]
-    #[serial(khive_walpin_sidecar_env)]
-    fn wal_pin_attribution_reports_disabled_when_the_sidecar_is_explicitly_off() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (pool, path) = seeded_pool(&dir);
-        let _ = &pool;
-        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
-        std::env::set_var("KHIVE_WALPIN_SIDECAR", "0");
-
-        let pin = wal_pin_attribution(&path, Duration::from_secs(30));
-
-        assert!(
-            !pin.available,
-            "an explicitly disabled sidecar can never produce a reconciled answer"
-        );
-        assert!(
-            pin.unavailable_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("disabled")),
-            "the reason must name the disabled sidecar, not a generic enumeration failure: \
-             {pin:?}"
-        );
-        assert!(pin.sidecar_entries.is_empty());
-        assert_eq!(pin.status, WalPinAttributionStatus::Degraded);
-    }
-}
+#[path = "diagnostics_tests.rs"]
+mod tests;

@@ -11,7 +11,7 @@ A change-set contains one `Envelope` and an ordered `Vec<Op>`. Order is semantic
 Line 1 is the envelope. Each following line is one internally tagged operation in stage order:
 
 ```text
-{"schema_version":1,"producer":"agent:x",...}
+{"schema_version":2,"producer":"agent:x",...}
 {"op":"create",...}
 {"op":"link",...}
 ```
@@ -20,13 +20,15 @@ Line 1 is the envelope. Each following line is one internally tagged operation i
 
 ## `to_ndjson`
 
-Encoding serializes the envelope first and then visits `ops` in slice order. Any serde failure becomes `ChangeSetError::Serialize`. No partial output escapes on error because the function returns only after completing the string.
+Encoding first refuses an envelope version other than `CURRENT_SCHEMA_VERSION`, then serializes the envelope first and then visits `ops` in slice order. Any serde failure becomes `ChangeSetError::Serialize`. No partial output escapes on error because the function returns only after completing the string.
 
 ## `from_ndjson`
 
 Decoding requires an envelope line, checks its `schema_version` against `CURRENT_SCHEMA_VERSION`, then decodes every remaining line as one `Op`. Lines are not reordered or skipped.
 
 A blank or whitespace-only operation line is malformed rather than ignored. This keeps the invariant “every post-header line is an operation” exception-free. Serde `deny_unknown_fields` mirrors reject extraneous or misspelled envelope, operation, patch, and embedded-preimage keys.
+
+A line in which any JSON object, at any depth, names the same member twice is malformed. Names are compared after JSON unescaping, so `"label"` and `"label"` are one name. A typed decode would keep only the last copy, so a check of the decoded values could not see an earlier one that the text still holds. The error gives a position only, never the member name or its value.
 
 Malformed JSON reports a one-based physical line number. An unsupported schema reports both the found and expected versions.
 

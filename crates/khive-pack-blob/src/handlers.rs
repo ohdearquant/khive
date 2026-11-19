@@ -1,16 +1,15 @@
 //! Verb handlers for the blob pack — thin wrappers over `BlobStore`.
 
-use std::sync::Arc;
-
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 
 use khive_runtime::daemon::MAX_FRAME_BYTES;
-use khive_runtime::{BlobHydrator, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::blob::ContentRef;
-use khive_storage::{BlobStore, UploadId};
+use khive_storage::UploadId;
 
 use crate::uploads::UploadManager;
 
@@ -57,26 +56,6 @@ pub fn max_request_part_raw_bytes() -> u64 {
     budget.saturating_sub(REQUEST_RESERVE) * 3 / 4
 }
 
-pub(crate) fn blob_store(runtime: &KhiveRuntime) -> Result<Arc<dyn BlobStore>, RuntimeError> {
-    runtime.blob_store().ok_or_else(|| {
-        RuntimeError::Unconfigured(
-            "no BlobStore installed on this server (configure [storage.blob] in khive.toml, or \
-             KHIVE_BLOB_ROOT)"
-                .to_string(),
-        )
-    })
-}
-
-pub(crate) fn blob_hydrator(runtime: &KhiveRuntime) -> Result<Arc<BlobHydrator>, RuntimeError> {
-    runtime.blob_hydrator().ok_or_else(|| {
-        RuntimeError::Unconfigured(
-            "no BlobStore installed on this server (configure [storage.blob] in khive.toml, or \
-             KHIVE_BLOB_ROOT)"
-                .to_string(),
-        )
-    })
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PutParams {
@@ -100,15 +79,21 @@ struct RangeParams {
     length: Option<u64>,
 }
 
+fn range_integer<E: serde::de::Error>(value: Value, field: &str) -> Result<u64, E> {
+    value.as_u64().ok_or_else(|| {
+        let serialized = value.to_string();
+        let shown = mask_for_redaction_surface(RedactionSurface::GateProbe, &serialized);
+        E::custom(format!(
+            "range.{field} must be a non-negative integer, got {shown}"
+        ))
+    })
+}
+
 fn deserialize_range_offset<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<u64, D::Error> {
     let value = Value::deserialize(deserializer)?;
-    value.as_u64().ok_or_else(|| {
-        serde::de::Error::custom(format!(
-            "range.offset must be a non-negative integer, got {value}"
-        ))
-    })
+    range_integer::<D::Error>(value, "offset")
 }
 
 fn deserialize_range_length<'de, D: serde::Deserializer<'de>>(
@@ -116,13 +101,7 @@ fn deserialize_range_length<'de, D: serde::Deserializer<'de>>(
 ) -> Result<Option<u64>, D::Error> {
     let value = Option::<Value>::deserialize(deserializer)?;
     value
-        .map(|value| {
-            value.as_u64().ok_or_else(|| {
-                serde::de::Error::custom(format!(
-                    "range.length must be a non-negative integer, got {value}"
-                ))
-            })
-        })
+        .map(|value| range_integer::<D::Error>(value, "length"))
         .transpose()
 }
 
@@ -133,9 +112,11 @@ fn deserialize_range<'de, D: serde::Deserializer<'de>>(
     value
         .map(|value| {
             if !value.is_object() {
-                return Err(serde::de::Error::custom(
-                    "range must be a JSON object with optional offset/length",
-                ));
+                let serialized = value.to_string();
+                let shown = mask_for_redaction_surface(RedactionSurface::GateProbe, &serialized);
+                return Err(serde::de::Error::custom(format!(
+                    "range must be a JSON object with optional offset/length; got {shown}"
+                )));
             }
             serde_json::from_value(value).map_err(serde::de::Error::custom)
         })
@@ -191,6 +172,10 @@ fn parse_upload_id(raw: &str, verb: &str) -> Result<UploadId, RuntimeError> {
     UploadId::from_hex(raw).map_err(|error| RuntimeError::InvalidInput(format!("{verb}: {error}")))
 }
 
+fn invalid_part_base64(error: impl std::fmt::Display) -> RuntimeError {
+    RuntimeError::InvalidInput(format!("blob.put_part: invalid base64: {error}"))
+}
+
 pub(crate) async fn handle_begin(
     uploads: &UploadManager,
     token: &NamespaceToken,
@@ -243,15 +228,13 @@ pub(crate) async fn handle_put_part(
             ));
         }
         let mut tail = [0; 3];
-        let tail_len = BASE64.decode_slice(suffix, &mut tail).map_err(|error| {
-            RuntimeError::InvalidInput(format!("blob.put_part: invalid base64: {error}"))
-        })?;
+        let tail_len = BASE64
+            .decode_slice(suffix, &mut tail)
+            .map_err(invalid_part_base64)?;
         let decoded_len = (prefix.len() / 4 * 3 + tail_len) as u64;
         return uploads.reject_oversized_part(&id, index, decoded_len).await;
     }
-    let bytes = BASE64.decode(b64).map_err(|error| {
-        RuntimeError::InvalidInput(format!("blob.put_part: invalid base64: {error}"))
-    })?;
+    let bytes = BASE64.decode(b64).map_err(invalid_part_base64)?;
     uploads.put_part(&id, index, bytes).await
 }
 
@@ -293,7 +276,7 @@ pub(crate) async fn handle_put(
             "blob.put is unavailable because the blob pack runtime is read-only".to_string(),
         ));
     }
-    let store = blob_store(runtime)?;
+    let store = runtime.require_blob_store()?;
 
     // Bound the decode before allocating: 4 base64 chars encode 3 bytes, so an
     // input longer than MAX_OBJECT_BYTES * 4/3 cannot fit under the ceiling. Reject
@@ -340,8 +323,8 @@ pub(crate) async fn handle_get(
     let GetParams { content_ref, range } = parse_params(params, "blob.get")?;
     let content_ref = parse_content_ref(&content_ref, "blob.get")?;
     let range = range.map(|range| (range.offset, range.length));
-    let store = blob_store(runtime)?;
-    let hydrator = blob_hydrator(runtime)?;
+    let store = runtime.require_blob_store()?;
+    let hydrator = runtime.require_blob_hydrator()?;
 
     let size = store.size(&content_ref).await?.ok_or_else(|| {
         RuntimeError::NotFound(format!(
@@ -435,7 +418,7 @@ pub(crate) async fn handle_stat(
 ) -> Result<Value, RuntimeError> {
     let StatParams { content_ref } = parse_params(params, "blob.stat")?;
     let content_ref = parse_content_ref(&content_ref, "blob.stat")?;
-    let store = blob_store(runtime)?;
+    let store = runtime.require_blob_store()?;
 
     match store.size(&content_ref).await? {
         None => Ok(json!({ "content_ref": content_ref.to_string(), "exists": false })),

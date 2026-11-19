@@ -1,0 +1,29 @@
+charter issue_readonly_investigation v1
+title "Investigate an issue without changing its source"
+subject issue
+
+roles:
+    investigator "reads and verifies issue evidence"
+
+triggers:
+    prompt.received
+    message.arrived
+    schedule.fired
+
+workflow:
+    phase intake by investigator:
+        await prompt.received or message.arrived or schedule.fired
+        goto authorize
+
+    phase authorize by investigator:
+        goto inspect
+
+    phase inspect by investigator:
+        goto probe
+
+    phase probe by investigator:
+        goto report
+
+    phase report by investigator:
+        require loop.log_written advisory
+        complete

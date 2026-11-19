@@ -1,0 +1,41 @@
+[
+  {
+    "name": "search_latency-list-runs-workload",
+    "crate": "khive-pack-knowledge",
+    "filter": "executable protocol check",
+    "command": "python3 crates/khive-pack-knowledge/perf/reducible/check.py --search <built-search-executable> --tail <built-tail-executable>",
+    "edits": [
+      {
+        "file": "crates/khive-pack-knowledge/benches/search_latency.rs",
+        "old": "if args.iter().any(|arg| arg == \"--list\") {",
+        "new": "if false {"
+      }
+    ]
+  },
+  {
+    "name": "tail_replay-list-runs-workload",
+    "crate": "khive-pack-knowledge",
+    "filter": "executable protocol check",
+    "command": "python3 crates/khive-pack-knowledge/perf/reducible/check.py --search <built-search-executable> --tail <built-tail-executable>",
+    "edits": [
+      {
+        "file": "crates/khive-pack-knowledge/benches/tail_replay.rs",
+        "old": "if args.iter().any(|arg| arg == \"--list\") {",
+        "new": "if false {"
+      }
+    ]
+  },
+  {
+    "name": "tail-replay-drops-report",
+    "crate": "khive-pack-knowledge",
+    "filter": "executable protocol check",
+    "command": "python3 crates/khive-pack-knowledge/perf/reducible/check.py --search <built-search-executable> --tail <built-tail-executable>",
+    "edits": [
+      {
+        "file": "crates/khive-pack-knowledge/benches/tail_replay.rs",
+        "old": "println!(\n        \"BENCH-JSON {}\",",
+        "new": "eprintln!(\n        \"BENCH-JSON {}\","
+      }
+    ]
+  }
+]

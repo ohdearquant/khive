@@ -3,7 +3,8 @@
 Technical reference for the `comm` pack's message write, threading, and read path —
 `comm.send` / `comm.delivered` / `comm.inbox` / `comm.read` / `comm.mark_read` / `comm.reply` /
 `comm.thread` / `comm.ingest` —
-spanning `message.rs`, `handlers.rs`, `params.rs`, and the inbox/thread indexes in
+spanning `message.rs`, `handlers.rs`, `handlers/inbox.rs`, `handlers/ingest.rs`,
+`handlers/read_marking.rs`, `handlers/reply.rs`, `params.rs`, and the inbox/thread indexes in
 `vocab.rs`.
 
 ## File attachments on local messages
@@ -40,8 +41,9 @@ reclaim on message deletion.
 
 `comm.inbox` and `comm.thread` return `attachments: [{content_ref, size,
 media_type}]` on each message, using `[]` when none exist; `attachments` is
-also an accepted projection field. Only the exact indexed roles above are
-read, sorted by index. Other roles and malformed suffixes are ignored.
+also an accepted projection field. Only the exact indexed roles above populate
+that array, sorted by index. Other roles and malformed suffixes are not file
+entries.
 `comm.read` returns the same metadata when `body=true` (the default), while
 `body=false` preserves the acknowledgement-only response. No comm response
 contains file bytes. Media type is nullable because references carry no MIME
@@ -62,6 +64,13 @@ until the quarantined metadata can be repaired. GC admission still requires
 the exact completed V21 epoch: migrated V47 stores remain refused until
 later epoch ownership has been reviewed.
 
+The count is owner-wide, before the positional display-role filter: an
+unreadable row with a non-message role such as `quarantine-original` can
+contribute even though that role is not displayed. Readable non-message
+rows contribute neither displayed files nor errors. This counts metadata
+rows, not missing object bytes; explicitly projecting an absent marker
+returns null.
+
 A failure of the attachment lookup itself still returns an error. Bulk
 `comm.read(body=true)` reads every target's fields before marking the first
 target, so that error does not change any target's read flag. Mark failures
@@ -72,10 +81,12 @@ to move files between server directories and the blob store without returning
 bytes through those tools. `blob.get` keeps its existing small-object base64
 behavior.
 
-## `message.rs::resolve_id`
+## Message id resolution
 
-Accepts a 36-char hyphenated UUID or an 8+ hex-char short prefix. The prefix
-is resolved via `runtime.resolve_prefix` (namespace-scoped).
+Handlers resolve a caller-supplied message id through the shared runtime
+helper `KhiveRuntime::resolve_uuid_or_prefix_for_verb`, which accepts a 36-char
+hyphenated UUID or an 8+ hex-char short prefix and labels its errors with the
+calling verb. The prefix lookup is namespace-scoped.
 
 ## `message.rs::attach_outbound_id_to_ambiguous_write`
 
@@ -166,6 +177,26 @@ encodes `[write_namespace, sending_actor, client_key]` as compact JSON after
 `comm-v1:`. The outbound copy alone holds this physical `notes.key`; both
 copies carry the logical key in properties, with reciprocal pair UUIDs.
 
+Email-addressed sends and replies consult the serving runtime's immutable
+recipient policy before a fresh pair is prepared. A configured denial returns
+a typed permission refusal without a pair, key claim, attachment owner,
+message index publication or inbox wake. Configured entries and requested
+recipients share the existing maintainer-address normalization; stored recipient
+spelling and exact keyed payload identity stay unchanged. Refusals name the
+normalized denied recipient, or the requested spelling when it does not parse,
+without exposing the configured set. An absent
+policy permits queuing without promising delivery; delivery itself requires a
+configured policy. Other validation and authorization still apply.
+
+For a keyed email request, the existing indexed live-holder lookup precedes
+fresh admission. A request naming attachments for an email address is refused
+before that lookup, since outbound channel addresses take none. An intact exact
+replay returns its receipt even after policy revocation, preserving delivery
+state and producing no new write or wake.
+A denied request with no holder linearizes at its final no-holder observation:
+a competing holder committed afterward can be retrieved by a later retry.
+Allowed creators retain the atomic claim and winner reconciliation below.
+
 `khive_runtime::keyed_message::create_keyed_message_pair` uses the existing
 atomic-note preparation, preserving validation, secret checks, FTS and vector
 writes. It appends the outbound key claim as the final statement guarded by
@@ -242,7 +273,7 @@ sessions that set `default_namespace` but not `actor_id`. Uses the shared
 actor-identity policy (#567) so this warning fires under exactly the same
 "unattributed" definition the gate and token minter use.
 
-## `handlers.rs::handle_delivered`
+## `handlers/parameter_aliases.rs::handle_delivered`
 
 Requires the full outbound UUID. It performs one indexed count of live inbound
 `message` notes in the caller's namespace whose `properties.from_actor` is the
@@ -394,14 +425,31 @@ visible before that query takes its storage snapshot; a commit that lands after
 the snapshot is left to the caller's next request.
 
 `comm.send` and `comm.reply` publish after their dual-write has committed.
-`comm.ingest` publishes only after `try_create_note` returns a newly committed
-note; the deduplicated path does not publish. The signal carries no message or
+`comm.ingest` publishes only after the trusted conditional insert commits a new
+note, including a commit whose indexing then failed; the deduplicated path does
+not publish. The signal carries no message or
 identity data and is not a delivery or authorization boundary. It is intentionally
 not cross-process pubsub: direct writes through another registry/process become
 visible on the timeout-edge final query or a subsequent call, while normal daemon
 dispatches share the same pack instance and wake immediately.
 
 ## `handlers.rs::handle_read`
+
+`mark` defaults to true. The descriptions below of marking and its acknowledgements
+apply to omission or `mark=true`. The single-ID opt-out
+`comm.read(id=..., mark=false)` uses the same target validation and returns the
+fetched message without changing its properties, `updated_at`, or unread inbox
+membership. `mark=false` with `ids` is refused, including an empty array, and
+non-boolean `mark` values are invalid parameters. A successful fetch returns the
+existing short `id`, canonical `full_id`, `status: "success"`, the fetched
+`properties`, and its actual `read` state: only stored JSON boolean true means
+read. Missing or non-boolean read values report false without rewriting properties.
+With the default `body=true`, the usual message and attachment metadata is added.
+With `body=false`, only that compact fetched-state response is returned, without
+expanded message fields or an attachment lookup. Neither response acknowledges a
+mark. The response describes the fetched snapshot; concurrent changes are not
+prevented. The verb remains a declaration/write operation with normal dispatch
+auditing, so this does not promise zero database writes.
 
 Fetches a message and marks it as read. Rejects `read()` on outbound messages — "read" is a
 recipient action; marking an outbound (sent) message as read corrupts the
@@ -482,6 +530,25 @@ been best-effort since its introduction. Four outcomes:
 `id`/`full_id` are returned in all four arms. There is no retry loop; a caller polling unread counts simply
 sees the message still unread (or in an indeterminate state) and can
 re-issue `comm.read` (self-healing).
+
+Storage failures also carry `mark_error_details`, projected by the shared runtime
+error serializer. The legacy `mark_error` string and `status`/`read` values remain
+unchanged. The details retain the typed `code` and `stage` when available, plus
+`sqlite_write_stage`, `sqlite_primary_code` and `sqlite_extended_code` for native
+SQLite failures. A direct mark blocked by a SQLite writer lock reports
+`code=stage=sqlite_statement_failure`; it is distinct from a pooled-writer checkout
+timeout or queued writer admission failure. Errors without native SQLite evidence
+do not invent native codes.
+
+`mark_error_details.domain_disposition` reflects the mark failure's known outcome.
+Failed marks use `not_committed`; an unknown request or native settlement retains
+`unknown`, even if the compatibility `status` field cannot express that additional
+uncertainty. Terminal writer evidence keeps its code precedence over an attached
+native stage. Successful marks and the `Ok(false)` no-row result have no
+`mark_error_details`. The same per-message shape applies to bulk `comm.read` and
+best-effort `comm.mark_read`; their aggregate statuses and body-exposure rules are
+unchanged.
+
 Every validation error that runs before the patch (not found, wrong kind,
 outbound, wrong addressee) is unaffected and stays a hard error.
 
@@ -494,12 +561,14 @@ chain. The single-message reply path already provides the common safe ordering:
 `comm.reply` commits the delivery pair first and only then attempts its
 best-effort fold-in read mark.
 
-## `handlers.rs::handle_mark_read`
+## `handlers/parameter_aliases.rs::handle_mark_read`
 
 `comm.mark_read` is the canonical named bulk mutation; it remains acknowledgement-only.
 Message bodies can be retrieved through `comm.read`, `comm.inbox`, or `comm.thread`.
 It requires `ids` (1-500) and accepts optional `atomic` (default
-false). Resolution, namespace/message-kind checks, inbound-direction enforcement, addressee
+false). A single message id may be passed as `id`, an alias of `ids` that the handler
+wraps into a one-element `ids` list; a call supplying both `id` and `ids` is refused even
+when the values agree. Resolution, namespace/message-kind checks, inbound-direction enforcement, addressee
 authorization, legacy-row compatibility, deduplication, response ordering, and aggregate counts
 are shared with `handle_read` rather than reimplemented.
 
@@ -530,6 +599,8 @@ committed mark as successful, with `read=true` merged into its validated propert
 siblings retain their fresh properties. The write transaction is never retried by this readback.
 
 ## `handlers.rs::handle_reply`
+
+The implementation lives in `handlers/reply.rs`; `handlers.rs` retains the crate-visible facade.
 
 Replies to a message, threading linkage.
 
@@ -606,7 +677,7 @@ An id cursor resolves to the full `(created_at, full_id)` tuple of the
 referenced note so ties on equal microsecond timestamps are broken
 deterministically instead of being skipped or duplicated. A timestamp cursor
 is parsed to microseconds via chrono (matching the pattern in
-`khive-pack-brain/src/handlers.rs` and `khive-vcs/src/sync.rs`) rather than
+`khive-pack-brain/src/handlers/event_counts.rs` and `khive-vcs/src/sync.rs`) rather than
 compared as a raw string, so non-canonical but valid RFC 3339 forms
 (whole-second `Z`, `+00:00` offsets, ...) compare correctly against khive's
 canonical microsecond timestamps. An `after` value that is neither a
@@ -616,10 +687,9 @@ silently coerced or treated as "no cursor". Two rows sharing a microsecond
 deterministically by `full_id`. Sorting on the `(created_at, full_id)` tuple
 (rather than timestamp alone) keeps ties stable across pages/backends.
 
-`ThreadRow` carries the sort/cursor key `(created_at, full_id)` alongside the
-already-rendered message JSON, so the total-order sort and cursor filter
-compare exact `(i64, Uuid)` tuples instead of re-parsing the ISO string
-embedded in the JSON. `AfterCursor::Id` carries the full tuple for
+The captured owner note carries the sort/cursor key `(created_at, full_id)`,
+so the total-order sort and cursor filter compare exact `(i64, Uuid)` tuples
+without rendering message JSON or parsing ISO strings. `AfterCursor::Id` carries the full tuple for
 tie-breaking; `AfterCursor::Timestamp` carries only the parsed microsecond
 value since there is no specific row to break ties against.
 
@@ -634,7 +704,26 @@ inbox, this is a live window walk: deletion of an already-fetched row does not s
 a new row inserted before a cursor already passed may not be observed. It does not create a
 snapshot, bound total thread memory/work, or change the public chronological cursor contract.
 
+Visibility filtering and twin folding run as each physical window arrives. The
+handler retains one captured owner note and the folded display-read value per
+visible logical group; hidden rows and discarded twins leave that collection
+immediately. The originally selected note is folded last only if its physical
+id was absent from the scan. This preserves the physical traversal order,
+one-hop twin references and the fetched row image even if storage changes later.
+The owner's properties remain unchanged: only the top-level display-read field
+uses the folded value.
+
+Message JSON and content previews are generated only after cursor filtering,
+ordering and truncation, once per returned owner. At most the effective response
+limit (500) is rendered. The full physical scan and physical-id set still scale
+with the thread, retained owner notes with visible logical groups, and sorting
+with eligible groups. This is a rendering and retention reduction, not a bound
+on SQLite work or total request memory. Attachment enrichment and optional field
+projection still run only on the final owners.
+
 ## `handlers.rs::handle_ingest`
+
+The implementation lives in `handlers/ingest.rs`; `handlers.rs` retains the dispatch facade.
 
 Writes a single inbound message note from a channel adapter. This is a
 `Visibility::Subhandler` verb: not accessible via the MCP wire, only callable
@@ -683,11 +772,52 @@ note's own UUID becomes the canonical root per ADR-040.
 back to the sending actor), (2) caller-supplied `default_inbound_actor` (fresh
 email landing actor), (3) `p.to.trim()` (back-compat: raw recipient address).
 
+External email uses the shared verified outbound-owner lookup in
+`handlers/ingest/correlation.rs`, trying `X-Khive-Thread-ID`, `In-Reply-To`, then
+each `References` token in document order. A completed lookup supplies the
+selected actor/thread through nonserialized channel context and does not run a
+second correlation lookup at ingest. If the host lookup fails, the ordered
+candidates remain attached to that selected transport message; ingest repeats
+the same lookup so typed storage errors reach the existing per-message hold
+ledger. Otherwise the first configured recipient alias wins, then the required
+external inbound actor. Startup validates this configuration before either host
+entrypoint starts its daemon callback, including clients that do not own polling.
+
+For external mail, the callers that run this lookup (the
+`pending_owner_candidates` ingest path and the email host's `lookup_thread_owner`)
+require proof on the thread-UUID pass. A sender-asserted `X-Khive-Thread-ID` that
+names a thread (rather than a Message-ID) selects that thread only when one of the
+thread's outbound notes is an email message whose Message-ID verifies against the
+configured mailbox domains, the same proof the Message-ID pass applies. The pass
+pages through the thread's outbound notes instead of taking the first row, so a
+copied Message-ID or a non-email row that sorts first cannot mask the verified
+owner. A UUID naming any other thread yields no owner, and the route falls through
+to the recipient aliases and then the external inbound actor. Maintainer mail uses
+the `correlation_external_id` path, which keeps the transport-level resolution and
+does not require an email Message-ID.
+
+An authenticated delivered opt-out, or one on a quarantine whose
+`quarantine_reason` is `screened` (addressed from its `quarantine_claimed_from`),
+commits an `outbound/address/reply_stop` suppression before duplicate
+acknowledgement or message creation. Both require the `opt_out.unsubscribe`
+label; ingest refuses a claimed opt-out on any other quarantine reason. It uses the
+same unique insert as mailto and operator entries. A failed insert leaves the
+message unacknowledged; an identical retry adds no second entry.
+
 Deduplication: when `external_id` is supplied, the trusted ingest insert uses a
 verify-after-insert check on the durable unique index over the external ID
 and exact `(channel_kind, channel_slug)` provenance. Missing channel fields
 occupy the empty index partition. A confirmed duplicate returns `Ok(None)`
 without error; other constraint violations surface as errors.
+
+Committed indexing failures (ADR-056, amendment 2026-10-05): when the insert
+commits but FTS or embedding work then fails, the handler returns the normal
+committed acknowledgement (`deduplicated=false`) with an added
+`post_commit_degradations` array of `{stage, error}` entries and publishes the
+inbox wake once. The field is absent on a healthy acknowledgement and on a dedup
+reply. A caller must not repeat the write to repair it: the repeat is
+deduplicated and attempts no indexing. The repair is the namespace reindex
+(`kkernel reindex`).
 For the #3228 IMAP account-key migration, an email poll also supplies its
 pre-account `legacy_external_id`. During one release window, `comm.ingest`
 reads that key before writing, restricted to an existing inbound email row
@@ -735,20 +865,66 @@ caller-supplied `channel_kind`, `channel_slug`, or `quarantined`. The internal
 `comm.ingest` subhandler remains their only supported writer; ordinary custom
 message metadata is unaffected.
 
+A quarantined message, whatever its `quarantine_reason`, is addressed to the
+maintainer (the runtime's configured actor) in place of the landing actor that
+ingest routing would choose (ADR-200 Amendment 1, Decision 6). The mailbox
+recipient check then keeps the record and its `quarantine_content_ref` out of
+every other actor's inbox, thread, read, get and search results. The rule is
+applied at ingest, so it covers records ingested once it is deployed: a
+quarantine record already stored keeps the `to_actor` it was written with, and a
+replay of the same message does not re-address it. A runtime with no configured
+actor keeps the routed landing actor.
+
+Delivered external email carries `origin: "external"`, `trust: "untrusted"`, and
+a JSON array of screening rule IDs. Inbox and thread reads retain these in
+properties; their projections and successful `comm.read` body results also
+expose `origin`, `trust`, and `labels`. Withheld content is a rule-ID placeholder.
+Its original RFC5322 bytes are published as a blob and atomically owned by a
+`quarantine-original` attachment on the delivered message, with no quarantine
+disposition or quarantine expiry. The delivered message carries no
+`quarantine_content_ref` or other blob reference in its properties; the attachment
+alone owns the original. Retries require matching channel identity and an owner
+attachment holding the replayed bytes; they never repair or extend a delivered note.
+Unsupported secondary-backend atomic custody refuses withheld delivery rather than
+dropping its original. Ordinary read surfaces and inbox notices contain no original
+body and no reference. The message's recipient actor and the maintainer read the
+original through `comm.withheld_body`, which audits every call.
+
+Failed withheld publication follows ADR-056's 2026-10-14 Decisions 1–3: the
+existing 60-retryable/5-other per-message bounds terminate in true quarantine,
+preserving screening labels and disclosing when the original could not be kept.
+Only failure to write that terminal quarantine continues to hold progress.
+
 When a quarantined inbound message carries `quarantine_content_ref`, ingest
 commits a `quarantine-original` note attachment with that same reference in the
 note's transaction. This attachment is the blob sweep's liveness root; metadata
-alone does not own stored bytes. A duplicate transport id repairs a missing
-attachment only when its stored reference matches the replayed bytes and the
-exact channel kind and slug match. The one-release legacy IMAP lookup applies
-those same ownership checks before acknowledging a quarantined replay; the
-old-key note keeps its stored `external_id`; the lookup already matched its
+alone does not own stored bytes. An attachment-free duplicate is acknowledged
+only after matching the namespaced, channel-scoped message identity, including
+the scoped legacy IMAP lookup. It attaches nothing and leaves the stored duplicate
+note unchanged; that receipt does not prove possession of the original or that
+changed replay content, sender, or metadata was stored. Delivered withheld retries
+retain their stricter original-custody requirements described above.
+
+This includes an attachment-free replay marked quarantined when the stored row is
+an ordinary delivered message. The duplicate acknowledgement preserves that
+original delivery: it does not record or disclose the replay's quarantine verdict,
+replace the body, install quarantine expiry, or attach original bytes. Its
+`deduplicated: true` receipt reports the existing identity and thread, not a new
+screening decision. A new identity with the same quarantined input still creates
+a quarantine record and reports its original-retention outcome. Delivered withheld
+replays and attachment-bearing replays remain subject to their custody checks.
+
+When a replay supplies an original attachment, a duplicate transport id repairs a
+missing attachment only when its stored reference matches the replayed bytes and
+the exact channel kind and slug match. The one-release legacy IMAP lookup applies
+those same ownership checks before acknowledging an attachment-bearing quarantined
+replay; the old-key note keeps its stored `external_id`; the lookup already matched its
 `channel_slug`, and the repair backfills a missing `quarantine_content_ref` and
 restores a missing matching attachment. When that old-key row has no `expires_at`, the
 repair also installs one from replay time plus configured retention, so the row
 that now owns the original bytes is selected by channel cleanup; an existing
-deadline on an old-key row is left as it is. A matching channel-scoped replay also
-installs a missing expiry deadline from replay time plus configured retention
+deadline on an old-key row is left as it is. A matching attachment-bearing
+channel-scoped replay also installs a missing expiry deadline from replay time plus configured retention
 while preserving a later existing deadline. An older quarantine row without a
 slug occupies the empty channel partition under ADR-056 and cannot be claimed
 or repaired by a replay from a named channel. At boot, the configured backends
@@ -764,12 +940,22 @@ each email or Telegram channel poll, an internal, bounded cleanup pass selects
 expired quarantine messages in that channel's ingest namespace and exact
 `channel_kind`/`channel_slug`, then hard-deletes each note and its attachment.
 Subsequent polls continue through the backlog, including when no new messages
-arrive. The blob sweep reclaims an unowned original after its grace period;
-an unexpired quarantine note and its attachment remain available. This follows
+arrive. Hard deletion releases attachment ownership but leaves the original's
+blob bytes on disk; an unexpired quarantine note and its attachment remain
+available. This follows
 [ADR-121](../../../../docs/adr/ADR-121-attachments-first-class.md)'s rule that
 a live note owns its attachment and hard deletion releases that ownership.
 Cleanup failure holds the channel poll and is reported as a failure, so it
 cannot produce a success heartbeat or advance transport progress.
+
+Physical reclamation remains pending ([#3679](https://github.com/ohdearquant/khive/issues/3679)).
+The serving process has no caller for the committed-object collector
+([#3038](https://github.com/ohdearquant/khive/issues/3038)); the daemon's staged-upload
+expiry sweep does not collect committed originals. A future collector must preserve
+ADR-121's publish grace and satisfy its approved schema and producer review,
+complete ownership registration and manifest closure, store binding, and verified
+adoption of populated roots. [#3324](https://github.com/ohdearquant/khive/issues/3324)
+tracks the current schema gate, which also blocks collection on current databases.
 
 The number of quarantine records that hold an original is bounded per channel
 configuration (for email, `KHIVE_EMAIL_QUARANTINE_MAX_RETAINED`, default 256; see the
@@ -788,6 +974,35 @@ deadline; no such path exists today. Older quarantine notes without
 require a separate audited migration or cleanup before the same retention
 guarantee can cover them. A row with the matching slug but no `expires_at`
 can receive its deadline on a matching trusted replay.
+
+When the comm pack runs on a secondary backend, the message and the main-backend
+owner row cannot be written together, so `comm.ingest` records the quarantine
+without its original: it drops `quarantine_content_ref` and stores
+`quarantine_original_retained: "false"` with
+`quarantine_original_not_retained_reason: "secondary-backend"`, and logs a warning
+naming the reference. The record keeps the normal retention deadline and counts
+toward `quarantined_count`, so the cap above still limits how many such records
+exist at once. The object the poller already published has no owner row and is
+not reclaimed when the record expires, because no collector runs today (see
+above); the transport still holds the original message. Refusing the ingest
+instead would hold the channel's progress on that message for every later poll.
+A replay of the same message resolves to the stored record and writes no owner
+row either.
+
+The `comm.ingest` receipt discloses the retention outcome for every NEW
+quarantine record (the `deduplicated=false` path): `quarantine_original_retained`
+is a JSON boolean read from the attachment actually persisted after the
+`secondary-backend` drop, so a drop inside `comm.ingest` reads like any other
+loss. When it is `false` the receipt also carries
+`quarantine_original_not_retained_reason` with the record's own stored reason
+(for example `retention-limit`, `original-unavailable`, `original-store-failed`,
+`quarantine-write-failed` or `secondary-backend`). A retained original and a
+lost one are otherwise indistinguishable from the response alone. A
+non-quarantine message carries neither key, and a deduplicated acknowledgement
+(`deduplicated=true`) carries neither, because it wrote no new record.
+Integrity note: a quarantined record with neither an attachment nor a stored
+reason is reported as `quarantine_original_retained: false` with no reason key;
+the reason is never invented.
 
 ## Message-ID / References header helpers (#403)
 
@@ -835,7 +1050,15 @@ can receive its deadline on a matching trusted replay.
 
 ## `vocab.rs::COMM_SCHEMA_PLAN_STMTS`
 
-Pack-auxiliary indexes for comm inbox and thread queries. Indexes use `WHERE
+The pack plan contains the auxiliary `comm_channel_cursor`, `comm_suppression` and
+`comm_suppression_mirror` tables; the last holds one row, the time of the last successful remote
+suppression mirror refresh that external admission reads (ADR-200 §6). Numbered core migration
+V52 installs the six comm indexes on `notes`: `idx_comm_message_direction`,
+`idx_comm_message_thread`, `idx_comm_message_to_actor`, `idx_comm_message_outbound_ref`,
+`idx_comm_message_outbound_recipient`, and `idx_comm_quarantine_expiry`. They are available
+without loading the comm pack; existing names and definitions are preserved.
+
+The inbox and thread indexes use `WHERE
 deleted_at IS NULL` (not `WHERE kind = 'message'`) so that SQLite's index
 planner can match them when queries contain the parameterized `kind = ?N`
 predicate emitted by `build_note_filter_where`. A literal-value partial index
@@ -844,7 +1067,7 @@ planner sees different predicates and falls back to a table scan.
 `deleted_at IS NULL` is always present in filtered queries, so the partial
 condition is always satisfied and the index is eligible. `kind` is included
 as an indexed column so the `kind = ?N` predicate is covered. The remaining
-pack statements are idempotent (`CREATE INDEX IF NOT EXISTS`).
+core index statements are idempotent (`CREATE INDEX IF NOT EXISTS`).
 
 `idx_comm_message_outbound_ref` covers the exact `comm.delivered` lookup by
 namespace, note kind, direction, sender actor, and `properties.outbound_ref`.

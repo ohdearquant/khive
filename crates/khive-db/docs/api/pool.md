@@ -7,6 +7,12 @@ function-specific technical reference for the pool's private/internal
 mechanics and the tests that pin them down; see `crates/khive-db/docs/design.md`
 ("Single-Writer Write Queue") for the ADR-067 rationale.
 
+Runtime write-route classification and checkpoint-ownership coordination live in
+`crates/khive-db/src/pool/admission.rs`. The public
+`khive_db::pool::RuntimeWriteOperation` path and the `ConnectionPool` entrypoints
+remain in `pool`; disk-space admission and write units live in
+`crates/khive-db/src/pool/write_units.rs`.
+
 ## Physical database identity
 
 On the first writable open of a new or legacy file-backed database, the pool
@@ -26,35 +32,126 @@ guard new connections to its opened file. The next writable pool open above
 the reserve installs and pins the UUID. The startup transaction uses the
 configured busy timeout.
 
+## Page cache and memory map
+
+Every pooled connection, reader or writer, keeps its own SQLite page cache on the
+process heap, so a process's ceiling is the per-connection size times its open
+connections. The default is 8 MiB per connection; `KHIVE_SQLITE_CACHE_KIB` sets it
+in KiB, from 512 to 1,048,576. Pages the cache drops are re-read from the operating
+system's file cache, which the kernel reclaims on its own.
+
+Each connection also maps up to 1 GiB of its database file for reads.
+`KHIVE_SQLITE_MMAP_BYTES` sets the window in bytes, from 0 to 2^40, and `0` turns
+memory-mapped reads off. Mapped pages are clean and file-backed, so the kernel can
+drop them under memory pressure without writing them anywhere; reads past the
+window go through the page cache instead, so lowering the window moves those reads
+onto the heap cache, which counts toward the process's own memory footprint.
+
+Both settings are read once per process. A set value that is not an integer inside
+its range, including one that is not valid Unicode, is logged at `warn` and the
+default is used, so a typo cannot stop a store from opening. The SQL bridge's
+standalone writer uses the same two settings.
+
 ## SQLite write reserve
 
-Writable file-backed pools use `KHIVE_DB_FREE_SPACE_FLOOR_BYTES` as their
-free-space reserve. The default is 1 GiB; `0` disables the check. The value is
-read once when the pool opens. An invalid byte count fails pool construction
-with `SqliteError::InvalidConfig`. In-memory and read-only pools do not sample
-disk space.
+Writable file-backed pools take their free-space reserve from the resolved
+disk-guard policy. A backend's own reserve setting wins, then
+`KHIVE_SQLITE_DISK_RESERVE_BYTES`, then the deprecated
+`KHIVE_DB_FREE_SPACE_FLOOR_BYTES` (still read, with a warning), then the 1 GiB
+default. Setting both variables to different values is a configuration error,
+even when a backend overrides them. The policy is resolved once when the pool
+opens, and invalid numeric settings fail construction with
+`SqliteError::InvalidConfig`. A reserve of `0` removes the floor comparison,
+but still requires volume identity, the cooperative lease and a successful
+probe; operation-specific headroom, including VACUUM's estimate, still applies.
+In-memory and read-only pools do not take the disk lease or sample disk space.
 
-Each pooled writer checkout, cancellable writer checkout, standalone writer
-open, standalone writer-handle operation, and writer-task request samples
-available space on the canonical database parent directory. At or below the
-reserve, admission returns a typed capacity-floor error before running the
-operation. Both a standalone writer handle and the writer task keep their
-SQLite connections open across operations, so each operation gets a fresh
-check after the handle was opened. The sampled value is not cached across
-admissions.
+`disk_guard_deadline_ms` resolves from the backend setting, then
+`KHIVE_SQLITE_DISK_GUARD_DEADLINE_MS`, then 2,000 ms. Its valid range is
+100–10,000 ms without clamping. It bounds volume-lease acquisition independently
+of the pool's `checkout_timeout` and the queue-only
+`write_admission_deadline_ms`.
 
-Checkpoint and diagnostics infrastructure connections, including the
-zero-wait `try_checkpoint_nowait` capability, remain available below the floor
-so recovery can reclaim WAL space. Pool startup also remains available; opening and
-configuring SQLite connections may perform setup I/O before any operation is
-admitted. A caller's `execute_script_top_level` is still a request-path
-operation, including `khive-vcs` sync's `WalCheckpointTruncate`; it is refused
-at or below the floor on both writer-task and standalone-handle routes. That
-request path does not use the infrastructure checkpoint connection and is not
-exempt. The check cannot predict the size of an arbitrary SQL transaction or
-writes by other processes, so a very large already-admitted transaction can
-still reach `SQLITE_FULL`. The reserve protects subsequent admissions and
-provides headroom for recovery; it is not a transaction-size quota.
+Writable file-backed hosts also need an absolute volume-lock directory shared
+by cooperating khive processes of the user. The default resolver uses a
+non-blank `KHIVE_VOLUME_LOCK_DIR`, otherwise `.khive/sqlite-volume-locks` under
+the first non-blank of `HOME` and `USERPROFILE`. There is no working-directory
+fallback; an unresolved or relative default is `SqliteError::InvalidConfig`.
+`ConnectionPool::new` requires a supplied, absolute directory before any SQLite
+open: a missing directory is a configuration error, and an explicitly supplied
+relative directory is a `CapacityUnavailable` lock-phase error. Read-only and
+in-memory pools do not require it. Test fixtures may supply their own directory;
+the test-harness default uses a separate temporary lock namespace.
+
+Admission identifies the volume through the nearest existing canonical ancestor
+of the database path, resolved once when the pool is built. On Unix, a database
+file that exists at that point is itself the probe target, not its parent; a
+missing file resolves through an existing ancestor, and a pool that creates its
+database keeps probing that ancestor.
+On Windows the capacity probe uses the resolved volume root. The stable volume
+key selects the cooperative lease, while the path is diagnostic/probe metadata.
+
+An admitted pooled checkout takes the volume lease before the writer mutex and
+leaves capacity sampling to the logical-write boundary: a transaction samples
+after successful `BEGIN IMMEDIATE`, before its body; an autocommit unit samples
+immediately before its callback. Public `writer()` and `try_writer()` return
+an exclusion owner, with no checkout-time capacity sample or public raw
+connection access. Consume it with `autocommit` for one operation or complete
+script, or `transaction` for an owned BEGIN IMMEDIATE/body/COMMIT unit. An
+unfinished script is rolled back and refused. `conn`, `conn_mut`, `Deref` and
+`DerefMut` are unavailable to callers outside `khive-db`; a callback cannot
+return a borrow of its connection or prepared statement. Existing callers that
+need schema migration use the pool/backend migration methods, which retain
+the captured policy, rather than acquiring a second lease through a raw wrapper.
+Writer-task transactional requests sample after `BEGIN`, and admitted standalone
+transactions follow the same order; writer-task top-level requests run without a
+transaction and sample before they run. Standalone autocommit statements/scripts
+sample before their first write call. Each admission takes a fresh sample; the result is not
+cached across operations. The lease stays held through commit, rollback or
+owned-connection settlement.
+
+Admission compares available space with the reserve plus required headroom. If
+that sum is nonzero, space at or below it returns `CapacityFloor` before the
+logical write runs; addition overflow also refuses. `CapacityUnavailable` distinguishes
+`identity`, `lock`, `lock_contended` and `probe` phases. Only `lock_contended`,
+where the guard deadline elapsed waiting for the lease, is retryable within the
+caller's bounded retry budget. Floor refusal and the other unavailable phases
+remain non-retryable. A thread that already holds the same volume lease is refused
+immediately with `VolumeLeaseReentry`, naming the holder and requester sites.
+Cross-thread contention instead waits within the guard deadline. A manual atomic
+unit's lease is detached from the thread that took it, so a later request from
+that thread waits like any other contender rather than reading as re-entry.
+
+A capacity refusal whose rollback restores autocommit leaves the writer reusable.
+A pooled `WriterGuard` rollback that does not prove autocommit retires that writer
+and returns `WriterSettlementUnknown`. This result is distinct from subsequent
+owned cleanup, which runs while the lease is held and may still restore autocommit
+or close the connection successfully. Only if that cleanup proves neither
+autocommit nor successful close is shared admission poisoned, so later writes
+fail with `WriterPoisoned` before starting. Storage
+projection distinguishes the unknown earlier outcome (`SideEffectsUnknown`) from
+a later refused write (`NotStarted`). The writer task additionally retires its
+queue on a terminal request outcome.
+
+Checkpoint and read-only diagnostics bypass disk-lease and capacity admission,
+including `try_checkpoint_nowait` and caller-issued
+`TopLevelMaintenance::WalCheckpointTruncate` on both writer-task and standalone
+SQL routes. The queued route uses `send_checkpoint_bounded`; the standalone
+route takes a lease only for `Vacuum`. VACUUM is not a recovery bypass: it needs
+the lease and a copy-sized estimate from database/WAL metadata, and an unavailable
+estimate, arithmetic overflow or insufficient headroom refuses it. A checkpoint
+bypass does not suppress SQLite errors or bypass the route's other availability
+checks. Pool startup remains available below the floor: startup connection
+setup can perform I/O, and bootstrap DDL has its own admitted boundary.
+
+An already-admitted large transaction or another filesystem consumer can still
+exhaust space. The sampled floor is neither reserved capacity nor guaranteed
+recovery headroom, and it is not a transaction-size quota. See
+[SQLite disk admission](disk-admission.md) for the boundary inventory and remaining
+admission work. Full ADR-154 conformance remains tracked by
+[#3551](https://github.com/ohdearquant/khive/issues/3551); native `SQLITE_FULL`
+code propagation after automatic rollback remains separate work in
+[#4405](https://github.com/ohdearquant/khive/issues/4405).
 
 `try_checkpoint_nowait` returns a restricted `CheckpointGuard`. It has fixed
 PASSIVE and TRUNCATE operations and exposes no raw SQLite connection or
@@ -111,10 +208,13 @@ single task. Every SQLite-backed store resolves through
 batch entry points, so a construction-time `None` is never a permanent routing
 decision.
 
-When `write_routing_strict` is enabled, a missing handle fails closed: a
-missing runtime preserves `StorageError::WriterTaskNoRuntime`, while an
-explicitly disabled or degraded queue returns a typed `StorageError::Pool`
-naming the operation. In compatibility mode, a caller may use its legacy
+When `write_routing_strict` is enabled, a missing or stopped handle fails closed
+with `StorageError::WriterOwnerUnavailable`. Its typed `source` preserves
+`WriterTaskNoRuntime` (not retryable) or `Pool` (retryable), and the wrapper names
+the attempted operation. The queue also checks closure at admission, covering an
+owner that stops after lookup. These refusals report `writer_owner_unavailable`
+with `request_state: not_started` and no requested write committed.
+In compatibility mode, a caller may use its legacy
 standalone/pool-mutex writer only after this lookup returns `None`; that exact
 fallback emits a store-specific `direct_route_violation` when the file-backed
 queue is enabled.
@@ -123,6 +223,47 @@ This routing hardening does **not** flip the strict-mode default. ADR-135 F2
 and ADR-136 D2 still require production A/B evidence and a release gate before
 `write_routing_strict` can become the default; until that evidence is accepted,
 `KHIVE_WRITE_ROUTING=strict` remains opt-in.
+
+### Closed lifecycle ownership under strict routing
+
+Strict mode also refuses raw pooled transaction/autocommit and standalone
+logical-write entrypoints before their callbacks or SQL execute. They report
+`writer_route_violation`, `request_state: not_started`, and `retryable: false`.
+Read-capable handles retain their read behavior. The common resolver, SQL writer,
+and atomic-unit resolver enforce the same strict owner requirement for files and
+explicit strict memory configurations. Default memory and explicit compatibility
+queue opt-out retain their existing routes.
+
+The allowed lifecycle owners are closed inside `khive-db`:
+
+| Owner                  | Permitted work                                                                                                                                                                                                          | Authority                                                                                      |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Core/service migration | Versioned startup or service schema migration with its existing settlement rules                                                                                                                                        | Crate-private core-migration checkout retained by `PooledMigrationTransactions`                |
+| Schema                 | Registered pack/service schema, model/table registration, constructor schema setup (including the once-per-pool `notes_seq` repair, which inserts sequence rows for notes that lack one), and lazy missing-index repair | Crate-private schema checkout at the existing schema-application boundary                      |
+| Attachment cutover     | Staging, authenticated completion, and finalization under the existing canonical GC-owner checks                                                                                                                        | Crate-private attachment-cutover checkout                                                      |
+| Checkpoint/recovery    | Checkpoint policy and dedicated PASSIVE/TRUNCATE operations                                                                                                                                                             | Restricted checkpoint checkout/connection; no general logical-write authority                  |
+| Queue infrastructure   | Opening and retaining the single writer's lifetime connection                                                                                                                                                           | Existing private writer-task connection factory; each queued operation keeps its own admission |
+
+The pooled owner discriminant is crate-private. Public writer handles receive
+request ownership, and neither a caller's operation label nor a volume-lease
+class can turn that into lifecycle ownership. Schema SQL remains supplied by
+trusted Rust schema registrars through the existing schema-application APIs;
+those APIs retain their schema contract and authority. Request SQL uses the
+ordinary writer route. Lazy schema repair can run during a request and still
+retains its cancellation and capacity checks.
+
+VACUUM remains ordered on the writer queue; skipping an enclosing BEGIN does not
+give it direct-write authority. Strict-mode FTS maintenance also uses the queue
+because its merge INSERTs are logical writes. The default maintenance route stays
+unchanged. Diagnostic reads and file-only recovery bookkeeping do not acquire
+logical-write authority. Disk reserve, volume-lease, deadline and settlement
+requirements remain independent of routing permission.
+
+Each lifecycle class has a strict-mode positive beside a non-listed raw pooled
+write refusal. The tests also pair default and strict request routes. A stopped
+owner before admission is distinct from a lost reply after COMMIT: only the latter
+receives `write_outcome_unknown`. A retained typed failure or proven rollback
+still takes precedence; see the storage error taxonomy for that receipt contract.
 
 ## `ConnectionPool::writer_task_for_runtime_write`
 
@@ -152,14 +293,18 @@ registry tests for defense-in-depth against cross-test interference.
 
 ## Pooled reader routing and raw-SQL exception budget
 
-Every typed store read uses `ConnectionPool::reader_until` for both file-backed
-and in-memory databases. A file-backed `SqlAccess::reader()` is only a logical
+Every typed store read waits for its permit on the async side with
+`ConnectionPool::acquire_reader_admission`, so a read that has to queue holds a
+task and not a blocking-pool thread, then selects its connection with
+`ConnectionPool::reader_with_admission`, for both file-backed and in-memory
+databases. A file-backed `SqlAccess::reader()` is only a logical
 handle: constructing or retaining it opens no SQLite connection. Its ordinary
 `query_row`, `query_all`, and `query_page` calls check out one pooled reader for
 the operation and return it only after statement finalization, callback cleanup,
 and connection reset/replacement. Ordinary reads through a queue-backed
 `SqlWriter` use the same route. There is no standalone fallback after pool
-saturation.
+saturation. A raw-SQL read waits for its permit the same way, so raw-SQL and
+typed reads are admitted in arrival order.
 
 The pool-wide reader admission budget is the effective `max_readers` (minimum
 one in degraded in-memory mode). Pooled guards and the explicit raw-SQL
@@ -197,6 +342,16 @@ seconds) for each reader-admission attempt. One operation can perform several
 sequential reads, and each operation-scoped checkout has its own bounded wait;
 the caller's total wall time can therefore exceed five seconds even though no
 single admission wait does. The timeout never triggers a fresh connection open.
+
+`KHIVE_READER_MAX_AGE_SECS` (default 300) and `KHIVE_READER_MAX_OPS` (default
+5000) configure `reader_max_age` and `reader_max_ops`. A pooled reader connection
+that has lived longer than the age limit, or has served more than the limit of
+successful checkouts, is closed on return and replaced by a fresh connection before
+the slot is reused; the replacement open happens inside the returning request's
+tail. Both comparisons are strict, so a zero value for either key recycles on every
+return. The in-memory pool shares one connection and is never recycled. Each replacement counts
+in `reader_discards` on the acquisition snapshot, and a replacement that fails to
+open counts in `reader_replacement_open_failures`.
 
 ### Synchronous `ReaderGuard::query_row`
 

@@ -242,7 +242,8 @@ async fn refresh_discloses_bounded_embeddings_in_reply_and_receipt_for_each_upda
         .expect("refresh must retain its bounded embedding result");
         let request = receipt(&runtime, &token, &reply).await;
         if long {
-            let expected = json!({"truncated": 1, "discarded_bytes": 1});
+            let expected =
+                json!({"truncated": 1, "discarded_bytes": 1, "token_reporting_unavailable": 1});
             assert_eq!(
                 reply["embedding_truncation_report"], expected,
                 "reply {arm}"
@@ -1077,7 +1078,8 @@ async fn overlapping_refresh_keeps_validators_with_the_settled_body() {
     let body_ref =
         khive_storage::ContentRef::from_hex(final_properties["blob_ref"].as_str().unwrap())
             .unwrap();
-    let stored_body = crate::blob_store(&runtime)
+    let stored_body = runtime
+        .require_blob_store()
         .unwrap()
         .get_bounded_verified(&body_ref, 64)
         .await
@@ -1233,7 +1235,8 @@ async fn redirected_refresh_keeps_a_newer_get_body_after_the_terminal_request() 
     );
     let body_ref =
         khive_storage::ContentRef::from_hex(properties["blob_ref"].as_str().unwrap()).unwrap();
-    let stored_body = crate::blob_store(&runtime)
+    let stored_body = runtime
+        .require_blob_store()
         .unwrap()
         .get_bounded_verified(&body_ref, 64)
         .await
@@ -1311,7 +1314,8 @@ async fn redirected_refresh_does_not_claim_a_terminal_row_created_during_its_req
     assert_eq!(properties["etag"], "newly-created-get");
     let body_ref =
         khive_storage::ContentRef::from_hex(properties["blob_ref"].as_str().unwrap()).unwrap();
-    let stored_body = crate::blob_store(&runtime)
+    let stored_body = runtime
+        .require_blob_store()
         .unwrap()
         .get_bounded_verified(&body_ref, 64)
         .await
@@ -1449,7 +1453,8 @@ async fn run_refresh_redirect_loses_to_get_after_terminal_request() {
     assert_eq!(properties["etag"], "newer-get");
     let body_ref =
         khive_storage::ContentRef::from_hex(properties["blob_ref"].as_str().unwrap()).unwrap();
-    let body = crate::blob_store(&runtime)
+    let body = runtime
+        .require_blob_store()
         .unwrap()
         .get_bounded_verified(&body_ref, 64)
         .await

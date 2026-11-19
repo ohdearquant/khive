@@ -16,6 +16,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import tomllib
 import unittest
 
 
@@ -76,6 +77,7 @@ if record:
         "home": os.environ.get("HOME"),
         "config": os.environ.get("KHIVE_CONFIG"),
         "config_was_file": config_path.is_file(),
+        "config_text": config_path.read_text() if config_path.is_file() else None,
         "db": os.environ.get("KHIVE_DB"),
         "log": os.environ.get("KHIVE_LOG"),
         "no_daemon": os.environ.get("KHIVE_NO_DAEMON"),
@@ -383,6 +385,25 @@ class VerifyLocalArtifactTests(unittest.TestCase):
         self.assertTrue(record["config_was_file"])
         self.assertEqual(Path(record["home"]).resolve(), Path(record["cwd"]).resolve())
         self.assertIsNone(record["leak"])
+
+    def test_isolated_config_declares_the_telemetry_default_carrier(self) -> None:
+        # The telemetry pack refuses to register without a declared default
+        # carrier, so an empty probe config fails every build that links it.
+        completed = self.run_probe()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        record = json.loads(self.record.read_text(encoding="utf-8"))
+        self.assertEqual(
+            tomllib.loads(record["config_text"]),
+            {"telemetry": {"default_carrier": "ephemeral"}},
+        )
+
+    def test_startup_refusal_reports_the_artifact_stderr(self) -> None:
+        # The fake exits before answering initialize, as a binary that refuses
+        # its configuration does; the reason it printed must reach the caller.
+        completed = self.run_probe("error")
+        self.assertNotEqual(completed.returncode, 0, completed.stdout)
+        self.assertIn("artifact stderr: synthetic probe failure", completed.stderr)
+        self.assertFalse(self.stamp.exists())
 
     def test_every_probe_or_contract_failure_removes_stale_stamp(self) -> None:
         for mode in (
@@ -828,6 +849,7 @@ class RecipeRun:
         signed_probe_invocations: int,
         replacement_started: bool = False,
         marker_after: bytes | None = None,
+        default_marker_after: bytes | None = None,
         old_daemon_returncode: int | None = None,
     ) -> None:
         self.rc = rc
@@ -840,6 +862,7 @@ class RecipeRun:
         self.signed_probe_invocations = signed_probe_invocations
         self.replacement_started = replacement_started
         self.marker_after = marker_after
+        self.default_marker_after = default_marker_after
         self.old_daemon_returncode = old_daemon_returncode
 
 
@@ -862,8 +885,19 @@ class MakefileGateContractTests(unittest.TestCase):
     def _extract_local_recipe(makefile_text: str) -> list[str]:
         """Return the shell commands make would run for `local:`, expanded."""
         variables = dict(
-            re.findall(r"^([A-Z_][A-Z0-9_]*)\s*:=\s*(.*)$", makefile_text, re.M)
+            re.findall(r"^([A-Z_][A-Z0-9_]*)\s*:=\s*(.*)$", makefile_text, re.MULTILINE)
         )
+        # A `define` block holds recipe lines shared between targets. Its body
+        # is spliced back in as the recipe lines it replaced: one leading tab
+        # off each line, joined with newlines, exactly as the lines below are.
+        for name, value in re.findall(
+            r"^define ([A-Z_][A-Z0-9_]*)\n(.*?)\nendef$",
+            makefile_text,
+            re.MULTILINE | re.DOTALL,
+        ):
+            variables[name] = "\n".join(
+                line.removeprefix("\t") for line in value.split("\n")
+            )
         body = makefile_text[makefile_text.index("local: verify-local-artifact") :]
         body = body[body.index("\n") + 1 :]
 
@@ -917,6 +951,10 @@ class MakefileGateContractTests(unittest.TestCase):
         makefile_text: str | None = None,
         fixture_shape: str = "bare",
         supervisor_marker: bytes | None = None,
+        default_supervisor_marker: bytes | None = None,
+        socket_relative: str | None = None,
+        marker_relative: str | None = None,
+        home_trailing_slash: bool = False,
         live_daemon: bool = False,
         observe_start: bool = False,
     ) -> RecipeRun:
@@ -1019,7 +1057,7 @@ class MakefileGateContractTests(unittest.TestCase):
                 (stub_bin / tool).chmod(0o755)
 
             env = dict(os.environ)
-            env["HOME"] = str(home)
+            env["HOME"] = str(home) + ("/" if home_trailing_slash else "")
             env["PATH"] = f"{stub_bin}:{env.get('PATH', '')}"
             env["PYTHONDONTWRITEBYTECODE"] = "1"
             env["CODESIGN_RECORD"] = str(codesign_record)
@@ -1045,7 +1083,19 @@ class MakefileGateContractTests(unittest.TestCase):
 
             khive_dir = home / ".khive"
             khive_dir.mkdir()
-            marker = khive_dir / "khived.supervisor"
+            default_marker = khive_dir / "khived.supervisor"
+            marker = default_marker
+            if socket_relative is not None:
+                env["KHIVE_SOCKET"] = str(home / socket_relative) if socket_relative else ""
+                if socket_relative and socket_relative != ".khive/khived.sock":
+                    env["KHIVE_PID"] = str(home / "private.pid")
+                    marker = home / (socket_relative + ".supervisor-marker")
+            if marker_relative is not None:
+                env["KHIVE_SUPERVISOR_MARKER"] = str(home / marker_relative) if marker_relative else ""
+                if marker_relative:
+                    marker = home / marker_relative
+            if default_supervisor_marker is not None:
+                default_marker.write_bytes(default_supervisor_marker)
             if supervisor_marker is not None:
                 marker.write_bytes(supervisor_marker)
             daemon: subprocess.Popen[bytes] | None = None
@@ -1121,6 +1171,9 @@ class MakefileGateContractTests(unittest.TestCase):
                 reaper.join(timeout=2)
                 old_daemon_returncode = daemon.returncode
             marker_after = marker.read_bytes() if marker.exists() else None
+            default_marker_after = (
+                default_marker.read_bytes() if default_marker.exists() else None
+            )
 
             staged = dest_dir / "kkernel.new"
             installed_bytes = dest.read_bytes() if dest.exists() else None
@@ -1150,6 +1203,7 @@ class MakefileGateContractTests(unittest.TestCase):
                 signed_probe_invocations=signed_probe_invocations,
                 replacement_started=replacement_started,
                 marker_after=marker_after,
+                default_marker_after=default_marker_after,
                 old_daemon_returncode=old_daemon_returncode,
             )
 
@@ -1253,6 +1307,19 @@ class MakefileGateContractTests(unittest.TestCase):
         self.assertIn("LOCAL_VERB_FLOOR := 98", self.makefile)
 
         local_recipe = self.makefile[self.makefile.index("local: verify-local-artifact") :]
+        # The install half lives in a define shared with install-artifact; read
+        # `local` with that body back in place, so every ordering below is the
+        # order `local` actually runs.
+        shared = re.search(
+            r"^define INSTALL_VERIFIED_ARTIFACT\n(.*?)\nendef$",
+            self.makefile,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(shared, "INSTALL_VERIFIED_ARTIFACT define not found")
+        self.assertIn("\t$(INSTALL_VERIFIED_ARTIFACT)\n", local_recipe)
+        local_recipe = local_recipe.replace(
+            "$(INSTALL_VERIFIED_ARTIFACT)", shared.group(1), 1
+        )
         self.assertNotIn("cargo build", local_recipe)
         stamp_check = local_recipe.index(
             '--inspect-stamp "$${LOCAL_BUILD_RECEIPT_VALUE}.verified"'
@@ -1318,6 +1385,36 @@ class MakefileGateContractTests(unittest.TestCase):
             "verification gate cannot see their verbs",
         )
 
+    def test_ci_probes_a_build_with_the_build_local_features(self) -> None:
+        """CI runs the install probe on a binary built like the operator's.
+
+        The probe's isolated config is only proven against a binary that links
+        every pack the install gate requests, so the CI build must use exactly
+        the build-local feature list and the probe must be `make fleet-check`.
+        """
+        features = re.search(r"^\s*--features (\S+) \\$", self.makefile, re.MULTILINE)
+        self.assertIsNotNone(features, "build-local --features line not found")
+        workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        step = re.search(
+            r"- name: Probe a kkernel built with the operator feature set\n"
+            r"        run: \|\n"
+            r"          (cargo build [^\n]+)\n"
+            r"          (make [^\n]+)\n",
+            workflow,
+        )
+        self.assertIsNotNone(step, "operator feature probe step not found in ci.yml")
+        self.assertEqual(
+            step.group(1),
+            "cargo build -p kkernel --bin kkernel --locked --features "
+            + features.group(1),
+        )
+        self.assertEqual(
+            step.group(2),
+            'make -C .. fleet-check FLEET_ARTIFACT="$PWD/target/debug/kkernel"',
+        )
+
     def test_fleet_targets_split_build_verification_from_verification_only(self) -> None:
         self.assertIn("fleet-build: verify-local-artifact\n", self.makefile)
         self.assertIn("fleet-check: validate-make-inputs\n", self.makefile)
@@ -1351,6 +1448,11 @@ class MakefileGateContractTests(unittest.TestCase):
             "$(LOCAL_VERB_FLOOR)",
             "$(LOCAL_BUILD_RECEIPT)",
             "$(CARGO)",
+            "$(FLEET_ARTIFACT)",
+            "$(EXPECTED_SHA256)",
+            "$(EXPECTED_REVISION)",
+            "$(PIN_DIR)",
+            "$(SUPERVISOR_LABEL)",
         )
         recipe_lines = [
             line
@@ -1873,6 +1975,93 @@ class MakefileGateContractTests(unittest.TestCase):
             "result from it is not evidence\n" + reverted.output,
         )
 
+    def test_private_socket_marker_does_not_share_default_supervision(self) -> None:
+        for socket in ("x.sock", "x.other", ".khive/khived"):
+            with self.subTest(socket=socket):
+                run = self._run_local_recipe(
+                    observe_start=True,
+                    socket_relative=socket,
+                    default_supervisor_marker=self.FOREIGN_MARKER,
+                )
+                self.assertEqual(run.rc, 0, run.output)
+                self.assertTrue(run.replacement_started, run.output)
+                self.assertIsNone(run.marker_after, run.output)
+                self.assertEqual(run.default_marker_after, self.FOREIGN_MARKER, run.output)
+
+    def test_private_supervisor_marker_suppresses_its_replacement(self) -> None:
+        for socket in ("x.sock", "x.other", ".khive/khived"):
+            with self.subTest(socket=socket):
+                run = self._run_local_recipe(
+                    observe_start=True,
+                    socket_relative=socket,
+                    supervisor_marker=self.FOREIGN_MARKER,
+                )
+                self.assertEqual(run.rc, 0, run.output)
+                self.assertFalse(run.replacement_started, run.output)
+                self.assertEqual(run.marker_after, self.FOREIGN_MARKER, run.output)
+                self.assertIsNone(run.default_marker_after, run.output)
+
+    def test_private_marker_override_precedence_and_empty_fallback(self) -> None:
+        for override in ("", "explicit-marker"):
+            with self.subTest(override=override):
+                run = self._run_local_recipe(
+                    observe_start=True,
+                    socket_relative="x.sock",
+                    marker_relative=override,
+                    supervisor_marker=self.FOREIGN_MARKER,
+                )
+                self.assertEqual(run.rc, 0, run.output)
+                self.assertFalse(run.replacement_started, run.output)
+                self.assertEqual(run.marker_after, self.FOREIGN_MARKER, run.output)
+                self.assertIsNone(run.default_marker_after, run.output)
+        absent_override = self._run_local_recipe(
+            observe_start=True,
+            socket_relative="x.sock",
+            marker_relative="absent-explicit-marker",
+            default_supervisor_marker=self.FOREIGN_MARKER,
+        )
+        self.assertEqual(absent_override.rc, 0, absent_override.output)
+        self.assertTrue(absent_override.replacement_started, absent_override.output)
+        self.assertEqual(
+            absent_override.default_marker_after, self.FOREIGN_MARKER, absent_override.output
+        )
+
+    def test_default_marker_parity_with_trailing_home(self) -> None:
+        for trailing_slash in (False, True):
+            for socket in (None, "", ".khive/khived.sock"):
+                with self.subTest(trailing_slash=trailing_slash, socket=socket):
+                    run = self._run_local_recipe(
+                        observe_start=True,
+                        socket_relative=socket,
+                        home_trailing_slash=trailing_slash,
+                        supervisor_marker=self.FOREIGN_MARKER,
+                    )
+                    self.assertEqual(run.rc, 0, run.output)
+                    self.assertFalse(run.replacement_started, run.output)
+                    self.assertEqual(run.marker_after, self.FOREIGN_MARKER, run.output)
+                    self.assertEqual(run.default_marker_after, self.FOREIGN_MARKER, run.output)
+
+    def test_socket_scoped_marker_control_detects_global_derivation(self) -> None:
+        start = self.makefile.index('\tMARKER=$${KHIVE_SUPERVISOR_MARKER:-};')
+        end = self.makefile.index('\tMARKER_LOCK=', start)
+        global_marker = (
+            self.makefile[:start]
+            + '\tMARKER=$${KHIVE_SUPERVISOR_MARKER:-$$HOME/.khive/khived.supervisor}; \\\n'
+            + self.makefile[end:]
+        )
+        reverted = self._run_local_recipe(
+            observe_start=True,
+            socket_relative="x.sock",
+            default_supervisor_marker=self.FOREIGN_MARKER,
+            makefile_text=global_marker,
+        )
+        self.assertEqual(reverted.rc, 0, reverted.output)
+        self.assertFalse(
+            reverted.replacement_started,
+            "global-marker mutation must reproduce the private-socket refusal\n" + reverted.output,
+        )
+        self.assertEqual(reverted.default_marker_after, self.FOREIGN_MARKER, reverted.output)
+
     def test_cargo_receipt_drives_verifier_and_ci_runs_regression_suite(self) -> None:
         self.assertIn("scripts/build_local_artifact.py", self.makefile)
         self.assertIn("scripts/verify_local_artifact.py", self.makefile)
@@ -2166,6 +2355,129 @@ class MakeLocalMarkerContractTests(unittest.TestCase):
                     marker.exists(),
                     "unconditional removal control did not remove the foreign marker",
                 )
+
+
+class InstallArtifactRefusalTests(unittest.TestCase):
+    """`make install-artifact` refuses before its first write on every bad input.
+
+    Each case runs the real Makefile under a sandbox HOME with a stand-in
+    artifact (a script that prints a `--version` line) and checks that the
+    installed binary is byte-identical afterwards and that no pin was written.
+    The last case is the control: valid inputs pass both identity checks and
+    reach the pack probe, which the stand-in fails, so the refusals above are
+    the checks speaking rather than the harness failing early.
+    """
+
+    REVISION = "0123456789abcdef0123456789abcdef01234567"
+    INSTALLED = b"installed binary\n"
+
+    def _run(
+        self,
+        *,
+        omit: tuple[str, ...] = (),
+        expected_sha256: str | None = None,
+        expected_revision: str | None = None,
+        artifact_revision: str | None = None,
+        existing_pin: bytes | None = None,
+    ) -> tuple[int, str, bytes, bytes | None, bool]:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "workspace"
+            (work / "scripts").mkdir(parents=True)
+            shutil.copy(MAKEFILE, work / "Makefile")
+            shutil.copy(VERIFY_SCRIPT, work / "scripts" / VERIFY_SCRIPT.name)
+            home = root / "home"
+            installed = home / ".cargo" / "bin" / "kkernel"
+            installed.parent.mkdir(parents=True)
+            installed.write_bytes(self.INSTALLED)
+            artifact = root / "artifact" / "kkernel"
+            artifact.parent.mkdir()
+            artifact.write_text(
+                "#!/bin/sh\n"
+                f"echo 'kkernel 0.0.0 (revision {artifact_revision or self.REVISION}, "
+                "built 2026-01-01T00:00:00Z)'\n",
+                encoding="utf-8",
+            )
+            artifact.chmod(0o755)
+            pin_dir = root / "pins"
+            if existing_pin is not None:
+                pin_dir.mkdir()
+                (pin_dir / "kkernel").write_bytes(existing_pin)
+            args = {
+                "FLEET_ARTIFACT": str(artifact),
+                "EXPECTED_SHA256": expected_sha256
+                or hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "EXPECTED_REVISION": expected_revision or self.REVISION,
+                "PIN_DIR": str(pin_dir),
+            }
+            for name in omit:
+                del args[name]
+            env = {k: v for k, v in os.environ.items() if not k.startswith("KHIVE_")}
+            env["HOME"] = str(home)
+            proc = subprocess.run(
+                ["make", "-f", "Makefile", "install-artifact"]
+                + [f"{name}={value}" for name, value in args.items()],
+                cwd=work,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            pin = pin_dir / "kkernel"
+            staged = (home / ".cargo" / "bin" / "kkernel.new").exists()
+            return (
+                proc.returncode,
+                proc.stdout + proc.stderr,
+                installed.read_bytes(),
+                pin.read_bytes() if pin.exists() else None,
+                staged,
+            )
+
+    def _assert_refused(self, result, message: str, *, pin: bytes | None = None) -> None:
+        rc, output, installed, pin_bytes, staged = result
+        self.assertNotEqual(rc, 0, output)
+        self.assertIn(message, output)
+        self.assertEqual(installed, self.INSTALLED, output)
+        self.assertEqual(pin_bytes, pin, output)
+        self.assertFalse(staged, output)
+
+    def test_refuses_without_an_artifact(self) -> None:
+        self._assert_refused(self._run(omit=("FLEET_ARTIFACT",)), "FLEET_ARTIFACT is required")
+
+    def test_refuses_without_a_pin_directory(self) -> None:
+        self._assert_refused(self._run(omit=("PIN_DIR",)), "PIN_DIR is required")
+
+    def test_refuses_a_malformed_expected_sha256(self) -> None:
+        self._assert_refused(
+            self._run(expected_sha256="abc"), "EXPECTED_SHA256 must be the artifact's sha256"
+        )
+
+    def test_refuses_a_malformed_expected_revision(self) -> None:
+        self._assert_refused(
+            self._run(expected_revision="main"), "EXPECTED_REVISION must be a git revision"
+        )
+
+    def test_refuses_an_artifact_whose_sha256_differs(self) -> None:
+        self._assert_refused(self._run(expected_sha256="0" * 64), "is not EXPECTED_SHA256")
+
+    def test_refuses_an_artifact_reporting_another_revision(self) -> None:
+        self._assert_refused(
+            self._run(artifact_revision="f" * 40), "not EXPECTED_REVISION " + self.REVISION
+        )
+
+    def test_never_overwrites_an_existing_pin(self) -> None:
+        self._assert_refused(
+            self._run(existing_pin=b"earlier pin\n"),
+            "a pin is never overwritten",
+            pin=b"earlier pin\n",
+        )
+
+    def test_valid_inputs_reach_the_pack_probe_and_install_nothing_when_it_fails(self) -> None:
+        result = self._run()
+        self._assert_refused(result, "the artifact failed the pack probe; nothing was installed")
+        output = result[1]
+        self.assertIn("Artifact sha256 matches EXPECTED_SHA256", output)
+        self.assertIn("Artifact revision matches EXPECTED_REVISION (" + self.REVISION + ")", output)
 
 
 if __name__ == "__main__":

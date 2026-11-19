@@ -5,20 +5,13 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
-use khive_types::{EntityTypeDef, HandlerDef, Pack};
 
 use crate::{handlers, preference_handlers, MoodboardPack, PACK_NAME};
 
 struct MoodboardPackFactory;
 
 impl khive_runtime::PackFactory for MoodboardPackFactory {
-    fn name(&self) -> &'static str {
-        PACK_NAME
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        &["kg"]
-    }
+    khive_runtime::pack_factory_metadata!(MoodboardPack);
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime> {
         Box::new(MoodboardPack::new(runtime))
@@ -29,29 +22,7 @@ inventory::submit! { khive_runtime::PackRegistration(&MoodboardPackFactory) }
 
 #[async_trait]
 impl PackRuntime for MoodboardPack {
-    fn name(&self) -> &str {
-        <Self as Pack>::NAME
-    }
-
-    fn note_kinds(&self) -> &'static [&'static str] {
-        <Self as Pack>::NOTE_KINDS
-    }
-
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        <Self as Pack>::ENTITY_KINDS
-    }
-
-    fn handlers(&self) -> &'static [HandlerDef] {
-        <Self as Pack>::HANDLERS
-    }
-
-    fn entity_types(&self) -> &'static [EntityTypeDef] {
-        <Self as Pack>::ENTITY_TYPES
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        <Self as Pack>::REQUIRES
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     async fn dispatch(
         &self,

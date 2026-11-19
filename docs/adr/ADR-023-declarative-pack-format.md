@@ -128,6 +128,16 @@ The same handler is reachable as `memory.recall` from MCP and as
 `kkernel exec 'memory.recall(...)'` from the CLI. The CLI is the operator's window into the
 full surface; MCP is the agent's filtered view.
 
+**Accepted operator subhandler:** ADR-046's
+[resolved-proposal cleanup amendment](ADR-046-event-sourced-proposals.md#amendment-resolved-proposal-cleanup-2026-10-09)
+specifies the exact name `kg.proposal_cleanup` with `Visibility::Subhandler`
+and `VerbCategory::Declaration`. Once implemented, it is
+callable through `kkernel exec`, while MCP execution is refused in every form
+and named help retains the internal/non-callable description above. The
+explicit `kg.` spelling applies to this operator subhandler; it does not
+rename the bare public KG verbs or add a public verb. This note records an
+accepted contract, not an available handler or an authorization exemption.
+
 This replaces the previous `VerbDef` type. Migration is mechanical: rename
 `VerbDef` → `HandlerDef`, add `visibility: Visibility::Verb` to every existing
 verb entry in pack-kg / pack-gtd / pack-memory / pack-brain crates, and mark
@@ -135,32 +145,39 @@ internal pipeline handlers with `Visibility::Subhandler`.
 
 ### 3. Operator visibility override status
 
-Per-pack `verbs_disabled` configuration is **not supported in the shipped v1
-operator surface**. The active surface has two controls:
+Operators can disable selected public handlers from loaded packs:
 
-1. Pack authors set each handler's static `Visibility::{Verb, Subhandler}` in
-   `Pack::HANDLERS`.
-2. Operators select which packs load via ADR-027 pack selection (`--pack`,
-   `KHIVE_PACKS`, or the built-in production default pack set).
+```toml
+[packs.memory]
+verbs_disabled = ["memory.remember", "memory.prune"]
+```
 
-The runtime's MCP capability list is built from loaded handlers whose static
-visibility is `Visibility::Verb`. There is no deployment-time downgrade path from
-`Verb` to `Subhandler`, and operators cannot promote `Subhandler` handlers onto the
-MCP wire.
+A policy-only entry defaults to the `main` backend. Boot rejects names that
+are unknown, belong to another pack, name an unloaded pack, or identify an
+internal `Subhandler`. This policy applies to registered native public handlers;
+mounted tools retain their mount-owned policy.
 
-`verbs_disabled` remains a deferred policy hook. Implementing it requires a config
-parser field, boot-time validation against loaded pack handlers, and tests proving
-that disabled verbs disappear from MCP capability discovery while remaining
-available to operator-only introspection.
+Disabled verbs disappear from MCP capability discovery, the `verbs` catalog,
+and public help. Ordinary dispatch and intercepted requests return the same
+unknown-verb refusal used for unavailable verbs; CLI atomic preflight rejects
+the whole unit before opening its target database. Operator-only handler and
+pack introspection retains the full registered surface. Disabling a verb does
+not unload its pack or change its vocabulary, hooks, or stored data, and cannot
+promote a subhandler onto the MCP wire.
+
+The effective sorted, deduplicated policy participates in daemon `config_id`
+for both implicit-main and multi-backend deployments. Changing the policy
+therefore requires a matching daemon configuration.
 
 ### 4. Verb naming — kg bare, all others pack-prefixed
 
 The native kg pack (`khive-pack-kg`) owns the **substrate verbs** and exposes them as
-bare verb names. This document deliberately makes no total normative. The authoritative set is
-the 20-entry `KG_HANDLERS` table in `crates/khive-pack-kg/src/handler_defs.rs`, cross-checked by
-`KG_SUBSTRATE_VERBS` in `crates/kkernel/tests/verb_namespace_contract.rs`; the current surface is
-readable at runtime with `request(ops="verbs(pack=\"kg\")")`. The table below classifies the
-shipped semantic allowlist by speech act, which is this section's actual subject:
+bare verb names, with the `stream.*` exception specified below. This document deliberately
+makes no total normative. Handler declarations live in
+`KG_HANDLERS` in `crates/khive-pack-kg/src/handler_defs.rs`; the bare allowlist is cross-checked by
+`KG_SUBSTRATE_VERBS` in `crates/kkernel/tests/verb_namespace_contract.rs`. The current public
+surface is readable with `request(ops="verbs(pack=\"kg\")")`. The table below classifies verbs by
+speech act; the complete public naming contract follows it.
 
 | Verb             | Speech act  | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | ---------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -180,6 +197,7 @@ shipped semantic allowlist by speech act, which is this section's actual subject
 | `withdraw`       | commissive  | Rescind an open proposal (proposer-only); emits `ProposalWithdrawn`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `stats`          | assertive   | Aggregate counts and health metrics for the namespace graph.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `verbs`          | assertive   | Enumerate all MCP-callable verbs; supports `category` and `pack` filters.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `schema`         | assertive   | Loaded vocabulary and attributed endpoint declarations, counts and content hash; proposed contract under [ADR-084 clarification](ADR-084-verb-surface-consistency.md#proposed-implementation-clarification-2026-10-10), pending acceptance and conformance validation.                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `context`        | assertive   | Entity-anchored graph context in one call: resolves anchors (by ID or hybrid search), expands 1-2 hops with per-node fanout caps, and packs the result within a char budget (ADR-089).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `resolve`        | assertive   | Resolve natural-language references to record ids: id-string passthrough, recently-referenced ring, exact-name match, then hybrid-search fallback; returns Resolved/Ambiguous/NotFound per ref, never a silent pick.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `whoami`         | assertive   | Report the caller's already-resolved identity: actor id and kind, whether the actor is the unattributed fallback, the write namespace, and the read-visible namespace set. Never returns tokens or credentials.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
@@ -218,7 +236,7 @@ places `search` limit metadata on successful MCP operation wrappers beside
 retain their exact array contract. This does not introduce a uniform metadata
 object into every pack handler's return value.
 
-Every other pack prefixes its verbs with the pack name and a single dot:
+Every other pack prefixes its verbs, public and internal, with the pack name and a single dot:
 
 ```
 memory.remember, memory.recall, memory.recall_candidates, memory.recall_score
@@ -238,18 +256,53 @@ dots:
 ✗ memory.recall.candidates       two dots, breaks "first dot is pack" rule
 ```
 
-The single rule: **first dot is always the pack name. There is no second dot.**
+#### Public declaration ownership (2026-11-15)
 
-**Enforcement**: This rule is enforced at CI time by the contract test at
-`crates/kkernel/tests/verb_namespace_contract.rs`. The test loads every
-`inventory`-registered pack, walks all `HandlerDef` names, and asserts:
+Runtime registration must enforce the following contract for native handlers with
+`Visibility::Verb`, in both ordinary and metadata-only registry construction. This
+specifies required behavior; it does not claim that runtime enforcement has shipped.
+The existing identifier grammar applies first, without case folding, automatic
+prefixing or new length restrictions.
 
-- A bare name (no dot) must be owned by the kg pack and appear in the
-  kg-substrate allowlist.
-- A dotted name must carry exactly one dot whose prefix matches `Pack::NAME`.
-- Two or more dots are always a violation.
+- A bare name requires the owner label to be exactly `kg` and membership in the kg
+  bare allowlist. `KG_SUBSTRATE_VERBS` in the contract test is the authoritative set.
+  The runtime check keeps its own copy of that set, and a test fails if the two
+  copies differ.
+- The kg pack may also declare `stream.<identifier>`, with exactly one dot and a
+  suffix accepted by the existing grammar, under
+  [ADR-174](ADR-174-ordered-streams-append.md). No other dotted public name is
+  admitted under `kg`. In particular, `kg.proposal_cleanup` remains an internal
+  `Subhandler` under §2, not a public exception.
+- A public name under any other owner must contain exactly one dot, with its
+  prefix equal to `PackRuntime::name()` byte-for-byte.
+- The label `stream` is reserved: a pack that reports it, or a mounted
+  registration that uses it as its namespace, is refused, because `stream.*` names belong to kg under ADR-174 and verb
+  classification is keyed on the name.
 
-Any verb name change or new pack registration that violates §4 will fail CI.
+A violation must refuse registry construction with `InvalidInput` identifying the
+declaring owner and handler. Disabling the declaration does not bypass validation.
+Rejecting previously admitted third-party declarations that violate this contract
+is an intentional compatibility change.
+
+The owner is the label reported by `PackRuntime::name()`, not authentication of the
+pack implementation. A pack that reports `kg` is held to the kg rules above whatever
+its implementation; because a registry refuses two packs with the same label
+(`PackRedeclared`), a second pack cannot report `kg` beside the real one. When the
+real kg pack is not loaded, a pack reporting `kg` is the only owner of those names;
+choosing which packs to load remains the embedder's trust decision. Ownership validation does not grant registration trust or
+change the distinction between `register` and `register_trusted`; neither route
+bypasses the public naming rule. Mounted registrations retain their separate
+policy. Internal `Visibility::Subhandler` admission, collision and visibility
+rules remain unchanged; this public ownership check does not apply to them.
+
+**CI coverage** remains the contract test at
+`crates/kkernel/tests/verb_namespace_contract.rs`. It loads the linked
+`inventory`-registered packs and walks **all** `HandlerDef` names, including
+internal handlers. Its naming checks require kg ownership and allowlist membership
+for bare names; they recognize kg's `stream.*` namespace and the exact internal
+name `kg.proposal_cleanup`, and require other packs' own prefixes with one dot.
+That all-handler check is distinct from runtime public-declaration validation:
+its internal cleanup exception does not make cleanup MCP-callable.
 
 The kkernel CLI uses the same dotted verb-DSL form as MCP, via the `exec` subcommand:
 
@@ -302,7 +355,7 @@ vocabulary. When called with a `kind` argument, kg consults the owning pack's
 pub trait KindHook: Send + Sync + std::fmt::Debug {
     // create — already in ADR-017
     async fn prepare_create(&self, rt: &KhiveRuntime, args: &mut Value) -> Result<(), RuntimeError>;
-    async fn after_create  (&self, rt: &KhiveRuntime, id: Uuid, args: &Value) -> Result<(), RuntimeError>;
+    async fn after_create  (&self, _rt: &KhiveRuntime, _id: Uuid, _args: &Value) -> Result<(), RuntimeError> { Ok(()) }
 
     // list
     async fn prepare_list  (&self, rt: &KhiveRuntime, args: &mut Value)             -> Result<(), RuntimeError> { Ok(()) }
@@ -317,7 +370,7 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
 }
 ```
 
-All non-create hooks have empty default impls. Packs override only the ones they need.
+Only `prepare_create` is required. The other hooks have no-op defaults; packs override the ones they need.
 
 Concrete examples:
 
@@ -527,16 +580,16 @@ Three reasons:
 
 ## Alternatives Considered
 
-| Alternative                                                   | Why rejected                                                                                                                                                                                             |
-| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| YAML pack manifests (original ADR-023 v0)                     | Bifurcates the pack ecosystem into code-packs and data-packs. Half-feature: real packs want vocabulary + verbs. Increases maintenance load. The accepted decision keeps packs in Rust.                   |
-| Pack verb override (last-loaded-wins or explicit declaration) | Breaks agent predictability. Verb semantics become deployment-dependent. KindHook is the safe extension point.                                                                                           |
-| Pack middleware / wrap interception                           | Composes badly (order-dependent chains); auth and audit belong at the runtime gate (ADR-018), not the pack layer.                                                                                        |
-| Four-tier visibility (Public/Advanced/Debug/Internal)         | Conflates MCP exposure with documentation gating. Skills already handle docs; two tiers (on/off the MCP wire) are sufficient.                                                                            |
-| Proc macro (`#[derive(Pack)]`)                                | Adds expansion magic; rust-analyzer + debuggers have to expand. Cargo-generate produces plain Rust that any LLM/human reads directly.                                                                    |
-| Declarative bang macro (`khive_pack! { ... }`)                | Same as proc macro; adds a DSL parallel to the real trait. Template + plain Rust is simpler.                                                                                                             |
-| Operators can promote Internal → Verb in khive.toml           | Bypasses pack author's safety contract. Operator can disable but never expand the MCP surface.                                                                                                           |
-| Allow new edge relation names from packs                      | Fragments traversal semantics; two packs may invent different names for the same concept. The closed 15-relation set (ADR-002) plus extensible endpoints (ADR-017 `EDGE_RULES`) covers the design space. |
+| Alternative                                                   | Why rejected                                                                                                                                                                                          |
+| ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| YAML pack manifests (original ADR-023 v0)                     | Bifurcates the pack ecosystem into code-packs and data-packs. Half-feature: real packs want vocabulary + verbs. Increases maintenance load. The accepted decision keeps packs in Rust.                |
+| Pack verb override (last-loaded-wins or explicit declaration) | Breaks agent predictability. Verb semantics become deployment-dependent. KindHook is the safe extension point.                                                                                        |
+| Pack middleware / wrap interception                           | Composes badly (order-dependent chains); auth and audit belong at the runtime gate (ADR-018), not the pack layer.                                                                                     |
+| Four-tier visibility (Public/Advanced/Debug/Internal)         | Conflates MCP exposure with documentation gating. Skills already handle docs; two tiers (on/off the MCP wire) are sufficient.                                                                         |
+| Proc macro (`#[derive(Pack)]`)                                | Adds expansion magic; rust-analyzer + debuggers have to expand. Cargo-generate produces plain Rust that any LLM/human reads directly.                                                                 |
+| Declarative bang macro (`khive_pack! { ... }`)                | Same as proc macro; adds a DSL parallel to the real trait. Template + plain Rust is simpler.                                                                                                          |
+| Operators can promote Internal → Verb in khive.toml           | Bypasses pack author's safety contract. Operator can disable but never expand the MCP surface.                                                                                                        |
+| Allow new edge relation names from packs                      | Fragments traversal semantics; two packs may invent different names for the same concept. The closed relation set (ADR-002) plus extensible endpoints (ADR-017 `EDGE_RULES`) covers the design space. |
 
 ## Implementation
 
@@ -563,9 +616,9 @@ pub trait Pack {
 
 ### Operator config status
 
-`verbs_disabled` is deferred and is not part of the shipped `khive.toml` schema.
-Current operator control is pack selection per ADR-027 plus pack-authored static
-handler visibility.
+`[packs.<name>].verbs_disabled` disables named public handlers after loaded-pack
+validation. Pack selection per ADR-027 and pack-authored static visibility still
+apply; operator-only introspection retains disabled handlers (see section 3).
 
 ### KindHook extension
 
@@ -597,7 +650,7 @@ working crate. Reference impl: `crates/khive-pack-kg/`.
 | Non-help subhandler via MCP request (single/batch/chain)   | Permission denied; internal subhandler; `not_committed`      |
 | Named MCP subhandler `help=true` request                   | Returns metadata with `callable_via_mcp: false`; no dispatch |
 | Subhandler visible through operator introspection          | Listed as `Visibility::Subhandler`, not MCP-callable         |
-| Future `verbs_disabled` config policy                      | Deferred; requires parser, validation, and capability tests  |
+| `verbs_disabled` config policy                             | Parsed and boot-validated; catalog and dispatch enforced     |
 | Pack template-generated crate compiles + passes smoke test | Yes                                                          |
 
 ## Amendment: dispatch-by-kind + KindHook as the mandatory pattern for future packs (2026-07-05)
@@ -614,6 +667,7 @@ current verb surface or verb count:
    a record) that dispatch-by-kind cannot express. Existing named verbs accepted for
    exactly this reason (for example the session pack's `session.resume`, per
    ADR-083) are unaffected; this rule governs new packs and new verbs going forward.
+   (superseded by ADR-095 Amendment 1, Decision 1)
 2. Per-kind create-time field validation (enum checks, format checks, cross-field
    guards) lives in that kind's `KindHook::prepare_create` implementation
    ([ADR-017](ADR-017-pack-standard.md) §KindHook), not in a parallel handler that
@@ -630,7 +684,7 @@ refactor that unifies `gtd.assign` onto the shared create-plus-`TaskHook` path.
 
 - [ADR-001](ADR-001-entity-kind-taxonomy.md) — closed `EntityKind` taxonomy that packs
   extend via `entity_type`, not new kinds
-- [ADR-002](ADR-002-edge-ontology.md) — closed 15-relation set; packs extend endpoints
+- [ADR-002](ADR-002-edge-ontology.md) — closed relation set; packs extend endpoints
   via `EDGE_RULES`, not new relations
 - [ADR-003](ADR-003-system-architecture.md) — kkernel / khive split
 - [ADR-013](ADR-013-note-kind-taxonomy.md) — closed note kind taxonomy

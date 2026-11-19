@@ -8,6 +8,32 @@ reintroduce. The boundary constructs the KG pack's public
 `ValidatedSearchRequest` once, before fan-out, rather than parsing an ad-hoc
 subset of the search JSON.
 
+## Caller-scoped note search (#3764)
+
+The MCP intercept uses `dispatch_intercepted_with_token_and_disposition`, then calls
+`CoordinatorService::fan_out_search_scoped` with the gate-authorized caller token and
+original arguments. A note search, including broad `kind="note"` searches, must retain
+that calling actor through backend search, message filtering and hydration. The actor
+configured on a backend is not a substitute for the calling actor's mailbox.
+
+`SubstrateCoordinatorService` passes the token to
+`SubstrateCoordinator::fan_out_search_with_token`. Each backend first retains the existing
+`authorize_with_visibility` admission for the primary and extra-visible namespaces, then
+uses the sealed caller token and `authorize_mailbox_view` for its note search. Candidate
+note rows are filtered against that view, and hydration rechecks it before publishing
+record metadata. Separate search and hydration reads do not form an atomic record snapshot.
+
+`extra_visible` carries the dispatch-resolved visible namespaces; it cannot grant a new
+mailbox view. An explicit `namespace=` intentionally supplies no extra-visible widening.
+Generic search has no delegated mailbox selector. The
+[generic message-read contract](../../../khive-pack-kg/docs/api/message-read-scope.md)
+records the copy, prefix and library read rules.
+
+The default implementation of `fan_out_search_scoped` preserves compatibility for entity
+search by invoking the older `fan_out_search` method. It refuses note search when the
+coordinator has not implemented the scoped method, with guidance to use `comm.inbox` for
+messages. Falling back to an unscoped note search would discard the mailbox contract.
+
 ## Complete search-filter contract (#1377)
 
 The validated request represents `kind`, `query`, `limit`, `entity_kind`,

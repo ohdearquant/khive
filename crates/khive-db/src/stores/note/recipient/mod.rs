@@ -14,6 +14,32 @@ pub enum RecipientDisposition {
     Stored,
     Quarantined,
 }
+
+/// Closed class of terminal acknowledgement refusals from ADR-105 A.9.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcknowledgementRetirementReason {
+    PermanentTransport,
+}
+impl AcknowledgementRetirementReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PermanentTransport => "permanent_transport",
+        }
+    }
+}
+
+/// Unsigned binding and disposition read from the durable acknowledgement journal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AckJournalEntry {
+    pub delivery_attempt_id: Uuid,
+    pub binding: Value,
+    pub disposition: RecipientDisposition,
+    pub attempt_count: u64,
+    pub not_before: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
 impl RecipientDisposition {
     fn as_str(self) -> &'static str {
         match self {
@@ -117,35 +143,16 @@ fn invalid(message: &str) -> StorageError {
     }
 }
 
-const REPLAY_SQL: &str = concat!(
-    "SELECT note_id,disposition,recipient_agent_id,recipient_actor FROM ",
-    "comm_recipient_replay WHERE sender_agent_id=?1 AND logical_message_id=?2",
-);
+const REPLAY_SQL: &str = include_str!("../../../../sql/comm-recipient-replay-select.sql");
 
 // An outbox transport row alone survives deletion of its message note. A
 // parent proves reply status only while that exact outbound note is live and
 // belongs to this recipient, addressed to the authenticated sender.
-const OUTBOUND_PARENT_SQL: &str = concat!(
-    "SELECT EXISTS(SELECT 1 FROM comm_sender_transport AS t JOIN notes AS n ",
-    "ON n.id=t.outbound_note_id AND n.namespace=t.namespace WHERE ",
-    "t.namespace=?1 AND t.logical_message_id=?2 AND ",
-    "t.sender_agent_id=?3 AND t.recipient_agent_id=?4 AND ",
-    "n.kind='message' AND n.deleted_at IS NULL AND ",
-    "json_extract(n.properties,'$.direction')='outbound')",
-);
+const OUTBOUND_PARENT_SQL: &str =
+    include_str!("../../../../sql/comm-recipient-live-outbound-parent-exists.sql");
 
-const CORRELATION_SQL: &str = concat!(
-    "SELECT id,CAST(json_extract(properties,'$.thread_id') AS TEXT) FROM notes WHERE ",
-    "namespace=?1 AND kind='message' AND deleted_at IS NULL AND ",
-    "((json_extract(properties,'$.from_actor')=?2 AND ",
-    "json_extract(properties,'$.to_actor')=?3) OR ",
-    "(json_extract(properties,'$.from_actor')=?3 AND ",
-    "json_extract(properties,'$.to_actor')=?2)) AND ",
-    "(json_extract(properties,'$.external_id')=?4 OR ",
-    "json_extract(properties,'$.thread_id') IN (?5,?6,?7,?8,?9,?10,?11,?12,?13) ",
-    "OR id=?14) ORDER BY created_at,id ",
-    "LIMIT 1",
-);
+const CORRELATION_SQL: &str =
+    include_str!("../../../../sql/comm-recipient-correlated-thread-select.sql");
 
 fn correlation_match_values(correlation: &str) -> ([Option<String>; 9], String) {
     let raw = correlation.trim();
@@ -165,47 +172,23 @@ fn correlation_match_values(correlation: &str) -> ([Option<String>; 9], String) 
     (spellings, root.to_string())
 }
 
-const INSERT_NOTE_SQL: &str = concat!(
-    "INSERT INTO notes ",
-    "(id,namespace,kind,status,name,content,salience,decay_factor,expires_at,",
-    "properties,created_at,updated_at,deleted_at,key) ",
-    "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-);
+const INSERT_NOTE_SQL: &str =
+    include_str!("../../../../sql/comm-recipient-message-note-insert.sql");
 
-const INSERT_REPLAY_SQL: &str = concat!(
-    "INSERT INTO comm_recipient_replay ",
-    "(sender_agent_id,logical_message_id,recipient_agent_id,recipient_actor,",
-    "note_id,disposition,created_at) ",
-    "VALUES (?1,?2,?3,?4,?5,?6,?7)",
-);
+const INSERT_REPLAY_SQL: &str = include_str!("../../../../sql/comm-recipient-replay-insert.sql");
 
-const QUARANTINE_SQL: &str = concat!(
-    "INSERT INTO comm_recipient_quarantine ",
-    "(sender_agent_id,logical_message_id,recipient_agent_id,delivery_item,reason,",
-    "parsed_plaintext,created_at) VALUES ",
-    "(?1,?2,?3,?4,?5,?6,?7)",
-);
+const QUARANTINE_SQL: &str = include_str!("../../../../sql/comm-recipient-quarantine-insert.sql");
 
-const LOCAL_BOUND_COUNT_SQL: &str = concat!(
-    "SELECT count(*) FROM comm_recipient_quarantine ",
-    "WHERE recipient_agent_id=?1 AND reason<>'policy_rejected'",
-);
-const LOCAL_BOUND_OLDEST_SQL: &str = concat!(
-    "SELECT sender_agent_id,logical_message_id,reason FROM comm_recipient_quarantine ",
-    "WHERE recipient_agent_id=?1 AND reason<>'policy_rejected' ",
-    "ORDER BY created_at,sender_agent_id,logical_message_id LIMIT ?2",
-);
-const SENDER_BOUND_COUNT_SQL: &str = concat!(
-    "SELECT count(*) FROM comm_recipient_quarantine ",
-    "WHERE recipient_agent_id=?1 AND sender_agent_id=?2 AND reason='policy_rejected'",
-);
-const SENDER_BOUND_OLDEST_SQL: &str = concat!(
-    "SELECT sender_agent_id,logical_message_id,reason FROM comm_recipient_quarantine ",
-    "WHERE recipient_agent_id=?1 AND sender_agent_id=?2 AND reason='policy_rejected' ",
-    "ORDER BY created_at,sender_agent_id,logical_message_id LIMIT ?3",
-);
+const LOCAL_BOUND_COUNT_SQL: &str =
+    include_str!("../../../../sql/comm-recipient-local-quarantine-count.sql");
+const LOCAL_BOUND_OLDEST_SQL: &str =
+    include_str!("../../../../sql/comm-recipient-local-quarantine-oldest-select.sql");
+const SENDER_BOUND_COUNT_SQL: &str =
+    include_str!("../../../../sql/comm-recipient-sender-quarantine-count.sql");
+const SENDER_BOUND_OLDEST_SQL: &str =
+    include_str!("../../../../sql/comm-recipient-sender-quarantine-oldest-select.sql");
 const DELETE_QUARANTINE_SQL: &str =
-    "DELETE FROM comm_recipient_quarantine WHERE sender_agent_id=?1 AND logical_message_id=?2";
+    include_str!("../../../../sql/comm-recipient-quarantine-delete.sql");
 
 /// Make room for one more quarantined item of `reason` under its bound by
 /// dropping the oldest items in the same bound, oldest `created_at` first,
@@ -276,15 +259,48 @@ fn evict_to_bound(
         .collect()
 }
 
-const ACK_LOOKUP_SQL: &str =
-    "SELECT binding,disposition FROM comm_ack_work WHERE delivery_attempt_id=?1";
+const ACK_LOOKUP_SQL: &str = include_str!("../../../../sql/comm-ack-binding-select.sql");
 
-const INSERT_ACK_SQL: &str = concat!(
-    "INSERT INTO comm_ack_work ",
-    "(delivery_attempt_id,sender_agent_id,logical_message_id,binding,disposition,",
-    "created_at,updated_at) ",
-    "VALUES (?1,?2,?3,?4,?5,?6,?6)",
-);
+const ACK_DUE_SQL: &str = include_str!("../../../../sql/comm-ack-due-select.sql");
+
+const ACK_FINISH_SQL: &str = include_str!("../../../../sql/comm-ack-finish-update.sql");
+
+const ACK_FAILED_TRY_SQL: &str = include_str!("../../../../sql/comm-ack-failed-try-update.sql");
+
+const ACK_RETIRE_SQL: &str = include_str!("../../../../sql/comm-ack-retire-update.sql");
+
+fn read_ack_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<AckJournalEntry> {
+    let attempt: String = row.get(0)?;
+    let delivery_attempt_id = Uuid::parse_str(&attempt).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let binding: String = row.get(1)?;
+    let binding = serde_json::from_str(&binding).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let disposition: String = row.get(2)?;
+    let disposition = serde_json::from_value(Value::String(disposition)).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let attempt_count = u64::try_from(row.get::<_, i64>(3)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })?;
+    Ok(AckJournalEntry {
+        delivery_attempt_id,
+        binding,
+        disposition,
+        attempt_count,
+        not_before: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+const INSERT_ACK_SQL: &str = include_str!("../../../../sql/comm-ack-insert.sql");
 
 struct AckIdentity<'a> {
     binding: &'a Value,
@@ -339,6 +355,90 @@ impl RecipientTransportStore {
         Self {
             notes: SqlNoteStore::new(pool, false),
         }
+    }
+
+    /// Pending entries at or before `now` (UTC microseconds), oldest first.
+    /// Pages are bounded to 1,000 entries; a zero limit returns no entries.
+    pub async fn list_due_acknowledgements(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> StorageResult<Vec<AckJournalEntry>> {
+        let limit = limit.min(1000) as i64;
+        self.notes
+            .with_reader("recipient_acknowledgement_due", move |conn| {
+                let mut statement = conn.prepare(ACK_DUE_SQL)?;
+                let entries = statement
+                    .query_map(params![now, limit], read_ack_entry)?
+                    .collect();
+                entries
+            })
+            .await
+    }
+
+    /// Finish a pending entry; terminal or absent entries return `false` unchanged.
+    pub async fn finish_acknowledgement(&self, delivery_attempt_id: Uuid) -> StorageResult<bool> {
+        self.notes
+            .with_writer_tx_storage("recipient_acknowledgement_finish", move |conn| {
+                let changed = conn
+                    .execute(
+                        ACK_FINISH_SQL,
+                        params![
+                            delivery_attempt_id.to_string(),
+                            chrono::Utc::now().timestamp_micros()
+                        ],
+                    )
+                    .map_err(|error| map_err(error, "recipient_acknowledgement_finish"))?;
+                Ok(changed != 0)
+            })
+            .await
+    }
+
+    /// Persist one failed try and its next eligible UTC-microsecond deadline.
+    /// The integer constraint aborts a counter overflow without changing the row.
+    pub async fn record_acknowledgement_failed_try(
+        &self,
+        delivery_attempt_id: Uuid,
+        not_before: i64,
+    ) -> StorageResult<bool> {
+        self.notes
+            .with_writer_tx_storage("recipient_acknowledgement_failed_try", move |conn| {
+                let changed = conn
+                    .execute(
+                        ACK_FAILED_TRY_SQL,
+                        params![
+                            delivery_attempt_id.to_string(),
+                            not_before,
+                            chrono::Utc::now().timestamp_micros()
+                        ],
+                    )
+                    .map_err(|error| map_err(error, "recipient_acknowledgement_failed_try"))?;
+                Ok(changed != 0)
+            })
+            .await
+    }
+
+    /// Retire a pending acknowledgement without touching its message or replay claim.
+    pub async fn retire_acknowledgement(
+        &self,
+        delivery_attempt_id: Uuid,
+        reason: AcknowledgementRetirementReason,
+    ) -> StorageResult<bool> {
+        self.notes
+            .with_writer_tx_storage("recipient_acknowledgement_retire", move |conn| {
+                let changed = conn
+                    .execute(
+                        ACK_RETIRE_SQL,
+                        params![
+                            delivery_attempt_id.to_string(),
+                            reason.as_str(),
+                            chrono::Utc::now().timestamp_micros()
+                        ],
+                    )
+                    .map_err(|error| map_err(error, "recipient_acknowledgement_retire"))?;
+                Ok(changed != 0)
+            })
+            .await
     }
     /// Answer an already committed logical message before its plaintext is
     /// interpreted again. The authenticated caller supplies the current local

@@ -1223,7 +1223,7 @@ lifecycle diagnostics.
 The mode travels on the daemon's command line. `mcp --daemon` gains `--lifetime <demand|persistent>`;
 when the flag is absent the mode is persistent, so an explicit invocation and every supervisor
 configuration written before this amendment keep today's behavior. Automatic spawn has a single
-construction point, the argument builder in `crates/khive-mcp/src/daemon.rs` that both CLI and MCP
+construction point, the argument builder in `crates/khive-mcp/src/daemon/launch.rs` that both CLI and MCP
 forwarding reach, and that builder passes `--lifetime demand`; the bounded-takeover replacement
 spawns through the same builder when it is implemented. The mode is not read from the environment:
 a spawned daemon inherits its caller's environment, so a variable set for one client would silently
@@ -1326,12 +1326,18 @@ interrupts a `COMMIT` that is already executing.
 
 ### Events daemon
 
-The main daemon already supervises a separate events daemon. `supervise_events_daemon`
-(`crates/khive-runtime/src/events_split.rs`) spawns the events-daemon subcommand when its socket
-is unreachable, reaps an exited child on every probe so it never accumulates a zombie, and, on
-the main daemon's own shutdown, sends SIGKILL to exactly the child it spawned (`Child::kill`) and
-reaps it; a pre-existing events daemon it did not spawn is left running untouched. The code's own reasoning for the
-unconditional kill is that durability rests on SQLite, not on the child's in-memory state.
+The main daemon registers `supervise_events_daemon_with_readiness` as the tracked
+`events_daemon_supervision` task (`crates/khive-mcp/src/serve/startup.rs`). The supervisor
+(`crates/khive-runtime/src/events_split/events_daemon.rs`) spawns the events-daemon subcommand when its socket
+is unreachable and no child handle is retained, subject to its respawn interval. It polls the retained
+child before each socket probe. A successful exit poll reaps the child; a poll error retains the
+handle for a later attempt unless the OS reports `ECHILD`, which clears the handle without signalling
+its PID. The main daemon cancels its shutdown token before waiting for tracked tasks
+(`crates/khive-runtime/src/daemon/boot_guard.rs`). When the supervisor reaches its cooperative shutdown
+branch, it attempts to kill and wait for its retained child; both results are currently ignored.
+Dropping or cancelling the supervisor future does not run that cleanup. A pre-existing events daemon
+it did not spawn is left alone. The code bases its kill policy on SQLite durability rather than
+volatile child state; these paths do not guarantee reaping after permanent errors or cancellation.
 [ADR-170](ADR-170-events-daemon-split.md), which describes this split, is proposed, not accepted.
 
 Retirement must classify what the events daemon is to this process before deciding what to do
@@ -1531,3 +1537,982 @@ auto/table formats preserve the full `bridge_instance_id`. A replaced bridge exe
 does not mask this memory-only read. A real in-place re-exec leaves PID continuity possible
 but changes `bridge_instance_id` and restarts all counts. A daemon-side frame counter or log
 proves that the diagnostics operation, including help and formatted reads, was never forwarded.
+
+## Amendment 13 (2026-09-27): daemon ownership follows claimed stores
+
+**Status**: Accepted.
+
+### Context
+
+ADR-049's accepted daemon singleton is scoped to one socket/PID rendezvous. Its
+HOME-derived socket path and the matching boot/recovery lock do not identify a
+SQLite store (§4 Socket protocol and Amendment 3 of this document).
+Two serving processes with different HOME values can therefore open the same
+absolute `[[backends]].path`. ADR-028 already deduplicates configured SQLite
+backends by canonical pathname (`docs/adr/ADR-028-pack-scoped-backends.md`,
+§Why deduplication by canonical path); that pathname is the ownership key for this amendment.
+
+### Decision
+
+An OSS serving daemon claims every distinct file-backed SQLite pathname in its
+effective topology before opening SQLite or running migrations. The claim is
+independent of HOME, socket, PID file, and recovery lock. A declared backend
+topology supplies its effective SQLite paths; an implicit single backend
+supplies the resolved database path. An in-memory target supplies none. Sort
+and deduplicate canonical paths before claiming. If a claim's derived lock
+sidecar pathname is itself a configured database pathname, refuse the whole
+boot before opening any sidecar for writing; after opening each sidecar but
+before locking or truncating it, refuse when the opened descriptor's
+`(device, inode)` matches any configured database identity observed at claim
+time or its hard-link count exceeds one (a configured database missing at
+claim time remains covered by the pathname preflight). A database whose own file
+name has the sidecar form (`.<name>.khived.lock`) refuses the boot at the same
+preflight. An existing sidecar longer than the 64-byte pid record, or starting
+with the SQLite header, is refused before truncation and left untouched. If one claim is unavailable
+or contended, abort the entire boot and release earlier claims. Hold all
+claims through serving and shutdown. Never unlink a lock sidecar. A contender
+refuses even when the holder PID is temporarily unavailable; PID text is only
+best-effort diagnostic evidence. Ordinary non-daemon stdio/local writers
+retain their existing coordination and are outside this daemon singleton
+guarantee. With the HOME boot lock held, an identified daemon already serving
+the same socket retains ADR-049's socket-owner refusal before store claims are
+attempted. This bounded, read-only protocol probe neither opens SQLite nor
+changes the rendezvous. An absent or unidentified socket proceeds to the store
+claims; those claims still precede every SQLite open and migration. The normal
+socket/PID boot fence remains authoritative after construction.
+
+Each claim uses a persistent `.DATABASE.khived.lock` sibling of the canonical
+database pathname. After the sidecar lock is held, freeze that canonical path
+as the _only_ path passed to SQLite. Re-resolve the configured spelling once
+for validation before opening; if a symlink now targets another path, refuse
+and name both the claimed and current paths. Validation must not replace the
+frozen open target.
+
+For a regular file present at claim, record `(device, inode)`. For a
+missing writable target, keep a Missing claim state, create/open the frozen
+path under the held lock, and bind its newly observed `(device, inode)`.
+Missing read-only targets refuse without creation, and a read-only claim never
+creates a missing parent directory. A created writable database has mode 0600
+before the umask; opening a pre-existing database preserves its permissions.
+SQLite's Unix VFS gives newly created WAL and SHM files the database's mode.
+The store-claim layer does not change permissions of existing databases or
+sidecars. Re-stat each canonical path
+immediately after its SQLite backend opens and before schema preparation, then
+again before serving; observed identity drift fails boot. Pass the bound file
+identity into both implicit and declared-backend pool construction. On verified
+64-bit Linux and macOS, the binary installs an immutable forwarding observer for
+the bundled Unix VFS `fstat` syscall at process startup, before any SQLite file
+I/O. A claimed writer open must observe the actual descriptor identity and match
+every successful observation to the held claim before any SQL, identity-row
+initialization, or WAL setup. No observations or any mismatch refuse boot,
+including when the original pathname is restored after a foreign file opens.
+The daemon's claim step, not SQLite, creates a missing writable database: after the sidecar
+claim it opens the file with create relative to the claimed parent directory and binds that
+descriptor's identity, and claimed SQLite opens then disable `SQLITE_OPEN_CREATE`, so SQLite
+opens only a file the claim created or found.
+Library hosts must call the unsafe startup initializer under its documented
+precondition; claimed opens never install it lazily. Other Unix ABIs and
+unverified VFS implementations refuse claimed opens. The forwarding callback
+neither closes nor denies SQLite's descriptors, preserving native POSIX lock
+handling. The final path checks remain additional startup guards.
+
+This check precedes pool SQL and WAL changes, not all native open-time I/O.
+SQLite's macOS msdos/exfat path can write to an empty file during native open;
+trusted nonmutating autoextensions must remain in place. The observer does not
+promise protection from that filesystem-specific raw write, mutating
+third-party autoextensions, or later replacement of the VFS syscall table.
+
+The guarantee is **per stable canonical pathname among participating daemon
+boots**, not per physical inode across distinct hardlink names. Symlink
+spellings that resolve to one stable pathname converge. A hardlink's distinct
+pathname gets a distinct sidecar, so another daemon can claim it even while
+the first daemon serves the same inode; hardlink aliases are unsupported. The repository test
+`store_guard_hardlink_names_remain_independent_unsupported_aliases` in
+`crates/khive-runtime/src/daemon.rs` demonstrates the separate claims. This
+is a property of the sidecar scheme, not a claim about SQLite's support for
+multi-link database files. A sidecar hardlinked to any file is refused before
+lock or truncation. Replacing a database at the same canonical pathname does not erase its
+persistent sidecar claim.
+
+For operators, the sidecar belongs to the store's directory, not to its data. Copying a store
+copies the database by SQLite's own rules and never the sidecar; the destination's first daemon
+creates its own. A copy that hard-links the sidecar (`cp -l`, a hard-link backup) is refused at
+boot by the link-count check. Restoring or replacing a store at the same path is done with every
+daemon on that store stopped, and leaves the sidecar in place; the next boot binds the new file.
+Never delete a sidecar while a daemon may be serving the store, because a second boot would then
+lock a new sidecar while the first still holds the old one. With every daemon stopped, deleting it
+is harmless: the next boot recreates it.
+
+### Acceptance and controls
+
+1. Distinct HOME rendezvous with one absolute SQLite store: the second daemon
+   refuses before constructing SQLite and names the contended store.
+2. Multiple declared backends with one shared secondary canonical path: the
+   second daemon refuses the full topology and drops any earlier claims.
+3. A configured symlink retargeted after claim is refused before open, with
+   both paths named; mutation of alias revalidation turns its named test red.
+4. A canonical file replaced after claim/binding is refused on the post-open
+   `(device, inode)` check; a no-op post-open assertion turns its named test red.
+5. A fresh writable database is created and identity-bound only after its
+   sidecar claim; a missing read-only target is not created. A serving daemon
+   retains every claim until shutdown.
+6. A second claim through a distinct hardlink name succeeds in the fixture,
+   documenting the excluded alias rather than accidentally promising safety.
+7. A claim set whose derived lock sidecar is another configured database
+   refuses the whole boot before any sidecar is opened for writing; an opened
+   sidecar whose descriptor identity matches a configured database or whose
+   hard-link count exceeds one refuses before lock or truncation.
+   `store_guard_refuses_a_database_at_another_stores_lock_sidecar` goes red if
+   the pathname preflight is dropped;
+   `store_guard_names_a_configured_database_matching_the_opened_sidecar` and
+   `store_guard_refuses_hardlinked_sidecar_before_lock_or_truncate` cover the
+   descriptor-identity and hard-link arms, respectively.
+8. A database named like a sidecar, or an existing sidecar holding a SQLite
+   header or more than 64 bytes, refuses before truncation, while a short
+   pid-only sidecar is reused. A read-only claim whose parent directory is
+   missing creates nothing.
+   `store_guard_refuses_to_truncate_a_sidecar_path_that_holds_other_data`,
+   `store_guard_reuses_a_short_pid_only_sidecar_after_a_restart`,
+   `store_guard_refuses_a_database_named_like_a_lock_sidecar` and
+   `store_guard_read_only_claim_refuses_a_missing_parent_without_creating_anything`
+   cover them.
+9. The descriptor observer. A writer, a standalone reader and a later pooled reader whose open
+   observes a foreign file refuse before any SQL
+   (`standalone_writer_refuses_foreign_descriptor_before_sql`,
+   `standalone_reader_refuses_foreign_descriptor_before_sql`,
+   `later_pooled_reader_refuses_foreign_descriptor_before_sql`); opening without the held identity
+   turns each red. A daemon claim refuses a foreign pool before identity-row or WAL setup
+   (`daemon_claim_blocks_foreign_pool_before_identity_or_wal_initialization`); dropping the claims
+   from the claimed backend open turns it red. An open with no successful observation refuses
+   (`observation_without_native_descriptor_evidence_refuses`); accepting a zero observation count
+   turns it red. A mismatch refuses even after the original pathname is restored
+   (`descriptor_claim_refuses_foreign_open_even_after_pathname_is_restored`); skipping the mismatch
+   record in the observer turns it red. An observer that did not install, which is how an
+   unverified ABI or VFS presents, refuses every claimed open
+   (`claimed_pool_without_process_startup_observer_refuses`); removing the initialization check
+   turns it red. No test forces the individual VFS, library-version or replaced-`fstat` detections
+   on a supported host, and on other targets only the refusing installer is compiled.
+
+The HOME boot/recovery lock still serializes startup and client recovery for
+one rendezvous. This amendment adds a separate store claim; it does not
+replace that lock or extend daemon ownership to non-daemon writers.
+
+## Amendment 14 (2026-10-12): strict forwarding by default and a named slow-daemon outcome
+
+**Status**: Accepted 2026-10-12. Decisions 2 and 3 are accepted; Decision 1 is withdrawn (see
+Decision 1).
+
+### Context
+
+A stdio host that forwards to the daemon (Decision §2) builds the same store-backed registry the
+daemon builds, before it reads its first request: it opens every configured SQLite backend, applies
+migrations and pack schema plans, and runs the boot repairs. Every pooled connection maps its store
+(a 1 GiB memory-map window by default) and carries its own page cache. The client then forwards
+every request, so on a host with a running daemon that work serves nothing. Measured before the
+legacy quarantine repair was skipped in forwarding clients, a client start took about 8 seconds
+and pulled the comm and main stores through the page cache; the repair skip removes the scan, not
+the opens, migrations and maps.
+
+A forwarding client serves a request itself in exactly these cases today
+(`crates/khive-mcp/src/server/bridge.rs`, `request_with_forward`):
+
+- the request carries `save_to`, which the daemon frame cannot carry, so it is always local;
+- the main backend is in memory, so no daemon can own it;
+- forwarding returned no response and Amendment 2's policy admitted local dispatch: a `no_socket`
+  outcome outside strict mode.
+
+`bridge.diagnostics` (Amendment 12) and request planning read process memory and the pack verb
+catalog, not a store.
+
+Separately, two client outcomes that mean "the daemon is alive but did not answer in time" carry no
+stable reason today. The boot-fence identity probe that times out after cold-boot quiescence
+returns a prose-only error. A response read that times out after the frame was fully written is
+classified internally as a parse failure (`crates/khive-mcp/src/daemon/forward.rs`) and returns the
+same error as a dropped connection ("daemon response lost after request was sent"). A caller cannot
+tell a slow daemon from a dead one, or count either.
+
+### Decision
+
+**1. Lazy store-backed registry: withdrawn.** As proposed, a forwarding client whose main backend
+is file-backed would have opened no SQLite backend at boot, built its catalog from pack metadata,
+and built the store-backed registry once, on its first local request. Measured after the per-
+connection page cache was capped at 8 MiB and the legacy quarantine repair was skipped in
+forwarding clients, a forwarding client boots in about 90 ms (warm, process start to its last boot
+line) and holds 17 MB physical footprint idle and 17 to 18 MB after serving requests, against
+303 MB before those two changes. At that cost the lazy build saves too little to justify building a
+verb catalog without pack runtimes and keeping the client's daemon identity equal to the eager
+path's.
+
+What the decision would still have bought is a client that never creates a store the daemon owns
+and never runs migrations beside the daemon. A narrower form that keeps only that property needs a
+no-create open mode through the pool and backend open for every configured store; migrations and
+pack schema plans skipped in forwarding clients; a client that starts the daemon first when a store
+is absent, so that the first run on a fresh host still works; and an audit of the other boot-time
+file writers (vector segment directories, the events sidecar, the attachment cutover). It is left
+to its own change. Forwarding clients keep the eager build.
+
+The narrower boot-admission property is proposed in [Amendment 15](#amendment-15-2026-10-19-conditional-client-boot-without-writer-admission).
+That partial amendment is Proposed; it does not restore the withdrawn lazy-registry design or
+change the status of this decision or Decisions 2 and 3.
+
+**2. Strict by default when a rendezvous is present.** `KHIVE_DAEMON_STRICT` becomes a tri-state:
+a truthy value is strict, an explicit false value (`0`, `false`, `no`, `off`) is not strict, and
+unset means strict exactly when a daemon rendezvous was present when the request entered the
+forward path, or is present at the fallback decision. A rendezvous is present when the client's
+resolved socket path or PID file (`khive_runtime::daemon::socket_path`, `pid_path`) exists on disk.
+The entry reading matters because recovery removes a dead daemon's socket and PID file before it
+respawns: read only at the decision, a host whose daemon just died would look like a host that never
+ran one. Under strict mode a request
+that would fall back is rejected with its reason code, as Amendment 2 already specifies for
+`KHIVE_DAEMON_STRICT=1`. With no rendezvous on disk, the quiet `no_socket` fallback of
+Amendment 2 is unchanged. The sanctioned way to run without a daemon stays `KHIVE_NO_DAEMON=1`.
+
+[Amendment 15](#amendment-15-2026-10-19-conditional-client-boot-without-writer-admission)
+proposes retaining the earlier rendezvous observation when its new boot recovery can consume that
+evidence before request entry. This limited observation-lifetime amendment is Proposed; the
+accepted tri-state and refusal outcomes above remain in force.
+
+**3. A named slow-daemon reason.** Both "alive but not in time" outcomes carry
+`reason: "daemon_slow"` in the error data, with a `phase` field and the elapsed wait in
+milliseconds:
+
+- `phase: "before_dispatch"`: the boot-fence identity probe timed out. Nothing was written;
+  `domain_disposition` is `not_committed`, and a retry is safe.
+- `phase: "after_write"`: the response read timed out after the frame was fully written. The
+  request may have been applied; `domain_disposition` is `unknown`. The no-retry rule of
+  Amendment 3 is unchanged: a caller settles by reading state before any re-send.
+
+The other post-write outcomes keep the existing error and gain a reason: a connection closed,
+reset, aborted or broken after the write carries `reason: "daemon_connection_lost"`, and any other
+read error or an undecodable response carries `reason: "parse_failure"`. The three post-write
+outcomes become distinguishable, and all three stay terminal.
+`daemon_slow` is a refusal, not a fallback: it never enters the Amendment 2 fallback set and is
+not counted in `fallback_total`. `bridge.diagnostics` (Amendment 12) gains one field,
+`daemon_slow`, an object with `before_dispatch` and `after_write` counts for this bridge process;
+every existing field keeps its meaning.
+
+### Acceptance
+
+1. Withdrawn with Decision 1.
+2. Withdrawn with Decision 1.
+3. With a socket file present but refusing, a request is rejected with `no_socket` when
+   `KHIVE_DAEMON_STRICT` is unset, falls back when it is `0`, and falls back quietly when neither
+   socket nor PID file exists. With a PID file naming a process that has exited and no socket, a
+   request is rejected with `no_socket` when `KHIVE_DAEMON_STRICT` is unset, although recovery
+   removes that PID file before the decision.
+4. A boot-fence probe timeout returns `daemon_slow` with `phase: "before_dispatch"` and
+   `not_committed`; a post-write read timeout returns `daemon_slow` with `phase: "after_write"`
+   and `unknown`; a post-write connection reset returns `daemon_connection_lost`.
+5. `bridge.diagnostics` reports the two `daemon_slow` counts, and `fallback_total` is unchanged by
+   them.
+
+Each acceptance item names a test whose mutation (strict default removed, entry reading removed,
+reason dropped) turns it red: `daemon/strict_default_tests.rs` for item 3 and
+`daemon/daemon_slow_tests.rs` for items 4 and 5, which include a real in-process daemon whose
+write is blocked by a held store lock.
+
+### Alternatives considered
+
+- **Strict for every forwarding client, unconditionally.** Simpler, but a client that has never
+  had a daemon on the host, with spawning unavailable, would refuse instead of serving. The
+  rendezvous predicate keeps that case on Amendment 2's quiet fallback.
+- **Keep the eager build with smaller maps and caches in clients.** Lowers the resident numbers
+  but still opens every store, runs migrations and schema plans, and races the daemon's boot on
+  each client start. This is where forwarding clients stand after Decision 1 was withdrawn; the
+  measured numbers are in Decision 1.
+- **Forward `save_to` requests and write the sink in the client.** Removes the most common local
+  case, but changes the daemon frame; it is compatible with this amendment and left to its own
+  change.
+
+### Out of scope
+
+Daemon and client timeouts keep their current values; this amendment names outcomes, it does not
+tune them. Daemon ownership of stores (Amendment 13) and the reconnect rules (Amendments 9 and 10)
+are unchanged.
+
+## Amendment 15 (2026-10-19): conditional client boot without writer admission
+
+**Status**: Proposed. **Disposition**: partial amendment of Amendment 14, Decision 1's deferred
+no-create and migration-free boot property, and Decision 2's rendezvous-observation lifetime when
+the new boot recovery precedes request entry, for #5223. The base ADR remains Accepted. The lazy
+registry design stays withdrawn. Decision 2's tri-state settings and refusal outcomes, Decision 3
+and the other amendments remain in force. Dependent implementation does not merge before this
+amendment's acceptance gate.
+
+### Context and boundary
+
+The eager registry is retained, including discovery, mount resolution, pack dependency and
+collision checks, and every mounted pack's schema plan. Idempotent DDL still acquires a writer:
+the writable pack-catalog path calls `apply_pack_ddl_statements_with_columns` for a nonempty plan.
+Pool identity bootstrap, journal-mode setup, configured embedding-model registration,
+vector-table preparation, the Events schema gate the audit binding reaches, blob-root creation and
+direct events-sidecar open can also write before the first request, and diagnostic and attribution
+files outside the stores are written as well. Skipping core migrations alone therefore does not
+establish the deferred property.
+
+This amendment proposes a boot-admission policy separate from configured store mode. A configured
+writable store remains writable, with the same configuration identity, routes and capabilities.
+Read-only **validation operations** during boot do not turn it into a configured read-only
+snapshot. There is no new public request flag, built-in-only catalog or lazy registry.
+
+### Decision 1: select the conditional boot once, preserve request forwarding
+
+For a file-backed stdio forwarding client, select the conditional boot when a rendezvous is
+present at boot, strict forwarding is not explicitly disabled, and `KHIVE_NO_DAEMON=1` is not
+selected. A rendezvous means either the resolved socket path or PID file exists, as in Amendment
+14. A daemon process and an in-memory main backend do not select this client policy.
+
+An absent rendezvous, explicit strict false (`0`, `false`, `no`, `off`), or `KHIVE_NO_DAEMON=1`
+keeps today's eager boot. Explicit strict true without a rendezvous still has its existing
+request semantics; it does not, by itself, select this boot policy. Boot selection must not use
+the broader `is_forwarding_client()` predicate, which does not establish these conditions.
+
+Conditional validation reads the socket and PID paths without removing either. Stale-rendezvous
+cleanup remains request-entry recovery, except when Decision 2's daemon-first startup itself
+needs that recovery. Before such startup can consume the evidence, retain the selected boot's
+positive rendezvous observation in the MCP host's state. It survives provisional-runtime teardown,
+ordinary eager rebuild and every spawned forwarding task for that host; a task-local reading
+taken only after boot is insufficient. End this observation's lifetime with that host, and do not
+leak it into a separately booted host in the same process.
+
+An explicit strict setting keeps priority. Otherwise the strict default is true if **any** of
+the host's retained boot observation, Amendment 14's request-entry observation or the rendezvous
+at the fallback decision is true. This is the limited Decision 2 observation-lifetime extension:
+boot recovery cannot make an unset-strict client forget a daemon it already observed. Explicit
+false remains non-strict; `KHIVE_NO_DAEMON=1` and requests local by design retain their routes.
+The observation is host state, not a new setting or part of `config_id`.
+
+Ordinary **boot** fallback below does not add any local **request** fallback, even after a failed
+daemon-first launch clears both paths before the first request. `daemon_slow`, unknown post-write
+outcomes, and all existing no-retry rules are unchanged.
+
+### Decision 2: no-create validation, with explicit ordinary-boot exits
+
+Under the conditional policy, open every configured store without creating its database or parent
+directories. Retain physical-file, volume, path-trust and backend-identity checks. Do not bootstrap
+a database nonce, change journal mode, apply core migrations or pack DDL, register configured
+embedding models, prepare vector tables or store schemas through a writer, create a blob root, run
+attachment conversion, or acquire a volume write lease during successful boot. No partly validated
+runtime may become the serving registry.
+
+Use the existing reader-side core compatibility check and pack declared-column validation for
+all selected plans, including mounts. The pack check validates `PackColumnAddition` declarations;
+an empty declaration list does no work. It does **not** prove that arbitrary SQL tables, indexes
+or triggers exist, and this amendment neither prepares nor executes undeclared pack SQL nor claims
+complete validation of it. The model-registry and boot-reached schema-gate checks below read
+definitions and rows and prepare their own built-in statements without stepping them; no
+validation DDL or DML runs against a configured store, and a reference definition is built only in
+a private in-memory database. Eager plan collection and collision checks still run.
+
+Each exit below is decided from a typed classification of what validation found, never from an
+error variant or message text. Where an existing validator folds a missing prerequisite and an
+incompatible one into one error, the check is split at its source. A result containing any
+refusal class is a refusal, even when it also contains a missing prerequisite. A native query
+error remains that error.
+
+The following exits are explicit:
+
+- A missing configured database, including a configured direct events sidecar, first asks the
+  daemon to start through the existing startup/recovery protocol. The client holds no store
+  writer, volume lease or recovery-lock descriptor while it does so: a client that took the boot
+  recovery lock releases it before invoking that protocol, which takes the lock itself, and does
+  not hold it while waiting for the daemon to become ready. After startup the client reacquires
+  its boot lock, reads the rendezvous again, and repeats Decision 1's selection and the no-create
+  validation from the start. A store still absent then takes today's ordinary eager boot under
+  that lock.
+- A core schema behind this build, missing declared pack columns or configured vector tables,
+  or an incomplete attachment cutover requires ordinary eager boot. For an incomplete cutover the
+  exit is the selection, not a promise that the ordinary repair succeeds; a corrupt cutover state
+  may still refuse there. A configured writable database whose identity table is absent also
+  takes that path; the conditional path does not mint a nonce or substitute weaker
+  physical-identity checks. An identity table without its row, or with a malformed identity,
+  keeps its existing error.
+- The persistent registration population of a runtime is what ordinary boot registers today: on a
+  writable backend, the models `configured_embedding_models` returns for that runtime's
+  configuration (configured engines whose names parse as built-in model aliases, or, with no engine
+  list, the configured embedding model and the additional embedding models). A model in that
+  population without its active registry row takes ordinary eager boot, which registers it as today.
+  Its active registry row is an `active` row whose canonical key equals the one ordinary boot writes
+  for it (engine name, model id, key version and dimensions) under the upsert's own binding and
+  comparison, a BLOB value, so a TEXT value with the same characters is a different key, and whose
+  activation time is set, and every column of which holds a value that the column's declared
+  affinity stores as it is: inserting the row's values into the private in-memory registry described
+  below gives each column the same value with the same storage class. An update rewrites the whole
+  record and applies each column's affinity again, so a row holding the real number 8.0 in the
+  INTEGER `output_dim` column, which a store can carry while still reading normally and which the
+  integrity check below reports as `ok`, would be changed by the upsert. Whether the upsert leaves
+  such a row as it is
+  depends on the registry's whole definition, so the check compares the definition rather than
+  listing properties of it. In one consistent read snapshot, the registry table and every index and
+  trigger attached to it, implicit indexes included, must equal the objects this build's registry
+  DDL creates when run against a private in-memory database: object type, name and table compared
+  exactly, and SQL text compared token for token, ignoring only whitespace and comments between
+  tokens. The two creators of the table in this build, the registry DDL and the V1 schema, produce
+  the same tokens. An added column, constraint, index or trigger, a changed definition under an
+  existing name, and a temporary object in the reader's connection that names the registry are each
+  outside that definition. With the definition matched, the reader also prepares the registry DDL
+  and the registration upsert without stepping them, on a connection with foreign key enforcement on
+  as every connection the source sets up has it (`crates/khive-db/src/pool/connection_setup.rs:300`,
+  `:333`), so a statement SQLite would refuse when compiling it is found before boot is selected; an
+  empty table elsewhere whose column references a registry column that is not a key leaves every
+  registry object exact and makes the upsert refuse to compile there. In the same snapshot, `PRAGMA
+  integrity_check` naming the registry table, which checks that table's records and every index on
+  it, must return the single result `ok`. Definitions and stored values say nothing about index
+  contents: a registry whose one-active index lacks the active row's entry matches every other
+  condition here, and its upsert fails as a malformed image, while a quick check, which reads the
+  index pages but does not verify that index content matches table content, reports `ok` there.
+  For that definition the upsert supplies every
+  column that requires a value and satisfies the status check, and on an existing key it sets only
+  the status and an unset activation time, so in a registry that passes that integrity check an
+  active row whose activation time is set and whose values its columns' affinities store as they are
+  is left unchanged. Any other state takes ordinary
+  eager boot, which creates, fills, reactivates or refuses as it does today: a definition outside
+  the one above, a missing table, index or column among them, a failed preparation, an integrity
+  check of the registry that reports anything but `ok`, no row with that key, an active row with
+  that key and no activation time, an active row with that key holding a
+  value its column's affinity would convert, a row with that key in another status, or, with no row
+  carrying that key, an active row for that engine name under another key, which ordinary boot's
+  insert
+  refuses on the one-active-per-engine index. A store whose registry was created from text with
+  other tokens is never admitted, because ordinary boot leaves an existing definition as it is; the
+  acceptance below includes a long-lived store migrated through the supported history, so a rule
+  that admits only freshly created stores fails it. A refused insert has the host result it has today:
+  `from_prepared_backend`, which a single-backend host uses, returns the error, while
+  `try_from_backend` and `from_backend`, which a multi-backend host uses for its default and
+  per-pack runtimes, log it and continue. Conditional boot classifies none of these states itself
+  and changes neither result. With every such model registered, conditional boot writes nothing to
+  the registry. Every runtime the host assembles, default and per pack, follows this rule. A
+  provider a pack registers under a name in that population replaces only the in-memory provider:
+  ordinary boot registers the row before provider hooks run, so the model stays in the population
+  and a missing row takes ordinary eager boot as it would without the pack. A read-only runtime, and
+  a provider a pack registers under a name that parses as no built-in model alias, have no
+  persistent registration obligation at ordinary boot, whatever rows the store already holds:
+  conditional boot neither checks nor writes a row for them, and their provider binding is validated
+  as ordinary boot validates it.
+- A per-store schema gate that boot itself reaches is marked ready only after a reader check, in
+  one consistent read snapshot, that its initializer would leave the store unchanged without
+  refusing. Marking the gate ready is what keeps its initializer from running; the reader check
+  alone does not. Today the audit binding reaches the Events gate during boot; its initializer runs
+  `CREATE ... IF NOT EXISTS` for the events tables and their indexes, adds both operation
+  attribution columns to an events table that has neither, and refuses one that has exactly one.
+  For that gate the check requires three things: every table and index the initializer's DDL names
+  exists as an object of that type; both attribution columns are present as the initializer's own
+  column check sees them; and every statement of that DDL prepares, without being stepped, on a
+  reader connection holding no temporary object. Each covers what the others cannot. Preparation
+  succeeds for a `CREATE ... IF NOT EXISTS` whose object is absent, so it does not show the object
+  exists. A name that exists does not show its statement is a no-op, because SQLite refuses some
+  statements when compiling them: an index statement naming a virtual table is refused even when an
+  index of that name already exists. The column check reads `pragma_table_info`, which does not
+  list a generated virtual column, so a column declared that way counts as absent: the initializer
+  would run its upgrade, and the upgrade's refusal is ordinary boot's. The check does not compare
+  definitions: an index of an expected name on another ordinary table is one the initializer leaves
+  as it is, and an events table whose attribution columns the upgrade added passes as a fresh one
+  does. A state the initializer would change or refuse takes ordinary eager boot, which upgrades or
+  refuses as today. Preparing these statements authorizes no execution of them against the store.
+- A missing filesystem blob root, configured explicitly or resolved by default, takes ordinary
+  eager boot, which creates it as today. Conditional boot opens an existing root without creating
+  it and keeps hydration configured: it does not treat a missing default root as the absence of a
+  blob store. Malformed blob configuration and path-trust refusal keep their errors.
+- A direct events sidecar whose existing permissions require the ordinary hardening procedure
+  takes ordinary eager boot. Conditional validation must not expose a sink that the existing
+  permission policy would first have hardened.
+- A newer or incompatible schema, malformed configuration, identity or volume change, path-trust
+  refusal, or failed audit capability check retains its existing error. Such errors are not a
+  general excuse to retry with more write authority.
+
+Before an ordinary-boot exit, discard provisional boot state and its handles; do not mix a partly
+validated catalog with a writable fallback catalog. This includes a process-lifetime cache entry
+the provisional boot published, such as a direct events-sidecar backend: conditional boot either
+publishes no such entry until its runtime is selected to serve, or evicts the entries it
+published before the exit, so the ordinary path opens its own. Preserve configured modes and
+`config_id` through both paths. The ordinary path performs its normal repairs and readiness
+checks, and its own writes acquire the ordinary leases. A failed daemon start never authorizes a
+local request that strict forwarding would refuse.
+
+### Decision 3: account for each boot writer
+
+Each row is part of the implementation and acceptance population. A no-create flag on the main
+database alone is insufficient. Boot ends when the transport admits its first request. An effect
+scheduled before that point belongs to boot, including one that completes asynchronously after
+the server build returns.
+
+| Surface                          | Conditional-boot disposition                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Database connection and identity | No CREATE, directory bootstrap, nonce initialization or journal-mode change. Keep physical identity, volume admission, path checks and existing WAL/SHM safety rules. Connection pragmas needed for reads must not execute schema or application writes.                                                                                                                                                                                                                                                                                                                                       |
+| Core and pack schema             | Reader validation with the coverage stated above. No migration, idempotent DDL transaction or catalog omission. Missing/behind prerequisites take Decision 2's ordinary path.                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Model registry                   | Reader check that each model in a runtime's persistent registration population (Decision 2) has its active registry row as Decision 2 defines it, in a registry whose definition matches Decision 2's reference and whose integrity check reads `ok` (Decision 2), in every writable runtime the host assembles. The registry DDL and upsert are prepared without stepping; none is executed at conditional boot. A missing row takes Decision 2's ordinary path.                                                                                                                              |
+| Store schema gates and repairs   | Per-store schema gates, the notes sequence repair, sparse and text index preparation, and vector preparation keep their first-use behavior: conditional validation marks none of them ready, except a gate boot itself reaches (Decision 2). The first local request that needs one runs it with its ordinary writer, lease and audit, as request work; on a writable store the notes sequence repair still runs on the first notes acquisition, before any local cursor read. A factory, hook or mount that reaches one during conditional boot is a defect the acquisition observer reports. |
+| Configured vectors and ANN files | Validate existing vector tables and columns through a reader, without forcing configured read-only mode or relying on a new instance's empty preparation cache. Do not warm a client ANN, register its checkpoint consumer, or create segment directories/checkpoint locks at boot. Path calculation is not evidence of file creation.                                                                                                                                                                                                                                                         |
+| Events sidecar                   | A direct binding needs an existing-file, no-create validation route retaining configured writable mode, canonical-path cache policy and trust checks. Validate existing permissions against the same policy; required hardening takes Decision 2's ordinary path, so conditional boot does not chmod or admit insecure backing. The frozen-snapshot read-only opener, which rejects live-writer SHM, is not a substitute, and its guards must not be weakened. Socket-backed events retain their existing forwarding route. Missing direct storage follows Decision 2.                         |
+| Attachment cutover and hydration | Read and require complete cutover, including the existing secondary-store legacy-attachment check. No GC-owner acquisition, staging, importing or finalization at conditional boot. Hydrator setup opens an existing blob root without creating it; Decision 2 gives a missing root its exit. Its construction cannot be assumed pure merely because cutover is complete.                                                                                                                                                                                                                      |
+| Audit sink                       | Retain the configured sink and idempotent-audit capability preflight, using no-create validated backing. Do not call `with_read_only_audit_store` for a configured writable client: that drops the sink and changes request behavior. Missing backing follows Decision 2; incompatible capability remains an error.                                                                                                                                                                                                                                                                            |
+| Diagnostic and attribution files | Keep their existing writes: the writer-timeout diagnostic sink (its directory resolves from `KHIVE_WRITER_TIMEOUT_SINK_DIR`, else `~/.khive/logs`, else `.khive-logs` beside the database; it is started at pool construction and writes from its own thread), the session WAL-pin beacons that ADR-091 Amendment 2 attributes with, the daemon rendezvous and recovery lock files, and the daemon launch log. They lie outside the configured stores, take no volume lease and hold no application or schema state. They are not disabled or deferred to obtain a zero count.                 |
+
+SQLite's coordination with an existing live WAL/SHM retains its existing rules. The claim here is
+no store creation, application/schema initialization or client volume-lease acquisition during
+conditional boot, not zero operating-system writes. Lease counts do not prove filesystem purity;
+the acceptance checks observe database contents, paths and permissions separately. Do not weaken
+read-only snapshot, daemon-ownership or file-pinning guards to obtain a green count.
+
+Requests local by design (`save_to`, request planning and bridge diagnostics) retain their normal
+routes on the read-validated runtime. A local request that writes acquires its ordinary lease and
+retains its audit obligations. A successful forward executes in the daemon and does not append a
+second client dispatch audit. These request effects are outside the boot-only no-write claim.
+
+### Acceptance: client attribution and controls
+
+These are deterministic required witnesses, not measured performance results. All run through the
+existing host validation queue; this Proposed text claims no native result.
+
+1. A test-support-only observer at the khive-db volume-lease acquisition point counts attempts in
+   the **client process**, across every configured store and boot phase, including identity,
+   schema, model registration, vectors and a direct events sidecar. It must observe the real
+   acquisition path, not a wrapper that a boot writer can bypass. An uninstalled observer fails
+   the witness, and every run asserts that the test-only measurement bypass, which returns before
+   the acquisition point, is off. The daemon's own acquisitions are separately attributed.
+2. Use one persistent, already-current fixture with a persistent identity, registered configured
+   models, configured vectors, complete attachment cutover, an existing blob root, audit backing,
+   and a mounted nonempty schema plan with declared columns. With the condition true, eager boot
+   plus one actual forwarded request records zero client acquisitions. With the **same fixture**
+   and only the boot condition made false, ordinary boot records at least one. A normal forward
+   must reach the daemon, not an injected response. Removing conditional selection, executing the
+   writable pack plan or running model registration must make the zero-count witness fail;
+   disabling the observer must also fail. A second run uses a store created by an earlier release
+   and migrated through every supported schema version to this one, served by a daemon of this
+   build: it too must take conditional boot with zero client acquisitions, so a registry or schema
+   rule that admits only freshly created stores fails it. That fixture names the release and commit
+   that created it, the sha256 of its archived image and the schema versions it migrated through,
+   and the run keeps the migration and boot-selection records, so the control can be repeated.
+3. Compare client boot before/after images independently: database identity and schema/version,
+   the model registry, configured vector tables, sidecar and segment/checkpoint paths, attachment
+   state, the blob root and relevant permissions. The after image is taken when the transport
+   admits its first request, after every boot-scheduled asynchronous effect has signalled
+   completion (the diagnostic sink's startup line, beacon registration). During this interval the
+   fixture's daemon makes no store writes: its warmup and checkpoint tasks are held by
+   test-support configuration until the client's after image is taken, no other client is
+   attached, and the daemon's own acquisition count across the interval is asserted zero, so no
+   daemon write is attributed to the client and none can hide a client write. Then release those
+   tasks and send the forwarded request. The diagnostic and attribution paths of Decision 3 are
+   listed expected differences. Images do not show a write undone before the after image, so
+   test-support observers count in the client process across the same interval. The observer at
+   the native database open counts opens carrying the create flag, which must read zero, and opens
+   without it, which must read at least one per configured store, so the zero is not an
+   uninstalled or bypassed observer. The observers at directory bootstrap, journal-mode change,
+   nonce initialization and permission hardening count attempts and must read zero. Existing WAL/SHM safety checks and
+   configured `config_id` must match ordinary boot. A forced read-only configuration must fail the
+   identity/capability witness.
+4. Exercise socket-only and PID-only rendezvous, unset/truthy/explicit-false strict values,
+   absent rendezvous, `KHIVE_NO_DAEMON=1`, daemon role and in-memory main. Check Decision 1's
+   selection and the strict request refusal contract, including the retained boot observation and
+   stale rendezvous
+   removal. A failed forward in strict mode must not execute the local mutation, including
+   after an ordinary-boot exit.
+   Specifically, begin with a stale rendezvous and a missing configured store, force daemon-first
+   startup to remove the stale paths and launch a daemon that never binds, then take ordinary
+   eager boot with strict unset. Both paths must be absent **before the first request**. That
+   first normal write must refuse with the strict-forward error, without local mutation or its
+   dispatch audit. Dropping the retained boot observation must make this witness fail. Check
+   stale socket and stale PID separately; a store-present control that removes paths only after
+   request entry does not exercise this earlier lifetime. Pair it with the existing no-boot-
+   rendezvous and explicit-false behavior, and a second independent host that cannot inherit the
+   first host's observation.
+5. Independently remove a configured store, the identity table, a declared pack column, a vector
+   table, a configured model's registry row, a boot-reached store schema object, the default blob
+   root, an explicitly configured blob root or a direct sidecar, and provide behind-schema and
+   incomplete-cutover fixtures. Check the specified daemon-first or ordinary-boot exit, without
+   serving the provisional runtime; after a blob-root exit hydration is available, and for an
+   incomplete cutover the selected exit is asserted separately from whether the ordinary repair
+   succeeds. Test a missing and an incompatible declared pack column separately and together; the
+   pair must refuse. Identity swap, an identity table without its row, a malformed identity,
+   volume/path-trust refusal, malformed blob configuration and incompatible schema remain
+   must-refuse controls, asserted before any repair write, not repair opportunities. A sidecar
+   requiring permission hardening must leave the conditional path before exposing its sink. A
+   later store's exit after a direct sidecar was opened must leave the serving runtime on the
+   ordinary path's events backend, not the provisional one. The missing-store case runs through
+   the production startup entrypoint, which holds the boot recovery lock, with a real daemon child
+   that needs that lock to start: the child must become ready and the client must validate again
+   after it; a direct server-build call lacks the outer lock and does not exercise this ordering.
+   Include a mounted pack in these checks; built-in-only coverage is insufficient. The removed model
+   row belongs to a built-in model in a writable runtime's persistent registration population. A
+   second arm removes the row of a configured built-in alias whose provider a pack replaces before
+   serving with one of matching dimensions; it too takes ordinary eager boot and registers the row.
+   Two controls keep conditional boot: a read-only per-pack runtime whose configured model has no
+   row, and a configured engine whose name parses as no built-in model alias, served by a provider a
+   pack registers. Neither takes an ordinary-boot exit or gains a registry row, and each configured
+   provider is bound as under ordinary boot. Registry states other than a missing row each take
+   ordinary eager boot with its result as today: a row with the model's key in `superseded` status,
+   with no other active row for its engine name, is reactivated; an active row with the model's key
+   and no activation time has it set; a missing registry index is created. An active row for the
+   model's engine name under another key, with no row carrying the model's key, and a registry table
+   without its `output_dim` column with the model's active row and both indexes intact, each keep
+   ordinary boot's refusal of the insert, with the host result Decision 2 names: an error on a
+   single-backend host, a logged warning on a multi-backend host that goes on to serve. An events
+   table with neither operation attribution column takes ordinary eager boot and is upgraded; one
+   with exactly one keeps ordinary boot's refusal; one whose two attribution columns exist only as
+   generated virtual columns takes ordinary eager boot and keeps the refusal of the upgrade; a
+   missing events index takes ordinary eager boot and is created. Further registry arms each keep
+   the model's active row, its activation time and the names of all three registry objects, and each
+   takes ordinary eager boot with ordinary boot's result: a table without the `UNIQUE` on
+   `canonical_key`, whose upsert SQLite refuses when compiling it; an added column that requires a
+   value and has no default, with the existing row given one, whose insert is refused; an added
+   `CHECK` that the existing row satisfies and the next registration's creation time does not; an
+   added trigger that writes another table on update, one that refuses the update, and one that
+   writes another table before an insert, which SQLite runs before the upsert resolves its conflict;
+   an added index, and an existing index redefined under its own name; a whitespace change inside a
+   string literal of the status check; and an active row whose canonical key is stored as TEXT with
+   the same characters, whose insert is refused on the one-active-per-engine index. A further
+   registry arm keeps the definition exact and the model's active row with its activation time set,
+   and stores the text `8` in that row's INTEGER `output_dim` (an image written under a TEXT
+   declaration of equal length whose declaration is then changed, which reads normally and which an
+   integrity check reports); it takes ordinary eager boot, whose upsert succeeds and stores the
+   integer 8 there. Another stores the real number 8.0 in that `output_dim` (written under a
+   declaration of equal length with no affinity, `BLOB`, which is then changed), which reads
+   normally and which the registry-scoped integrity check reports as `ok`; it too takes ordinary
+   eager boot, whose upsert succeeds and stores the integer 8. Another keeps the definition, the
+   model's active row and its values exact and removes that row's entry from the one-active index
+   (an image edit), which the registry-scoped integrity check reports and a quick check does not; it
+   takes ordinary eager boot, whose upsert fails as a malformed image, with the host result Decision
+   2 names. Another adds an empty table elsewhere whose column references the registry's `status`
+   column, which leaves every registry object and the row exact; it takes ordinary eager boot, whose
+   upsert SQLite refuses when compiling it with foreign key enforcement on. Further Events arms take
+   ordinary eager boot with ordinary boot's refusal: an
+   `events` table that is an FTS5 virtual table carrying every expected column, with every expected
+   index name placed on another table, and the same for `event_observations` alone. Controls keep
+   conditional boot: a registry created by the V1 schema, one created by the registry DDL, and one
+   whose definition differs from the DDL only in whitespace and comments between tokens; an events
+   table whose attribution columns the upgrade added; and an expected events index name that exists
+   on another ordinary table. A test-support observer counts the prepared check statements that are
+   stepped against a configured store and must read zero. A mutation that classifies any must-exit
+   state by a reader without taking ordinary boot must fail its arm, and so must a reader that
+   checks registry columns, indexes or other properties by list instead of comparing the definition,
+   compares only the objects the DDL names, skips preparation, prepares the registry statements
+   without foreign key enforcement (the incoming foreign key arm), prepares only the first Events
+   statement, steps a prepared statement, compares the definition but not the stored values of the
+   model's row (the real `output_dim` arm), replaces the registry-scoped integrity check with a
+   quick check or none (the missing index entry arm), or counts hidden or generated columns as
+   present, as an
+   unfiltered `pragma_table_xinfo` listing does (the generated-column arm).
+6. After validated conditional boot, exercise local planning/diagnostics and a local `save_to`
+   request that writes and audits. Require its real lease and audit record. Require exactly the
+   existing daemon-side dispatch audit for a forwarded write and no duplicate client dispatch
+   audit. Dropping the configured sink must fail. A test-support event store whose
+   idempotent-audit capability reads false, bound through the conditional host build, must refuse
+   before serving with the existing incompatible-event-store error, beside the healthy-backing
+   success above; removing the capability preflight must make that refusal witness fail.
+   A first-use notes witness runs on the same conditional host. The fixture is current in every
+   respect Decision 2 checks and holds two live notes in one namespace: one with its `notes_seq`
+   row and one without it. After conditional boot, with the client's boot lease count and the
+   backend's notes sequence repair count both zero, a local `save_to` request carrying
+   `list(kind="note", after=<the sequenced note's id>)` must run the repair on its notes
+   acquisition, through the ordinary writer and its lease, before the sequence-cursor query reads,
+   and the saved result must contain the unsequenced note. `save_to` keeps the request local under
+   the preserved forwarding policy, and the `after` argument selects the cursor read. The same
+   request after ordinary boot is the control. Marking the repair as already run during
+   conditional construction alone must make this witness fail.
+
+The acceptance gate needs executed baseline and independent mutation controls, with compilation
+or setup failures distinguished from the intended assertion failures. In particular, removal of
+strict fallback refusal must fail a must-refuse request witness. Neither a named test nor a
+zero count from an inactive observer is a passing result.
+
+### Scope and acceptance status
+
+This is the narrower property left open by Amendment 14, not a latency or memory optimization
+claim. No historical timings are extrapolated. Store ownership, daemon protocol, request retry
+semantics, timeouts, configured modes, full discovery and mount visibility are unchanged.
+
+The docs-only proposal carries no implementation or executed acceptance. Independent spec review
+and approval through the designated specification gate are required before dependent
+implementation merges; a merged Proposed text does not itself grant that acceptance.
+
+## Amendment 16 (2026-10-25): declared store maintenance with responsive stdio bridges
+
+**Status**: Proposed. **Disposition**: amends Decision §2's fallback rules, and the no-socket outcomes of Amendment
+14 Decision 2, for the time a declared maintenance epoch is closed, for #6063. The base ADR remains Accepted. This
+amendment neither accepts Amendment 15 nor restores the lazy registry that Amendment 14 withdrew, and it adds no pack
+metadata API and no mounted-catalog contract. Dependent implementation does not merge before this amendment's
+acceptance gate.
+
+**Origin**: the measurement of stdio bridges across the store-migrating upgrade of 2026-10-24, recorded in #6063,
+and the interim operator procedure decided after it. It is an engineering decision drawn from that measurement; no
+product-owner instruction prompted it.
+
+### Context
+
+An upgrade whose new build migrates the stores cannot use the in-place path a protocol bump uses. The daemon is
+stopped for a snapshot and the migration. A request that reaches a running stdio bridge in that window takes the
+no-socket path, where it may spawn a daemon or, with strict mode unset and no rendezvous on disk, dispatch locally
+against the stores being migrated. The supervisor marker (ADR-185 Amendment 1) already holds a client for up to three
+restart intervals with no spawn and no local dispatch (measured in #6063). Every running bridge, however, opens the
+configured stores read-write at boot and keeps them open while it only forwards. A procedure that requires no process
+to hold a store file therefore stops every bridge, and an MCP client that does not restart its stdio server needs a
+manual reconnect.
+
+Four facts at the inspected revision shape the decision:
+
+1. A bridge runs no WAL checkpoint task, schedule ticker or channel loop; those start only in the daemon role
+   (`start_host_background_tasks` in `crates/khive-mcp/src/serve/startup.rs`, the checkpoint task in
+   `crates/khive-runtime/src/daemon/boot_guard.rs`). Its background work beside the stores is the session sweep
+   (`run_session_sweep_task` in `crates/khive-db/src/checkpoint/lifecycle.rs`), which never checkpoints and opens no
+   SQLite transaction but writes the process's WAL-pin beacon file beside the database on every tick. A bridge also
+   holds the events database open writable in direct mode, because only daemon hosts switch the event plane to
+   socket forwarding (`enable_events_forwarding_for_daemon` in `crates/khive-mcp/src/serve/runtime_config.rs`); its
+   audit batch appends only rows that local dispatch submits (`crates/khive-runtime/src/audit_batch.rs`).
+2. A bridge checks its executable's identity on each `request` call before dispatch
+   (`crates/khive-mcp/src/server/bridge.rs`); `tools/list` does not run the check. A bridge whose executable was
+   replaced returns a retryable error and re-execs in place after that response, keeping its PID and stdio
+   descriptors, on every install (`arm_executable_self_heal` in `crates/khive-mcp/src/daemon/self_heal.rs`). Only a
+   protocol mismatch seen by an already resumed bridge takes the drain-and-exit path.
+3. A re-exec'd or newly started bridge runs the ordinary boot before it serves: it opens the configured backends,
+   prepares the core schema, runs the attachment cutover, applies pack schema plans in write transactions and
+   registers the configured embedding models (`crates/khive-mcp/src/serve/runtime_config.rs`,
+   `crates/khive-mcp/src/server/pack_setup.rs`, `crates/khive-runtime/src/config.rs`). Boot is neither
+   migration-free nor write-free, so a boot inside the window would migrate or write stores mid-procedure, and
+   bridges that refresh together after release serialize on those writes.
+4. A connection pool closes its writable connection last so that SQLite can checkpoint on close
+   (`impl Drop for ConnectionPool` in `crates/khive-db/src/pool.rs`). A process that holds the last open connection to
+   a store rewrites the database file and removes the `-wal` when it exits.
+
+The numbered SQL migrations at the inspected revision change no journal mode or page size and run no VACUUM or
+checkpoint. The code-map store's DELETE-journal transition (`crates/khive-db/src/code_map_vfs/transition.rs`) is a
+separate policy and is outside this procedure.
+
+### Decision
+
+1. A declared maintenance epoch is a hard admission fence over an explicit canonical physical-store set, including
+   configured secondary databases and derived event stores. It is distinct from the supervisor boot marker and its
+   elapsed-grace behavior. Expiry, owner death, `KHIVE_NO_DAEMON`, non-strict configuration and absence of a
+   rendezvous never authorize local store access or daemon spawning while an epoch is closed. The store set is
+   derived from the resolved configuration: the main database, each configured backend database and the derived
+   events database, each by canonical path. The declaration is one record per store set, kept in the directory of
+   the main database, owned by the user that owns the stores, created owner-only and replaced atomically. It carries
+   an opaque epoch; its phase (`closing`, `quiescent`, `migrating`, `ready`, or a failed state that stays closed);
+   the store set; the target installation's identity and configuration; owner evidence, which is the coordinator's
+   process ID, start time and executable identity; the digest of the epoch capability's secret (Decision 2); and
+   bounded phase deadlines.
+   The coordinator writes `ready` only at release (procedure step 11), after the target's readiness has been verified
+   while the record still reads `migrating`. `ready` is the only phase that opens admission, and that record, kept at
+   the same location until the next epoch's declaration replaces it, is the release receipt. The coordinator is the single
+   writer: it publishes the record, advances its phases and writes the receipt, and the owner evidence names it. A
+   declaration or receipt from any other writer, or one a participant cannot attribute to its epoch's coordinator, is
+   refused: it neither opens admission nor releases a bridge, and the participant stays closed and reports it. A
+   participant likewise treats as a closed epoch, never as an absent one, a record it cannot parse, one whose file
+   owner is not the user that owns the stores, one that grants access to any other user, and one in a directory that
+   any other user can write. A participant checks the owner evidence against the epoch and the store set it carries;
+   it cannot tell one process of the stores' owner from another, so attribution among that user's processes is
+   cooperative. The trust boundary is the user that owns the stores: a process running as that user can already
+   open the stores directly.
+2. Publication closes admission to new boot and local store work. Work admitted beforehand must settle under tracked
+   activity leases before the coordinator certifies quiescence. Leases cover actual asynchronous completion and
+   non-SQL store effects, not the idle lifetime of a runtime or SQLite connection. A bridge's session sweep, which
+   writes its WAL-pin beacon, is either taken under a lease or stopped while the epoch is closed; it is not exempted
+   as read-only. Each participant takes a per-store shared admission lease before boot or local store work and reads
+   the declaration while holding it, so a check cannot be separated from the open it admits. The coordinator
+   publishes `closing`, waits for the leases admitted earlier to drain, then takes the set exclusively in canonical
+   path order. Leases have operating-system lifetime semantics, so a process that dies releases them. A lock held
+   through an open file description is shared with a child forked from its holder, so each lease descriptor is
+   created close-on-exec and a process holding a lease starts other processes only by spawning a new image: a child
+   carries the descriptor only until its own exec, so a lease ends with its holder, or at the latest when a child the
+   holder was starting at that moment execs.
+   The coordinator owns exclusive maintenance admission for the entire
+   store set through snapshot, migration and readiness; only its capability for this epoch and store set passes the
+   closed fence, and there is no general override. The coordinator starts the target daemon as its delegate and hands
+   it that capability at launch on an inherited descriptor, never in argv, which process listings show, or in the
+   environment, which every child inherits. The coordinator creates the descriptor close-on-exec and clears that flag
+   only in the delegate's child, after the child is created and before its exec. The coordinator's own descriptor
+   never loses the flag, so a process started from another coordinator thread at the same moment does not receive it,
+   and neither does any other process the coordinator starts. The delegate marks it
+   close-on-exec again before it starts any thread or process, and it starts processes only by spawning a new image,
+   so a process the delegate starts does not inherit it; the delegate hands it on, the same way, to the events daemon
+   it supervises and to no other process. The capability is an owner-only regular file that the coordinator creates
+   exclusively in the declaration's directory, opens and unlinks at once, before it publishes the declaration, so no
+   path names it and only a process holding the descriptor can read it. It holds the epoch, the canonical store
+   set, the recorded target identity and a random secret of at least 128 bits, and the declaration records the
+   secret's digest. The
+   delegate learns the descriptor's number from an option value, which names a descriptor and grants nothing. The
+   fence reads the capability through the descriptor from offset zero, so a shared file offset does not matter, and
+   admits only when the descriptor refers to an unlinked regular file owned by the stores' owner and readable by no
+   other user, the file parses, its epoch, store set and target identity equal the current declaration's, and its
+   secret's digest equals the one the declaration records. Anything else is no capability: a number that names no
+   open descriptor or names anything else, a file that still has a path, and a descriptor kept from an earlier
+   epoch, since each epoch mints a new secret. The coordinator closes its own descriptor at release. Under the
+   coordinator's exclusive hold the fence admits the delegate's boot,
+   migration and readiness checks, and that events daemon, and no other process. The delegate and that events daemon
+   take no admission lease while the epoch is closed: the coordinator's exclusive hold covers their store work and the
+   capability is their admission, so neither waits on the hold. The capability ends at release. It
+   keeps cooperating processes that were not started as the delegate out of the closed fence; it is not a defense
+   against a hostile process of the same user, which on Linux and macOS alike can open the stores directly and which
+   the trust boundary in Decision 1 already excludes. A marker check without synchronized admission is insufficient.
+   Successful migration invalidates activity admission from old runtime generations, background work included, until
+   the process has refreshed; a proved pre-mutation abort may keep the predecessor generation.
+3. Existing stdio bridges retain PID and transport and return structured retryable `maintenance_in_progress` errors
+   carrying the epoch and phase within caller budgets. They do not execute local fallback or local `save_to`, refresh
+   a mounted catalog from stores, enter degraded bootstrap, or spawn a daemon. Process-only diagnostics may continue,
+   and `tools/list` answers from the catalog already in memory. While an epoch is closed a bridge returns the
+   maintenance error before its executable-identity check and arms no exec, so an installation inside the window
+   cannot start a boot of the new image before release. Cold clients wait before opening any configured store; there
+   is no fabricated temporary tool catalog.
+4. This procedure permits existing idle connections only for a certified same-file WAL migration. Certification
+   covers the exact migration range, pack plans, boot repairs and associated files. Changing journal mode or page
+   size, replacing or unlinking a live database, `-wal` or `-shm`, and offline restore are excluded. The snapshot is a
+   transaction-quiescent, complete store-set copy plus a restore proof with the previous binary; an online backup of
+   one database is not a substitute for that proof. The coordinator opens a connection on every store in the set
+   before it certifies quiescence, and so before the old daemons stop. These are plain connections that run no
+   schema preparation. It holds them at least through the end of the copy and closes them at release, so that no
+   process exiting during the copy, the
+   stopped daemons included, can run a close-time checkpoint. The copy proves each database, `-wal` and `-shm`
+   unchanged across it. No write transaction runs and the coordinator's idle connections hold no read transaction,
+   so no process changes a `-shm` during the copy, and each copied `-shm` is the WAL index of exactly the copied
+   `-wal`. Every copy, the vector index copies and the writable restore copy included, is created owner-only, like
+   the stores. The copy is then frozen
+   read-only, as read-only inspection requires: it refuses a writable `-shm`, and it refuses a non-empty `-wal` with
+   no `-shm` beside it, because SQLite would then either omit committed WAL frames or create a new index
+   (`read_only_wal_open_target_for_path` in `crates/khive-db/src/pool/connection_setup.rs`). The restore proof runs
+   on a writable copy of it made without the `-shm`, so the previous binary rebuilds the WAL index from the `-wal`
+   rather than trusting the copied one. An idle
+   connection holds no WAL read mark, so it does not block the target daemon's open-time checkpoint under a
+   configured WAL ceiling; a read transaction does, and it is covered by a lease.
+5. The declaration precedes atomic executable installation. Release requires the declared target daemon to prove
+   schema, configuration and protocol readiness, and leaves the `ready` receipt of Decision 1, which records the
+   completed epoch and the target. Before any
+   stale-runtime store-sensitive work, a bridge observes that receipt and validates the installed executable's
+   identity without the ordinary throttle. Identity is the existing device-and-inode identity (modification time where no
+   inode is reported) of the path the bridge started from (`BridgeExecutable` in `crates/khive-mcp/src/daemon/executable.rs`); the receipt records the target's
+   identity at that path, the bridge execs only when the installed path matches it, and the exec target is always
+   that path, never a value carried in a message. A changed image uses the existing response-triggered in-place exec and
+   resumed handshake mode. No asynchronous park or resume exec is introduced, and the ordinary protocol-mismatch loop
+   breaker remains unchanged. A `tools/list` answered before the refresh carries the previous image's tool list and
+   verb description, as a client that listed tools before any install already does. Failure to validate or exec the target inhibits work; it
+   does not authorize stale local dispatch.
+6. Declaration scope is independent of `HOME` and socket. All participating boot, local and CLI paths enforce it
+   before the recovery lock and before any store opens. The procedure starts only from an installed executable that
+   already participates; an installation older than this amendment is first upgraded by the current install path,
+   outside these guarantees. Non-participating executables, those older than this amendment that do not read the
+   declaration, and external holders are inventoried before publication (step 1 of the procedure order): each such
+   process is stopped by PID or upgraded, and the coordinator does not publish while one remains. Participating
+   processes on the previous build are not in that inventory: existing bridges keep running under Decision 3, and the
+   old daemon and events daemon stop at step 5. A non-participant that holds a store file at the holder check (step 6) ends the epoch before any
+   snapshot, and the copy proves the database and `-wal` unchanged across it. A non-participating process that starts
+   during the window is not controlled by an advisory protocol; that limit is stated, not closed. Existing daemon
+   singleton claims remain distinct.
+7. A failed drain aborts before migration. A failed or abandoned epoch remains closed until an explicit, proved
+   recovery action. After a pre-mutation abort, the holder check at step 6 included, that action may be resuming the
+   validated old service; after mutation, recovery is forward
+   repair or the existing offline restore of the paired stores and binary. Transparent PID-preserving offline rollback
+   is not promised.
+8. With no declaration and no migrating upgrade, current boot, catalogs, fallback, `save_to`, in-memory operation and
+   daemon recovery semantics remain unchanged. The existing risk that response-triggered self-heal loses a pipelined
+   stdin frame is documented separately; this amendment does not claim a lossless transport handoff.
+
+### Procedure order
+
+1. Inventory non-participating executables and external holders of the store set (Decision 6). Stop each such process
+   by PID or upgrade it, and do not continue while one remains. Participating bridges and the old daemons on the
+   previous build are not stopped here.
+2. Create the epoch capability (Decision 2), then publish the declaration for the store set, carrying the
+   capability's digest, in its `closing` phase.
+3. Drill a cold client: it waits and spawns nothing.
+4. Open the coordinator's connection on every store in the set, then drain activity leases until quiescence is
+   certified, and write `quiescent`.
+5. Stop the old daemon and events daemon by PID. Bridges stay running, and the coordinator's open connections keep
+   either exit from running a close-time checkpoint.
+6. If any process outside the participants holds a store file, end the epoch in a failed state, which stays closed
+   until an explicit, proved recovery action (Decision 7); take no snapshot and run no migration.
+7. Copy every database, `-wal` and `-shm` and every vector index directory of the set, prove the database, `-wal`
+   and `-shm` files unchanged across the copy, and freeze the copy read-only.
+8. Prove that a writable copy of the snapshot, made without its `-shm`, restores with the previous binary.
+9. Install the new executable atomically.
+10. Write `migrating`, then start the target daemon as the coordinator's delegate, holding the epoch capability. It migrates the configured
+    backends in place and starts the events daemon, which prepares the events schema before it accepts traffic.
+    Verify readiness while the record still reads `migrating`.
+11. Release by writing the `ready` receipt, then close the coordinator's connections.
+
+### Acceptance
+
+These are obligations for the implementation, run in Linux CI with fixture binaries, a temporary `HOME` and
+temporary stores, explicit test barriers instead of sleeps, and process identity read from `/proc/<pid>/exe`. Each
+fails on the code at the inspected revision unless stated otherwise.
+
+- **Responsive bridge across the window, then two installs.** With a declaration closed and the daemon stopped, a
+  read, a mutating call and a `save_to` call through one live bridge each return the maintenance error within budget,
+  with no local result, no saved file and no new daemon PID; user data in the stores is unchanged. After release the
+  next call succeeds on the new image under the same bridge PID and pipes. A second install on the same PID behaves
+  the same way. An executable installed while the epoch is closed starts no exec before release. The
+  repeated-identity exec alone works today and is a control.
+- **Check-then-open races.** A cold boot paused just before its first SQLite open, and a warm local or `save_to` call
+  paused just before store-work admission, do not cross a declaration published while they are paused. The
+  coordinator cannot certify quiescence while a lease admitted earlier is outstanding.
+- **Every entry point.** Two backends plus a derived events store; a second bridge with a different socket and `HOME`
+  over the same physical stores; local `exec`; direct events and admin paths. Every store-dependent entry waits or
+  refuses; metadata-only help stays available; a cold client holds no configured store descriptor before release.
+- **Declaration record.** A record that cannot be parsed, one that is not owner-only, one owned by another user, one
+  in a directory another user can write, and one written by a process other than the epoch's coordinator each keep
+  every entry closed and release no bridge. A `ready` receipt whose
+  target identity does not match the installed path leaves the bridge inhibited, with no exec. A record that still
+  reads `migrating` after the target's readiness checks pass keeps every entry closed and releases no bridge, and the
+  `ready` record written at release opens admission. During migration the
+  delegate target daemon and its events daemon are admitted without taking an admission lease. A process of the same image started without the epoch
+  capability is refused, and so is a child the delegate starts other than its events daemon, including one started
+  at the earliest point the delegate's startup allows; a process the coordinator starts other than the delegate holds
+  no capability descriptor, including one started from another coordinator thread while the delegate spawns; the
+  capability appears in neither the delegate's argv nor its environment. While the epoch is closed the fence refuses
+  a capability descriptor kept from an earlier epoch, a capability file that still has a path, one another user can
+  read, and a file carrying the current epoch, store set and target identity with a secret whose digest the
+  declaration does not record.
+- **Old images and holders.** A non-participating process found by the inventory (step 1) keeps the coordinator from
+  publishing until it is stopped or upgraded, a bridge running the previous participating build keeps its PID through
+  the window, and a fixture non-participant holding a store file at the holder check
+  (step 6) ends the epoch with no snapshot and no migration.
+- **Drain means settlement.** Read and write transactions, and a cancelled request whose spawned continuation is
+  still running, keep the coordinator in the closing phase until each settles; a deadline fails entry with no
+  snapshot and no migration, while idle descriptors stay open.
+- **Snapshot and migration classes.** With idle bridge connections held, the copy restores with integrity and
+  expected counts, and the source migrates without closing those descriptors. A fixture migration that changes the
+  journal mode, and one that replaces a store file, is refused before the source is touched. A fixture client that
+  exits during the copy holding what would otherwise be the last connection leaves the copied database and `-wal`
+  consistent. A fixture daemon that is the only other holder, stopped after quiescence, leaves the database and
+  `-wal` unchanged. The frozen copy passes read-only inspection and shows the rows committed only in its `-wal`, a
+  `-shm` that changes during the copy fails the copy, the writable restore copy carries no copied `-shm`, and every
+  copy is owner-only. With a WAL ceiling configured and the WAL over it, the
+  target daemon's open-time checkpoint succeeds while idle bridge descriptors are held.
+- **Failure, owner death and deadline.** A coordinator killed before mutation, or after one migration step, a request
+  budget that expires, and a target whose stat, exec or readiness fails, each leave the bridge alive and returning a
+  named retryable inhibition, with no grace-time fallback and no spawn. A lease holder killed while a child it
+  started is still running leaves no lease held: the child carries no lease descriptor, and the coordinator
+  certifies quiescence without waiting on that child.
+- **Release receipt and throttle.** A resumed bridge idle for the whole window, released inside the ordinary identity
+  throttle interval, checks the target on its first `request` call and refreshes by the identity exec, not by
+  drain-and-exit, with no new MCP `initialize`. A `tools/list` before that call returns without an error and without
+  a store read.
+- **Refresh after release.** Several resumed bridges released together each complete the refresh, and the elapsed
+  time and writer waits of their boots are recorded. This is a measurement, not a test that fails today.
+
+Compatibility controls, which need not fail today: with no declaration, forwarding, strictness configuration,
+permitted no-socket fallback, local `save_to` manifests, in-memory operation, configuration identity, catalog
+filtering and protocol-mismatch loop breaking are unchanged. A deterministic two-frame pipelining probe runs against
+the base and the candidate; any loss on the base is recorded, and a loss only on the candidate blocks the change.
+
+### Alternatives considered
+
+1. **Polling only, with no activity barrier.** A process can pass its check just before the declaration and then open
+   or migrate a store, and work submitted earlier can still be running. It cannot justify the copy boundary.
+2. **A permanently store-free forwarding bridge.** Static handler metadata does not describe mounted packs, replay
+   trust, `save_to` or local fallback. Removing fallback changes behavior without a declaration; lazy fallback brings
+   back the descriptors this design would avoid. The lazy registry was withdrawn in Amendment 14.
+3. **A client-lifetime fence with an exec into a parked host and a resume exec.** It reaches zero descriptors, which
+   an in-place WAL migration does not need, at the cost of transport buffering, child cleanup, a parked catalog and two
+   execs per window.
+4. **Stopping every bridge with SIGSTOP.** Open descriptors are tolerated, but a stopped bridge cannot answer with a
+   budgeted error, may be frozen inside a transaction, and does not hold back a client that starts afterwards.
+
+### Out of scope
+
+A lossless stdin handoff across exec; PID-preserving offline rollback; migrations outside the certified same-file
+WAL class; control over processes that do not participate; any change to Amendment 15.
+
+### Scope and acceptance status
+
+The docs-only proposal carries no implementation or executed acceptance. Before use, the snapshot step needs a
+measured restore on the target filesystem with idle descriptors held. Independent spec review and approval through
+the designated specification gate are required before dependent implementation merges; a merged Proposed text does
+not itself grant that acceptance.

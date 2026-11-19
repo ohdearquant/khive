@@ -52,9 +52,9 @@ default across the runtime.
   `Artifact`, `Service`).
 - **`Link`** — a directed, typed edge between two nodes (`source`, `target`,
   `relation: EdgeRelation`, `weight: f64` in `[0.0, 1.0]`).
-  `EdgeRelation` is the closed 19-relation ontology, grouped into 9
+  `EdgeRelation` is the closed 20-relation ontology, grouped into 10
   `EdgeCategory` values (Structure, Derivation, Provenance, Temporal,
-  Dependency, Implementation, Lateral, Annotation, Epistemic).
+  Dependency, Implementation, Lateral, Annotation, Epistemic, Ownership).
 - **`Event`** — append-only log entry (`verb`, `substrate: SubstrateKind`,
   `kind: EventKind`, `payload: EventPayload`) produced by every verb execution;
   `EventOutcome` is `Success | Denied | Error`.

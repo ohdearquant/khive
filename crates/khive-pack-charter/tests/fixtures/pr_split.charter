@@ -1,0 +1,11 @@
+charter pr_split v1
+title "Split an oversized pull request"
+subject pull_request
+
+roles:
+    author
+
+workflow:
+    phase split by author:
+        action pull_request.split by author
+        complete

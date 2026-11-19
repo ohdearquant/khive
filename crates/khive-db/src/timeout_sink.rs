@@ -11,8 +11,8 @@
 //! and returns immediately — it never opens a file, never creates a
 //! directory, never calls `fsync`, and never blocks on a full channel (a
 //! full channel just drops the event and bumps a counter). All of that I/O
-//! happens on a single dedicated background thread that owns the NDJSON
-//! file exclusively, so there is never a second writer to race for
+//! happens on one dedicated background thread per resolved log directory,
+//! owning its NDJSON file exclusively, so no second writer races for
 //! `O_APPEND` atomicity. Pool boot (`init`) mirrors this: it only resolves a
 //! directory path (pure, no I/O) and spawns that thread — the thread itself
 //! does the first `create_dir_all`/`open` on its own schedule, never on the
@@ -23,10 +23,12 @@
 //! file, dead process) looks identical to a healthy quiet one unless the
 //! heartbeat cadence is also checked. The sink is never initialized for an
 //! in-memory or read-only pool (neither can report a writer-admission timeout)
-//! — only a writable file-backed pool's boot claims the process-global writer
-//! thread, so `startup`/`heartbeat` rows always carry a real, writable database
-//! identity. Skipping read-only pools also prevents inspection from writing a
-//! sibling log tree or starving a later writable pool of the global claim.
+//! — only a writable file-backed pool registers with its resolved directory's
+//! writer, so `startup`/`heartbeat` rows carry a writable database identity.
+//! Skipping read-only pools prevents inspection from writing a sibling log tree.
+//! Ordinary pool Drop leaves the sink running. An explicit close handle, obtained
+//! before pool release and awaited after writer settlement, drains and joins it;
+//! new registration in that directory is refused while it is closing.
 //!
 //! A short write (the OS accepting only part of a line) is treated as
 //! TERMINAL for the sink instance rather than retried: with a single writer
@@ -89,11 +91,16 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::pool::{ConnectionPool, TEST_HARNESS_ENV};
+
+#[path = "timeout_sink/lifecycle.rs"]
+mod lifecycle;
+pub(crate) use lifecycle::{Registration, WriterLease};
+pub use lifecycle::{TimeoutSinkCloseError, TimeoutSinkCloseHandle};
 
 /// Default liveness cadence. A 24h-zero-timeouts claim is only valid
 /// alongside heartbeats at (at least) this cadence — see module docs.
@@ -157,13 +164,12 @@ const SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV: &str = "KHIVE_SLOW_WRITE_THRESHOLD_M
 /// (disabled) — a zero bound would stamp every write and turn the sink into
 /// a write log, which it is not.
 pub(crate) fn slow_write_threshold() -> Option<Duration> {
-    match std::env::var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV) {
-        Ok(v) => match v.parse::<u64>() {
-            Ok(0) => None,
-            Ok(ms) => Some(Duration::from_millis(ms)),
-            Err(_) => Some(SLOW_WRITE_THRESHOLD),
-        },
-        Err(_) => Some(SLOW_WRITE_THRESHOLD),
+    match crate::env::env_parse_or(
+        SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV,
+        SLOW_WRITE_THRESHOLD.as_millis() as u64,
+    ) {
+        0 => None,
+        ms => Some(Duration::from_millis(ms)),
     }
 }
 
@@ -237,6 +243,9 @@ pub(crate) enum Site {
     /// `ConnectionPool::writer()` timed out waiting for the pooled writer
     /// mutex.
     PoolAdmission,
+    /// A write of any writer class waited out the guard deadline for the
+    /// volume lease, which it takes before its connection (ADR-154 §3).
+    VolumeLease,
     /// A standalone writer connection opened by `stores::graph`.
     StandaloneGraph,
     /// A standalone writer connection opened by `stores::event`.
@@ -289,6 +298,7 @@ impl Site {
     fn as_str(self) -> &'static str {
         match self {
             Site::PoolAdmission => "pool_admission",
+            Site::VolumeLease => "volume_lease",
             Site::StandaloneGraph => "standalone:graph",
             Site::StandaloneEvent => "standalone:event",
             Site::StandaloneText => "standalone:text",
@@ -322,24 +332,40 @@ impl Site {
 ///
 /// `kind` distinguishes the durable row shapes this sink emits:
 /// `"timeout"` (a writer-admission or busy/locked timeout, carries `site` +
-/// `error`), `"queue_saturation"` (a caller-visible `WriteQueueFull`, carries
+/// `error`; a volume-lease timeout also carries `phase` = `"lock_contended"`),
+/// `"queue_saturation"` (a caller-visible `WriteQueueFull`, carries
 /// `timeout_ms`), `"writer_task_retirement"` (a `WriterTask` terminal
 /// retirement, carries `error` as the retirement reason),
+/// `"writer_guard_drop"` (a pooled writer guard released inside a transaction
+/// and settled by its drop, carries `error` as the settlement outcome),
 /// `"sqlite_full"` (SQLite exhausted the volume during a write),
 /// `"direct_route_violation"` (a direct writer acquisition bypassing an
 /// enabled queue, carries `site`), and `"slow_write"` (a queued write whose
 /// send-to-reply span met [`SLOW_WRITE_THRESHOLD`], carries `elapsed_ms` +
-/// `queue_depth` plus the four decomposed writer-stage durations).
+/// `queue_depth` plus the four decomposed writer-stage durations, and a
+/// `labels` array naming the statements the writer ran).
 struct QueuedEvent {
     ts_utc: String,
     kind: &'static str,
     db: String,
     site: Option<&'static str>,
+    phase: Option<&'static str>,
     error: Option<String>,
     timeout_ms: Option<u64>,
     elapsed_ms: Option<u64>,
     queue_depth: Option<u64>,
     writer_stages: Option<WriterStageFields>,
+    labels: Option<SlowWriteLabels>,
+}
+
+/// Bounded labels carried on a `"slow_write"` row: at most
+/// [`crate::writer_task::MAX_WRITE_LABELS`] distinct labels in first-seen
+/// order, plus the count of further distinct labels that were dropped.
+#[derive(Clone, serde::Serialize)]
+pub(crate) struct SlowWriteLabels {
+    pub(crate) labels: Box<[String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) labels_truncated: Option<u64>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -351,9 +377,7 @@ struct WriterStageFields {
     total_micros: u64,
 }
 
-/// Process-global handle to the writer thread's inbox. Set at most once per
-/// process by [`init`] — see that function's doc comment for why an
-/// in-memory pool never claims this slot.
+/// Handle to one resolved directory's writer-thread inbox.
 struct SinkHandle {
     sender: SyncSender<QueuedEvent>,
     /// Shared with the writer thread: incremented here on a full channel
@@ -361,8 +385,6 @@ struct SinkHandle {
     /// — one counter, reported via `sink_error_summary`.
     dropped: Arc<AtomicU64>,
 }
-
-static SINK: OnceLock<SinkHandle> = OnceLock::new();
 
 #[cfg(test)]
 static SQLITE_FULL_CAPTURE: std::sync::Mutex<Option<mpsc::Sender<String>>> =
@@ -373,7 +395,7 @@ pub(crate) fn capture_sqlite_full_for_test(sender: Option<mpsc::Sender<String>>)
     *SQLITE_FULL_CAPTURE.lock().unwrap() = sender;
 }
 
-/// One JSON line: `{ts_utc, kind, db, site, error, timeout_ms?}`.
+/// One JSON line: `{ts_utc, kind, db, site, phase?, error, timeout_ms?}`.
 /// `site`/`error`/`timeout_ms`/`pid`/`version` are omitted (not null) when
 /// not applicable to `kind` — `startup` rows carry `pid`/`version` and no
 /// `site`/`error`; `timeout`/`sink_error_summary` rows are the reverse.
@@ -385,6 +407,8 @@ struct EventRecord<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     site: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timeout_ms: Option<u64>,
@@ -394,6 +418,8 @@ struct EventRecord<'a> {
     queue_depth: Option<u64>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     writer_stages: Option<WriterStageFields>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    labels: Option<SlowWriteLabels>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -406,11 +432,13 @@ fn build_line(
     kind: &str,
     db: &str,
     site: Option<&str>,
+    phase: Option<&str>,
     error: Option<&str>,
     timeout_ms: Option<u64>,
     elapsed_ms: Option<u64>,
     queue_depth: Option<u64>,
     writer_stages: Option<WriterStageFields>,
+    labels: Option<SlowWriteLabels>,
     pid: Option<u32>,
     version: Option<&str>,
 ) -> String {
@@ -419,11 +447,13 @@ fn build_line(
         kind,
         db,
         site,
+        phase,
         error,
         timeout_ms,
         elapsed_ms,
         queue_depth,
         writer_stages,
+        labels,
         pid,
         version,
     };
@@ -450,8 +480,10 @@ fn build_line_now(
         kind,
         db,
         site,
+        None,
         error,
         timeout_ms,
+        None,
         None,
         None,
         None,
@@ -485,7 +517,7 @@ fn truncate_error(s: &str, max_bytes: usize) -> String {
 /// Push `event` onto `sender` without ever blocking. A full channel drops
 /// the event and increments `dropped` — the only failure mode a caller-side
 /// enqueue can have. Pulled out of [`emit_timeout`] so it is unit-testable
-/// against a bare channel, with no dependency on the process-global `SINK`.
+/// against a bare channel, with no dependency on the routing registry.
 fn enqueue(sender: &SyncSender<QueuedEvent>, dropped: &AtomicU64, event: QueuedEvent) {
     if sender.try_send(event).is_err() {
         dropped.fetch_add(1, Ordering::Relaxed);
@@ -685,11 +717,13 @@ fn write_event(sink: &mut AppendSink<File>, dropped: &AtomicU64, event: QueuedEv
         event.kind,
         &event.db,
         event.site,
+        event.phase,
         event.error.as_deref(),
         event.timeout_ms,
         event.elapsed_ms,
         event.queue_depth,
         event.writer_stages,
+        event.labels,
         None,
         None,
     );
@@ -764,11 +798,8 @@ fn writer_thread_loop(
     dropped: Arc<AtomicU64>,
     heartbeat_interval: Duration,
 ) {
-    // No filesystem effect without a published handle: `init` only sends
-    // this token after `SINK.set` confirms this thread's handle won the
-    // `OnceLock` race. On a lost race the sender is dropped without ever
-    // sending, this `recv` returns `Err`, and the thread exits having
-    // touched nothing on disk.
+    // No filesystem effect without a published registry entry. Registration
+    // retains this thread's join before sending its startup token.
     if go.recv().is_err() {
         return;
     }
@@ -889,12 +920,12 @@ fn resolve_log_dir(db_parent: Option<&Path>) -> Option<PathBuf> {
 }
 
 fn heartbeat_interval_from_env() -> Duration {
-    std::env::var(HEARTBEAT_MS_OVERRIDE_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&ms| ms > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(HEARTBEAT_INTERVAL)
+    let millis = crate::env::env_parse_or(HEARTBEAT_MS_OVERRIDE_ENV, 0_u64);
+    if millis > 0 {
+        Duration::from_millis(millis)
+    } else {
+        HEARTBEAT_INTERVAL
+    }
 }
 
 /// Test-only: read [`WRITE_DELAY_MS_OVERRIDE_ENV`] once at writer-thread
@@ -902,11 +933,7 @@ fn heartbeat_interval_from_env() -> Duration {
 /// [`AppendSink::write_line`] treats as "no delay" — a no-op check on every
 /// write, not a behavior change.
 fn write_delay_from_env() -> Duration {
-    std::env::var(WRITE_DELAY_MS_OVERRIDE_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::ZERO)
+    Duration::from_millis(crate::env::env_parse_or(WRITE_DELAY_MS_OVERRIDE_ENV, 0_u64))
 }
 
 fn pause_at_startup_barrier_for_test() {
@@ -925,75 +952,23 @@ fn pause_at_startup_barrier_for_test() {
     let _ = std::fs::write(dir.join("resumed"), b"resumed");
 }
 
-/// Initialize the process-global sink on first call from a writable file-backed
-/// pool; every later call (from another pool booting in the same process)
-/// is a cheap no-op once a sink is in place. Does no filesystem I/O itself —
-/// only path resolution (pure) plus spawning the writer thread, which does
-/// its own first `create_dir_all`/`open` on its own schedule (see module
-/// docs and [`writer_thread_loop`]). This is what keeps pool boot off the
-/// filesystem-latency hook entirely.
-///
-/// `db_parent` is the booting pool's database file's parent directory,
-/// `None` for an in-memory pool. The caller also skips this function entirely
-/// for a read-only pool. Neither kind may claim the sink: there is no possible
-/// writer timeout to report, and claiming the slot first would starve out a
-/// later writable file-backed pool. `db_identity` names the claiming pool in
-/// the `startup` row.
-pub(crate) fn init(db_parent: Option<&Path>, db_identity: &str) {
+/// Register a writable file-backed pool with its resolved directory's sink.
+/// This resolves paths and spawns a thread without caller-side filesystem I/O.
+/// Pools sharing the directory share its writer. Ordinary Drop keeps the sink
+/// running; explicit close refuses new registration until the old thread joins.
+/// In-memory and read-only pools do not register. Thread-allocation failure is
+/// best-effort as before; a later pool may retry initialization.
+pub(crate) fn init(
+    db_parent: Option<&Path>,
+    db_identity: &str,
+) -> Result<Option<Registration>, crate::error::SqliteError> {
     let Some(db_parent) = db_parent else {
-        return;
+        return Ok(None);
     };
-    if SINK.get().is_some() {
-        return;
-    }
     let Some(dir) = resolve_log_dir(Some(db_parent)) else {
-        return;
+        return Ok(None);
     };
-
-    let heartbeat_interval = heartbeat_interval_from_env();
-    let (sender, receiver) = mpsc::sync_channel::<QueuedEvent>(QUEUE_CAPACITY);
-    let (go_sender, go_receiver) = mpsc::sync_channel::<()>(1);
-    let dropped = Arc::new(AtomicU64::new(0));
-    let thread_dropped = Arc::clone(&dropped);
-    let db_identity = db_identity.to_string();
-
-    // Spawn the writer thread FIRST, before publishing anything through the
-    // process-global `OnceLock`. `Builder::spawn` fails when the OS can't
-    // create a new thread (resource exhaustion — the process is already at
-    // its thread-count or memory limit); if that happens here, the slot
-    // must stay unclaimed rather than get permanently wedged into "sink
-    // present, but its writer thread never actually started" — a later
-    // pool booting in the same process (by which point the transient
-    // exhaustion may have cleared) gets to retry `init` from scratch instead
-    // of inheriting a dead claim. The spawned thread does no filesystem
-    // work of its own accord: it blocks on `go_receiver` until this
-    // function sends the go token below, so spawning it here has no
-    // observable effect until publication succeeds.
-    let spawn_result = thread::Builder::new()
-        .name("khive-writer-timeout-sink".to_string())
-        .spawn(move || {
-            writer_thread_loop(
-                go_receiver,
-                receiver,
-                dir,
-                db_identity,
-                thread_dropped,
-                heartbeat_interval,
-            )
-        });
-
-    if spawn_result.is_ok() {
-        let handle = SinkHandle { sender, dropped };
-        // On a lost `OnceLock` race (another pool's `init` call published
-        // first), `handle` — and with it `sender` — is simply dropped here,
-        // and `go_sender` below is never sent, only dropped. The thread
-        // spawned above sees its `go_receiver` error on its blocking `recv`
-        // and exits immediately, having done no filesystem work; the pool
-        // that won the race already has its own thread running.
-        if SINK.set(handle).is_ok() {
-            let _ = go_sender.send(());
-        }
-    }
+    lifecycle::init(dir, db_identity)
 }
 
 /// This pool's identity string for the sink's `db` field: its canonical
@@ -1010,7 +985,7 @@ pub(crate) fn db_label(pool: &ConnectionPool) -> String {
 /// caller. A no-op if the sink was never initialized (no file-backed pool
 /// has booted yet in this process).
 pub(crate) fn emit_timeout(db: &str, site: Site, error: &str, timeout_ms: Option<u64>) {
-    let Some(handle) = SINK.get() else {
+    let Some(handle) = lifecycle::route(db) else {
         return;
     };
     let event = QueuedEvent {
@@ -1018,11 +993,37 @@ pub(crate) fn emit_timeout(db: &str, site: Site, error: &str, timeout_ms: Option
         kind: "timeout",
         db: db.to_string(),
         site: Some(site.as_str()),
+        phase: None,
         error: Some(truncate_error(error, MAX_ERROR_BYTES)),
         timeout_ms,
         elapsed_ms: None,
         queue_depth: None,
         writer_stages: None,
+        labels: None,
+    };
+    enqueue(&handle.sender, &handle.dropped, event);
+}
+
+/// Record a writer timeout at the volume lease: the write waited out the guard
+/// deadline because another writer held the volume. The same `timeout` row as
+/// the pool mutex stage, with `site` naming the lease and `phase` the capacity
+/// phase the caller received (`CapacityUnavailable { phase: LockContended }`).
+pub(crate) fn emit_lease_timeout(db: &str, error: &str, timeout_ms: u64) {
+    let Some(handle) = lifecycle::route(db) else {
+        return;
+    };
+    let event = QueuedEvent {
+        ts_utc: now_rfc3339(),
+        kind: "timeout",
+        db: db.to_string(),
+        site: Some(Site::VolumeLease.as_str()),
+        phase: Some(khive_storage::CapacityUnavailablePhase::LockContended.as_str()),
+        error: Some(truncate_error(error, MAX_ERROR_BYTES)),
+        timeout_ms: Some(timeout_ms),
+        elapsed_ms: None,
+        queue_depth: None,
+        writer_stages: None,
+        labels: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1054,7 +1055,7 @@ pub(crate) fn maybe_emit_sqlite_full(db: &str, error: &(dyn std::error::Error + 
         let _ = sender.send(db.to_string());
     }
     tracing::error!(db, error = %error, "SQLite ran out of disk space during a write");
-    let Some(handle) = SINK.get() else {
+    let Some(handle) = lifecycle::route(db) else {
         return;
     };
     let event = sqlite_full_event(db, error);
@@ -1067,11 +1068,13 @@ fn sqlite_full_event(db: &str, error: &(dyn std::error::Error + 'static)) -> Que
         kind: "sqlite_full",
         db: db.to_string(),
         site: None,
+        phase: None,
         error: Some(truncate_error(&error.to_string(), MAX_ERROR_BYTES)),
         timeout_ms: None,
         elapsed_ms: None,
         queue_depth: None,
         writer_stages: None,
+        labels: None,
     }
 }
 
@@ -1081,7 +1084,7 @@ fn sqlite_full_event(db: &str, error: &(dyn std::error::Error + 'static)) -> Que
 /// was never accepted (ADR-136 D1 gate 6a). Before this, `WriteQueueFull`
 /// reached the caller with no sink emission at all.
 pub(crate) fn emit_queue_saturation(db: &str, timeout_ms: u64) {
-    let Some(handle) = SINK.get() else {
+    let Some(handle) = lifecycle::route(db) else {
         return;
     };
     let event = QueuedEvent {
@@ -1089,11 +1092,13 @@ pub(crate) fn emit_queue_saturation(db: &str, timeout_ms: u64) {
         kind: "queue_saturation",
         db: db.to_string(),
         site: None,
+        phase: None,
         error: None,
         timeout_ms: Some(timeout_ms),
         elapsed_ms: None,
         queue_depth: None,
         writer_stages: None,
+        labels: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1103,7 +1108,7 @@ pub(crate) fn emit_queue_saturation(db: &str, timeout_ms: u64) {
 /// permanently (ADR-136 D1 gate 6b). Before this, retirement was observable
 /// only through a `tracing::error!` line before the queue closed.
 pub(crate) fn emit_writer_task_retirement(db: &str, reason: &str) {
-    let Some(handle) = SINK.get() else {
+    let Some(handle) = lifecycle::route(db) else {
         return;
     };
     let event = QueuedEvent {
@@ -1111,11 +1116,36 @@ pub(crate) fn emit_writer_task_retirement(db: &str, reason: &str) {
         kind: "writer_task_retirement",
         db: db.to_string(),
         site: None,
+        phase: None,
         error: Some(truncate_error(reason, MAX_ERROR_BYTES)),
         timeout_ms: None,
         elapsed_ms: None,
         queue_depth: None,
         writer_stages: None,
+        labels: None,
+    };
+    enqueue(&handle.sender, &handle.dropped, event);
+}
+
+/// Record a pooled writer guard released inside a transaction, which its drop
+/// then settled. `outcome` says whether the rollback restored autocommit or the
+/// writer was retired.
+pub(crate) fn emit_writer_guard_drop(db: &str, outcome: &str) {
+    let Some(handle) = lifecycle::route(db) else {
+        return;
+    };
+    let event = QueuedEvent {
+        ts_utc: now_rfc3339(),
+        kind: "writer_guard_drop",
+        db: db.to_string(),
+        site: None,
+        phase: None,
+        error: Some(truncate_error(outcome, MAX_ERROR_BYTES)),
+        timeout_ms: None,
+        elapsed_ms: None,
+        queue_depth: None,
+        writer_stages: None,
+        labels: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1125,6 +1155,81 @@ thread_local! {
     static DIRECT_ROUTE_CAPTURE: std::cell::RefCell<Option<Vec<(String, Site)>>> = const {
         std::cell::RefCell::new(None)
     };
+}
+
+/// `slow_write` rows [`db`, labels] captured by [`SlowWriteCapture`]. The
+/// drain loop runs a request's telemetry on a blocking-pool thread the test
+/// cannot itself run on, so the capture is process-global rather than
+/// thread-local; the capture tests hold [`SLOW_WRITE_CAPTURE_LOCK`] and run
+/// `#[serial]` so that at most one arming test is active at a time. Each
+/// captured row carries its db label so a test can select its own row even if
+/// a concurrent unrelated writer task (which could inherit the arming test's
+/// threshold override at spawn) contributes one.
+#[cfg(test)]
+static SLOW_WRITE_CAPTURE: std::sync::Mutex<Option<Vec<(String, SlowWriteLabels)>>> =
+    std::sync::Mutex::new(None);
+
+/// Serializes [`SlowWriteCapture`] arms within the test binary; a slow-write
+/// test must also carry `#[serial_test::serial]` so no other test is
+/// mid-write while the capture is armed. An async lock, because a capture
+/// test holds it across the awaited write.
+#[cfg(test)]
+pub(crate) static SLOW_WRITE_CAPTURE_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+/// An armed [`SLOW_WRITE_CAPTURE`], disarmed on drop (including on unwind).
+/// The caller must hold [`SLOW_WRITE_CAPTURE_LOCK`] for the guard's whole
+/// life; [`Self::drain`] consumes it and returns the captured rows in
+/// emission order.
+#[cfg(test)]
+pub(crate) struct SlowWriteCapture {
+    _private: (),
+}
+
+#[cfg(test)]
+impl SlowWriteCapture {
+    /// Arm the capture; panics if one is already armed.
+    pub(crate) fn arm() -> Self {
+        let mut slot = SLOW_WRITE_CAPTURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(slot.is_none(), "nested slow-write capture");
+        *slot = Some(Vec::new());
+        Self { _private: () }
+    }
+
+    /// Return the `(db, labels)` rows captured so far and disarm.
+    pub(crate) fn drain(self) -> Vec<(String, SlowWriteLabels)> {
+        let rows = SLOW_WRITE_CAPTURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
+        std::mem::forget(self);
+        rows
+    }
+}
+
+#[cfg(test)]
+impl Drop for SlowWriteCapture {
+    fn drop(&mut self) {
+        *SLOW_WRITE_CAPTURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// Record a `(db, labels)` row into the capture when one is armed (test
+/// helper).
+#[cfg(test)]
+fn record_slow_write_capture(db: &str, labels: SlowWriteLabels) {
+    if let Some(rows) = SLOW_WRITE_CAPTURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        rows.push((db.to_owned(), labels));
+    }
 }
 
 #[cfg(test)]
@@ -1159,7 +1264,7 @@ pub(crate) fn emit_direct_route_violation(db: &str, site: Site) {
             events.push((db.to_owned(), site));
         }
     });
-    let Some(handle) = SINK.get() else {
+    let Some(handle) = lifecycle::route(db) else {
         return;
     };
     let event = QueuedEvent {
@@ -1167,11 +1272,13 @@ pub(crate) fn emit_direct_route_violation(db: &str, site: Site) {
         kind: "direct_route_violation",
         db: db.to_string(),
         site: Some(site.as_str()),
+        phase: None,
         error: None,
         timeout_ms: None,
         elapsed_ms: None,
         queue_depth: None,
         writer_stages: None,
+        labels: None,
     };
     enqueue(&handle.sender, &handle.dropped, event);
 }
@@ -1182,7 +1289,9 @@ pub(crate) fn emit_direct_route_violation(db: &str, site: Site) {
 /// fields remain, while the microsecond stage fields distinguish admission,
 /// SQLite write-lock acquisition, operation body, and COMMIT (#1849).
 pub(crate) fn emit_slow_write(db: &str, stages: &crate::writer_task::WriterStageObservation) {
-    let Some(handle) = SINK.get() else {
+    #[cfg(test)]
+    record_slow_write_capture(db, slow_write_labels_from(stages));
+    let Some(handle) = lifecycle::route(db) else {
         return;
     };
     let event = QueuedEvent {
@@ -1190,6 +1299,7 @@ pub(crate) fn emit_slow_write(db: &str, stages: &crate::writer_task::WriterStage
         kind: "slow_write",
         db: db.to_string(),
         site: None,
+        phase: None,
         error: None,
         timeout_ms: None,
         elapsed_ms: Some(stages.total_micros / 1_000),
@@ -1201,8 +1311,30 @@ pub(crate) fn emit_slow_write(db: &str, stages: &crate::writer_task::WriterStage
             commit_micros: stages.commit_micros,
             total_micros: stages.total_micros,
         }),
+        labels: Some(slow_write_labels_from(stages)),
     };
     enqueue(&handle.sender, &handle.dropped, event);
+}
+
+/// The bounded labels the sink would write for `stages`, for tests that
+/// assert the `slow_write` row shape without reading the NDJSON file.
+#[cfg(test)]
+pub(crate) fn slow_write_labels_for_test(
+    stages: &crate::writer_task::WriterStageObservation,
+) -> SlowWriteLabels {
+    slow_write_labels_from(stages)
+}
+
+/// Project the writer-stage observation's bounded, first-seen-ordered label
+/// list onto the row's shape. The observation already carries at most
+/// [`crate::writer_task::MAX_WRITE_LABELS`] distinct labels plus its dropped
+/// count, so this is a move, not a re-bound. An observation with no labels
+/// yields an empty array and no `labels_truncated` key.
+fn slow_write_labels_from(stages: &crate::writer_task::WriterStageObservation) -> SlowWriteLabels {
+    SlowWriteLabels {
+        labels: stages.labels.iter().cloned().collect(),
+        labels_truncated: stages.labels_truncated,
+    }
 }
 
 /// `true` for the two rusqlite error codes a standalone writer connection
@@ -1229,452 +1361,31 @@ pub(crate) fn maybe_emit_busy(db: &str, site: Site, err: &rusqlite::Error) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::thread;
-
-    #[test]
-    fn store_direct_route_sites_have_stable_names() {
-        assert_eq!(Site::DirectRouteEntity.as_str(), "direct_route:entity");
-        assert_eq!(Site::DirectRouteNote.as_str(), "direct_route:note");
-        assert_eq!(
-            Site::DirectRouteGraphGeneralWrite.as_str(),
-            "direct_route:graph_general_write"
-        );
-        assert_eq!(
-            Site::DirectRouteEventGeneralWrite.as_str(),
-            "direct_route:event_general_write"
-        );
-        assert_eq!(
-            Site::DirectRouteSparseGeneralWrite.as_str(),
-            "direct_route:sparse_general_write"
-        );
-        assert_eq!(
-            Site::DirectRouteAgentGeneralWrite.as_str(),
-            "direct_route:agent_general_write"
-        );
-        assert_eq!(
-            Site::DirectRouteRuntimeMergeEntity.as_str(),
-            "direct_route:runtime_merge_entity"
-        );
-        assert_eq!(
-            Site::DirectRouteRuntimeMergeNote.as_str(),
-            "direct_route:runtime_merge_note"
-        );
-        assert_eq!(
-            Site::DirectRouteRuntimeUpdateSymmetricEdge.as_str(),
-            "direct_route:runtime_update_symmetric_edge"
-        );
-    }
-
-    #[test]
-    fn resolve_log_dir_prefers_explicit_override() {
-        let dir = tempfile::tempdir().unwrap();
-        std::env::set_var(SINK_DIR_OVERRIDE_ENV, dir.path());
-        let resolved = resolve_log_dir(None);
-        std::env::remove_var(SINK_DIR_OVERRIDE_ENV);
-        assert_eq!(resolved, Some(dir.path().to_path_buf()));
-    }
-
-    #[test]
-    fn resolve_log_dir_falls_back_to_db_parent_under_test_harness() {
-        std::env::remove_var(SINK_DIR_OVERRIDE_ENV);
-        // KHIVE_TEST_HARNESS=1 is force-set by .cargo/config.toml for every
-        // cargo test/binary in this workspace — assert the behavior this
-        // module relies on to keep tests off the real ~/.khive/logs.
-        assert_eq!(std::env::var(TEST_HARNESS_ENV).as_deref(), Ok("1"));
-        let parent = Path::new("/tmp/does-not-need-to-exist");
-        let resolved = resolve_log_dir(Some(parent));
-        assert_eq!(resolved, Some(parent.join(FALLBACK_LOG_SUBDIR)));
-    }
-
-    #[test]
-    fn resolve_log_dir_none_without_db_parent_under_test_harness() {
-        std::env::remove_var(SINK_DIR_OVERRIDE_ENV);
-        assert_eq!(resolve_log_dir(None), None);
-    }
-
-    #[test]
-    fn slow_write_threshold_env_override_and_zero_disable() {
-        std::env::remove_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV);
-        assert_eq!(slow_write_threshold(), Some(SLOW_WRITE_THRESHOLD));
-
-        std::env::set_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV, "250");
-        assert_eq!(slow_write_threshold(), Some(Duration::from_millis(250)));
-
-        // 0 = disabled entirely, never "emit every write".
-        std::env::set_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV, "0");
-        assert_eq!(slow_write_threshold(), None);
-
-        // Unparseable falls back to the default, never to disabled — a typo
-        // in the override must not silently turn the instrument off.
-        std::env::set_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV, "not-a-number");
-        assert_eq!(slow_write_threshold(), Some(SLOW_WRITE_THRESHOLD));
-        std::env::remove_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV);
-    }
-
-    #[test]
-    fn slow_write_line_carries_elapsed_and_depth_and_omits_inapplicable_fields() {
-        let stages = WriterStageFields {
-            queue_wait_micros: 11,
-            transaction_acquire_micros: 22,
-            body_micros: 1_111_000,
-            commit_micros: 44,
-            total_micros: 1_234_000,
+/// A typed direct transaction can fail at `BEGIN IMMEDIATE`, before its DML
+/// closure runs. Follow the driver source chain at the completed operation
+/// boundary so that busy errors from both BEGIN and the body reach the same
+/// standalone timeout site exactly once. `execute_direct_transaction` owns
+/// SQLITE_FULL escalation, so this helper emits only busy/locked rows.
+pub(crate) fn maybe_emit_busy_storage_error(
+    db: &str,
+    site: Site,
+    error: &khive_storage::StorageError,
+) {
+    let mut cause: &(dyn std::error::Error + 'static) = error;
+    loop {
+        if let Some(sqlite_error) = cause.downcast_ref::<rusqlite::Error>() {
+            if is_busy_or_locked(sqlite_error) {
+                emit_timeout(db, site, &sqlite_error.to_string(), None);
+            }
+            return;
+        }
+        let Some(source) = cause.source() else {
+            return;
         };
-        let line = build_line(
-            now_rfc3339(),
-            "slow_write",
-            "test-db",
-            None,
-            None,
-            None,
-            Some(1234),
-            Some(7),
-            Some(stages),
-            None,
-            None,
-        );
-        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(parsed["kind"], "slow_write");
-        assert_eq!(parsed["elapsed_ms"], 1234);
-        assert_eq!(parsed["queue_depth"], 7);
-        assert_eq!(parsed["queue_wait_micros"], 11);
-        assert_eq!(parsed["transaction_acquire_micros"], 22);
-        assert_eq!(parsed["body_micros"], 1_111_000);
-        assert_eq!(parsed["commit_micros"], 44);
-        assert_eq!(parsed["total_micros"], 1_234_000);
-        // Inapplicable fields are omitted, not null (existing sink contract).
-        assert!(parsed.get("site").is_none());
-        assert!(parsed.get("error").is_none());
-        assert!(parsed.get("timeout_ms").is_none());
-    }
-
-    #[test]
-    fn truncate_error_leaves_short_strings_untouched() {
-        let short = "database is locked";
-        assert_eq!(truncate_error(short, MAX_ERROR_BYTES), short);
-    }
-
-    #[test]
-    fn truncate_error_bounds_long_strings() {
-        let long = "x".repeat(MAX_ERROR_BYTES * 4);
-        let truncated = truncate_error(&long, MAX_ERROR_BYTES);
-        assert!(
-            truncated.len() <= MAX_ERROR_BYTES + "...(truncated)".len(),
-            "truncated length {} exceeds bound",
-            truncated.len()
-        );
-        assert!(truncated.ends_with("...(truncated)"));
-    }
-
-    #[test]
-    fn truncate_error_respects_utf8_char_boundaries() {
-        // A multi-byte character straddling the byte cutoff must not panic
-        // and must produce valid UTF-8.
-        let s = "a".repeat(MAX_ERROR_BYTES - 1) + "€€€€";
-        let truncated = truncate_error(&s, MAX_ERROR_BYTES);
-        assert!(truncated.is_char_boundary(truncated.len() - "...(truncated)".len()));
-    }
-
-    /// `enqueue` (the whole of what a caller-path emission does) never
-    /// blocks on a full channel — it drops the event and counts it. No
-    /// `SINK`/`OnceLock`/thread involved, so this is deterministic.
-    #[test]
-    fn enqueue_drops_and_counts_on_full_channel() {
-        let (sender, _receiver) = mpsc::sync_channel::<QueuedEvent>(1);
-        let dropped = AtomicU64::new(0);
-        let make_event = || QueuedEvent {
-            ts_utc: now_rfc3339(),
-            kind: "timeout",
-            db: "test-db".to_string(),
-            site: Some(Site::PoolAdmission.as_str()),
-            error: Some("boom".to_string()),
-            timeout_ms: Some(5),
-            elapsed_ms: None,
-            queue_depth: None,
-            writer_stages: None,
-        };
-
-        enqueue(&sender, &dropped, make_event());
-        assert_eq!(dropped.load(Ordering::Relaxed), 0);
-
-        // Channel capacity is 1 and nothing has drained it yet, so this
-        // second enqueue must be dropped rather than block.
-        enqueue(&sender, &dropped, make_event());
-        assert_eq!(dropped.load(Ordering::Relaxed), 1);
-    }
-
-    /// A short write (partial acceptance) is TERMINAL for the sink instance
-    /// — no later line may land after an unterminated fragment. Uses an
-    /// in-memory mock `Write` so the failure mode is exact and
-    /// reproducible, with no reliance on OS-level file-descriptor tricks.
-    struct ShortWriteOnceThenOk {
-        calls: usize,
-        written: Vec<u8>,
-    }
-
-    impl Write for ShortWriteOnceThenOk {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.calls += 1;
-            if self.calls == 1 && buf.len() > 1 {
-                // Accept only part of the buffer once.
-                let n = buf.len() - 1;
-                self.written.extend_from_slice(&buf[..n]);
-                Ok(n)
-            } else {
-                self.written.extend_from_slice(buf);
-                Ok(buf.len())
-            }
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn append_sink_short_write_poisons_permanently() {
-        let mut sink = AppendSink::<ShortWriteOnceThenOk>::new();
-        sink.set_target(ShortWriteOnceThenOk {
-            calls: 0,
-            written: Vec::new(),
-        });
-
-        assert!(
-            !sink.write_line("first line\n"),
-            "a short write must be reported as failed"
-        );
-        assert!(sink.is_poisoned());
-        assert!(!sink.is_open(), "the target must be dropped on poisoning");
-
-        // Even a fresh, healthy target must never be accepted again.
-        sink.set_target(ShortWriteOnceThenOk {
-            calls: 0,
-            written: Vec::new(),
-        });
-        assert!(
-            !sink.is_open(),
-            "set_target must refuse to arm a poisoned sink"
-        );
-        assert!(
-            !sink.write_line("second line\n"),
-            "a poisoned sink must never write again"
-        );
-    }
-
-    /// Distinguishes "hard I/O error" (recoverable — the target is
-    /// dropped, but a later `set_target` heals it) from "short write"
-    /// (terminal — see the test above).
-    /// Shares a "has failed once, globally" flag across separately
-    /// constructed instances — mirrors the real scenario: the writer
-    /// thread's *first* target (this drain's `File`) fails, gets dropped,
-    /// and a *later, distinct* target (the next `ensure_open`'s freshly
-    /// reopened `File`) succeeds. Resetting a per-instance counter instead
-    /// would make the second instance fail too, which is not what "retry
-    /// heals" means.
-    struct ErrorOnceThenOk {
-        already_failed: Arc<std::sync::atomic::AtomicBool>,
-        written: Vec<u8>,
-    }
-
-    impl Write for ErrorOnceThenOk {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            if !self.already_failed.swap(true, Ordering::Relaxed) {
-                return Err(std::io::Error::other("injected failure"));
-            }
-            self.written.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn append_sink_hard_error_is_recoverable_not_poisoned() {
-        let already_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut sink = AppendSink::<ErrorOnceThenOk>::new();
-        sink.set_target(ErrorOnceThenOk {
-            already_failed: Arc::clone(&already_failed),
-            written: Vec::new(),
-        });
-
-        assert!(!sink.write_line("first line\n"));
-        assert!(
-            !sink.is_poisoned(),
-            "an ordinary write error must not be terminal"
-        );
-        assert!(!sink.is_open(), "the failed target is dropped");
-
-        // A later retry (mirroring the writer thread's next `ensure_open`
-        // reopening a fresh `File`) must be able to arm and write
-        // successfully.
-        sink.set_target(ErrorOnceThenOk {
-            already_failed: Arc::clone(&already_failed),
-            written: Vec::new(),
-        });
-        assert!(sink.write_line("second line\n"));
-    }
-
-    /// A temporarily unwritable log directory must heal once it becomes
-    /// writable — a permanent silent disable after one failed open is not
-    /// acceptable behavior.
-    #[test]
-    fn append_sink_recovers_after_transient_directory_failure() {
-        let dir = tempfile::tempdir().unwrap();
-        let blocker = dir.path().join("blocker");
-        std::fs::write(&blocker, b"not a directory").unwrap();
-        let bogus_dir = blocker.join("logs");
-
-        let mut sink = AppendSink::<File>::new();
-        sink.ensure_open(&bogus_dir);
-        assert!(!sink.is_open(), "open against a blocked path must fail");
-        assert!(!sink.is_poisoned(), "a failed open must not be terminal");
-
-        // "Fix" the directory: remove the blocking file, so the same path
-        // (now backed by a real directory) can be created and opened.
-        std::fs::remove_file(&blocker).unwrap();
-        sink.ensure_open(&bogus_dir);
-        assert!(
-            sink.is_open(),
-            "a later ensure_open against a now-writable directory must succeed"
-        );
-        assert!(sink.write_line("recovered\n"));
-
-        let contents = std::fs::read_to_string(bogus_dir.join(ndjson_file_name())).unwrap();
-        assert!(contents.contains("recovered"));
-    }
-
-    /// Coverage-contract concurrency test: many threads enqueuing
-    /// simultaneously must never panic or corrupt the channel; every
-    /// accepted event, once drained by a single-threaded writer, produces
-    /// an intact JSON line — no interleaving is even structurally possible
-    /// with one writer thread, but this proves the producer side is sound
-    /// under real concurrent load.
-    #[test]
-    fn concurrent_enqueue_then_single_threaded_drain_produces_intact_lines() {
-        let (sender, receiver) = mpsc::sync_channel::<QueuedEvent>(QUEUE_CAPACITY);
-        let dropped = Arc::new(AtomicU64::new(0));
-
-        const THREADS: usize = 64;
-        let handles: Vec<_> = (0..THREADS)
-            .map(|i| {
-                let sender = sender.clone();
-                let dropped = Arc::clone(&dropped);
-                thread::spawn(move || {
-                    let event = QueuedEvent {
-                        ts_utc: now_rfc3339(),
-                        kind: "timeout",
-                        db: "concurrent-test".to_string(),
-                        site: Some(Site::StandaloneGraph.as_str()),
-                        error: Some(format!("contention-{i}")),
-                        timeout_ms: Some(i as u64),
-                        elapsed_ms: None,
-                        queue_depth: None,
-                        writer_stages: None,
-                    };
-                    enqueue(&sender, &dropped, event);
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-        drop(sender);
-
-        let mut sink = AppendSink::<Vec<u8>>::new();
-        sink.set_target(Vec::new());
-        let mut written_lines = 0usize;
-        while let Ok(event) = receiver.try_recv() {
-            let line = build_line(
-                event.ts_utc,
-                event.kind,
-                &event.db,
-                event.site,
-                event.error.as_deref(),
-                event.timeout_ms,
-                event.elapsed_ms,
-                event.queue_depth,
-                event.writer_stages,
-                None,
-                None,
-            );
-            if sink.write_line(&line) {
-                written_lines += 1;
-            }
-        }
-
-        assert_eq!(
-            written_lines + dropped.load(Ordering::Relaxed) as usize,
-            THREADS,
-            "every enqueue must be either written or counted as dropped"
-        );
-        assert_eq!(
-            dropped.load(Ordering::Relaxed),
-            0,
-            "queue capacity exceeds THREADS"
-        );
-
-        let bytes = sink.into_target().expect("target must still be armed");
-        let contents = String::from_utf8(bytes).unwrap();
-        let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), THREADS);
-        for line in &lines {
-            let parsed: serde_json::Value =
-                serde_json::from_str(line).unwrap_or_else(|e| panic!("corrupt line {line:?}: {e}"));
-            assert_eq!(parsed["kind"], "timeout");
-            assert_eq!(parsed["site"], "standalone:graph");
-        }
-    }
-
-    #[test]
-    fn is_busy_or_locked_classifies_sqlite_error_codes() {
-        let busy = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-            Some("database is locked".to_string()),
-        );
-        assert!(is_busy_or_locked(&busy));
-
-        let locked = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
-            Some("table is locked".to_string()),
-        );
-        assert!(is_busy_or_locked(&locked));
-
-        let other = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
-            Some("constraint failed".to_string()),
-        );
-        assert!(!is_busy_or_locked(&other));
-
-        assert!(!is_busy_or_locked(&rusqlite::Error::QueryReturnedNoRows));
-    }
-
-    #[test]
-    fn sqlite_full_escalation_has_its_own_event_kind() {
-        let full = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
-            Some("disk I/O write stopped".to_string()),
-        );
-        let wrapped = khive_storage::StorageError::driver(
-            khive_storage::StorageCapability::Sql,
-            "test_write",
-            full,
-        );
-        assert!(is_sqlite_full(&wrapped));
-        let event = sqlite_full_event("test.db", &wrapped);
-        assert_eq!(event.kind, "sqlite_full");
-        assert_eq!(event.site, None);
-        assert_eq!(event.timeout_ms, None);
-
-        let busy = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-            None,
-        );
-        assert!(!is_sqlite_full(&busy));
-        assert!(is_busy_or_locked(&busy));
+        cause = source;
     }
 }
+
+#[cfg(test)]
+#[path = "timeout_sink_tests.rs"]
+mod tests;

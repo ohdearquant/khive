@@ -74,3 +74,13 @@ the same adapter. The handler-owned values override free-form adapter metadata. 
 `channel_slug`, and `quarantined` are transport-owned on `message` notes: only `comm.ingest` may
 establish them, and generic create, update, atomic-update preparation, and merge cannot forge,
 change, erase, or transfer them.
+
+Delivered external email adds `origin = "external"`, `trust = "untrusted"`, and
+`labels` as a JSON array of screening rule identifiers. These are extension
+fields, not additions to the stable v1 table. Consumers should treat the body as
+untrusted data. A withheld message keeps the sender and subject but replaces its
+body with a placeholder naming the rules; raw MIME is retained only through its
+`quarantine-original` attachment, which `comm.withheld_body` reads, and the
+message's properties carry no blob reference. Inbox/thread projections and successful body
+reads expose the marking fields. Ordinary messages without those properties
+keep their existing read shape.

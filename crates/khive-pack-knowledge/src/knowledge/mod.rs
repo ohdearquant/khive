@@ -4,12 +4,14 @@ pub(crate) mod matching;
 pub(crate) mod schema;
 pub(crate) mod scoring;
 pub(crate) mod section_feedback;
+pub(crate) mod snapshot_invalidation;
 pub(crate) mod vamana;
 
 mod atom_validation;
 mod compose;
 mod crud;
 mod eval;
+mod export;
 mod fold_handler;
 pub(crate) mod index_handler;
 mod lexical_timeout;
@@ -25,6 +27,10 @@ mod a5_rerank_tests;
 #[cfg(test)]
 mod ann_degrade_tests;
 #[cfg(test)]
+mod index_catalogue_tests;
+#[cfg(test)]
 mod namespace_move_consumer_tests;
+#[cfg(test)]
+mod namespace_move_snapshot_key_tests;
 #[cfg(test)]
 mod suggest_ranking_tests;

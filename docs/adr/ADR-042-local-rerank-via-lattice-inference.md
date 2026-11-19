@@ -32,10 +32,27 @@ uses the feature keys `relevance`, `salience`, `temporal`, `text_match`, and
 `vector_match`; when non-empty, that weighted score replaces the default final
 `rank_score`.
 
-Native lattice/cross-encoder rerank, LoRA hook resolution, runtime rerank config,
-latency disable behavior, and memory-path `RerankExecuted` emission are deferred.
-`khive-retrieval` contains a native cross-encoder scaffold and an empty
-`native-rerank` feature only.
+The opt-in `native-rerank` Cargo feature now provides a concrete local BERT
+cross-encoder through pinned `lattice-inference` 0.15.0, a runtime entity-document
+resolver, and `KhiveRuntime::native_cross_encoder_reranker` to compose them. Default
+retrieval and runtime builds do not enable the inference dependency. Native model
+selection in recall, LoRA hook resolution, runtime rerank config, latency disable
+behavior, and memory-path `RerankExecuted` emission remain deferred.
+
+The concrete scorer returns one sigmoid probability in `[0, 1]` per document in
+input order, not raw logits. Although sigmoid is mathematically monotonic, finite
+precision and saturation can introduce ties; strict score ordering is not
+guaranteed. Equal scores retain candidate input order.
+
+The runtime resolver reads live entities by UUID using the existing store's by-ID
+namespace contract. Text is the canonical entity name plus a space and nonempty
+description, or name alone. Missing or deleted entities produce `None`; the
+reranker drops them while keeping retained IDs, documents, and scores aligned.
+The result limit applies after filtering and scoring. An all-missing batch returns
+empty without calling the scorer. Resolver failures and resolver/score length
+mismatches remain errors. Attachment hydration and merged-ID redirects are not
+performed. This drop behavior is distinct from the future caller-level fallback
+in §6; no native recall fallback is enabled by constructing the adapter.
 
 ### What this ADR does
 
@@ -48,7 +65,7 @@ latency disable behavior, and memory-path `RerankExecuted` emission are deferred
 ### What this ADR does NOT do
 
 - Change the shipped ADR-033 weighted feature rerank contract.
-- Claim that `lattice-inference`, LoRA hooks, runtime `rerank_model_id`, or
+- Claim that LoRA hooks, runtime `rerank_model_id`, or
   memory-path `RerankExecuted` emission are currently shipped.
 - Add query paraphrasing or synthesis call sites.
 
@@ -248,9 +265,9 @@ Shipped rerank computes a single weighted score from five feature keys:
 | `text_match`   | Candidate appeared in text results   |
 | `vector_match` | Candidate appeared in vector results |
 
-The generic retrieval `Reranker` trait and native cross-encoder scaffold exist in
-`khive-retrieval`, but native cross-encoder use remains deferred until the inference
-port lands.
+The generic retrieval `Reranker` trait and concrete feature-gated native adapter
+exist in `khive-retrieval`, with runtime entity resolution and composition as
+described above. Integration into the memory rerank pipeline remains deferred.
 
 If a reranker errors, its scores default to `0.0` for that batch — the rest of the
 pipeline proceeds. This preserves the §6 degraded-mode-tolerance contract per
@@ -387,9 +404,9 @@ audit logs without losing recall functionality.
 
 ### Negative
 
-- Adds dependency on `lattice-inference` from `khive-runtime` (was previously only
-  `lattice-embed`). The dependency is opt-in via `rerank_model_id` config but the
-  link is mandatory at compile.
+- Enabling the `native-rerank` Cargo feature adds the native inference dependency
+  through `khive-retrieval`. This dependency is absent from default builds;
+  future runtime model-selection configuration is separate from feature selection.
 - Rerank latency dominates recall when enabled. Operators must pick model + GPU
   configuration that fits the budget.
 - The fallback paths (no model, mismatch, latency) are degraded-mode behaviors that
@@ -421,14 +438,16 @@ audit logs without losing recall functionality.
 ### Crate dependencies
 
 ```toml
-# khive-runtime/Cargo.toml
-lattice-inference = "X"
-lattice-tune      = { version = "X", features = ["inference-hook"] }
+# khive-retrieval/Cargo.toml (workspace pin)
+lattice-inference = { version = "=0.15.0", default-features = false, optional = true, features = ["bert", "std"] }
+
+[features]
+native-rerank = ["dep:lattice-inference"]
 ```
 
-The `inference-hook` feature flag is mandatory at compile because the brain pack
-references `LoraHook` types from lattice-tune unconditionally. Pure-Bayesian
-deployments compile the flag in but never load a LoRA profile.
+The runtime's feature forwards to `khive-retrieval/native-rerank`. LoRA hook
+dependencies and their feature policy remain part of the deferred integration;
+the concrete BERT scorer does not enable or require them.
 
 ### Handler
 
@@ -514,3 +533,82 @@ are deferred with native rerank.
 - `crates/khive-pack-memory/src/handlers/sub_handlers.rs`: rerank handler.
 - `crates/khive-pack-brain/src/lib.rs`: `resolve_rerank_hook`.
 - `crates/khive-runtime/src/runtime.rs`: `rerank_model_id` config wiring.
+
+## Amendment 1 (2026-10-08): provenance event for the weighted-feature rerank path
+
+**Status**: accepted (2026-10-08); implemented by this change
+
+### Context
+
+Decision 5 specifies `RerankExecuted` for the native rerank stage: a required `model_id`, per
+reranker named sub-scores, `f32` final scores, and the LoRA hook fields. `EventKind::RerankExecuted`,
+`RerankExecutedPayload` (`crates/khive-types/src/event.rs`) and the ADR-041 projection
+(`decode_rerank_observations` in `crates/khive-db/src/stores/event.rs`) exist, and nothing emits
+the event. The shipped path is `memory.recall_rerank` (Decision 1): a weighted combination of the
+five named features over caller-supplied candidates, scored in `f64`, with no model, no query
+identity and no profile, and it preserves the candidate order it was given. Its scoring ignores
+weight keys outside the five feature names, and the handler's `active_rerankers` list reports every
+positive key, including ignored ones.
+
+Emitting the native-shaped payload from the weighted path would require inventing a model id,
+narrowing scores without saying so, and reporting ignored weight keys as applied tiers. Emitting an
+untyped payload beside the typed one would leave the projection and the type in disagreement.
+This amendment changes the typed contract so that one event describes both paths honestly.
+
+### Decision
+
+1. **One event kind, two reranker shapes.** `RerankExecuted` gains a `reranker` discriminator
+   with the values `native` and `weighted`. The native shape is Decision 5 unchanged. The weighted
+   shape is emitted by `memory.recall_rerank` once per call, in the caller's namespace.
+2. **Payload changes.** `model_id` becomes optional and is absent for the weighted shape. A new
+   optional `query_id` carries a caller-supplied correlation id when the request names one and is
+   absent otherwise; the event never fabricates one. A new `tiers` list names, in scoring order,
+   the feature weights that contributed: the keys among `relevance`, `salience`, `temporal`,
+   `text_match` and `vector_match` whose configured weight is positive. Weight keys outside that
+   set are not tiers; they are listed under a separate `ignored_weights` field so an operator can
+   see a misspelled key without it being counted as applied. `reranked` carries the five named
+   feature values per candidate and `final_scores` the weighted score, both narrowed to `f32` as
+   the field types already are; the narrowing is part of the contract and the response returned to
+   the caller keeps `f64`. `latency_us` is recorded. `hook_applied` and `hook_target_match` are
+   `false` for the weighted shape, which has no hook stage.
+3. **Candidate identity.** `candidates` lists, in input order, the ids of the candidates whose
+   `id` field parses as a UUID. A candidate without a parseable id is counted in a new
+   `unidentified_candidates` field and omitted from `candidates`, `reranked` and `final_scores`;
+   it is still scored and returned to the caller as today. The handler does not mint ids.
+4. **Order.** `final_scores` is in the handler's output order, which for the weighted path is the
+   input order, so a consumer can read before and after positions from `candidates` and
+   `final_scores` without a separate field.
+5. **Projection.** `decode_rerank_observations` accepts an absent `model_id` and continues to
+   derive `Candidate` and `Selected` rows from `candidates` and `final_scores`; no new observation
+   kinds are introduced. The existing field-name fallback chain is unchanged.
+6. **Source compatibility.** Changing `model_id` to optional and adding fields alters a public
+   struct in `khive-types`; it is a source change for direct constructors and exhaustive
+   destructurings and is recorded in the changelog as such. Stored events written before this
+   amendment carry no `reranker` field and are read as `native`.
+
+### Alternatives considered
+
+- **Emit the native payload with a placeholder model id.** Rejected: a fabricated id is a false
+  provenance claim that the ADR-041 projection would store as fact.
+- **Emit an untyped JSON payload the projection happens to decode.** Rejected: the typed payload
+  and the stored event would disagree, and the `f32` narrowing would be silent.
+- **A separate `WeightedRerankExecuted` kind.** Rejected: it adds a variant to the exhaustive
+  `EventKind` enum for the same observation shape and doubles the projection; a discriminator
+  field carries the distinction at lower cost.
+- **Keep the weighted path unobserved.** Rejected: ADR-032 feedback and the recall retune driver
+  (ADR-081) need to know which rerank weights produced an ordering.
+
+### Consequences
+
+- The weighted path becomes observable without claiming a model, a hook or a query it did not
+  have, and recall tuning can correlate a reordering with the weights that produced it when the
+  caller supplies a query id.
+- Scores in the event are `f32`; a consumer that needs the `f64` values reads the handler
+  response.
+- The amendment is implemented by the change that closes #4801, which also updates the payload
+  type, the projection and the memory pack test named there.
+
+### Refs
+
+- Decision 1, Decision 5, §Implementation "Events"; ADR-041; ADR-032; ADR-081.
+- #4801.

@@ -17,56 +17,79 @@ TRIGGERS = (
     "execute_atomic_ops_file(", "run_reindex(",
     "run_reindex_without_embeddings(", "run_reindex_offline(",
 )
-MODULES = ("exec.rs", "cli.rs", "code_ingest.rs", "reindex.rs", "pack_introspect.rs",
-           "atomic_apply.rs", "atomic_project_origin_tests.rs")
+# Concern files `exec_tests.rs` pulls in with `include!`. They are read from the parent so a new part joins
+# the census without an edit here; a part dropped from the parent lowers the count below its floor.
+EXEC_TEST_PARTS = tuple(re.findall(r'(?m)^include!\("(exec_tests/[^"]+)"\);$',
+                                   (SOURCE / "exec_tests.rs").read_text()))
+MODULES = ("exec.rs", "exec_tests.rs", "exec_atomic_result_shape_tests.rs", "cli.rs", "code_ingest.rs",
+           "reindex/tests/mod.rs", "pack_introspect.rs", "atomic_apply.rs", "atomic_apply_tests.rs",
+           "atomic_apply_validate_atomic_args_tests.rs", "atomic_project_origin_tests.rs") + EXEC_TEST_PARTS
+# Test files included at column zero rather than as an inline module.
+COLUMN_ZERO = ("exec_tests.rs", "exec_atomic_result_shape_tests.rs", "reindex/tests/mod.rs",
+               "atomic_apply_tests.rs", "atomic_apply_validate_atomic_args_tests.rs") + EXEC_TEST_PARTS
 
 
-def functions(source):
-    # These modules use one four-space test-module level. Matching the
+def functions(source, indent="    "):
+    # Inline modules use four spaces; extracted test modules use column zero. Matching the
     # closing line at that same level keeps nested blocks and raw fixture JSON.
-    for match in re.finditer(r"(?m)^    (?:async )?fn (\w+)(?:<[^>]*>)?\(", source):
-        end = source.index("\n    }", match.end())
+    for match in re.finditer(r"(?m)^" + re.escape(indent) + r"(?:async )?fn (\w+)(?:<[^>]*>)?\(", source):
+        end = source.index("\n" + indent + "}", match.end())
         start = source.index("{", match.end(), end) + 1
-        before = max(source.rfind("\n    }", 0, match.start()),
-                     source.rfind("\n    //", 0, match.start()))
+        # The first function of a file has neither boundary above it; its attributes start at offset 0.
+        before = max(source.rfind("\n" + indent + "}", 0, match.start()),
+                     source.rfind("\n" + indent + "//", 0, match.start()), 0)
         yield match.group(1), source[before:match.start()], source[start:end]
 
 
+def module_functions(filename):
+    indent = "" if filename in COLUMN_ZERO else "    "
+    return functions((SOURCE / filename).read_text(), indent)
+
+
+def isolation(filename, name=None):
+    prologue = ISOLATION
+    if (filename, name) == ("exec_tests.rs", "atomic_update_null_and_type_semantics_match_canonical_behavior"):
+        prologue = prologue.replace("run_in_child()", "run_in_child_with_stack_size(4 * 1024 * 1024)")
+    return prologue.replace("\n    ", "\n") if filename in COLUMN_ZERO else prologue
+
+
 def function(filename, name):
-    return next(body for found, _, body in functions((SOURCE / filename).read_text())
+    return next(body for found, _, body in module_functions(filename)
                 if found == name)
 
 
 class KkernelTestIsolationTests(unittest.TestCase):
     def test_child_environment_removes_external_model_cache_override(self):
         source = (SOURCE / "test_process.rs").read_text()
-        command = source[source.index("let output = command"):source.index('.expect("spawn isolated test")')]
+        command = source[source.index("run_exact_test_in_child("):source.index("fixture = Some(")]
         self.assertIn('.env_remove("LATTICE_MODEL_CACHE")', command,
                       "exact child must not inherit an external model cache override")
 
     def test_environment_and_fallback_cases_enter_exact_children(self):
         count = 0
         for filename in MODULES:
-            for name, attributes, body in functions((SOURCE / filename).read_text()):
+            for name, attributes, body in module_functions(filename):
                 if "#[test]" not in attributes and "#[tokio::test" not in attributes:
                     continue
                 if not any(trigger in body for trigger in TRIGGERS):
                     continue
                 count += 1
-                self.assertTrue(body.strip().startswith(ISOLATION),
+                self.assertTrue(body.strip().startswith(isolation(filename, name)),
                                 f"{filename}:{name} must enter exact child before fixture setup")
         self.assertGreaterEqual(count, 89, "fixture census must not become vacuous")
 
     def test_atomic_execution_callers_enter_exact_children(self):
         count = 0
-        for filename in ("exec.rs", "atomic_apply.rs", "atomic_project_origin_tests.rs"):
-            for name, attributes, body in functions((SOURCE / filename).read_text()):
+        for filename in ("exec.rs", "exec_tests.rs", "exec_atomic_result_shape_tests.rs", "atomic_apply.rs",
+                         "atomic_apply_tests.rs", "atomic_apply_validate_atomic_args_tests.rs",
+                         "atomic_project_origin_tests.rs"):
+            for name, attributes, body in module_functions(filename):
                 if "#[tokio::test" not in attributes or "execute_atomic_ops_file(" not in body:
                     continue
                 count += 1
-                self.assertTrue(body.strip().startswith(ISOLATION),
+                self.assertTrue(body.strip().startswith(isolation(filename, name)),
                                 f"{filename}:{name} atomic caller must enter exact child")
-        self.assertEqual(count, 22, "all direct atomic execution witnesses must be counted")
+        self.assertEqual(count, 25, "all direct atomic execution witnesses must be counted")
 
     def test_reindex_command_cases_choose_explicit_offline_setup(self):
         zero_model_cases = {
@@ -75,7 +98,7 @@ class KkernelTestIsolationTests(unittest.TestCase):
             "reindex_fts_fixture_clears_primary_and_additional_models",
         }
         count = 0
-        for name, attributes, body in functions((SOURCE / "reindex.rs").read_text()):
+        for name, attributes, body in module_functions("reindex/tests/mod.rs"):
             if "#[tokio::test" not in attributes:
                 continue
             if not re.search(r"\brun_reindex(?:_without_embeddings|_offline)?\(", body):
@@ -85,12 +108,12 @@ class KkernelTestIsolationTests(unittest.TestCase):
                                 f"{name} must choose an explicit offline reindex fixture")
             expected = "run_reindex_without_embeddings(" if name in zero_model_cases else "run_reindex_offline("
             self.assertIn(expected, body, f"{name} must preserve its intended embedding mode")
-            self.assertTrue(body.strip().startswith(ISOLATION),
+            self.assertTrue(body.strip().startswith(isolation("reindex/tests/mod.rs")),
                             f"{name} must enter exact child before reindex setup")
-        self.assertEqual(count, 9, "all reindex command witnesses must be counted")
+        self.assertEqual(count, 10, "all reindex command witnesses must be counted")
 
     def test_reindex_offline_setup_replaces_each_configured_provider(self):
-        body = function("reindex.rs", "run_reindex_offline")
+        body = function("reindex/tests/mod.rs", "run_reindex_offline")
         self.assertIn("for name in runtime.registered_embedding_model_names()", body)
         self.assertIn("runtime.register_embedder(FixedReindexEmbedder { name, dimensions })", body,
                       "offline reindex fixture must replace every native provider")
@@ -104,12 +127,19 @@ class KkernelTestIsolationTests(unittest.TestCase):
         default = function("code_ingest.rs", "code_ingest_batch")
         setup = function("code_ingest.rs", "code_ingest_batch_with_runtime_setup")
         self.assertIn("code_ingest_batch_with_runtime_setup(args, |_| Ok(()))", default)
-        install = "install_test_embedders(runtime)?;"
+        install = "install_test_embedders,"
         self.assertIn(install, setup, "default ingest must install offline providers")
-        self.assertLess(setup.index(install), setup.index("runtime_setup(runtime)"),
+        self.assertLess(setup.index(install), setup.index("runtime_setup,"),
+                        "offline providers must be the provider setup, ahead of the custom setup")
+        source = (SOURCE / "code_ingest.rs").read_text()
+        opened = source.index("let runtime = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!(\"{e}\"))?;")
+        providers = source.index("provider_setup(&runtime)?;", opened)
+        self.assertLess(providers, source.index("build_code_ingest_registry(&runtime)?;", opened),
+                        "offline providers must be installed before the registry is built")
+        self.assertLess(providers, source.index("runtime_setup(&runtime)?;", opened),
                         "custom setup must retain its final override")
         provider = function("code_ingest.rs", "install_test_embedders")
-        self.assertIn("runtime.register_embedder(FixedEmbeddingProvider { name, dimensions })", provider,
+        self.assertIn("runtime.try_register_embedder(FixedEmbeddingProvider { name, dimensions })?;", provider,
                       "offline fixture must replace each configured native provider")
 
     def test_gate_allow_ingest_installs_offline_providers(self):

@@ -76,6 +76,8 @@ pub(crate) struct GetParams {
     pub(crate) kind: Option<String>,
     pub(crate) note_kind: Option<String>,
     pub(crate) include_deleted: Option<bool>,
+    #[serde(default)]
+    pub(crate) hydrate: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -99,6 +101,8 @@ pub(crate) struct ListParams {
     /// page. An empty string starts cursor mode from the beginning.
     pub(crate) after: Option<String>,
     pub(crate) note_kind: Option<String>,
+    /// Substrate notes.status selection, separate from workflow status below.
+    pub(crate) note_status: Option<khive_storage::note::NoteStatusSelector>,
     pub(crate) status: Option<String>,
     pub(crate) created_by_actor: Option<String>,
     pub(crate) key_prefix: Option<String>,
@@ -137,7 +141,12 @@ pub(crate) struct WhoamiParams {}
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DbDiagnosticsParams {}
+pub(crate) struct DbDiagnosticsParams {
+    /// Inspect only the opened database that serves this backend name.
+    pub(crate) backend: Option<String>,
+    /// `false` skips the `dbstat` walk. Requested walks also obey the private snapshot footprint caps.
+    pub(crate) size_composition: Option<bool>,
+}
 
 /// ADR-099 B3: `pub` so kkernel's `--atomic` seam can deserialize through this same
 /// canonical struct, reproducing `deny_unknown_fields` rejection. Fields stay
@@ -148,6 +157,7 @@ pub struct UpdateParams {
     pub(crate) id: String,
     pub(crate) kind: Option<String>,
     pub(crate) name: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
     pub(crate) description: Option<Value>,
     pub(crate) content: Option<String>,
     #[serde(default, deserialize_with = "tri_f64")]
@@ -228,6 +238,7 @@ pub(crate) struct SearchParams {
     pub(crate) entity_kind: Option<String>,
     pub(crate) entity_type: Option<String>,
     pub(crate) note_kind: Option<String>,
+    pub(crate) note_status: Option<khive_storage::note::NoteStatusSelector>,
     pub(crate) include_superseded: Option<bool>,
     pub(crate) properties: Option<Value>,
     pub(crate) tags: Option<Vec<String>>,
@@ -235,6 +246,8 @@ pub(crate) struct SearchParams {
     pub(crate) min_rank_score: Option<f64>,
     pub(crate) min_score: Option<f64>,
     pub(crate) order_by: Option<String>,
+    pub(crate) created_after: Option<String>,
+    pub(crate) created_before: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -266,6 +279,30 @@ pub struct LinkParams {
     pub(crate) verbose: Option<bool>,
     pub(crate) links: Option<Vec<BulkLinkEntry>>,
     pub(crate) atomic: Option<bool>,
+}
+
+/// Normalize the singleton link spellings before strict canonical validation,
+/// shared with the CLI atomic preparation path.
+pub fn normalize_link_params(params: &mut Value) -> Result<(), khive_runtime::RuntimeError> {
+    let Some(map) = params.as_object_mut() else {
+        return Ok(());
+    };
+    for (canonical, alias) in [
+        ("source_id", "source"),
+        ("target_id", "target"),
+        ("relation", "kind"),
+    ] {
+        if map.contains_key(canonical) && map.contains_key(alias) {
+            return Err(khive_runtime::RuntimeError::InvalidInput(format!(
+                "`{alias}` is an alias for `{canonical}`; supply only one of the two, \
+                 even when the values agree"
+            )));
+        }
+        if let Some(value) = map.remove(alias) {
+            map.insert(canonical.to_owned(), value);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -383,6 +420,10 @@ pub(crate) struct ResolveParams {
     pub(crate) limit: Option<u32>,
 }
 
+fn deserialize_present_value<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
 pub(crate) fn tri_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<f64>>, D::Error> {
     Ok(Some(Option::deserialize(d)?))
 }
@@ -396,3 +437,7 @@ pub(crate) fn tri_string<'de, D: Deserializer<'de>>(
 ) -> Result<Option<Option<String>>, D::Error> {
     Ok(Some(Option::deserialize(d)?))
 }
+
+#[cfg(test)]
+#[path = "neighbors_params_contract_tests.rs"]
+mod neighbors_contract_tests;

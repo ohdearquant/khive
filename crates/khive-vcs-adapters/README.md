@@ -53,12 +53,16 @@ the record's `properties`.
 
 ## Format support
 
-Only the JSON array format (`JsonFormatAdapter`) is implemented today. `PHASE0_FORMATS`
-(`"csv"`, `"tsv"`, `"json"`, `"ndjson"`) names the formats the v0.5 adapter registry is
-expected to accept; `AdapterError::NotYetImplemented` is the error path reserved for
-formats declared but not yet backed by an adapter. Additional formats (BibTeX,
-Turtle/N-Triples, JSON-LD, GraphML, GEXF, Markdown) are tracked as deferred work — see
-`docs/api/adapter-protocol.md` in this crate.
+JSON arrays (`JsonFormatAdapter`), CSV/TSV (`CsvFormatAdapter`), and
+[BibTeX](docs/api/bibtex-adapter.md) (`BibtexFormatAdapter`) are implemented.
+BibTeX accepts an `impl BufRead`, frames one entry at a time, expands bounded
+`@string` definitions, and resolves crossrefs before returning converted records.
+`kkernel kg import` accepts `--format bibtex` and infers `.bib` without case sensitivity.
+
+`PHASE0_FORMATS` (`"csv"`, `"tsv"`, `"json"`, `"ndjson"`) retains the original P0
+format list; BibTeX is a P1 format. `AdapterError::NotYetImplemented` remains the
+error path for deferred formats: Turtle/N-Triples, JSON-LD, GraphML, GEXF and
+Markdown. See `docs/api/adapter-protocol.md` in this crate.
 
 ## Where this sits
 

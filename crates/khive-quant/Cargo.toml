@@ -27,3 +27,11 @@ criterion = { workspace = true }
 [[bench]]
 name = "sq8_kernel"
 harness = false
+
+[[bench]]
+name = "sq8_affine"
+harness = false
+
+[[bench]]
+name = "sq8_throughput"
+harness = false

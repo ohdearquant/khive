@@ -13,7 +13,7 @@
 
 ## Context
 
-khive's ontology is closed: 9 entity kinds, 17 edge relations in named families, 5 note
+khive's ontology is closed: 9 entity kinds, 20 edge relations in named families, 5 note
 kinds. That closure is the product's central bet, and it is also a rendering opportunity no
 generic graph library exploits: a closed vocabulary can have a _complete_ visual encoding,
 where every kind and relation has one stable visual identity and a reader who has learned
@@ -36,7 +36,7 @@ ontology is amended (ADR-001/002/013 process), never extended ad hoc by a view.
 - **Entity kinds (9)**: each kind has a stable pairing of icon (per the ADR-151 SVG
   contract) and hue. The pairing is defined once in a shared legend module consumed by
   every graph, list, and inspector surface.
-- **Edge relations (17)**: line treatment is assigned per ADR-002 _family_, with
+- **Edge relations (20)**: line treatment is assigned per ADR-002 _family_, with
   relation-level differentiation inside a family only where the family has more than one
   member on screen: structure (contains/part_of/instance_of) as quiet solid lines;
   derivation and provenance as directional treatments; dependency
@@ -44,7 +44,9 @@ ontology is amended (ADR-001/002/013 process), never extended ad hoc by a view.
   (competes_with/composed_with) as undirected treatments; `annotates` as the recessive
   dashed treatment; epistemic `supports`/`refutes` (ADR-055) as the one place semantic
   color applies to edges — the support/refute tokens from ADR-151 D2, since their meaning
-  is evaluative, not structural.
+  is evaluative, not structural. Ownership (`owns`, ADR-197) uses the existing
+  neutral directional treatment with the distinct `O` glyph; reciprocal holdings
+  retain their separate directions. The ownership family is separate from Structure.
 - **Note kinds (5)**: notes render as satellite chips off their anchor, tinted by kind,
   visually subordinate to entities.
 - **Derived vs ingested**: an exporter-derived edge (ADR-147 D5) always carries a visible
@@ -101,7 +103,7 @@ affordance, not documentation.
 
 ## Acceptance criteria
 
-- A shared legend module enumerates all 9 + 17 + 5 identities plus the derived-edge mark;
+- A shared legend module enumerates all 9 + 20 + 5 identities plus the derived-edge mark;
   a completeness test fails when the ontology and the legend disagree.
 - Derived edges are visually distinct from ingested edges in every graph view.
 - Rendering the same golden bundle twice yields identical settled layouts (asserted by

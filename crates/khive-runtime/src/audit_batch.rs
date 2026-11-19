@@ -65,16 +65,7 @@ pub enum AuditProducer {
     /// A drained process-lifetime `OnceLock` config-lock row.
     ConfigLocked,
     /// A `memory.recall` execution's pure-observability audit row.
-    ///
-    /// Classified and ready for routing, but not yet wired to a live call
-    /// site in this slice: `khive-pack-memory`'s recall handler reaches only
-    /// `KhiveRuntime` (`crates/khive-runtime/src/runtime.rs`), which does not
-    /// hold this batch seam and is outside this change's file ownership
-    /// (`final_file_ownership_r2.md` assigns `runtime.rs` to the D8 author).
-    /// Wiring this variant to `emit_recall_executed_event` needs either an
-    /// ownership-map amendment granting `runtime.rs` a narrow accessor, or
-    /// threading a second seam onto `KhiveRuntime` — both out of scope here.
-    #[allow(dead_code)]
+    /// Submitted by the recall handler through its owning registry's batch.
     RecallExecuted,
 }
 
@@ -247,8 +238,9 @@ pub enum AuditCommitOutcome {
 
 /// Production-visible snapshot of [`AuditBatch::health_metrics`]. See there
 /// for field semantics. `khive_db::diagnostics::RuntimeAuditBatchMetrics` carries
-/// these three fields plus `admission_refused_obligations` and
-/// `admission_unresolved_obligations`, which are sourced from process-wide
+/// these three fields plus `admission_refused_obligations`,
+/// `retry_exhausted_obligations`, and `admission_unresolved_obligations`,
+/// which are sourced from process-wide
 /// counters outside `AuditBatch` rather than from this struct — see
 /// `VerbRegistry::audit_batch_metrics`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,9 +341,8 @@ struct Waiting {
     responder: oneshot::Sender<Result<AuditCommitOutcome, AuditTerminalReason>>,
 }
 
-/// A committed/failed generation's accounting, retained for the lifetime of
-/// the process (bounded in practice by process lifetime and generation
-/// volume; this slice makes no attempt to prune history).
+/// A committed/failed generation's accounting. Detailed history is retained when
+/// compiled for tests or with `test-internals`; ordinary builds keep cumulative counters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditGenerationSnapshot {
     pub generation_id: u64,
@@ -366,10 +357,12 @@ struct State {
     pending: Vec<Waiting>,
     in_flight_generation: Option<u64>,
     driver_active: bool,
+    physical_reservations: usize,
     next_generation_id: u64,
     submitted_rows: u64,
     committed_rows: u64,
     store_batch_calls: u64,
+    #[cfg(any(test, feature = "test-internals"))]
     generations: Vec<AuditGenerationSnapshot>,
     flush_failures: u64,
     degraded_rows: u64,
@@ -391,10 +384,12 @@ impl State {
             pending: Vec::new(),
             in_flight_generation: None,
             driver_active: false,
+            physical_reservations: 0,
             next_generation_id: 0,
             submitted_rows: 0,
             committed_rows: 0,
             store_batch_calls: 0,
+            #[cfg(any(test, feature = "test-internals"))]
             generations: Vec::new(),
             flush_failures: 0,
             degraded_rows: 0,
@@ -405,6 +400,14 @@ impl State {
         }
     }
 
+    /// No-op outside `test`/`test-internals`; operators read [`AuditBatch::health_metrics`].
+    fn record_generation(&mut self, generation: AuditGenerationSnapshot) {
+        #[cfg(any(test, feature = "test-internals"))]
+        self.generations.push(generation);
+        #[cfg(not(any(test, feature = "test-internals")))]
+        let _ = generation;
+    }
+
     fn is_idle(&self) -> bool {
         self.pending.is_empty() && self.in_flight_generation.is_none() && !self.driver_active
     }
@@ -412,9 +415,59 @@ impl State {
 
 struct Inner {
     state: Mutex<State>,
+    // Completion witnesses only: physical shutdown never aborts admitted work.
+    physical_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+}
+
+struct PhysicalReservation(Arc<Inner>);
+
+impl Drop for PhysicalReservation {
+    fn drop(&mut self) {
+        self.0.state.lock().physical_reservations -= 1;
+    }
 }
 
 impl Inner {
+    fn reserve_physical(self: &Arc<Self>) -> PhysicalReservation {
+        self.state.lock().physical_reservations += 1;
+        PhysicalReservation(Arc::clone(self))
+    }
+
+    fn spawn_physical<F, T>(
+        self: &Arc<Self>,
+        registration: PhysicalReservation,
+        future: F,
+    ) -> JoinHandle<T>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let running = self.reserve_physical();
+        let handle = tokio::spawn(async move {
+            let result = future.await;
+            drop(running);
+            result
+        });
+        {
+            let mut tasks = self.physical_tasks.lock();
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(handle.abort_handle());
+        }
+        // A very short task can finish before its witness is published. Keep
+        // registration reserved until publication to close that zero-work gap.
+        drop(registration);
+        handle
+    }
+
+    fn physically_finished(&self) -> bool {
+        self.state.lock().physical_reservations == 0
+            && self
+                .physical_tasks
+                .lock()
+                .iter()
+                .all(|task| task.is_finished())
+    }
+
     /// Wins once: the first abnormal driver/supervisor exit sets `Failed`
     /// and drains every accepted waiter (this generation's, plus anything
     /// still queued for a future one) with the same typed reason. A later
@@ -433,7 +486,7 @@ impl Inner {
             state.flush_failures += 1;
             state.degraded = true;
             let generation_id = state.next_generation_id;
-            state.generations.push(AuditGenerationSnapshot {
+            state.record_generation(AuditGenerationSnapshot {
                 generation_id,
                 submitted_rows: (in_flight_waiters.len() + drained.len()) as u64,
                 committed_rows: 0,
@@ -517,10 +570,17 @@ enum RetryDecision {
 }
 
 fn classify_store_error(err: &StorageError) -> RetryDecision {
-    match err {
+    match err.without_sqlite_write_stage() {
+        // This replay is safe only because the batch append is idempotent.
+        StorageError::WriteOutcomeUnknown { .. } => RetryDecision::Retry,
+        StorageError::WriterOwnerUnavailable { source, .. } => classify_store_error(source),
         StorageError::WriteQueueFull { .. } | StorageError::WriterTaskBusy { .. } => {
             RetryDecision::Retry
         }
+        StorageError::CapacityUnavailable {
+            phase: khive_storage::CapacityUnavailablePhase::LockContended,
+            ..
+        } => RetryDecision::Retry,
         // Transient availability conditions, not judgments on the batch. The
         // events-daemon forwarding lane (ADR-170) reports an unreachable or
         // stalled daemon as `Pool`/`Timeout`; the direct SQL path reports
@@ -528,8 +588,25 @@ fn classify_store_error(err: &StorageError) -> RetryDecision {
         // configured bounded retries exist for — treating them as terminal
         // would abandon a generation on the first blip of a daemon restart.
         StorageError::Pool { .. } | StorageError::Timeout { .. } => RetryDecision::Retry,
-        StorageError::WriterTaskRequestFailed { request_state, .. }
-        | StorageError::WriterTaskTerminated { request_state } => match request_state {
+        // The writer task wraps any request operation that failed and was rolled
+        // back, whatever the cause, so the wrapper alone does not say whether a
+        // retry can succeed: a missing column fails the same way on every
+        // attempt. Judge the cause it carries. A request left in an unknown
+        // state is replayed regardless, because the append is idempotent.
+        StorageError::WriterTaskRequestFailed {
+            request_state,
+            source,
+        } => match request_state {
+            WriterTaskRequestState::NotStarted | WriterTaskRequestState::TransactionRolledBack => {
+                if is_sqlite_busy_or_locked(source) {
+                    RetryDecision::Retry
+                } else {
+                    classify_store_error(source)
+                }
+            }
+            WriterTaskRequestState::SideEffectsUnknown => RetryDecision::Retry,
+        },
+        StorageError::WriterTaskTerminated { request_state, .. } => match request_state {
             WriterTaskRequestState::NotStarted | WriterTaskRequestState::TransactionRolledBack => {
                 RetryDecision::Retry
             }
@@ -542,6 +619,22 @@ fn classify_store_error(err: &StorageError) -> RetryDecision {
         }
         _ => RetryDecision::Terminal(AuditTerminalReason::StoreFailure),
     }
+}
+
+/// Whether a failed writer request's preserved cause is SQLite contention. The
+/// writer keeps the request body's driver error as the cause, and a driver
+/// error is not one of the typed transient variants `classify_store_error`
+/// retries on its own.
+fn is_sqlite_busy_or_locked(err: &StorageError) -> bool {
+    let StorageError::Driver { source, .. } = err.without_sqlite_write_stage() else {
+        return false;
+    };
+    matches!(
+        source
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(|error| error.sqlite_error_code()),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
 }
 
 enum GenerationResult {
@@ -601,15 +694,23 @@ async fn run_generation(
         attempt += 1;
         match store.append_events_idempotent(events.clone()).await {
             Ok(result) => return GenerationResult::Committed(result.rows),
-            Err(err) => match classify_store_error(&err) {
-                RetryDecision::Retry if attempt < config.max_commit_attempts.get() => {
-                    tokio::time::sleep(config.retry_backoff).await;
-                }
-                RetryDecision::Retry => {
-                    return GenerationResult::Failed(AuditTerminalReason::RetryExhausted)
-                }
-                RetryDecision::Terminal(reason) => return GenerationResult::Failed(reason),
-            },
+            Err(err) => {
+                let reason = match classify_store_error(&err) {
+                    RetryDecision::Retry if attempt < config.max_commit_attempts.get() => {
+                        tokio::time::sleep(config.retry_backoff).await;
+                        continue;
+                    }
+                    RetryDecision::Retry => AuditTerminalReason::RetryExhausted,
+                    RetryDecision::Terminal(reason) => reason,
+                };
+                tracing::warn!(
+                    error = %err,
+                    attempts = attempt,
+                    ?reason,
+                    "audit generation failed; its rows were not committed"
+                );
+                return GenerationResult::Failed(reason);
+            }
         }
     }
 }
@@ -635,6 +736,7 @@ impl AuditBatch {
         Arc::new(Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(State::new()),
+                physical_tasks: Mutex::new(Vec::new()),
             }),
             store,
             config: Arc::new(config),
@@ -659,14 +761,45 @@ impl AuditBatch {
         }
     }
 
-    fn spawn_supervisor_if_idle(&self) {
+    fn spawn_supervisor_if_idle(&self, registration: PhysicalReservation) {
         let inner = self.inner.clone();
         let store = self.store.clone();
         let config = self.config.clone();
-        let handle = tokio::spawn(async move {
+        let handle = self.inner.spawn_physical(registration, async move {
             supervisor_loop(inner, store, config).await;
         });
         *self.supervisor.lock() = Some(handle);
+    }
+
+    /// Stop admission and wait until all accepted append tasks and their
+    /// supervisors/reapers have physically finished. Unlike `close_and_drain`,
+    /// a driver-abandoned append still holds this barrier until it returns.
+    ///
+    /// Task completion witnesses stay on the batch, so cancelling this wait
+    /// neither detaches a taken join nor loses the barrier for a later call.
+    /// No admitted write is aborted. This may wait indefinitely for a store
+    /// that never returns; callers may cancel their wait without cancelling it.
+    /// The batch's own store Arc remains owned until the batch is dropped.
+    pub(crate) async fn close_and_wait_for_physical_completion(
+        &self,
+    ) -> Result<(), AuditTerminalReason> {
+        {
+            let mut state = self.inner.state.lock();
+            if matches!(state.lifecycle, Lifecycle::Open) {
+                state.lifecycle = Lifecycle::Closing;
+            }
+        }
+        let result = AuditBatchControl::quiesce(self).await;
+        while !self.inner.physically_finished() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        {
+            let mut state = self.inner.state.lock();
+            if result.is_ok() && matches!(state.lifecycle, Lifecycle::Closing) {
+                state.lifecycle = Lifecycle::Closed;
+            }
+        }
+        result
     }
 
     /// Enqueue one row and keep waiting for its real generation outcome past
@@ -715,7 +848,7 @@ impl AuditBatch {
 
         let producer = row.producer;
         let (tx, mut rx) = oneshot::channel();
-        let need_spawn = {
+        let supervisor_registration = {
             let mut state = self.inner.state.lock();
             match state.lifecycle {
                 Lifecycle::Closed | Lifecycle::Closing => {
@@ -736,11 +869,16 @@ impl AuditBatch {
             let need_spawn = !state.driver_active;
             if need_spawn {
                 state.driver_active = true;
+                // Publish this obligation under the admission lock, before a
+                // concurrent physical close can observe terminal/idle state.
+                state.physical_reservations += 1;
+                Some(PhysicalReservation(Arc::clone(&self.inner)))
+            } else {
+                None
             }
-            need_spawn
         };
-        if need_spawn {
-            self.spawn_supervisor_if_idle();
+        if let Some(registration) = supervisor_registration {
+            self.spawn_supervisor_if_idle(registration);
         }
 
         if wait_until_resolved {
@@ -835,7 +973,7 @@ async fn supervisor_loop(
             {
                 let mut state = inner.state.lock();
                 state.flush_failures += 1;
-                state.generations.push(AuditGenerationSnapshot {
+                state.record_generation(AuditGenerationSnapshot {
                     generation_id,
                     submitted_rows: submitted,
                     committed_rows: 0,
@@ -872,8 +1010,10 @@ async fn supervisor_loop(
             .map(|w| w.event.clone())
             .collect();
 
-        let mut child: JoinHandle<GenerationResult> =
-            tokio::spawn(run_generation(store.clone(), events, config.clone()));
+        let mut child: JoinHandle<GenerationResult> = inner.spawn_physical(
+            inner.reserve_physical(),
+            run_generation(store.clone(), events, config.clone()),
+        );
 
         #[cfg(any(test, feature = "fault-injection"))]
         if fault::CHILD_CANCEL.swap(false, Ordering::SeqCst) {
@@ -912,7 +1052,7 @@ async fn supervisor_loop(
                     state.flush_failures += 1;
                     state.outstanding_abandoned_appends += 1;
                     let generation_id = state.next_generation_id.saturating_sub(1);
-                    state.generations.push(AuditGenerationSnapshot {
+                    state.record_generation(AuditGenerationSnapshot {
                         generation_id,
                         submitted_rows: submitted,
                         committed_rows: 0,
@@ -927,7 +1067,7 @@ async fn supervisor_loop(
                         .send(Err(AuditTerminalReason::DriverAppendAbandoned));
                 }
                 let reaper_inner = inner.clone();
-                tokio::spawn(async move {
+                inner.spawn_physical(inner.reserve_physical(), async move {
                     let result = child.await;
                     let mut state = reaper_inner.state.lock();
                     state.outstanding_abandoned_appends =
@@ -963,7 +1103,7 @@ async fn supervisor_loop(
                     state.flush_failures += 1;
                     state.degraded = true;
                     let generation_id = state.next_generation_id.saturating_sub(1);
-                    state.generations.push(AuditGenerationSnapshot {
+                    state.record_generation(AuditGenerationSnapshot {
                         generation_id,
                         submitted_rows: submitted,
                         committed_rows: 0,
@@ -1003,7 +1143,7 @@ async fn supervisor_loop(
                     state.store_batch_calls += 1;
                     state.committed_rows += committed_n;
                     let generation_id = state.next_generation_id.saturating_sub(1);
-                    state.generations.push(AuditGenerationSnapshot {
+                    state.record_generation(AuditGenerationSnapshot {
                         generation_id,
                         submitted_rows: submitted,
                         committed_rows: committed_n,
@@ -1286,3 +1426,127 @@ mod test_internals {
 
 #[cfg(any(test, feature = "test-internals"))]
 pub use test_internals::*;
+
+#[cfg(test)]
+#[path = "audit_batch_physical_close_tests.rs"]
+mod physical_close_tests;
+
+#[cfg(test)]
+mod commit_reply_tests {
+    use super::*;
+    use khive_storage::event::IdempotentEventBatchResult;
+    use khive_storage::{BatchWriteSummary, EventFilter, Page, PageRequest, StorageResult};
+    use std::sync::atomic::AtomicUsize;
+
+    struct LostReplyStore {
+        inner: Arc<dyn EventStore>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl EventStore for LostReplyStore {
+        async fn append_event(&self, event: Event) -> StorageResult<()> {
+            self.inner.append_event(event).await
+        }
+        async fn append_events(&self, events: Vec<Event>) -> StorageResult<BatchWriteSummary> {
+            self.inner.append_events(events).await
+        }
+        async fn get_event(&self, id: uuid::Uuid) -> StorageResult<Option<Event>> {
+            self.inner.get_event(id).await
+        }
+        async fn query_events(
+            &self,
+            filter: EventFilter,
+            page: PageRequest,
+        ) -> StorageResult<Page<Event>> {
+            self.inner.query_events(filter, page).await
+        }
+        async fn count_events(&self, filter: EventFilter) -> StorageResult<u64> {
+            self.inner.count_events(filter).await
+        }
+        fn preflight_event(&self, event: &Event) -> StorageResult<()> {
+            self.inner.preflight_event(event)
+        }
+        fn supports_idempotent_audit_batch(&self) -> bool {
+            true
+        }
+        async fn append_events_idempotent(
+            &self,
+            events: Vec<Event>,
+        ) -> StorageResult<IdempotentEventBatchResult> {
+            let result = self.inner.append_events_idempotent(events).await?;
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(StorageError::WriteOutcomeUnknown {
+                    source: Box::new(std::io::Error::other("reply lost after stored append")),
+                });
+            }
+            Ok(result)
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_commit_reply_reconciles_identical_stored_audit_without_duplicate() {
+        let backend = khive_db::StorageBackend::memory().expect("memory event store");
+        let store = Arc::new(LostReplyStore {
+            inner: backend.events().expect("event capability"),
+            calls: AtomicUsize::new(0),
+        });
+        let event = Event::new(
+            "local",
+            "memory.recall",
+            khive_types::EventKind::Audit,
+            khive_types::SubstrateKind::Event,
+            "test:lost-reply",
+        );
+        let result = run_generation(
+            store.clone(),
+            vec![event.clone()],
+            Arc::new(AuditBatchConfig {
+                max_commit_attempts: std::num::NonZeroU8::new(2).unwrap(),
+                retry_backoff: Duration::ZERO,
+                ..AuditBatchConfig::default()
+            }),
+        )
+        .await;
+        let GenerationResult::Committed(rows) = result else {
+            panic!("idempotent audit replay must reconcile the lost COMMIT reply");
+        };
+        assert_eq!(rows, vec![EventAppendDisposition::AlreadyPresentIdentical]);
+        assert_eq!(store.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(store.get_event(event.id).await.unwrap(), Some(event));
+        assert_eq!(
+            store.count_events(EventFilter::default()).await.unwrap(),
+            1,
+            "audit recovery must not duplicate the already stored row"
+        );
+    }
+
+    #[test]
+    fn unavailable_owner_retries_pool_but_not_missing_runtime_or_route_violation() {
+        let unavailable = |source| StorageError::WriterOwnerUnavailable {
+            operation: "audit append".into(),
+            source: Box::new(source),
+        };
+        assert!(matches!(
+            classify_store_error(&unavailable(StorageError::Pool {
+                operation: "owner".into(),
+                message: "stopped".into(),
+            })),
+            RetryDecision::Retry
+        ));
+        for error in [
+            unavailable(StorageError::WriterTaskNoRuntime),
+            StorageError::WriterRouteViolation {
+                operation: "audit append".into(),
+            },
+        ] {
+            assert!(
+                matches!(
+                    classify_store_error(&error),
+                    RetryDecision::Terminal(AuditTerminalReason::StoreFailure)
+                ),
+                "configuration/routing refusal is not an idempotent replay candidate"
+            );
+        }
+    }
+}

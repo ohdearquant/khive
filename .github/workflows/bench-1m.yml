@@ -56,6 +56,12 @@ on:
         required: false
         default: ""
 
+# A new push to a pull request cancels that pull request's run in progress. Other events keep
+# one group per run, so pushes and manual runs are never cancelled.
+concurrency:
+  group: bench-1m-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -68,6 +74,9 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   ann-ci-gate:
     name: ANN structural regression gate (synthetic, hermetic)
+    # Pull requests from this repository's codex/ branches skip this job; the integration/** push
+    # run that merges them runs it on the merged tree.
+    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'codex/') && github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -93,6 +102,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: astral-sh/setup-uv@v4
         with:
@@ -151,6 +161,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: astral-sh/setup-uv@v4
         with:

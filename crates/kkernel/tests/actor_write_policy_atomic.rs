@@ -41,6 +41,7 @@ fn run_atomic(home: &TempDir, actor: &str) -> Output {
         .env_clear()
         .env("HOME", home.path())
         .env("TMPDIR", home.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", home.path().join("volume-locks"))
         .env("KHIVE_NO_DAEMON", "1")
         .env("KHIVE_SOCKET", home.path().join("unused.sock"))
         .env("KHIVE_PACKS", "kg")

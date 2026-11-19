@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
 
 use crate::brain_signal::BrainSignal;
@@ -72,8 +72,6 @@ impl SectionPosteriorState {
         m.insert(SectionType::Examples, BetaPosterior::new(5.0, 2.0));
         m.insert(SectionType::FailureModes, BetaPosterior::new(3.0, 2.0));
         m.insert(SectionType::ExpertLens, BetaPosterior::new(3.0, 2.0));
-        m.insert(SectionType::References, BetaPosterior::new(2.0, 2.0));
-        m.insert(SectionType::Other, BetaPosterior::new(2.0, 2.0));
         m
     }
 
@@ -182,26 +180,40 @@ impl SectionPosteriorState {
         self.total_events += 1;
 
         for (section_type, feedback_signal) in signals {
-            if let Some(posterior) = self.posteriors.get_mut(section_type) {
-                match feedback_signal {
-                    FeedbackSignal::Useful => posterior.update_success_weighted(weight),
-                    FeedbackSignal::NotUseful => posterior.update_failure_weighted(weight),
-                    FeedbackSignal::Wrong => posterior.update_failure_weighted(2.0 * weight),
-                }
-                if let Some(prior) = self.priors.get(section_type) {
-                    if let Err(e) = posterior.apply_ess_cap(&prior.clone(), DEFAULT_ESS_CAP) {
-                        eprintln!(
-                            "[brain-core] apply_ess_cap failed for section {:?}: {e}",
-                            section_type
-                        );
-                    }
-                }
+            if let Err(e) = self.apply_section_feedback_entry(section_type, feedback_signal, weight)
+            {
+                eprintln!(
+                    "[brain-core] apply_ess_cap failed for section {:?}: {e}",
+                    section_type
+                );
             }
         }
 
         if self.exploration_epoch > 0 {
             self.exploration_epoch -= 1;
         }
+    }
+
+    /// Update one existing section and cap its evidence against its prior.
+    /// An existing section requires a finite, positive weight.
+    /// Counters, exploration state, iteration order and error reporting belong to the caller.
+    pub fn apply_section_feedback_entry(
+        &mut self,
+        section_type: &SectionType,
+        feedback_signal: &FeedbackSignal,
+        weight: f64,
+    ) -> Result<(), String> {
+        if let Some(posterior) = self.posteriors.get_mut(section_type) {
+            match feedback_signal {
+                FeedbackSignal::Useful => posterior.update_success_weighted(weight),
+                FeedbackSignal::NotUseful => posterior.update_failure_weighted(weight),
+                FeedbackSignal::Wrong => posterior.update_failure_weighted(2.0 * weight),
+            }
+            if let Some(prior) = self.priors.get(section_type).cloned() {
+                posterior.apply_ess_cap(&prior, DEFAULT_ESS_CAP)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -228,10 +240,37 @@ pub fn derive_deterministic_weights(state: &SectionPosteriorState) -> HashMap<Se
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SectionPosteriorSnapshot {
+    #[serde(deserialize_with = "deserialize_section_posterior_map")]
     pub posteriors: HashMap<SectionType, BetaPosterior>,
+    #[serde(deserialize_with = "deserialize_section_posterior_map")]
     pub priors: HashMap<SectionType, BetaPosterior>,
     pub total_events: u64,
     pub exploration_epoch: u64,
+}
+
+/// Load a persisted section posterior map, dropping entries keyed by a retired
+/// section type (ADR-048, 2026-10-04 amendment). Snapshots written before the
+/// retirement carry those keys; the remaining entries load unchanged. Any other
+/// key that is not a current section type is still a load error, so this does
+/// not loosen `SectionType` itself.
+fn deserialize_section_posterior_map<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<SectionType, BetaPosterior>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = HashMap::<String, BetaPosterior>::deserialize(deserializer)?;
+    let mut kept = HashMap::with_capacity(raw.len());
+    for (key, posterior) in raw {
+        if SectionType::is_retired_name(&key) {
+            continue;
+        }
+        let section = key
+            .parse::<SectionType>()
+            .map_err(<D::Error as serde::de::Error>::custom)?;
+        kept.insert(section, posterior);
+    }
+    Ok(kept)
 }
 
 /// Count-aware pessimistic estimate of a section's posterior: the mean minus
@@ -314,7 +353,7 @@ fn sample_beta_gamma(alpha: f64, beta: f64, rng: &mut impl Rng) -> f64 {
 fn sample_gamma_mt(shape: f64, rng: &mut impl Rng) -> f64 {
     if shape < 1.0 {
         let g = sample_gamma_mt(shape + 1.0, rng);
-        let u: f64 = rng.gen();
+        let u: f64 = rng.random();
         return g * u.powf(1.0 / shape);
     }
     let d = shape - 1.0 / 3.0;
@@ -326,7 +365,7 @@ fn sample_gamma_mt(shape: f64, rng: &mut impl Rng) -> f64 {
             continue;
         }
         let v = v_raw * v_raw * v_raw;
-        let u: f64 = rng.gen();
+        let u: f64 = rng.random();
         if u < 1.0 - 0.0331 * (x * x) * (x * x) {
             return d * v;
         }
@@ -337,153 +376,11 @@ fn sample_gamma_mt(shape: f64, rng: &mut impl Rng) -> f64 {
 }
 
 fn sample_standard_normal_bm(rng: &mut impl Rng) -> f64 {
-    let u1: f64 = rng.gen::<f64>().max(f64::EPSILON);
-    let u2: f64 = rng.gen();
+    let u1: f64 = rng.random::<f64>().max(f64::EPSILON);
+    let u2: f64 = rng.random();
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn derive_weights_sums_to_one() {
-        let state = SectionPosteriorState::new();
-        let mut rng = rand::thread_rng();
-        for _ in 0..20 {
-            let weights = derive_weights(&state, &mut rng);
-            assert_eq!(weights.len(), SectionType::all().len());
-            let sum: f64 = weights.values().sum();
-            assert!(
-                (sum - 1.0).abs() < 1e-9,
-                "weights must sum to 1.0; got {sum}"
-            );
-        }
-    }
-
-    /// The same weights must normalize to bit-identical results whatever order
-    /// the map happens to iterate in.
-    #[test]
-    fn renormalization_does_not_depend_on_map_iteration_order() {
-        let raw = [0.1, 0.2, 0.3, 0.7, 0.11, 0.13, 0.17, 0.19, 0.23, 0.29];
-        let normalize = |order: &[usize]| {
-            let mut weights: HashMap<SectionType, f64> = order
-                .iter()
-                .map(|&i| (SectionType::ALL[i], raw[i]))
-                .collect();
-            apply_floor_and_renorm(&mut weights, DEFAULT_SECTION_WEIGHT_FLOOR);
-            SectionType::ALL.map(|section| weights[&section].to_bits())
-        };
-        let forward: Vec<usize> = (0..raw.len()).collect();
-        let expected = normalize(&forward);
-        for round in 0..64 {
-            let mut order = forward.clone();
-            order.rotate_left(round % raw.len());
-            if round % 2 == 1 {
-                order.reverse();
-            }
-            assert_eq!(normalize(&order), expected, "round {round}");
-        }
-    }
-
-    #[test]
-    fn deterministic_weights_sum_to_one() {
-        let state = SectionPosteriorState::new();
-        let weights = derive_deterministic_weights(&state);
-        assert_eq!(weights.len(), 10);
-        let sum: f64 = weights.values().sum();
-        assert!(
-            (sum - 1.0).abs() < 1e-9,
-            "deterministic weights must sum to 1.0; got {sum}"
-        );
-    }
-
-    #[test]
-    fn epoch_zero_uses_deterministic() {
-        let mut state = SectionPosteriorState::new();
-        state.exploration_epoch = 0;
-        let mut rng = rand::thread_rng();
-        let w1 = derive_weights(&state, &mut rng);
-        let w2 = derive_weights(&state, &mut rng);
-        for st in SectionType::all() {
-            assert!(
-                (w1[st] - w2[st]).abs() < 1e-12,
-                "epoch=0 should give deterministic weights for {:?}",
-                st
-            );
-        }
-    }
-
-    #[test]
-    fn higher_alpha_gets_higher_weight() {
-        let mut priors = SectionPosteriorState::default_priors();
-        priors.insert(
-            SectionType::OperationalGuidance,
-            BetaPosterior::new(20.0, 2.0),
-        );
-        let mut state = SectionPosteriorState::from_priors(priors);
-        state.exploration_epoch = 0;
-        let weights = derive_deterministic_weights(&state);
-        let og = weights[&SectionType::OperationalGuidance];
-        let form = weights[&SectionType::Formalism];
-        assert!(og > form, "og={og:.4} form={form:.4}");
-    }
-
-    /// BRAIN-0483: hand-computed `lower_confidence_bound` values.
-    ///
-    /// alpha=11, beta=1 (10-for-10 lucky streak): mean = 11/12 = 0.916667,
-    /// variance = alpha*beta / (n^2*(n+1)) = 11 / (144*13) = 0.00587607,
-    /// sqrt(variance) = 0.0766595, lcb = 0.916667 - 0.0766595 = 0.840007.
-    ///
-    /// alpha=901, beta=101 (900-for-1000): mean = 901/1002 = 0.899202,
-    /// variance = 91001 / (1002^2*1003) = 91001 / 1007016012 = 0.0000903668,
-    /// sqrt(variance) = 0.00950614, lcb = 0.899202 - 0.00950614 = 0.889696.
-    #[test]
-    fn lower_confidence_bound_hand_computed() {
-        let lucky = BetaPosterior::new(11.0, 1.0);
-        let seasoned = BetaPosterior::new(901.0, 101.0);
-        assert!(
-            (lower_confidence_bound(&lucky) - 0.840_007).abs() < 1e-5,
-            "lucky lcb = {}",
-            lower_confidence_bound(&lucky)
-        );
-        assert!(
-            (lower_confidence_bound(&seasoned) - 0.889_696).abs() < 1e-5,
-            "seasoned lcb = {}",
-            lower_confidence_bound(&seasoned)
-        );
-    }
-
-    /// BRAIN-0483: a section with one lucky streak (high mean, tiny evidence)
-    /// must not outrank a section with hundreds of observations at a lower raw
-    /// mean once `deterministic_weights` is the permanent scoring path
-    /// (`exploration_epoch == 0`). Raw mean alone gets this backwards
-    /// (0.916667 > 0.899202); the lower-confidence-bound correction flips it
-    /// (0.840007 < 0.889696), matching the evidence.
-    #[test]
-    fn deterministic_weights_does_not_let_a_lucky_streak_beat_seasoned_evidence() {
-        let mut priors = SectionPosteriorState::default_priors();
-        priors.insert(SectionType::Examples, BetaPosterior::new(11.0, 1.0));
-        priors.insert(
-            SectionType::OperationalGuidance,
-            BetaPosterior::new(901.0, 101.0),
-        );
-        let mut state = SectionPosteriorState::from_priors(priors);
-        state.exploration_epoch = 0;
-
-        let raw_mean_examples = state.posteriors[&SectionType::Examples].mean();
-        let raw_mean_og = state.posteriors[&SectionType::OperationalGuidance].mean();
-        assert!(
-            raw_mean_examples > raw_mean_og,
-            "fixture must reproduce the raw-mean inversion: examples={raw_mean_examples:.6} og={raw_mean_og:.6}"
-        );
-
-        let weights = derive_deterministic_weights(&state);
-        let examples = weights[&SectionType::Examples];
-        let og = weights[&SectionType::OperationalGuidance];
-        assert!(
-            og > examples,
-            "seasoned evidence must outrank a lucky streak once corrected: og={og:.6} examples={examples:.6}"
-        );
-    }
-}
+#[path = "section_state_tests.rs"]
+mod tests;

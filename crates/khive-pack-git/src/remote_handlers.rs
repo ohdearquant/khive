@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use khive_pack_tool::policy;
 use khive_runtime::engine_config::GitWriteRepositoryConfig;
 use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::types::{SqlStatement, SqlValue};
@@ -13,7 +12,7 @@ use crate::local_handlers::{
 use crate::receipts::{self, Disposition, Receipt};
 use crate::remote_transport::{ApiRequest, PushRequest, RemoteError};
 use crate::sql::sql;
-use crate::write_argv::{validate_ref_name, validate_repo_path};
+use crate::write_argv::{reject_force, validate_ref_name, validate_repo_path};
 use crate::{credentials, local_git, GitPack};
 
 impl Failure {
@@ -44,6 +43,7 @@ fn keys(verb: &str) -> &'static [&'static str] {
             "branch",
             "expected_local",
             "expected_remote",
+            "force",
             "session_id",
         ],
         "git.pr_open" => &[
@@ -95,6 +95,18 @@ fn validate(verb: &str, params: &Value) -> Result<(), Failure> {
     crate::params::parse(verb, params.clone())
         .map_err(|error| Failure::invalid(error.to_string()))?;
     validate_keys(params, keys(verb))?;
+    if verb == "git.push" {
+        let force = match params.get("force") {
+            None => None,
+            Some(Value::Bool(force)) => Some(*force),
+            Some(_) => return Err(Failure::invalid("force must be a boolean")),
+        };
+        reject_force(force).map_err(|error| Failure {
+            reason: "force_denied",
+            ambiguous: false,
+            detail: Some(error.to_string()),
+        })?;
+    }
     validate_repo_path(Path::new(required(params, "repo")?))
         .map_err(|_| Failure::invalid("repo must be an absolute repository path"))?;
     optional(params, "session_id")?;
@@ -156,6 +168,7 @@ fn safe_inputs(verb: &str, params: &Value) -> Value {
         if let Some(value) = params.get(*key) {
             if value.is_null()
                 || value.is_u64()
+                || (*key == "force" && value.is_boolean())
                 || value.as_str().is_some_and(|s| s.len() <= 1024 * 1024)
             {
                 result.insert((*key).into(), value.clone());
@@ -295,7 +308,7 @@ impl GitPack {
         verb: &str,
         params: Value,
     ) -> Result<Value, RuntimeError> {
-        let actor = policy::actor_label(token);
+        let actor = token.actor().label();
         let mut receipt = Receipt::new(
             token.namespace().as_str(),
             &actor,
@@ -1027,7 +1040,7 @@ impl GitPack {
         };
         if committed {
             prior.disposition = Disposition::Committed;
-            prior.finished_at = Some(chrono::Utc::now().timestamp_micros());
+            prior.finished_at = Some(khive_storage::now_micros());
             prior.reason = None;
             receipts::persist(self.runtime(), prior).await?;
         }

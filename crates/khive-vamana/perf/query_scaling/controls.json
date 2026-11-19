@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "controls": [
+    {
+      "id": "dimension_headers_are_hashed",
+      "mutation": "Remove input_hash.update(&record_buf) from load_fvecs, or hash only decoded f32 bytes.",
+      "must_fail": "fvecs_identity_hashes_the_exact_loaded_file_including_headers"
+    },
+    {
+      "id": "content_identity_is_not_shape",
+      "mutation": "Replace the loader digest with a constant or dimension/count-derived string.",
+      "must_fail": "same_shape_changed_values_change_the_input_identity"
+    },
+    {
+      "id": "small_matrix_is_not_scaling_evidence",
+      "mutation": "Remove the four-point or 10x range refusal from check_run.",
+      "must_fail": "ScalingEvidenceTests.test_bad_matrices_are_refused_even_with_good_reported_fit"
+    },
+    {
+      "id": "flat_curve_is_not_a_growth_verdict",
+      "mutation": "Replace the descriptive shape_conclusion with an automatic sublinear verdict, or use producer-supplied fits.",
+      "must_fail": "ScalingEvidenceTests.test_flat_data_is_not_promoted_to_sublinear_growth"
+    },
+    {
+      "id": "archive_bytes_are_bound",
+      "mutation": "Remove the raw SHA-256 comparison.",
+      "must_fail": "ScalingEvidenceTests.test_raw_archive_tamper_is_refused"
+    },
+    {
+      "id": "quality_and_cohort_must_match",
+      "mutation": "Remove one tested input-identity, commit, recall, saturation, host, config, finite-latency or oracle refusal.",
+      "must_fail": "ScalingEvidenceTests.test_run_corruption_is_refused"
+    }
+  ]
+}

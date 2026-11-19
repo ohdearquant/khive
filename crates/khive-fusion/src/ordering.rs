@@ -12,8 +12,5 @@ pub fn cmp_desc_then_id<Id: Ord>(
     a: &(Id, DeterministicScore),
     b: &(Id, DeterministicScore),
 ) -> Ordering {
-    match b.1.cmp(&a.1) {
-        Ordering::Equal => a.0.cmp(&b.0),
-        other => other,
-    }
+    khive_score::cmp_desc_then_id(a.1, &a.0, b.1, &b.0)
 }

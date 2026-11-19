@@ -26,6 +26,7 @@ fn stdio_mcp_survives_when_the_stderr_consumer_disconnects() {
         .arg("--pack")
         .arg("kg")
         .env("HOME", home.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", home.path().join("volume-locks"))
         // rmcp emits an initialization event at INFO after the request below.
         // Keeping that event enabled makes the regression deterministic even
         // if every startup diagnostic was already written before we close the

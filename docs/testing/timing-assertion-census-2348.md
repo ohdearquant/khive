@@ -101,6 +101,33 @@ file-level exclusions. The existing D rows can still be fragile when the
 test's expected-versus-failure gap is narrow; classification describes the
 source of the bound, not proof that coverage passes.
 
+### Current follow-up status (6 October 2026)
+
+The A rows above retain the original census base and classifications. Subsequent repairs are:
+
+- The MCP forwarding write/read timeout tests in `crates/khive-mcp/src/daemon_tests.rs` now select their bounds through the shared timing helper. Both modes retain an unconditional strict numeric assertion: the 2-second request timeout plus 1 second ordinarily (3 seconds), or three times that timeout under coverage (6 seconds). Both keep the separate 10-second watchdog, outcome classification, stream cleanup, and private-home child isolation. This consolidates policy selection without changing the timing contract or establishing coverage-run acceptance.
+
+- `socket_speaks_khived_protocol_rejects_a_non_protocol_listener` now uses the shared timing helper with `DUPLICATE_PROBE_TIMEOUT * 4`: the ordinary strict bound remains 2 seconds for the production 500 ms timeout. Coverage omits only that numeric assertion. The real non-protocol-listener refusal and cleanup remain, with a separate 30-second hang watchdog in both modes. This is a timeout-derived timing assertion plus a watchdog, not a measured coverage result.
+- The comm hold-time tests already use the shared helper: ordinary runs retain the calibrated median/p95 limits, while coverage omits those numeric gates and retains sample-integrity checks. The calibration remains historical rather than fixture-derived.
+- `test_stalled_request_is_bounded_and_reaped` already gives initialization a separate 2-second startup allowance; the stalled request and reap budgets remain 0.25 seconds. Its setup no longer consumes the request's measured timeout.
+
+### Comm long-poll follow-up (21 October 2026)
+
+The two live absolute-ceiling rows formerly at `comm/tests/integration.rs:502,642`
+are `inbox_long_poll_wakes_after_concurrent_ingest` and
+`inbox_long_poll_returns_immediately_when_matches_exist` in
+`crates/khive-pack-comm/tests/integration.rs`. Both now select a strict bound
+through the shared timing helper: one fifth of their 5-second wait budget
+ordinarily (unchanged `<1 s`), or the midpoint of that budget under coverage
+(`<2.5 s`). Both retain their result assertions and must beat the 5-second
+fallback. Separate 10-second watchdogs guard hangs; they do not replace the
+numeric assertions. The ingest watchdog now aborts and joins its waiter on
+expiry. The original stopwatch boundaries and unrelated-wake checks remain.
+This closes these two absolute-ceiling follow-ups only; selector-branch tests
+without compiler instrumentation do not establish coverage-run acceptance.
+
+These updates do not establish coverage-run acceptance or close the other census follow-ups.
+
 The Python completion-envelope assertion at
 `scripts/tests/test_contract_harness.py:157-167`, called at
 `292,311,349,377,502`, is **D with a fixed scheduling floor**: its formula

@@ -37,13 +37,13 @@ verb-dispatch machinery that lets packs (`kg`, `gtd`, `memory`, …) extend the 
 ## Usage
 
 ```rust
-use khive_runtime::{KhiveRuntime, RuntimeConfig};
+use khive_runtime::KhiveRuntime;
 use khive_types::namespace::Namespace;
 
-// In-memory runtime (tests and pure local embedding). Production callers use
+// In-memory runtime with embedding models disabled. Production callers use
 // khive-mcp/kkernel's async host builders so legacy V21 attachment cutover is
 // completed before any runtime is exposed.
-let runtime = KhiveRuntime::new(RuntimeConfig::default())?;
+let runtime = KhiveRuntime::memory()?;
 
 // Every read/write is scoped by a NamespaceToken minted through the configured Gate.
 let token = runtime.authorize(Namespace::local())?;
@@ -53,7 +53,11 @@ let graph = runtime.graph(&token)?; // Arc<dyn khive_storage::GraphStore>
 
 `KhiveRuntime::new` is suitable for fresh, exact-current, and in-memory
 databases. It deliberately refuses a legacy V20 database that needs verified
-application-assisted migration. Official production boot uses the async
+application-assisted migration, with `RuntimeError::AttachmentCutoverRequired`;
+an embedding host runs `khive_runtime::coordinate_attachment_cutover` over that
+database and then constructs the runtime again. When the database holds legacy
+moodboard preference models, that call needs a legacy-preference verifier and a
+blob hydrator; without them it fails closed and the cutover stays resumable. Official production boot uses the async
 `khive_mcp::serve::build_single_backend_runtime` or multi-backend builders and
 then `KhiveRuntime::from_prepared_backend`. The infallible `from_backend`
 constructor is a low-level assembly seam whose caller must already have

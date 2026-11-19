@@ -1,25 +1,30 @@
-//! Schedule pack vocabulary — handler definitions, param schemas, and auxiliary SQL.
+//! Schedule pack vocabulary — handler definitions and param schemas.
 
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, Visibility};
 
-/// Pack-auxiliary indexes for agenda scans and creator-provenance lookup.
-///
-/// Uses `WHERE deleted_at IS NULL` instead of `WHERE kind = 'scheduled_event'` so
-/// that the parameterized `kind = ?N` predicate in `build_note_filter_where` can
-/// use this index.  A literal-value partial condition (`WHERE kind = 'scheduled_event'`)
-/// is invisible to the planner when the query uses a bound parameter for `kind`.
-/// `namespace` and `kind` are included as indexed columns for efficient namespace+kind
-/// range scans. The statements are idempotent (`CREATE INDEX IF NOT EXISTS`) and are NOT
-/// part of the core versioned migration chain. The second index binds provenance lookup
-/// to namespace + internal verb + target note + outcome, avoiding an event-history scan
-/// for each fired row.
-pub(crate) static SCHEDULE_SCHEMA_PLAN_STMTS: [&str; 2] = [
-    "CREATE INDEX IF NOT EXISTS idx_schedule_trigger \
-        ON notes(namespace, kind, json_extract(properties, '$.trigger_at')) \
-        WHERE deleted_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_schedule_creator_provenance \
-        ON events(namespace, verb, target_id, outcome)",
-];
+const REPEAT_PARAM: ParamDef = ParamDef {
+    name: "repeat",
+    param_type: "string",
+    required: false,
+    description: "Recurrence, evaluated in UTC (never local time): \"daily\" | \"weekly\" | \"monthly\" | \"every:<N><s|m|h|d>\" (an interval from the previous trigger, e.g. \"every:15m\") | a five-field cron expression, minute hour day-of-month month day-of-week in UTC (e.g. \"0 9 * * 1\" is 09:00 UTC on Mondays). Anything else is rejected at creation, so a stored recurrence is always one the executor can advance.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+const MISFIRE_POLICY_PARAM: ParamDef = ParamDef {
+    name: "misfire_policy",
+    param_type: "string",
+    required: false,
+    description: "Missed-occurrence policy: \"skip\" (default, existing global grace) or \"catch_up_once\" (consider only the latest due occurrence). catch_up_once always requires explicit max_lateness, for both one-shot and repeating events.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
+const MAX_LATENESS_PARAM: ParamDef = ParamDef {
+    name: "max_lateness",
+    param_type: "integer",
+    required: false,
+    description: "Required with catch_up_once: a positive, representable integer number of seconds. Equality is admitted. No period-derived default; rejected with skip or omitted misfire_policy.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
 
 pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
     HandlerDef {
@@ -42,13 +47,9 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
                 description: "Trigger time in RFC 3339 format (e.g. \"2026-06-01T09:00:00Z\"). Must not be empty.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
-            ParamDef {
-                name: "repeat",
-                param_type: "string",
-                required: false,
-                description: "Recurrence, evaluated in UTC (never local time): \"daily\" | \"weekly\" | \"monthly\" | \"every:<N><s|m|h|d>\" (an interval from the previous trigger, e.g. \"every:15m\") | a five-field cron expression, minute hour day-of-month month day-of-week in UTC (e.g. \"0 9 * * 1\" is 09:00 UTC on Mondays). Anything else is rejected at creation, so a stored recurrence is always one the executor can advance.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            REPEAT_PARAM,
+            MISFIRE_POLICY_PARAM,
+            MAX_LATENESS_PARAM,
         ],
     },
     HandlerDef {
@@ -94,18 +95,14 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
                                requires (see the handler description). Must not be empty.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
-            ParamDef {
-                name: "repeat",
-                param_type: "string",
-                required: false,
-                description: "Recurrence, evaluated in UTC (never local time): \"daily\" | \"weekly\" | \"monthly\" | \"every:<N><s|m|h|d>\" (an interval from the previous trigger, e.g. \"every:15m\") | a five-field cron expression, minute hour day-of-month month day-of-week in UTC (e.g. \"0 9 * * 1\" is 09:00 UTC on Mondays). Anything else is rejected at creation, so a stored recurrence is always one the executor can advance.",
-                resolution_mode: IdResolutionMode::NotApplicable,
-            },
+            REPEAT_PARAM,
+            MISFIRE_POLICY_PARAM,
+            MAX_LATENESS_PARAM,
         ],
     },
     HandlerDef {
         name: "schedule.agenda",
-        description: "List upcoming scheduled events.",
+        description: "List upcoming scheduled events ordered by UTC trigger instant, stored timestamp text, then UUID. Round-trip non-null next.after verbatim and next.after_id with the same time window until an empty page returns next=null; continuation is exclusive and does not pin a snapshot or promise more rows.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -113,14 +110,28 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
                 name: "from",
                 param_type: "string",
                 required: false,
-                description: "Start of time window in RFC 3339 format. Omit to start from earliest pending event.",
+                description: "Inclusive start of time window in RFC 3339 format. Omit to start from earliest pending event.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "to",
                 param_type: "string",
                 required: false,
-                description: "End of time window in RFC 3339 format. Omit to include all future events.",
+                description: "Inclusive end of time window in RFC 3339 format. Omit to include all future events.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "after",
+                param_type: "string",
+                required: false,
+                description: "Exclusive continuation timestamp in RFC 3339 format, returned as next.after. Preserve its original text and supply together with after_id; existing from/to filters still apply.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "after_id",
+                param_type: "string",
+                required: false,
+                description: "Continuation UUID, returned as next.after_id. Supply together with after; UUID breaks ties with the same UTC instant and stored timestamp text.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

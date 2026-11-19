@@ -50,13 +50,40 @@ struct QueryMetrics {
     mrr: f64,
 }
 
+/// One answer for every way a query set can fail to open, so the error does not
+/// say whether the path exists, is a directory, or is unreadable.
+fn cannot_open(path: &Path) -> RuntimeError {
+    RuntimeError::InvalidInput(format!(
+        "knowledge.eval_retrieval: cannot open query set {}",
+        path.display()
+    ))
+}
+
+/// The parser's own message can quote the file (a value, a key, the offending
+/// line), so a parse failure is reported by position only.
+fn parse_error(path: &Path, contents: &str, error: &toml::de::Error) -> RuntimeError {
+    let position = error
+        .span()
+        .and_then(|span| contents.get(..span.start))
+        .map(|before| {
+            let line = before.matches('\n').count() + 1;
+            let column = before
+                .rsplit('\n')
+                .next()
+                .map_or(0, |tail| tail.chars().count())
+                + 1;
+            format!(" at line {line}, column {column}")
+        })
+        .unwrap_or_default();
+    RuntimeError::InvalidInput(format!(
+        "knowledge.eval_retrieval: query set {} is not a valid query set{position}",
+        path.display()
+    ))
+}
+
 fn parse_query_set(path: &Path, contents: &str) -> Result<Vec<ValidatedQuery>, RuntimeError> {
-    let parsed: QuerySetFile = toml::from_str(contents).map_err(|error| {
-        RuntimeError::InvalidInput(format!(
-            "knowledge.eval_retrieval: invalid TOML syntax in query set {}: {error}",
-            path.display()
-        ))
-    })?;
+    let parsed: QuerySetFile =
+        toml::from_str(contents).map_err(|error| parse_error(path, contents, &error))?;
     if parsed.queries.is_empty() {
         return Err(RuntimeError::InvalidInput(format!(
             "knowledge.eval_retrieval: query set {} contains no queries",
@@ -144,30 +171,15 @@ impl KnowledgeHandlers {
         }
         let query_set = tokio::fs::canonicalize(&requested_query_set)
             .await
-            .map_err(|error| {
-                RuntimeError::InvalidInput(format!(
-                    "knowledge.eval_retrieval: cannot resolve query set {}: {error}",
-                    requested_query_set.display()
-                ))
-            })?;
+            .map_err(|_| cannot_open(&requested_query_set))?;
         let persisted_query_set = query_set
             .to_str()
-            .ok_or_else(|| {
-                RuntimeError::InvalidInput(format!(
-                    "knowledge.eval_retrieval: canonical query-set path is not valid UTF-8: {}",
-                    query_set.display()
-                ))
-            })?
+            .ok_or_else(|| cannot_open(&requested_query_set))?
             .to_owned();
         let contents = tokio::fs::read_to_string(&query_set)
             .await
-            .map_err(|error| {
-                RuntimeError::InvalidInput(format!(
-                    "knowledge.eval_retrieval: cannot read query set {}: {error}",
-                    query_set.display()
-                ))
-            })?;
-        let queries = parse_query_set(&query_set, &contents)?;
+            .map_err(|_| cannot_open(&requested_query_set))?;
+        let queries = parse_query_set(&requested_query_set, &contents)?;
 
         let mut precision_at_5 = 0.0;
         let mut recall_at_5 = 0.0;
@@ -229,11 +241,7 @@ impl KnowledgeHandlers {
             .map_err(|error| sql_err("eval_retrieval writer", error))?;
         writer
             .execute(SqlStatement {
-                sql: "INSERT INTO knowledge_eval_runs \
-                      (id, namespace, run_at, query_set, total_queries, precision_at_5, \
-                       recall_at_5, mrr, notes) \
-                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_eval_run_insert").into(),
                 params: vec![
                     SqlValue::Text(run_id.clone()),
                     SqlValue::Text(namespace),
@@ -260,71 +268,5 @@ impl KnowledgeHandlers {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn expected_set_metrics_use_fixed_k_and_ranked_first_hit() {
-        let expected = HashSet::from(["alpha".to_string(), "beta".to_string()]);
-        let returned = vec!["noise".to_string(), "beta".to_string(), "alpha".to_string()];
-        let metrics = score_query(&expected, &returned);
-        assert_eq!(metrics.precision_at_5, 0.4);
-        assert_eq!(metrics.recall_at_5, 1.0);
-        assert_eq!(metrics.mrr, 0.5);
-    }
-
-    #[test]
-    fn results_beyond_fixed_k_do_not_count() {
-        let expected = HashSet::from(["expected".to_string()]);
-        let returned = ["a", "b", "c", "d", "e", "expected"]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        let metrics = score_query(&expected, &returned);
-        assert_eq!(metrics.precision_at_5, 0.0);
-        assert_eq!(metrics.recall_at_5, 0.0);
-        assert_eq!(metrics.mrr, 0.0);
-    }
-
-    #[test]
-    fn query_set_validation_names_the_invalid_entry() {
-        let error = parse_query_set(
-            Path::new("fixture.toml"),
-            r#"
-                [[queries]]
-                query = "valid"
-                expected_slugs = ["alpha"]
-
-                [[queries]]
-                query = " "
-                expected_slugs = ["beta"]
-            "#,
-        )
-        .expect_err("blank query must fail");
-        let message = error.to_string();
-        assert!(message.contains("fixture.toml"));
-        assert!(message.contains("[1]"));
-    }
-
-    #[test]
-    fn empty_query_set_is_a_whole_file_validation_error() {
-        for contents in ["", "# no queries yet\n"] {
-            let error = parse_query_set(Path::new("fixture.toml"), contents)
-                .expect_err("query set without entries must fail");
-            let message = error.to_string();
-            assert!(message.contains("fixture.toml"));
-            assert!(message.contains("contains no queries"));
-            assert!(!message.contains("invalid TOML syntax"));
-        }
-    }
-
-    #[test]
-    fn shipped_query_set_is_valid_and_publicly_bounded() {
-        let queries = parse_query_set(
-            Path::new("eval_set.toml"),
-            include_str!("../../tests/fixtures/eval_set.toml"),
-        )
-        .expect("shipped query set must validate");
-        assert_eq!(queries.len(), 10);
-    }
-}
+#[path = "eval_tests.rs"]
+mod tests;

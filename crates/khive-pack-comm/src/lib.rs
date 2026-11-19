@@ -1,16 +1,22 @@
-//! pack-comm — Communication pack providing ten public `comm.*` verbs.
+//! pack-comm — Communication pack providing fifteen public `comm.*` verbs.
 
 mod file_attachments;
 pub mod handlers;
 pub(crate) mod idempotency;
 pub(crate) mod inbox_signal;
 pub(crate) mod message;
+pub mod node_route;
 pub(crate) mod pack;
 pub(crate) mod params;
 pub(crate) mod vocab;
 
+pub use handlers::{record_outbox_scan, OutboxScan, OutboxScanOutcome};
 pub use pack::CommPack;
 
+#[cfg(test)]
+mod channel_route_tests;
+#[cfg(test)]
+mod email_admission_tests;
 #[cfg(test)]
 mod idempotency_tests;
 #[cfg(test)]
@@ -28,3 +34,6 @@ mod inbox_filter_tests;
 /// See crates/khive-pack-comm/docs/api/channel-health.md#librschannel_health_namespace--rationale
 /// for the incident history (khive #606, #877, #917).
 pub const CHANNEL_HEALTH_NAMESPACE: &str = "local";
+
+#[cfg(test)]
+mod poll_result_contract_tests;

@@ -75,6 +75,57 @@ async fn latest_annotating_note_default_refuses_without_silent_history_scan() {
     ));
 }
 
+#[tokio::test]
+async fn symmetric_update_default_refuses_without_upserting() {
+    use khive_storage::graph::SymmetricEdgeUpdateRequest;
+
+    let edge = make_edge("record-owner", Uuid::new_v4(), 100);
+    let before = serde_json::to_value(&edge).unwrap();
+    let store = TraitDefaultOnlyGraphStore::new(vec![edge.clone()]);
+    let error = store
+        .update_symmetric_edge_if_unchanged(SymmetricEdgeUpdateRequest {
+            namespace: edge.namespace,
+            id: edge.id,
+            source_id: Uuid::from_u128(1),
+            target_id: Uuid::from_u128(2),
+            relation: EdgeRelation::CompetesWith,
+            weight: 0.9,
+            metadata: None,
+            expected_updated_at_micros: 100,
+            expected_deleted_at_micros: None,
+        })
+        .await
+        .expect_err("a backend must explicitly implement the transaction");
+    assert!(matches!(error, StorageError::Unsupported {
+        capability: StorageCapability::Graph, operation, ..
+    } if operation == "update_symmetric_edge_if_unchanged"));
+    assert_eq!(
+        serde_json::to_value(&*store.edges.lock().unwrap()).unwrap(),
+        serde_json::json!([before]),
+        "neither an upsert fallback nor any other mutation is permitted"
+    );
+}
+
+/// The runtime's `stats` read falls back to the three single-purpose edge
+/// counts only on this exact operation name, so a backend without the combined
+/// aggregate must report it under that name.
+#[tokio::test]
+async fn combined_edge_count_default_refuses_by_name() {
+    let store = TraitDefaultOnlyGraphStore::new(Vec::new());
+    let error = store
+        .count_edges_by_relation_and_endpoint_base_in_namespaces(&["default".to_string()])
+        .await
+        .expect_err("a backend without the combined aggregate must report Unsupported");
+    assert!(matches!(
+        error,
+        StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation,
+            ..
+        } if operation == "count_edges_by_relation_and_endpoint_base_in_namespaces"
+    ));
+}
+
 #[async_trait]
 impl GraphStore for TraitDefaultOnlyGraphStore {
     async fn upsert_edge(&self, edge: Edge) -> StorageResult<()> {

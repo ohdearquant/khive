@@ -2,6 +2,10 @@
 
 use std::sync::Arc;
 
+#[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
+mod receipt_credentials;
+pub(crate) use receipt_credentials::with_receipt_credentials;
+
 use async_trait::async_trait;
 use khive_runtime::EmbedderProvider;
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};

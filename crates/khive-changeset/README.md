@@ -22,7 +22,7 @@ artifact itself — nothing about how it is validated, tiered, reviewed, or comm
   provenance trailer; when absent, the committing tool derives a deterministic fallback from
   `producer` and `staged_at` instead. Absent by default and never serialized (not even as
   `null`) — round-tripping an envelope without one leaves it unset.
-- **`Op`** — one of five typed operations, over the same entity/edge/note vocabulary and
+- **`Op`** — one of six typed operations, over the same entity/edge/note vocabulary and
   edge-endpoint contract the live request DSL already uses:
   - `Create` — mints a stage-time-stable `Id128` for a new entity or note.
   - `Link` — creates a new edge; `source`/`target` may reference another op's minted id.
@@ -37,6 +37,7 @@ artifact itself — nothing about how it is validated, tiered, reviewed, or comm
   - `Delete` — removes an entity, note, or edge. Carries the full prior record state as a
     **required** field (`preimage`); a `delete` op without one cannot be constructed or
     deserialized.
+  - `Restore` — restores a soft-deleted row using a strict full expected live record; see [restore](docs/api/restore.md) for lifecycle and inversion limits.
   - `Merge` — merges two entities. Carries both prior entities and the incident edges the
     merge will rewire as a **required** field, for the same reason.
 

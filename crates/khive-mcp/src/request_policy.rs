@@ -105,6 +105,7 @@ mod tests {
         }
         for ops in [
             "comm.read(id=\"x\")",
+            "apply_changeset(delta=\"original complete delta\")",
             "memory.recall(query=\"x\")",
             "search(query=\"x\")",
             "tool.check(tool=\"x\")",

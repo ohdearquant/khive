@@ -58,7 +58,7 @@ impl TryFrom<EdgeRecordRaw> for EdgeRecord {
                 raw.weight
             ));
         }
-        if !(0.0..=1.0).contains(&raw.weight) {
+        if !khive_types::validate_edge_weight(raw.weight) {
             return Err(format!(
                 "EdgeRecord: weight must be in [0.0, 1.0], got {}",
                 raw.weight

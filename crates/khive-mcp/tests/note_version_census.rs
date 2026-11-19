@@ -1,3 +1,4 @@
+use khive_db::test_hooks::TestHooks;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -6,18 +7,47 @@ use rusqlite::{params, Connection};
 use syn::parse::Parser;
 use syn::visit::Visit;
 
+use khive_db::stores::note::note_due_key_values;
+
+#[path = "../../khive-db/src/stores/note/guarded_patch.rs"]
+mod guarded_note_patch;
+
+#[path = "../../khive-runtime/tests/support/static_sql_source.rs"]
+mod static_sql_source;
+use static_sql_source::{CanonicalBindings, StaticSqlSources};
+
+const LEGACY_SQL_WRITERS: &[&str] = &[
+    "khive-db/sql/005-unique-comm-external-id.sql",
+    "khive-db/sql/031-note-versions.sql",
+    "khive-db/sql/notes-ddl.sql",
+];
+const APPLICATION_SQL_WRITERS: &[(&str, &str, &str)] = &[
+    (
+        "khive-pack-gtd/sql/task-transition-update.sql",
+        GTD,
+        "gtd_transition_statement",
+    ),
+    (
+        "khive-pack-gtd/sql/task-repair-update.sql",
+        GTD_REPAIR,
+        "checked_update_sql",
+    ),
+];
+
 const DB: &str = "khive-db/src/stores/note.rs";
+const PROPERTY_CAS: &str = "khive-db/src/statement_lists.rs";
 const MIGRATIONS: &str = "khive-db/src/migrations.rs";
-const EVENTS: &str = "khive-mcp/src/pending_events.rs";
+const RECLAIM: &str = "khive-mcp/src/pending_events/reclaim.rs";
+const RECEIPTS: &str = "khive-mcp/src/pending_events/receipt.rs";
 const GTD: &str = "khive-pack-gtd/src/handlers.rs";
 const GTD_REPAIR: &str = "khive-pack-gtd/src/repair.rs";
-const SCHEDULE: &str = "khive-pack-schedule/src/handlers.rs";
-const CURATION: &str = "khive-runtime/src/curation.rs";
+const CURATION: &str = "khive-runtime/src/curation/merge_sql.rs";
 const CREATE: &str = "khive-runtime/src/note_create.rs";
 const OPERATIONS: &str = "khive-runtime/src/operations.rs";
 const MESSAGE: &str = "khive-runtime/src/keyed_message.rs";
 const FAULT: &str = "khive-runtime/src/atomic_message.rs";
-const COMM: &str = "khive-pack-comm/src/handlers.rs";
+const COMM_HEARTBEAT: &str = "khive-pack-comm/src/handlers/quarantine_heartbeat.rs";
+const GUARDED_PATCH: &str = "khive-db/src/stores/note/guarded_patch.rs";
 const ID: &str = "00000000-0000-4000-8000-000000000001";
 
 fn words(sql: &str) -> Vec<String> {
@@ -96,6 +126,153 @@ fn note_insert_columns(words: &[String]) -> Option<usize> {
         .get(table)
         .is_some_and(|w| w == "NOTES")
         .then_some(table + 1)
+}
+
+#[derive(Debug)]
+enum InitializerToken {
+    Word(String),
+    Quoted(String),
+    Symbol(char),
+}
+
+impl InitializerToken {
+    fn keyword(&self, expected: &str) -> bool {
+        matches!(self, Self::Word(word) if word.eq_ignore_ascii_case(expected))
+    }
+
+    fn identifier(&self) -> Option<&str> {
+        match self {
+            Self::Word(word) | Self::Quoted(word) => Some(word),
+            Self::Symbol(_) => None,
+        }
+    }
+
+    fn symbol(&self, expected: char) -> bool {
+        matches!(self, Self::Symbol(symbol) if *symbol == expected)
+    }
+}
+
+fn initializer_tokens(sql: &str) -> Vec<InitializerToken> {
+    let mut input = sql.chars().peekable();
+    let mut tokens = Vec::new();
+    let identifier_char =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '$') || !c.is_ascii();
+    while let Some(c) = input.next() {
+        if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c' | '\u{feff}') {
+            continue;
+        }
+        if c == '-' && input.peek() == Some(&'-') {
+            for c in input.by_ref() {
+                if c == '\n' {
+                    break;
+                }
+            }
+        } else if c == '/' && input.peek() == Some(&'*') {
+            input.next();
+            // SQLite block comments end at the first closing pair; they do not nest.
+            while let Some(c) = input.next() {
+                if c == '*' && input.peek() == Some(&'/') {
+                    input.next();
+                    break;
+                }
+            }
+        } else if matches!(c, '\'' | '"' | '`' | '[') {
+            let close = if c == '[' { ']' } else { c };
+            let mut quoted = String::new();
+            while let Some(next) = input.next() {
+                if next == close {
+                    if close != ']' && input.peek() == Some(&close) {
+                        input.next();
+                    } else {
+                        break;
+                    }
+                }
+                quoted.push(next);
+            }
+            // Single quotes may denote identifiers in SQLite identifier positions,
+            // but no quoted token may start an INSERT or stand in for INTO.
+            tokens.push(InitializerToken::Quoted(quoted));
+        } else if identifier_char(c) {
+            let mut word = String::from(c);
+            while input.peek().is_some_and(|c| identifier_char(*c)) {
+                word.push(input.next().unwrap());
+            }
+            tokens.push(InitializerToken::Word(word));
+        } else {
+            tokens.push(InitializerToken::Symbol(c));
+        }
+    }
+    tokens
+}
+
+fn initializer_columns_at(tokens: &[InitializerToken], start: usize) -> Option<usize> {
+    let mut at = start + 1;
+    if tokens[start].keyword("INSERT") {
+        if tokens.get(at).is_some_and(|token| token.keyword("OR")) {
+            at += 1;
+            if !tokens.get(at).is_some_and(|token| {
+                ["ROLLBACK", "ABORT", "REPLACE", "FAIL", "IGNORE"]
+                    .iter()
+                    .any(|action| token.keyword(action))
+            }) {
+                return None;
+            }
+            at += 1;
+        }
+    } else if !tokens[start].keyword("REPLACE") {
+        return None;
+    }
+    if !tokens.get(at).is_some_and(|token| token.keyword("INTO")) {
+        return None;
+    }
+    at += 1;
+    let first = tokens.get(at)?.identifier()?;
+    at += 1;
+    let table = if tokens.get(at).is_some_and(|token| token.symbol('.')) {
+        if !first.eq_ignore_ascii_case("MAIN") {
+            return None;
+        }
+        at += 1;
+        let table = tokens.get(at)?.identifier()?;
+        at += 1;
+        table
+    } else {
+        first
+    };
+    if !table.eq_ignore_ascii_case("NOTES") {
+        return None;
+    }
+    if tokens.get(at).is_some_and(|token| token.keyword("AS")) {
+        at += 1;
+        tokens.get(at)?.identifier()?;
+        at += 1;
+    }
+    tokens
+        .get(at)
+        .is_some_and(|token| token.symbol('('))
+        .then_some(at + 1)
+}
+
+fn assert_note_version_implicit(sql: &str, owner: &str) {
+    let tokens = initializer_tokens(sql);
+    for start in 0..tokens.len() {
+        let Some(mut column) = initializer_columns_at(&tokens, start) else {
+            continue;
+        };
+        while let Some(name) = tokens.get(column).and_then(InitializerToken::identifier) {
+            assert!(
+                !name.eq_ignore_ascii_case("VERSION"),
+                "{owner} explicitly initializes note.version"
+            );
+            if !tokens
+                .get(column + 1)
+                .is_some_and(|token| token.symbol(','))
+            {
+                break;
+            }
+            column += 2;
+        }
+    }
 }
 
 fn starts_with_ci(bytes: &[u8], at: usize, needle: &[u8]) -> bool {
@@ -229,6 +406,9 @@ fn assignments_rule_out_version(sql: &str) -> bool {
 fn test_only(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| {
         a.path().is_ident("test")
+            || (a.path().segments.len() == 2
+                && a.path().segments[0].ident == "tokio"
+                && a.path().segments[1].ident == "test")
             || (a.path().is_ident("cfg")
                 && a.parse_args::<syn::Path>()
                     .is_ok_and(|p| p.is_ident("test")))
@@ -236,18 +416,26 @@ fn test_only(attrs: &[syn::Attribute]) -> bool {
 }
 
 #[derive(Default)]
-struct Scanner {
+struct Scanner<'a> {
     owner: String,
     statements: Vec<(String, String)>,
+    source_path: String,
+    sql_sources: Option<&'a StaticSqlSources>,
+    loader_bindings: CanonicalBindings,
+    loaded_writers: Vec<(String, String)>,
+    markerless_calls: BTreeSet<(String, String)>,
+    recipient_stores: BTreeSet<String>,
 }
 
-impl<'ast> Visit<'ast> for Scanner {
+impl<'ast> Visit<'ast> for Scanner<'_> {
     fn visit_attribute(&mut self, _: &'ast syn::Attribute) {}
 
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
         if !test_only(&item.attrs) {
             let old = std::mem::replace(&mut self.owner, item.sig.ident.to_string());
+            let stores = std::mem::take(&mut self.recipient_stores);
             syn::visit::visit_item_fn(self, item);
+            self.recipient_stores = stores;
             self.owner = old;
         }
     }
@@ -255,7 +443,9 @@ impl<'ast> Visit<'ast> for Scanner {
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
         if !test_only(&item.attrs) {
             let old = std::mem::replace(&mut self.owner, item.sig.ident.to_string());
+            let stores = std::mem::take(&mut self.recipient_stores);
             syn::visit::visit_impl_item_fn(self, item);
+            self.recipient_stores = stores;
             self.owner = old;
         }
     }
@@ -270,14 +460,95 @@ impl<'ast> Visit<'ast> for Scanner {
 
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         if !test_only(&item.attrs) {
+            let nested = static_sql_source::module_bindings(item, &self.loader_bindings, test_only);
+            let old = std::mem::replace(&mut self.loader_bindings, nested);
             syn::visit::visit_item_mod(self, item);
+            self.loader_bindings = old;
+            self.loader_bindings.observe_module(item);
         }
+    }
+
+    fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+        if !test_only(&item.attrs) {
+            self.loader_bindings.observe_macro(item);
+            syn::visit::visit_item_macro(self, item);
+        }
+    }
+
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        let nested = static_sql_source::block_bindings(block, &self.loader_bindings, test_only);
+        let old = std::mem::replace(&mut self.loader_bindings, nested);
+        syn::visit::visit_block(self, block);
+        self.loader_bindings = old;
     }
 
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
         if !test_only(&item.attrs) {
             syn::visit::visit_item_impl(self, item);
         }
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if let (syn::Pat::Ident(binding), Some(init)) = (&local.pat, &local.init) {
+            if let syn::Expr::Call(call) = init.expr.as_ref() {
+                if let syn::Expr::Path(path) = call.func.as_ref() {
+                    let parts: Vec<_> = path
+                        .path
+                        .segments
+                        .iter()
+                        .map(|part| part.ident.to_string())
+                        .collect();
+                    if parts.ends_with(&["RecipientTransportStore".into(), "new".into()]) {
+                        self.recipient_stores.insert(binding.ident.to_string());
+                    }
+                }
+            }
+        }
+        syn::visit::visit_local(self, local);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        let method = call.method.to_string();
+        if markerless_route(&method) {
+            self.markerless_calls.insert((self.owner.clone(), method));
+        } else if method == "commit" {
+            let known_receiver = matches!(call.receiver.as_ref(), syn::Expr::Path(path)
+                if path
+                    .path
+                    .get_ident()
+                    .is_some_and(|name| self.recipient_stores.contains(&name.to_string()))
+            );
+            let recipient_argument = call.args.iter().any(|arg| {
+                matches!(arg, syn::Expr::Struct(value)
+                if value.path.segments.last().is_some_and(|part| part.ident == "RecipientCommit"))
+            });
+            if known_receiver || recipient_argument {
+                self.markerless_calls
+                    .insert((self.owner.clone(), "RecipientTransportStore::commit".into()));
+            }
+        }
+        syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = call.func.as_ref() {
+            if let Some(last) = path.path.segments.last() {
+                let name = last.ident.to_string();
+                if markerless_route(&name) {
+                    self.markerless_calls.insert((self.owner.clone(), name));
+                } else if name == "commit"
+                    && path
+                        .path
+                        .segments
+                        .iter()
+                        .any(|part| part.ident == "RecipientTransportStore")
+                {
+                    self.markerless_calls
+                        .insert((self.owner.clone(), "RecipientTransportStore::commit".into()));
+                }
+            }
+        }
+        syn::visit::visit_expr_call(self, call);
     }
 
     fn visit_expr_block(&mut self, item: &'ast syn::ExprBlock) {
@@ -287,6 +558,35 @@ impl<'ast> Visit<'ast> for Scanner {
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        let empty = StaticSqlSources::new();
+        if let Some(sql) = static_sql_source::resolve_static_sql(
+            &self.source_path,
+            mac,
+            self.sql_sources.unwrap_or(&empty),
+            &self.loader_bindings,
+        )
+        .unwrap_or_else(|error| panic!("{error}"))
+        {
+            if !LEGACY_SQL_WRITERS.contains(&sql.asset_path.as_str()) {
+                if note_writer(&sql.produced_text) {
+                    self.loaded_writers
+                        .push((sql.asset_path, self.owner.clone()));
+                }
+                self.process_sql(sql.produced_text);
+            }
+            return;
+        }
+        if mac.path.is_ident("vec") {
+            let expression = syn::parse_str::<syn::Expr>(&format!("[{}]", mac.tokens))
+                .unwrap_or_else(|error| panic!("{}: invalid vec! body: {error}", self.source_path));
+            self.visit_expr(&expression);
+            return;
+        }
+        assert!(
+            !static_sql_source::opaque_sql_loader(mac),
+            "{}: uninspectable nested SQL loader",
+            self.source_path
+        );
         // SQL commonly lives inside format!/vec!, whose bodies Visit leaves opaque.
         let args = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
             .parse2(mac.tokens.clone());
@@ -334,7 +634,12 @@ impl<'ast> Visit<'ast> for Scanner {
     }
 
     fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
-        let sql = literal.value();
+        self.process_sql(literal.value());
+    }
+}
+
+impl Scanner<'_> {
+    fn process_sql(&mut self, sql: String) {
         let tokens = words(&sql);
         if tokens.first().is_some_and(|w| w == "UPDATE") && tokens.iter().any(|w| w == "SET") {
             let target = sql
@@ -346,23 +651,236 @@ impl<'ast> Visit<'ast> for Scanner {
                 self.owner
             );
         }
-        if let Some(start) = note_insert_columns(&tokens) {
-            let columns = &tokens[start..];
-            let end = columns
-                .iter()
-                .position(|w| w == "VALUES" || w == "SELECT")
-                .unwrap_or(columns.len());
-            assert!(
-                !columns[..end].iter().any(|w| w == "VERSION"),
-                "{} explicitly initializes note.version",
-                self.owner
-            );
-        }
+        assert_note_version_implicit(&sql, &self.owner);
         if note_writer(&sql) {
             assert!(!self.owner.is_empty(), "note writer needs a named owner");
             self.statements.push((self.owner.clone(), sql));
         }
     }
+}
+
+fn markerless_route(name: &str) -> bool {
+    matches!(
+        name,
+        "upsert_note"
+            | "insert_note_if_absent"
+            | "try_insert_note"
+            | "try_insert_note_with_attachments"
+            | "upsert_notes"
+            | "batch_upsert_notes"
+            | "note_upsert_statement"
+            | "note_insert_if_absent_statement"
+            | "note_insert_keyed_statement"
+    )
+}
+
+#[derive(Clone, Copy)]
+enum MarkerDisposition {
+    StorageConstructor,
+    UnkeyedNote,
+    FixedNonMemoryKind,
+    RuntimeReceiptUnit,
+    RestoredExport,
+}
+
+// ADR-144 A4: only RuntimeReceiptUnit adds modern atomically; constructors and
+// forwarding wrappers do not infer provenance from the current binary.
+const MARKERLESS_CALLERS: &[(&str, &str, &str, MarkerDisposition)] = &[
+    (
+        "khive-db/src/backend/core_stores/note.rs",
+        "upsert_note",
+        "upsert_note",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        "khive-db/src/backend/core_stores/note.rs",
+        "insert_note_if_absent",
+        "insert_note_if_absent",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        "khive-db/src/backend/core_stores/note.rs",
+        "upsert_notes",
+        "upsert_notes",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        "khive-db/src/backend/core_stores/note.rs",
+        "try_insert_note",
+        "try_insert_note",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        "khive-db/src/backend/core_stores/note.rs",
+        "try_insert_note_with_attachments",
+        "try_insert_note_with_attachments",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        DB,
+        "note_insert_if_absent_statement",
+        "note_upsert_statement",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        DB,
+        "note_insert_keyed_statement",
+        "note_upsert_statement",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        DB,
+        "upsert_note",
+        "note_upsert_statement",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        DB,
+        "insert_note_if_absent",
+        "note_insert_if_absent_statement",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        DB,
+        "try_insert_note",
+        "try_insert_note_with_attachments",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        DB,
+        "upsert_notes",
+        "batch_upsert_notes",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        "khive-runtime/src/note_store_guard.rs",
+        "upsert_note",
+        "upsert_note",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        "khive-runtime/src/note_store_guard.rs",
+        "insert_note_if_absent",
+        "insert_note_if_absent",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        "khive-runtime/src/note_store_guard.rs",
+        "upsert_notes",
+        "upsert_notes",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        "khive-runtime/src/note_store_guard.rs",
+        "try_insert_note",
+        "try_insert_note",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        OPERATIONS,
+        "create_note_inner",
+        "upsert_note",
+        MarkerDisposition::UnkeyedNote,
+    ),
+    (
+        OPERATIONS,
+        "try_create_note_impl",
+        "try_insert_note",
+        MarkerDisposition::UnkeyedNote,
+    ),
+    (
+        OPERATIONS,
+        "try_create_note_impl",
+        "try_insert_note_with_attachments",
+        MarkerDisposition::UnkeyedNote,
+    ),
+    (
+        COMM_HEARTBEAT,
+        "persist_heartbeat",
+        "insert_note_if_absent",
+        MarkerDisposition::FixedNonMemoryKind,
+    ),
+    (
+        "kkernel/src/code_ingest.rs",
+        "persist_ingest_note",
+        "upsert_note",
+        MarkerDisposition::FixedNonMemoryKind,
+    ),
+    // The note importer re-inserts exported rows, keyed memories included,
+    // under their original ids and writes no epoch marker. A restored keyed
+    // memory therefore has missing provenance: exact replay of its key fails
+    // with reason receipt_epoch_unknown, and recall is unchanged.
+    (
+        "kkernel/src/import_notes.rs",
+        "run",
+        "insert_note_if_absent",
+        MarkerDisposition::RestoredExport,
+    ),
+    // The atomic note create and the canonical create share one builder: an
+    // ordinary create upserts, a canonical create inserts under its staged
+    // identifier. Neither carries a key.
+    (
+        "khive-runtime/src/atomic_prepare/add_update.rs",
+        "prepare_add_note_record",
+        "note_upsert_statement",
+        MarkerDisposition::UnkeyedNote,
+    ),
+    (
+        "khive-runtime/src/atomic_prepare/add_update.rs",
+        "prepare_add_note_record",
+        "note_insert_if_absent_statement",
+        MarkerDisposition::UnkeyedNote,
+    ),
+    (
+        MESSAGE,
+        "create_keyed_message_pair_with_extra_statements",
+        "note_insert_if_absent_statement",
+        MarkerDisposition::FixedNonMemoryKind,
+    ),
+    (
+        FAULT,
+        "prepare_atomic_note_requests",
+        "note_insert_keyed_statement",
+        MarkerDisposition::RuntimeReceiptUnit,
+    ),
+    (
+        FAULT,
+        "prepare_atomic_note_requests",
+        "note_upsert_statement",
+        MarkerDisposition::RuntimeReceiptUnit,
+    ),
+    (
+        CREATE,
+        "prepare_note_create_classified",
+        "note_insert_if_absent_statement",
+        MarkerDisposition::RuntimeReceiptUnit,
+    ),
+    (
+        "khive-runtime/src/comm_recipient.rs",
+        "ingest_verified_recipient",
+        "RecipientTransportStore::commit",
+        MarkerDisposition::FixedNonMemoryKind,
+    ),
+];
+
+fn assert_markerless_callers(
+    found: &MarkerlessCalls,
+    inventory: &[(&str, &str, &str, MarkerDisposition)],
+) {
+    assert!(!found.is_empty(), "markerless note-route coverage is empty");
+    let expected = inventory
+        .iter()
+        .map(|(path, owner, route, _)| (path.to_string(), owner.to_string(), route.to_string()))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        expected.len(),
+        inventory.len(),
+        "duplicate markerless caller disposition"
+    );
+    assert_eq!(
+        *found, expected,
+        "every markerless note-route caller needs an explicit disposition"
+    );
 }
 
 fn root() -> PathBuf {
@@ -382,75 +900,167 @@ fn files(dir: &Path, extension: &str, output: &mut Vec<PathBuf>) {
             ) {
                 files(&path, extension, output);
             }
-        } else if path.extension().is_some_and(|e| e == extension)
-            && !path
-                .file_stem()
-                .unwrap()
-                .to_string_lossy()
-                .ends_with("_tests")
-        {
+        } else if path.extension().is_some_and(|e| e == extension) && {
+            // Test-only modules are `<name>_tests.rs` or a directory module's `tests.rs`.
+            let stem = path.file_stem().unwrap().to_string_lossy();
+            !stem.ends_with("_tests") && stem != "tests"
+        } {
             output.push(path);
         }
     }
 }
 
-fn census() -> BTreeMap<(String, String), String> {
+fn live_sql_sources() -> StaticSqlSources {
     let root = root();
-    let mut sources = Vec::new();
+    let mut paths = Vec::new();
     for entry in std::fs::read_dir(&root).unwrap() {
-        let src = entry.unwrap().path().join("src");
-        if src.is_dir() {
-            files(&src, "rs", &mut sources);
+        let sql = entry.unwrap().path().join("sql");
+        if sql.is_dir() {
+            files(&sql, "sql", &mut paths);
         }
     }
-    let mut found = BTreeMap::new();
-    for source in sources {
-        let mut scanner = Scanner::default();
-        scanner.visit_file(&syn::parse_file(&std::fs::read_to_string(&source).unwrap()).unwrap());
-        for (owner, sql) in scanner.statements {
-            let key = (
-                source
-                    .strip_prefix(&root)
+    paths
+        .into_iter()
+        .map(|path| {
+            (
+                path.strip_prefix(&root)
                     .unwrap()
                     .to_string_lossy()
-                    .into_owned(),
-                owner,
-            );
+                    .replace('\\', "/"),
+                std::fs::read_to_string(path).unwrap(),
+            )
+        })
+        .collect()
+}
+
+type NamedSqlWriters = BTreeMap<(String, String), String>;
+type LoadedSqlWriters = BTreeSet<(String, String, String)>;
+
+fn scan_sources_with_sql(
+    sources: &[(String, String)],
+    sql_sources: &StaticSqlSources,
+) -> (NamedSqlWriters, LoadedSqlWriters) {
+    let (writers, loaded, _) = scan_sources_with_routes(sources, sql_sources);
+    (writers, loaded)
+}
+
+type MarkerlessCalls = BTreeSet<(String, String, String)>;
+
+fn scan_sources_with_routes(
+    sources: &[(String, String)],
+    sql_sources: &StaticSqlSources,
+) -> (NamedSqlWriters, LoadedSqlWriters, MarkerlessCalls) {
+    let parsed = sources
+        .iter()
+        .map(|(path, source)| (path.clone(), syn::parse_file(source).unwrap()))
+        .collect::<Vec<_>>();
+    let bindings = static_sql_source::canonical_bindings(&parsed, test_only);
+    let mut found = BTreeMap::new();
+    let mut loaded = BTreeSet::new();
+    let mut markerless = BTreeSet::new();
+    for (path, file) in &parsed {
+        let mut scanner = Scanner {
+            source_path: path.clone(),
+            sql_sources: Some(sql_sources),
+            loader_bindings: bindings[path].clone(),
+            ..Scanner::default()
+        };
+        scanner.visit_file(file);
+        for (owner, route) in scanner.markerless_calls {
+            markerless.insert((path.clone(), owner, route));
+        }
+        for (asset, owner) in scanner.loaded_writers {
+            loaded.insert((asset, path.clone(), owner));
+        }
+        for (owner, sql) in scanner.statements {
+            let key = (path.clone(), owner);
             assert!(
                 found.insert(key.clone(), sql).is_none(),
                 "multiple writer templates: {key:?}"
             );
         }
     }
+    (found, loaded, markerless)
+}
+
+fn assert_sql_ownership(
+    sql_sources: &StaticSqlSources,
+    loaded: &BTreeSet<(String, String, String)>,
+) {
+    let found = sql_sources
+        .iter()
+        .filter(|(_, text)| note_writer(text))
+        .map(|(path, _)| path.as_str())
+        .collect::<BTreeSet<_>>();
+    let expected = LEGACY_SQL_WRITERS
+        .iter()
+        .copied()
+        .chain(APPLICATION_SQL_WRITERS.iter().map(|(asset, _, _)| *asset))
+        .collect();
+    assert_eq!(found, expected, "SQL writer asset inventory");
+    let expected = APPLICATION_SQL_WRITERS
+        .iter()
+        .map(|(asset, path, owner)| (asset.to_string(), path.to_string(), owner.to_string()))
+        .collect();
+    assert_eq!(*loaded, expected, "SQL writer asset-to-caller ownership");
+}
+
+fn census() -> BTreeMap<(String, String), String> {
+    let root = root();
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(&root).unwrap() {
+        let src = entry.unwrap().path().join("src");
+        if src.is_dir() {
+            files(&src, "rs", &mut paths);
+        }
+    }
+    let sources = paths
+        .into_iter()
+        .map(|path| {
+            (
+                path.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                std::fs::read_to_string(path).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let sql_sources = live_sql_sources();
+    let (mut found, loaded, markerless) = scan_sources_with_routes(&sources, &sql_sources);
+    assert_markerless_callers(&markerless, MARKERLESS_CALLERS);
+    assert_sql_ownership(&sql_sources, &loaded);
     let expected = [
         (DB, "NOTE_UPSERT_SQL"),
+        (PROPERTY_CAS, "property_cas_statements"),
         (DB, "note_replace_if_unchanged_statement"),
         (DB, "note_metadata_replace_if_unchanged_statement"),
         (DB, "note_update_properties_statement"),
         (DB, "note_set_property_statement"),
         (DB, "note_soft_delete_statement"),
         (DB, "execute_filtered_note_property_patch"),
+        // Key assignment sets only the key of a live keyless note; the version
+        // trigger advances it once.
+        (DB, "note_assign_key_statement"),
         (MIGRATIONS, "migrate_outbound_due_key"),
-        (EVENTS, "claim_pending_event"),
-        (EVENTS, "mark_dispatch_invoking"),
-        (EVENTS, "renew_dispatch_lease"),
-        (EVENTS, "persist_dispatch_outcome"),
-        (EVENTS, "requeue_legacy_claim"),
-        (EVENTS, "finalize_corrupt_receipt"),
-        (EVENTS, "finalize_firing_event"),
+        (RECEIPTS, "claim_pending_event_inner"),
+        (RECEIPTS, "mark_dispatch_invoking"),
+        (RECEIPTS, "renew_dispatch_lease"),
+        (RECEIPTS, "persist_dispatch_outcome"),
+        (RECLAIM, "requeue_legacy_claim"),
+        (RECLAIM, "finalize_corrupt_receipt"),
+        (RECLAIM, "finalize_firing_event"),
         (GTD, "gtd_transition_statement"),
         (GTD_REPAIR, "checked_update_sql"),
-        (SCHEDULE, "cancel_pending_event"),
         (CURATION, "merge_note_sql"),
-        (CREATE, "prepare_note_create"),
+        (CREATE, "prepare_note_create_classified"),
         (OPERATIONS, "restore_note"),
         // Keyed message pairs stamp the caller key onto the outbound note in a
         // second statement, so a freshly created pair settles at version 2. The
         // writer never assigns the column itself; the trigger does.
-        (MESSAGE, "create_keyed_message_pair_with_attachments"),
-        // A matching quarantine replay repairs legacy retention metadata in
-        // one UPDATE. The note version trigger, not this writer, advances it.
-        (COMM, "repair_duplicate_quarantine"),
+        (MESSAGE, "create_keyed_message_pair_with_extra_statements"),
+        // Guarded partial properties advance through the note version trigger.
+        (GUARDED_PATCH, "note_patch_properties_statement"),
         // This feature can compile outside tests; keep its zero-row writer visible.
         (FAULT, "injected_failure_statement"),
     ]
@@ -462,11 +1072,29 @@ fn census() -> BTreeMap<(String, String), String> {
         "production writer enumeration must not be vacuous"
     );
     assert_eq!(found.keys().cloned().collect::<BTreeSet<_>>(), expected);
+    // The closed notes prefix is inventoried by the ordinary visitor. Native
+    // checks must use the actual completed builder output, not this partial seed.
+    let key = (
+        PROPERTY_CAS.to_owned(),
+        "property_cas_statements".to_owned(),
+    );
+    let statement = property_cas_probe_statement();
+    assert!(statement.sql.starts_with(&found[&key]));
+    assert!(note_writer(&statement.sql));
+    found.insert(key, statement.sql);
+    let key = (
+        GUARDED_PATCH.to_owned(),
+        "note_patch_properties_statement".to_owned(),
+    );
+    let statement = guarded_patch_probe_statement();
+    assert!(statement.sql.starts_with(&found[&key]));
+    assert!(note_writer(&statement.sql));
+    found.insert(key, statement.sql);
     found
 }
 
 fn fixture(kind: &str, properties: &str) -> Connection {
-    let mut conn = Connection::open_in_memory().unwrap();
+    let mut conn = khive_db::test_hooks::registered(Connection::open_in_memory().unwrap());
     khive_db::migrations::run_migrations(&mut conn).unwrap();
     conn.execute(
         "INSERT INTO notes (id,namespace,kind,status,content,properties,created_at,updated_at) \
@@ -479,7 +1107,7 @@ fn fixture(kind: &str, properties: &str) -> Connection {
 }
 
 fn deleted_fixture(kind: &str, properties: &str) -> Connection {
-    let mut conn = Connection::open_in_memory().unwrap();
+    let mut conn = khive_db::test_hooks::registered(Connection::open_in_memory().unwrap());
     khive_db::migrations::run_migrations(&mut conn).unwrap();
     conn.execute(
         "INSERT INTO notes (id,namespace,kind,status,content,properties,created_at,updated_at,deleted_at) \
@@ -492,7 +1120,7 @@ fn deleted_fixture(kind: &str, properties: &str) -> Connection {
 }
 
 fn install_authorizer(conn: &Connection) {
-    conn.authorizer(Some(|context: AuthContext<'_>| match context.action {
+    conn.test_authorizer(Some(|context: AuthContext<'_>| match context.action {
         AuthAction::Update {
             table_name: "notes",
             column_name: "version",
@@ -550,12 +1178,24 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
     let writers = census();
     let cases = [
         (DB, "note_update_properties_statement", "memory", "{}"),
+        (
+            PROPERTY_CAS,
+            "property_cas_statements",
+            "memory",
+            r#"{"checked":"before"}"#,
+        ),
         (MIGRATIONS, "migrate_outbound_due_key", "memory", "{}"),
         (
-            EVENTS,
+            RECLAIM,
             "requeue_legacy_claim",
             "scheduled_event",
             r#"{"status":"firing"}"#,
+        ),
+        (
+            RECEIPTS,
+            "renew_dispatch_lease",
+            "scheduled_event",
+            r#"{"status":"firing","firing_at":100,"dispatch_receipt":{"invocation_id":"00000000-0000-4000-8000-000000000002","state":"invoking"}}"#,
         ),
         (
             GTD,
@@ -569,28 +1209,22 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
             "task",
             r#"{"status":"archived"}"#,
         ),
-        (
-            SCHEDULE,
-            "cancel_pending_event",
-            "scheduled_event",
-            r#"{"status":"pending"}"#,
-        ),
         (CURATION, "merge_note_sql", "memory", "{}"),
-        (CREATE, "prepare_note_create", "memory", "{}"),
+        (CREATE, "prepare_note_create_classified", "memory", "{}"),
         (OPERATIONS, "restore_note", "memory", "{}"),
         // The keyed pair stamps the caller key onto an already-inserted
         // outbound note, so the fixture is a keyless message row.
         (
             MESSAGE,
-            "create_keyed_message_pair_with_attachments",
+            "create_keyed_message_pair_with_extra_statements",
             "message",
             "{}",
         ),
         (
-            COMM,
-            "repair_duplicate_quarantine",
+            GUARDED_PATCH,
+            "note_patch_properties_statement",
             "message",
-            r#"{"quarantined":true,"quarantine_content_ref":"census-ref","channel_kind":"email"}"#,
+            "{}",
         ),
         (FAULT, "injected_failure_statement", "memory", "{}"),
     ];
@@ -620,8 +1254,27 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
                     rusqlite::types::Null
                 ],
             ),
+            PROPERTY_CAS => {
+                let statement = property_cas_probe_statement();
+                assert_eq!(statement.sql, *sql);
+                conn.execute(
+                    sql,
+                    rusqlite::params_from_iter(property_cas_probe_params(&statement)),
+                )
+            }
             MIGRATIONS => conn.execute(sql, params![vec![0_u8; 12], "2020-01-01T00:00:00Z", ID]),
-            EVENTS => conn.execute(sql, params![200_i64, ID, "local", 100_i64, properties]),
+            RECLAIM => conn.execute(sql, params![200_i64, ID, "local", 100_i64, properties]),
+            RECEIPTS => conn.execute(
+                sql,
+                params![
+                    300_i64,
+                    200_i64,
+                    ID,
+                    "local",
+                    100_i64,
+                    "00000000-0000-4000-8000-000000000002"
+                ],
+            ),
             GTD => conn.execute(
                 sql,
                 params![
@@ -652,10 +1305,6 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
                     r#"{"originals":{}}"#,
                 ],
             ),
-            SCHEDULE => conn.execute(
-                sql,
-                params!["2026-09-09T00:00:00Z", 200_i64, ID, "local", properties],
-            ),
             CURATION => conn.execute(sql, params![200_i64, "local", ID]),
             CREATE => conn.execute(sql, params!["census/key", ID, "local", "memory"]),
             OPERATIONS => conn.execute(
@@ -663,18 +1312,14 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
                 params!["active", 200_i64, ID, "local", "memory"],
             ),
             MESSAGE => conn.execute(sql, params!["census/key", ID, "local"]),
-            COMM => conn.execute(
-                sql,
-                params![
-                    ID,
-                    "local",
-                    "census-ref",
-                    "email",
-                    "census@example.com",
-                    300_i64,
-                    200_i64
-                ],
-            ),
+            GUARDED_PATCH => {
+                let statement = guarded_patch_probe_statement();
+                assert_eq!(statement.sql, *sql);
+                conn.execute(
+                    sql,
+                    rusqlite::params_from_iter(guarded_patch_probe_params(&statement)),
+                )
+            }
             FAULT => conn.execute(sql, []),
             _ => unreachable!(),
         }
@@ -725,35 +1370,245 @@ fn note_version_scanner_controls() {
 }
 
 #[test]
-fn note_version_sql_files_are_inventoried_and_trigger_is_the_only_exception() {
-    let root = root();
+fn note_version_scanner_skips_tokio_tests_but_keeps_async_writers() {
+    let mut scanner = Scanner::default();
+    scanner.visit_file(
+        &syn::parse_file(
+            r#"
+        #[tokio::test]
+        async fn fixture() { call("UPDATE notes SET content='fixture'"); }
+        #[tokio::test(flavor = "current_thread")]
+        async fn configured_fixture() { call("UPDATE notes SET content='fixture'"); }
+        #[::tokio::test]
+        async fn absolute_fixture() { call("UPDATE notes SET content='fixture'"); }
+        async fn live() { call("UPDATE notes SET content='live'"); }
+        #[other::test]
+        async fn unknown_attribute() { call("UPDATE notes SET content='live'"); }
+        #[tokio::instrument]
+        async fn another_tokio_attribute() { call("UPDATE notes SET content='live'"); }
+        #[cfg(any(test, feature = "fault-injection"))]
+        async fn feature() { call("UPDATE notes SET content='live' WHERE 1=0"); }
+    "#,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        scanner
+            .statements
+            .iter()
+            .map(|(owner, _)| owner.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "live",
+            "unknown_attribute",
+            "another_tokio_attribute",
+            "feature"
+        ],
+        "skip only the known Tokio test harness; retain every production-capable async writer"
+    );
+}
+
+#[test]
+fn plain_sql_insert_retains_the_note_version_initializer_guard() {
+    let ordinary = "INSERT INTO notes (id, properties) VALUES (?1, ?2)";
+    assert!(!note_writer(ordinary));
+    assert_note_version_implicit(ordinary, "ordinary.sql");
+    let explicit = "INSERT INTO notes (id, version, properties) VALUES (?1, 1, ?2)";
+    assert!(!note_writer(explicit));
+    assert!(std::panic::catch_unwind(|| {
+        assert_note_version_implicit(explicit, "explicit.sql");
+    })
+    .is_err());
+}
+
+fn assert_initializer_refusal(owner: &str, check: impl FnOnce() + std::panic::UnwindSafe) {
+    let failure = std::panic::catch_unwind(check).expect_err("explicit version must be refused");
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .expect("initializer refusal has a string diagnostic");
+    assert!(
+        message.contains(owner) && message.contains("explicitly initializes note.version"),
+        "wrong refusal: {message}"
+    );
+}
+
+#[test]
+fn note_version_initializer_checks_later_inserts_and_replace() {
+    for sql in [
+        "\u{feff}INSERT INTO notes (id, version) VALUES (1, 2);",
+        "INSERT INTO audit (id, version) VALUES (1, 2); INSERT INTO notes (id, version) VALUES (1, \
+            2);",
+        "INSERT INTO notes (id) VALUES (1); INSERT INTO main.notes (id, version) SELECT 2, 3;",
+        "REPLACE INTO notes (id, version) VALUES (1, 2);",
+        "WITH input(id) AS (SELECT 1) INSERT INTO notes AS target (id, version) SELECT id, 2 FROM \
+            input;",
+        "CREATE TRIGGER new_note AFTER INSERT ON audit BEGIN INSERT INTO notes (id, version) \
+            VALUES (NEW.id, 2); END;",
+    ] {
+        assert_initializer_refusal("statements.sql", || {
+            assert_note_version_implicit(sql, "statements.sql");
+        });
+    }
+    for prefix in [
+        "INSERT",
+        "INSERT OR ROLLBACK",
+        "INSERT OR ABORT",
+        "INSERT OR REPLACE",
+        "INSERT OR FAIL",
+        "INSERT OR IGNORE",
+        "REPLACE",
+    ] {
+        for target in [
+            "notes",
+            "main.notes",
+            r#""main"."notes""#,
+            "`main`.`notes`",
+            "[main].[notes]",
+            "'main'.'notes'",
+        ] {
+            let explicit = format!("{prefix} INTO {target} (id, \"version\") VALUES (1, 2);");
+            assert_initializer_refusal("forms.sql", || {
+                assert_note_version_implicit(&explicit, "forms.sql");
+            });
+            let ordinary = format!("{prefix} INTO {target} (id, content) VALUES (1, 'version');");
+            assert_note_version_implicit(&ordinary, "forms.sql");
+        }
+    }
+}
+
+#[test]
+fn note_version_initializer_respects_quotes_comments_and_column_boundaries() {
+    for sql in [
+        r#"INSERT INTO notes ("values", "select", "version") VALUES (1, 2, 3);"#,
+        "insert/* target */into MAIN /* schema */ . [NoTeS] (id, [VeRsIoN]) values (1, 2);",
+        "REPLACE INTO `notes` (id, `version`) SELECT 1, 2;",
+        "INSERT INTO 'notes' ('id', 'version') VALUES (1, 2);",
+        r#"INSERT INTO notes ("ver""sion", version) VALUES (1, 2);"#,
+        "INSERT INTO notes (`ver``sion`, version) VALUES (1, 2);",
+        "INSERT INTO notes ([semi;colon], version) VALUES (1, 2);",
+        "/* outer /* inner */ INSERT INTO notes (version) VALUES (1);",
+        "INSERT INTO audit (content) VALUES ('escaped ''; REPLACE INTO notes(version) VALUES \
+            (1);'); REPLACE INTO notes (version) VALUES (2);",
+    ] {
+        assert_initializer_refusal("quoted.sql", || {
+            assert_note_version_implicit(sql, "quoted.sql");
+        });
+    }
+    for sql in [
+        "INSERT INTO audit (version) VALUES (1); INSERT INTO notes (id, content) VALUES (2, \
+            'version');",
+        "INSERT INTO notes_seq (version) VALUES (1);",
+        "INSERT INTO other.notes (version) VALUES (1);",
+        r#"INSERT INTO "main.notes" (version) VALUES (1);"#,
+        "INSERT INTO notes (id, versioned, version$tag, versioné) SELECT id, version, 1, 2 FROM \
+            audit;",
+        "INSERT INTO notes DEFAULT VALUES;",
+        "\u{feff}INSERT INTO notes (id) VALUES (1);",
+        "INSERT INTO notes (ver\u{feff}sion) VALUES (1);",
+        "REPLACE INTO main.notes (id) VALUES (1);",
+        "SELECT 'INSERT INTO notes(version) VALUES (1);';",
+        r#"SELECT "INSERT", "INTO", "notes", "version";"#,
+        r#"SELECT "escaped ""; INSERT INTO notes(version) VALUES (1);";"#,
+        "SELECT 'escaped ''; INSERT INTO notes(version) VALUES (1);';",
+        "SELECT `escaped ``; INSERT INTO notes(version) VALUES (1);`;",
+        "SELECT [semicolon; INSERT INTO notes(version) VALUES (1)];",
+        "-- INSERT INTO notes(version) VALUES (1);\nINSERT INTO notes(id) VALUES (1);",
+        "/* REPLACE INTO notes(version) VALUES (1); */ INSERT INTO notes(id) VALUES (1);",
+        "INSERT INTO notes (id, content) VALUES (1, 'version; INSERT INTO notes(version) VALUES \
+            (2);');",
+        // Comments separate tokens; punctuation prevents borrowing another statement's INTO.
+        "INS/**/ERT INTO notes(version) VALUES (1);",
+        "SELECT INSERT; SELECT INTO notes(version);",
+        r#"SELECT "INSERT" INTO notes(version);"#,
+    ] {
+        assert_note_version_implicit(sql, "harmless.sql");
+    }
+}
+
+#[test]
+fn sql_file_inventory_applies_initializer_guard_before_writer_filtering() {
+    let fixture = tempfile::tempdir().unwrap();
+    let sql_dir = fixture.path().join("fixture").join("sql");
+    std::fs::create_dir_all(sql_dir.join("nested")).unwrap();
+    let writer = sql_dir.join("nested").join("writer.sql");
+    std::fs::write(
+        &writer,
+        "UPDATE notes SET content = 'safe' WHERE id = 'fixture';",
+    )
+    .unwrap();
+    std::fs::write(
+        sql_dir.join("ignored.txt"),
+        "INSERT INTO notes (version) VALUES (1);",
+    )
+    .unwrap();
+    let insert = sql_dir.join("insert.sql");
+    std::fs::write(
+        &insert,
+        "INSERT INTO audit (version) VALUES (1); INSERT INTO notes (id) VALUES (2);",
+    )
+    .unwrap();
+    let expected = BTreeSet::from([writer
+        .strip_prefix(fixture.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()]);
+    assert_eq!(sql_file_writer_inventory(fixture.path()), expected);
+
+    for poisoned in [
+        "\u{feff}INSERT INTO notes (version) VALUES (1);",
+        "INSERT INTO audit (id) VALUES (1); INSERT INTO notes (id, version) VALUES (2, 3);",
+        "INSERT INTO notes (id) VALUES (1); REPLACE INTO main.notes (id, version) VALUES (2, 3);",
+    ] {
+        assert!(
+            !note_writer(poisoned),
+            "the guard must precede the writer filter"
+        );
+        std::fs::write(&insert, poisoned).unwrap();
+        assert_initializer_refusal(&insert.display().to_string(), || {
+            sql_file_writer_inventory(fixture.path());
+        });
+    }
+    std::fs::write(&insert, "REPLACE INTO notes (id) VALUES (1);").unwrap();
+    assert_eq!(sql_file_writer_inventory(fixture.path()), expected);
+}
+
+fn sql_file_writer_inventory(root: &Path) -> BTreeSet<String> {
     let mut sources = Vec::new();
-    for entry in std::fs::read_dir(&root).unwrap() {
+    for entry in std::fs::read_dir(root).unwrap() {
         let sql = entry.unwrap().path().join("sql");
         if sql.is_dir() {
             files(&sql, "sql", &mut sources);
         }
     }
-    let found: BTreeSet<_> = sources
+    sources
         .into_iter()
-        .filter(|path| note_writer(&std::fs::read_to_string(path).unwrap()))
+        .filter(|path| {
+            let sql = std::fs::read_to_string(path).unwrap();
+            assert_note_version_implicit(&sql, &path.display().to_string());
+            note_writer(&sql)
+        })
         .map(|path| {
-            path.strip_prefix(&root)
+            path.strip_prefix(root)
                 .unwrap()
                 .to_string_lossy()
                 .into_owned()
         })
-        .collect();
+        .collect()
+}
+
+#[test]
+fn note_version_sql_files_are_inventoried_and_trigger_is_the_only_exception() {
+    let found = sql_file_writer_inventory(&root());
     assert_eq!(
         found,
-        [
-            "khive-db/sql/005-unique-comm-external-id.sql",
-            "khive-db/sql/031-note-versions.sql",
-            "khive-db/sql/notes-ddl.sql"
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
+        LEGACY_SQL_WRITERS
+            .iter()
+            .copied()
+            .chain(APPLICATION_SQL_WRITERS.iter().map(|(asset, _, _)| *asset))
+            .map(str::to_owned)
+            .collect()
     );
 
     let historical = fixture("memory", "{}");
@@ -764,7 +1619,7 @@ fn note_version_sql_files_are_inventoried_and_trigger_is_the_only_exception() {
         .unwrap();
     assert_eq!(version(&historical), 1);
     for direct in [false, true] {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = khive_db::test_hooks::registered(Connection::open_in_memory().unwrap());
         if !direct {
             for migration in khive_db::migrations::MIGRATIONS
                 .iter()
@@ -1033,4 +1888,376 @@ fn a_dynamic_update_setting_only_namespace_passes_the_scanner() {
     "#;
     let mut scanner = Scanner::default();
     scanner.visit_file(&syn::parse_file(source).unwrap());
+}
+
+#[test]
+fn static_sql_loaders_keep_named_writers_and_legacy_ownership() {
+    let update = "UPDATE notes SET properties=?1 WHERE id=?2";
+    let assets = StaticSqlSources::from([
+        ("sample/sql/update.sql".into(), format!("{update}\n")),
+        (
+            LEGACY_SQL_WRITERS[0].into(),
+            "UPDATE notes SET properties='{}'; CREATE INDEX fixture ON notes(id);".into(),
+        ),
+    ]);
+    let source = "fn writer() { call(khive_runtime::sql!(\"update\")); }";
+    let (loaded, links) =
+        scan_sources_with_sql(&[("sample/src/lib.rs".into(), source.into())], &assets);
+    let (inline, _) = scan_sources_with_sql(
+        &[(
+            "sample/src/lib.rs".into(),
+            format!("fn writer() {{ call({update:?}); }}"),
+        )],
+        &StaticSqlSources::new(),
+    );
+    assert_eq!(loaded, inline);
+    assert_eq!(
+        links,
+        BTreeSet::from([(
+            "sample/sql/update.sql".into(),
+            "sample/src/lib.rs".into(),
+            "writer".into()
+        )])
+    );
+    let (included, _) = scan_sources_with_sql(
+        &[(
+            "sample/src/lib.rs".into(),
+            "fn writer() { call(include_str!(\"../sql/update.sql\")); }".into(),
+        )],
+        &assets,
+    );
+    assert_eq!(
+        included[&("sample/src/lib.rs".into(), "writer".into())],
+        format!("{update}\n")
+    );
+    let (legacy, legacy_links) = scan_sources_with_sql(
+        &[(
+            "khive-db/src/migrations.rs".into(),
+            "const V5: &str = include_str!(\"../sql/005-unique-comm-external-id.sql\");".into(),
+        )],
+        &assets,
+    );
+    assert!(legacy.is_empty());
+    assert!(legacy_links.is_empty());
+}
+
+#[test]
+fn loaded_sql_cannot_hide_version_changes_duplicates_or_shadowing() {
+    let source = "fn writer() { call(khive_runtime::sql!(\"update\")); }";
+    for sql in [
+        "INSERT INTO notes (id, version) VALUES (?1, 8)",
+        "UPDATE {table} SET version=8",
+    ] {
+        let assets = StaticSqlSources::from([("sample/sql/update.sql".into(), sql.into())]);
+        assert!(std::panic::catch_unwind(|| scan_sources_with_sql(
+            &[("sample/src/lib.rs".into(), source.into())],
+            &assets
+        ))
+        .is_err());
+    }
+    let assets = StaticSqlSources::from([(
+        "sample/sql/update.sql".into(),
+        "UPDATE notes SET version=8".into(),
+    )]);
+    let (found, _) = scan_sources_with_sql(&[("sample/src/lib.rs".into(), source.into())], &assets);
+    assert!(!assignments_rule_out_version(
+        &found[&("sample/src/lib.rs".into(), "writer".into())]
+    ));
+    for source in [
+        "fn writer() { call(khive_runtime::sql!(\"update\")); call(khive_runtime::sql!(\"update\")); }",
+        "fn writer() { use other as khive_runtime; call(khive_runtime::sql!(\"update\")); }",
+        "mod khive_runtime {} fn writer() { call(khive_runtime::sql!(\"update\")); }",
+    ] {
+        assert!(std::panic::catch_unwind(|| scan_sources_with_sql(&[("sample/src/lib.rs".into(), source.into())], &assets)).is_err(), "{source}");
+    }
+    let positive = "mod unrelated { use unknown::*; } #[cfg(test)] mod hidden { use other as khive_runtime; } fn writer() { call(khive_runtime::sql!(\"update\")); }";
+    assert_eq!(
+        scan_sources_with_sql(&[("sample/src/lib.rs".into(), positive.into())], &assets)
+            .0
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn application_sql_inventory_rejects_orphans_and_wrong_callers() {
+    let mut assets = StaticSqlSources::new();
+    for asset in LEGACY_SQL_WRITERS
+        .iter()
+        .copied()
+        .chain(APPLICATION_SQL_WRITERS.iter().map(|(asset, _, _)| *asset))
+    {
+        assets.insert(asset.into(), "UPDATE notes SET content='fixture'".into());
+    }
+    let links = APPLICATION_SQL_WRITERS
+        .iter()
+        .map(|(asset, path, owner)| (asset.to_string(), path.to_string(), owner.to_string()))
+        .collect::<BTreeSet<_>>();
+    assert_sql_ownership(&assets, &links);
+    assert!(std::panic::catch_unwind(|| assert_sql_ownership(&assets, &BTreeSet::new())).is_err());
+    let mut wrong = links.clone();
+    let first = wrong.pop_first().unwrap();
+    wrong.insert((first.0, first.1, "unrelated_writer".into()));
+    assert!(std::panic::catch_unwind(|| assert_sql_ownership(&assets, &wrong)).is_err());
+    assets.insert(
+        "sample/sql/unreferenced.sql".into(),
+        "UPDATE notes SET content='rogue'".into(),
+    );
+    assert!(std::panic::catch_unwind(|| assert_sql_ownership(&assets, &links)).is_err());
+}
+
+#[test]
+fn markerless_route_census_rejects_empty_and_unlisted_production_callers() {
+    let path = "khive-runtime/src/fixture.rs";
+    let source = r#"
+        async fn approved(store: Store, note: Note) { store.upsert_note(note).await; }
+        #[cfg(test)] mod tests { fn ignored() { note_insert_keyed_statement(&note); } }
+    "#;
+    let scan = |source: &str| {
+        scan_sources_with_routes(&[(path.into(), source.into())], &StaticSqlSources::new()).2
+    };
+    let inventory = [(
+        path,
+        "approved",
+        "upsert_note",
+        MarkerDisposition::StorageConstructor,
+    )];
+    assert_markerless_callers(&scan(source), &inventory);
+    assert!(std::panic::catch_unwind(|| assert_markerless_callers(&scan(""), &inventory)).is_err());
+    let added = format!("{source} fn unreviewed() {{ note_insert_keyed_statement(&note); }}");
+    assert!(
+        std::panic::catch_unwind(|| assert_markerless_callers(&scan(&added), &inventory)).is_err()
+    );
+    let transport = r#"async fn received(pool: Pool, request: RecipientCommit) {
+        let recipient = RecipientTransportStore::new(pool);
+        recipient.commit(request).await;
+    }"#;
+    assert_markerless_callers(
+        &scan(transport),
+        &[(
+            path,
+            "received",
+            "RecipientTransportStore::commit",
+            MarkerDisposition::FixedNonMemoryKind,
+        )],
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_markerless_callers(&scan(transport), &inventory))
+            .is_err()
+    );
+}
+
+fn guarded_patch_probe_statement() -> khive_storage::SqlStatement {
+    let patch = khive_storage::note::NotePropertyPatch {
+        preconditions: Vec::new(),
+        set: [("checked".into(), serde_json::json!(true))].into(),
+        extend_expires_at: None,
+        updated_at: 200,
+    };
+    guarded_note_patch::note_patch_properties_statement(
+        uuid::Uuid::parse_str(ID).unwrap(),
+        "local",
+        "message",
+        &patch,
+    )
+    .unwrap()
+}
+
+fn guarded_patch_probe_params(
+    statement: &khive_storage::SqlStatement,
+) -> Vec<rusqlite::types::Value> {
+    statement
+        .params
+        .iter()
+        .map(|value| match value {
+            khive_storage::SqlValue::Text(value) => rusqlite::types::Value::Text(value.clone()),
+            khive_storage::SqlValue::Integer(value) => rusqlite::types::Value::Integer(*value),
+            khive_storage::SqlValue::Null => rusqlite::types::Value::Null,
+            other => panic!("unexpected real guarded patch probe binding: {other:?}"),
+        })
+        .collect()
+}
+
+// These probes call the real public builder. Only its chosen Uuid/Text fixture
+// values are rendered here; all other native SQL variants keep the DB controls.
+fn property_cas_probe_statement() -> khive_storage::SqlStatement {
+    let statements = khive_db::statement_lists::property_cas_statements(
+        "notes",
+        uuid::Uuid::parse_str(ID).unwrap(),
+        &[("$.checked", khive_storage::SqlValue::Text("before".into()))],
+        &[("$.checked", khive_storage::SqlValue::Text("after".into()))],
+    )
+    .unwrap();
+    assert_eq!(statements.len(), 1);
+    assert!(statements[0].label.is_none());
+    statements.into_iter().next().unwrap()
+}
+
+fn property_cas_probe_params(
+    statement: &khive_storage::SqlStatement,
+) -> Vec<rusqlite::types::Value> {
+    statement
+        .params
+        .iter()
+        .map(|value| match value {
+            khive_storage::SqlValue::Uuid(value) => rusqlite::types::Value::Text(value.to_string()),
+            khive_storage::SqlValue::Text(value) => rusqlite::types::Value::Text(value.clone()),
+            other => panic!("unexpected real builder probe binding: {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn closed_property_builder_is_a_named_writer_and_dynamic_seed_still_refuses() {
+    let source = include_str!("../../khive-db/src/statement_lists.rs");
+    let assets = StaticSqlSources::from([(
+        "khive-db/sql/live-holder-read.sql".into(),
+        include_str!("../../khive-db/sql/live-holder-read.sql").into(),
+    )]);
+    let (writers, loaded) = scan_sources_with_sql(&[(PROPERTY_CAS.into(), source.into())], &assets);
+    assert!(loaded.is_empty());
+    assert_eq!(
+        writers.keys().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([(PROPERTY_CAS.into(), "property_cas_statements".into())])
+    );
+    let completed = property_cas_probe_statement();
+    assert!(completed
+        .sql
+        .starts_with(&writers[&(PROPERTY_CAS.into(), "property_cas_statements".into())]));
+
+    let old_seed = "UPDATE notes SET properties";
+    assert_eq!(source.matches(old_seed).count(), 1);
+    let opaque = source.replacen(old_seed, "UPDATE {table} SET properties", 1);
+    assert!(
+        std::panic::catch_unwind(|| scan_sources_with_sql(
+            &[(PROPERTY_CAS.into(), opaque)],
+            &assets
+        ))
+        .is_err(),
+        "actual builder source with a dynamic incomplete seed must still refuse"
+    );
+}
+
+#[test]
+fn actual_property_builder_keeps_notes_version_authority_and_mismatch_noop() {
+    let conn = fixture("memory", r#"{"checked":"before"}"#);
+    let statement = property_cas_probe_statement();
+    assert_eq!(
+        conn.execute(
+            &statement.sql,
+            rusqlite::params_from_iter(property_cas_probe_params(&statement))
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(version(&conn), 2);
+    let properties: String = conn
+        .query_row("SELECT properties FROM notes WHERE id=?1", [ID], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&properties).unwrap(),
+        serde_json::json!({"checked":"after"})
+    );
+    assert_eq!(
+        conn.execute(
+            &statement.sql,
+            rusqlite::params_from_iter(property_cas_probe_params(&statement))
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(version(&conn), 2);
+    let unchanged: String = conn
+        .query_row("SELECT properties FROM notes WHERE id=?1", [ID], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(unchanged, properties);
+
+    let explicit = statement
+        .sql
+        .replacen(" WHERE ", ", version = version + 1 WHERE ", 1);
+    assert_ne!(explicit, statement.sql);
+    assert!(
+        conn.prepare(&explicit).is_err(),
+        "the notes authorizer still refuses a direct version assignment"
+    );
+    let deleted = deleted_fixture("memory", r#"{"checked":"before"}"#);
+    assert_eq!(
+        deleted
+            .execute(
+                &statement.sql,
+                rusqlite::params_from_iter(property_cas_probe_params(&statement))
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(version(&deleted), 1);
+}
+
+#[test]
+fn actual_property_builder_keeps_entity_version_guard_and_closed_table_refusal() {
+    let conn = fixture("memory", "{}");
+    conn.execute("INSERT INTO entities(id,namespace,kind,name,properties,created_at,updated_at) VALUES (?1,'local','concept','fixture','{\"checked\":\"before\"}',100,100)", [ID]).unwrap();
+    let mut statements = khive_db::statement_lists::property_cas_statements(
+        "entities",
+        uuid::Uuid::parse_str(ID).unwrap(),
+        &[("$.checked", khive_storage::SqlValue::Text("before".into()))],
+        &[("$.checked", khive_storage::SqlValue::Text("after".into()))],
+    )
+    .unwrap();
+    assert_eq!(statements.len(), 1);
+    let statement = statements.remove(0);
+    assert_eq!(
+        conn.execute(
+            &statement.sql,
+            rusqlite::params_from_iter(property_cas_probe_params(&statement))
+        )
+        .unwrap(),
+        1
+    );
+    let after: (i64, String) = conn
+        .query_row(
+            "SELECT version,properties FROM entities WHERE id=?1",
+            [ID],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after.0, 2);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&after.1).unwrap(),
+        serde_json::json!({"checked":"after"})
+    );
+    assert_eq!(
+        conn.execute(
+            &statement.sql,
+            rusqlite::params_from_iter(property_cas_probe_params(&statement))
+        )
+        .unwrap(),
+        0
+    );
+    let unchanged: (i64, String) = conn
+        .query_row(
+            "SELECT version,properties FROM entities WHERE id=?1",
+            [ID],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(unchanged, after);
+    for table in [
+        "graph_edges",
+        "NOTES",
+        "main.notes",
+        "notes; DELETE FROM entities",
+    ] {
+        assert!(khive_db::statement_lists::property_cas_statements(
+            table,
+            uuid::Uuid::parse_str(ID).unwrap(),
+            &[],
+            &[]
+        )
+        .is_err());
+    }
 }

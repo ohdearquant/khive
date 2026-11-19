@@ -1,0 +1,26 @@
+charter stale_task_triage v1
+title "Triage stale task records"
+subject task
+
+roles:
+    triager "checks and updates a task record"
+
+triggers:
+    message.arrived
+    schedule.fired
+    prompt.received
+
+workflow:
+    phase intake by triager:
+        await message.arrived or schedule.fired or prompt.received
+        goto inspect
+
+    phase inspect by triager:
+        goto disposition
+
+    phase disposition by triager:
+        goto record
+
+    phase record by triager:
+        require loop.log_written advisory
+        complete

@@ -133,15 +133,16 @@ read with `WHERE namespace = ?` (`khive-pack-brain/sql/brain_implicit_mass_read.
 Add a move primitive to the store surface.
 
 ```
-move_namespace(source, routes: [(record_kind, target_namespace)]) -> MoveCounts
+move_namespace(source, routes: [(subject_class, target_namespace)]) -> MoveCounts
+(corrected by Amendment 5)
 ```
 
 ### The route map is data, not a callback
 
 One source namespace fans out to several targets, so a single rename cannot express the operation.
-The routing is supplied as a list of `(record_kind, target_namespace)` pairs rather than as a
-function, because a list can be validated whole before the transaction opens, logged, replayed and
-tested against a fixture, and a closure can do none of those.
+The routing is supplied as a list of `(subject_class, target_namespace)` pairs (corrected by
+Amendment 5) rather than as a function, because a list can be validated whole before the transaction
+opens, logged, replayed and tested against a fixture, and a closure can do none of those.
 
 Validation before any write, with two outcomes that must not look alike:
 
@@ -163,6 +164,9 @@ them. So the key names a subject class, qualified by kind for the two classes th
 note:<kind>   entity:<kind>   edge   atom   domain
 ```
 
+[Amendment 4](#amendment-4-2026-10-04-edge-relation-routes) extends this grammar with
+`edge:<relation>` and defines its precedence over the bare `edge` fallback.
+
 The qualification is not decoration. Nothing in the schema stops a note kind and an entity kind
 sharing a spelling, and an unqualified key would route both on a store where they do. It also makes
 the refusal exact: the message names `note:observation` rather than `observation`.
@@ -182,11 +186,18 @@ Only subject classes are routed. Everything else is carried:
 None of these appears in the route map. A caller cannot route them independently, because they have
 no independent existence.
 
+In a single-target move, every source `knowledge_sections` row moves to that target, matching the
+whole-namespace vector move. This applies even when no atom or domain class is routed, or when a
+historical section's parent is missing or already attributed elsewhere. Section counts appear in
+`MoveCounts.rows`. In a partitioning move, sections follow the routed atom or domain mirror that
+owns them.
+
 The four fts5 tables do not take one mechanism, and the split is measured rather than assumed.
 `fts_notes` and `fts_entities` are ordinary fts5 tables: an `UPDATE` of their `namespace` column is
 accepted, preserves the rowid the two maps are keyed on, and leaves the index intact. `fts_knowledge`
-and `fts_sections` are declared `content=` over `knowledge_atoms` and `knowledge_sections`, and there
-an `UPDATE` of the same column returns success and changes nothing, because the value a reader gets
+is declared over the filtered `knowledge_atoms_fts_content` view and `fts_sections` is declared over
+`knowledge_sections` (corrected by Amendment 5). For both, an `UPDATE` of the same column returns
+success and changes nothing, because the value a reader gets
 comes from the content table. That pair is maintained by schema triggers firing on
 `UPDATE OF ... namespace` (`sql/schema.sql`, `sql/026-knowledge-fts-repair.sql`), so writing the base
 row is both sufficient and the only thing that works. The dangerous half is the second: a sweep that
@@ -264,12 +275,14 @@ paragraph revisited before it is made, rather than after.
 
 ### A stream member cannot move at all
 
-`sql/029-note-streams.sql` pins stream membership to a namespace with four triggers, and the pin is
+`sql/029-note-streams.sql` pins stream membership to a namespace with six triggers (corrected by
+Amendment 5), and the pin is
 absolute rather than conditional. `refuse_stream_entry_rewrite` aborts any `UPDATE` of a member
 note that names `namespace` in its `SET` list; `refuse_stream_entry_delete` aborts the delete;
 `refuse_stream_ledger_update` and `refuse_stream_ledger_delete` abort every write to the ledger
 rows themselves. `stream_schema_tests.rs:37` already asserts the first of these directly, with
 `UPDATE notes SET namespace='other'` in its list of forbidden statements.
+Two additional triggers guard stream insertion and sequence continuity.
 
 So a stream member has no move at all, by update or by delete and reinsert, and the primitive
 refuses any move whose routed kinds reach one. The refusal comes from a read of `note_streams` by
@@ -341,32 +354,32 @@ happened under, and rewriting it makes the history claim something that did not 
 whole reason, and it does not need a cost to justify it.
 
 The cost it does carry is narrow and worth stating precisely, because the wider version invites a
-workaround nobody needs. Only a read that FILTERS BY NAMESPACE pays it: `stores/event.rs:1264` and
-the list at `:1314` scope by namespace, so after a move those return the moved records' history
-under the source namespace and a reader wanting the whole trail asks for both. A read keyed on
-anything else - by id at `:387`, or by any caller-side identifier that is not the namespace - is
-unaffected, and there is no verb today that publishes a namespace-scoped event read to a consumer.
+workaround nobody needs. `stores/event.rs:1402-1417` scopes the public `get_event` read by namespace.
+The ID-only helper at `:441-450` is used by event append, not by the public getter. The claim that
+the public by-ID read is unaffected is superseded by Amendment 5, Decision 1.
 
 ## Consequences
 
 An edge's namespace is the namespace of the connection that wrote it, not of its endpoints
 (`khive-pack-kg/src/handlers/link.rs:63`, `:193`, `:284`). After a kind-partitioned move an edge can
 therefore sit in a different namespace from the records it joins, and it hydrates because by-id
-`get` is namespace-agnostic. That property is under discussion in #2802. Anything that scopes by-id
-reads to the caller's own namespace would break cross-pack neighbours on exactly the trees this
-move creates, and whoever takes that issue needs to read this paragraph first.
+`get` is namespace-agnostic. This property is specified by Rule 9 of [ADR-007](ADR-007-namespace.md)
+and documented in PR #2923 (corrected by Amendment 5). Anything that scopes by-id reads to the
+caller's own namespace would break cross-pack neighbours on exactly the trees this move creates.
 
-The affected-table set is not a constant and must not become one. A migration that adds a
-namespace-carrying table adds it to this primitive's scope, and a migration that adds a
-namespace-bearing uniqueness constraint adds it to the refusal set. Both are silent failures if
-missed: the first skips rows, the second corrupts them.
+The affected-table set is not a constant and must not become one. A namespace-carrying table with no
+disposition refuses with `UnknownTable`, rather than being silently skipped (corrected by Amendment
+5). A namespace-bearing uniqueness constraint omitted from collision enumeration can still refuse
+through the statement constraint and transaction rollback, as described in Amendment 2 (corrected
+by Amendment 5).
 
 ## Acceptance
 
 - A move over a populated store leaves every affected table consistent, asserted per table rather
   than by a spot check, with the vector tables enumerated from `sqlite_master` rather than from a
   list written into the test.
-- A concurrent writer during the move cannot produce a resurrected or a lost row.
+- A concurrent writer during the move cannot produce a resurrected or a lost row. (Not established
+  by an executed acceptance test at this revision.)
 - A route map naming classes whose rows live in another backend succeeds here reporting zero for
   them, so the same map is re-runnable against each backend of a split store.
 - A route map missing a kind that has rows refuses without writing anything, and a routed kind with
@@ -388,22 +401,24 @@ missed: the first skips rows, the second corrupts them.
 - A move reaching a stream member refuses before writing anything, names the notes and their
   `(stream, seq)`, and the arm is distinguishable from a trigger abort: the mutation control removes
   the pre-flight read and the same case then fails with `stream_member` from inside the transaction.
+  (Not established by an executed acceptance test at this revision.)
 - The fixture is parameterized rather than collision-only. A clean move asserting counts in equals
   counts out, non-zero, is the arm that would go missing if every case collided, and it is the arm
   that detects a conflict-swallowing insert.
 - An ANN consumer that was caught up before the move consumes the moved subjects afterwards, which
   is the arm that fails if the write log is rewritten instead of appended to.
-- The fixture is built through the store's own writers. A SQL seed produces no fts5 shadow rows, no
-  write-log entries and no vector rows, so it would exercise everything except the part that is
-  hard.
+- The fixture uses writer-shaped SQL rather than the public store writers (corrected by Amendment
+  5). The fixture builder documents which derived rows are produced by triggers and which are added
+  explicitly in `crates/khive-db/src/namespace_move_fixture.rs:13-32`.
 
 ## Amendment 1 (2026-09-15): the source side of a move, and what a partitioning move cannot carry
 
 **Status: accepted (2026-09-16).** Accepted on its own acceptance arm rather than on review:
 `the_source_index_stops_answering_for_a_moved_subject`, in the knowledge pack, holds the source
 bridge at its pre-move watermark, drives the fresh-tail leg past it, and asserts that the tail
-carries a delete naming the moved subject. Three corrections found while implementing the primitive
-this ADR specifies.
+carries a delete naming the moved subject. This arm establishes the fresh-tail instruction, not a
+search result from either namespace (corrected by Amendment 5). Three corrections found while
+implementing the primitive this ADR specifies.
 Each is a place where the accepted text describes one side of a two-sided operation, or presumes a
 shape of request it does not name.
 
@@ -480,3 +495,429 @@ because every step here asserts an absence except the two controls that bracket 
 
 The arm's home is the knowledge pack, above `khive-db`, because that is where the consumer surface
 and the watermark actually live.
+
+## Amendment 2 (2026-10-04): logical domain routes and partitioned vector destinations
+
+**Status: accepted (2026-10-19).** Refs #3696. Accepted on its own acceptance arm: the seven
+`namespace_move::partition_tests` fixtures named under Acceptance below pass at main commit
+`0dcb34b7` (the merge of #5324). The fixtures compile only with the `khive-db` `vectors` feature
+enabled (`cargo test -p khive-db --features vectors`); without it the module is absent and nothing
+runs. Each of the nine mutations that Acceptance says must fail a fixture was applied alone to that
+commit, turned its fixture red, and the fixture passed again once the mutation was removed:
+removing mirror exclusion, removing physical mirror carry, counting mirrors as ordinary atoms,
+routing mirror sections through Atom, removing the source-parent namespace predicate, removing the
+staging namespace predicate, reintroducing the compound SELECT term limit (one SELECT term per
+route), removing the orphan check, and removing the competing-subject check. As Acceptance states,
+these fixtures do not establish warmed ANN consumer behavior; Amendment 1's consumer acceptance and
+ADR-144's session/replay acceptance remain separate requirements.
+
+This amendment refines the route-key and derived-parent descriptions above for a
+domain's mirror atom and adds the partitioned vector destination rule. Amendment 1's
+paired ANN instructions, warmed source/target consumer acceptance, per-backend
+transaction and resume rules remain in force.
+
+### Canonical Domain owns its mirror
+
+`knowledge.upsert_domains` publishes a canonical `knowledge_domains` row and a
+mirror `knowledge_atoms` row with the same ID and namespace as one logical record.
+`knowledge.index` indexes that atom under `knowledge.atom`. For routing, a domain
+row owns an atom row exactly when both ID and namespace match. Tags, slugs, names
+and vector kind/field do not establish this pairing.
+
+The `domain` route carries the canonical row, its same-ID/same-namespace mirror,
+and the mirror's source sections and vectors. The `atom` route covers only atoms
+without that matching domain row. Its inventory excludes mirrors, so a backend
+holding only domains and mirrors needs no `atom` route. An explicit `atom` route
+with no ordinary atoms still succeeds with count zero. Soft-deleted rows retain
+the same classification and move with the other rows.
+
+A section contributes its parent's route only when the section and parent atom
+both occupy the source namespace. A mirror section follows `domain`; an ordinary
+atom's section follows `atom`. Sections are selected before the parent moves, so
+an atom already in a target or another namespace cannot supply that parent route
+for a leftover source section. Atom and Domain route order does not change the
+result: neither route moves the other's logical records. Domains may have a
+different target from ordinary atoms.
+
+This is a pairing rule for the two knowledge tables, not a priority between
+unrelated classes sharing an ID. A note, entity, edge or another admitted subject
+with that ID still contributes its route. Different target namespaces constitute
+ambiguity; multiple source subjects naming the same target do not.
+
+### Exactly one source destination before writes
+
+A partitioned request has no single target shared by every route. In each backend,
+every vector row in a runtime `vec_*` table whose namespace is the source must
+resolve by subject ID to exactly one distinct target among the routed source
+subjects described above. Vector kind/field do not select a physical subject
+class. Zero destinations or multiple distinct destinations refuse that backend's
+whole move before temporary staging, base/vector DML or ANN log writes, with
+reason `unroutable_vector` (`MoveError::UnroutableVector`, including the subject ID,
+table and destination count). Existing malformed-route, unknown-table,
+unrouted-class and stream-member checks may refuse first.
+
+An absent source subject, or a source section with no source parent, contributes
+no destination through that physical class. If no other routed source subject
+with the same ID contributes one, the vector therefore refuses with zero
+destinations. This applies separately to each backend receiving the route map;
+it does not undo a transaction already committed on another backend. The
+single-target vector branch retains its existing whole-source-namespace behavior.
+In a single-target move, routing a knowledge class carries every source
+`knowledge_sections` row to that target, even when its parent atom already occupies
+the target or a third namespace.
+
+Every successful partitioned move carries all source vector rows to those unique
+targets, preserves their bytes, and appends source-delete then destination-upsert
+instructions. Runtime vector tables are never reported as `left_behind` in a
+successful partitioned move. Destination and foreign vector rows are outside the
+source staged set. Vector provenance and other retained bookkeeping or
+namespace-scoped aggregates keep their separate existing accounting.
+
+An earlier partitioning move may have left a vector in source after moving its
+physical subject elsewhere. A second partitioned move does not infer a target
+from that now-foreign subject. If no routed source subject with the same ID
+remains, it refuses with zero destinations before writes; if another such subject
+remains, the normal distinct-target rule applies. This amendment provides no
+automatic repair or cleanup for already stranded rows.
+
+### Bound route data and existing collision policy
+
+Route values are bound through `VALUES`, with six fixed subject/section SELECT
+branches. Adding kind routes does not add compound SELECT terms; SQLite's bind
+variable limits still apply. This is no promise of unlimited routes or constant
+work as a route map grows.
+
+The existing conservative collision enumeration remains per reachable constraint
+and distinct target over source rows, rather than filtering each query to one
+route class. In particular, a domain mirror slug collision can refuse even when
+there is no Atom route. Constraints not enumerated still refuse through plain
+failing statements and caller rollback. This amendment adds no conflict winner,
+replacement policy or cross-backend atomicity.
+
+### Acceptance
+
+- `partitioned_vectors_follow_every_source_class_and_its_sections` must route a
+  writer-shaped domain/mirror pair separately from ordinary atoms, move both
+  physical domain rows together, preserve bytes and paired logs, exclude residents
+  and become a no-op on repeat. Removing mirror exclusion or physical mirror carry
+  must fail it.
+- `domain_mirror_and_sections_need_only_domain_route_in_either_order` must carry
+  domain, mirror, section and vectors with no Atom route in either route-list
+  order, preserving bytes, counts, foreign keys and repeated-call behavior.
+  Counting mirrors as ordinary atoms or routing their sections through Atom must
+  fail it.
+- `source_section_with_foreign_parent_refuses_before_any_write` must use distinct
+  identities and refuse its source vector with zero destinations while preserving
+  `total_changes()`. Removing the source-parent namespace predicate must fail it.
+- `foreign_vector_for_source_subject_stays_outside_the_staged_set` must leave a
+  foreign vector untouched, without logging it, while moving its actual source
+  subject. Removing the staging namespace predicate must fail the explicit
+  successful-move assertion after valid fixture setup.
+- `partition_routes_above_compound_select_limit_still_move_real_vectors` must
+  admit 501 additional distinct kind routes and move actual source vectors.
+  Reintroducing the compound SELECT term limit must fail the explicit successful
+  move assertion after valid setup.
+- `domain_mirror_slug_collision_refuses_without_an_atom_route` must return the
+  named collision before any write, without depending on an Atom route.
+- `partitioned_orphan_and_competing_subject_routes_refuse_before_any_write` must
+  refuse zero and multiple distinct destinations before writes; independently
+  removing either check must fail its corresponding case.
+
+These are `namespace_move::partition_tests` fixtures. The domain pair is seeded
+with writer-shaped SQL; those fixtures do not execute the public knowledge writer
+or establish warmed ANN consumer behavior. Amendment 1's consumer acceptance and
+ADR-144's session/replay acceptance remain separate requirements.
+
+## Amendment 3 (2026-10-04): tables a pack creates, and authorization state
+
+**Status: Proposed.** Refs #4040.
+
+The decision above classifies the tables the core schema creates. A pack can create its own
+table with a `namespace` column, and a move that meets rows in a table it has no rule for
+refuses with `UnknownTable`. Eight such tables existed without a rule. This amendment gives each
+one a rule and adds a test that fails when a ninth appears. Amendments 1 and 2 remain in force.
+
+### Rows keyed to a routed subject follow it
+
+`gtd_lifecycle_audit` rows are keyed by the task note they describe. They move with that note,
+to the note's destination, in single-target and partitioning moves alike. A row whose note stays
+in the source stays with it and is counted in `left_behind`. The task's history is read where the
+task is read, so it is not treated as an event log.
+
+### Receipts of work follow a total single-target move
+
+`knowledge_eval_runs`, `exec_runs`, `exec_events` and `git_receipts` record work done in a
+namespace and are keyed to no routed subject. They take the rule Amendment 1 gave
+`proposals_open`: a total single-target move carries them, and a partitioning move leaves them in
+the source and reports each table's row count in `left_behind`. `exec_events` rows belong to an
+`exec_runs` row in the same namespace, so the two tables move or stay together. The unique key of
+`exec_runs` is a partial index, which the collision enumeration does not read. A target that
+already holds a row with the same key therefore refuses the move as a failing statement and the
+caller's rollback, the rule Amendment 2 states for constraints that are not enumerated, and the
+error names the key's columns and not the rows.
+
+### Index snapshots are derived and are deleted, not moved
+
+`retrieval_snapshots` rows are rebuilt from the vectors they summarise. A move deletes the
+source namespace's snapshot rows, including rows stored under a composite key that begins with
+the namespace, and writes none for the target. The target's index is rebuilt by its next
+consumer under the rules of Amendment 1.
+
+### Authorization state is never carried
+
+`tool_policy` and `tool_grants` say what a namespace has allowed. No move carries them, in
+either shape: an allow row arriving in a target would grant there what the target never decided.
+They stay in the source and the move neither deletes nor rewrites them.
+
+Rows that stay are reported so that a caller can raise them with an operator:
+
+- `left_behind` names both tables with the number of rows that stayed;
+- the move result carries two counts, the policy rows that are not soft-deleted and the grants
+  in force at the instant the move ran: granted, not invalidated and not expired. These are the
+  row conditions the tool pack itself reads. The pack also matches a grant's registration pin
+  against the tool's current registration when it decides a call, which a move does not
+  evaluate, so the count can include a pinned grant that no longer matches and never omits a
+  grant the pack would honour;
+- a move that leaves a policy row that is not soft-deleted or a grant in force logs
+  one line at warn level naming the source namespace and the two counts, with no row contents.
+
+**Residual.** Authorization rows left under the old namespace name will meet any data later
+placed under that name. The operator disposes of them. A move never deletes authorization state,
+because a move that guessed wrong would silently widen or revoke access.
+
+### Every pack table has a rule, checked by a test
+
+A test builds one store holding the schema of every built-in pack, runs the namespace census over
+it, and requires each table the census finds to have a disposition or to be named in the
+excluded list. Its failure message names the tables without a rule.
+
+### Acceptance
+
+- A total single-target move of a source holding rows in all eight tables succeeds. Audit rows
+  and the four receipt tables are in the target, `exec_events` rows still match their `exec_runs`
+  row, the source's snapshot rows are gone and the target has none, authorization rows are
+  byte-identical in the source, `left_behind` names both authorization tables, and the two
+  operator counts equal the seeded live rows where the fixture also seeds one soft-deleted policy
+  row, one expired grant, one grant request that was never decided and one revoked grant.
+- A partitioning move of the same source succeeds. Audit rows follow their notes, the four
+  receipt tables and both authorization tables stay and are counted in `left_behind`, and the
+  operator counts are as above.
+- A store without these tables, or a source with no rows in them, moves exactly as before.
+- A target that already holds an `exec_runs` row with the same unique key refuses the move with
+  the failing statement's error, and after the caller's rollback the source and target rows are
+  byte-identical to before.
+- Removing the rule for any one table fails the pack-schema test, and so does adding a
+  namespace-bearing table to the test store without a rule.
+- The liveness predicates for policy and grant rows are pinned by a test in the tool pack that
+  builds rows through the pack's own writers, so the move's counts cannot drift from what the
+  pack reads.
+
+## Amendment 4 (2026-10-04): edge relation routes
+
+**Status: accepted (2026-10-20).** Refs #4038. Accepted on its own acceptance arm: the
+`namespace_move::edge_tests` fixtures named under Acceptance below pass at main commit `972d8861`,
+run with the `khive-db` `vectors` feature (`cargo test -p khive-db --features vectors`); without
+that feature the vector fixture `edge_vectors_follow_the_resolved_relation_not_both_matching_routes`
+is not compiled. Each of the five mutation controls that the seventh and ninth Acceptance bullets
+require was applied alone to that commit and turned its unchanged fixture red after valid setup, at
+the move under test or an assertion on its result, and the fixture passed again once the mutation
+was removed: removing the edge route predicate, skipping collision preflight, removing relation
+filtering from the edge update, removing per-relation preflight, and removing fallback exclusion
+from the vector selector. #5761, merged after that run, gives the vector fixture two vector kinds
+and two fields and records its own two mutation checks (a kind filter and a field filter on the edge
+vector selector). The fallback-exclusion control was run again against that fixture at main commit
+`e8b59a3a`: the fixture passed, the mutation turned it red at the move under test, and it passed
+again once the mutation was removed.
+
+This route grammar serves relation-specific namespace moves in #4038, whose acceptance requires
+exact relation routes with an order-independent bare-edge fallback, refusal of unrouted relations
+before writes, per-route counts and vectors following the resolved edge destination.
+
+### Canonical relation keys and fallback precedence
+
+The extended route-key grammar is:
+
+```
+note:<kind>   entity:<kind>   edge:<relation>   edge   atom   domain
+```
+
+`edge:<relation>` accepts exactly the canonical stored names in
+`khive_types::EdgeRelation::VALID_NAMES`. Empty, unknown or noncanonical qualifiers refuse as
+`UnknownSubjectClass` with the original key. Direct construction of a Rust route must enforce the
+same validation before writes. Two entries for the same relation refuse as `DuplicateRoute`, even
+if their targets are equal. A specific relation key and the bare `edge` fallback are distinct keys.
+
+For each source graph edge, its specific relation route takes precedence over `edge`. The fallback
+carries only relations without a specific route, independently of route-list order. If neither
+route exists for a relation present in source, preflight refuses the entire backend move before any
+write and names `edge:<relation>` and its row count. The inventory includes soft-deleted rows.
+Validation restricts requested specific keys; the fallback retains the prior compatibility with
+stored relation strings, including historical noncanonical values. Endpoints never determine the
+destination.
+
+`MoveCounts.subjects` reports the number moved by each supplied route key, including explicit
+zeroes. The fallback's count excludes specifically routed relations, and the `graph_edges` row
+total counts each moved row once. Bare-edge-only requests retain their prior rows and counts.
+
+### Totality, a target equal to the source, and collisions
+
+The namespace aggregates move only under a total, single-target move (Learned state; Amendment 1
+section 2; Amendment 3). For that test, the edge class counts as routed when every relation present
+in the source resolves to a route, through its specific key or through the fallback. Exhaustive
+specific relation routes are therefore total for edges with or without a bare `edge` route. The
+request is single-target when every route, specific relation routes included, names the same
+target. Exhaustive relation routes to one target carry the aggregates; relation routes to two or
+more targets leave them in place and report them as left behind, like any other partitioning move.
+
+Every route, specific relation routes included, refuses before any write when its target is the
+source namespace. The primitive already does this per route (`MoveError::TargetIsSource`, rendered
+as "routed to the namespace it is already in", checked in `namespace_move.rs` before the source
+inventory is read). This amendment states the rule and extends it to the new keys; it does not add
+a new refusal.
+
+**Collision exception (#4121, 2026-10-05).** This replaces the earlier requirement to
+check every source edge against every routed target. Collision enumeration still visits each
+reachable constraint once per distinct target. For `graph_edges`'s named
+`idx_graph_edges_unique_triple` constraint only, it considers source edges whose resolved relation
+route names that target: the specific `edge:<relation>` route wins, otherwise the bare `edge`
+fallback applies. This is the same resolution used by the move itself, independent of route-list
+order. A stored legacy relation without a specific route still follows the bare fallback.
+
+A matching triple resident in another routed target does not refuse the move when the source edge
+will not be written there. A matching triple in the edge's actual destination still refuses before
+any write and reports the same table, constraint, target and key. Several routes naming one target
+do not duplicate a reported collision. Soft-deleted source edges remain in this check; the triple
+index is not partial. No resident row is overwritten or merged.
+
+All other constraints retain Amendment 2's conservative source-row enumeration, including domain
+mirror slug collisions without an Atom route. Partial and expression index exclusions, the plain
+statement constraint backstop and caller-owned transaction/rollback behavior are unchanged. This
+exception does not change route validation, edge/vector destinations, aggregate totality or any ADR
+status.
+
+### Vectors use the same resolved edge destination
+
+Amendment 2's partitioned vector resolution uses this same resolved edge route. A specific route
+plus a fallback does not contribute two destinations for one edge. Different physical subjects
+sharing an ID still obey the existing distinct-target ambiguity rule. Source scoping, vector bytes,
+paired ANN instructions, collision refusal, transaction ownership, aggregate handling and
+repeated-call behavior retain their existing rules. This amendment extends the route grammar and,
+for the graph-edge triple constraint only, replaces Amendment 2's rule of checking every source edge
+against every routed target. It changes nothing else in Amendments 1 through 3 and does not change
+the status of the document.
+
+### Acceptance
+
+- Five canonical relations, including a deleted edge, move to their exact specific or fallback
+  destinations with fallback first and last. Assert per-ID destinations, unchanged nonnamespace
+  columns, explicit zero counts, no double counting and an empty repeated move.
+- Exhaustive specific routes succeed without a bare fallback; omitting a present relation refuses
+  before any write with its exact key and count. Empty, unknown and noncanonical keys, direct invalid
+  Rust routes, duplicate relation routes and a target equal to source must refuse.
+- A bare-edge-only request preserves its prior behavior, including historical noncanonical stored
+  relations and deleted rows. Destination and foreign residents remain unchanged.
+- With every other class routed to one target, exhaustive specific relation routes to that same
+  target, without a bare `edge` route, move the namespace aggregates. The same source with its
+  relations split across two targets leaves them in place and reports them as left behind.
+- Source relations A and B routed to T1 and T2 move directly when T2 holds a resident with A's
+  triple: assert exact per-ID destinations, unchanged nonnamespace fields and resident rows, per-route
+  counts and zero moves on repetition. Cover exhaustive specific routes and a specific route with
+  the bare fallback in either route-list order, including legacy relations and deleted source edges.
+- With A's triple resident in its actual T1 destination, refuse before any write and report the
+  exact table, unique-triple constraint, target and triple key. The same refusal applies to fallback
+  destinations; several routes sharing a target report one collision. Assert unchanged rows and no
+  writes, with a moved unrelated row in the fixture so bypassing preflight cannot pass unnoticed.
+- Removing only the edge route predicate must make the unchanged direct-success fixture fail on
+  the false refusal. Skipping collision preflight must make the unchanged named-refusal fixture
+  fail. Both controls must compile, and each fixture must pass again after exact restoration.
+- Actual source edge vectors follow the resolved route in either route-list order, preserve bytes
+  and append a source-delete then destination-upsert pair per moved vector. Vector kind and field do
+  not choose the destination. Resident vectors remain unchanged and unlogged.
+- Removing relation filtering from the actual edge update must fail the unchanged routing test;
+  removing per-relation preflight must fail the unchanged missing-relation test; removing fallback
+  exclusion from the vector selector must fail the unchanged vector success test. Each control
+  requires a semantic failure after valid setup and the same test passing after exact restoration.
+
+These storage routing fixtures do not establish warmed ANN consumer behavior, which stays with
+Amendment 1's consumer acceptance. Amendment 2's orphan and competing-subject refusals are proven by
+its own `partitioned_orphan_and_competing_subject_routes_refuse_before_any_write` fixture, not by
+these.
+
+## Amendment 5 (2026-10-23) -- event lookup and operator invocation
+
+**Status**: Accepted 2026-10-23. It does not change the status of the base ADR or of earlier amendments.
+
+**Addresses**: [#5595](https://github.com/ohdearquant/khive/issues/5595).
+
+**Trigger.** The public `get_event` query filters by namespace and ID, while the resolver describes
+the storage read as ID-only and applies visibility after it receives the event
+(`crates/khive-db/src/stores/event.rs:1402-1417`,
+`crates/khive-runtime/src/operations/identity_reads.rs:282-286`). The move is defined as a
+per-backend function over a connection (`crates/khive-db/src/namespace_move.rs:1353-1363`). The
+route stores a `SubjectClass` in each `MoveRoute` (`crates/khive-db/src/namespace_move.rs:115-120`).
+The amendment defines the event lookup contract and the invocation boundary for namespace moves.
+
+### Decision 1 -- event lookup is ID-only at storage
+
+The storage `get_event(id)` query is ID-only. The resolver applies the caller's visible namespace
+set after reading the event. A source-namespace event is therefore resolved from the target
+namespace only when the source namespace is in that visible set. This follows the existing resolver
+shape for notes and the namespace-agnostic by-ID contract in ADR-007 Rules 1 and 2
+(`crates/khive-runtime/src/operations/identity_reads.rs:275-286`,
+`docs/adr/ADR-007-namespace.md:242-246`).
+
+The existing public query still contains `WHERE namespace = ?1 AND id = ?2`, so this decision
+specifies a change that the current implementation does not yet satisfy
+(`crates/khive-db/src/stores/event.rs:1402-1417`). The ID-only helper at lines 441-450 is used by
+event append and does not satisfy the public getter contract
+(`crates/khive-db/src/stores/event.rs:441-450,521`).
+
+### Decision 2 -- acceptance records the tested consumer arm
+
+The move-then-read case moves a note, leaves its event in the source namespace, and reads the event
+by ID from the target. The returned event is checked against the expected text. Resolution succeeds only when
+the source namespace is in the caller's visible set, and it does not resolve when that namespace
+is absent. The storage getter is ID-only; the visible-set decision belongs to resolution, as
+Decision 1 states (`crates/khive-runtime/src/operations/identity_reads.rs:282-286`).
+
+Amendment 1 remains accepted on the executed fresh-tail arm. That arm drives
+`vamana::fresh_tail_leg` and asserts a source-side delete instruction for the moved subject; it
+does not assert source or target search results (`crates/khive-pack-knowledge/src/knowledge/namespace_move_consumer_tests.rs:27-43,78,143-188`).
+The search requirements in Amendment 1 remain acceptance criteria until a test asserts them.
+The base concurrency and stream-member acceptance arms are also unexecuted and remain open; the
+corresponding acceptance requirements remain open
+(`crates/khive-db/src/namespace_move.rs:741-747`).
+
+### Decision 3 -- invocation is operator-only
+
+The first and only invocation surface is `kkernel db move-namespace`, a subcommand of the existing
+`kkernel db` group beside `migrate` and `check` (`crates/kkernel/src/cli.rs:87,292-295`). It runs in a
+local kkernel process against the store that process opens, as `kkernel db migrate` does. No MCP
+server, daemon socket request or remote peer reaches it, so a tenant credential has no path to it.
+A verb form is not part of this amendment; adding one requires its own amendment naming its gate.
+The refusal vocabulary follows the store's existing errors:
+`UnroutedClass`, `StreamMembers`, and `Collisions`
+(`crates/khive-db/src/namespace_move.rs:261-285,314-325`). The primitive stays per-backend
+(`crates/khive-db/src/namespace_move.rs:1353-1363`); the subcommand applies one route map to each
+backend in turn through that backend's writer, reports per-backend counts, stops at the first failing
+backend, and is re-runnable, which is the per-backend and resume behaviour the base text specifies.
+
+The in-place factual corrections record the current schema and refusal behavior. `fts_knowledge`
+uses the filtered `knowledge_atoms_fts_content` view (`crates/khive-db/sql/026-knowledge-fts-repair.sql:20-33`),
+and the stream migration defines six triggers (`crates/khive-db/sql/029-note-streams.sql:11-51`).
+An unhandled namespace table refuses with `UnknownTable`
+(`crates/khive-db/src/namespace_move.rs:308-312,713-717`). The namespace-move fixture uses
+statements and documents trigger-produced rows separately from rows it inserts explicitly
+(`crates/khive-db/src/namespace_move_fixture.rs:13-32`).
+
+### Acceptance
+
+| ID   | Statement                                                                                                                                            | Evidence                                                                                                                                                                                                                      |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A5.1 | `get_event` by ID returns the event regardless of its stored namespace.                                                                              | `cargo test -p khive-db get_event_by_id_is_namespace_agnostic`<br>`crates/khive-db/src/stores/event.rs:1402-1417`                                                                                                             |
+| A5.2 | After a note moves and its event remains in the source, target resolution returns it when source is visible and does not when source is not visible. | `cargo test -p khive-runtime resolve_moved_event_by_id_visibility`<br>`crates/khive-runtime/src/operations/identity_reads.rs:282-286`                                                                                         |
+| A5.3 | The accepted Amendment 1 evidence asserts the source fresh-tail delete; search-result acceptance is separate.                                        | `the_source_index_stops_answering_for_a_moved_subject`<br>`crates/khive-pack-knowledge/src/knowledge/namespace_move_consumer_tests.rs:78-188`<br>`cargo test -p khive-pack-knowledge namespace_move_source_and_target_search` |
+| A5.4 | A concurrent writer cannot resurrect or lose a row during a move.                                                                                    | `cargo test -p khive-db namespace_move_concurrent_writer`                                                                                                                                                                     |
+| A5.5 | A stream-member move refuses before writes and names the member rows.                                                                                | `cargo test -p khive-db namespace_move_stream_member_refusal`; preflight in `crates/khive-db/src/namespace_move.rs:666-679,741-743`                                                                                           |
+| A5.6 | `kkernel db move-namespace` is the only non-test caller of `move_namespace`, and no registered verb calls it.                                        | caller search for `move_namespace(` over `crates/` excluding tests; `cargo test -p kkernel` covering the subcommand's refusal output                                                                                          |
+| A5.7 | Refusals use the store's `UnroutedClass`, `StreamMembers`, and `Collisions` errors.                                                                  | `crates/khive-db/src/namespace_move.rs:261-285,314-325`                                                                                                                                                                       |

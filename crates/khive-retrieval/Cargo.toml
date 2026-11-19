@@ -15,16 +15,16 @@ description = "Hybrid retrieval composer (HNSW + BM25 + fusion + graph + cross-e
 bench = false
 
 [dependencies]
-khive-hnsw    = { version = "0.9.0", path = "../khive-hnsw" }
-khive-bm25    = { version = "0.9.0", path = "../khive-bm25" }
-khive-fusion  = { version = "0.9.0", path = "../khive-fusion" }
-khive-score   = { version = "0.9.0", path = "../khive-score" }
-khive-types   = { version = "0.9.0", path = "../khive-types" }
-khive-fold    = { version = "0.9.0", path = "../khive-fold", optional = true }
-khive-storage = { version = "0.9.0", path = "../khive-storage", optional = true }
-khive-db      = { version = "0.9.0", path = "../khive-db" }
-khive-gate    = { version = "0.9.0", path = "../khive-gate", optional = true }
+khive-hnsw    = { version = "0.20.0", path = "../khive-hnsw", optional = true }
+khive-bm25    = { version = "0.20.0", path = "../khive-bm25", optional = true }
+khive-fusion  = { version = "0.20.0", path = "../khive-fusion" }
+khive-score   = { version = "0.20.0", path = "../khive-score" }
+khive-types   = { version = "0.20.0", path = "../khive-types" }
+khive-fold    = { version = "0.20.0", path = "../khive-fold", optional = true }
+khive-storage = { version = "0.20.0", path = "../khive-storage", optional = true }
+khive-gate    = { version = "0.20.0", path = "../khive-gate", optional = true }
 lattice-embed = { workspace = true }
+lattice-inference = { workspace = true, optional = true, features = ["bert", "std"] }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -45,27 +45,56 @@ rand = { workspace = true, optional = true }
 # and avoid pulling in rusqlite/lattice-embed/khive-storage unless explicitly requested.
 # This deviation is tracked as a known gap pending an ADR-030 amendment.
 default = []
+# Re-exports the khive-hnsw index types (HnswIndex, HnswConfig, ...) at the crate root
+hnsw = ["dep:khive-hnsw"]
+# Re-exports the khive-bm25 index types (Bm25Index, Bm25Config, ...) at the crate root
+bm25 = ["dep:khive-bm25"]
 # Policy-based access control for search results (uses khive-gate API)
 policy = ["khive-gate"]
 # HNSW checkpoint integration with khive-fold (ADR-030 F167)
 # Enables HnswCheckpoint/HnswCheckpointStore re-exports and khive-hnsw checkpoint support.
-checkpoint = ["khive-fold", "khive-hnsw/checkpoint"]
+checkpoint = ["hnsw", "khive-fold", "khive-hnsw/checkpoint"]
 # SQLite-based persistence for HNSW and BM25 indexes
-persist = ["rusqlite", "tracing", "rand"]
+persist = ["hnsw", "bm25", "rusqlite", "tracing", "rand", "khive-storage"]
 # Adapters bridging khive-storage backends (sqlite-vec, FTS5) to retrieval search traits.
-# Enables the vectors feature on khive-db so sqlite-vec is loaded for tests.
-storage-adapters = ["khive-storage", "khive-db/vectors"]
-# Native cross-encoder reranking (deferred until khive-inference is ported)
-native-rerank = []
+# The adapter tests get sqlite-vec from the khive-db dev-dependency's vectors feature.
+storage-adapters = ["khive-storage"]
+# Shared candidate execution with the existing request-scoped storage context.
+executor = ["khive-storage"]
+# Opt-in CPU BERT cross-encoder scoring; inference defaults remain disabled.
+native-rerank = ["dep:lattice-inference"]
 # Native embedding service (delegated to lattice-embed; reserved for future feature-gating)
 embed = []
+# Hidden helpers shared by the packs that keep file-backed ANN checkpoints: the checkpoint
+# directory lock, the rotation watcher loop and the consumer registry. The registry runs its
+# SQL through khive-storage and logs through tracing.
+ann = ["khive-storage", "tracing"]
 
 [dev-dependencies]
 criterion = { workspace = true }
-khive-score = { version = "0.9.0", path = "../khive-score" }
-khive-fusion = { version = "0.9.0", path = "../khive-fusion" }
+tokio = { workspace = true, features = ["test-util"] }
+khive-score = { version = "0.20.0", path = "../khive-score" }
+khive-fusion = { version = "0.20.0", path = "../khive-fusion" }
+# Storage adapter, ANN registry and persistent weight tests use khive-db; `vectors` loads sqlite-vec.
+khive-db = { version = "0.20.0", path = "../khive-db", features = ["vectors", "test-support"] }
+# The read-only snapshot test freezes WAL sidecars with the shared fixture.
+khive-storage = { version = "0.20.0", path = "../khive-storage", features = ["test-support"] }
 
 [[bench]]
 name = "fusion_bench"
 path = "benches/fusion_bench.rs"
 harness = false
+
+[[bench]]
+name = "retrieval_lifecycle"
+harness = false
+
+[[bench]]
+name = "retrieval_persistence"
+harness = false
+required-features = ["persist"]
+
+[[bench]]
+name = "retrieval_ann_registry"
+harness = false
+required-features = ["ann"]

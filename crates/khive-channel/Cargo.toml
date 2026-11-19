@@ -11,6 +11,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Channel transport abstraction for outbound and inbound message delivery (ADR-056)"
 
+[lib]
+bench = false
+
 [dependencies]
 async-trait = { workspace = true }
 thiserror = { workspace = true }
@@ -18,10 +21,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-tracing = { workspace = true }
 tokio = { workspace = true }
 ring = "=0.17.14"
 curve25519-dalek = { version = "=4.1.3", default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "channel_lifecycle"
+harness = false
+
+[[bench]]
+name = "channel_allocations"
+harness = false

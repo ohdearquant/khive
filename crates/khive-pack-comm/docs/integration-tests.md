@@ -94,6 +94,8 @@ These tests reproduce two fixed bugs: #200: from_actor stamped as 'local' when s
 
 When our own outbound email carries X-Khive-Thread-ID = <thread_uuid>, a reply that preserves that header arrives with correlation_external_id = <thread_uuid>. The existing pass-1 (external_id match) finds nothing because thread_uuid ≠ the note's external_id (which is a Message-ID).  The new pass-2 matches $.thread_id on an outbound note to recover from_actor and route the reply back to the original sender's actor.
 
+For external mail the thread-UUID pass requires the same proof the Message-ID pass does: the thread must hold an outbound email whose Message-ID verifies under the configured mailbox domains (ADR-200 Amendment 1 decision 4). The pass pages the thread's outbound notes rather than taking the first, so a copied Message-ID or a non-email row that sorts first cannot supply a route. A UUID naming a thread with no verified outbound email yields no owner; routing then falls through to the recipient aliases and the external inbound actor. Maintainer mail on the `correlation_external_id` path keeps the unproven transport-level resolution.
+
 ### issue #403: In-Reply-To/References on outbound replies (native MUA threading)
 
 khive's own thread continuity uses X-Khive-Thread-ID / external_id correlation (tested above); native mail clients (iPhone Mail, Gmail) instead group conversations by RFC 5322 Message-ID ancestry, which these tests cover.

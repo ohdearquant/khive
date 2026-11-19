@@ -22,6 +22,8 @@ use crate::{KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
 const MODEL: &str = "keyed-memory-test-model";
 const DIMS: usize = 4;
 const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(10);
+// Distinct from the bounded atomic-write attempt numbers.
+pub(crate) const MISSING_SOURCE_CHECKPOINT: usize = usize::MAX;
 
 struct TestEmbeddingService;
 
@@ -119,6 +121,7 @@ async fn assert_rows(runtime: &KhiveRuntime, token: &NamespaceToken, notes: i64,
         "SELECT COUNT(*) FROM ann_write_log WHERE namespace = ?1",
         "SELECT COUNT(*) FROM memory_visibility_receipts WHERE namespace = ?1",
         "SELECT COUNT(*) FROM memory_visibility_fences WHERE namespace = ?1",
+        "SELECT COUNT(*) FROM memory_visibility_epochs WHERE namespace = ?1",
     ] {
         assert_eq!(
             count(runtime, sql, vec![SqlValue::Text(namespace.into())]).await,
@@ -144,6 +147,75 @@ async fn assert_rows(runtime: &KhiveRuntime, token: &NamespaceToken, notes: i64,
         .await,
         edges
     );
+}
+
+#[tokio::test]
+async fn keyed_memory_new_secret_key_is_refused_without_writes() {
+    // This is the synthetic detector fixture used by the secret-gate tests.
+    const SYNTHETIC_KEY: &str = "AKIAFAKEKEY1234567890";
+    validate_memory_key(SYNTHETIC_KEY).expect("fixture key must be syntactically valid");
+    assert!(
+        matches!(
+            crate::secret_gate::check(SYNTHETIC_KEY),
+            Err(RuntimeError::SecretDetected(_))
+        ),
+        "fixture key must independently trigger the secret detector"
+    );
+
+    // Establish that the same fixture can create and replay an ordinary key.
+    let (good_runtime, good_token, good_source) = fixture("key-gate-positive").await;
+    assert_rows(&good_runtime, &good_token, 0, 0).await;
+    let (first, edge, replayed, fences) = create_keyed_memory_with_receipt(
+        &good_runtime,
+        &good_token,
+        spec("benign-key", "ordinary memory", Some(good_source)),
+    )
+    .await
+    .expect("benign create");
+    assert!(!replayed);
+    assert!(edge.is_some());
+    assert_eq!(fences.len(), 1);
+    assert_rows(&good_runtime, &good_token, 1, 1).await;
+    let (second, replay_edge, replayed, replay_fences) = create_keyed_memory_with_receipt(
+        &good_runtime,
+        &good_token,
+        spec("benign-key", "ordinary memory", Some(good_source)),
+    )
+    .await
+    .expect("benign exact replay");
+    assert!(replayed);
+    assert!(replay_edge.is_none());
+    assert_eq!(second.id, first.id);
+    assert_eq!(replay_fences, fences);
+    assert_rows(&good_runtime, &good_token, 1, 1).await;
+
+    let (runtime, token, source) = fixture("key-gate-refusal").await;
+    assert_rows(&runtime, &token, 0, 0).await;
+    let error = match create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec(SYNTHETIC_KEY, "ordinary memory", Some(source)),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("secret-bearing new key was accepted"),
+    };
+    assert!(
+        !error.to_string().contains(SYNTHETIC_KEY),
+        "displayed refusal must not disclose the key"
+    );
+    assert!(
+        !format!("{error:?}").contains(SYNTHETIC_KEY),
+        "debug refusal must not disclose the key"
+    );
+    match error {
+        RuntimeError::SecretDetected(matched) => {
+            assert_eq!(matched.location.as_deref(), Some("note.key"));
+        }
+        _ => panic!("expected a located secret-gate refusal"),
+    }
+    assert_rows(&runtime, &token, 0, 0).await;
 }
 
 #[tokio::test]
@@ -299,7 +371,7 @@ async fn keyed_memory_replay_refuses_when_original_receipt_is_missing() {
     assert_eq!(error.kind(), ErrorKind::Unavailable);
     assert_eq!(
         error.details().and_then(|details| details.get("reason")),
-        Some("freshness_unmet")
+        Some("receipt_temporarily_unavailable")
     );
 }
 
@@ -343,7 +415,7 @@ async fn keyed_memory_replay_refuses_when_original_model_fence_is_missing() {
     assert_eq!(error.kind(), ErrorKind::Unavailable);
     assert_eq!(
         error.details().and_then(|details| details.get("reason")),
-        Some("freshness_unmet")
+        Some("receipt_temporarily_unavailable")
     );
 }
 
@@ -742,7 +814,6 @@ async fn remove_holder(runtime: &KhiveRuntime, token: &NamespaceToken, holder: U
 async fn keyed_memory_disappearing_holder_retries_once_and_commits_one_candidate() {
     let (runtime, token, source) = fixture("keyed-memory-holder-retry").await;
     let key = "retry-operation";
-    let holder = seed_holder(&runtime, &token, key).await;
     let (_arm, mut checkpoints) = arm_checkpoints(token.namespace().as_str());
     let worker_runtime = runtime.clone();
     let worker_token = token.clone();
@@ -755,10 +826,9 @@ async fn keyed_memory_disappearing_holder_retries_once_and_commits_one_candidate
         .await
     });
 
-    expect_checkpoint(&mut checkpoints, 0, false)
-        .await
-        .send(())
-        .expect("resume first attempt");
+    let resume = expect_checkpoint(&mut checkpoints, 0, false).await;
+    let holder = seed_holder(&runtime, &token, key).await;
+    resume.send(()).expect("resume first attempt");
     let resume = expect_checkpoint(&mut checkpoints, 0, true).await;
     remove_holder(&runtime, &token, holder).await;
     resume.send(()).expect("resume first holder lookup");
@@ -787,7 +857,6 @@ async fn keyed_memory_disappearing_holder_retries_once_and_commits_one_candidate
 async fn keyed_memory_disappearing_holders_exhaust_exactly_two_attempts_without_candidate_rows() {
     let (runtime, token, source) = fixture("keyed-memory-holder-exhaustion").await;
     let key = "exhaustion-operation";
-    let first_holder = seed_holder(&runtime, &token, key).await;
     let (_arm, mut checkpoints) = arm_checkpoints(token.namespace().as_str());
     let worker_runtime = runtime.clone();
     let worker_token = token.clone();
@@ -800,10 +869,9 @@ async fn keyed_memory_disappearing_holders_exhaust_exactly_two_attempts_without_
         .await
     });
 
-    expect_checkpoint(&mut checkpoints, 0, false)
-        .await
-        .send(())
-        .expect("resume first attempt");
+    let resume = expect_checkpoint(&mut checkpoints, 0, false).await;
+    let first_holder = seed_holder(&runtime, &token, key).await;
+    resume.send(()).expect("resume first attempt");
     let resume = expect_checkpoint(&mut checkpoints, 0, true).await;
     remove_holder(&runtime, &token, first_holder).await;
     resume.send(()).expect("resume first holder lookup");
@@ -882,6 +950,104 @@ async fn keyed_memory_source_deleted_after_prepare_rolls_back_at_endpoint_guard(
 }
 
 #[tokio::test]
+async fn keyed_memory_endpoint_guard_reconciles_winner_after_source_deletion() {
+    let (runtime, token, source) = fixture("keyed-memory-source-winner").await;
+    let key = "winner-after-prepare";
+    let content = "same concurrent keyed memory";
+    let (arm, mut checkpoints) = arm_checkpoints(token.namespace().as_str());
+    let worker_runtime = runtime.clone();
+    let worker_token = token.clone();
+    let worker = tokio::spawn(async move {
+        create_keyed_memory_with_receipt(
+            &worker_runtime,
+            &worker_token,
+            spec(key, content, Some(source)),
+        )
+        .await
+    });
+    let resume = expect_checkpoint(&mut checkpoints, 0, false).await;
+    // Stop intercepting new callers while the already-paused loser stays paused.
+    drop(arm);
+    let (winner, _, replayed, winner_fences) =
+        create_keyed_memory_with_receipt(&runtime, &token, spec(key, content, None))
+            .await
+            .expect("concurrent winner commits");
+    assert!(!replayed);
+    assert!(runtime
+        .delete_entity(&token, source, true)
+        .await
+        .expect("delete source"));
+    resume.send(()).expect("resume prepared loser");
+    let (note, edge, replayed, fences) = tokio::time::timeout(CHECKPOINT_TIMEOUT, worker)
+        .await
+        .expect("worker must finish")
+        .expect("worker must not panic")
+        .expect("failed endpoint guard reconciles the winning key");
+    assert_eq!(note.id, winner.id);
+    assert!(edge.is_none());
+    assert!(replayed);
+    assert_eq!(fences, winner_fences);
+    assert_rows(&runtime, &token, 1, 0).await;
+}
+
+#[tokio::test]
+async fn keyed_memory_missing_source_recheck_replays_concurrent_winner() {
+    let (runtime, token, _) = fixture("keyed-memory-missing-source-winner").await;
+    let key = "winner-after-missing-source";
+    let content = "same concurrent keyed memory";
+    let missing_source = Uuid::new_v4();
+    assert!(!runtime
+        .substrate_exists_by_id(&token, missing_source)
+        .await
+        .expect("missing source lookup"));
+    assert_rows(&runtime, &token, 0, 0).await;
+
+    let (arm, mut checkpoints) = arm_checkpoints(token.namespace().as_str());
+    let worker_runtime = runtime.clone();
+    let worker_token = token.clone();
+    let worker = tokio::spawn(async move {
+        create_keyed_memory_with_receipt(
+            &worker_runtime,
+            &worker_token,
+            spec(key, content, Some(missing_source)),
+        )
+        .await
+    });
+    // The hook follows the absent first holder lookup and missing-source classification.
+    let resume = expect_checkpoint(&mut checkpoints, MISSING_SOURCE_CHECKPOINT, true).await;
+    assert_rows(&runtime, &token, 0, 0).await;
+    assert!(!runtime
+        .substrate_exists_by_id(&token, missing_source)
+        .await
+        .expect("source remains absent"));
+    // The paused operation keeps its resume channel while new callers bypass the hook.
+    drop(arm);
+    let (winner, winner_edge, replayed, winner_fences) = tokio::time::timeout(
+        CHECKPOINT_TIMEOUT,
+        create_keyed_memory_with_receipt(&runtime, &token, spec(key, content, None)),
+    )
+    .await
+    .expect("concurrent winner must finish before timeout")
+    .expect("concurrent winner commits");
+    assert!(!replayed);
+    assert!(winner_edge.is_none());
+    assert_eq!(winner_fences.len(), 1);
+    assert_rows(&runtime, &token, 1, 0).await;
+
+    resume.send(()).expect("resume missing-source loser");
+    let (note, edge, replayed, fences) = tokio::time::timeout(CHECKPOINT_TIMEOUT, worker)
+        .await
+        .expect("worker must finish")
+        .expect("worker must not panic")
+        .expect("missing-source recheck reconciles the winning key");
+    assert_eq!(note.id, winner.id);
+    assert!(edge.is_none());
+    assert!(replayed);
+    assert_eq!(fences, winner_fences);
+    assert_rows(&runtime, &token, 1, 0).await;
+}
+
+#[tokio::test]
 async fn keyed_memory_checkpoint_arms_are_namespace_scoped_and_removed_on_drop() {
     let namespace = "keyed-memory-checkpoint-scope";
     let (arm, mut checkpoints) = arm_checkpoints(namespace);
@@ -890,4 +1056,640 @@ async fn keyed_memory_checkpoint_arms_are_namespace_scoped_and_removed_on_drop()
     drop(arm);
     checkpoint(namespace, 0, false).await;
     assert!(checkpoints.try_recv().is_err());
+}
+
+async fn receipt_test_execute(runtime: &KhiveRuntime, sql: &str, id: Uuid) {
+    runtime
+        .sql()
+        .writer()
+        .await
+        .unwrap()
+        .execute(SqlStatement {
+            sql: sql.into(),
+            params: vec![SqlValue::Text(id.to_string())],
+            label: Some("receipt-provenance-control".into()),
+        })
+        .await
+        .unwrap();
+}
+
+async fn receipt_snapshot(runtime: &KhiveRuntime) -> serde_json::Value {
+    let mut reader = runtime.sql().reader().await.unwrap();
+    let mut snapshots = Vec::new();
+    for table in [
+        "notes",
+        "memory_visibility_epochs",
+        "memory_visibility_receipts",
+        "memory_visibility_fences",
+        "ann_write_log",
+        "graph_edges",
+    ] {
+        snapshots.push(
+            reader
+                .query_all(SqlStatement {
+                    sql: format!("SELECT * FROM {table} ORDER BY rowid"),
+                    params: vec![],
+                    label: Some("receipt-snapshot".into()),
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    serde_json::to_value(snapshots).unwrap()
+}
+
+async fn assert_unknown_replay(runtime: &KhiveRuntime, token: &NamespaceToken, note: &Note) {
+    let before = receipt_snapshot(runtime).await;
+    for _ in 0..2 {
+        let error = create_keyed_memory_with_receipt(
+            runtime,
+            token,
+            spec(note.key.as_deref().unwrap(), &note.content, None),
+        )
+        .await
+        .unwrap_err();
+        let value =
+            crate::error_projection::runtime_error_value(error, crate::DomainDisposition::Unknown);
+        assert_eq!(value["details"]["reason"], "receipt_epoch_unknown");
+        assert_eq!(value["details"]["memory_id"], note.id.to_string());
+        assert_eq!(value["retryable"], false);
+        assert_eq!(value["domain_disposition"], "not_committed");
+        assert_eq!(receipt_snapshot(runtime).await, before);
+    }
+}
+
+#[tokio::test]
+async fn lower_note_constructors_and_statement_builders_never_assert_modern() {
+    for route in 0..8 {
+        let runtime = KhiveRuntime::memory().unwrap();
+        runtime.install_kind_registry(vec![], vec!["memory".into()]);
+        let token = token(&runtime, "receipt-lower-writer");
+        let mut note = Note::new(token.namespace().as_str(), "memory", "lower-level identity");
+        note.key = Some("lower-key".into());
+        let store = runtime.notes(&token).unwrap();
+        match route {
+            0 => store.upsert_note(note.clone()).await.unwrap(),
+            1 => assert!(store.insert_note_if_absent(note.clone()).await.unwrap()),
+            2 => assert!(store.try_insert_note(note.clone()).await.unwrap()),
+            3 => assert!(runtime
+                .backend()
+                .notes()
+                .unwrap()
+                .try_insert_note_with_attachments(note.clone(), vec![])
+                .await
+                .unwrap()),
+            4 => {
+                store.upsert_notes(vec![note.clone()]).await.unwrap();
+            }
+            5..=7 => {
+                let statement = match route {
+                    5 => khive_db::stores::note::note_upsert_statement(&note),
+                    6 => khive_db::stores::note::note_insert_if_absent_statement(&note),
+                    _ => khive_db::stores::note::note_insert_keyed_statement(&note),
+                };
+                runtime
+                    .sql()
+                    .writer()
+                    .await
+                    .unwrap()
+                    .execute(statement)
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            count(
+                &runtime,
+                "SELECT COUNT(*) FROM memory_visibility_epochs WHERE note_id = ?1",
+                vec![SqlValue::Text(note.id.to_string())]
+            )
+            .await,
+            0
+        );
+        assert_unknown_replay(&runtime, &token, &note).await;
+    }
+}
+
+#[tokio::test]
+async fn in_place_kind_change_and_restored_receipt_cannot_promote_unknown() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    runtime.install_kind_registry(vec![], vec!["memory".into(), "observation".into()]);
+    let token = token(&runtime, "receipt-kind-change");
+    let mut note = Note::new(
+        token.namespace().as_str(),
+        "observation",
+        "later memory identity",
+    );
+    note.key = Some("kind-change-key".into());
+    // The low-level constructor, unlike the runtime policy wrapper, accepts a
+    // caller-supplied replacement kind. It still has no receipt context.
+    let store = runtime.backend().notes().unwrap();
+    store.upsert_note(note.clone()).await.unwrap();
+    note.kind = "memory".into();
+    store.upsert_note(note.clone()).await.unwrap();
+    assert_unknown_replay(&runtime, &token, &note).await;
+
+    let (modern, _, _, _) = create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec("unknown-key", "complete but unknown", None),
+    )
+    .await
+    .unwrap();
+    receipt_test_execute(
+        &runtime,
+        "UPDATE memory_visibility_epochs SET epoch = 'unknown' WHERE note_id = ?1",
+        modern.id,
+    )
+    .await;
+    // A complete original header is already present. It cannot promote unknown
+    // either now or after that same zero-model receipt is restored.
+    assert_unknown_replay(&runtime, &token, &modern).await;
+    receipt_test_execute(
+        &runtime,
+        "DELETE FROM memory_visibility_receipts WHERE note_id = ?1",
+        modern.id,
+    )
+    .await;
+    receipt_test_execute(
+        &runtime,
+        concat!(
+            "INSERT INTO memory_visibility_receipts(namespace, note_id, model_count) ",
+            "SELECT namespace, id, 0 FROM notes WHERE id = ?1"
+        ),
+        modern.id,
+    )
+    .await;
+    assert_unknown_replay(&runtime, &token, &modern).await;
+}
+
+#[tokio::test]
+async fn contradictory_receipt_namespace_and_unreadable_epoch_store_do_not_issue_fences() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    runtime.install_kind_registry(vec![], vec!["memory".into()]);
+    let token = token(&runtime, "receipt-conflict");
+    let (note, _, _, _) = create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec("conflict-key", "receipt identity", None),
+    )
+    .await
+    .unwrap();
+    receipt_test_execute(
+        &runtime,
+        "UPDATE memory_visibility_receipts SET namespace = 'foreign' WHERE note_id = ?1",
+        note.id,
+    )
+    .await;
+    assert_unknown_replay(&runtime, &token, &note).await;
+    receipt_test_execute(
+        &runtime,
+        concat!(
+            "UPDATE memory_visibility_receipts SET namespace = ",
+            "(SELECT namespace FROM notes WHERE id = ?1) WHERE note_id = ?1"
+        ),
+        note.id,
+    )
+    .await;
+    runtime
+        .sql()
+        .writer()
+        .await
+        .unwrap()
+        .execute(SqlStatement {
+            sql: "ALTER TABLE memory_visibility_epochs RENAME TO unavailable_epochs".into(),
+            params: vec![],
+            label: Some("receipt-unavailable-control".into()),
+        })
+        .await
+        .unwrap();
+    let error = create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec("conflict-key", "receipt identity", None),
+    )
+    .await
+    .unwrap_err();
+    let value =
+        crate::error_projection::runtime_error_value(error, crate::DomainDisposition::Unknown);
+    assert_eq!(value["details"]["reason"], "receipt_store_unavailable");
+    assert_eq!(value["retryable"], true);
+    assert_eq!(
+        count(
+            &runtime,
+            "SELECT COUNT(*) FROM unavailable_epochs WHERE note_id = ?1 AND epoch = 'modern'",
+            vec![SqlValue::Text(note.id.to_string())]
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn generic_and_stream_atomic_preparation_publish_modern_with_the_note() {
+    use crate::atomic_message::{
+        prepare_atomic_note_requests, AtomicNoteOptions, AtomicNoteRequest, AtomicNoteSpec,
+    };
+    use crate::atomic_runner::{run_atomic_unit, AtomicRunOutcome};
+    let runtime = KhiveRuntime::memory().unwrap();
+    runtime.install_kind_registry(vec![], vec!["memory".into()]);
+    let token = token(&runtime, "receipt-shared-atomic-writer");
+    // This is the shared production preparer used by generic keyed creates and
+    // stream-batch members; no specialized memory flag is supplied here.
+    let prepared = prepare_atomic_note_requests(
+        &runtime,
+        ["generic-key", "stream-key"]
+            .into_iter()
+            .map(|key| AtomicNoteRequest {
+                spec: AtomicNoteSpec {
+                    token: &token,
+                    id: None,
+                    kind: "memory",
+                    name: None,
+                    content: key,
+                    properties: None,
+                },
+                options: AtomicNoteOptions {
+                    key: Some(key),
+                    ..Default::default()
+                },
+            })
+            .collect(),
+    )
+    .await
+    .unwrap();
+    let ids: Vec<_> = prepared.notes.iter().map(|note| note.id).collect();
+    assert!(matches!(
+        run_atomic_unit(runtime.sql().as_ref(), prepared.plans)
+            .await
+            .unwrap(),
+        AtomicRunOutcome::Committed { .. }
+    ));
+    for id in ids {
+        assert_eq!(
+            count(
+                &runtime,
+                concat!(
+                    "SELECT COUNT(*) FROM memory_visibility_epochs e ",
+                    "JOIN memory_visibility_receipts r ON r.note_id = e.note_id ",
+                    "AND r.namespace = e.namespace JOIN notes n ON n.id = e.note_id ",
+                    "WHERE n.id = ?1 AND n.key IS NOT NULL ",
+                    "AND e.epoch = 'modern' AND r.model_count = 0"
+                ),
+                vec![SqlValue::Text(id.to_string())]
+            )
+            .await,
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn modern_epoch_follows_real_delete_restore_and_new_identity_on_key_reuse() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    runtime.install_kind_registry(vec![], vec!["memory".into()]);
+    let token = token(&runtime, "receipt-real-lifecycle");
+    let (original, _, _, original_fences) = create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec("lifecycle-key", "lifecycle memory", None),
+    )
+    .await
+    .unwrap();
+    assert!(runtime
+        .delete_note(&token, original.id, false)
+        .await
+        .unwrap());
+    assert_eq!(
+        count(
+            &runtime,
+            "SELECT COUNT(*) FROM memory_visibility_epochs WHERE note_id = ?1 AND epoch = 'modern'",
+            vec![SqlValue::Text(original.id.to_string())]
+        )
+        .await,
+        1
+    );
+    assert!(
+        runtime
+            .restore_note(&token, original.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+    );
+    let (restored, _, replay, fences) = create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec("lifecycle-key", "lifecycle memory", None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.id, original.id);
+    assert!(replay);
+    assert_eq!(fences, original_fences);
+    assert!(runtime
+        .delete_note(&token, original.id, true)
+        .await
+        .unwrap());
+    assert_eq!(
+        count(
+            &runtime,
+            "SELECT COUNT(*) FROM memory_visibility_epochs WHERE note_id = ?1",
+            vec![SqlValue::Text(original.id.to_string())]
+        )
+        .await,
+        0
+    );
+    let (replacement, _, replay, _) = create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec("lifecycle-key", "replacement identity", None),
+    )
+    .await
+    .unwrap();
+    assert!(!replay);
+    assert_ne!(replacement.id, original.id);
+    assert_eq!(
+        count(
+            &runtime,
+            "SELECT COUNT(*) FROM memory_visibility_epochs WHERE note_id = ?1 AND epoch = 'modern'",
+            vec![SqlValue::Text(replacement.id.to_string())]
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn stream_batch_keyed_memory_records_modern_without_the_specialized_writer() {
+    use crate::streams::{StreamBatchMember, StreamWriteSpec};
+    let runtime = KhiveRuntime::memory().unwrap();
+    runtime.install_kind_registry(vec![], vec!["memory".into()]);
+    let token = token(&runtime, "receipt-stream-writer");
+    let registry = crate::pack::VerbRegistryBuilder::new().build().unwrap();
+    let result = runtime
+        .stream_batch_atomic(
+            &token,
+            vec![StreamBatchMember::Write(StreamWriteSpec {
+                key: "stream-memory-key".into(),
+                kind: "memory".into(),
+                doc: json!({"memory": "batched"}),
+                tags: None,
+                embed: Some(false),
+                expected_version: None,
+            })],
+            None,
+            vec![],
+            &registry,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.len(), 1);
+    let notes = runtime
+        .notes(&token)
+        .unwrap()
+        .get_live_notes_by_key(
+            token.namespace().as_str(),
+            "stream-memory-key",
+            Some("memory"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(
+        count(
+            &runtime,
+            concat!(
+                "SELECT COUNT(*) FROM memory_visibility_epochs e ",
+                "JOIN memory_visibility_receipts r ON e.note_id = r.note_id ",
+                "AND e.namespace = r.namespace WHERE e.note_id = ?1 ",
+                "AND e.epoch = 'modern' AND r.model_count = 0"
+            ),
+            vec![SqlValue::Text(notes[0].id.to_string())]
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn note_merge_does_not_transfer_epoch_to_the_existing_destination_identity() {
+    use crate::curation::{ContentMergeStrategy, EntityDedupMergePolicy};
+    let runtime = KhiveRuntime::memory().unwrap();
+    runtime.install_kind_registry(vec![], vec!["memory".into()]);
+    let token = token(&runtime, "receipt-merge-identity");
+    let (source, _, _, _) = create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec("merge-source", "source content", None),
+    )
+    .await
+    .unwrap();
+    let mut destination = Note::new(token.namespace().as_str(), "memory", "destination content");
+    destination.key = Some("merge-destination".into());
+    runtime
+        .notes(&token)
+        .unwrap()
+        .upsert_note(destination.clone())
+        .await
+        .unwrap();
+    runtime
+        .merge_note(
+            &token,
+            destination.id,
+            source.id,
+            EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::PreferInto,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        count(
+            &runtime,
+            "SELECT COUNT(*) FROM memory_visibility_epochs WHERE note_id = ?1",
+            vec![SqlValue::Text(destination.id.to_string())]
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &runtime,
+            "SELECT COUNT(*) FROM memory_visibility_epochs WHERE note_id = ?1 AND epoch = 'modern'",
+            vec![SqlValue::Text(source.id.to_string())]
+        )
+        .await,
+        1
+    );
+    let destination = runtime
+        .notes(&token)
+        .unwrap()
+        .get_note(destination.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_unknown_replay(&runtime, &token, &destination).await;
+}
+
+#[tokio::test]
+async fn orphan_fences_are_unknown_even_with_a_legacy_or_modern_marker() {
+    for epoch in ["legacy", "modern"] {
+        let runtime = KhiveRuntime::memory().unwrap();
+        runtime.install_kind_registry(vec![], vec!["memory".into()]);
+        let token = token(&runtime, "receipt-orphan-fence");
+        let (note, _, _, _) = create_keyed_memory_with_receipt(
+            &runtime,
+            &token,
+            spec("orphan-key", "orphan receipt evidence", None),
+        )
+        .await
+        .unwrap();
+        // Model a damaged historical database without changing the reader:
+        // the fence has no header but retains its exact note attribution.
+        {
+            let writer = runtime.backend().pool().try_writer().unwrap();
+            writer
+                .autocommit(|conn| {
+                    conn.pragma_update(None, "foreign_keys", false).unwrap();
+                    conn.execute(
+                        "DELETE FROM memory_visibility_receipts WHERE note_id = ?1",
+                        [note.id.to_string()],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        concat!(
+                            "INSERT INTO memory_visibility_fences",
+                            "(namespace, note_id, model, ann_write_log_seq) ",
+                            "VALUES (?1, ?2, 'original-model', 7)"
+                        ),
+                        rusqlite::params![token.namespace().as_str(), note.id.to_string()],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "UPDATE memory_visibility_epochs SET epoch = ?1 WHERE note_id = ?2",
+                        rusqlite::params![epoch, note.id.to_string()],
+                    )
+                    .unwrap();
+                    conn.pragma_update(None, "foreign_keys", true).unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_unknown_replay(&runtime, &token, &note).await;
+    }
+}
+
+#[tokio::test]
+async fn keyed_memory_replay_ignores_source_and_preserves_the_original_write() {
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    runtime.install_kind_registry(vec!["concept".into()], vec!["memory".into()]);
+    let token = token(&runtime, "keyed-memory-source-replay");
+    let source = runtime
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "original source",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("original source")
+        .id;
+    let alternate = runtime
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "alternate source",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("alternate source")
+        .id;
+    runtime.register_embedder(TestEmbeddingProvider);
+    runtime
+        .vectors_for_model(&token, MODEL)
+        .expect("test vector table");
+    let key = "source-is-creation-only";
+    let content = "a keyed memory with an original source";
+    let (first, first_edge, replayed, fences) =
+        create_keyed_memory_with_receipt(&runtime, &token, spec(key, content, Some(source)))
+            .await
+            .expect("first create");
+    assert!(!replayed);
+    let first_edge = first_edge.expect("original annotation edge");
+    assert_rows(&runtime, &token, 1, 1).await;
+
+    for replay_source in [Some(source), Some(alternate), Some(Uuid::new_v4()), None] {
+        let (note, new_edge, replayed, replay_fences) =
+            create_keyed_memory_with_receipt(&runtime, &token, spec(key, content, replay_source))
+                .await
+                .expect("source is ignored for an existing keyed replay");
+        assert_eq!(note.id, first.id);
+        assert!(replayed);
+        assert!(new_edge.is_none());
+        assert_eq!(replay_fences, fences);
+        assert_rows(&runtime, &token, 1, 1).await;
+        assert_eq!(
+            count(
+                &runtime,
+                "SELECT COUNT(*) FROM graph_edges WHERE id = ?1 AND source_id = ?2 \
+                 AND target_id = ?3 AND relation = 'annotates' AND deleted_at IS NULL",
+                vec![
+                    SqlValue::Text(first_edge.to_string()),
+                    SqlValue::Text(first.id.to_string()),
+                    SqlValue::Text(source.to_string()),
+                ],
+            )
+            .await,
+            1
+        );
+    }
+
+    let conflict = create_keyed_memory(
+        &runtime,
+        &token,
+        spec(key, "different content", Some(Uuid::new_v4())),
+    )
+    .await
+    .expect_err("a missing replay source cannot mask a content conflict");
+    assert_idempotency_conflict(conflict, key, first.id);
+    assert_rows(&runtime, &token, 1, 1).await;
+
+    assert!(runtime
+        .delete_entity(&token, source, true)
+        .await
+        .expect("delete source"));
+    let edge_count = count(
+        &runtime,
+        "SELECT COUNT(*) FROM graph_edges WHERE namespace = ?1",
+        vec![SqlValue::Text(token.namespace().as_str().into())],
+    )
+    .await;
+    let (note, new_edge, replayed, replay_fences) =
+        create_keyed_memory_with_receipt(&runtime, &token, spec(key, content, Some(source)))
+            .await
+            .expect("replay after source deletion");
+    assert_eq!(note.id, first.id);
+    assert!(replayed);
+    assert!(new_edge.is_none());
+    assert_eq!(replay_fences, fences);
+    assert_rows(&runtime, &token, 1, edge_count).await;
+
+    let error = create_keyed_memory(
+        &runtime,
+        &token,
+        spec("new-key", "new content", Some(Uuid::new_v4())),
+    )
+    .await
+    .expect_err("a new key still requires an existing source");
+    assert!(matches!(error, RuntimeError::NotFound(_)));
+    assert_rows(&runtime, &token, 1, edge_count).await;
 }

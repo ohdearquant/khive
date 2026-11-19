@@ -3,8 +3,8 @@ use criterion::{
     Criterion,
 };
 use khive_fusion::{
-    fuse, normalize_weights, reciprocal_rank_fusion, union_fusion, weighted_fusion,
-    weights_are_normalized, FusionStrategy,
+    fuse, normalize_weights, reciprocal_rank_fusion, try_normalize_weights, union_fusion,
+    weighted_fusion, weights_are_normalized, FusionStrategy,
 };
 use khive_score::DeterministicScore;
 
@@ -160,6 +160,38 @@ fn bench_fuse_dispatcher(c: &mut Criterion) {
         });
     }
 
+    // Weighted RRF uses the same owned-input timing boundary as the existing
+    // dispatcher cases: source cloning and output destruction are included.
+    for n_sources in [2, 3] {
+        let sources = make_sources(n_sources, 500);
+        let strategy = FusionStrategy::WeightedRrf {
+            k: 60,
+            weights: (1..=n_sources).map(|i| i as f64).collect(),
+        };
+        for top_k in [10, 50, 100] {
+            let probe = fuse(sources.clone(), &strategy, top_k).expect("valid weighted RRF");
+            assert_eq!(probe.len(), top_k);
+            let ids: std::collections::HashSet<_> = probe.iter().map(|(id, _)| *id).collect();
+            assert_eq!(ids.len(), top_k);
+            assert!(probe.windows(2).all(|pair| {
+                pair[0].1 > pair[1].1 || (pair[0].1 == pair[1].1 && pair[0].0 < pair[1].0)
+            }));
+            group.bench_function(
+                format!("weighted_rrf/{n_sources}src_500items_top{top_k}"),
+                |b| {
+                    b.iter(|| {
+                        fuse(
+                            black_box(sources.clone()),
+                            black_box(&strategy),
+                            black_box(top_k),
+                        )
+                        .expect("valid weighted RRF")
+                    });
+                },
+            );
+        }
+    }
+
     group.finish();
 }
 
@@ -190,6 +222,39 @@ fn bench_weight_utilities(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_try_normalize(c: &mut Criterion) {
+    let mut group = c.benchmark_group("weight_utils_fallible");
+    group.sample_size(200);
+    for count in [2usize, 3, 20] {
+        let raw: Vec<f64> = (1..=count).map(|i| i as f64).collect();
+        let normalized = normalize_weights(&raw);
+        let mut nan_last = raw.clone();
+        nan_last[count - 1] = f64::NAN;
+        let mut infinity_last = raw.clone();
+        infinity_last[count - 1] = f64::INFINITY;
+        for (name, input, invalid) in [
+            ("normalized", normalized, false),
+            ("finite_unnormalized", raw, false),
+            ("nan_last", nan_last, true),
+            ("infinity_last", infinity_last, true),
+        ] {
+            let probe = try_normalize_weights(&input);
+            if invalid {
+                assert_eq!(probe, Err(count - 1));
+            } else {
+                let weights = probe.expect("finite input is accepted regardless of sum");
+                assert_eq!(weights.len(), count);
+                assert!(weights.iter().all(|w| w.is_finite() && *w > 0.0));
+                assert!(weights_are_normalized(&weights, 1e-12));
+            }
+            group.bench_with_input(BenchmarkId::new(name, count), &input, |b, weights| {
+                b.iter(|| try_normalize_weights(black_box(weights)));
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_rrf,
@@ -197,5 +262,6 @@ criterion_group!(
     bench_union,
     bench_fuse_dispatcher,
     bench_weight_utilities,
+    bench_try_normalize,
 );
 criterion_main!(benches);

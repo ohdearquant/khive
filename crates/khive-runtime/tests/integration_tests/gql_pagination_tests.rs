@@ -1,0 +1,1589 @@
+// =============================================================================
+// GQL query truncation warning (issue #777)
+//
+// The compiler cannot infer truncation from the requested LIMIT alone — it
+// must observe whether a real (max_limit + 1)-th match exists. These tests
+// exercise the full compile -> execute -> strip-sentinel -> warn pipeline
+// against real result sets straddling the default 500-row cap.
+// =============================================================================
+
+/// Seed `n` concept entities into a fresh namespace and return the token.
+async fn seed_concepts(rt: &KhiveRuntime, ns: &str, n: usize) -> khive_runtime::NamespaceToken {
+    let tok = rt.authorize(Namespace::parse(ns).unwrap()).unwrap();
+    for i in 0..n {
+        rt.create_entity_with_embedding_report(
+            &tok,
+            "concept",
+            None,
+            &format!("seed-{i}"),
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .map(|(record, _report)| record)
+        .unwrap();
+    }
+    tok
+}
+
+async fn gql_page(
+    rt: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    query: &str,
+    page_size: usize,
+) -> khive_runtime::QueryResult {
+    rt.query_with_metadata(
+        token,
+        query,
+        khive_query::CompileOptions {
+            max_limit: page_size,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn no_explicit_limit_under_and_at_cap_emits_no_warning() {
+    let rt = rt();
+
+    // 499 matches, no explicit LIMIT: below the cap, all rows returned, no warning.
+    let tok_499 = seed_concepts(&rt, "trunc-499", 499).await;
+    let result_499 = rt
+        .query_with_metadata(
+            &tok_499,
+            "MATCH (a:concept) RETURN a",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result_499.rows.len(), 499);
+    assert!(
+        result_499.warnings.is_empty(),
+        "499 matches under the cap must not warn: {:?}",
+        result_499.warnings
+    );
+    assert!(
+        !result_499.truncated,
+        "#1247: under the cap is not truncated"
+    );
+
+    // Exactly 500 matches, no explicit LIMIT: right at the cap, no truncation, no warning.
+    let tok_500 = seed_concepts(&rt, "trunc-500", 500).await;
+    let result_500 = rt
+        .query_with_metadata(
+            &tok_500,
+            "MATCH (a:concept) RETURN a",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result_500.rows.len(), 500);
+    assert!(
+        result_500.warnings.is_empty(),
+        "exactly 500 matches must not warn (nothing was dropped): {:?}",
+        result_500.warnings
+    );
+    assert!(
+        !result_500.truncated,
+        "#1247: exactly at the cap is not truncated (nothing was dropped)"
+    );
+}
+
+#[tokio::test]
+async fn no_explicit_limit_over_cap_warns_and_strips_sentinel() {
+    let rt = rt();
+
+    // 501 matches, no explicit LIMIT — this is issue #777's original silent-
+    // truncation case: the cap is the only bound, and the compiler cannot know
+    // ahead of time that a 501st row exists.
+    let tok = seed_concepts(&rt, "trunc-501", 501).await;
+    let result = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept) RETURN a",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.rows.len(),
+        500,
+        "sentinel row must be stripped; exactly max_limit rows must be returned"
+    );
+    assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
+    assert!(result.warnings[0].contains("500"), "{}", result.warnings[0]);
+    assert!(
+        result.warnings[0].contains("SKIP 500") && result.warnings[0].contains("next_offset"),
+        "#1601: the warning must agree with the machine-readable GQL continuation: {}",
+        result.warnings[0]
+    );
+    assert!(result.has_more);
+    assert_eq!(result.next_offset, Some(500));
+    assert!(
+        result.truncated,
+        "#1247: truncated must be the structural signal, independent of warnings text"
+    );
+
+    // The sentinel row must not leak into the returned set: every row must be
+    // a distinct seeded entity.
+    let names: std::collections::HashSet<_> = result
+        .rows
+        .iter()
+        .filter_map(|r| match r.get("a_name") {
+            Some(khive_storage::types::SqlValue::Text(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names.len(), 500, "sentinel row must not leak into results");
+
+    let final_page = gql_page(&rt, &tok, "MATCH (a:concept) RETURN a SKIP 500", 500).await;
+    assert_eq!((final_page.offset, final_page.page_size), (500, 500));
+    assert_eq!(
+        final_page.rows.len(),
+        1,
+        "SKIP 500 must retrieve the 501st match"
+    );
+    assert!(!final_page.has_more && !final_page.truncated);
+    assert_eq!(final_page.next_offset, None);
+    let final_name = match final_page.rows[0].get("a_name") {
+        Some(khive_storage::types::SqlValue::Text(name)) => name,
+        other => panic!("final page must project the remaining entity name, got {other:?}"),
+    };
+    assert!(
+        !names.contains(final_name),
+        "the final page must not overlap the first 500 rows"
+    );
+}
+
+#[tokio::test]
+async fn explicit_limit_variants_against_501_matches() {
+    let rt = rt();
+    let tok = seed_concepts(&rt, "trunc-501-limits", 501).await;
+
+    // LIMIT above the cap: the cap still binds, warning fires, sentinel stripped.
+    let above_cap = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept) RETURN a LIMIT 600",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(above_cap.rows.len(), 500);
+    assert_eq!(
+        above_cap.warnings.len(),
+        1,
+        "LIMIT above cap with 501 real matches must warn: {:?}",
+        above_cap.warnings
+    );
+    assert!(above_cap.warnings[0].contains("600"));
+    assert!(above_cap.warnings[0].contains("500"));
+    assert!(
+        above_cap.truncated,
+        "#1247: LIMIT above cap must set truncated"
+    );
+
+    // LIMIT exactly at the cap: the cap never binds (requested <= max_limit),
+    // so no sentinel is fetched and no warning fires, even though 501 rows
+    // actually match — the caller asked for exactly 500 and got exactly 500.
+    let at_cap = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept) RETURN a LIMIT 500",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(at_cap.rows.len(), 500);
+    assert!(
+        at_cap.warnings.is_empty(),
+        "LIMIT == cap must not warn: {:?}",
+        at_cap.warnings
+    );
+    assert!(
+        !at_cap.truncated,
+        "#1247: an explicit LIMIT the caller chose is not server-side truncation"
+    );
+
+    // LIMIT below the cap: this is the false-positive regression
+    // case (LIMIT above the requested value but under real matches would have
+    // wrongly warned under the old requested-limit-only inference). Here the
+    // requested LIMIT is under the cap, so it must never warn regardless of
+    // how many rows actually match.
+    let below_cap = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept) RETURN a LIMIT 100",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(below_cap.rows.len(), 100);
+    assert!(
+        below_cap.warnings.is_empty(),
+        "LIMIT below cap must not warn: {:?}",
+        below_cap.warnings
+    );
+    assert!(
+        !below_cap.truncated,
+        "#1247: LIMIT below cap is not truncated"
+    );
+}
+
+#[tokio::test]
+async fn explicit_limit_over_cap_with_few_real_matches_emits_no_warning() {
+    let rt = rt();
+
+    // Only 20 real matches, but the explicit LIMIT (600) exceeds the cap
+    // (500). This is the false-positive regression case: the old
+    // warn-whenever-LIMIT-exceeds-cap inference would have fired here even
+    // though nothing was actually truncated. All 20 rows must come back and
+    // no warning must fire.
+    let tok = seed_concepts(&rt, "trunc-20-limit-over-cap", 20).await;
+    let result = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept) RETURN a LIMIT 600",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.rows.len(), 20);
+    assert!(
+        result.warnings.is_empty(),
+        "LIMIT above cap with fewer real matches than the cap must not warn: {:?}",
+        result.warnings
+    );
+    assert!(
+        !result.truncated,
+        "#1247: fewer real matches than the cap is not truncation"
+    );
+}
+
+#[tokio::test]
+async fn gql_skip_pages_are_deterministic_complete_and_machine_continuable() {
+    let rt = rt();
+    let tok = seed_concepts(&rt, "gql-pages-12", 12).await;
+
+    let names = |result: &khive_runtime::QueryResult| {
+        result
+            .rows
+            .iter()
+            .filter_map(|row| match row.get("a_name") {
+                Some(khive_storage::types::SqlValue::Text(name)) => Some(name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let first = gql_page(&rt, &tok, "MATCH (a:concept) RETURN a", 5).await;
+    let first_repeat = gql_page(&rt, &tok, "MATCH (a:concept) RETURN a", 5).await;
+    let second = gql_page(&rt, &tok, "MATCH (a:concept) RETURN a SKIP 5", 5).await;
+    let third = gql_page(&rt, &tok, "MATCH (a:concept) RETURN a SKIP 10", 5).await;
+
+    assert_eq!(
+        names(&first),
+        names(&first_repeat),
+        "page order must be stable"
+    );
+    assert_eq!((first.offset, first.page_size), (0, 5));
+    assert!(first.has_more && first.truncated);
+    assert_eq!(first.next_offset, Some(5));
+    assert!(
+        first
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("SKIP 5")),
+        "human guidance must agree with next_offset: {:?}",
+        first.warnings
+    );
+
+    assert_eq!((second.offset, second.page_size), (5, 5));
+    assert!(second.has_more && second.truncated);
+    assert_eq!(second.next_offset, Some(10));
+
+    assert_eq!((third.offset, third.page_size), (10, 5));
+    assert!(!third.has_more && !third.truncated);
+    assert_eq!(third.next_offset, None);
+    assert_eq!(third.rows.len(), 2);
+
+    let all_names = names(&first)
+        .into_iter()
+        .chain(names(&second))
+        .chain(names(&third))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        all_names.len(),
+        12,
+        "paging must retrieve the full match set"
+    );
+}
+
+#[tokio::test]
+async fn gql_query_limit_composes_with_page_size() {
+    let rt = rt();
+    let tok = seed_concepts(&rt, "gql-page-limit-composition", 8).await;
+
+    let caller_bounded = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept) RETURN a LIMIT 3",
+            khive_query::CompileOptions {
+                max_limit: 5,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(caller_bounded.rows.len(), 3);
+    assert_eq!(caller_bounded.page_size, 3);
+    assert!(!caller_bounded.has_more);
+    assert_eq!(caller_bounded.next_offset, None);
+
+    let server_bounded = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept) RETURN a LIMIT 8",
+            khive_query::CompileOptions {
+                max_limit: 5,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(server_bounded.rows.len(), 5);
+    assert_eq!(server_bounded.page_size, 5);
+    assert!(server_bounded.has_more);
+    assert_eq!(server_bounded.next_offset, Some(5));
+
+    // Only 8 real matches exist, so SKIP 5 exhausts the data after 3 rows,
+    // even though LIMIT still permits 8 rows after that offset.
+    let terminal = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept) RETURN a SKIP 5 LIMIT 8",
+            khive_query::CompileOptions {
+                max_limit: 5,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(terminal.rows.len(), 3);
+    assert!(!terminal.has_more);
+    assert_eq!(terminal.next_offset, None);
+}
+
+/// #6691: LIMIT bounds the result after SKIP on each request, while page_size
+/// bounds the payload and the sentinel establishes whether another row exists.
+#[tokio::test]
+async fn gql_query_limit_applies_after_skip_on_every_page() {
+    let rt = rt();
+    let tok = rt
+        .authorize(Namespace::parse("gql-page-limit-after-skip").unwrap())
+        .unwrap();
+    let expected = (1..=20)
+        .map(|number| format!("row-{number:02}"))
+        .collect::<Vec<_>>();
+    for name in &expected {
+        gql_metadata_entity(&rt, &tok, name).await;
+    }
+    let base = "MATCH (a:concept) RETURN a.name ORDER BY a.name";
+    let names = |result: &khive_runtime::QueryResult| {
+        result
+            .rows
+            .iter()
+            .map(|row| row.text("a_name").expect("ordered entity name").to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    // The caller's terminal three-row page is rows 11–13, even though SKIP > LIMIT.
+    let window = gql_page(&rt, &tok, &format!("{base} SKIP 10 LIMIT 3"), 5).await;
+    assert_eq!(names(&window), expected[10..13]);
+    assert_eq!((window.offset, window.page_size), (10, 3));
+    assert!(!window.has_more && !window.truncated);
+    assert_eq!(window.next_offset, None);
+    assert!(window.warnings.is_empty());
+    let repeat = gql_page(&rt, &tok, &format!("{base} SKIP 10 LIMIT 3"), 5).await;
+    assert_eq!(names(&repeat), names(&window), "unchanged data, same page");
+
+    let mut collected = Vec::new();
+    for offset in (0..20).step_by(2) {
+        let page = gql_page(&rt, &tok, &format!("{base} SKIP {offset} LIMIT 5"), 2).await;
+        assert_eq!((page.offset, page.page_size), (offset, 2));
+        assert_eq!(
+            page.rows.len(),
+            2,
+            "sentinel must not escape at SKIP {offset}"
+        );
+        assert_eq!(names(&page), expected[offset..offset + 2]);
+        let has_more = offset < 18;
+        assert_eq!(page.has_more, has_more);
+        assert_eq!(page.truncated, has_more);
+        assert_eq!(page.next_offset, has_more.then_some(offset + 2));
+        if let Some(next) = page.next_offset {
+            assert!(page
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(&format!("SKIP {next}"))));
+        } else {
+            assert!(page.warnings.is_empty());
+        }
+        collected.extend(names(&page));
+    }
+    assert_eq!(collected, expected, "LIMIT restarts after each SKIP");
+    assert_eq!(collected.iter().collect::<BTreeSet<_>>().len(), 20);
+
+    for tail in [
+        "LIMIT 0",
+        "SKIP 10 LIMIT 0",
+        "SKIP 20 LIMIT 5",
+        "SKIP 99 LIMIT 5",
+    ] {
+        let empty = gql_page(&rt, &tok, &format!("{base} {tail}"), 2).await;
+        assert!(empty.rows.is_empty(), "{tail}");
+        assert!(!empty.has_more && !empty.truncated);
+        assert_eq!(empty.next_offset, None);
+        assert!(empty.warnings.is_empty());
+    }
+}
+
+/// Put values in accepted edge-ID order, independently of random UUID allocation.
+async fn gql_metadata_star(
+    runtime: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    values: Vec<serde_json::Value>,
+) -> (Uuid, Vec<khive_storage::Edge>) {
+    let source = gql_metadata_entity(runtime, token, "ordered source").await;
+    let mut edges = Vec::new();
+    for index in 0..values.len() {
+        let target = gql_metadata_entity(runtime, token, &format!("ordered target {index}")).await;
+        edges.push(
+            runtime
+                .link(token, source, target, EdgeRelation::VariantOf, 1.0, None)
+                .await
+                .unwrap(),
+        );
+    }
+    edges.sort_by_key(|edge| edge.id.to_string());
+    for (edge, metadata) in edges.iter_mut().zip(values) {
+        let accepted = runtime
+            .link(
+                token,
+                source,
+                edge.target_id,
+                EdgeRelation::VariantOf,
+                1.0,
+                Some(metadata),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted.id, edge.id,
+            "replacement retains the accepted natural-key identity"
+        );
+        *edge = accepted;
+    }
+    (source, edges)
+}
+
+#[tokio::test]
+async fn gql_metadata_order_preserves_sqlite_types_and_identity_ties() {
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let values = vec![
+        serde_json::json!({"sort": {"x": 1}}),
+        serde_json::json!({"sort": "a"}),
+        serde_json::json!({"sort": [1]}),
+        serde_json::json!({"sort": "A"}),
+        serde_json::json!({"sort": "2"}),
+        serde_json::json!({"sort": "10"}),
+        serde_json::json!({"sort": 10}),
+        serde_json::json!({"sort": 2}),
+        serde_json::json!({"sort": 1.5}),
+        serde_json::json!({"sort": true}),
+        serde_json::json!({"sort": 1}),
+        serde_json::json!({"sort": false}),
+        serde_json::json!({"sort": 0}),
+        serde_json::json!({"sort": null}),
+        serde_json::json!({}),
+    ];
+    let (source, edges) = gql_metadata_star(&runtime, &token, values).await;
+    // SQL NULL, numeric values, then BINARY text. JSON arrays/objects are text;
+    // booleans are integers and tie with the matching numeric value.
+    let groups = vec![
+        vec![13, 14],
+        vec![11, 12],
+        vec![9, 10],
+        vec![8],
+        vec![7],
+        vec![6],
+        vec![5],
+        vec![4],
+        vec![3],
+        vec![2],
+        vec![1],
+        vec![0],
+    ];
+    for descending in [false, true] {
+        let mut ordered_groups = groups.clone();
+        if descending {
+            ordered_groups.reverse();
+        }
+        let expected = ordered_groups
+            .iter()
+            .flatten()
+            .map(|index| edges[*index].id.to_string())
+            .collect::<Vec<_>>();
+        let direction = if descending { "DESC" } else { "ASC" };
+        let rows = runtime.query(&token, &format!(
+            "MATCH (a:concept)-[e:variant_of]->(b:concept) WHERE a.id = '{source}' RETURN e.id, e.metadata ORDER BY e.metadata.sort {direction}"
+        )).await.unwrap();
+        assert_eq!(gql_metadata_ids(&rows), expected, "{direction}");
+        for row in &rows {
+            assert_eq!(
+                row.columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["e_id", "e_metadata"]
+            );
+        }
+    }
+    let mut descending = groups;
+    descending.reverse();
+    for group in &mut descending {
+        group.reverse();
+    }
+    let expected = descending
+        .iter()
+        .flatten()
+        .map(|index| edges[*index].id.to_string())
+        .collect::<Vec<_>>();
+    let rows = runtime.query(&token, &format!(
+        "MATCH (a:concept)-[e:variant_of]->(b:concept) WHERE a.id = '{source}' RETURN e.id ORDER BY e.metadata.sort DESC, e.id DESC"
+    )).await.unwrap();
+    assert_eq!(
+        gql_metadata_ids(&rows),
+        expected,
+        "second requested term precedes the identity suffix"
+    );
+}
+
+#[tokio::test]
+async fn gql_metadata_order_pages_preserve_visibility_sentinels_and_post_skip_limits() {
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    let (source, edges) = gql_metadata_star(
+        &runtime,
+        &token,
+        [6, 5, 4, 3, 2, 1, 1]
+            .into_iter()
+            .map(|order| serde_json::json!({"order": order, "selected": true}))
+            .collect(),
+    )
+    .await;
+    let mut excluded = Vec::new();
+    for (name, order) in [
+        ("deleted edge", -30),
+        ("deleted endpoint", 30),
+        ("predicate excluded", -20),
+    ] {
+        let target = gql_metadata_entity(&runtime, &token, name).await;
+        excluded.push(runtime.link(&token, source, target, EdgeRelation::VariantOf, 1.0,
+            Some(serde_json::json!({"order": order, "selected": name != "predicate excluded"}))).await.unwrap());
+    }
+    assert!(runtime
+        .delete_edge(&token, excluded[0].id.into(), false)
+        .await
+        .unwrap());
+    assert!(runtime
+        .delete_entity(&token, excluded[1].target_id, false)
+        .await
+        .unwrap());
+    let hidden_token = runtime
+        .authorize(Namespace::parse("metadata-hidden").unwrap())
+        .unwrap();
+    let hidden_target = gql_metadata_entity(&runtime, &hidden_token, "hidden endpoint").await;
+    let hidden = runtime
+        .link(
+            &hidden_token,
+            source,
+            hidden_target,
+            EdgeRelation::VariantOf,
+            1.0,
+            Some(serde_json::json!({"order": -100, "selected": true})),
+        )
+        .await
+        .unwrap();
+    let expected = [5, 6, 4, 3, 2, 1, 0]
+        .map(|index| edges[index].id.to_string())
+        .to_vec();
+    let base = format!("MATCH (a:concept)-[e:variant_of]->(b:concept) WHERE a.id = '{source}' AND e.metadata.selected = true RETURN e.id, e.metadata ORDER BY e.metadata.order");
+    let before = gql_metadata_snapshot(&runtime).await;
+    let whole = gql_page(&runtime, &token, &base, 20).await;
+    assert_eq!(gql_metadata_ids(&whole.rows), expected);
+    let first = gql_page(&runtime, &token, &base, 2).await;
+    let repeat = gql_page(&runtime, &token, &base, 2).await;
+    assert_eq!(gql_metadata_ids(&first.rows), expected[..2]);
+    assert_eq!(gql_metadata_ids(&repeat.rows), expected[..2]);
+    let mut collected = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = gql_page(&runtime, &token, &format!("{base} SKIP {offset}"), 2).await;
+        assert_eq!((page.offset, page.page_size), (offset, 2));
+        assert_eq!(page.has_more, page.truncated);
+        assert!(page.rows.len() <= 2, "sentinel must not escape");
+        collected.extend(gql_metadata_ids(&page.rows));
+        match page.next_offset {
+            Some(next) => {
+                assert!(page.has_more);
+                assert_eq!(next, offset + page.rows.len());
+                assert!(page
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(&format!("SKIP {next}"))));
+                offset = next;
+            }
+            None => {
+                assert!(!page.has_more);
+                break;
+            }
+        }
+        assert!(offset < 10, "bounded continuation");
+    }
+    assert_eq!(collected, expected);
+    assert_eq!(
+        collected.iter().collect::<BTreeSet<_>>().len(),
+        expected.len()
+    );
+    let mut limited = Vec::new();
+    for (offset, end, next) in [
+        (0, 2, Some(2)),
+        (2, 4, Some(4)),
+        (4, 6, Some(6)),
+        (6, 7, None),
+    ] {
+        let page = gql_page(
+            &runtime,
+            &token,
+            &format!("{base} SKIP {offset} LIMIT 3"),
+            2,
+        )
+        .await;
+        assert_eq!((page.offset, page.page_size), (offset, 2));
+        assert_eq!(gql_metadata_ids(&page.rows), expected[offset..end]);
+        assert_eq!(page.next_offset, next);
+        assert_eq!(page.has_more, next.is_some());
+        assert_eq!(page.truncated, next.is_some());
+        limited.extend(gql_metadata_ids(&page.rows));
+    }
+    assert_eq!(limited, expected);
+    let caller_bounded = gql_page(&runtime, &token, &format!("{base} SKIP 3 LIMIT 2"), 2).await;
+    assert_eq!(gql_metadata_ids(&caller_bounded.rows), expected[3..5]);
+    assert!(!caller_bounded.has_more && !caller_bounded.truncated);
+    assert_eq!(caller_bounded.next_offset, None);
+    let exhausted = gql_page(&runtime, &token, &format!("{base} SKIP 7 LIMIT 3"), 2).await;
+    assert!(exhausted.rows.is_empty());
+    assert!(!exhausted.has_more && !exhausted.truncated);
+    assert_eq!(exhausted.next_offset, None);
+    let wider = runtime
+        .authorize_with_visibility(
+            Namespace::local(),
+            vec![Namespace::parse("metadata-hidden").unwrap()],
+        )
+        .unwrap();
+    let visible = gql_page(&runtime, &wider, &base, 20).await;
+    let mut with_hidden = vec![hidden.id.to_string()];
+    with_hidden.extend(expected);
+    assert_eq!(gql_metadata_ids(&visible.rows), with_hidden);
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_recursive_metadata_order_pages_preserve_distinct_rows() {
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let root = gql_metadata_entity(&runtime, &token, "diamond root").await;
+    let left = gql_metadata_entity(&runtime, &token, "diamond left").await;
+    let right = gql_metadata_entity(&runtime, &token, "diamond right").await;
+    let joint = gql_metadata_entity(&runtime, &token, "diamond joint").await;
+    for (from, to) in [(root, left), (root, right), (left, joint), (right, joint)] {
+        runtime
+            .link(
+                &token,
+                from,
+                to,
+                EdgeRelation::VariantOf,
+                1.0,
+                Some(serde_json::json!({"order": 90})),
+            )
+            .await
+            .unwrap();
+    }
+    for (index, order) in [7, 3, 7, 5].into_iter().enumerate() {
+        let end = gql_metadata_entity(&runtime, &token, &format!("diamond end {index}")).await;
+        runtime
+            .link(
+                &token,
+                joint,
+                end,
+                EdgeRelation::VariantOf,
+                1.0,
+                Some(serde_json::json!({"order": order, "final": true})),
+            )
+            .await
+            .unwrap();
+    }
+    let base = format!("MATCH (a:concept)-[e:variant_of*1..3]->(b:concept) WHERE a.id = '{root}' AND e.metadata.final = true RETURN e.metadata ORDER BY e.metadata.order");
+    let mut values = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = gql_page(
+            &runtime,
+            &token,
+            &format!("{base} SKIP {offset} LIMIT 2"),
+            1,
+        )
+        .await;
+        assert_eq!((page.offset, page.page_size), (offset, 1));
+        assert_eq!(page.rows.len(), 1);
+        let row = &page.rows[0];
+        assert_eq!(
+            row.columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["e_metadata", "_depth", "_total_weight"]
+        );
+        assert!(matches!(
+            row.get("_depth"),
+            Some(khive_storage::SqlValue::Integer(3))
+        ));
+        assert!(
+            matches!(row.get("_total_weight"), Some(khive_storage::SqlValue::Float(weight)) if *weight == 3.0)
+        );
+        values.push(
+            serde_json::from_str::<serde_json::Value>(row.text("e_metadata").unwrap()).unwrap(),
+        );
+        match page.next_offset {
+            Some(next) => {
+                assert!(page.has_more && page.truncated);
+                assert_eq!(next, offset + 1);
+                offset = next;
+            }
+            None => {
+                assert!(!page.has_more && !page.truncated);
+                break;
+            }
+        }
+        assert!(
+            offset < 4,
+            "DISTINCT must collapse both paths and identical projected final edges"
+        );
+    }
+    assert_eq!(
+        values,
+        [3, 5, 7].map(|order| serde_json::json!({"order": order, "final": true}))
+    );
+    let caller_bounded = gql_page(&runtime, &token, &format!("{base} SKIP 1 LIMIT 1"), 1).await;
+    assert_eq!(caller_bounded.rows.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            caller_bounded.rows[0].text("e_metadata").unwrap()
+        )
+        .unwrap(),
+        serde_json::json!({"order": 5, "final": true})
+    );
+    assert!(!caller_bounded.has_more && !caller_bounded.truncated);
+    assert_eq!(caller_bounded.next_offset, None);
+    for tail in ["LIMIT 0", "SKIP 3 LIMIT 2", "SKIP 99 LIMIT 2"] {
+        let empty = gql_page(&runtime, &token, &format!("{base} {tail}"), 1).await;
+        assert!(empty.rows.is_empty(), "{tail}");
+        assert!(!empty.has_more && !empty.truncated);
+        assert_eq!(empty.next_offset, None);
+    }
+    let start = runtime.query(&token, &format!(
+        "MATCH (a:concept)-[e:variant_of*1..3]->(b:concept) WHERE a.id = '{root}' AND e.metadata.final = true RETURN a.id, a.name, e.metadata ORDER BY a.name DESC, e.metadata.order"
+    )).await.unwrap();
+    assert_eq!(start.len(), 3);
+    for row in &start {
+        assert_eq!(row.text("a_id").unwrap(), root.to_string());
+        assert_eq!(row.text("a_name").unwrap(), "diamond root");
+    }
+    let error = runtime.query(&token, &format!(
+        "MATCH (a:concept)-[e:variant_of*1..3]->(b:concept) WHERE a.id = '{root}' RETURN e.metadata ORDER BY e.weight"
+    )).await.unwrap_err();
+    assert!(
+        matches!(error.refusal_source(), khive_runtime::RuntimeError::Query(khive_query::QueryError::Unsupported(message)) if message.contains("variable-length ORDER BY must be derived from RETURN projections")),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn gql_comma_order_and_paging_preserve_every_tuple() {
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let fixture = gql_comma_star(&runtime, &token).await;
+    let before = gql_metadata_snapshot(&runtime).await;
+    for (direction, left_order, right_order) in
+        [("ASC", [1, 0], [1, 2, 0]), ("DESC", [0, 1], [0, 1, 2])]
+    {
+        let expected = left_order
+            .into_iter()
+            .flat_map(|left| right_order.into_iter().map(move |right| (left, right)))
+            .map(|(left, right)| {
+                (
+                    fixture.left[left].id.to_string(),
+                    fixture.right[right].id.to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if direction == "ASC" {
+            assert_ne!(
+                expected,
+                fixture.pairs(),
+                "fixture must distinguish requested order from identity order"
+            );
+        }
+        let base = format!("{} RETURN e.id, f.id ORDER BY e.metadata.order {direction}, f.metadata.order {direction}", fixture.pattern());
+        let whole = gql_page(&runtime, &token, &base, 20).await;
+        assert_eq!(gql_comma_pairs(&whole.rows), expected, "{direction}");
+        assert!(!whole.has_more && !whole.truncated);
+        assert_eq!(whole.next_offset, None);
+        let repeat = gql_page(&runtime, &token, &base, 2).await;
+        assert_eq!(gql_comma_pairs(&repeat.rows), expected[..2]);
+        let mut collected = Vec::new();
+        for offset in [0, 2, 4] {
+            let page = gql_page(&runtime, &token, &format!("{base} SKIP {offset}"), 2).await;
+            assert_eq!((page.offset, page.page_size), (offset, 2));
+            assert_eq!(page.rows.len(), 2, "sentinel removed");
+            assert_eq!(page.has_more, offset < 4);
+            assert_eq!(page.truncated, page.has_more);
+            assert_eq!(page.next_offset, (offset < 4).then_some(offset + 2));
+            collected.extend(gql_comma_pairs(&page.rows));
+        }
+        assert_eq!(collected, expected);
+        assert_eq!(collected.iter().collect::<BTreeSet<_>>().len(), 6);
+        let mut limited = Vec::new();
+        for (offset, count, next) in [(0, 2, Some(2)), (2, 2, Some(4)), (4, 2, None)] {
+            let page = gql_page(
+                &runtime,
+                &token,
+                &format!("{base} SKIP {offset} LIMIT 5"),
+                2,
+            )
+            .await;
+            assert_eq!(page.rows.len(), count);
+            assert_eq!(page.next_offset, next);
+            assert_eq!(page.has_more, next.is_some());
+            assert_eq!(page.truncated, next.is_some());
+            limited.extend(gql_comma_pairs(&page.rows));
+        }
+        assert_eq!(limited, expected, "query LIMIT applies after each SKIP");
+        let final_row = gql_page(&runtime, &token, &format!("{base} SKIP 5 LIMIT 5"), 2).await;
+        assert_eq!(gql_comma_pairs(&final_row.rows), expected[5..]);
+        assert!(!final_row.has_more && !final_row.truncated);
+        assert_eq!(final_row.next_offset, None);
+        let caller_bounded = gql_page(&runtime, &token, &format!("{base} SKIP 2 LIMIT 2"), 2).await;
+        assert_eq!(gql_comma_pairs(&caller_bounded.rows), expected[2..4]);
+        assert!(!caller_bounded.has_more && !caller_bounded.truncated);
+        assert_eq!(caller_bounded.next_offset, None);
+        for tail in ["LIMIT 0", "SKIP 6 LIMIT 5", "SKIP 99"] {
+            let page = gql_page(&runtime, &token, &format!("{base} {tail}"), 2).await;
+            assert!(page.rows.is_empty(), "{tail}");
+            assert!(!page.has_more && !page.truncated);
+            assert_eq!(page.next_offset, None);
+        }
+    }
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_comma_multiplicity_preserves_equal_pairs_and_projection_duplicates() {
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    let a = gql_metadata_entity(&runtime, &token, "bag source").await;
+    let b = gql_metadata_entity(&runtime, &token, "bag target").await;
+    let mut edges = Vec::new();
+    for relation in [EdgeRelation::Extends, EdgeRelation::VariantOf] {
+        edges.push(
+            runtime
+                .link(
+                    &token,
+                    a,
+                    b,
+                    relation,
+                    1.0,
+                    Some(serde_json::json!({"order": 1})),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    assert_ne!(
+        edges[0].relation, edges[1].relation,
+        "two legal natural keys"
+    );
+    edges.sort_by_key(|edge| edge.id.to_string());
+    let lo = edges[0].id.to_string();
+    let hi = edges[1].id.to_string();
+    let expected = vec![
+        (lo.clone(), lo.clone()),
+        (lo.clone(), hi.clone()),
+        (hi.clone(), lo.clone()),
+        (hi.clone(), hi.clone()),
+    ];
+    let pattern = format!("MATCH (a)-[e:extends|variant_of]->(b), (a)-[f:extends|variant_of]->(b) WHERE a.id = '{a}' AND b.id = '{b}'");
+    let before = gql_metadata_snapshot(&runtime).await;
+    for suffix in ["", " ORDER BY e.metadata.order ASC, f.metadata.order DESC"] {
+        let rows = runtime
+            .query(&token, &format!("{pattern} RETURN e.id, f.id{suffix}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            gql_comma_pairs(&rows),
+            expected,
+            "all requested values and earlier node identities tie before edge IDs"
+        );
+    }
+    let projection = runtime
+        .query(&token, &format!("{pattern} RETURN a.id"))
+        .await
+        .unwrap();
+    assert_eq!(
+        projection.len(),
+        4,
+        "bag projection retains four equal rows"
+    );
+    assert!(projection
+        .iter()
+        .all(|row| row.text("a_id").unwrap() == a.to_string()));
+    let first = gql_page(&runtime, &token, &format!("{pattern} RETURN a.id"), 2).await;
+    let second = gql_page(
+        &runtime,
+        &token,
+        &format!("{pattern} RETURN a.id SKIP 2"),
+        2,
+    )
+    .await;
+    assert_eq!(first.rows.len(), 2);
+    assert_eq!(first.next_offset, Some(2));
+    assert_eq!(second.rows.len(), 2);
+    assert!(!second.has_more);
+    assert_eq!(second.next_offset, None);
+    let error = runtime.query(&token, &format!("MATCH (a)-[e:extends|variant_of]->(b), (a)-[e:extends|variant_of]->(b) WHERE a.id = '{a}' RETURN a.id")).await.unwrap_err();
+    assert!(
+        matches!(error.refusal_source(), khive_runtime::RuntimeError::Query(khive_query::QueryError::Unsupported(message)) if message == "repeated edge variable 'e' not supported")
+    );
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_distinct_and_grouped_pages_cut_complete_results_after_skip() {
+    use khive_storage::SqlValue;
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let mut ids = Vec::new();
+    for group in 0..5 {
+        for _ in 0..4 {
+            ids.push(
+                gql_return_path_entity(
+                    &runtime,
+                    &token,
+                    "paged group",
+                    serde_json::json!({"group": group}),
+                )
+                .await,
+            );
+        }
+    }
+    gql_metadata_observation(&runtime, &token).await;
+    runtime
+        .link(&token, ids[0], ids[1], EdgeRelation::Extends, 1.0, None)
+        .await
+        .unwrap();
+    let before = gql_metadata_snapshot(&runtime).await;
+    for projection in [
+        "DISTINCT n.properties.group",
+        "n.properties.group, count(n)",
+        "DISTINCT n.properties.group, count(n)",
+    ] {
+        let base = format!("MATCH (n:concept {{name: 'paged group'}}) RETURN {projection} ORDER BY n.properties.group");
+        for (offset, expected, next) in [
+            (0, vec![0, 1], Some(2)),
+            (2, vec![2, 3], Some(4)),
+            (4, vec![4], None),
+        ] {
+            let page = gql_page(
+                &runtime,
+                &token,
+                &format!("{base} SKIP {offset} LIMIT 3"),
+                2,
+            )
+            .await;
+            assert_eq!((page.offset, page.page_size), (offset, 2));
+            assert_eq!(page.rows.len(), expected.len(), "sentinel must not escape");
+            assert_eq!(page.has_more, next.is_some());
+            assert_eq!(page.truncated, next.is_some());
+            assert_eq!(page.next_offset, next);
+            for (row, group) in page.rows.iter().zip(expected) {
+                assert_gql_sql_value_eq!(
+                    row.get("n_properties_group"),
+                    Some(&SqlValue::Integer(group))
+                );
+                assert_eq!(
+                    row.columns.len(),
+                    if projection.contains("count") { 2 } else { 1 }
+                );
+                if projection.contains("count") {
+                    assert_gql_sql_value_eq!(
+                        row.get("count_n"),
+                        Some(&SqlValue::Integer(4)),
+                        "count the full group before any payload cut"
+                    );
+                }
+            }
+        }
+        for (offset, limit, expected) in [
+            (2, 2, vec![2, 3]),
+            (3, 2, vec![3, 4]),
+            (4, 2, vec![4]),
+            (5, 3, vec![]),
+            (99, 3, vec![]),
+            (0, 0, vec![]),
+        ] {
+            let page = gql_page(
+                &runtime,
+                &token,
+                &format!("{base} SKIP {offset} LIMIT {limit}"),
+                2,
+            )
+            .await;
+            assert_eq!(page.rows.len(), expected.len());
+            assert!(!page.has_more && !page.truncated);
+            assert_eq!(page.next_offset, None);
+            assert!(page.warnings.is_empty());
+            for (row, group) in page.rows.iter().zip(expected) {
+                assert_gql_sql_value_eq!(
+                    row.get("n_properties_group"),
+                    Some(&SqlValue::Integer(group))
+                );
+                if projection.contains("count") {
+                    assert_gql_sql_value_eq!(row.get("count_n"), Some(&SqlValue::Integer(4)));
+                }
+            }
+        }
+    }
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_comma_counts_preserve_six_binding_rows_before_grouping() {
+    use khive_storage::SqlValue;
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let fixture = gql_comma_star(&runtime, &token).await;
+    let before = gql_metadata_snapshot(&runtime).await;
+    let pattern = fixture.pattern();
+    let ordinary = runtime
+        .query(&token, &format!("{pattern} RETURN e.id, f.id"))
+        .await
+        .unwrap();
+    assert_eq!(gql_comma_pairs(&ordinary), fixture.pairs());
+    assert_eq!(ordinary.len(), 6);
+    let counts = runtime
+        .query(
+            &token,
+            &format!("{pattern} RETURN count(a), count(e), count(f)"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(counts.len(), 1);
+    assert_eq!(counts[0].columns.len(), 3);
+    for column in ["count_a", "count_e", "count_f"] {
+        assert_gql_sql_value_eq!(counts[0].get(column), Some(&SqlValue::Integer(6)));
+    }
+    let distinct = gql_page(
+        &runtime,
+        &token,
+        &format!("{pattern} RETURN DISTINCT a.id LIMIT 3"),
+        1,
+    )
+    .await;
+    assert_eq!(distinct.rows.len(), 1);
+    assert_eq!(
+        distinct.rows[0].text("a_id"),
+        Ok(fixture.root.to_string().as_str())
+    );
+    assert!(
+        !distinct.has_more,
+        "six matching inputs must not manufacture a distinct sentinel"
+    );
+    assert_eq!(distinct.next_offset, None);
+    let groups = gql_page(
+        &runtime,
+        &token,
+        &format!("{pattern} RETURN e.metadata.group, count(f) LIMIT 3"),
+        1,
+    )
+    .await;
+    assert_eq!(groups.rows.len(), 1);
+    assert_eq!(groups.rows[0].text("e_metadata_group"), Ok("left"));
+    assert_gql_sql_value_eq!(groups.rows[0].get("count_f"), Some(&SqlValue::Integer(6)));
+    assert!(!groups.has_more);
+    assert_eq!(groups.next_offset, None);
+    let exhausted = gql_page(
+        &runtime,
+        &token,
+        &format!("{pattern} RETURN e.metadata.group, count(f) SKIP 1 LIMIT 3"),
+        1,
+    )
+    .await;
+    assert!(exhausted.rows.is_empty());
+    assert!(!exhausted.has_more);
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_not_exists_filters_before_grouping_distinct_and_continuation() {
+    use khive_storage::SqlValue;
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    let evidence = gql_metadata_entity(&runtime, &token, "page evidence").await;
+    for group in 0..5 {
+        for index in 0..6 {
+            let id = gql_return_path_entity(
+                &runtime,
+                &token,
+                "absence page requirement",
+                serde_json::json!({"group": group}),
+            )
+            .await;
+            if index < 2 {
+                runtime
+                    .link(&token, evidence, id, EdgeRelation::Supports, 0.5, None)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+    let before = gql_metadata_snapshot(&runtime).await;
+    for projection in [
+        "DISTINCT r.properties.group",
+        "r.properties.group, count(r)",
+        "DISTINCT r.properties.group, count(r)",
+    ] {
+        let source = format!("MATCH (r:concept {{name: 'absence page requirement'}}) WHERE NOT EXISTS {{ (f)-[:supports]->(r) }} RETURN {projection} ORDER BY r.properties.group");
+        for (offset, expected, next) in [
+            (0, vec![0, 1], Some(2)),
+            (2, vec![2, 3], Some(4)),
+            (4, vec![4], None),
+        ] {
+            let page = gql_page(
+                &runtime,
+                &token,
+                &format!("{source} SKIP {offset} LIMIT 3"),
+                2,
+            )
+            .await;
+            assert_eq!((page.offset, page.page_size), (offset, 2));
+            assert_eq!(page.rows.len(), expected.len());
+            assert_eq!(
+                (page.has_more, page.truncated, page.next_offset),
+                (next.is_some(), next.is_some(), next)
+            );
+            for (row, group) in page.rows.iter().zip(expected) {
+                assert_gql_sql_value_eq!(
+                    row.get("r_properties_group"),
+                    Some(&SqlValue::Integer(group))
+                );
+                assert_eq!(
+                    row.columns.len(),
+                    if projection.contains("count") { 2 } else { 1 }
+                );
+                if projection.contains("count") {
+                    assert_gql_sql_value_eq!(
+                        row.get("count_r"),
+                        Some(&SqlValue::Integer(4)),
+                        "support filtering must precede grouping and payload caps"
+                    );
+                }
+            }
+        }
+        for (offset, limit, expected) in [
+            (2, 2, vec![2, 3]),
+            (3, 2, vec![3, 4]),
+            (4, 2, vec![4]),
+            (5, 3, vec![]),
+            (99, 3, vec![]),
+            (0, 0, vec![]),
+        ] {
+            let page = gql_page(
+                &runtime,
+                &token,
+                &format!("{source} SKIP {offset} LIMIT {limit}"),
+                2,
+            )
+            .await;
+            assert_eq!(page.rows.len(), expected.len());
+            assert!(!page.has_more && !page.truncated);
+            assert_eq!(page.next_offset, None);
+            assert!(page.warnings.is_empty());
+            for (row, group) in page.rows.iter().zip(expected) {
+                assert_gql_sql_value_eq!(
+                    row.get("r_properties_group"),
+                    Some(&SqlValue::Integer(group))
+                );
+                if projection.contains("count") {
+                    assert_gql_sql_value_eq!(row.get("count_r"), Some(&SqlValue::Integer(4)));
+                }
+            }
+        }
+    }
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_mixed_distinct_and_grouped_pages_apply_after_complete_matches() {
+    use khive_storage::SqlValue;
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    for (group, rank) in [(0, 30), (1, 10), (2, 50), (3, 20), (4, 40)] {
+        let root = gql_return_path_entity(
+            &runtime,
+            &token,
+            "mixed paged root",
+            serde_json::json!({"rank":100}),
+        )
+        .await;
+        let left = gql_metadata_entity(&runtime, &token, "mixed page left").await;
+        let right = gql_metadata_entity(&runtime, &token, "mixed page right").await;
+        let joint = gql_metadata_entity(&runtime, &token, "mixed page joint").await;
+        let end = gql_metadata_entity(&runtime, &token, "mixed page end").await;
+        for (from, to, weight) in [
+            (root, left, 0.125),
+            (root, right, 0.25),
+            (left, joint, 0.125),
+            (right, joint, 0.125),
+            (joint, end, 0.125),
+        ] {
+            runtime
+                .link(&token, from, to, EdgeRelation::Extends, weight, None)
+                .await
+                .unwrap();
+        }
+        for _ in 0..2 {
+            let attachment = gql_return_path_entity(
+                &runtime,
+                &token,
+                "mixed page attachment",
+                serde_json::json!({"group":group,"rank":rank}),
+            )
+            .await;
+            runtime
+                .link(&token, end, attachment, EdgeRelation::Contains, 1.0, None)
+                .await
+                .unwrap();
+        }
+    }
+    let before = gql_metadata_snapshot(&runtime).await;
+    let pattern =
+        "MATCH (a:concept {name: 'mixed paged root'})-[e:extends*3..3]->(b)-[f:contains]->(A)";
+    for projection in [
+        "DISTINCT A.properties.group",
+        "A.properties.group, count(A)",
+        "DISTINCT A.properties.group, count(A)",
+    ] {
+        let base = format!("{pattern} RETURN {projection} ORDER BY A.properties.group");
+        for (offset, expected, next) in [
+            (0, vec![0, 1], Some(2)),
+            (2, vec![2, 3], Some(4)),
+            (4, vec![4], None),
+        ] {
+            let page = gql_page(
+                &runtime,
+                &token,
+                &format!("{base} SKIP {offset} LIMIT 3"),
+                2,
+            )
+            .await;
+            assert_eq!((page.offset, page.page_size), (offset, 2));
+            assert_eq!(
+                page.rows.len(),
+                expected.len(),
+                "remove only the final result sentinel"
+            );
+            assert_eq!(
+                (page.has_more, page.truncated, page.next_offset),
+                (next.is_some(), next.is_some(), next)
+            );
+            for (row, group) in page.rows.iter().zip(expected) {
+                assert_gql_sql_value_eq!(
+                    row.get("A_properties_group"),
+                    Some(&SqlValue::Integer(group))
+                );
+                assert_eq!(
+                    row.columns.len(),
+                    if projection.contains("count") { 2 } else { 1 }
+                );
+                if projection.contains("count") {
+                    assert_gql_sql_value_eq!(row.get("count_A"), Some(&SqlValue::Integer(4)), "all paths and both suffix nodes must enter the group despite differing metrics");
+                }
+            }
+        }
+        for (offset, limit, expected) in [
+            (0, 2, vec![0, 1]),
+            (2, 2, vec![2, 3]),
+            (3, 2, vec![3, 4]),
+            (4, 2, vec![4]),
+            (5, 3, vec![]),
+            (99, 3, vec![]),
+            (0, 0, vec![]),
+        ] {
+            let page = gql_page(
+                &runtime,
+                &token,
+                &format!("{base} SKIP {offset} LIMIT {limit}"),
+                2,
+            )
+            .await;
+            assert_eq!(page.rows.len(), expected.len());
+            assert!(!page.has_more && !page.truncated);
+            assert_eq!(page.next_offset, None);
+            assert!(page.warnings.is_empty());
+            for (row, group) in page.rows.iter().zip(expected) {
+                assert_gql_sql_value_eq!(
+                    row.get("A_properties_group"),
+                    Some(&SqlValue::Integer(group))
+                );
+                if projection.contains("count") {
+                    assert_gql_sql_value_eq!(row.get("count_A"), Some(&SqlValue::Integer(4)));
+                }
+            }
+        }
+    }
+    for (offset, expected, next) in [
+        (0, vec![(0, 0.5), (0, 0.375)], Some(2)),
+        (1, vec![(0, 0.375), (1, 0.5)], Some(3)),
+        (8, vec![(4, 0.5), (4, 0.375)], None),
+        (10, vec![], None),
+    ] {
+        let page = gql_page(&runtime, &token, &format!("{pattern} RETURN A.properties.group ORDER BY A.properties.group SKIP {offset} LIMIT 3"), 2).await;
+        assert_eq!(page.rows.len(), expected.len());
+        assert_eq!(
+            (page.has_more, page.truncated, page.next_offset),
+            (next.is_some(), next.is_some(), next)
+        );
+        for (row, (group, weight)) in page.rows.iter().zip(expected) {
+            assert_eq!(row.columns.len(), 3);
+            assert_gql_sql_value_eq!(
+                row.get("A_properties_group"),
+                Some(&SqlValue::Integer(group))
+            );
+            assert_gql_sql_value_eq!(row.get("_depth"), Some(&SqlValue::Integer(3)));
+            assert_gql_sql_value_eq!(row.get("_total_weight"), Some(&SqlValue::Float(weight)));
+        }
+    }
+    for grouped in [false, true] {
+        for container in [false, true] {
+            let values = if container {
+                "a.properties, A.properties, a.properties.rank"
+            } else {
+                "a.properties.rank, A.properties.rank"
+            };
+            let projection = if grouped {
+                format!("{values}, count(A)")
+            } else {
+                format!("DISTINCT {values}")
+            };
+            let page = gql_page(
+                &runtime,
+                &token,
+                &format!(
+                    "{pattern} RETURN {projection} ORDER BY A.properties.rank DESC SKIP 1 LIMIT 3"
+                ),
+                2,
+            )
+            .await;
+            assert_eq!(
+                (page.has_more, page.truncated, page.next_offset),
+                (true, true, Some(3))
+            );
+            assert_eq!(page.rows.len(), 2);
+            for (row, (group, rank)) in page.rows.iter().zip([(4, 40), (0, 30)]) {
+                assert_gql_sql_value_eq!(
+                    row.get("a_properties_rank"),
+                    Some(&SqlValue::Integer(100))
+                );
+                assert_eq!(
+                    row.columns.len(),
+                    if container { 3 } else { 2 } + usize::from(grouped)
+                );
+                if container {
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(
+                            row.text("a_properties").unwrap()
+                        )
+                        .unwrap(),
+                        serde_json::json!({"rank":100})
+                    );
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(
+                            row.text("A_properties").unwrap()
+                        )
+                        .unwrap(),
+                        serde_json::json!({"group":group,"rank":rank})
+                    );
+                } else {
+                    assert_gql_sql_value_eq!(
+                        row.get("A_properties_rank"),
+                        Some(&SqlValue::Integer(rank))
+                    );
+                }
+                if grouped {
+                    assert_gql_sql_value_eq!(row.get("count_A"), Some(&SqlValue::Integer(4)));
+                }
+            }
+        }
+        let projection = if grouped {
+            "a.properties.rank, A.properties.rank, count(A)"
+        } else {
+            "DISTINCT a.properties.rank, A.properties.rank"
+        };
+        let page = gql_page(
+            &runtime,
+            &token,
+            &format!("{pattern} RETURN {projection} SKIP 1 LIMIT 3"),
+            2,
+        )
+        .await;
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.next_offset, Some(3));
+        for (row, rank) in page.rows.iter().zip([20, 30]) {
+            assert_gql_sql_value_eq!(row.get("a_properties_rank"), Some(&SqlValue::Integer(100)));
+            assert_gql_sql_value_eq!(row.get("A_properties_rank"), Some(&SqlValue::Integer(rank)));
+            if grouped {
+                assert_gql_sql_value_eq!(row.get("count_A"), Some(&SqlValue::Integer(4)));
+            }
+        }
+    }
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}
+
+#[tokio::test]
+async fn gql_mixed_or_filters_joined_bindings_before_page() {
+    use khive_storage::SqlValue;
+    let runtime = rt();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    gql_metadata_observation(&runtime, &token).await;
+    for (name, fixed_pick, variable_pick) in [
+        ("00-reject", 0, 0),
+        ("10-fixed", 1, 0),
+        ("20-variable", 0, 1),
+        ("30-both", 1, 1),
+        ("40-reject", 0, 0),
+    ] {
+        let a = gql_metadata_entity(&runtime, &token, "mixed OR start").await;
+        let b = gql_metadata_entity(&runtime, &token, "mixed OR middle").await;
+        let c = gql_metadata_entity(&runtime, &token, name).await;
+        runtime
+            .link(
+                &token,
+                a,
+                b,
+                EdgeRelation::Contains,
+                1.0,
+                Some(serde_json::json!({"pick":fixed_pick})),
+            )
+            .await
+            .unwrap();
+        runtime
+            .link(
+                &token,
+                b,
+                c,
+                EdgeRelation::Extends,
+                0.25,
+                Some(serde_json::json!({"pick":variable_pick})),
+            )
+            .await
+            .unwrap();
+    }
+    let before = gql_metadata_snapshot(&runtime).await;
+    let pattern = "MATCH (a)-[f:contains]->(b)-[e:extends*1..2]->(c)";
+    for (predicate, expected) in [
+        ("f.metadata.pick = 1", vec!["10-fixed", "30-both"]),
+        ("e.metadata.pick = 1", vec!["20-variable", "30-both"]),
+        (
+            "f.metadata.pick = 1 OR e.metadata.pick = 1",
+            vec!["10-fixed", "20-variable", "30-both"],
+        ),
+    ] {
+        let rows = runtime
+            .query(
+                &token,
+                &format!("{pattern} WHERE {predicate} RETURN c.name ORDER BY c.name"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.text("c_name").unwrap())
+                .collect::<Vec<_>>(),
+            expected,
+            "handwritten expected set: {predicate}"
+        );
+        for row in rows {
+            assert_eq!(row.columns.len(), 3);
+            assert_gql_sql_value_eq!(row.get("_depth"), Some(&SqlValue::Integer(1)));
+            assert_gql_sql_value_eq!(row.get("_total_weight"), Some(&SqlValue::Float(0.25)));
+        }
+    }
+    let filtered = format!("{pattern} WHERE f.metadata.pick = 1 OR e.metadata.pick = 1");
+    for projection in ["c.name", "DISTINCT c.name", "c.name, count(c)"] {
+        for (offset, expected, next) in [
+            (0, vec!["10-fixed", "20-variable"], Some(2)),
+            (2, vec!["30-both"], None),
+            (3, vec![], None),
+        ] {
+            let page = gql_page(
+                &runtime,
+                &token,
+                &format!("{filtered} RETURN {projection} ORDER BY c.name SKIP {offset} LIMIT 3"),
+                2,
+            )
+            .await;
+            assert_eq!((page.offset, page.page_size), (offset, 2));
+            assert_eq!(
+                page.rows
+                    .iter()
+                    .map(|row| row.text("c_name").unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                (page.has_more, page.truncated, page.next_offset),
+                (next.is_some(), next.is_some(), next)
+            );
+            for row in page.rows {
+                if projection.contains("count") {
+                    assert_eq!(row.columns.len(), 2);
+                    assert_gql_sql_value_eq!(row.get("count_c"), Some(&SqlValue::Integer(1)));
+                } else if projection.starts_with("DISTINCT") {
+                    assert_eq!(row.columns.len(), 1);
+                }
+            }
+        }
+    }
+    assert_eq!(gql_metadata_snapshot(&runtime).await, before);
+}

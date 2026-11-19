@@ -9,22 +9,12 @@ persistent Unix-socket daemon); the rest of the subcommand tree covers everythin
 operator needs outside of agent dispatch — schema migrations, KG sync/validate/fetch,
 pack introspection, embedding-model lifecycle, and reindexing.
 
-## Install
-
-```bash
-cargo install kkernel
-```
-
-or build from source:
+## Install from source
 
 ```bash
 git clone https://github.com/ohdearquant/khive.git && cd khive
-cd crates && cargo build --release -p kkernel
+cargo install --path crates/kkernel --locked
 ```
-
-The npm package `khive` installs a thin `khive` / `khive-mcp` shim that forwards to
-`kkernel mcp` for users who prefer `npm install -g khive` over Rust tooling; the two
-install paths produce the same binary underneath.
 
 ## Usage
 
@@ -54,18 +44,18 @@ kkernel exec --pending-events          # cron-friendly: fire due scheduled_event
 
 ## Subcommands
 
-| Subcommand | Purpose                                                                                     |
-| ---------- | ------------------------------------------------------------------------------------------- |
-| `mcp`      | Serve the MCP `request` surface — stdio, `--daemon`, or a registered transport              |
-| `exec`     | Run a verb DSL expression (or `--ops-file batch.jsonl`) through the pack registry           |
-| `sync`     | Build a working SQLite database from `.khive/kg/*.ndjson` sources                           |
-| `kg`       | `validate` / `init` / `fetch` / `export` / `import` / `status` / `hook` — KG versioning ops |
-| `db`       | `migrate` / `check` — apply or report pending schema migrations                             |
-| `pack`     | `list` / `handler <name>` — introspect registered packs and their verb surface              |
-| `engine`   | Embedding-model lifecycle: list, status, migrate, drift-check                               |
-| `vector`   | Vector store capabilities and orphan sweep                                                  |
-| `reindex`  | Rebuild embedding vectors and FTS documents for entities, notes, and knowledge atoms        |
-| `backend`  | `list` / `info <name>` — inspect registered storage backends                                |
+| Subcommand | Purpose                                                                                                |
+| ---------- | ------------------------------------------------------------------------------------------------------ |
+| `mcp`      | Serve the MCP `request` surface — stdio, `--daemon`, or a registered transport                         |
+| `exec`     | Run a verb DSL expression (or `--ops-file batch.jsonl`) through the pack registry                      |
+| `sync`     | Build a working SQLite database from `.khive/kg/*.ndjson` sources                                      |
+| `kg`       | `validate` / `init` / `fetch` / `update` / `export` / `import` / `status` / `hook` — KG versioning ops |
+| `db`       | `migrate` / `check` — apply or report pending schema migrations                                        |
+| `pack`     | `list` / `handler <name>` — introspect registered packs and their verb surface                         |
+| `engine`   | Embedding-model lifecycle: list, status, migrate, drift-check                                          |
+| `vector`   | Vector store capabilities and orphan sweep                                                             |
+| `reindex`  | Rebuild embedding vectors and FTS documents for entities, notes, and knowledge atoms                   |
+| `backend`  | `list` / `info <name>` — inspect registered storage backends                                           |
 
 All subcommands emit JSON on stdout by default (for piping/parsing); pass `--human`
 where supported for a readable table. `kkernel kg`, `kkernel sync`, and the NDJSON-to-SQLite
@@ -73,13 +63,67 @@ rebuild logic they wrap live in [`khive-vcs`](https://crates.io/crates/khive-vcs
 [`khive-vcs-adapters`](https://crates.io/crates/khive-vcs-adapters); `kkernel`'s own
 `kg/` module is a thin CLI wrapper over those libraries.
 
+`kkernel kg export` publishes one archive through an exclusive temporary sibling, retaining
+non-UTF-8 filenames and ordinary destination replacement. It refuses every pre-existing
+temporary entry and checks file sync before rename. Unix uses `khive-fs` and syncs the held
+parent directory after rename; parent-directory sync is Unix-only. A directory-sync error can
+leave the new archive installed. Failed writes, file syncs and renames remove the temporary
+owned by that attempt, reporting any cleanup failure alongside the original error. An
+incumbent temporary is never removed. Callers must serialize exports sharing the same names;
+newly created ancestor directories are not recursively synced.
+
+### Updating a remote commit
+
+`kkernel kg update origin --ref v2 --repo .` resolves a remote Git ref to its full
+40-character commit SHA and writes only that remote's `commit` in the existing
+`.khive/kg/schema.yaml`. The JSON receipt includes `remote`, `requested_ref`,
+`previous_commit`, `commit`, and `updated`. Annotated tags are peeled to a commit;
+tags that name trees or blobs refuse.
+
+```yaml
+format_version: "2.0.0"
+remotes:
+  - name: origin
+    url: /path/to/remote.git
+    ref: main
+    commit: "1111111111111111111111111111111111111111"
+```
+
+Use either `url` (a Git URL or a local repository path) or `repo: owner/name` (a
+GitHub shorthand), never both. Relative local paths are resolved against `--repo`,
+which defaults to the current directory. Omitted `--ref` uses the selected remote's
+`ref`, then its `HEAD`; it does not assume a branch named `main`. Ref input must be
+one branch/tag/ref name or full SHA, without refspec destinations, wildcards or
+revision expressions. A malformed or unsupported schema, missing/duplicate remote,
+unresolvable ref, or non-commit object leaves the original schema intact.
+
+This Git `commit` is independent of the optional SHA-256 archive `pin`. Update does
+not change that pin, `khive_version`, other schema values, NDJSON, cached archives,
+or a database. Current `kg fetch` still takes explicit `--url`/`--ref`/`--pin`
+arguments; it does not load schema remotes. `kg init` creates `.khive/kg/schema.yaml`
+when absent and preserves an existing regular schema and its pins.
+
+Successful edits preserve YAML values but normalize formatting and discard comments.
+An unchanged commit returns `updated: false` without rewriting any bytes. Updates
+use a unique temporary Git repository and a sibling staged schema file. Concurrent
+updates refuse while `.khive/state/kg-update.lock` is held; retry after the other
+command completes. Detected intervening schema edits refuse too, but external
+editors that ignore that lock are not covered by an atomic compare-and-swap. Files
+are synced before publication, and the schema directory is synced on Unix. If
+durability confirmation fails after publication, the error explicitly says the new
+commit was published; inspect the schema before retrying.
+
 ## Configuration
 
 Resolution precedence for the default namespace: `--actor` > `--namespace` (legacy alias) >
 `[actor] id` in a `khive.toml` config file > `"local"`. Config file search order when
 `--config` is not given: `./khive.toml`, `./.khive/config.toml`, `~/.khive/config.toml`.
 `~/.khive/.env` is loaded into the process environment at startup if present (real env vars
-take precedence).
+take precedence). It is skipped when `KHIVE_ACTOR`, `KHIVE_NAMESPACE`, or any `--actor` or `--namespace`
+argument (including one after `--`, such as the daemon arguments of `kkernel supervisor launch`)
+names an agent actor (`agent:` prefix, any case, leading whitespace
+ignored), or when `KHIVE_LOAD_DOTENV` is `0`, `false`, `no`, `off` or an unrecognized value; when
+the file exists, startup prints one line saying why.
 
 | Environment variable              | Effect                                                        |
 | --------------------------------- | ------------------------------------------------------------- |
@@ -94,6 +138,18 @@ take precedence).
 Two feature flags gate optional functionality, both pass-through to `khive-mcp`:
 `bench-embedder` (deterministic hash embedder for benchmarking, never enabled in release
 builds) and `channel-email` (SMTP/IMAP polling loop, inert without `KHIVE_EMAIL_*` env vars).
+
+The agent, telemetry and web packs are the optional features `pack-agent`, `pack-telemetry` and
+`pack-web`. All three are off by default; enable the ones you want with `--features` (the operator
+build, `make build-local`, enables all three). A build without one does not link that pack: it is
+absent from the pack list the server reports, and naming it in `--pack` or `KHIVE_PACKS` is refused
+as an unknown pack.
+
+Two command-line features are also off by default and on in the operator build. `kg-adapters`
+adds JSON, NDJSON, CSV, TSV and BibTeX input to `kkernel kg import`; without it `kg import` reads
+native khive-kg archives and refuses any other format, named or inferred from the file extension,
+before it reads the source. `repo-showcase` adds `kkernel repo export` and `kkernel repo build`,
+which write offline repository showcase bundles.
 
 ## Where this sits
 

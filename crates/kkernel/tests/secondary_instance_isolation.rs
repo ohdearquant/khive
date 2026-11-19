@@ -244,6 +244,11 @@ impl Fixture {
             .env("KHIVE_NO_DAEMON", "1")
             .env("KHIVE_LOCK", self.sandbox.join("boot.lock"))
             .env("KHIVE_RECOVERER_LOCK", self.sandbox.join("recoverer.lock"))
+            // Outside the HOME and sandbox trees, which the test snapshots.
+            .env(
+                "KHIVE_VOLUME_LOCK_DIR",
+                self._root.path().join("volume-locks"),
+            )
             .arg("exec")
             .args(["--strict", "--output-format", "json"]);
         command

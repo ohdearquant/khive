@@ -2,11 +2,273 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant as WallInstant};
 
 use crate::{StorageError, StorageResult};
+
+const SEARCH_PHASES: [SearchPhase; 25] = [
+    SearchPhase::Authorization,
+    SearchPhase::TextSearch,
+    SearchPhase::VectorSearch,
+    SearchPhase::VectorEmbedding,
+    SearchPhase::Fusion,
+    SearchPhase::EntityHydration,
+    SearchPhase::NoteHydration,
+    SearchPhase::SupersededFilter,
+    SearchPhase::MailboxScopeHydration,
+    SearchPhase::MailboxAuthorization,
+    SearchPhase::TextReaderAdmission,
+    SearchPhase::TextReaderCheckout,
+    SearchPhase::TextBlockingRead,
+    SearchPhase::VectorReaderAdmission,
+    SearchPhase::VectorReaderCheckout,
+    SearchPhase::VectorBlockingRead,
+    SearchPhase::EntityReaderAdmission,
+    SearchPhase::EntityReaderCheckout,
+    SearchPhase::EntityBlockingRead,
+    SearchPhase::NoteReaderAdmission,
+    SearchPhase::NoteReaderCheckout,
+    SearchPhase::NoteBlockingRead,
+    SearchPhase::GraphReaderAdmission,
+    SearchPhase::GraphReaderCheckout,
+    SearchPhase::GraphBlockingRead,
+];
+
+/// A stage of one backend search, named in the deadline warning when that search times out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum SearchPhase {
+    Authorization,
+    TextSearch,
+    VectorSearch,
+    VectorEmbedding,
+    Fusion,
+    EntityHydration,
+    NoteHydration,
+    SupersededFilter,
+    MailboxScopeHydration,
+    MailboxAuthorization,
+    TextReaderAdmission,
+    TextReaderCheckout,
+    TextBlockingRead,
+    VectorReaderAdmission,
+    VectorReaderCheckout,
+    VectorBlockingRead,
+    EntityReaderAdmission,
+    EntityReaderCheckout,
+    EntityBlockingRead,
+    NoteReaderAdmission,
+    NoteReaderCheckout,
+    NoteBlockingRead,
+    GraphReaderAdmission,
+    GraphReaderCheckout,
+    GraphBlockingRead,
+}
+
+impl SearchPhase {
+    /// The phase name written in log fields.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Authorization => "authorization",
+            Self::TextSearch => "text_search",
+            Self::VectorSearch => "vector_search",
+            Self::VectorEmbedding => "vector_embedding",
+            Self::Fusion => "fusion",
+            Self::EntityHydration => "entity_hydration",
+            Self::NoteHydration => "note_hydration",
+            Self::SupersededFilter => "superseded_filter",
+            Self::MailboxScopeHydration => "mailbox_scope_hydration",
+            Self::MailboxAuthorization => "mailbox_authorization",
+            Self::TextReaderAdmission => "text_reader_admission",
+            Self::TextReaderCheckout => "text_reader_checkout",
+            Self::TextBlockingRead => "text_blocking_read",
+            Self::VectorReaderAdmission => "vector_reader_admission",
+            Self::VectorReaderCheckout => "vector_reader_checkout",
+            Self::VectorBlockingRead => "vector_blocking_read",
+            Self::EntityReaderAdmission => "entity_reader_admission",
+            Self::EntityReaderCheckout => "entity_reader_checkout",
+            Self::EntityBlockingRead => "entity_blocking_read",
+            Self::NoteReaderAdmission => "note_reader_admission",
+            Self::NoteReaderCheckout => "note_reader_checkout",
+            Self::NoteBlockingRead => "note_blocking_read",
+            Self::GraphReaderAdmission => "graph_reader_admission",
+            Self::GraphReaderCheckout => "graph_reader_checkout",
+            Self::GraphBlockingRead => "graph_blocking_read",
+        }
+    }
+}
+
+struct SearchPhaseTraceInner {
+    origin: std::time::Instant,
+    active_since_ns: [AtomicU64; SEARCH_PHASES.len()],
+    completed_ns: [AtomicU64; SEARCH_PHASES.len()],
+    completed_order: [AtomicU64; SEARCH_PHASES.len()],
+    entered: AtomicU64,
+    next_completion: AtomicU64,
+}
+
+/// Which phases one backend search has entered and finished, shared by the search and the code
+/// that reports its deadline. Marking a phase only touches atomics, so a reader never waits on a
+/// stalled phase.
+#[derive(Clone)]
+pub struct SearchPhaseTrace(Arc<SearchPhaseTraceInner>);
+
+/// Keeps one phase active until dropped; dropping it adds the elapsed time to that phase.
+pub struct SearchPhaseGuard {
+    trace: SearchPhaseTrace,
+    phase: SearchPhase,
+    started_ns: u64,
+}
+
+/// A trace read at one instant, formatted for the deadline warning fields.
+#[derive(Clone)]
+pub struct SearchPhaseSnapshot {
+    pub in_flight_phase: String,
+    pub phase_elapsed_ms: u64,
+    pub active_phases: String,
+    pub completed_phases: String,
+}
+
+tokio::task_local! {
+    static SEARCH_PHASE_TRACE: SearchPhaseTrace;
+}
+
+impl SearchPhaseTrace {
+    /// An empty trace with no phase entered.
+    pub fn new() -> Self {
+        Self(Arc::new(SearchPhaseTraceInner {
+            origin: std::time::Instant::now(),
+            active_since_ns: std::array::from_fn(|_| AtomicU64::new(0)),
+            completed_ns: std::array::from_fn(|_| AtomicU64::new(0)),
+            completed_order: std::array::from_fn(|_| AtomicU64::new(0)),
+            entered: AtomicU64::new(0),
+            next_completion: AtomicU64::new(0),
+        }))
+    }
+
+    /// Mark `phase` active from now until the returned guard drops. A phase entered again before
+    /// its earlier guard drops reports the later entry.
+    pub fn enter(&self, phase: SearchPhase) -> SearchPhaseGuard {
+        let started_ns = self.elapsed_ns();
+        let index = phase as usize;
+        self.0.active_since_ns[index].store(started_ns.saturating_add(1), Ordering::Release);
+        self.0.entered.fetch_or(1u64 << index, Ordering::Relaxed);
+        SearchPhaseGuard {
+            trace: self.clone(),
+            phase,
+            started_ns,
+        }
+    }
+
+    /// The most recently entered active phase and its time so far, every active phase, and the
+    /// finished phases in completion order with their total time.
+    pub fn snapshot(&self) -> SearchPhaseSnapshot {
+        let now_ns = self.elapsed_ns();
+        let mut active = Vec::new();
+        let mut completed = Vec::new();
+        for phase in SEARCH_PHASES {
+            let index = phase as usize;
+            let active_since = self.0.active_since_ns[index].load(Ordering::Acquire);
+            if active_since != 0 {
+                active.push((active_since - 1, phase));
+            }
+            let order = self.0.completed_order[index].load(Ordering::Acquire);
+            if order != 0 {
+                completed.push((
+                    order,
+                    phase,
+                    self.0.completed_ns[index].load(Ordering::Relaxed),
+                ));
+            }
+        }
+        active.sort_unstable_by_key(|(started_ns, _)| *started_ns);
+        completed.sort_unstable_by_key(|(order, _, _)| *order);
+
+        let (in_flight_phase, phase_elapsed_ms) = match active.last() {
+            Some((started_ns, phase)) => (
+                phase.as_str().to_string(),
+                nanos_to_millis(now_ns.saturating_sub(*started_ns)),
+            ),
+            None if self.0.entered.load(Ordering::Relaxed) == 0 => ("not_entered".into(), 0),
+            None => ("between_phases".into(), 0),
+        };
+        let active_phases = if active.is_empty() {
+            "none".to_string()
+        } else {
+            active
+                .iter()
+                .map(|(started_ns, phase)| {
+                    format!(
+                        "{}={}ms",
+                        phase.as_str(),
+                        nanos_to_millis(now_ns.saturating_sub(*started_ns))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let completed_phases = if completed.is_empty() {
+            "none".to_string()
+        } else {
+            completed
+                .iter()
+                .map(|(_, phase, elapsed_ns)| {
+                    format!("{}={}ms", phase.as_str(), nanos_to_millis(*elapsed_ns))
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        SearchPhaseSnapshot {
+            in_flight_phase,
+            phase_elapsed_ms,
+            active_phases,
+            completed_phases,
+        }
+    }
+
+    fn elapsed_ns(&self) -> u64 {
+        u64::try_from(self.0.origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
+impl Default for SearchPhaseTrace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for SearchPhaseGuard {
+    fn drop(&mut self) {
+        let index = self.phase as usize;
+        let elapsed_ns = self.trace.elapsed_ns().saturating_sub(self.started_ns);
+        self.trace.0.completed_ns[index].fetch_add(elapsed_ns, Ordering::Relaxed);
+        let order = self.trace.0.next_completion.fetch_add(1, Ordering::Relaxed) + 1;
+        self.trace.0.completed_order[index].store(order, Ordering::Release);
+        self.trace.0.active_since_ns[index].store(0, Ordering::Release);
+    }
+}
+
+fn nanos_to_millis(nanos: u64) -> u64 {
+    nanos / 1_000_000
+}
+
+/// Run `future` with `trace` as the current task's search phase trace.
+pub async fn scope_search_phase_trace<F: Future>(trace: SearchPhaseTrace, future: F) -> F::Output {
+    SEARCH_PHASE_TRACE.scope(trace, future).await
+}
+
+/// Mark `phase` on the current task's trace; `None` when no trace is in scope.
+pub fn enter_search_phase(phase: SearchPhase) -> Option<SearchPhaseGuard> {
+    SEARCH_PHASE_TRACE.try_with(|trace| trace.enter(phase)).ok()
+}
+
+/// The current task's trace, for work that runs on another thread.
+pub fn capture_search_phase_trace() -> Option<SearchPhaseTrace> {
+    SEARCH_PHASE_TRACE.try_with(Clone::clone).ok()
+}
 
 /// Default nonzero ceiling for request-owned read work, including compose.
 pub const DEFAULT_REQUEST_READ_TIMEOUT_SECS: u64 = 30;
@@ -363,100 +625,5 @@ async fn wait_for_receiver_set(receivers: Arc<[tokio::sync::watch::Receiver<bool
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn read_ceiling_accepts_up_to_one_day_and_corrects_loudly_past_it() {
-        let cases: [(Option<&str>, u64, bool); 9] = [
-            (None, DEFAULT_REQUEST_READ_TIMEOUT_SECS, false),
-            (Some("1"), 1, false),
-            (Some("3600"), 3_600, false),
-            (Some("7200"), 7_200, false),
-            (Some("86400"), MAX_REQUEST_READ_TIMEOUT_SECS, false),
-            (Some("86401"), MAX_REQUEST_READ_TIMEOUT_SECS, true),
-            (Some("0"), DEFAULT_REQUEST_READ_TIMEOUT_SECS, true),
-            (Some("-5"), DEFAULT_REQUEST_READ_TIMEOUT_SECS, true),
-            (Some("two hours"), DEFAULT_REQUEST_READ_TIMEOUT_SECS, true),
-        ];
-        for (raw, seconds, corrected) in cases {
-            let (got, correction) = resolve_request_read_timeout_secs(raw);
-            assert_eq!(got, seconds, "ceiling for {raw:?}");
-            assert_eq!(correction.is_some(), corrected, "correction for {raw:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn nested_scopes_merge_cancellation_sources() {
-        let (outer_tx, outer_rx) = tokio::sync::watch::channel(false);
-        let (_inner_tx, inner_rx) = tokio::sync::watch::channel(false);
-
-        let stopped = scope_request_read_cancellation(
-            outer_rx,
-            scope_request_read_cancellation(inner_rx, async move {
-                outer_tx.send(true).expect("outer scope remains live");
-                wait_for_request_read_cancellation().await;
-                request_read_is_cancelled()
-            }),
-        )
-        .await;
-
-        assert!(stopped);
-    }
-
-    #[tokio::test]
-    async fn sender_loss_is_request_abandonment() {
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        drop(tx);
-
-        let stopped = scope_request_read_cancellation(rx, async {
-            capture_request_read_context().stop_reason()
-        })
-        .await;
-
-        assert_eq!(stopped, Some(RequestReadStopReason::Cancelled));
-    }
-
-    #[tokio::test]
-    async fn spawned_child_inherits_the_same_cancellation() {
-        let (tx, rx) = tokio::sync::watch::channel(false);
-
-        let stopped = scope_request_read_cancellation(rx, async move {
-            let child = tokio::spawn(inherit_request_read_context(async {
-                wait_for_request_read_cancellation().await;
-                request_read_is_cancelled()
-            }));
-            tx.send(true).expect("child receiver remains live");
-            child.await.expect("child task")
-        })
-        .await;
-
-        assert!(stopped);
-    }
-
-    #[tokio::test]
-    async fn nested_deadline_keeps_the_earlier_absolute_instant() {
-        let earlier = RequestReadDeadline::after(Duration::from_secs(10));
-        let later = RequestReadDeadline::after(Duration::from_secs(20));
-
-        let effective = scope_request_read_deadline_at(earlier, async {
-            effective_request_read_deadline(later)
-        })
-        .await;
-
-        assert_eq!(effective.async_at(), earlier.async_at());
-    }
-
-    #[tokio::test]
-    async fn async_phase_cannot_degrade_cancelled_work_to_success() {
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        tx.send(true).expect("receiver remains live");
-
-        let result = scope_request_read_cancellation(rx, async {
-            await_request_read_phase("test.phase", async { 7_u8 }).await
-        })
-        .await;
-
-        assert!(matches!(result, Err(StorageError::Timeout { .. })));
-    }
-}
+#[path = "request_context/tests.rs"]
+mod tests;

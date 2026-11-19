@@ -6,6 +6,7 @@
 
 use std::{
     future::Future,
+    net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -29,6 +30,54 @@ use tracing::instrument;
 
 use crate::oauth::TokenProvider;
 
+const SMTP_ADDRESS_TIMEOUT: Duration = Duration::from_secs(10);
+const SMTP_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Default)]
+struct ConnectionAttempt {
+    last_failure: Mutex<Option<String>>,
+}
+
+impl ConnectionAttempt {
+    async fn connect_addresses<F, Fut>(
+        &self,
+        addresses: impl IntoIterator<Item = SocketAddr>,
+        address_timeout: Duration,
+        mut connect: F,
+    ) -> Result<AsyncSmtpConnection, ChannelError>
+    where
+        F: FnMut(SocketAddr) -> Fut,
+        Fut: Future<Output = Result<AsyncSmtpConnection, ChannelError>>,
+    {
+        let mut last_failure = None;
+        for address in addresses {
+            let error = match tokio::time::timeout(address_timeout, connect(address)).await {
+                Ok(Ok(connection)) => return Ok(connection),
+                Ok(Err(error)) => error,
+                Err(_) => ChannelError::Transport(format!(
+                    "SMTP handshake deadline exceeded after {address_timeout:?}"
+                )),
+            };
+            let permanent = matches!(error, ChannelError::Auth(_));
+            let failure = format!("{address}: {error}");
+            *self.last_failure.lock().await = Some(failure.clone());
+            if permanent {
+                return Err(classify_smtp_connection_error(
+                    true,
+                    format!("SMTP connection refused: {failure}"),
+                ));
+            }
+            last_failure = Some(failure);
+        }
+        Err(match last_failure {
+            Some(failure) => ChannelError::Transport(
+                format!("SMTP connection failed after all resolved addresses failed; last failure: {failure}"),
+            ),
+            None => ChannelError::Transport("SMTP relay resolved to no addresses".into()),
+        })
+    }
+}
+
 /// Custom MIME header for khive thread correlation.
 ///
 /// Attached to outbound messages so that replies can be linked back to the
@@ -48,6 +97,30 @@ impl lettre::message::header::Header for XKhiveThreadId {
     fn display(&self) -> lettre::message::header::HeaderValue {
         lettre::message::header::HeaderValue::new(
             lettre::message::header::HeaderName::new_from_ascii_str("X-Khive-Thread-ID"),
+            self.0.clone(),
+        )
+    }
+}
+
+/// Custom MIME header for the RFC 8058/2369 `List-Unsubscribe` value.
+///
+/// Attached to outbound external messages so a recipient's mail client can offer the
+/// `mailto:` opt-out. Absent on policy-recipient messages.
+#[derive(Clone)]
+struct ListUnsubscribe(String);
+
+impl lettre::message::header::Header for ListUnsubscribe {
+    fn name() -> lettre::message::header::HeaderName {
+        lettre::message::header::HeaderName::new_from_ascii_str("List-Unsubscribe")
+    }
+
+    fn parse(s: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self(s.trim().to_string()))
+    }
+
+    fn display(&self) -> lettre::message::header::HeaderValue {
+        lettre::message::header::HeaderValue::new(
+            lettre::message::header::HeaderName::new_from_ascii_str("List-Unsubscribe"),
             self.0.clone(),
         )
     }
@@ -81,6 +154,7 @@ pub(crate) trait SmtpConnector: Send + Sync + 'static {
         message_id: Option<&str>,
         in_reply_to: Option<&str>,
         references: Option<&str>,
+        list_unsubscribe: Option<&str>,
     ) -> Result<(), ChannelError>;
 }
 
@@ -136,28 +210,44 @@ impl LettreSmtp {
         }
     }
 
-    async fn connect(&self) -> Result<AsyncSmtpConnection, ChannelError> {
+    async fn connect(
+        &self,
+        attempt: Arc<ConnectionAttempt>,
+    ) -> Result<AsyncSmtpConnection, ChannelError> {
         let tls = TlsParameters::new(self.host.clone())
             .map_err(|e| ChannelError::Transport(format!("SMTP relay setup failed: {e}")))?;
         let hello_name = ClientId::default();
-        // Match lettre's transport defaults: implicit TLS on 465, mandatory
-        // STARTTLS elsewhere, and a 60-second network/command timeout.
-        let mut connection = AsyncSmtpConnection::connect_tokio1(
-            (self.host.as_str(), self.port),
-            Some(Duration::from_secs(60)),
-            &hello_name,
-            (self.port == 465).then(|| tls.clone()),
-            None,
-        )
-        .await
-        .map_err(smtp_connection_error)?;
-        if self.port != 465 {
-            connection
-                .starttls(tls, &hello_name)
-                .await
-                .map_err(smtp_connection_error)?;
-        }
-        Ok(connection)
+        let addresses: Vec<_> = tokio::net::lookup_host((self.host.as_str(), self.port))
+            .await
+            .map_err(|error| ChannelError::Transport(format!("SMTP relay lookup failed: {error}")))?
+            .collect();
+        // lettre's timeout covers only TCP. Bound each full greeting/EHLO/TLS
+        // handshake with SMTP_ADDRESS_TIMEOUT, using implicit TLS on 465 and
+        // STARTTLS elsewhere. SMTP_TRANSACTION_TIMEOUT can stop the walk before exhaustion.
+        attempt
+            .connect_addresses(addresses, SMTP_ADDRESS_TIMEOUT, |address| {
+                let tls = tls.clone();
+                let hello_name = &hello_name;
+                async move {
+                    let mut connection = AsyncSmtpConnection::connect_tokio1(
+                        address,
+                        Some(SMTP_ADDRESS_TIMEOUT),
+                        hello_name,
+                        (self.port == 465).then(|| tls.clone()),
+                        None,
+                    )
+                    .await
+                    .map_err(smtp_connection_error)?;
+                    if self.port != 465 {
+                        connection
+                            .starttls(tls, hello_name)
+                            .await
+                            .map_err(smtp_connection_error)?;
+                    }
+                    Ok(connection)
+                }
+            })
+            .await
     }
 
     async fn send_message_with_connect<F, Fut>(
@@ -168,62 +258,101 @@ impl LettreSmtp {
         connect: F,
     ) -> Result<(), ChannelError>
     where
-        F: FnOnce() -> Fut,
+        F: FnOnce(Arc<ConnectionAttempt>) -> Fut,
         Fut: Future<Output = Result<AsyncSmtpConnection, ChannelError>>,
     {
-        let mut cached = self.connection.lock().await;
-        // Own the connection during every exchange. Cancellation or an error
-        // must never return a partially completed SMTP transaction to the cache.
-        //
-        // A cached session is probed before it is trusted. The far side closes
-        // idle sessions on its own schedule, and a socket the server has already
-        // closed looks identical to a live one until something is written to it.
-        // The probe is the only repair available here: retrying a FAILED send is
-        // not, because `send` drives MAIL, RCPT and DATA, and a transport error
-        // after the server accepted DATA cannot be told apart at this layer from
-        // one before it. Retrying then would deliver the message twice, and a
-        // late notification is better than a duplicated one. A probe is safe
-        // precisely because it is idempotent and happens before the message is
-        // offered.
-        let reusable = match cached.take() {
-            Some(mut session) if session.credentials == credentials => {
-                // Note the asymmetry with the fresh-connection call below, which
-                // is deliberate: there, a refused NOOP is a real failure and
-                // `classify_smtp_preamble_status` turns it into an error. Here
-                // the same `false` means the session aged out, which is an
-                // ordinary state and not an error. One value, two meanings,
-                // separated by which arm read it.
-                session.connection.test_connected().await.then_some(session)
-            }
-            _ => None,
-        };
-        let mut session = match reusable {
-            Some(session) => session,
-            None => {
-                let mut connection = connect().await?;
-                connection
-                    .auth(mechanisms, &credentials)
-                    .await
-                    .map_err(smtp_connection_error)?;
-                classify_smtp_preamble_status(connection.test_connected().await)?;
-                AuthenticatedConnection {
-                    credentials,
-                    connection,
-                }
-            }
-        };
+        self.send_message_with_connect_timeout(
+            message,
+            credentials,
+            mechanisms,
+            connect,
+            SMTP_TRANSACTION_TIMEOUT,
+        )
+        .await
+    }
 
-        // Calling the connection directly cannot reconnect inside MAIL/RCPT/DATA.
-        // A new handshake always passes through the connection/AUTH classifier.
-        session
-            .connection
-            .send(message.envelope(), &message.formatted())
-            .await
-            .map_err(|error| {
-                classify_smtp_send_error(error.is_permanent(), format!("SMTP send failed: {error}"))
-            })?;
-        *cached = Some(session);
-        Ok(())
+    async fn send_message_with_connect_timeout<F, Fut>(
+        &self,
+        message: Message,
+        credentials: Credentials,
+        mechanisms: &[Mechanism],
+        connect: F,
+        transaction_timeout: Duration,
+    ) -> Result<(), ChannelError>
+    where
+        F: FnOnce(Arc<ConnectionAttempt>) -> Fut,
+        Fut: Future<Output = Result<AsyncSmtpConnection, ChannelError>>,
+    {
+        let attempt = Arc::new(ConnectionAttempt::default());
+        let exchange = async {
+            let mut cached = self.connection.lock().await;
+            // Own the connection during every exchange. Cancellation or an error
+            // must never return a partially completed SMTP transaction to the cache.
+            //
+            // A cached session is probed before it is trusted. The far side closes
+            // idle sessions on its own schedule, and a socket the server has already
+            // closed looks identical to a live one until something is written to it.
+            // The probe is the only repair available here: retrying a FAILED send is
+            // not, because `send` drives MAIL, RCPT and DATA, and a transport error
+            // after the server accepted DATA cannot be told apart at this layer from
+            // one before it. Retrying then would deliver the message twice, and a
+            // late notification is better than a duplicated one. A probe is safe
+            // precisely because it is idempotent and happens before the message is
+            // offered.
+            let reusable = match cached.take() {
+                Some(mut session) if session.credentials == credentials => {
+                    // Note the asymmetry with the fresh-connection call below, which
+                    // is deliberate: there, a refused NOOP is a real failure and
+                    // `classify_smtp_preamble_status` turns it into an error. Here
+                    // the same `false` means the session aged out, which is an
+                    // ordinary state and not an error. One value, two meanings,
+                    // separated by which arm read it.
+                    session.connection.test_connected().await.then_some(session)
+                }
+                _ => None,
+            };
+            let mut session = match reusable {
+                Some(session) => session,
+                None => {
+                    let mut connection = connect(attempt.clone()).await?;
+                    connection
+                        .auth(mechanisms, &credentials)
+                        .await
+                        .map_err(smtp_connection_error)?;
+                    classify_smtp_preamble_status(connection.test_connected().await)?;
+                    AuthenticatedConnection {
+                        credentials,
+                        connection,
+                    }
+                }
+            };
+
+            // Calling the connection directly cannot reconnect inside MAIL/RCPT/DATA.
+            // A new handshake always passes through the connection/AUTH classifier.
+            session
+                .connection
+                .send(message.envelope(), &message.formatted())
+                .await
+                .map_err(|error| {
+                    classify_smtp_send_error(
+                        error.is_permanent(),
+                        format!("SMTP send failed: {error}"),
+                    )
+                })?;
+            *cached = Some(session);
+            Ok(())
+        };
+        match tokio::time::timeout(transaction_timeout, exchange).await {
+            Ok(result) => result,
+            Err(_) => {
+                let mut message =
+                    format!("SMTP transaction deadline exceeded after {transaction_timeout:?}");
+                if let Some(failure) = attempt.last_failure.lock().await.as_ref() {
+                    message.push_str(&format!("; last connection failure: {failure}"));
+                }
+                Err(ChannelError::Transport(message))
+            }
+        }
     }
 }
 
@@ -305,6 +434,7 @@ fn build_message(
     message_id: Option<&str>,
     in_reply_to: Option<&str>,
     references: Option<&str>,
+    list_unsubscribe: Option<&str>,
 ) -> Result<Message, ChannelError> {
     let from_mb: Mailbox = from.parse().map_err(|e| {
         ChannelError::InvalidEnvelope(format!("invalid from address {from:?}: {e}"))
@@ -321,6 +451,10 @@ fn build_message(
 
     if let Some(tid) = thread_id_header {
         builder = builder.header(XKhiveThreadId(tid.to_string()));
+    }
+
+    if let Some(value) = list_unsubscribe {
+        builder = builder.header(ListUnsubscribe(reject_crlf(value)?.to_string()));
     }
 
     if let Some(mid) = message_id {
@@ -359,6 +493,7 @@ impl SmtpConnector for LettreSmtp {
         message_id: Option<&str>,
         in_reply_to: Option<&str>,
         references: Option<&str>,
+        list_unsubscribe: Option<&str>,
     ) -> Result<(), ChannelError> {
         let msg = build_message(
             from,
@@ -369,9 +504,10 @@ impl SmtpConnector for LettreSmtp {
             message_id,
             in_reply_to,
             references,
+            list_unsubscribe,
         )?;
 
-        self.deliver_message_with_connect(msg, || self.connect())
+        self.deliver_message_with_connect(msg, |attempt| self.connect(attempt))
             .await
     }
 }
@@ -383,7 +519,7 @@ impl LettreSmtp {
         connect: F,
     ) -> Result<(), ChannelError>
     where
-        F: FnOnce() -> Fut,
+        F: FnOnce(Arc<ConnectionAttempt>) -> Fut,
         Fut: Future<Output = Result<AsyncSmtpConnection, ChannelError>>,
     {
         let (credentials, mechanisms, oauth) = match &self.auth {
@@ -408,8 +544,8 @@ impl LettreSmtp {
         let connect_failed = AtomicBool::new(false);
         let connect_failed_flag = &connect_failed;
         let result = self
-            .send_message_with_connect(msg, credentials, mechanisms, move || async move {
-                let connection = connect().await;
+            .send_message_with_connect(msg, credentials, mechanisms, move |attempt| async move {
+                let connection = connect(attempt).await;
                 connect_failed_flag.store(connection.is_err(), Ordering::Relaxed);
                 connection
             })
@@ -468,6 +604,7 @@ impl SmtpSender {
     /// Message-ID. `references` is the full ancestor chain to set as `References`
     /// (space-separated angle-bracketed ids); when `in_reply_to` is present but
     /// `references` is `None`, `References` falls back to `in_reply_to` alone.
+    /// `list_unsubscribe`, when present, is set as the `List-Unsubscribe` header verbatim.
     #[allow(clippy::too_many_arguments)]
     pub async fn send(
         &self,
@@ -479,6 +616,7 @@ impl SmtpSender {
         message_id: Option<&str>,
         in_reply_to: Option<&str>,
         references: Option<&str>,
+        list_unsubscribe: Option<&str>,
     ) -> Result<(), ChannelError> {
         self.inner
             .deliver(
@@ -490,6 +628,7 @@ impl SmtpSender {
                 message_id,
                 in_reply_to,
                 references,
+                list_unsubscribe,
             )
             .await
     }
@@ -583,53 +722,7 @@ mod tests {
             let counts = self.counts.clone();
             let stalled = self.stalled.clone();
             let (client, server) = tokio::io::duplex(8192);
-            let task = tokio::spawn(async move {
-                let mut server = BufReader::new(server);
-                server.write_all(b"220 scripted SMTP\r\n").await.unwrap();
-                for (expected, reply) in script {
-                    if expected == "CLOSE" {
-                        return;
-                    }
-                    let mut line = String::new();
-                    loop {
-                        line.clear();
-                        assert_ne!(
-                            server.read_line(&mut line).await.unwrap(),
-                            0,
-                            "missing {expected}"
-                        );
-                        if expected != "." || line == ".\r\n" {
-                            break;
-                        }
-                    }
-                    assert!(
-                        line.starts_with(&expected),
-                        "expected {expected}, got {line}"
-                    );
-                    {
-                        let mut counts = counts.lock().unwrap();
-                        if expected.starts_with("AUTH ") {
-                            counts.auth += 1;
-                        } else if expected == "NOOP" {
-                            counts.noop += 1;
-                        } else if expected == "." {
-                            counts.messages += 1;
-                        }
-                    }
-                    server.write_all(reply.as_bytes()).await.unwrap();
-                    if reply.is_empty() {
-                        stalled.notify_one();
-                    }
-                }
-                // Keep the session alive until its owner drops it. Unexpected
-                // extra traffic fails instead of silently satisfying a script.
-                let mut line = String::new();
-                assert_eq!(
-                    server.read_line(&mut line).await.unwrap(),
-                    0,
-                    "extra command: {line}"
-                );
-            });
+            let task = tokio::spawn(Self::serve(server, script, counts, stalled));
             self.servers.lock().unwrap().push(task);
             AsyncSmtpConnection::connect_with_transport(
                 Box::new(ScriptedStream(client)),
@@ -637,6 +730,59 @@ mod tests {
             )
             .await
             .map_err(smtp_connection_error)
+        }
+
+        async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
+            server: S,
+            script: Script,
+            counts: Arc<Mutex<SmtpCounts>>,
+            stalled: Arc<tokio::sync::Notify>,
+        ) {
+            let mut server = BufReader::new(server);
+            server.write_all(b"220 scripted SMTP\r\n").await.unwrap();
+            for (expected, reply) in script {
+                if expected == "CLOSE" {
+                    return;
+                }
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    assert_ne!(
+                        server.read_line(&mut line).await.unwrap(),
+                        0,
+                        "missing {expected}"
+                    );
+                    if expected != "." || line == ".\r\n" {
+                        break;
+                    }
+                }
+                assert!(
+                    line.starts_with(&expected),
+                    "expected {expected}, got {line}"
+                );
+                {
+                    let mut counts = counts.lock().unwrap();
+                    if expected.starts_with("AUTH ") {
+                        counts.auth += 1;
+                    } else if expected == "NOOP" {
+                        counts.noop += 1;
+                    } else if expected == "." {
+                        counts.messages += 1;
+                    }
+                }
+                server.write_all(reply.as_bytes()).await.unwrap();
+                if reply.is_empty() {
+                    stalled.notify_one();
+                }
+            }
+            // Keep the session alive until its owner drops it. Unexpected
+            // extra traffic fails instead of silently satisfying a script.
+            let mut line = String::new();
+            assert_eq!(
+                server.read_line(&mut line).await.unwrap(),
+                0,
+                "extra command: {line}"
+            );
         }
 
         async fn finish(self) -> SmtpCounts {
@@ -696,7 +842,21 @@ mod tests {
         mechanism: Mechanism,
         secret: &str,
     ) -> Result<(), ChannelError> {
-        let message = build_message(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            connector.send_message_with_connect(
+                test_message(),
+                Credentials::new("sender@example.com".to_string(), secret.to_string()),
+                &[mechanism],
+                |_| server.connect(),
+            ),
+        )
+        .await
+        .expect("SMTP exchange timed out")
+    }
+
+    fn test_message() -> Message {
+        build_message(
             "sender@example.com",
             "recipient@example.com",
             "subject",
@@ -705,19 +865,309 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
-        .unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            connector.send_message_with_connect(
-                message,
-                Credentials::new("sender@example.com".to_string(), secret.to_string()),
-                &[mechanism],
-                || server.connect(),
+        .unwrap()
+    }
+
+    async fn connect_plain(address: SocketAddr) -> Result<AsyncSmtpConnection, ChannelError> {
+        AsyncSmtpConnection::connect_tokio1(address, None, &ClientId::default(), None, None)
+            .await
+            .map_err(smtp_connection_error)
+    }
+
+    #[tokio::test]
+    async fn smtp_address_walk_stops_on_first_permanent_refusal() {
+        let addresses = [
+            SocketAddr::from(([127, 0, 0, 1], 2525)),
+            SocketAddr::from(([127, 0, 0, 1], 2526)),
+        ];
+        let attempt = ConnectionAttempt::default();
+        let mut contacted = Vec::new();
+        let result = attempt
+            .connect_addresses(addresses, SMTP_ADDRESS_TIMEOUT, |address| {
+                contacted.push(address);
+                std::future::ready(Err(if address == addresses[0] {
+                    ChannelError::Auth("554 relay refused".into())
+                } else {
+                    ChannelError::Transport("421 relay unavailable".into())
+                }))
+            })
+            .await;
+        let error = result
+            .err()
+            .expect("address walk must refuse the connection");
+        assert_eq!(contacted, vec![addresses[0]]);
+        let ChannelError::Auth(message) = error else {
+            panic!("permanent connection refusal must stop the account: {error:?}");
+        };
+        let failure = attempt.last_failure.lock().await.clone().unwrap();
+        assert!(failure.contains(&addresses[0].to_string()), "{failure}");
+        assert!(failure.contains("554 relay refused"), "{failure}");
+        assert_eq!(message, format!("SMTP connection refused: {failure}"));
+        assert!(!message.contains(&addresses[1].to_string()), "{message}");
+    }
+
+    #[tokio::test]
+    async fn smtp_address_walk_stops_on_permanent_refusal_after_transient_failure() {
+        let addresses = [
+            SocketAddr::from(([127, 0, 0, 1], 2525)),
+            SocketAddr::from(([127, 0, 0, 1], 2526)),
+            SocketAddr::from(([127, 0, 0, 1], 2527)),
+        ];
+        let attempt = ConnectionAttempt::default();
+        let mut contacted = Vec::new();
+        let result = attempt
+            .connect_addresses(addresses, SMTP_ADDRESS_TIMEOUT, |address| {
+                contacted.push(address);
+                std::future::ready(Err(if address == addresses[1] {
+                    ChannelError::Auth("554 relay refused".into())
+                } else {
+                    ChannelError::Transport("421 relay unavailable".into())
+                }))
+            })
+            .await;
+        let error = result
+            .err()
+            .expect("address walk must refuse the connection");
+        assert_eq!(contacted, addresses[..2]);
+        let ChannelError::Auth(message) = error else {
+            panic!(
+                "permanent connection refusal must survive an earlier transient error: {error:?}"
+            );
+        };
+        let failure = attempt.last_failure.lock().await.clone().unwrap();
+        assert!(failure.contains(&addresses[1].to_string()), "{failure}");
+        assert!(failure.contains("554 relay refused"), "{failure}");
+        assert_eq!(message, format!("SMTP connection refused: {failure}"));
+        assert!(!message.contains(&addresses[0].to_string()), "{message}");
+        assert!(!message.contains(&addresses[2].to_string()), "{message}");
+    }
+
+    #[tokio::test]
+    async fn smtp_address_walk_reports_last_failure_when_all_addresses_are_transient() {
+        let addresses = [
+            SocketAddr::from(([127, 0, 0, 1], 2525)),
+            SocketAddr::from(([127, 0, 0, 1], 2526)),
+        ];
+        let attempt = ConnectionAttempt::default();
+        let mut contacted = Vec::new();
+        let result = attempt
+            .connect_addresses(addresses, SMTP_ADDRESS_TIMEOUT, |address| {
+                contacted.push(address);
+                std::future::ready(Err(ChannelError::Transport(
+                    if address == addresses[0] {
+                        "421 first relay unavailable"
+                    } else {
+                        "421 last relay unavailable"
+                    }
+                    .into(),
+                )))
+            })
+            .await;
+        let error = result.err().expect("all transient attempts must fail");
+        assert_eq!(contacted, addresses);
+        let ChannelError::Transport(message) = error else {
+            panic!("transient connection failures must remain retryable: {error:?}");
+        };
+        let failure = attempt.last_failure.lock().await.clone().unwrap();
+        assert!(failure.contains(&addresses[1].to_string()), "{failure}");
+        assert!(failure.contains("421 last relay unavailable"), "{failure}");
+        assert_eq!(message, format!("SMTP connection failed after all resolved addresses failed; last failure: {failure}"));
+        assert!(!message.contains(&addresses[0].to_string()), "{message}");
+        assert!(
+            !message.contains("421 first relay unavailable"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn smtp_transaction_deadline_interrupts_silent_greeting() {
+        let failed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addresses = [failed.local_addr().unwrap(), silent.local_addr().unwrap()];
+        let refusal = tokio::spawn(async move {
+            let (mut socket, _) = failed.accept().await.unwrap();
+            socket
+                .write_all(b"421 relay unavailable\r\n")
+                .await
+                .unwrap();
+        });
+        let stalled = tokio::spawn(async move {
+            let (socket, _) = silent.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut line = String::new();
+            assert_eq!(socket.read_line(&mut line).await.unwrap(), 0);
+        });
+        let connector = LettreSmtp::new("unused.invalid", 587, "unused", "unused");
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            connector.send_message_with_connect_timeout(
+                test_message(),
+                Credentials::new("sender@example.com".into(), "test-password".into()),
+                &[Mechanism::Plain],
+                |attempt| async move {
+                    // The address deadline exceeds the outer test guard, so only
+                    // the transaction deadline can make this delivery finish.
+                    attempt
+                        .connect_addresses(addresses, Duration::from_secs(5), connect_plain)
+                        .await
+                },
+                Duration::from_millis(500),
             ),
         )
         .await
-        .expect("SMTP exchange timed out")
+        .expect("transaction deadline did not stop the silent greeting")
+        .unwrap_err();
+        let ChannelError::Transport(message) = error else {
+            panic!("deadline must remain transient: {error:?}");
+        };
+        assert!(
+            message.contains("SMTP transaction deadline exceeded"),
+            "{message}"
+        );
+        assert!(message.contains(&addresses[0].to_string()), "{message}");
+        assert!(message.contains("421"), "{message}");
+        assert!(
+            !message.contains("all resolved addresses failed"),
+            "{message}"
+        );
+        assert!(connector.connection.lock().await.is_none());
+        for server in [refusal, stalled] {
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn smtp_address_walk_reaches_healthy_relay_after_handshake_failure() {
+        for stall in [false, true] {
+            let failed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let healthy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addresses = [failed.local_addr().unwrap(), healthy.local_addr().unwrap()];
+            let first = tokio::spawn(async move {
+                let (socket, _) = failed.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                socket
+                    .write_all(b"220 incomplete handshake\r\n")
+                    .await
+                    .unwrap();
+                let mut line = String::new();
+                assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                assert!(line.starts_with("EHLO "), "{line}");
+                if stall {
+                    line.clear();
+                    assert_eq!(socket.read_line(&mut line).await.unwrap(), 0);
+                }
+            });
+            let counts = Arc::new(Mutex::new(SmtpCounts::default()));
+            let observed = counts.clone();
+            let second = tokio::spawn(async move {
+                let (socket, _) = healthy.accept().await.unwrap();
+                ScriptedSmtp::serve(
+                    socket,
+                    successful_session(Mechanism::Plain, "test-password", 1),
+                    observed,
+                    Arc::new(tokio::sync::Notify::new()),
+                )
+                .await;
+            });
+            let connector = LettreSmtp::new("unused.invalid", 587, "unused", "unused");
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                connector.send_message_with_connect_timeout(
+                    test_message(),
+                    Credentials::new("sender@example.com".into(), "test-password".into()),
+                    &[Mechanism::Plain],
+                    |attempt| async move {
+                        attempt
+                            .connect_addresses(addresses, Duration::from_millis(200), connect_plain)
+                            .await
+                    },
+                    Duration::from_secs(3),
+                ),
+            )
+            .await
+            .expect("address walk did not finish")
+            .unwrap();
+            drop(connector);
+            for server in [first, second] {
+                tokio::time::timeout(Duration::from_secs(2), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            let counts = counts.lock().unwrap();
+            assert_eq!((counts.auth, counts.noop, counts.messages), (1, 1, 1));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn smtp_transaction_deadline_discards_stalled_sessions_without_retrying_send() {
+        for stage in ["auth", "preamble", "cached_noop", "data"] {
+            let connector = LettreSmtp::new("unused.invalid", 587, "unused", "unused");
+            let mut stalled = successful_session(Mechanism::Plain, "test-password", 1);
+            match stage {
+                "auth" => stalled.truncate(2),
+                "preamble" => stalled.truncate(3),
+                "cached_noop" => stalled.push(step("NOOP", "250 ready")),
+                "data" => {}
+                _ => unreachable!(),
+            }
+            stalled.last_mut().unwrap().1.clear();
+            let server = ScriptedSmtp::new(vec![
+                stalled,
+                successful_session(Mechanism::Plain, "test-password", 1),
+            ]);
+            if stage == "cached_noop" {
+                scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
+                    .await
+                    .unwrap();
+            }
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                connector.send_message_with_connect_timeout(
+                    test_message(),
+                    Credentials::new("sender@example.com".into(), "test-password".into()),
+                    &[Mechanism::Plain],
+                    |_| server.connect(),
+                    Duration::from_millis(200),
+                ),
+            )
+            .await
+            .expect("transaction deadline did not stop the stalled exchange")
+            .unwrap_err();
+            assert!(
+                matches!(error, ChannelError::Transport(_)),
+                "{stage}: {error:?}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("SMTP transaction deadline exceeded"),
+                "{stage}: {error}"
+            );
+            assert!(connector.connection.lock().await.is_none(), "{stage}");
+            assert_eq!(server.counts.lock().unwrap().connections, 1, "{stage}");
+            assert_eq!(server.scripts.lock().unwrap().len(), 1, "{stage}");
+            scripted_delivery(&connector, &server, Mechanism::Plain, "test-password")
+                .await
+                .unwrap();
+            drop(connector);
+            let counts = server.finish().await;
+            let messages = if matches!(stage, "cached_noop" | "data") {
+                2
+            } else {
+                1
+            };
+            assert_eq!(
+                (counts.connections, counts.auth, counts.messages),
+                (2, 2, messages),
+                "{stage}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -823,6 +1273,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         };
@@ -842,7 +1293,7 @@ mod tests {
                 ScriptedSmtp::new(vec![handshake(Mechanism::Xoauth2, "oauth-token", reply)]);
             let err = tokio::time::timeout(
                 Duration::from_secs(2),
-                connector.deliver_message_with_connect(message(), || server.connect()),
+                connector.deliver_message_with_connect(message(), |_| server.connect()),
             )
             .await
             .expect("scripted delivery must finish")
@@ -890,18 +1341,19 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         };
         let error = connector
-            .deliver_message_with_connect(message(), || server.connect())
+            .deliver_message_with_connect(message(), |_| server.connect())
             .await
             .unwrap_err();
         assert!(matches!(error, ChannelError::RetryableAuth(_)));
         assert!(provider.cached_token_for_test().await.is_none());
         provider.cache_for_test("refreshed-token").await;
         connector
-            .deliver_message_with_connect(message(), || server.connect())
+            .deliver_message_with_connect(message(), |_| server.connect())
             .await
             .unwrap();
         drop(connector);
@@ -931,11 +1383,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         // What `connect` returns for a 5xx greeting, EHLO or STARTTLS reply.
         let err = connector
-            .deliver_message_with_connect(message, || async {
+            .deliver_message_with_connect(message, |_| async {
                 Err::<AsyncSmtpConnection, _>(ChannelError::Auth(
                     "SMTP connection/authentication failed: permanent error (554): no service"
                         .into(),
@@ -1174,6 +1627,7 @@ mod tests {
             _message_id: Option<&str>,
             _in_reply_to: Option<&str>,
             _references: Option<&str>,
+            _list_unsubscribe: Option<&str>,
         ) -> Result<(), ChannelError> {
             self.calls.lock().unwrap().push((
                 from.to_string(),
@@ -1196,6 +1650,7 @@ mod tests {
                 "to@example.com",
                 "Hello",
                 "body text",
+                None,
                 None,
                 None,
                 None,
@@ -1283,6 +1738,7 @@ mod tests {
                 _message_id: Option<&str>,
                 _in_reply_to: Option<&str>,
                 _references: Option<&str>,
+                _list_unsubscribe: Option<&str>,
             ) -> Result<(), ChannelError> {
                 self.headers
                     .lock()
@@ -1304,6 +1760,7 @@ mod tests {
                 "s",
                 "b",
                 Some("tid-abc"),
+                None,
                 None,
                 None,
                 None,
@@ -1333,6 +1790,7 @@ mod tests {
                 message_id: Option<&str>,
                 _in_reply_to: Option<&str>,
                 _references: Option<&str>,
+                _list_unsubscribe: Option<&str>,
             ) -> Result<(), ChannelError> {
                 self.captured
                     .lock()
@@ -1355,6 +1813,7 @@ mod tests {
                 "b",
                 None,
                 Some("<abc123@example.com>"),
+                None,
                 None,
                 None,
             )
@@ -1383,6 +1842,7 @@ mod tests {
                 _message_id: Option<&str>,
                 in_reply_to: Option<&str>,
                 _references: Option<&str>,
+                _list_unsubscribe: Option<&str>,
             ) -> Result<(), ChannelError> {
                 self.captured
                     .lock()
@@ -1406,6 +1866,7 @@ mod tests {
                 None,
                 None,
                 Some("<parent123@example.com>"),
+                None,
                 None,
             )
             .await
@@ -1433,6 +1894,7 @@ mod tests {
                 _message_id: Option<&str>,
                 _in_reply_to: Option<&str>,
                 references: Option<&str>,
+                _list_unsubscribe: Option<&str>,
             ) -> Result<(), ChannelError> {
                 self.captured
                     .lock()
@@ -1457,6 +1919,7 @@ mod tests {
                 None,
                 Some("<parent123@example.com>"),
                 Some("<grandparent1@example.com> <parent123@example.com>"),
+                None,
             )
             .await
             .unwrap();
@@ -1495,6 +1958,7 @@ mod tests {
             None,
             Some("<parent123@example.com>"),
             None,
+            None,
         )
         .expect("build_message ok");
 
@@ -1516,6 +1980,7 @@ mod tests {
             "b@example.com",
             "subject",
             "body",
+            None,
             None,
             None,
             None,
@@ -1547,6 +2012,7 @@ mod tests {
             Some("<self123@example.com>"),
             Some("<parent123@example.com>"),
             None,
+            None,
         )
         .expect("build_message ok");
 
@@ -1571,6 +2037,7 @@ mod tests {
             None,
             Some("<parent123@example.com>"),
             Some("<grandparent1@example.com> <grandparent2@example.com> <parent123@example.com>"),
+            None,
         )
         .expect("build_message ok");
 
@@ -1601,6 +2068,7 @@ mod tests {
             None,
             Some("<parent123@example.com>"),
             None,
+            None,
         )
         .expect("build_message ok");
 
@@ -1624,9 +2092,63 @@ mod tests {
             None,
             Some("<parent123@example.com>"),
             Some("<evil@example.com>\r\nBcc: attacker@evil.com"),
+            None,
         )
         .expect_err("CRLF in References must be rejected, not silently forwarded");
 
+        assert!(matches!(err, ChannelError::InvalidEnvelope(_)));
+    }
+
+    #[test]
+    fn build_message_sets_list_unsubscribe_when_present_and_rejects_crlf() {
+        let msg = build_message(
+            "a@example.com",
+            "b@example.com",
+            "subject",
+            "body",
+            None,
+            None,
+            None,
+            None,
+            Some("<mailto:a@example.com?subject=unsubscribe%20tok>"),
+        )
+        .expect("build_message ok");
+        let formatted = formatted_str(&msg);
+        assert!(
+            formatted
+                .contains("List-Unsubscribe: <mailto:a@example.com?subject=unsubscribe%20tok>"),
+            "formatted message must carry List-Unsubscribe; got:\n{formatted}"
+        );
+        assert!(!formatted.contains("List-Unsubscribe-Post"));
+
+        // No header when the value is absent.
+        let plain = build_message(
+            "a@example.com",
+            "b@example.com",
+            "subject",
+            "body",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("build_message ok");
+        assert!(!formatted_str(&plain).contains("List-Unsubscribe"));
+
+        // CRLF in the value is rejected.
+        let err = build_message(
+            "a@example.com",
+            "b@example.com",
+            "subject",
+            "body",
+            None,
+            None,
+            None,
+            None,
+            Some("<mailto:a@example.com>\r\nBcc: attacker@evil.com"),
+        )
+        .expect_err("CRLF in List-Unsubscribe must be rejected");
         assert!(matches!(err, ChannelError::InvalidEnvelope(_)));
     }
 }

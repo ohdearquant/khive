@@ -6,8 +6,19 @@ and reject low-information retrieval queries.
 ## `is_identifier`
 
 Returns true only for text with no whitespace, at least one ASCII letter, and a structural boundary:
-an explicit separator, a lowercase-to-uppercase transition, or a letter/digit transition. A single
-plain letter and an all-lowercase word are not identifiers.
+an explicit separator, a lowercase-to-uppercase transition, an acronym-to-word boundary such as
+`XMLParser`, or a letter/digit transition. An acronym boundary is an uppercase letter followed by
+another uppercase letter and then a lowercase letter, except a terminal plural `s` with no
+following ASCII lowercase letter. That suffix stays with the acronym at the end of input or
+before a separator, uppercase letter, or digit: `APIs`, `IDs` and `URLs` remain whole words,
+and `APIsFoo` splits as `apis`, `foo`. A longer lowercase run restores the acronym boundary:
+`DBUsers` splits as `db`, `users`, `APIUsage` as `api`, `usage`, and `URLsafe` as `ur`, `lsafe`.
+`XMLToJSON` still splits before `To`.
+
+This is a character rule with no dictionary or acronym-length heuristic. `XMLIsEmpty` has the
+same shape as `APIsFoo`, so it splits as `xmlis`, `empty`; the splitter cannot distinguish the
+word `Is` from a plural suffix. Plain lowercase, titlecase, and all-uppercase words without a
+boundary are not identifiers.
 
 ## `split_identifier`
 
@@ -27,8 +38,13 @@ can differ near the threshold because of rounding; choose the precision required
 `ScriptProfile::analyze` returns CJK fraction, ASCII-letter fraction, and total character count.
 Empty input produces zero fractions. `is_cjk_dominant` uses the same strict 15% threshold.
 
-## `is_meaningful_query`
+## `is_meaningful_text_query`
 
 Rejects empty or whitespace-only input, symbol/punctuation/emoji-only input, a single ASCII letter,
 and repeated-character gibberish when one character exceeds 80% of non-whitespace characters. A
 single digit and meaningful non-ASCII characters remain eligible.
+
+The deprecated `is_meaningful_query` function delegates to this unchanged text policy for one
+release. Memory recall uses the separate `is_meaningful_recall_query` policy, which requires
+alphabetic or CJK content and checks character diversity within each word. The policies are
+intentionally different; neither helper applies stop-word filtering or Unicode normalization.

@@ -194,7 +194,7 @@ fn parse_args() -> Args {
 
 // ─── fvecs loader ────────────────────────────────────────────────────────────
 
-fn load_fvecs(path: &Path) -> (Vec<f32>, usize) {
+fn load_fvecs(path: &Path) -> (Vec<f32>, usize, String) {
     let file = File::open(path).unwrap_or_else(|e| panic!("cannot open {}: {e}", path.display()));
     let mut reader = BufReader::new(file);
     let mut buf4 = [0u8; 4];
@@ -217,11 +217,13 @@ fn load_fvecs(path: &Path) -> (Vec<f32>, usize) {
     let mut reader = BufReader::new(File::open(path).unwrap());
     let mut out = Vec::with_capacity(n * dim);
     let mut record_buf = vec![0u8; record_size];
+    let mut input_hash = blake3::Hasher::new();
 
     for rec_idx in 0..n {
         reader
             .read_exact(&mut record_buf)
             .expect("fvecs read error");
+        input_hash.update(&record_buf);
         let rec_dim = i32::from_le_bytes(record_buf[0..4].try_into().unwrap()) as usize;
         assert!(
             rec_dim == dim,
@@ -234,7 +236,7 @@ fn load_fvecs(path: &Path) -> (Vec<f32>, usize) {
         }
     }
 
-    (out, dim)
+    (out, dim, input_hash.finalize().to_hex().to_string())
 }
 
 // ─── distance ────────────────────────────────────────────────────────────────
@@ -1043,7 +1045,7 @@ fn main() {
 
     print!("Loading base vectors... ");
     let t0 = Instant::now();
-    let (base_all, dim) = load_fvecs(&args.base_path);
+    let (base_all, dim, base_blake3) = load_fvecs(&args.base_path);
     let n_base = base_all.len() / dim;
     println!(
         "{:.1}ms  ({} vectors, dim={})",
@@ -1054,7 +1056,7 @@ fn main() {
 
     print!("Loading query vectors... ");
     let t0 = Instant::now();
-    let (query_all, query_dim) = load_fvecs(&args.query_path);
+    let (query_all, query_dim, query_blake3) = load_fvecs(&args.query_path);
     let n_query = query_all.len() / query_dim;
     println!(
         "{:.1}ms  ({} vectors, dim={})",
@@ -1446,7 +1448,9 @@ fn main() {
             "normalization": args.normalization,
             "seed": seed_value,
             "base_file": base_file_value,
+            "base_blake3": base_blake3,
             "query_file": query_file_value,
+            "query_blake3": query_blake3,
             "source_url": source_url_value,
         },
         "config": {
@@ -1579,3 +1583,7 @@ fn build_assertions(
         "exit_code": exit_code,
     })
 }
+
+#[cfg(test)]
+#[path = "vec_bench/input_identity_tests.rs"]
+mod input_identity_tests;

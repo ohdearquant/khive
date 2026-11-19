@@ -87,7 +87,7 @@ pub fn plan_for_parser_corpus(input: &str) -> Value {
         let text = planned
             .content
             .first()
-            .and_then(|content| content.raw.as_text())
+            .and_then(|content| content.as_text())
             .expect("plan response contains JSON text");
         let plan: Value = serde_json::from_str(&text.text).expect("decoded plan object");
         assert_eq!(plan["parsed"], false);

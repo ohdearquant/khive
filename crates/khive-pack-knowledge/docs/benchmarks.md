@@ -1,5 +1,27 @@
 # khive-pack-knowledge — Benchmark Ledger
 
+<!-- bench-reference:begin -->
+
+Generated from `perf/reference.json` by `scripts/render-bench-reference.py`; do not edit this block.
+
+Reference baselines for `khive-pack-knowledge`. Values are the committed reference median for each benchmark, in the unit shown; A/A is the ratio between the two same-commit runs. The date is the committer date of the baseline commit.
+
+Comparison class: `rustc 1.95.0 (59807616e 2026-04-14)`, `bench` profile, AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics, cores 2,3, kernel 6.8.0-142-generic.
+
+| Benchmark                           | Reference median | A/A ratio | Baseline commit                            | Commit date |
+| ----------------------------------- | ---------------- | --------- | ------------------------------------------ | ----------- |
+| `knowledge_get/by_slug`             | 91.599 µs        | 1.001     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_learn/concept_create`    | 809.172 µs       | 1.006     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_list/corpus/10`          | 165.499 µs       | 1.002     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_list/corpus/100`         | 223.354 µs       | 1.001     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_search_fts/rerank_false` | 1.174 ms         | 1.003     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_stats/stats_query`       | 215.177 µs       | 1.006     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_upsert_atoms/atoms/1`    | 513.688 µs       | 1.012     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_upsert_atoms/atoms/10`   | 2.180 ms         | 1.003     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+| `knowledge_upsert_atoms/atoms/50`   | 7.180 ms         | 1.005     | `212bf72e498de9fbbda42cc0e2902906c730e3ea` | 2026-10-17  |
+
+<!-- bench-reference:end -->
+
 ## Benchmark Suite
 
 | Benchmark               | File                         | Description                                                                                   |
@@ -25,6 +47,61 @@ cargo test -p khive-pack-knowledge --test bench \
   benchmark_knowledge_search_warm_latency -- --ignored --nocapture
 ```
 
+## Inline ANN build runtime measurement
+
+The ignored `measure_inline_ann_build_tick_gap` test measures the real
+`load_and_build_from_vector_store` path on a Tokio runtime with two workers,
+while a separate task ticks every 10 ms. It uses an isolated temporary database,
+the existing local test embedder, and deterministic normalized 384-dimensional
+vectors. It does not download an embedding model. Database creation and corpus
+seeding finish before the timing window.
+
+Run from the repository root on the machine where the result will be evaluated:
+
+```bash
+KHIVE_ANN_MEASUREMENT_ROWS=4096 cargo test --manifest-path crates/Cargo.toml \
+  -p khive-pack-knowledge --lib --release \
+  knowledge::vamana::tests::runtime_measurement::measure_inline_ann_build_tick_gap \
+  -- --exact --ignored --nocapture --test-threads=1
+```
+
+Capture the `ANN_RUNTIME_MEASUREMENT` JSON line with the commit SHA, toolchain,
+CPU, operating system, available memory, exact command, and concurrent machine
+load. The test reports a 20-tick baseline, the elapsed scan-and-build time, the
+number of observed ticks, and the largest gap between ticks. The measured build
+is spawned onto a runtime worker because the async test body itself executes on
+Tokio's `block_on` thread. The ticker records its first tick after completion
+before stopping, so a stall at the end cannot disappear from the report. Its
+window includes dispatch and completion notification overhead. Missed ticks are
+skipped rather than replayed as a burst.
+
+The default corpus has 4,096 rows. `KHIVE_ANN_MEASUREMENT_ROWS` accepts 1 through
+32,768 rows; the upper limit represents 48 MiB of raw vector data before SQLite,
+scan buffers, and index overhead. Each invocation seeds one corpus and performs
+one build. There is no automatic growth or retry loop. Start at the default and,
+if `exceeds_one_second` is false, increase the row count within the limit and run
+again. A run that does not exceed one second is insufficient for the requested
+measurement. If even the limit is too fast, record that limitation instead of
+claiming the requirement was met. Resource limits bound the corpus, not runtime;
+the build remains synchronous CPU work on a worker during this measurement.
+
+The instrument makes no timing pass/fail assertion and no automatic stall
+classification. Compare the recorded maximum gap with the 10 ms target and the
+baseline, and repeat qualifying runs to distinguish machine noise. A small gap
+only shows that this ticker stayed responsive: the second worker may service it
+while the build occupies the first. The elapsed time includes the vector-store
+scan, so it does not isolate graph construction time. Record those limitations
+with the observed result in issue #4491 before choosing a production scheduling
+change. No native result is recorded here yet.
+
+To run the small deterministic checks for corpus bounds, vector generation, and
+delayed tick accounting separately:
+
+```bash
+cargo test --manifest-path crates/Cargo.toml -p khive-pack-knowledge --lib \
+  knowledge::vamana::tests::runtime_measurement:: -- --test-threads=1
+```
+
 ## Environment
 
 - Toolchain: stable (as specified in workspace `rust-toolchain.toml`)
@@ -48,7 +125,6 @@ cargo test -p khive-pack-knowledge --test bench \
 - vs prior: first formal release ledger entry — no prior comparable baseline
 
 #### `knowledge_bench` (Criterion, FTS-only, no embedder, in-memory SQLite)
-
 
 | Scenario                          | Low      | Median   | High     | Outliers   |
 | --------------------------------- | -------- | -------- | -------- | ---------- |
@@ -76,6 +152,174 @@ Numbers not yet recorded in this ledger entry; will be added on next full bench 
 
 ## Accepted Regressions
 
-A p50 regression gate of +20% applies to the Criterion `knowledge_bench` scenarios.
+A p50 regression gate of +20% was stated for the Criterion `knowledge_bench` scenarios
+as of v0.2.8. No check enforces it; see the note under Generated workload coverage.
 
 Last reviewed: v0.2.8 (2026-06-08)
+
+## Generated workload coverage
+
+These additive targets cover public dispatch with generated data. Existing targets
+and historical observations above are retained. The historical +20% statement is
+not an enforced gate: timing rows below are advisory trends, with qualified-host
+baselines still pending. No native measurement is claimed by this addition.
+
+| Target/group                                    | Scenarios                                                 | Timed work                                                                                                                                                | Baseline |
+| ----------------------------------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| `knowledge_workloads / knowledge_compose`       | 100 atoms / 10 domains; 1000 / 20; `max_tokens=2000`      | Pinned-atom retrieval, scoring and bounded Markdown assembly; actual-call p50/p95 and estimated rendered tokens/sec                                       | pending  |
+| `knowledge_workloads / knowledge_suggest`       | The same two atom/domain corpora                          | Domain retrieval and actual member-cost aggregation; actual-call p50/p95                                                                                  | pending  |
+| `knowledge_workloads / knowledge_fold`          | 100/1000/10000 candidates × budget 256/2048               | Parse and select scored candidates of size 32; actual-call p50/p95 versus N                                                                               | pending  |
+| `knowledge_workloads / knowledge_search_scale`  | 100/1000/10000 indexed atoms, limit 20                    | Hybrid lexical/ANN retrieval and stored-vector reranking; actual-call p50/p95                                                                             | pending  |
+| `knowledge_workloads / knowledge_search_matrix` | 1000 atoms, half draft; alpha 0/0.5/1 × drafts false/true | Actual status filtering and embedding-score blending; actual-call p50/p95                                                                                 | pending  |
+| `knowledge_index_build`                         | 1000/10000 atoms; 100000 explicitly opt-in                | One cold full index dispatch per size, including synthetic embedding, vector writes, corpus scan, ANN build and publication; elapsed time and vectors/sec | pending  |
+
+The Criterion target contains 19 scenarios. Each reports 21 actual individual
+dispatch durations, with nearest-rank p50/p95 (ranks 11 and 20), then separately
+runs Criterion's adaptive measurements. Parameter construction, fixture seeding,
+warm-up, result validation and response destruction are outside each returned
+duration. The timer includes synchronous `block_on`/dispatch overhead. Baselines
+must use the same timer and fixture regime; these are not isolated inner-function
+costs. Compose's token rate sums `ceil(markdown.len()/4)` over the 21 calls and
+divides by their summed durations. This follows the implementation's UTF-8 byte
+budget unit, not an actual tokenizer. Pinned atoms do not exercise auto-compose's
+KG blend; domains are seeded and measured separately by suggest.
+
+Every corpus is an isolated private file database with a queued WAL writer. The
+registry has KG/knowledge packs and the same optional-audit-sink composition as
+the older benchmark; it does not include persistent dispatch-audit overhead.
+No model is configured for compose/suggest/fold. Search and index use a registered
+deterministic normalized 384-dimensional synthetic provider, with no downloads.
+Draft and reviewed vectors occupy distinct neighborhoods; this tests execution
+and filtering, not real-model semantic quality. Search setup fully indexes its
+corpus before timing. Search checks 20 unique real atoms, returned status and
+successful stored-vector reranking without fallback or degraded responses. ANN
+provenance is required for the all-reviewed scale/index corpora and the matrix
+cells that include drafts. When the mixed corpus excludes drafts, filtering and
+final ranking can remove the query-nearest ANN candidates from the returned top
+20; a result without ANN provenance must retain lexical provenance on every row.
+Suggest rejects missing member costs; fold verifies exact selected
+cardinality and summed budget. Writer shutdown is joined before directory removal.
+
+Text, slugs and vectors are deterministic; public upsert assigns fresh UUIDs and
+timestamps. ANN subject ordering can therefore vary between fresh corpora. Record
+that limitation when comparing builds rather than assuming identical graph layout.
+
+The cold-index target does not use adaptive repetitions or report percentiles.
+It creates and seeds a fresh corpus before the timer and validates all indexed
+counts, ANN publication and an actual ANN-backed search afterward. “Cold” means
+no preexisting corpus vectors or ANN in that fixture, not a flushed OS page
+cache. The duration includes synthetic embedding and storage work, so it is not
+pure graph-construction time. Publication and post-build read validation are
+required; a zero-vector or failed build cannot produce a successful report.
+
+```bash
+cd crates
+cargo bench -p khive-pack-knowledge --bench knowledge_workloads -- --quick --noplot
+cargo bench -p khive-pack-knowledge --bench knowledge_index_build -- --quick --noplot
+# Bounded custom-harness smoke: exactly one 1000-atom build, then Success.
+cargo test -p khive-pack-knowledge --bench knowledge_index_build
+# Explicit reference measurement only; exclude this setting from scheduled CI.
+KHIVE_BENCH_KNOWLEDGE_100K=1 cargo bench -p khive-pack-knowledge --bench knowledge_index_build
+```
+
+Cargo supplies `--bench` to custom harnesses for `cargo bench`. Without it, or
+with `--test`, this target runs 1000 atoms once and prints a standalone `Success`
+line only after validation and teardown. Normal benchmark mode runs 1000 and
+10000 once each. Criterion-style flags such as `--quick` and `--noplot` are accepted
+without changing those fixed sizes. The 100000 corpus is additional only when
+`KHIVE_BENCH_KNOWLEDGE_100K=1` and benchmark mode are both selected.
+
+The existing inline tick-gap measurement remains an ignored internal test.
+Its measurement module is `cfg(test)` and its full-build helper is `pub(crate)`;
+an external benchmark cannot call that instrument through the current public
+API. No visibility is widened. `knowledge_index_build` measures the public full
+index operation and does not claim to reproduce the private ticker measurement.
+The historical `search_latency` and tick-gap ledger entries still have no new
+measurement. Record commit, toolchain, machine, command, environment and concurrent
+load alongside each qualified-host baseline. Workflow selection is separate work.
+
+## Namespace fallback and automatic compose
+
+`knowledge_namespace` reuses the private queued-WAL fixture without an embedder.
+It runs two paired corpora: 10 local atoms and 3 local domains, preceded by either
+0 or 20,000 matching foreign atoms. Each domain has one live local member.
+Fixture insertion, reader acquisition, parameter preparation, result validation
+and writer shutdown are outside the measured SQL interval.
+
+Two clocks are reported separately:
+
+- `eligibility_fallback_sql` executes the same private SQL builder as production,
+  for one admitted term, through the runtime reader. It is the fallback query
+  duration, not the duration of the complete lexical stage.
+- `full_suggest` measures the public `knowledge.suggest` dispatch, including
+  lexical gathering, hydration, scoring and member sizing. It validates all
+  three expected domain names and their member costs.
+
+Both arms take one untimed warm-up, then 21 individual samples and print
+nearest-rank p50/p95. They use fixed repetitions rather than adaptive Criterion
+iterations. The ordinary lexical-stage budget, candidate limits and status/type
+filters remain unchanged. Successful lexical-stage timing is not exposed by the
+benchmark API; use the daemon's phase diagnostics for that separate observation.
+The accompanying regressions bound VDBE/join work and preserve exact legacy
+rows/order. VDBE counts do not measure work hidden inside an FTS virtual-table step.
+
+```bash
+cd crates
+# Small smoke: one measured call of each clock per corpus, then Success.
+cargo test -p khive-pack-knowledge --bench knowledge_namespace
+# Paired fallback SQL and full-suggest measurements.
+cargo bench -p khive-pack-knowledge --bench knowledge_namespace
+# Explicit larger reference scene; exclude this setting from scheduled CI.
+KHIVE_BENCH_COMPOSE_STORE_SIZE=1 cargo bench -p khive-pack-knowledge --bench knowledge_namespace
+# Change only the ordinary local-atom count for a scaling comparison.
+KHIVE_BENCH_COMPOSE_STORE_SIZE=1 KHIVE_BENCH_COMPOSE_LOCAL_ATOMS=60000 \
+  cargo bench -p khive-pack-knowledge --bench knowledge_namespace
+```
+
+The opt-in scene defaults to exactly 180,474 ordinary local atoms and 25,504
+local domains with their mirror rows. `KHIVE_BENCH_COMPOSE_LOCAL_ATOMS` selects
+a positive integer local-atom count when the scene is enabled; for example,
+use 60,000 and 360,000 for the scaling comparison. An empty, malformed,
+non-Unicode, zero or overflowing value exits with an error before any seeding.
+The domain count stays at 25,504, so changing the atom count isolates that
+variable; domain members still refer to live atoms. Each measurement reports
+the actual `local_atoms` and `local_domains`. Listing, smoke mode and ordinary
+runs without the opt-in scene ignore this variable. `knowledge.stats` verifies those counts before
+measurement; domain mirrors are excluded from its ordinary atom count. It then
+runs three automatic `knowledge.compose` calls with a 17-word query,
+`max_tokens=1500`, and no pinned atoms or domains. Each response must be
+nonempty, free of hydration degradation and suggestion errors, and within the
+rendered-byte budget. The **absolute acceptance target is below 6,000 ms per
+call**. Each JSON line reports the elapsed time and whether it met that target;
+a missed target is retained rather than hidden by retries or a timing-sensitive
+unit assertion. Smoke mode never enables the larger scene, even if the variable
+is set.
+
+This is a synthetic store-size measurement, not a replay of a production store.
+All rows have deterministic matching content, every domain has one member, and
+there are no model, persistent dispatch-audit or network costs. It deliberately
+places the ordinary atoms before the domain mirrors, exercising recovery beyond
+the bounded initial candidate window. No production-latency or six-second
+success claim follows from the source change. Record the three observations,
+commit, toolchain, hardware and concurrent load, and compare with a disposable
+copy using both original FTS-first statements. Keep fixture bytes, both size settings and all other
+code identical. Both builds must contain the same local-count option; vary only
+the two SQL statements between arms. At each size, run the builds in the order
+new, previous, previous, new, retaining all three compose observations from
+each invocation. Qualified-host baseline and acceptance results are not recorded
+in this ledger yet.
+
+## Performance guarantees
+
+| Operation                           | Input                         | Metric         | Bound                                                                      |
+| ----------------------------------- | ----------------------------- | -------------- | -------------------------------------------------------------------------- |
+| `knowledge_search_fts/rerank_false` | 50-atom corpus, limit default | median latency | Advisory trend; last recorded value 432.5 µs (`docs/benchmarks.md` v0.2.8) |
+| `knowledge_list/corpus/100`         | 100 atoms                     | median latency | Advisory trend; last recorded value 213.2 µs (`docs/benchmarks.md` v0.2.8) |
+| `knowledge_upsert_atoms/atoms/50`   | 50 atoms                      | median latency | Advisory trend; last recorded value 11.89 ms (`docs/benchmarks.md` v0.2.8) |
+| `knowledge_get/by_slug`             | 1 atom                        | median latency | Advisory trend; last recorded value 29.35 µs (`docs/benchmarks.md` v0.2.8) |
+| `knowledge_search_scale/atoms10000` | 10 000 atoms, limit 20        | median latency | Advisory trend; baseline pending                                           |
+| `knowledge_index_build`             | 10 000 atoms cold build       | build time     | Advisory trend; baseline pending                                           |
+
+These rows add no deterministic performance bound or automatic percentage gate.
+Historical values are observations. New rolling and fixed-reference comparisons
+await qualified-host measurements; all new baseline cells remain pending.

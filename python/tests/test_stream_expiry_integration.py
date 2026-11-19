@@ -102,7 +102,7 @@ def test_expiry_arm10_socket_expiry_and_intervening_writer(scratch_daemon):
         assert details["field"] == "expires_at" and json.loads(details["value"]) == first["deadline"]
         assert datetime.fromisoformat(details["now"].replace("Z", "+00:00")) > deadline
         assert _counts(scratch_daemon) == before
-        assert request("stream.stat", stream=stream)["result"] == {"count":1, "head_seq":1}
+        assert request("stream.stat", stream=stream)["result"] == {"count":1, "head_seq":1, "floor_seq":1}
         assert request("get", key=key, kind="head")["result"]["version"] == 1
         proc.stdin.write("renew\n")
         proc.stdin.flush()
@@ -119,7 +119,7 @@ def test_expiry_arm10_socket_expiry_and_intervening_writer(scratch_daemon):
         # every equality above pass vacuously. This is the arm that fails if the
         # scoping is wrong rather than merely narrow.
         assert _counts(scratch_daemon)[2] > 0
-        assert request("stream.stat", stream=stream)["result"] == {"count":2, "head_seq":2}
+        assert request("stream.stat", stream=stream)["result"] == {"count":2, "head_seq":2, "floor_seq":1}
         proc.stdin.write("done\n")
         proc.stdin.flush()
         _, stderr = proc.communicate(timeout=60)

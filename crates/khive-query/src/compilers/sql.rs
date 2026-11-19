@@ -2,15 +2,12 @@
 
 use crate::ast::*;
 use crate::error::QueryError;
-use crate::validate::{validate_with_warnings, MAX_DEPTH};
+use crate::language::read_only_error;
+use crate::validate::{validate_with_warnings, MAX_DEPTH, SYNTHETIC_RELATIONS};
 
-/// Closed observation projections handled outside canonical graph edges.
-const SYNTHETIC_RELATIONS: &[&str] = &[
-    "observed_as_candidate",
-    "observed_as_selected",
-    "observed_as_target",
-    "observed_as_signal",
-];
+#[path = "mailbox.rs"]
+mod mailbox;
+use mailbox::MailboxLowering;
 
 fn is_synthetic(rel: &str) -> bool {
     SYNTHETIC_RELATIONS.contains(&rel)
@@ -27,7 +24,11 @@ fn synthetic_role(rel: &str) -> Option<&'static str> {
 }
 
 /// Substrate-agnostic source for canonical edge endpoints (issue #467).
-const PRIMARY_NODE_SQL: &str = "\
+fn primary_node_sql(mailbox: Option<&MailboxLowering>) -> String {
+    let note_filter = mailbox.map_or_else(String::new, |scope| scope.note_filter("notes"));
+    let edge_filter = mailbox.map_or_else(String::new, |scope| scope.edge_filter("graph_edges"));
+    format!(
+        "\
     SELECT id, namespace, kind, entity_type, name, description, NULL AS content, \
            NULL AS status, NULL AS salience, NULL AS decay_factor, properties, \
            created_at, updated_at, deleted_at, 'entity' AS substrate_kind \
@@ -36,7 +37,7 @@ const PRIMARY_NODE_SQL: &str = "\
     SELECT id, namespace, kind, NULL AS entity_type, name, NULL AS description, \
            content, status, salience, decay_factor, properties, \
            created_at, updated_at, deleted_at, 'note' AS substrate_kind \
-      FROM notes \
+      FROM notes{note_filter} \
     UNION ALL \
     SELECT id, namespace, kind, NULL AS entity_type, verb AS name, \
            NULL AS description, NULL AS content, NULL AS status, \
@@ -49,14 +50,19 @@ const PRIMARY_NODE_SQL: &str = "\
            NULL AS description, NULL AS content, NULL AS status, \
            NULL AS salience, NULL AS decay_factor, metadata AS properties, \
            created_at, updated_at, deleted_at, 'edge' AS substrate_kind \
-      FROM graph_edges";
+      FROM graph_edges{edge_filter}"
+    )
+}
 
-fn primary_node_source(alias: &str) -> String {
-    format!("({PRIMARY_NODE_SQL}) {alias}")
+fn primary_node_source(alias: &str, mailbox: Option<&MailboxLowering>) -> String {
+    format!("({}) {alias}", primary_node_sql(mailbox))
 }
 
 /// Entity/note referent source for synthetic observation targets (issue #468).
-const OBSERVATION_TARGET_SQL: &str = "\
+fn observation_target_sql(mailbox: Option<&MailboxLowering>) -> String {
+    let note_filter = mailbox.map_or_else(String::new, |scope| scope.note_filter("notes"));
+    format!(
+        "\
     SELECT id, namespace, kind, entity_type, name, description, \
            NULL AS content, NULL AS status, NULL AS salience, \
            NULL AS decay_factor, properties, created_at, updated_at, \
@@ -66,10 +72,27 @@ const OBSERVATION_TARGET_SQL: &str = "\
     SELECT id, namespace, kind, NULL AS entity_type, name, NULL AS description, \
            content, status, salience, decay_factor, properties, \
            created_at, updated_at, deleted_at, 'note' AS referent_kind \
-      FROM notes";
+      FROM notes{note_filter}"
+    )
+}
 
-fn observation_target_source(alias: &str) -> String {
-    format!("({OBSERVATION_TARGET_SQL}) {alias}")
+fn observation_target_source(alias: &str, mailbox: Option<&MailboxLowering>) -> String {
+    format!("({}) {alias}", observation_target_sql(mailbox))
+}
+
+fn edge_source(alias: &str, mailbox: Option<&MailboxLowering>) -> String {
+    match mailbox {
+        Some(scope) => format!(
+            "(SELECT * FROM graph_edges{}) {alias}",
+            scope.edge_filter("graph_edges")
+        ),
+        None => format!("graph_edges {alias}"),
+    }
+}
+
+/// Quotes one SQL identifier while preserving the returned column name.
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 /// Parameterized read-only SQL plus the metadata required to decode its result.
@@ -98,6 +121,18 @@ pub struct TruncationCheck {
     pub requested_limit: Option<usize>,
 }
 
+/// Caller-derived mailbox partition applied by [`compile_with_mailbox`].
+///
+/// The compiler does not authenticate this scope. The runtime must derive it
+/// from its authorized caller, never from query text or query arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryMailboxScope {
+    /// Exact caller actor label; SQL always binds it as a text parameter.
+    pub actor_id: String,
+    /// Whether the anonymous, non-delegated local caller may see legacy rows.
+    pub legacy_local: bool,
+}
+
 /// Runtime options injected by the caller to scope and cap query execution.
 pub struct CompileOptions {
     /// Namespace scope; empty means all namespaces.
@@ -120,23 +155,18 @@ impl Default for CompileOptions {
 
 /// Chooses the SQL limit and optional cap-sentinel check (issue #777).
 ///
-/// An explicit query-text `LIMIT` is a TOTAL bound across every `SKIP` page, not a
-/// page-local one (ADR-008 §"query LIMIT and page_size composition", docs/guide/api-reference.md).
-/// `offset` is the page's `SKIP` value; the SQL bound is `min(limit - offset, max_limit)`,
-/// and the cap sentinel (`max_limit + 1`) is requested only when another page could still
-/// exist within the query's own limit. An offset at or beyond the limit yields SQL `LIMIT 0`
-/// — a terminal empty page, never an error.
+/// An explicit query-text `LIMIT` bounds rows after `SKIP` (ADR-008 Amendment 3).
+/// Limits at or below `max_limit` are terminal without a sentinel. Larger or absent
+/// limits request `max_limit + 1` rows so the runtime can detect another page.
 /// See `crates/khive-query/docs/api/sql-compilation.md` for lifecycle details.
 fn effective_limit(
     requested_limit: Option<usize>,
-    offset: usize,
     max_limit: usize,
 ) -> (usize, Option<TruncationCheck>) {
     match requested_limit {
         Some(limit) => {
-            let remaining = limit.saturating_sub(offset);
-            if remaining <= max_limit {
-                (remaining, None)
+            if limit <= max_limit {
+                (limit, None)
             } else {
                 (
                     max_limit.saturating_add(1),
@@ -167,6 +197,30 @@ fn effective_limit(
 /// a projection cannot be lowered, or a bound limit/value is invalid.
 /// See `crates/khive-query/docs/api/sql-compilation.md` for compilation paths.
 pub fn compile(query: &GqlQuery, opts: &CompileOptions) -> Result<CompiledQuery, QueryError> {
+    compile_scoped(query, opts, None)
+}
+
+/// Compiles under a caller-derived message partition before matching and paging.
+///
+/// This is a pure lowering API, not an authorization or actor-resolution boundary.
+/// Namespace filtering and all other [`compile`] behavior remain unchanged.
+///
+/// # Errors
+///
+/// Returns the same validation and lowering errors as [`compile`].
+pub fn compile_with_mailbox(
+    query: &GqlQuery,
+    opts: &CompileOptions,
+    mailbox: &QueryMailboxScope,
+) -> Result<CompiledQuery, QueryError> {
+    compile_scoped(query, opts, Some(mailbox))
+}
+
+fn compile_scoped(
+    query: &GqlQuery,
+    opts: &CompileOptions,
+    mailbox: Option<&QueryMailboxScope>,
+) -> Result<CompiledQuery, QueryError> {
     if query.pattern.elements.is_empty() {
         return Err(QueryError::Compile("empty pattern".into()));
     }
@@ -175,9 +229,13 @@ pub fn compile(query: &GqlQuery, opts: &CompileOptions) -> Result<CompiledQuery,
     let warnings = validate_with_warnings(&mut query)?;
 
     let mut compiled = if query.pattern.has_variable_length() {
-        compile_variable_length(&query, opts)?
+        if query.pattern.edges().count() > 1 {
+            compile_mixed_length(&query, opts, mailbox)?
+        } else {
+            compile_variable_length(&query, opts, mailbox)?
+        }
     } else {
-        compile_fixed_length(&query, opts)?
+        compile_fixed_length(&query, opts, mailbox)?
     };
     compiled.warnings.extend(warnings);
 
@@ -193,11 +251,15 @@ fn assert_select_only(sql: &str) -> Result<(), QueryError> {
     if first == "SELECT" || first == "WITH" {
         return Ok(());
     }
-    Err(QueryError::Compile(
-        "the query verb is read-only; \
-         to mutate the graph use: create, update, link, merge, delete"
-            .into(),
-    ))
+    Err(read_only_error(QueryError::Compile))
+}
+
+fn in_placeholders(indices: impl IntoIterator<Item = usize>) -> String {
+    indices
+        .into_iter()
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn namespace_filter(alias: &str, opts: &CompileOptions, params: &mut Vec<QueryValue>) -> String {
@@ -207,15 +269,11 @@ fn namespace_filter(alias: &str, opts: &CompileOptions, params: &mut Vec<QueryVa
         params.push(QueryValue::Text(opts.scopes[0].clone()));
         format!(" AND {alias}.namespace = ?{}", params.len())
     } else {
-        let placeholders: Vec<String> = opts
-            .scopes
-            .iter()
-            .map(|s| {
-                params.push(QueryValue::Text(s.clone()));
-                format!("?{}", params.len())
-            })
-            .collect();
-        format!(" AND {alias}.namespace IN ({})", placeholders.join(", "))
+        let placeholders = in_placeholders(opts.scopes.iter().map(|s| {
+            params.push(QueryValue::Text(s.clone()));
+            params.len()
+        }));
+        format!(" AND {alias}.namespace IN ({})", placeholders)
     }
 }
 
@@ -322,17 +380,184 @@ fn synthetic_endpoint_node_indices(
     (source_set, target_set)
 }
 
+struct NodeCorrelation {
+    id: String,
+    substrate: String,
+}
+
+/// One lowering context owns all block aliases and reuses the caller's bound scope.
+struct AbsenceContext<'a> {
+    opts: &'a CompileOptions,
+    mailbox: Option<&'a MailboxLowering>,
+    nodes: std::collections::HashMap<String, NodeCorrelation>,
+    next_block: usize,
+}
+
+impl<'a> AbsenceContext<'a> {
+    fn new(opts: &'a CompileOptions, mailbox: Option<&'a MailboxLowering>) -> Self {
+        Self {
+            opts,
+            mailbox,
+            nodes: std::collections::HashMap::new(),
+            next_block: 0,
+        }
+    }
+
+    fn bind_node(&mut self, variable: &str, alias: &str, substrate: String) {
+        self.nodes.insert(
+            variable.to_owned(),
+            NodeCorrelation {
+                id: format!("{alias}.id"),
+                substrate,
+            },
+        );
+    }
+
+    fn lower(
+        &mut self,
+        pattern: &MatchPattern,
+        params: &mut Vec<QueryValue>,
+    ) -> Result<String, QueryError> {
+        let block = self.next_block;
+        self.next_block += 1;
+        let mut sources = Vec::new();
+        let mut predicates = Vec::new();
+        let mut node_index = 0usize;
+        let mut edge_index = 0usize;
+        for element in &pattern.elements {
+            match element {
+                PatternElement::Node(node) => {
+                    let alias = format!("absence_{block}_n{node_index}");
+                    sources.push(primary_node_source(&alias, self.mailbox));
+                    predicates.push(format!("{alias}.deleted_at IS NULL"));
+                    let scope = namespace_filter(&alias, self.opts, params);
+                    if !scope.is_empty() {
+                        predicates.push(scope.trim_start_matches(" AND ").to_owned());
+                    }
+                    if let Some(kind) = &node.kind {
+                        predicates.push(kind_filter_predicate(&alias, kind, params));
+                    }
+                    if let Some(entity_type) = &node.entity_type {
+                        params.push(QueryValue::Text(entity_type.clone()));
+                        predicates.push(format!("{alias}.entity_type = ?{}", params.len()));
+                    }
+                    let mut properties: Vec<_> = node.properties.iter().collect();
+                    properties.sort_by_key(|(key, _)| key.as_str());
+                    for (key, value) in properties {
+                        let text_column = if key == "name" { Some("name") } else { None };
+                        predicates.push(compile_property_equality(
+                            &alias,
+                            key,
+                            value,
+                            text_column,
+                            params,
+                        )?);
+                    }
+                    if let Some(correlation) =
+                        node.variable.as_ref().and_then(|v| self.nodes.get(v))
+                    {
+                        predicates.push(format!("{alias}.id = {}", correlation.id));
+                        predicates.push(format!(
+                            "{alias}.substrate_kind = {}",
+                            correlation.substrate,
+                        ));
+                    }
+                    node_index += 1;
+                }
+                PatternElement::Edge(edge) => {
+                    let alias = format!("absence_{block}_e{edge_index}");
+                    let previous = format!("absence_{block}_n{}", node_index - 1);
+                    let next = format!("absence_{block}_n{node_index}");
+                    sources.push(edge_source(&alias, self.mailbox));
+                    predicates.push(format!("{alias}.deleted_at IS NULL"));
+                    let scope = namespace_filter(&alias, self.opts, params);
+                    if !scope.is_empty() {
+                        predicates.push(scope.trim_start_matches(" AND ").to_owned());
+                    }
+                    let outgoing = format!(
+                        "{alias}.source_id = {previous}.id AND {alias}.target_id = {next}.id"
+                    );
+                    let incoming = format!(
+                        "{alias}.target_id = {previous}.id AND {alias}.source_id = {next}.id"
+                    );
+                    predicates.push(match edge.direction {
+                        EdgeDirection::Out => outgoing,
+                        EdgeDirection::In => incoming,
+                        EdgeDirection::Both => format!("(({outgoing}) OR ({incoming}))"),
+                    });
+                    if edge.relations.len() == 1 {
+                        params.push(QueryValue::Text(edge.relations[0].clone()));
+                        predicates.push(format!("{alias}.relation = ?{}", params.len()));
+                    } else if !edge.relations.is_empty() {
+                        let placeholders = in_placeholders(edge.relations.iter().map(|relation| {
+                            params.push(QueryValue::Text(relation.clone()));
+                            params.len()
+                        }));
+                        predicates.push(format!("{alias}.relation IN ({placeholders})"));
+                    }
+                    edge_index += 1;
+                }
+            }
+        }
+        Ok(format!(
+            "NOT EXISTS (SELECT 1 FROM {} WHERE {})",
+            sources.join(", "),
+            predicates.join(" AND "),
+        ))
+    }
+}
+
+fn contains_not_exists(expr: &WhereExpr) -> bool {
+    match expr {
+        WhereExpr::NotExists(_) => true,
+        WhereExpr::And(left, right) | WhereExpr::Or(left, right) => {
+            contains_not_exists(left) || contains_not_exists(right)
+        }
+        WhereExpr::True | WhereExpr::Condition(_) => false,
+    }
+}
+
+fn absence_needs_final_start(
+    expr: &WhereExpr,
+    start_var: Option<&str>,
+    end_var: Option<&str>,
+) -> bool {
+    match expr {
+        WhereExpr::NotExists(pattern) => {
+            pattern.nodes().any(|node| {
+                node.variable
+                    .as_deref()
+                    .is_some_and(|v| Some(v) == start_var)
+            }) && pattern
+                .nodes()
+                .any(|node| node.variable.as_deref().is_some_and(|v| Some(v) == end_var))
+        }
+        WhereExpr::And(left, right) | WhereExpr::Or(left, right) => {
+            absence_needs_final_start(left, start_var, end_var)
+                || absence_needs_final_start(right, start_var, end_var)
+        }
+        WhereExpr::True | WhereExpr::Condition(_) => false,
+    }
+}
+
 /// Compiles fixed-length patterns to a JOIN chain.
 fn compile_fixed_length(
     query: &GqlQuery,
     opts: &CompileOptions,
+    mailbox: Option<&QueryMailboxScope>,
 ) -> Result<CompiledQuery, QueryError> {
     let mut params: Vec<QueryValue> = Vec::new();
+    let mailbox = mailbox.map(|scope| MailboxLowering::bind(scope, &mut params));
+    let mailbox = mailbox.as_ref();
     let mut from_parts: Vec<String> = Vec::new();
     let mut join_parts: Vec<String> = Vec::new();
     let mut where_parts: Vec<String> = Vec::new();
     let mut select_parts: Vec<String> = Vec::new();
     let mut order_parts: Vec<String> = Vec::new();
+    let mut output_aliases = ProjectionAliases::default();
+    let has_counts = has_binding_counts(query);
+    let result_mode = query.distinct || has_counts;
+    let mut result_values = ResultValues::default();
 
     let mut node_aliases: Vec<String> = Vec::new();
     let mut var_to_alias: std::collections::HashMap<String, (String, VarKind)> =
@@ -345,206 +570,220 @@ fn compile_fixed_length(
     let mut node_idx = 0usize;
     let mut edge_idx = 0usize;
 
-    for element in &query.pattern.elements {
-        match element {
-            PatternElement::Node(np) => {
-                let alias = format!("n{node_idx}");
-                node_aliases.push(alias.clone());
+    for pattern in query.patterns() {
+        let path_start_node_idx = node_idx;
+        for element in &pattern.elements {
+            match element {
+                PatternElement::Node(np) => {
+                    let alias = format!("n{node_idx}");
+                    node_aliases.push(alias.clone());
 
-                let is_event_source = event_source_indices.contains(&node_idx);
-                let is_observation_target = observation_target_indices.contains(&node_idx);
+                    let is_event_source = event_source_indices.contains(&node_idx);
+                    let is_observation_target = observation_target_indices.contains(&node_idx);
 
-                // Paging requires a total order over match identities, not caller
-                // projections. UUIDs can overlap across unioned substrates, so keep
-                // each union's discriminator ahead of its ID.
-                if is_event_source {
-                    order_parts.push(format!("{alias}.id"));
-                } else if is_observation_target {
-                    order_parts.push(format!("{alias}.referent_kind"));
-                    order_parts.push(format!("{alias}.id"));
-                } else {
-                    order_parts.push(format!("{alias}.substrate_kind"));
-                    order_parts.push(format!("{alias}.id"));
-                }
-
-                if node_idx == 0 {
+                    // Paging requires a total order over match identities, not caller
+                    // projections. UUIDs can overlap across unioned substrates, so keep
+                    // each union's discriminator ahead of its ID.
                     if is_event_source {
-                        from_parts.push(format!("events {alias}"));
-                    } else if !is_observation_target {
-                        from_parts.push(primary_node_source(&alias));
+                        order_parts.push(format!("{alias}.id"));
+                    } else if is_observation_target {
+                        order_parts.push(format!("{alias}.referent_kind"));
+                        order_parts.push(format!("{alias}.id"));
+                    } else {
+                        order_parts.push(format!("{alias}.substrate_kind"));
+                        order_parts.push(format!("{alias}.id"));
                     }
-                }
 
-                if is_event_source {
-                    // Events have no `deleted_at`; namespace is filtered directly.
-                    let ns_filter = namespace_filter(&alias, opts, &mut params);
-                    if !ns_filter.is_empty() {
-                        where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
+                    if node_idx == 0 {
+                        if is_event_source {
+                            from_parts.push(format!("events {alias}"));
+                        } else if !is_observation_target {
+                            from_parts.push(primary_node_source(&alias, mailbox));
+                        }
+                    } else if node_idx == path_start_node_idx {
+                        // Validation permits only canonical comma components. Keep the
+                        // same filtered source on each root before the global identity join.
+                        join_parts.push(format!(
+                            "CROSS JOIN {}",
+                            primary_node_source(&alias, mailbox)
+                        ));
                     }
-                    // Bare `event` needs no kind predicate on an event-only source.
-                    if let Some(ref kind) = np.kind {
-                        if kind != "event" {
-                            params.push(QueryValue::Text(kind.clone()));
-                            where_parts.push(format!("{alias}.kind = ?{}", params.len()));
+
+                    if is_event_source {
+                        // Events have no `deleted_at`; namespace is filtered directly.
+                        let ns_filter = namespace_filter(&alias, opts, &mut params);
+                        if !ns_filter.is_empty() {
+                            where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
+                        }
+                        // Bare `event` needs no kind predicate on an event-only source.
+                        if let Some(ref kind) = np.kind {
+                            if kind != "event" {
+                                params.push(QueryValue::Text(kind.clone()));
+                                where_parts.push(format!("{alias}.kind = ?{}", params.len()));
+                            }
+                        }
+                        if np.entity_type.is_some() {
+                            return Err(QueryError::Compile(
+                                "event nodes do not have an entity_type column".into(),
+                            ));
+                        }
+                        if !np.properties.is_empty() {
+                            return Err(QueryError::Compile(
+                                "event nodes do not support inline property filters; \
+                             use a WHERE clause on verb, outcome, or payload fields"
+                                    .into(),
+                            ));
+                        }
+                    } else if is_observation_target {
+                        where_parts.push(format!("{alias}.deleted_at IS NULL"));
+
+                        let ns_filter = namespace_filter(&alias, opts, &mut params);
+                        if !ns_filter.is_empty() {
+                            where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
+                        }
+
+                        if let Some(ref kind) = np.kind {
+                            where_parts.push(observation_kind_filter_predicate(
+                                &alias,
+                                kind,
+                                &mut params,
+                            ));
+                        }
+
+                        if let Some(ref et) = np.entity_type {
+                            params.push(QueryValue::Text(et.clone()));
+                            where_parts.push(format!("{alias}.entity_type = ?{}", params.len()));
+                        }
+
+                        let mut props: Vec<_> = np.properties.iter().collect();
+                        props.sort_by_key(|(k, _)| k.as_str());
+                        for (key, val) in props {
+                            let text_column = if key == "name" || key == "content" {
+                                Some(key.as_str())
+                            } else {
+                                None
+                            };
+                            where_parts.push(compile_property_equality(
+                                &alias,
+                                key,
+                                val,
+                                text_column,
+                                &mut params,
+                            )?);
+                        }
+                    } else {
+                        where_parts.push(format!("{alias}.deleted_at IS NULL"));
+
+                        let ns_filter = namespace_filter(&alias, opts, &mut params);
+                        if !ns_filter.is_empty() {
+                            where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
+                        }
+
+                        if let Some(ref kind) = np.kind {
+                            where_parts.push(kind_filter_predicate(&alias, kind, &mut params));
+                        }
+
+                        if let Some(ref et) = np.entity_type {
+                            params.push(QueryValue::Text(et.clone()));
+                            where_parts.push(format!("{alias}.entity_type = ?{}", params.len()));
+                        }
+
+                        let mut props: Vec<_> = np.properties.iter().collect();
+                        props.sort_by_key(|(k, _)| k.as_str());
+                        for (key, val) in props {
+                            let text_column = if key == "name" { Some("name") } else { None };
+                            where_parts.push(compile_property_equality(
+                                &alias,
+                                key,
+                                val,
+                                text_column,
+                                &mut params,
+                            )?);
                         }
                     }
-                    if np.entity_type.is_some() {
-                        return Err(QueryError::Compile(
-                            "event nodes do not have an entity_type column".into(),
-                        ));
-                    }
-                    if !np.properties.is_empty() {
-                        return Err(QueryError::Compile(
-                            "event nodes do not support inline property filters; \
-                             use a WHERE clause on verb, outcome, or payload fields"
-                                .into(),
-                        ));
-                    }
-                } else if is_observation_target {
-                    where_parts.push(format!("{alias}.deleted_at IS NULL"));
 
-                    let ns_filter = namespace_filter(&alias, opts, &mut params);
-                    if !ns_filter.is_empty() {
-                        where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
-                    }
-
-                    if let Some(ref kind) = np.kind {
-                        where_parts.push(observation_kind_filter_predicate(
-                            &alias,
-                            kind,
-                            &mut params,
-                        ));
-                    }
-
-                    if let Some(ref et) = np.entity_type {
-                        params.push(QueryValue::Text(et.clone()));
-                        where_parts.push(format!("{alias}.entity_type = ?{}", params.len()));
-                    }
-
-                    let mut props: Vec<_> = np.properties.iter().collect();
-                    props.sort_by_key(|(k, _)| k.as_str());
-                    for (key, val) in props {
-                        let text_column = if key == "name" || key == "content" {
-                            Some(key.as_str())
+                    if let Some(ref var) = np.variable {
+                        let kind = if is_event_source {
+                            VarKind::EventNode
+                        } else if is_observation_target {
+                            VarKind::ObservationTargetNode
                         } else {
-                            None
+                            VarKind::Node
                         };
-                        where_parts.push(compile_property_equality(
-                            &alias,
-                            key,
-                            val,
-                            text_column,
-                            &mut params,
-                        )?);
-                    }
-                } else {
-                    where_parts.push(format!("{alias}.deleted_at IS NULL"));
-
-                    let ns_filter = namespace_filter(&alias, opts, &mut params);
-                    if !ns_filter.is_empty() {
-                        where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
+                        if let Some((first_alias, _)) = var_to_alias.get(var) {
+                            // A repeated name across paths denotes a typed record identity.
+                            // Retain the first alias for projections and every occurrence's filters.
+                            where_parts.push(format!(
+                                "{alias}.substrate_kind = {first_alias}.substrate_kind"
+                            ));
+                            where_parts.push(format!("{alias}.id = {first_alias}.id"));
+                        } else {
+                            var_to_alias.insert(var.clone(), (alias.clone(), kind));
+                        }
                     }
 
-                    if let Some(ref kind) = np.kind {
-                        where_parts.push(kind_filter_predicate(&alias, kind, &mut params));
-                    }
-
-                    if let Some(ref et) = np.entity_type {
-                        params.push(QueryValue::Text(et.clone()));
-                        where_parts.push(format!("{alias}.entity_type = ?{}", params.len()));
-                    }
-
-                    let mut props: Vec<_> = np.properties.iter().collect();
-                    props.sort_by_key(|(k, _)| k.as_str());
-                    for (key, val) in props {
-                        let text_column = if key == "name" { Some("name") } else { None };
-                        where_parts.push(compile_property_equality(
-                            &alias,
-                            key,
-                            val,
-                            text_column,
-                            &mut params,
-                        )?);
-                    }
+                    node_idx += 1;
                 }
+                PatternElement::Edge(ep) => {
+                    let e_alias = format!("e{edge_idx}");
+                    let prev_node = &node_aliases[node_aliases.len() - 1];
+                    let next_alias = format!("n{}", node_idx);
 
-                if let Some(ref var) = np.variable {
-                    let kind = if is_event_source {
-                        VarKind::EventNode
-                    } else if is_observation_target {
-                        VarKind::ObservationTargetNode
-                    } else {
-                        VarKind::Node
-                    };
-                    var_to_alias.insert(var.clone(), (alias.clone(), kind));
-                }
-
-                node_idx += 1;
-            }
-            PatternElement::Edge(ep) => {
-                let e_alias = format!("e{edge_idx}");
-                let prev_node = &node_aliases[node_aliases.len() - 1];
-                let next_alias = format!("n{}", node_idx);
-
-                // The synthetic and canonical backing tables have no meaningful shared join key.
-                let has_synthetic = ep.relations.iter().any(|r| is_synthetic(r));
-                let has_canonical = ep.relations.iter().any(|r| !is_synthetic(r));
-                if has_synthetic && has_canonical {
-                    return Err(QueryError::Compile(
+                    // The synthetic and canonical backing tables have no meaningful shared join key.
+                    let has_synthetic = ep.relations.iter().any(|r| is_synthetic(r));
+                    let has_canonical = ep.relations.iter().any(|r| !is_synthetic(r));
+                    if has_synthetic && has_canonical {
+                        return Err(QueryError::Compile(
                         "cannot mix synthetic observed_as_* relations with canonical edge relations \
                          in a single edge pattern"
                             .into(),
                     ));
-                }
+                    }
 
-                if has_synthetic {
-                    // `(event_id, role, position)` is the observation primary key.
-                    order_parts.push(format!("{e_alias}.event_id"));
-                    order_parts.push(format!("{e_alias}.role"));
-                    order_parts.push(format!("{e_alias}.position"));
-                    // Synthetic projections are always event-to-referent.
-                    if !matches!(ep.direction, EdgeDirection::Out) {
-                        return Err(QueryError::Compile(
+                    if has_synthetic {
+                        // `(event_id, role, position)` is the observation primary key.
+                        order_parts.push(format!("{e_alias}.event_id"));
+                        order_parts.push(format!("{e_alias}.role"));
+                        order_parts.push(format!("{e_alias}.position"));
+                        // Synthetic projections are always event-to-referent.
+                        if !matches!(ep.direction, EdgeDirection::Out) {
+                            return Err(QueryError::Compile(
                             "synthetic observed_as_* edges are always event → entity (outbound only)".into(),
                         ));
-                    }
-                    join_parts.push(format!(
+                        }
+                        join_parts.push(format!(
                         "JOIN event_observations {e_alias} ON {e_alias}.event_id = {prev_node}.id"
                     ));
-                    let roles: Vec<&'static str> = ep
-                        .relations
-                        .iter()
-                        .filter_map(|r| synthetic_role(r))
-                        .collect();
-                    if roles.len() == 1 {
-                        params.push(QueryValue::Text(roles[0].to_string()));
-                        where_parts.push(format!("{e_alias}.role = ?{}", params.len()));
-                    } else if roles.len() > 1 {
-                        let placeholders: Vec<String> = roles
+                        let roles: Vec<&'static str> = ep
+                            .relations
                             .iter()
-                            .map(|r| {
-                                params.push(QueryValue::Text(r.to_string()));
-                                format!("?{}", params.len())
-                            })
+                            .filter_map(|r| synthetic_role(r))
                             .collect();
-                        where_parts
-                            .push(format!("{e_alias}.role IN ({})", placeholders.join(", ")));
-                    }
-                    // `referent_kind` prevents equal IDs on different substrates from colliding.
-                    join_parts.push(format!(
-                        "JOIN {} ON {next_alias}.id = {e_alias}.entity_id \
+                        if roles.len() == 1 {
+                            params.push(QueryValue::Text(roles[0].to_string()));
+                            where_parts.push(format!("{e_alias}.role = ?{}", params.len()));
+                        } else if roles.len() > 1 {
+                            let placeholders = in_placeholders(roles.iter().map(|r| {
+                                params.push(QueryValue::Text(r.to_string()));
+                                params.len()
+                            }));
+                            where_parts.push(format!("{e_alias}.role IN ({})", placeholders));
+                        }
+                        // `referent_kind` prevents equal IDs on different substrates from colliding.
+                        join_parts.push(format!(
+                            "JOIN {} ON {next_alias}.id = {e_alias}.entity_id \
                          AND {next_alias}.referent_kind = {e_alias}.referent_kind",
-                        observation_target_source(&next_alias)
-                    ));
-                    // Enforce the ADR-041 role/substrate matrix.
-                    where_parts.push(format!(
+                            observation_target_source(&next_alias, mailbox)
+                        ));
+                        // Enforce the ADR-041 role/substrate matrix.
+                        where_parts.push(format!(
                         "(({e_alias}.role IN ('candidate', 'selected') AND {e_alias}.referent_kind IN ('entity', 'note')) \
                           OR ({e_alias}.role = 'target' AND {e_alias}.referent_kind IN ('entity', 'note')) \
                           OR ({e_alias}.role = 'signal' AND {e_alias}.referent_kind IN ('entity', 'note')))"
                     ));
-                } else {
-                    order_parts.push(format!("{e_alias}.id"));
-                    let (source_join, target_join) = match ep.direction {
+                    } else {
+                        order_parts.push(format!("{e_alias}.id"));
+                        let (source_join, target_join) = match ep.direction {
                         EdgeDirection::Out => (
                             format!("{e_alias}.source_id = {prev_node}.id"),
                             "target_id",
@@ -561,59 +800,75 @@ fn compile_fixed_length(
                         ),
                     };
 
-                    let next_join_col = if target_join == "CASE_BOTH" {
-                        format!(
+                        let next_join_col = if target_join == "CASE_BOTH" {
+                            format!(
                             "CASE WHEN {e_alias}.source_id = {prev_node}.id THEN {e_alias}.target_id ELSE {e_alias}.source_id END"
                         )
-                    } else {
-                        format!("{e_alias}.{target_join}")
-                    };
-
-                    join_parts.push(format!(
-                        "JOIN graph_edges {e_alias} ON {source_join} AND {e_alias}.deleted_at IS NULL"
-                    ));
-
-                    let ens_filter = namespace_filter(&e_alias, opts, &mut params);
-                    if !ens_filter.is_empty() {
-                        where_parts.push(ens_filter.trim_start_matches(" AND ").to_string());
-                    }
-
-                    join_parts.push(format!(
-                        "JOIN {} ON {next_alias}.id = {next_join_col}",
-                        primary_node_source(&next_alias)
-                    ));
-
-                    if !ep.relations.is_empty() {
-                        if ep.relations.len() == 1 {
-                            params.push(QueryValue::Text(ep.relations[0].clone()));
-                            where_parts.push(format!("{e_alias}.relation = ?{}", params.len()));
                         } else {
-                            let placeholders: Vec<String> = ep
-                                .relations
-                                .iter()
-                                .map(|r| {
+                            format!("{e_alias}.{target_join}")
+                        };
+
+                        join_parts.push(format!(
+                            "JOIN {} ON {source_join} AND {e_alias}.deleted_at IS NULL",
+                            edge_source(&e_alias, mailbox)
+                        ));
+
+                        let ens_filter = namespace_filter(&e_alias, opts, &mut params);
+                        if !ens_filter.is_empty() {
+                            where_parts.push(ens_filter.trim_start_matches(" AND ").to_string());
+                        }
+
+                        join_parts.push(format!(
+                            "JOIN {} ON {next_alias}.id = {next_join_col}",
+                            primary_node_source(&next_alias, mailbox)
+                        ));
+
+                        if !ep.relations.is_empty() {
+                            if ep.relations.len() == 1 {
+                                params.push(QueryValue::Text(ep.relations[0].clone()));
+                                where_parts.push(format!("{e_alias}.relation = ?{}", params.len()));
+                            } else {
+                                let placeholders = in_placeholders(ep.relations.iter().map(|r| {
                                     params.push(QueryValue::Text(r.clone()));
-                                    format!("?{}", params.len())
-                                })
-                                .collect();
-                            where_parts.push(format!(
-                                "{e_alias}.relation IN ({})",
-                                placeholders.join(", ")
-                            ));
+                                    params.len()
+                                }));
+                                where_parts
+                                    .push(format!("{e_alias}.relation IN ({})", placeholders));
+                            }
                         }
                     }
-                }
 
-                if let Some(ref var) = ep.variable {
-                    var_to_alias.insert(var.clone(), (e_alias.clone(), VarKind::Edge));
-                }
+                    if let Some(ref var) = ep.variable {
+                        let kind = if has_synthetic {
+                            VarKind::SyntheticEdge
+                        } else {
+                            VarKind::Edge
+                        };
+                        var_to_alias.insert(var.clone(), (e_alias.clone(), kind));
+                    }
 
-                edge_idx += 1;
+                    edge_idx += 1;
+                }
             }
         }
     }
 
-    if let Some(where_sql) = compile_where_expr(&query.where_clause, &var_to_alias, &mut params)? {
+    let mut absence = AbsenceContext::new(opts, mailbox);
+    for (variable, (alias, kind)) in &var_to_alias {
+        let substrate = match kind {
+            VarKind::Node => format!("{alias}.substrate_kind"),
+            VarKind::ObservationTargetNode => format!("{alias}.referent_kind"),
+            VarKind::EventNode => "'event'".to_owned(),
+            VarKind::Edge | VarKind::SyntheticEdge => continue,
+        };
+        absence.bind_node(variable, alias, substrate);
+    }
+    if let Some(where_sql) = compile_where_expr(
+        &query.where_clause,
+        &var_to_alias,
+        &mut params,
+        &mut absence,
+    )? {
         where_parts.push(where_sql);
     }
 
@@ -621,53 +876,109 @@ fn compile_fixed_length(
         let var = item.variable();
         if let Some((alias, kind)) = var_to_alias.get(var) {
             match item {
-                ReturnItem::Property(_, prop) => {
-                    let col = property_to_column(prop, kind)?;
-                    select_parts.push(format!("{alias}.{col} AS {var}_{prop}"));
+                ReturnItem::Count(_) => {
+                    // Every fixed binding is mandatory, including synthetic edges
+                    // whose exposed id is NULL but whose observation row exists.
+                    let expression = "COUNT(1)".to_owned();
+                    let output_alias = output_aliases.register(
+                        format!("count_{var}"),
+                        ProjectionIdentity::Count(var.to_owned()),
+                    )?;
+                    select_parts.push(select_projection(&expression, &output_alias, result_mode));
+                    result_values.count(expression);
                 }
-                ReturnItem::Variable(_) => match kind {
-                    VarKind::Node => {
-                        select_parts.push(format!(
-                            "{alias}.id AS {var}_id, {alias}.namespace AS {var}_namespace, \
-                             {alias}.kind AS {var}_kind, {alias}.entity_type AS {var}_entity_type, \
-                             {alias}.name AS {var}_name, \
-                             {alias}.properties AS {var}_properties, \
-                             {alias}.created_at AS {var}_created_at, \
-                             {alias}.updated_at AS {var}_updated_at"
+                ReturnItem::Path(_, property) => {
+                    let (root, path) = return_path_parts(property)?;
+                    let expression = return_path_expression(
+                        property,
+                        kind,
+                        &format!("{alias}.{root}"),
+                        &mut params,
+                    )?;
+                    let output_alias = output_aliases.register(
+                        format!("{var}_{root}_{}", path.join("_")),
+                        ProjectionIdentity::Property(var.to_owned(), property.clone()),
+                    )?;
+                    select_parts.push(select_projection(&expression, &output_alias, result_mode));
+                    result_values.property(var, property.clone(), expression);
+                }
+                ReturnItem::Property(_, prop) => {
+                    let expression = scalar_property_expression(prop, kind, alias)?;
+                    let output_alias = output_aliases.register(
+                        format!("{var}_{prop}"),
+                        ProjectionIdentity::Property(
+                            var.to_owned(),
+                            PropertyRef::Field(prop.clone()),
+                        ),
+                    )?;
+                    select_parts.push(select_projection(&expression, &output_alias, result_mode));
+                    result_values.property(var, PropertyRef::Field(prop.clone()), expression);
+                }
+                ReturnItem::Variable(_) => {
+                    let columns: &[(&str, &str)] = match kind {
+                        VarKind::Node => &[
+                            ("id", "id"),
+                            ("namespace", "namespace"),
+                            ("kind", "kind"),
+                            ("entity_type", "entity_type"),
+                            ("name", "name"),
+                            ("properties", "properties"),
+                            ("created_at", "created_at"),
+                            ("updated_at", "updated_at"),
+                        ],
+                        VarKind::ObservationTargetNode => &[
+                            ("id", "id"),
+                            ("namespace", "namespace"),
+                            ("kind", "kind"),
+                            ("entity_type", "entity_type"),
+                            ("status", "status"),
+                            ("content", "content"),
+                            ("salience", "salience"),
+                            ("properties", "properties"),
+                            ("created_at", "created_at"),
+                            ("updated_at", "updated_at"),
+                            ("referent_kind", "referent_kind"),
+                        ],
+                        VarKind::EventNode => &[
+                            ("id", "id"),
+                            ("namespace", "namespace"),
+                            ("verb", "verb"),
+                            ("substrate", "substrate"),
+                            ("actor", "actor"),
+                            ("kind", "kind"),
+                            ("outcome", "outcome"),
+                            ("payload", "payload"),
+                            ("created_at", "created_at"),
+                        ],
+                        VarKind::Edge | VarKind::SyntheticEdge => &[
+                            ("id", "id"),
+                            ("source_id", "source"),
+                            ("target_id", "target"),
+                            ("relation", "relation"),
+                            ("weight", "weight"),
+                        ],
+                    };
+                    for (column, suffix) in columns {
+                        let output_alias = output_aliases.register(
+                            format!("{var}_{suffix}"),
+                            ProjectionIdentity::Property(
+                                var.to_owned(),
+                                PropertyRef::Field((*column).to_owned()),
+                            ),
+                        )?;
+                        let expression = format!("{alias}.{column}");
+                        select_parts.push(select_projection(
+                            &expression,
+                            &output_alias,
+                            result_mode,
                         ));
+                        result_values.property(
+                            var,
+                            PropertyRef::Field((*column).to_owned()),
+                            expression,
+                        );
                     }
-                    VarKind::ObservationTargetNode => {
-                        select_parts.push(format!(
-                            "{alias}.id AS {var}_id, {alias}.namespace AS {var}_namespace, \
-                             {alias}.kind AS {var}_kind, {alias}.entity_type AS {var}_entity_type, \
-                             {alias}.status AS {var}_status, \
-                             {alias}.content AS {var}_content, \
-                             {alias}.salience AS {var}_salience, \
-                             {alias}.properties AS {var}_properties, \
-                             {alias}.created_at AS {var}_created_at, \
-                             {alias}.updated_at AS {var}_updated_at, \
-                             {alias}.referent_kind AS {var}_referent_kind"
-                        ));
-                    }
-                    VarKind::EventNode => {
-                        select_parts.push(format!(
-                            "{alias}.id AS {var}_id, {alias}.namespace AS {var}_namespace, \
-                             {alias}.verb AS {var}_verb, {alias}.substrate AS {var}_substrate, \
-                             {alias}.actor AS {var}_actor, {alias}.kind AS {var}_kind, \
-                             {alias}.outcome AS {var}_outcome, \
-                             {alias}.payload AS {var}_payload, \
-                             {alias}.created_at AS {var}_created_at"
-                        ));
-                    }
-                    VarKind::Edge => {
-                        select_parts.push(format!(
-                            "{alias}.id AS {var}_id, {alias}.source_id AS {var}_source, \
-                             {alias}.target_id AS {var}_target, \
-                             {alias}.relation AS {var}_relation, \
-                             {alias}.weight AS {var}_weight"
-                        ));
-                    }
-                },
+                }
             }
         } else {
             return Err(QueryError::Compile(format!(
@@ -676,19 +987,39 @@ fn compile_fixed_length(
         }
     }
 
+    if result_mode {
+        order_parts = result_values.order(&query.order_by, &mut params)?;
+    } else if !query.order_by.is_empty() {
+        let mut requested = Vec::new();
+        for item in &query.order_by {
+            let (alias, kind) = var_to_alias.get(&item.variable).ok_or_else(|| {
+                QueryError::Compile(format!("unknown variable '{}' in ORDER BY", item.variable))
+            })?;
+            let expression = order_property_expression(&item.property, kind, alias, &mut params)?;
+            requested.push(format!(
+                "{expression} COLLATE BINARY {}",
+                order_direction(item.direction)
+            ));
+        }
+        requested.extend(order_parts);
+        order_parts = requested;
+    }
+
     let offset_i64 = i64::try_from(query.offset)
         .map_err(|_| QueryError::InvalidInput("SKIP exceeds i64::MAX".into()))?;
     params.push(QueryValue::Integer(offset_i64));
     let offset_param = params.len();
 
-    let (limit, truncation_check) = effective_limit(query.limit, query.offset, opts.max_limit);
+    let (limit, truncation_check) = effective_limit(query.limit, opts.max_limit);
     let limit_i64 = i64::try_from(limit)
         .map_err(|_| QueryError::InvalidInput("limit exceeds i64::MAX".into()))?;
     params.push(QueryValue::Integer(limit_i64));
     let limit_param = params.len();
 
+    let distinct = if query.distinct { "DISTINCT " } else { "" };
+    let group_by = result_values.group_by(has_counts);
     let sql = format!(
-        "SELECT {} FROM {} {} WHERE {} ORDER BY {} LIMIT ?{} OFFSET ?{}",
+        "SELECT {distinct}{} FROM {} {} WHERE {}{group_by} ORDER BY {} LIMIT ?{} OFFSET ?{}",
         select_parts.join(", "),
         from_parts.join(", "),
         join_parts.join(" "),
@@ -712,16 +1043,18 @@ fn compile_where_expr(
     expr: &WhereExpr,
     var_to_alias: &std::collections::HashMap<String, (String, VarKind)>,
     params: &mut Vec<QueryValue>,
+    absence: &mut AbsenceContext<'_>,
 ) -> Result<Option<String>, QueryError> {
     match expr {
         WhereExpr::True => Ok(None),
+        WhereExpr::NotExists(pattern) => absence.lower(pattern, params).map(Some),
         WhereExpr::Condition(cond) => {
             let sql = compile_single_condition(cond, var_to_alias, params)?;
             Ok(Some(sql))
         }
         WhereExpr::And(l, r) => {
-            let ls = compile_where_expr(l, var_to_alias, params)?;
-            let rs = compile_where_expr(r, var_to_alias, params)?;
+            let ls = compile_where_expr(l, var_to_alias, params, absence)?;
+            let rs = compile_where_expr(r, var_to_alias, params, absence)?;
             Ok(match (ls, rs) {
                 (None, None) => None,
                 (Some(s), None) | (None, Some(s)) => Some(s),
@@ -729,11 +1062,12 @@ fn compile_where_expr(
             })
         }
         WhereExpr::Or(l, r) => {
-            let ls = compile_where_expr(l, var_to_alias, params)?;
-            let rs = compile_where_expr(r, var_to_alias, params)?;
+            let ls = compile_where_expr(l, var_to_alias, params, absence)?;
+            let rs = compile_where_expr(r, var_to_alias, params, absence)?;
             Ok(match (ls, rs) {
                 (None, None) => None,
-                (Some(s), None) | (None, Some(s)) => Some(s),
+                (Some(s), None) => Some(format!("({s} OR 1)")),
+                (None, Some(s)) => Some(format!("(1 OR {s})")),
                 (Some(l), Some(r)) => Some(format!("({l} OR {r})")),
             })
         }
@@ -752,7 +1086,7 @@ fn compile_single_condition(
         ))
     })?;
 
-    let col_expr = where_property_expression(&cond.property, kind, alias)?;
+    let col_expr = where_property_expression(&cond.property, kind, alias, params)?;
 
     compile_condition_predicate(&col_expr, cond, params)
 }
@@ -820,12 +1154,12 @@ fn compile_condition_predicate(
                 .any(|value| matches!(value, ConditionValue::String(_)));
             let placeholders = values
                 .iter()
-                .map(|value| bind_condition_value(value, params).map(|index| format!("?{index}")))
+                .map(|value| bind_condition_value(value, params))
                 .collect::<Result<Vec<_>, _>>()?;
             let collate = if has_string { " COLLATE NOCASE" } else { "" };
             Ok(format!(
                 "{col_expr}{collate} IN ({})",
-                placeholders.join(", ")
+                in_placeholders(placeholders)
             ))
         }
         CompareOp::IsNotNull => {
@@ -875,59 +1209,77 @@ fn expr_endpoint_set(
     expr: &WhereExpr,
     start_var: Option<&str>,
     end_var: Option<&str>,
+    edge_var: Option<&str>,
 ) -> (bool, bool) {
     match expr {
         WhereExpr::True => (false, false),
+        WhereExpr::NotExists(pattern) => {
+            let uses_end = pattern
+                .nodes()
+                .any(|node| node.variable.as_deref().is_some_and(|v| Some(v) == end_var));
+            let uses_start = pattern.nodes().any(|node| {
+                node.variable
+                    .as_deref()
+                    .is_some_and(|v| Some(v) == start_var)
+            });
+            // A mixed-correlated atom is indivisible and belongs to the final row.
+            (uses_start && !uses_end, uses_end)
+        }
         WhereExpr::Condition(c) => {
             let is_start = start_var == Some(c.variable.as_str());
-            let is_end = end_var == Some(c.variable.as_str());
+            let is_end = end_var == Some(c.variable.as_str())
+                || (edge_var == Some(c.variable.as_str())
+                    && matches!(&c.property, PropertyRef::MetadataPath(_)));
             (is_start, is_end)
         }
         WhereExpr::And(l, r) | WhereExpr::Or(l, r) => {
-            let (ls, le) = expr_endpoint_set(l, start_var, end_var);
-            let (rs, re) = expr_endpoint_set(r, start_var, end_var);
+            let (ls, le) = expr_endpoint_set(l, start_var, end_var, edge_var);
+            let (rs, re) = expr_endpoint_set(r, start_var, end_var, edge_var);
             (ls || rs, le || re)
         }
     }
 }
 
-/// Rejects OR subtrees that cannot be preserved across CTE endpoint phases.
+/// Rejects OR subtrees spanning the start phase and final node/edge phase.
 fn reject_or_spanning_endpoints(
     expr: &WhereExpr,
     start: &NodePattern,
     end: &NodePattern,
+    edge: &EdgePattern,
 ) -> Result<(), QueryError> {
     let start_var = start.variable.as_deref();
     let end_var = end.variable.as_deref();
-    reject_or_spanning_impl(expr, start_var, end_var)
+    let edge_var = edge.variable.as_deref();
+    reject_or_spanning_impl(expr, start_var, end_var, edge_var)
 }
 
 fn reject_or_spanning_impl(
     expr: &WhereExpr,
     start_var: Option<&str>,
     end_var: Option<&str>,
+    edge_var: Option<&str>,
 ) -> Result<(), QueryError> {
     match expr {
-        WhereExpr::True | WhereExpr::Condition(_) => Ok(()),
+        WhereExpr::True | WhereExpr::Condition(_) | WhereExpr::NotExists(_) => Ok(()),
         WhereExpr::And(l, r) => {
-            reject_or_spanning_impl(l, start_var, end_var)?;
-            reject_or_spanning_impl(r, start_var, end_var)
+            reject_or_spanning_impl(l, start_var, end_var, edge_var)?;
+            reject_or_spanning_impl(r, start_var, end_var, edge_var)
         }
         WhereExpr::Or(l, r) => {
-            let (l_start, l_end) = expr_endpoint_set(l, start_var, end_var);
-            let (r_start, r_end) = expr_endpoint_set(r, start_var, end_var);
+            let (l_start, l_end) = expr_endpoint_set(l, start_var, end_var, edge_var);
+            let (r_start, r_end) = expr_endpoint_set(r, start_var, end_var, edge_var);
             let spans_start = l_start || r_start;
             let spans_end = l_end || r_end;
             if spans_start && spans_end {
                 return Err(QueryError::Unsupported(
-                    "WHERE clauses that span both endpoints in a variable-length pattern \
+                    "WHERE clauses that span the start and final row in a variable-length pattern \
                      are not yet supported; rewrite as separate queries or restrict each \
-                     OR branch to one endpoint"
+                     OR branch to one phase"
                         .into(),
                 ));
             }
-            reject_or_spanning_impl(l, start_var, end_var)?;
-            reject_or_spanning_impl(r, start_var, end_var)
+            reject_or_spanning_impl(l, start_var, end_var, edge_var)?;
+            reject_or_spanning_impl(r, start_var, end_var, edge_var)
         }
     }
 }
@@ -936,8 +1288,16 @@ fn compile_var_len_condition(
     cond: &Condition,
     start_var: Option<&str>,
     end_var: Option<&str>,
+    edge_var: Option<&str>,
     params: &mut Vec<QueryValue>,
 ) -> Result<(String, &'static str), QueryError> {
+    if edge_var == Some(cond.variable.as_str()) {
+        if let PropertyRef::MetadataPath(path) = &cond.property {
+            let expression = bound_json_path_expression("t.via_metadata", path, params)?;
+            // Final-edge predicates share the final node's phase, not its SQL alias.
+            return Ok((compile_condition_predicate(&expression, cond, params)?, "r"));
+        }
+    }
     let col_alias = if start_var == Some(cond.variable.as_str()) {
         "s"
     } else if end_var == Some(cond.variable.as_str()) {
@@ -950,25 +1310,50 @@ fn compile_var_len_condition(
         )));
     };
 
-    let col_expr = where_property_expression(&cond.property, &VarKind::Node, col_alias)?;
+    let col_expr = where_property_expression(&cond.property, &VarKind::Node, col_alias, params)?;
 
     let sql = compile_condition_predicate(&col_expr, cond, params)?;
     Ok((sql, col_alias))
 }
 
+fn compile_variable_length_absence(
+    pattern: &MatchPattern,
+    end_var: Option<&str>,
+    params: &mut Vec<QueryValue>,
+    absence: &mut AbsenceContext<'_>,
+) -> Result<(String, &'static str), QueryError> {
+    let final_phase = pattern
+        .nodes()
+        .any(|node| node.variable.as_deref().is_some_and(|v| Some(v) == end_var));
+    Ok((
+        absence.lower(pattern, params)?,
+        if final_phase { "r" } else { "s" },
+    ))
+}
+
 /// Routes variable-length predicates to the start or end CTE phase.
 fn compile_variable_length_where(
     expr: &WhereExpr,
-    start_var: Option<&str>,
-    end_var: Option<&str>,
+    (start_var, end_var, edge_var): (Option<&str>, Option<&str>, Option<&str>),
     params: &mut Vec<QueryValue>,
     start_conditions: &mut Vec<String>,
     end_conditions: &mut Vec<String>,
+    absence: &mut AbsenceContext<'_>,
 ) -> Result<Option<String>, QueryError> {
     match expr {
         WhereExpr::True => Ok(None),
+        WhereExpr::NotExists(pattern) => {
+            let (sql, alias) = compile_variable_length_absence(pattern, end_var, params, absence)?;
+            if alias == "s" {
+                start_conditions.push(sql);
+            } else {
+                end_conditions.push(sql);
+            }
+            Ok(None)
+        }
         WhereExpr::Condition(cond) => {
-            let (sql, alias) = compile_var_len_condition(cond, start_var, end_var, params)?;
+            let (sql, alias) =
+                compile_var_len_condition(cond, start_var, end_var, edge_var, params)?;
             if alias == "s" {
                 start_conditions.push(sql);
             } else {
@@ -979,40 +1364,46 @@ fn compile_variable_length_where(
         WhereExpr::And(l, r) => {
             compile_variable_length_where(
                 l,
-                start_var,
-                end_var,
+                (start_var, end_var, edge_var),
                 params,
                 start_conditions,
                 end_conditions,
+                absence,
             )?;
             compile_variable_length_where(
                 r,
-                start_var,
-                end_var,
+                (start_var, end_var, edge_var),
                 params,
                 start_conditions,
                 end_conditions,
+                absence,
             )?;
             Ok(None)
         }
         WhereExpr::Or(l, r) => {
             // The prior spanning check guarantees both branches use one endpoint.
-            let l_sql = compile_variable_length_where_to_sql(l, start_var, end_var, params)?;
-            let r_sql = compile_variable_length_where_to_sql(r, start_var, end_var, params)?;
+            let l_sql = compile_variable_length_where_to_sql(
+                l, start_var, end_var, edge_var, params, absence,
+            )?;
+            let r_sql = compile_variable_length_where_to_sql(
+                r, start_var, end_var, edge_var, params, absence,
+            )?;
             match (l_sql, r_sql) {
                 (None, None) => {}
                 (Some((ls, la)), None) => {
+                    let combined = format!("({ls} OR 1)");
                     if la == "s" {
-                        start_conditions.push(ls);
+                        start_conditions.push(combined);
                     } else {
-                        end_conditions.push(ls);
+                        end_conditions.push(combined);
                     }
                 }
                 (None, Some((rs, ra))) => {
+                    let combined = format!("(1 OR {rs})");
                     if ra == "s" {
-                        start_conditions.push(rs);
+                        start_conditions.push(combined);
                     } else {
-                        end_conditions.push(rs);
+                        end_conditions.push(combined);
                     }
                 }
                 (Some((ls, la)), Some((rs, _ra))) => {
@@ -1034,17 +1425,27 @@ fn compile_variable_length_where_to_sql(
     expr: &WhereExpr,
     start_var: Option<&str>,
     end_var: Option<&str>,
+    edge_var: Option<&str>,
     params: &mut Vec<QueryValue>,
+    absence: &mut AbsenceContext<'_>,
 ) -> Result<Option<(String, &'static str)>, QueryError> {
     match expr {
         WhereExpr::True => Ok(None),
+        WhereExpr::NotExists(pattern) => {
+            compile_variable_length_absence(pattern, end_var, params, absence).map(Some)
+        }
         WhereExpr::Condition(cond) => {
-            let (sql, alias) = compile_var_len_condition(cond, start_var, end_var, params)?;
+            let (sql, alias) =
+                compile_var_len_condition(cond, start_var, end_var, edge_var, params)?;
             Ok(Some((sql, alias)))
         }
         WhereExpr::And(l, r) => {
-            let ls = compile_variable_length_where_to_sql(l, start_var, end_var, params)?;
-            let rs = compile_variable_length_where_to_sql(r, start_var, end_var, params)?;
+            let ls = compile_variable_length_where_to_sql(
+                l, start_var, end_var, edge_var, params, absence,
+            )?;
+            let rs = compile_variable_length_where_to_sql(
+                r, start_var, end_var, edge_var, params, absence,
+            )?;
             Ok(match (ls, rs) {
                 (None, None) => None,
                 (Some(s), None) | (None, Some(s)) => Some(s),
@@ -1052,23 +1453,419 @@ fn compile_variable_length_where_to_sql(
             })
         }
         WhereExpr::Or(l, r) => {
-            let ls = compile_variable_length_where_to_sql(l, start_var, end_var, params)?;
-            let rs = compile_variable_length_where_to_sql(r, start_var, end_var, params)?;
+            let ls = compile_variable_length_where_to_sql(
+                l, start_var, end_var, edge_var, params, absence,
+            )?;
+            let rs = compile_variable_length_where_to_sql(
+                r, start_var, end_var, edge_var, params, absence,
+            )?;
             Ok(match (ls, rs) {
                 (None, None) => None,
-                (Some(s), None) | (None, Some(s)) => Some(s),
+                (Some((sql, alias)), None) => Some((format!("({sql} OR 1)"), alias)),
+                (None, Some((sql, alias))) => Some((format!("(1 OR {sql})"), alias)),
                 (Some((lsql, la)), Some((rsql, _))) => Some((format!("({lsql} OR {rsql})"), la)),
             })
         }
     }
 }
 
+fn mixed_node_conditions(
+    node: &NodePattern,
+    alias: &str,
+    opts: &CompileOptions,
+    params: &mut Vec<QueryValue>,
+) -> Result<Vec<String>, QueryError> {
+    let mut conditions = vec![format!("{alias}.deleted_at IS NULL")];
+    let namespace = namespace_filter(alias, opts, params);
+    if !namespace.is_empty() {
+        conditions.push(namespace.trim_start_matches(" AND ").to_owned());
+    }
+    if let Some(kind) = &node.kind {
+        conditions.push(kind_filter_predicate(alias, kind, params));
+    }
+    if let Some(entity_type) = &node.entity_type {
+        params.push(QueryValue::Text(entity_type.clone()));
+        conditions.push(format!("{alias}.entity_type = ?{}", params.len()));
+    }
+    let mut properties: Vec<_> = node.properties.iter().collect();
+    properties.sort_by_key(|(key, _)| key.as_str());
+    for (key, value) in properties {
+        let text_column = if key == "name" { Some("name") } else { None };
+        conditions.push(compile_property_equality(
+            alias,
+            key,
+            value,
+            text_column,
+            params,
+        )?);
+    }
+    Ok(conditions)
+}
+
+fn mixed_segment_cte(
+    index: usize,
+    start: &NodePattern,
+    edge: &EdgePattern,
+    carries_metadata: bool,
+    opts: &CompileOptions,
+    mailbox: Option<&MailboxLowering>,
+    params: &mut Vec<QueryValue>,
+) -> Result<String, QueryError> {
+    let start_conditions = mixed_node_conditions(start, "s", opts, params)?;
+    let edge_namespace = namespace_filter("e", opts, params);
+    let next_namespace = namespace_filter("next_node", opts, params);
+    let relation = if edge.relations.is_empty() {
+        String::new()
+    } else {
+        let placeholders = in_placeholders(edge.relations.iter().map(|relation| {
+            params.push(QueryValue::Text(relation.clone()));
+            params.len()
+        }));
+        format!(" AND e.relation IN ({placeholders})")
+    };
+    params.push(QueryValue::Integer(i64::try_from(edge.max_hops).map_err(
+        |_| QueryError::InvalidInput("max_depth exceeds i64::MAX".into()),
+    )?));
+    let maximum = params.len();
+    let (edge_join, next_id) = match edge.direction {
+        EdgeDirection::Out => ("e.source_id = t.current_id", "e.target_id"),
+        EdgeDirection::In => ("e.target_id = t.current_id", "e.source_id"),
+        EdgeDirection::Both => (
+            "(e.source_id = t.current_id OR e.target_id = t.current_id)",
+            "CASE WHEN e.source_id = t.current_id THEN e.target_id ELSE e.source_id END",
+        ),
+    };
+    let (metadata_column, metadata_seed, metadata_value) = if carries_metadata {
+        (", metadata", ", NULL", ", e.metadata")
+    } else {
+        ("", "", "")
+    };
+    // Each segment owns its typed zero seed and visited path. UNION ALL keeps
+    // distinct routes which later converge on the same final edge countable.
+    Ok(format!(
+        "segment_{index}(start_id, current_id, start_substrate, current_substrate, \
+         depth, path, total_weight, id, relation, weight{metadata_column}) AS (\
+             SELECT s.id, s.id, s.substrate_kind, s.substrate_kind, 0, s.id, 0.0, \
+                    NULL, NULL, NULL{metadata_seed} \
+             FROM primary_nodes s WHERE {start_where} \
+             UNION ALL \
+             SELECT t.start_id, {next_id}, t.start_substrate, next_node.substrate_kind, \
+                    t.depth + 1, t.path || ',' || {next_id}, t.total_weight + e.weight, \
+                    e.id, e.relation, e.weight{metadata_value} \
+             FROM segment_{index} t CROSS JOIN {edges} \
+                 ON {edge_join} AND e.deleted_at IS NULL{edge_namespace}{relation} \
+             JOIN primary_nodes next_node ON next_node.id = ({next_id}) \
+                 AND next_node.deleted_at IS NULL{next_namespace} \
+             WHERE t.depth < ?{maximum} \
+               AND (t.depth = 0 OR (',' || t.path || ',') NOT LIKE '%,' || {next_id} || ',%')\
+         )",
+        start_where = start_conditions.join(" AND "),
+        edges = edge_source("e", mailbox),
+    ))
+}
+
+fn compile_mixed_length(
+    query: &GqlQuery,
+    opts: &CompileOptions,
+    mailbox: Option<&QueryMailboxScope>,
+) -> Result<CompiledQuery, QueryError> {
+    let mut params = Vec::new();
+    let mailbox = mailbox.map(|scope| MailboxLowering::bind(scope, &mut params));
+    let mailbox = mailbox.as_ref();
+    let nodes: Vec<_> = query.pattern.nodes().collect();
+    let edges: Vec<_> = query.pattern.edges().collect();
+    let mut ctes = vec![format!("primary_nodes AS ({})", primary_node_sql(mailbox))];
+    let mut joins = Vec::new();
+    let mut conditions = Vec::new();
+    let mut var_to_alias = std::collections::HashMap::new();
+    let mut variable_edges = std::collections::HashSet::new();
+    let mut depths = Vec::new();
+    let mut weights = Vec::new();
+
+    for (index, node) in nodes.iter().enumerate() {
+        let alias = format!("n{index}");
+        conditions.extend(mixed_node_conditions(node, &alias, opts, &mut params)?);
+        if let Some(variable) = &node.variable {
+            var_to_alias.insert(variable.clone(), (alias, VarKind::Node));
+        }
+    }
+    for (index, edge) in edges.iter().enumerate() {
+        let previous = format!("n{index}");
+        let next = format!("n{}", index + 1);
+        let alias = format!("e{index}");
+        if edge.min_hops != 1 || edge.max_hops != 1 {
+            let carries_metadata = edge.variable.as_deref().is_some_and(|variable| {
+                query.return_items.iter().any(|item| {
+                    matches!(item, ReturnItem::Property(var, field)
+                        if var == variable && field == "metadata")
+                        || matches!(item, ReturnItem::Path(var, PropertyRef::MetadataPath(_))
+                            if var == variable)
+                }) || query.where_clause.conditions().any(|condition| {
+                    condition.variable == variable
+                        && matches!(&condition.property, PropertyRef::MetadataPath(_))
+                }) || query.order_by.iter().any(|item| {
+                    item.variable == variable
+                        && matches!(&item.property, PropertyRef::MetadataPath(_))
+                })
+            });
+            ctes.push(mixed_segment_cte(
+                index,
+                nodes[index],
+                edge,
+                carries_metadata,
+                opts,
+                mailbox,
+                &mut params,
+            )?);
+            joins.push(format!(
+                "JOIN segment_{index} {alias} ON {alias}.start_id = {previous}.id \
+                 AND {alias}.start_substrate = {previous}.substrate_kind"
+            ));
+            joins.push(format!(
+                "JOIN primary_nodes {next} ON {next}.id = {alias}.current_id \
+                 AND {next}.substrate_kind = {alias}.current_substrate"
+            ));
+            if edge.min_hops > 0 {
+                params.push(QueryValue::Integer(i64::try_from(edge.min_hops).map_err(
+                    |_| QueryError::InvalidInput("min_depth exceeds i64::MAX".into()),
+                )?));
+                conditions.push(format!("{alias}.depth >= ?{}", params.len()));
+            }
+            depths.push(format!("{alias}.depth"));
+            weights.push(format!("{alias}.total_weight"));
+            if let Some(variable) = &edge.variable {
+                variable_edges.insert(variable.clone());
+            }
+        } else {
+            let (edge_join, next_id) = match edge.direction {
+                EdgeDirection::Out => (
+                    format!("{alias}.source_id = {previous}.id"),
+                    format!("{alias}.target_id"),
+                ),
+                EdgeDirection::In => (
+                    format!("{alias}.target_id = {previous}.id"),
+                    format!("{alias}.source_id"),
+                ),
+                EdgeDirection::Both => (
+                    format!("({alias}.source_id = {previous}.id OR {alias}.target_id = {previous}.id)"),
+                    format!("CASE WHEN {alias}.source_id = {previous}.id THEN {alias}.target_id ELSE {alias}.source_id END"),
+                ),
+            };
+            let namespace = namespace_filter(&alias, opts, &mut params);
+            joins.push(format!(
+                "JOIN {} ON {edge_join} AND {alias}.deleted_at IS NULL{namespace}",
+                edge_source(&alias, mailbox),
+            ));
+            joins.push(format!(
+                "JOIN primary_nodes {next} ON {next}.id = ({next_id})"
+            ));
+            if !edge.relations.is_empty() {
+                let placeholders = in_placeholders(edge.relations.iter().map(|relation| {
+                    params.push(QueryValue::Text(relation.clone()));
+                    params.len()
+                }));
+                conditions.push(format!("{alias}.relation IN ({placeholders})"));
+            }
+        }
+        if let Some(variable) = &edge.variable {
+            var_to_alias.insert(variable.clone(), (alias, VarKind::Edge));
+        }
+    }
+
+    for condition in query.where_clause.conditions() {
+        if variable_edges.contains(&condition.variable)
+            && !matches!(&condition.property, PropertyRef::MetadataPath(_))
+        {
+            return Err(QueryError::Compile(format!(
+                "variable-length edge '{}' in WHERE supports only metadata.<path> predicates",
+                condition.variable,
+            )));
+        }
+    }
+    let mut absence = AbsenceContext::new(opts, mailbox);
+    for (variable, (alias, kind)) in &var_to_alias {
+        if *kind == VarKind::Node {
+            absence.bind_node(variable, alias, format!("{alias}.substrate_kind"));
+        }
+    }
+    if let Some(predicate) = compile_where_expr(
+        &query.where_clause,
+        &var_to_alias,
+        &mut params,
+        &mut absence,
+    )? {
+        conditions.push(predicate);
+    }
+
+    let has_counts = has_binding_counts(query);
+    let result_mode = query.distinct || has_counts;
+    let mut output_aliases = ProjectionAliases::default();
+    let mut result_values = ResultValues::default();
+    let mut selections = Vec::new();
+    for item in &query.return_items {
+        let variable = item.variable();
+        let (alias, kind) = var_to_alias.get(variable).ok_or_else(|| {
+            QueryError::Compile(format!("unknown variable '{variable}' in RETURN clause"))
+        })?;
+        let is_variable_edge = variable_edges.contains(variable);
+        let projections: Vec<(String, PropertyRef, String)> = match item {
+            ReturnItem::Count(_) => {
+                let expression = if is_variable_edge {
+                    format!("COUNT({alias}.id)")
+                } else {
+                    "COUNT(1)".to_owned()
+                };
+                let output = output_aliases.register(
+                    format!("count_{variable}"),
+                    ProjectionIdentity::Count(variable.to_owned()),
+                )?;
+                selections.push(select_projection(&expression, &output, result_mode));
+                result_values.count(expression);
+                continue;
+            }
+            ReturnItem::Path(_, property) => {
+                let (root, path) = return_path_parts(property)?;
+                let expression = return_path_expression(
+                    property,
+                    kind,
+                    &format!("{alias}.{root}"),
+                    &mut params,
+                )?;
+                vec![(
+                    format!("{variable}_{root}_{}", path.join("_")),
+                    property.clone(),
+                    expression,
+                )]
+            }
+            ReturnItem::Property(_, property) => {
+                if is_variable_edge
+                    && !["id", "relation", "weight", "metadata"].contains(&property.as_str())
+                {
+                    return Err(QueryError::Compile(format!(
+                        "unknown variable-length edge property '{property}' in RETURN projection. Valid: id, relation, weight, metadata"
+                    )));
+                }
+                let column = property_to_column(property, kind)?;
+                vec![(
+                    format!("{variable}_{property}"),
+                    PropertyRef::Field(property.clone()),
+                    format!("{alias}.{column}"),
+                )]
+            }
+            ReturnItem::Variable(_) => {
+                let columns: &[(&str, &str)] = if *kind == VarKind::Node {
+                    &[
+                        ("id", "id"),
+                        ("namespace", "namespace"),
+                        ("kind", "kind"),
+                        ("entity_type", "entity_type"),
+                        ("name", "name"),
+                        ("properties", "properties"),
+                        ("created_at", "created_at"),
+                        ("updated_at", "updated_at"),
+                    ]
+                } else if is_variable_edge {
+                    &[("id", "id"), ("relation", "relation"), ("weight", "weight")]
+                } else {
+                    &[
+                        ("id", "id"),
+                        ("source_id", "source"),
+                        ("target_id", "target"),
+                        ("relation", "relation"),
+                        ("weight", "weight"),
+                    ]
+                };
+                columns
+                    .iter()
+                    .map(|(column, suffix)| {
+                        (
+                            format!("{variable}_{suffix}"),
+                            PropertyRef::Field((*column).to_owned()),
+                            format!("{alias}.{column}"),
+                        )
+                    })
+                    .collect()
+            }
+        };
+        for (output, property, expression) in projections {
+            let output = output_aliases.register(
+                output,
+                ProjectionIdentity::Property(variable.to_owned(), property.clone()),
+            )?;
+            selections.push(select_projection(&expression, &output, result_mode));
+            result_values.property(variable, property, expression);
+        }
+    }
+
+    let group_by = result_values.group_by(has_counts);
+    let mut order =
+        result_values
+            .order(&query.order_by, &mut params)
+            .map_err(|error| match error {
+                QueryError::Unsupported(_) if !result_mode => QueryError::Unsupported(
+                    "mixed variable-length ORDER BY must be derived from RETURN projections".into(),
+                ),
+                other => other,
+            })?;
+    if !result_mode {
+        let depth = format!("({})", depths.join(" + "));
+        let weight = format!("({})", weights.join(" + "));
+        let depth_alias = output_aliases.register(
+            "_depth".into(),
+            ProjectionIdentity::TraversalMetric("depth"),
+        )?;
+        let weight_alias = output_aliases.register(
+            "_total_weight".into(),
+            ProjectionIdentity::TraversalMetric("total_weight"),
+        )?;
+        selections.push(format!("{depth} AS {depth_alias}"));
+        selections.push(format!("{weight} AS {weight_alias}"));
+        // Requested values lead; metrics precede selected-value ties. Expression
+        // ordering avoids SQLite's case-insensitive output-alias resolution.
+        order.insert(query.order_by.len(), format!("{weight} DESC"));
+        order.insert(query.order_by.len(), depth);
+    }
+    params.push(QueryValue::Integer(i64::try_from(query.offset).map_err(
+        |_| QueryError::InvalidInput("SKIP exceeds i64::MAX".into()),
+    )?));
+    let offset = params.len();
+    let (limit, truncation_check) = effective_limit(query.limit, opts.max_limit);
+    params.push(QueryValue::Integer(i64::try_from(limit).map_err(|_| {
+        QueryError::InvalidInput("limit exceeds i64::MAX".into())
+    })?));
+    let limit = params.len();
+    let distinct = if query.distinct || !result_mode {
+        "DISTINCT "
+    } else {
+        ""
+    };
+    let sql = format!(
+        "WITH RECURSIVE {} SELECT {distinct}{} FROM primary_nodes n0 {} \
+         WHERE {}{group_by} ORDER BY {} LIMIT ?{limit} OFFSET ?{offset}",
+        ctes.join(", "),
+        selections.join(", "),
+        joins.join(" "),
+        conditions.join(" AND "),
+        order.join(", "),
+    );
+    Ok(CompiledQuery {
+        sql,
+        params,
+        return_vars: query.return_items.clone(),
+        warnings: Vec::new(),
+        truncation_check,
+    })
+}
+
 /// Compiles one variable-length edge to a recursive CTE.
 fn compile_variable_length(
     query: &GqlQuery,
     opts: &CompileOptions,
+    mailbox: Option<&QueryMailboxScope>,
 ) -> Result<CompiledQuery, QueryError> {
     let mut params: Vec<QueryValue> = Vec::new();
+    let mailbox = mailbox.map(|scope| MailboxLowering::bind(scope, &mut params));
+    let mailbox = mailbox.as_ref();
     let mut var_to_alias: std::collections::HashMap<String, (String, VarKind)> =
         std::collections::HashMap::new();
 
@@ -1097,8 +1894,32 @@ fn compile_variable_length(
         ));
     }
 
+    let carries_metadata = query.return_items.iter().any(|item| {
+        matches!(item, ReturnItem::Property(var, field)
+            if edge.variable.as_deref() == Some(var.as_str()) && field == "metadata")
+            || matches!(item, ReturnItem::Path(var, PropertyRef::MetadataPath(_))
+                if edge.variable.as_deref() == Some(var.as_str()))
+    }) || query.where_clause.conditions().any(|condition| {
+        edge.variable.as_deref() == Some(condition.variable.as_str())
+            && matches!(&condition.property, PropertyRef::MetadataPath(_))
+    }) || query.order_by.iter().any(|item| {
+        edge.variable.as_deref() == Some(item.variable.as_str())
+            && matches!(&item.property, PropertyRef::MetadataPath(_))
+    });
+    let metadata_column = if carries_metadata {
+        ", via_metadata"
+    } else {
+        ""
+    };
+    let metadata_value = if carries_metadata { ", e.metadata" } else { "" };
+
     let max_depth = edge.max_hops.min(MAX_DEPTH);
     let min_depth = edge.min_hops;
+    let has_counts = has_binding_counts(query);
+    let result_mode = query.distinct || has_counts;
+    // Raw path counts cannot tolerate UUID-only endpoint rejoin fanout. The
+    // typed seed also serves positive minima, filtered at the final projection.
+    let typed_traversal = min_depth == 0 || result_mode || contains_not_exists(&query.where_clause);
 
     let mut start_conditions: Vec<String> = vec!["s.deleted_at IS NULL".to_string()];
     let ns_filter = namespace_filter("s", opts, &mut params);
@@ -1132,15 +1953,11 @@ fn compile_variable_length(
             params.push(QueryValue::Text(edge.relations[0].clone()));
             relation_condition = format!(" AND e.relation = ?{}", params.len());
         } else {
-            let placeholders: Vec<String> = edge
-                .relations
-                .iter()
-                .map(|r| {
-                    params.push(QueryValue::Text(r.clone()));
-                    format!("?{}", params.len())
-                })
-                .collect();
-            relation_condition = format!(" AND e.relation IN ({})", placeholders.join(", "));
+            let placeholders = in_placeholders(edge.relations.iter().map(|r| {
+                params.push(QueryValue::Text(r.clone()));
+                params.len()
+            }));
+            relation_condition = format!(" AND e.relation IN ({})", placeholders);
         }
     }
 
@@ -1201,15 +2018,25 @@ fn compile_variable_length(
         )?);
     }
 
-    reject_or_spanning_endpoints(&query.where_clause, start, end)?;
+    reject_or_spanning_endpoints(&query.where_clause, start, end, edge)?;
 
+    let mut absence = AbsenceContext::new(opts, mailbox);
+    for (node, alias) in [(start, "s"), (end, "r")] {
+        if let Some(variable) = &node.variable {
+            absence.bind_node(variable, alias, format!("{alias}.substrate_kind"));
+        }
+    }
     if let Some(where_sql) = compile_variable_length_where(
         &query.where_clause,
-        start.variable.as_deref(),
-        end.variable.as_deref(),
+        (
+            start.variable.as_deref(),
+            end.variable.as_deref(),
+            edge.variable.as_deref(),
+        ),
         &mut params,
         &mut start_conditions,
         &mut end_conditions,
+        &mut absence,
     )? {
         // Keep the defensive fallback if a future expression has no endpoint binding.
         start_conditions.push(where_sql);
@@ -1222,17 +2049,6 @@ fn compile_variable_length(
         end_conditions.push(format!("t.depth >= ?{}", params.len()));
     }
 
-    let offset_i64 = i64::try_from(query.offset)
-        .map_err(|_| QueryError::InvalidInput("SKIP exceeds i64::MAX".into()))?;
-    params.push(QueryValue::Integer(offset_i64));
-    let offset_param = params.len();
-
-    let (limit, truncation_check) = effective_limit(query.limit, query.offset, opts.max_limit);
-    let limit_i64 = i64::try_from(limit)
-        .map_err(|_| QueryError::InvalidInput("limit exceeds i64::MAX".into()))?;
-    params.push(QueryValue::Integer(limit_i64));
-    let limit_param = params.len();
-
     if let Some(ref var) = start.variable {
         var_to_alias.insert(var.clone(), ("s".to_string(), VarKind::Node));
     }
@@ -1244,15 +2060,77 @@ fn compile_variable_length(
     }
 
     let mut select_parts: Vec<String> = Vec::new();
-    let mut has_start = false;
+    let mut projection_aliases: Vec<String> = Vec::new();
+    let mut projection_expressions: Vec<String> = Vec::new();
+    let has_path_projections = query
+        .return_items
+        .iter()
+        .any(|item| matches!(item, ReturnItem::Path(_, _)));
+    let mut output_aliases = ProjectionAliases::default();
+    let mut returned_paths: Vec<(String, PropertyRef, String)> = Vec::new();
+    let mut returned_columns: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    let mut returned_expressions: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    let mut result_values = ResultValues::default();
+    let mut has_start = absence_needs_final_start(
+        &query.where_clause,
+        start.variable.as_deref(),
+        end.variable.as_deref(),
+    );
 
     for item in &query.return_items {
         let var = item.variable();
         if let Some((_, kind)) = var_to_alias.get(var) {
             match item {
+                ReturnItem::Count(_) => {
+                    let expression = if *kind == VarKind::Edge {
+                        // Count occurrences, not distinct final-edge identities;
+                        // the zero-hop path has no final edge and contributes zero.
+                        "COUNT(t.via_edge)"
+                    } else {
+                        "COUNT(1)"
+                    }
+                    .to_owned();
+                    let output_alias = output_aliases.register(
+                        format!("count_{var}"),
+                        ProjectionIdentity::Count(var.to_owned()),
+                    )?;
+                    select_parts.push(select_projection(&expression, &output_alias, result_mode));
+                    result_values.count(expression);
+                }
+                ReturnItem::Path(_, property) => {
+                    let (root, path) = return_path_parts(property)?;
+                    let column = if *kind == VarKind::Node {
+                        let table = if start.variable.as_deref() == Some(var) {
+                            has_start = true;
+                            "s"
+                        } else {
+                            "r"
+                        };
+                        format!("{table}.{root}")
+                    } else {
+                        "t.via_metadata".to_owned()
+                    };
+                    let expression = return_path_expression(property, kind, &column, &mut params)?;
+                    let output_alias = output_aliases.register(
+                        format!("{var}_{root}_{}", path.join("_")),
+                        ProjectionIdentity::Property(var.to_owned(), property.clone()),
+                    )?;
+                    select_parts.push(select_projection(&expression, &output_alias, result_mode));
+                    result_values.property(var, property.clone(), expression.clone());
+                    returned_paths.push((var.to_owned(), property.clone(), expression.clone()));
+                    projection_expressions.push(expression);
+                    projection_aliases.push(output_alias);
+                }
                 ReturnItem::Property(_, prop) => {
                     let is_start = start.variable.as_deref() == Some(var);
-                    if matches!(kind, VarKind::EventNode | VarKind::ObservationTargetNode) {
+                    if matches!(
+                        kind,
+                        VarKind::EventNode
+                            | VarKind::ObservationTargetNode
+                            | VarKind::SyntheticEdge
+                    ) {
                         return Err(QueryError::Unsupported(
                             "synthetic observed_as_* edges cannot be used in variable-length \
                              patterns; use a fixed-length edge pattern instead"
@@ -1265,46 +2143,116 @@ fn compile_variable_length(
                             has_start = true;
                         }
                         let col = property_to_column(prop, kind)?;
-                        select_parts.push(format!("{tbl}.{col} AS {var}_{prop}"));
+                        let output_alias = output_aliases.register(
+                            format!("{var}_{prop}"),
+                            ProjectionIdentity::Property(
+                                var.to_owned(),
+                                PropertyRef::Field(prop.clone()),
+                            ),
+                        )?;
+                        let expression = format!("{tbl}.{col}");
+                        select_parts.push(select_projection(
+                            &expression,
+                            &output_alias,
+                            result_mode,
+                        ));
+                        result_values.property(
+                            var,
+                            PropertyRef::Field(prop.clone()),
+                            expression.clone(),
+                        );
+                        returned_expressions
+                            .insert((var.to_owned(), prop.to_owned()), expression.clone());
+                        projection_expressions.push(expression);
+                        returned_columns
+                            .insert((var.to_owned(), prop.to_owned()), output_alias.clone());
+                        projection_aliases.push(output_alias);
                     } else {
                         let col = match prop.as_str() {
                             "id" => "via_edge",
                             "relation" => "via_relation",
                             "weight" => "via_weight",
+                            "metadata" => "via_metadata",
                             _ => {
                                 return Err(QueryError::Compile(format!(
                                     "unknown edge property '{prop}' in RETURN projection. \
-                                     Valid: id, source_id, target_id, relation, weight"
+                                     Valid: id, relation, weight, metadata"
                                 )));
                             }
                         };
-                        select_parts.push(format!("t.{col} AS {var}_{prop}"));
+                        let output_alias = output_aliases.register(
+                            format!("{var}_{prop}"),
+                            ProjectionIdentity::Property(
+                                var.to_owned(),
+                                PropertyRef::Field(prop.clone()),
+                            ),
+                        )?;
+                        let expression = format!("t.{col}");
+                        select_parts.push(select_projection(
+                            &expression,
+                            &output_alias,
+                            result_mode,
+                        ));
+                        result_values.property(
+                            var,
+                            PropertyRef::Field(prop.clone()),
+                            expression.clone(),
+                        );
+                        returned_expressions
+                            .insert((var.to_owned(), prop.to_owned()), expression.clone());
+                        projection_expressions.push(expression);
+                        returned_columns
+                            .insert((var.to_owned(), prop.to_owned()), output_alias.clone());
+                        projection_aliases.push(output_alias);
                     }
                 }
                 ReturnItem::Variable(_) => match kind {
                     VarKind::Node => {
-                        if start.variable.as_deref() == Some(var) {
+                        let tbl = if start.variable.as_deref() == Some(var) {
                             has_start = true;
-                            select_parts.push(format!(
-                                "s.id AS {var}_id, s.namespace AS {var}_namespace, \
-                                 s.kind AS {var}_kind, s.entity_type AS {var}_entity_type, \
-                                 s.name AS {var}_name, \
-                                 s.properties AS {var}_properties, \
-                                 s.created_at AS {var}_created_at, \
-                                 s.updated_at AS {var}_updated_at"
-                            ));
+                            "s"
                         } else {
-                            select_parts.push(format!(
-                                "r.id AS {var}_id, r.namespace AS {var}_namespace, \
-                                 r.kind AS {var}_kind, r.entity_type AS {var}_entity_type, \
-                                 r.name AS {var}_name, \
-                                 r.properties AS {var}_properties, \
-                                 r.created_at AS {var}_created_at, \
-                                 r.updated_at AS {var}_updated_at"
+                            "r"
+                        };
+                        for column in [
+                            "id",
+                            "namespace",
+                            "kind",
+                            "entity_type",
+                            "name",
+                            "properties",
+                            "created_at",
+                            "updated_at",
+                        ] {
+                            let output_alias = output_aliases.register(
+                                format!("{var}_{column}"),
+                                ProjectionIdentity::Property(
+                                    var.to_owned(),
+                                    PropertyRef::Field(column.to_owned()),
+                                ),
+                            )?;
+                            let expression = format!("{tbl}.{column}");
+                            select_parts.push(select_projection(
+                                &expression,
+                                &output_alias,
+                                result_mode,
                             ));
+                            result_values.property(
+                                var,
+                                PropertyRef::Field(column.to_owned()),
+                                expression.clone(),
+                            );
+                            returned_expressions
+                                .insert((var.to_owned(), column.to_owned()), expression.clone());
+                            projection_expressions.push(expression);
+                            returned_columns
+                                .insert((var.to_owned(), column.to_owned()), output_alias.clone());
+                            projection_aliases.push(output_alias);
                         }
                     }
-                    VarKind::EventNode | VarKind::ObservationTargetNode => {
+                    VarKind::EventNode
+                    | VarKind::ObservationTargetNode
+                    | VarKind::SyntheticEdge => {
                         return Err(QueryError::Unsupported(
                             "synthetic observed_as_* edges cannot be used in variable-length \
                              patterns; use a fixed-length edge pattern instead"
@@ -1312,10 +2260,36 @@ fn compile_variable_length(
                         ));
                     }
                     VarKind::Edge => {
-                        select_parts.push(format!(
-                            "t.via_edge AS {var}_id, t.via_relation AS {var}_relation, \
-                             t.via_weight AS {var}_weight"
-                        ));
+                        for (column, suffix) in [
+                            ("via_edge", "id"),
+                            ("via_relation", "relation"),
+                            ("via_weight", "weight"),
+                        ] {
+                            let output_alias = output_aliases.register(
+                                format!("{var}_{suffix}"),
+                                ProjectionIdentity::Property(
+                                    var.to_owned(),
+                                    PropertyRef::Field(suffix.to_owned()),
+                                ),
+                            )?;
+                            let expression = format!("t.{column}");
+                            select_parts.push(select_projection(
+                                &expression,
+                                &output_alias,
+                                result_mode,
+                            ));
+                            result_values.property(
+                                var,
+                                PropertyRef::Field(suffix.to_owned()),
+                                expression.clone(),
+                            );
+                            returned_expressions
+                                .insert((var.to_owned(), suffix.to_owned()), expression.clone());
+                            projection_expressions.push(expression);
+                            returned_columns
+                                .insert((var.to_owned(), suffix.to_owned()), output_alias.clone());
+                            projection_aliases.push(output_alias);
+                        }
                     }
                 },
             }
@@ -1326,33 +2300,131 @@ fn compile_variable_length(
         }
     }
 
-    select_parts.push("t.depth AS _depth".to_string());
-    select_parts.push("t.total_weight AS _total_weight".to_string());
-
-    // This path uses SELECT DISTINCT, so ordering by hidden path identities can
-    // pick an arbitrary representative for collapsed rows. Ordering by every
-    // projected alias instead gives a total order over the rows that survive
-    // DISTINCT while retaining depth/weight as the leading traversal order.
-    let projection_order = select_parts
-        .iter()
-        .flat_map(|group| group.split(", "))
-        .filter_map(|projection| projection.rsplit_once(" AS ").map(|(_, alias)| alias))
-        .filter(|alias| !matches!(*alias, "_depth" | "_total_weight"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let projection_order_suffix = if projection_order.is_empty() {
-        String::new()
+    let group_by = result_values.group_by(has_counts);
+    let result_order = if result_mode {
+        result_values
+            .order(&query.order_by, &mut params)?
+            .join(", ")
     } else {
-        format!(", {projection_order}")
-    };
+        let depth_alias = output_aliases.register(
+            "_depth".into(),
+            ProjectionIdentity::TraversalMetric("depth"),
+        )?;
+        let total_weight_alias = output_aliases.register(
+            "_total_weight".into(),
+            ProjectionIdentity::TraversalMetric("total_weight"),
+        )?;
+        select_parts.push(format!("t.depth AS {depth_alias}"));
+        select_parts.push(format!("t.total_weight AS {total_weight_alias}"));
 
-    // `r` is required by end filters; `s` is needed only for a start projection.
-    let join_start = if has_start {
-        "JOIN primary_nodes s ON s.id = t.start_id"
+        // This path uses SELECT DISTINCT, so ordering by hidden path identities can
+        // pick an arbitrary representative for collapsed rows. Ordering by every
+        // projected alias instead gives a total order over the rows that survive
+        // DISTINCT while retaining depth/weight as the leading traversal order.
+        // Keep aliases as data: public AST names may contain SQL delimiters.
+        projection_aliases.retain(|alias| alias != &depth_alias && alias != &total_weight_alias);
+        // SQLite resolves output aliases without ASCII case sensitivity. New path
+        // queries may have distinct case-preserved labels, so order by their actual
+        // selected expressions. Keep legacy SQL unchanged when no path is returned.
+        let projection_order = if has_path_projections {
+            projection_expressions.join(", ")
+        } else {
+            projection_aliases.join(", ")
+        };
+        let (depth_order, total_weight_order) = if has_path_projections {
+            ("t.depth", "t.total_weight")
+        } else {
+            (depth_alias.as_str(), total_weight_alias.as_str())
+        };
+        let projection_order_suffix = if projection_order.is_empty() {
+            String::new()
+        } else {
+            format!(", {projection_order}")
+        };
+
+        let mut requested_order = Vec::new();
+        for item in &query.order_by {
+            if let Some((_, _, projected)) =
+                returned_paths.iter().find(|(variable, property, _)| {
+                    variable == &item.variable && property == &item.property
+                })
+            {
+                requested_order.push(format!(
+                    "{projected} COLLATE BINARY {}",
+                    order_direction(item.direction)
+                ));
+                continue;
+            }
+            let root = match &item.property {
+                PropertyRef::Field(field) => field.as_str(),
+                PropertyRef::JsonPath(_) => "properties",
+                PropertyRef::MetadataPath(_) => "metadata",
+            };
+            let returned_values = if has_path_projections {
+                &returned_expressions
+            } else {
+                &returned_columns
+            };
+            let projected = returned_values
+                .get(&(item.variable.clone(), root.to_owned()))
+                .ok_or_else(|| {
+                    QueryError::Unsupported(
+                        "variable-length ORDER BY must be derived from RETURN projections".into(),
+                    )
+                })?;
+            let expression = match &item.property {
+                PropertyRef::Field(_) => projected.clone(),
+                PropertyRef::JsonPath(path) | PropertyRef::MetadataPath(path) => {
+                    bound_json_path_expression(projected, path, &mut params)?
+                }
+            };
+            requested_order.push(format!(
+                "{expression} COLLATE BINARY {}",
+                order_direction(item.direction)
+            ));
+        }
+        let requested_order = if requested_order.is_empty() {
+            String::new()
+        } else {
+            format!("{}, ", requested_order.join(", "))
+        };
+
+        format!(
+            "{requested_order}{depth_order}, {total_weight_order} DESC{projection_order_suffix}"
+        )
+    };
+    let distinct = if query.distinct || !result_mode {
+        "DISTINCT "
     } else {
         ""
     };
-    let join_end = "JOIN primary_nodes r ON r.id = t.current_id";
+
+    let offset_i64 = i64::try_from(query.offset)
+        .map_err(|_| QueryError::InvalidInput("SKIP exceeds i64::MAX".into()))?;
+    params.push(QueryValue::Integer(offset_i64));
+    let offset_param = params.len();
+
+    let (limit, truncation_check) = effective_limit(query.limit, opts.max_limit);
+    let limit_i64 = i64::try_from(limit)
+        .map_err(|_| QueryError::InvalidInput("limit exceeds i64::MAX".into()))?;
+    params.push(QueryValue::Integer(limit_i64));
+    let limit_param = params.len();
+
+    // `r` is required by end filters; `s` is needed only for a start projection.
+    let join_start = if has_start {
+        if typed_traversal {
+            "JOIN primary_nodes s ON s.id = t.start_id AND s.substrate_kind = t.start_substrate"
+        } else {
+            "JOIN primary_nodes s ON s.id = t.start_id"
+        }
+    } else {
+        ""
+    };
+    let join_end = if typed_traversal {
+        "JOIN primary_nodes r ON r.id = t.current_id AND r.substrate_kind = t.current_substrate"
+    } else {
+        "JOIN primary_nodes r ON r.id = t.current_id"
+    };
 
     let next_node_ns_and = if next_node_ns_filter.is_empty() {
         String::new()
@@ -1360,52 +2432,94 @@ fn compile_variable_length(
         format!(" AND {}", next_node_ns_filter.trim_start_matches(" AND "))
     };
 
-    let sql = format!(
-        "WITH RECURSIVE primary_nodes AS ({primary_nodes}), \
-         traverse(start_id, current_id, depth, path, total_weight, via_edge, via_relation, via_weight) AS (\
-             SELECT s.id, {seed_next}, 1, s.id || ',' || {seed_next}, e.weight, \
-                    e.id, e.relation, e.weight \
-             FROM primary_nodes s \
-             JOIN graph_edges e ON {seed_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
-             JOIN primary_nodes next_node ON next_node.id = ({seed_next}) \
-                    AND next_node.deleted_at IS NULL{next_node_ns_and} \
-             WHERE {start_where} \
-             UNION ALL \
-             SELECT t.start_id, {recurse_next}, t.depth + 1, \
-                    t.path || ',' || {recurse_next}, \
-                    t.total_weight + e.weight, \
-                    e.id, e.relation, e.weight \
-             FROM traverse t CROSS JOIN graph_edges e \
-                 ON {recurse_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
-             JOIN primary_nodes next_node ON next_node.id = ({recurse_next}) \
-                    AND next_node.deleted_at IS NULL{next_node_ns_and} \
-             WHERE t.depth < ?{depth_param} \
-               AND (',' || t.path || ',') NOT LIKE '%,' || {recurse_next} || ',%' \
-         ) \
-         SELECT DISTINCT {select_cols} \
-         FROM traverse t \
-         {join_start} {join_end} \
-         WHERE {end_where} \
-         ORDER BY _depth, _total_weight DESC{projection_order_suffix} \
-         LIMIT ?{limit_param} OFFSET ?{offset_param}",
-        primary_nodes = PRIMARY_NODE_SQL,
-        seed_next = seed_next,
-        seed_join = seed_join,
-        e_ns_filter = e_ns_filter,
-        relation_condition = relation_condition,
-        start_where = start_conditions.join(" AND "),
-        recurse_next = recurse_next,
-        recurse_join = recurse_join,
-        next_node_ns_and = next_node_ns_and,
-        depth_param = depth_param,
-        select_cols = select_parts.join(", "),
-        join_start = join_start,
-        join_end = join_end,
-        end_where = end_conditions.join(" AND "),
-        projection_order_suffix = projection_order_suffix,
-        limit_param = limit_param,
-        offset_param = offset_param,
-    );
+    let sql = if typed_traversal {
+        // Seed from nodes, not incident edges: an isolated visible node is a
+        // depth-zero path. Carry substrate identity so equal UUIDs in different
+        // union members cannot become one another's zero-hop endpoint. The first
+        // expansion may take a self-loop, as the positive-depth seed does;
+        // subsequent expansions retain the visited-ID cycle guard.
+        let metadata_null = if carries_metadata { ", NULL" } else { "" };
+        format!(
+            "WITH RECURSIVE primary_nodes AS ({primary_nodes}), \
+             traverse(start_id, current_id, start_substrate, current_substrate, depth, path, total_weight, via_edge, via_relation, via_weight{metadata_column}) AS (\
+                 SELECT s.id, s.id, s.substrate_kind, s.substrate_kind, 0, s.id, 0.0, \
+                        NULL, NULL, NULL{metadata_null} \
+                 FROM primary_nodes s \
+                 WHERE {start_where} \
+                 UNION ALL \
+                 SELECT t.start_id, {recurse_next}, t.start_substrate, next_node.substrate_kind, \
+                        t.depth + 1, t.path || ',' || {recurse_next}, \
+                        t.total_weight + e.weight, \
+                        e.id, e.relation, e.weight{metadata_value} \
+                 FROM traverse t CROSS JOIN {edges} \
+                     ON {recurse_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
+                 JOIN primary_nodes next_node ON next_node.id = ({recurse_next}) \
+                        AND next_node.deleted_at IS NULL{next_node_ns_and} \
+                 WHERE t.depth < ?{depth_param} \
+                   AND (t.depth = 0 OR (',' || t.path || ',') NOT LIKE '%,' || {recurse_next} || ',%') \
+             ) \
+             SELECT {distinct}{select_cols} \
+             FROM traverse t \
+             {join_start} {join_end} \
+             WHERE {end_where}{group_by} \
+             ORDER BY {result_order} \
+             LIMIT ?{limit_param} OFFSET ?{offset_param}",
+            primary_nodes = primary_node_sql(mailbox),
+            edges = edge_source("e", mailbox),
+            start_where = start_conditions.join(" AND "),
+            select_cols = select_parts.join(", "),
+            end_where = end_conditions.join(" AND "),
+        )
+    } else {
+        // Retain the established positive-depth seed and parameter ordering.
+        format!(
+            "WITH RECURSIVE primary_nodes AS ({primary_nodes}), \
+             traverse(start_id, current_id, depth, path, total_weight, via_edge, via_relation, via_weight{metadata_column}) AS (\
+                 SELECT s.id, {seed_next}, 1, s.id || ',' || {seed_next}, e.weight, \
+                        e.id, e.relation, e.weight{metadata_value} \
+                 FROM primary_nodes s \
+                 JOIN {edges} ON {seed_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
+                 JOIN primary_nodes next_node ON next_node.id = ({seed_next}) \
+                        AND next_node.deleted_at IS NULL{next_node_ns_and} \
+                 WHERE {start_where} \
+                 UNION ALL \
+                 SELECT t.start_id, {recurse_next}, t.depth + 1, \
+                        t.path || ',' || {recurse_next}, \
+                        t.total_weight + e.weight, \
+                        e.id, e.relation, e.weight{metadata_value} \
+                 FROM traverse t CROSS JOIN {edges} \
+                     ON {recurse_join} AND e.deleted_at IS NULL{e_ns_filter}{relation_condition} \
+                 JOIN primary_nodes next_node ON next_node.id = ({recurse_next}) \
+                        AND next_node.deleted_at IS NULL{next_node_ns_and} \
+                 WHERE t.depth < ?{depth_param} \
+                   AND (',' || t.path || ',') NOT LIKE '%,' || {recurse_next} || ',%' \
+             ) \
+             SELECT {distinct}{select_cols} \
+             FROM traverse t \
+             {join_start} {join_end} \
+             WHERE {end_where}{group_by} \
+             ORDER BY {result_order} \
+             LIMIT ?{limit_param} OFFSET ?{offset_param}",
+            primary_nodes = primary_node_sql(mailbox),
+            edges = edge_source("e", mailbox),
+            seed_next = seed_next,
+            seed_join = seed_join,
+            e_ns_filter = e_ns_filter,
+            relation_condition = relation_condition,
+            start_where = start_conditions.join(" AND "),
+            recurse_next = recurse_next,
+            recurse_join = recurse_join,
+            next_node_ns_and = next_node_ns_and,
+            depth_param = depth_param,
+            select_cols = select_parts.join(", "),
+            join_start = join_start,
+            join_end = join_end,
+            end_where = end_conditions.join(" AND "),
+            result_order = result_order,
+            limit_param = limit_param,
+            offset_param = offset_param,
+        )
+    };
 
     Ok(CompiledQuery {
         sql,
@@ -1424,6 +2538,8 @@ enum VarKind {
     /// Synthetic observation target backed by an entity/note referent.
     ObservationTargetNode,
     Edge,
+    /// Observation edges have no canonical graph-edge metadata column.
+    SyntheticEdge,
 }
 
 const NODE_COLUMNS: &[&str] = &[
@@ -1468,7 +2584,15 @@ const EVENT_COLUMNS: &[&str] = &[
     "session_id",
     "created_at",
 ];
-const EDGE_COLUMNS: &[&str] = &["id", "source_id", "target_id", "relation", "weight"];
+const EDGE_COLUMNS: &[&str] = &[
+    "id",
+    "source_id",
+    "target_id",
+    "relation",
+    "weight",
+    "metadata",
+];
+const SYNTHETIC_EDGE_COLUMNS: &[&str] = &["id", "source_id", "target_id", "relation", "weight"];
 const NODE_WHERE_COLUMNS: &[&str] = &[
     "id",
     "name",
@@ -1512,7 +2636,174 @@ fn property_columns(kind: &VarKind) -> (&'static [&'static str], &'static str) {
         VarKind::ObservationTargetNode => (OBSERVATION_TARGET_COLUMNS, "observation target"),
         VarKind::EventNode => (EVENT_COLUMNS, "event"),
         VarKind::Edge => (EDGE_COLUMNS, "edge"),
+        VarKind::SyntheticEdge => (SYNTHETIC_EDGE_COLUMNS, "edge"),
     }
+}
+
+/// Semantic identity excludes parameter positions and generated output labels.
+#[derive(PartialEq, Eq)]
+enum ProjectionIdentity {
+    Property(String, PropertyRef),
+    Count(String),
+    TraversalMetric(&'static str),
+}
+
+fn has_binding_counts(query: &GqlQuery) -> bool {
+    query
+        .return_items
+        .iter()
+        .any(|item| matches!(item, ReturnItem::Count(_)))
+}
+
+fn select_projection(expression: &str, alias: &str, result_mode: bool) -> String {
+    if result_mode {
+        // Explicit collation governs DISTINCT as well as grouping and ordering;
+        // it does not cast numeric, null or JSON-extracted values to text.
+        format!("{expression} COLLATE BINARY AS {alias}")
+    } else {
+        format!("{expression} AS {alias}")
+    }
+}
+
+/// Actual selected expressions for distinct/grouped results. Public labels are
+/// never SQL lookup keys: SQLite resolves aliases without ASCII case sensitivity.
+#[derive(Default)]
+struct ResultValues {
+    expressions: Vec<String>,
+    properties: Vec<(String, PropertyRef, String)>,
+}
+
+impl ResultValues {
+    fn property(&mut self, variable: &str, property: PropertyRef, expression: String) {
+        self.expressions.push(expression.clone());
+        self.properties
+            .push((variable.to_owned(), property, expression));
+    }
+
+    fn count(&mut self, expression: String) {
+        self.expressions.push(expression);
+    }
+
+    fn group_by(&self, has_counts: bool) -> String {
+        if !has_counts || self.properties.is_empty() {
+            // A counts-only empty match set must still produce one zero row.
+            return String::new();
+        }
+        let keys = self
+            .properties
+            .iter()
+            .map(|(_, _, expression)| format!("{expression} COLLATE BINARY"))
+            .collect::<Vec<_>>();
+        format!(" GROUP BY {}", keys.join(", "))
+    }
+
+    fn order(
+        &self,
+        items: &[OrderItem],
+        params: &mut Vec<QueryValue>,
+    ) -> Result<Vec<String>, QueryError> {
+        let mut order = Vec::new();
+        for item in items {
+            let exact = self.properties.iter().find(|(variable, property, _)| {
+                variable == &item.variable && property == &item.property
+            });
+            let expression = if let Some((_, _, expression)) = exact {
+                expression.clone()
+            } else {
+                let (root, path) = match &item.property {
+                    PropertyRef::JsonPath(path) => ("properties", path),
+                    PropertyRef::MetadataPath(path) => ("metadata", path),
+                    PropertyRef::Field(_) => {
+                        return Err(QueryError::Unsupported(
+                            "distinct/grouped ORDER BY must be derived from RETURN projections"
+                                .into(),
+                        ));
+                    }
+                };
+                let container = self.properties.iter().find(|(variable, property, _)| {
+                    variable == &item.variable && property == &PropertyRef::Field(root.to_owned())
+                });
+                let (_, _, expression) = container.ok_or_else(|| {
+                    QueryError::Unsupported(
+                        "distinct/grouped ORDER BY must be derived from RETURN projections".into(),
+                    )
+                })?;
+                bound_json_path_expression(expression, path, params)?
+            };
+            order.push(format!(
+                "{expression} COLLATE BINARY {}",
+                order_direction(item.direction)
+            ));
+        }
+        // Only returned values define ties; identities and traversal metrics
+        // which were not requested cannot split groups or DISTINCT results.
+        order.extend(
+            self.expressions
+                .iter()
+                .map(|expression| format!("{expression} COLLATE BINARY")),
+        );
+        Ok(order)
+    }
+}
+
+#[derive(Default)]
+struct ProjectionAliases {
+    identities: std::collections::HashMap<String, ProjectionIdentity>,
+}
+
+impl ProjectionAliases {
+    fn register(
+        &mut self,
+        alias: String,
+        identity: ProjectionIdentity,
+    ) -> Result<String, QueryError> {
+        if let Some(previous) = self.identities.get(&alias) {
+            if previous != &identity {
+                return Err(QueryError::Compile(format!(
+                    "RETURN projection column name collision: '{alias}' denotes different expressions"
+                )));
+            }
+        } else {
+            self.identities.insert(alias.clone(), identity);
+        }
+        Ok(quote_identifier(&alias))
+    }
+}
+
+fn return_path_parts(property: &PropertyRef) -> Result<(&'static str, &[String]), QueryError> {
+    match property {
+        PropertyRef::JsonPath(path) => Ok(("properties", path)),
+        PropertyRef::MetadataPath(path) => Ok(("metadata", path)),
+        PropertyRef::Field(_) => Err(QueryError::Compile(
+            "RETURN paths require a properties or metadata path".into(),
+        )),
+    }
+}
+
+/// The caller supplies a compiler-owned column; the complete JSON path is bound.
+fn return_path_expression(
+    property: &PropertyRef,
+    kind: &VarKind,
+    column: &str,
+    params: &mut Vec<QueryValue>,
+) -> Result<String, QueryError> {
+    let (_, path) = return_path_parts(property)?;
+    match property {
+        PropertyRef::JsonPath(_)
+            if !matches!(kind, VarKind::Node | VarKind::ObservationTargetNode) =>
+        {
+            return Err(QueryError::Compile(
+                "RETURN properties paths require a node binding with JSON properties".into(),
+            ));
+        }
+        PropertyRef::MetadataPath(_) if *kind != VarKind::Edge => {
+            return Err(QueryError::Compile(
+                "metadata paths require a canonical edge binding".into(),
+            ));
+        }
+        _ => {}
+    }
+    bound_json_path_expression(column, path, params)
 }
 
 fn property_to_column<'a>(prop: &'a str, kind: &VarKind) -> Result<&'a str, QueryError> {
@@ -1528,12 +2819,26 @@ fn property_to_column<'a>(prop: &'a str, kind: &VarKind) -> Result<&'a str, Quer
     }
 }
 
+fn scalar_property_expression(
+    prop: &str,
+    kind: &VarKind,
+    alias: &str,
+) -> Result<String, QueryError> {
+    let column = property_to_column(prop, kind)?;
+    if *kind == VarKind::SyntheticEdge && column == "id" {
+        Ok("NULL".to_owned())
+    } else {
+        Ok(format!("{alias}.{column}"))
+    }
+}
+
 fn where_property_columns(kind: &VarKind) -> (&'static [&'static str], &'static str) {
     match kind {
         VarKind::Node => (NODE_WHERE_COLUMNS, "node"),
         VarKind::ObservationTargetNode => (OBSERVATION_TARGET_WHERE_COLUMNS, "observation target"),
         VarKind::EventNode => (EVENT_WHERE_COLUMNS, "event"),
         VarKind::Edge => (EDGE_WHERE_COLUMNS, "edge"),
+        VarKind::SyntheticEdge => (EDGE_WHERE_COLUMNS, "edge"),
     }
 }
 
@@ -1541,6 +2846,7 @@ fn where_property_expression(
     property: &PropertyRef,
     kind: &VarKind,
     alias: &str,
+    params: &mut Vec<QueryValue>,
 ) -> Result<String, QueryError> {
     let (valid, kind_name) = where_property_columns(kind);
     match property {
@@ -1566,1294 +2872,85 @@ fn where_property_expression(
                     valid.join(", ")
                 )));
             }
-            if path.is_empty() {
+            json_path_expression(&format!("{alias}.properties"), path)
+        }
+        PropertyRef::MetadataPath(path) => {
+            if *kind != VarKind::Edge {
                 return Err(QueryError::Compile(
-                    "JSON property path cannot be empty; use 'properties.<path>'".into(),
+                    "metadata paths require a canonical edge binding".into(),
                 ));
             }
-            if let Some(segment) = path.iter().find(|segment| {
-                segment.is_empty() || !segment.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
-            }) {
+            bound_json_path_expression(&format!("{alias}.metadata"), path, params)
+        }
+    }
+}
+
+fn validated_json_path(path: &[String]) -> Result<String, QueryError> {
+    if path.is_empty() {
+        return Err(QueryError::Compile(
+            "JSON property path cannot be empty; use a named path below the JSON container".into(),
+        ));
+    }
+    if let Some(segment) = path.iter().find(|segment| {
+        segment.is_empty() || !segment.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+    }) {
+        return Err(QueryError::Compile(format!(
+            "invalid JSON property path segment '{segment}'; path segments must be identifiers"
+        )));
+    }
+    Ok(format!("$.{}", path.join(".")))
+}
+
+fn json_path_expression(column: &str, path: &[String]) -> Result<String, QueryError> {
+    let path = validated_json_path(path)?;
+    Ok(format!("json_extract({column}, '{path}')"))
+}
+
+fn bound_json_path_expression(
+    column: &str,
+    path: &[String],
+    params: &mut Vec<QueryValue>,
+) -> Result<String, QueryError> {
+    params.push(QueryValue::Text(validated_json_path(path)?));
+    Ok(format!("json_extract({column}, ?{})", params.len()))
+}
+
+fn order_property_expression(
+    property: &PropertyRef,
+    kind: &VarKind,
+    alias: &str,
+    params: &mut Vec<QueryValue>,
+) -> Result<String, QueryError> {
+    match property {
+        PropertyRef::Field(field) => {
+            if matches!(field.as_str(), "namespace" | "properties" | "metadata") {
+                return Err(QueryError::Compile(
+                    "ORDER BY requires a scalar field or explicit JSON path, not namespace or a JSON container".into(),
+                ));
+            }
+            scalar_property_expression(field, kind, alias)
+        }
+        PropertyRef::JsonPath(path) => {
+            let (columns, kind_name) = property_columns(kind);
+            if !columns.contains(&"properties") {
                 return Err(QueryError::Compile(format!(
-                    "invalid JSON property path segment '{segment}'; \
-                     path segments must be identifiers"
+                    "{kind_name} variables do not expose JSON properties in ORDER BY"
                 )));
             }
-            Ok(format!(
-                "json_extract({alias}.properties, '$.{}')",
-                path.join(".")
-            ))
+            bound_json_path_expression(&format!("{alias}.properties"), path, params)
         }
+        PropertyRef::MetadataPath(_) => where_property_expression(property, kind, alias, params),
+    }
+}
+
+fn order_direction(direction: OrderDirection) -> &'static str {
+    match direction {
+        OrderDirection::Asc => "ASC",
+        OrderDirection::Desc => "DESC",
     }
 }
 
 // Inline tests exercise private compiler phases without widening the public API.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::parsers::gql;
-
-    fn opts() -> CompileOptions {
-        CompileOptions::default()
-    }
-
-    fn scoped(namespace: &str) -> CompileOptions {
-        CompileOptions {
-            scopes: vec![namespace.to_string()],
-            max_limit: 500,
-        }
-    }
-
-    #[test]
-    fn fixed_length_basic() {
-        let q =
-            gql::parse("MATCH (a:concept)-[e:introduced_by]->(b:paper) RETURN a, e, b LIMIT 10")
-                .unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(compiled.sql.contains("JOIN graph_edges"));
-        assert!(compiled.sql.contains("LIMIT"));
-        assert_eq!(
-            compiled.return_vars,
-            vec![
-                ReturnItem::Variable("a".into()),
-                ReturnItem::Variable("e".into()),
-                ReturnItem::Variable("b".into()),
-            ]
-        );
-        assert!(!compiled.sql.contains("WITH RECURSIVE"));
-    }
-
-    #[test]
-    fn namespace_scoping_injected() {
-        let q =
-            gql::parse("MATCH (a:concept)-[e:introduced_by]->(b:paper) RETURN a LIMIT 5").unwrap();
-        let compiled = compile(&q, &scoped("research")).unwrap();
-        assert!(compiled.sql.contains("namespace"));
-        let has_ns_param = compiled
-            .params
-            .iter()
-            .any(|p| matches!(p, QueryValue::Text(s) if s == "research"));
-        assert!(has_ns_param, "namespace must be a bound parameter");
-    }
-
-    #[test]
-    fn edge_property_whitelist_rejects_unknown() {
-        let q = gql::parse("MATCH (a)-[e:introduced_by]->(b) WHERE e.source_id = 'x' RETURN a")
-            .unwrap();
-        let result = compile(&q, &opts());
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("source_id") || err.contains("not queryable"),
-            "error: {err}"
-        );
-    }
-
-    #[test]
-    fn edge_property_relation_allowed() {
-        let q = gql::parse("MATCH (a)-[e]->(b) WHERE e.relation = 'extends' RETURN a").unwrap();
-        let result = compile(&q, &opts());
-        assert!(
-            result.is_ok(),
-            "relation should be allowed: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
-    fn edge_property_weight_allowed() {
-        let q = gql::parse("MATCH (a)-[e]->(b) WHERE e.weight > 0.5 RETURN a").unwrap();
-        let result = compile(&q, &opts());
-        assert!(
-            result.is_ok(),
-            "weight should be allowed: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
-    fn variable_length_uses_cte() {
-        let q =
-            gql::parse("MATCH (a {name: 'LoRA'})-[:extends*1..3]->(b) RETURN b LIMIT 20").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(compiled.sql.contains("WITH RECURSIVE"));
-        assert!(compiled.sql.contains("traverse"));
-    }
-
-    #[test]
-    fn depth_cap_at_ten_rejects_above_max() {
-        let q = gql::parse("MATCH (a)-[:extends*1..50]->(b) RETURN b").unwrap();
-        let err = compile(&q, &opts()).unwrap_err();
-        assert!(
-            matches!(err, QueryError::InvalidInput(_)),
-            "expected InvalidInput for depth > 10, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn depth_within_cap_compiles() {
-        let q = gql::parse("MATCH (a)-[:extends*1..10]->(b) RETURN b").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(compiled.sql.contains("WITH RECURSIVE"));
-        let depth_val = compiled.params.iter().find_map(|p| {
-            if let QueryValue::Integer(n) = p {
-                Some(*n)
-            } else {
-                None
-            }
-        });
-        assert_eq!(depth_val, Some(10), "depth param should be 10");
-    }
-
-    #[test]
-    fn limit_capped_by_max_limit() {
-        let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a LIMIT 1000").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        let limit_param = compiled.params.last().unwrap();
-        assert!(
-            matches!(limit_param, QueryValue::Integer(501)),
-            "expected Integer(501), got {limit_param:?}"
-        );
-    }
-
-    #[test]
-    fn limit_over_cap_requests_sentinel_row() {
-        let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a LIMIT 1000").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert_eq!(
-            compiled.truncation_check,
-            Some(TruncationCheck {
-                max_limit: 500,
-                requested_limit: Some(1000),
-            })
-        );
-        let limit_param = compiled.params.last().unwrap();
-        assert!(
-            matches!(limit_param, QueryValue::Integer(501)),
-            "expected sentinel LIMIT 501, got {limit_param:?}"
-        );
-    }
-
-    #[test]
-    fn limit_exactly_at_cap_no_sentinel() {
-        let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a LIMIT 500").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert_eq!(compiled.truncation_check, None);
-        let limit_param = compiled.params.last().unwrap();
-        assert!(matches!(limit_param, QueryValue::Integer(500)));
-    }
-
-    #[test]
-    fn limit_below_cap_no_sentinel() {
-        let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a LIMIT 100").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert_eq!(compiled.truncation_check, None);
-        let limit_param = compiled.params.last().unwrap();
-        assert!(matches!(limit_param, QueryValue::Integer(100)));
-    }
-
-    #[test]
-    fn no_explicit_limit_requests_sentinel_row() {
-        let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert_eq!(
-            compiled.truncation_check,
-            Some(TruncationCheck {
-                max_limit: 500,
-                requested_limit: None,
-            })
-        );
-        let limit_param = compiled.params.last().unwrap();
-        assert!(
-            matches!(limit_param, QueryValue::Integer(501)),
-            "expected sentinel LIMIT 501, got {limit_param:?}"
-        );
-    }
-
-    #[test]
-    fn fixed_length_skip_is_bound_after_a_total_identity_order() {
-        let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a SKIP 500").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled
-                .sql
-                .contains("ORDER BY n0.substrate_kind, n0.id, e0.id, n1.substrate_kind, n1.id"),
-            "fixed-length pages need a deterministic total identity order: {}",
-            compiled.sql
-        );
-        assert!(compiled.sql.contains("LIMIT ?") && compiled.sql.contains("OFFSET ?"));
-        assert!(
-            compiled
-                .params
-                .iter()
-                .any(|p| matches!(p, QueryValue::Integer(500))),
-            "SKIP must be a bound integer parameter: {:?}",
-            compiled.params
-        );
-    }
-
-    #[test]
-    fn variable_length_skip_totally_orders_distinct_projected_rows() {
-        let q = gql::parse("MATCH (a)-[:extends*1..3]->(b) RETURN b SKIP 25").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains(
-                "ORDER BY _depth, _total_weight DESC, b_id, b_namespace, b_kind, \
-                 b_entity_type, b_name"
-            ),
-            "recursive DISTINCT pages need a total projected-row order: {}",
-            compiled.sql
-        );
-        assert!(compiled.sql.contains("LIMIT ?") && compiled.sql.contains("OFFSET ?"));
-        assert!(
-            compiled
-                .params
-                .iter()
-                .any(|p| matches!(p, QueryValue::Integer(25))),
-            "SKIP must be a bound integer parameter: {:?}",
-            compiled.params
-        );
-    }
-
-    #[cfg(target_pointer_width = "64")]
-    #[test]
-    fn skip_over_sql_integer_range_is_rejected() {
-        let too_large = (i64::MAX as u64) + 1;
-        let q = gql::parse(&format!("MATCH (a:concept) RETURN a SKIP {too_large}")).unwrap();
-        let err = compile(&q, &opts()).unwrap_err();
-        assert!(
-            matches!(err, QueryError::InvalidInput(_)) && err.to_string().contains("SKIP"),
-            "unrepresentable SKIP must fail before SQL execution, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn variable_length_limit_over_cap_requests_sentinel_row() {
-        let q = gql::parse("MATCH (a)-[:extends*1..3]->(b) RETURN b LIMIT 5000").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert_eq!(
-            compiled.truncation_check,
-            Some(TruncationCheck {
-                max_limit: 500,
-                requested_limit: Some(5000),
-            })
-        );
-        let limit_param = compiled.params.last().unwrap();
-        assert!(
-            matches!(limit_param, QueryValue::Integer(501)),
-            "expected sentinel LIMIT 501, got {limit_param:?}"
-        );
-    }
-
-    #[test]
-    fn compile_rejects_unknown_relation() {
-        let q = gql::parse("MATCH (a)-[:not_a_relation]->(b) RETURN a").unwrap();
-        let err = compile(&q, &opts()).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("not_a_relation"), "msg: {msg}");
-    }
-
-    #[test]
-    fn compile_unknown_kind_passes_through() {
-        let q = gql::parse("MATCH (a:gizmo)-[:extends]->(b) RETURN a").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        let has_gizmo = compiled
-            .params
-            .iter()
-            .any(|p| matches!(p, QueryValue::Text(s) if s == "gizmo"));
-        assert!(
-            has_gizmo,
-            "pack-agnostic: unknown kind must pass through into SQL params"
-        );
-    }
-
-    #[test]
-    fn compile_kind_passes_through_unchanged() {
-        let q =
-            gql::parse("MATCH (a:paper)-[:introduced_by]->(b:concept) RETURN a LIMIT 1").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        let has_paper = compiled
-            .params
-            .iter()
-            .any(|p| matches!(p, QueryValue::Text(s) if s == "paper"));
-        assert!(
-            has_paper,
-            "kind 'paper' must pass through unchanged into SQL params"
-        );
-    }
-
-    #[test]
-    fn compile_rejects_namespace_in_where() {
-        let q =
-            gql::parse("MATCH (a:concept)-[:extends]->(b) WHERE a.namespace = 'other' RETURN a")
-                .unwrap();
-        let err = compile(&q, &opts()).unwrap_err();
-        assert!(err.to_string().contains("namespace"), "msg: {err}");
-    }
-
-    #[test]
-    fn compile_explicit_nested_json_property_in_where() {
-        let q = gql::parse(
-            "MATCH (a)-[:extends]->(b) \
-             WHERE a.properties.finding.severity = 'high' RETURN a",
-        )
-        .unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled
-                .sql
-                .contains("json_extract(n0.properties, '$.finding.severity') = ?"),
-            "sql: {}",
-            compiled.sql
-        );
-    }
-
-    #[test]
-    fn compile_rejects_unknown_unqualified_where_field() {
-        let q = gql::parse("MATCH (a)-[:extends]->(b) WHERE a.severity = 'high' RETURN a").unwrap();
-        let err = compile(&q, &opts()).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Compile(ref msg)
-                if msg.contains("unknown node field 'severity'")
-                    && msg.contains("properties.<path>")),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn compile_rejects_bare_properties_where_field() {
-        let q = gql::parse("MATCH (a)-[:extends]->(b) WHERE a.properties = '{}' RETURN a").unwrap();
-        let err = compile(&q, &opts()).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Compile(ref msg)
-                if msg.contains("reserved as the JSON path root")),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn where_json_path_rejects_empty_hand_built_path() {
-        let err =
-            where_property_expression(&PropertyRef::JsonPath(Vec::new()), &VarKind::Node, "n0")
-                .unwrap_err();
-        assert!(
-            matches!(err, QueryError::Compile(ref msg) if msg.contains("cannot be empty")),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn where_json_path_rejects_injection_shaped_hand_built_segment() {
-        let err = where_property_expression(
-            &PropertyRef::JsonPath(vec!["severity') OR 1=1 --".into()]),
-            &VarKind::Node,
-            "n0",
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, QueryError::Compile(ref msg)
-                if msg.contains("invalid JSON property path segment")),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn where_json_path_rejects_edge_and_event_bindings() {
-        for kind in [VarKind::Edge, VarKind::EventNode] {
-            let err = where_property_expression(
-                &PropertyRef::JsonPath(vec!["severity".into()]),
-                &kind,
-                "bound",
-            )
-            .unwrap_err();
-            assert!(
-                matches!(err, QueryError::Compile(ref msg)
-                    if msg.contains("do not expose JSON properties")),
-                "got {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn compile_rejects_unknown_relation_in_where() {
-        let q = gql::parse("MATCH (a)-[e:extends]->(b) WHERE e.relation = 'related_to' RETURN a")
-            .unwrap();
-        let err = compile(&q, &opts()).unwrap_err();
-        assert!(err.to_string().contains("related_to"), "msg: {err}");
-    }
-
-    #[test]
-    fn compile_kind_in_where_passes_through_unchanged() {
-        let q = gql::parse("MATCH (a)-[:extends]->(b) WHERE a.kind = 'paper' RETURN a").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        let has_paper = compiled
-            .params
-            .iter()
-            .any(|p| matches!(p, QueryValue::Text(s) if s == "paper"));
-        assert!(
-            has_paper,
-            "kind 'paper' must pass through unchanged into SQL params"
-        );
-    }
-
-    #[test]
-    fn variable_length_return_start_only_joins_end_entity() {
-        let q = gql::parse("MATCH (a:concept)-[:extends*1..3]->(b) RETURN a LIMIT 10").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains("JOIN primary_nodes r"),
-            "primary_nodes r must always be joined when r.* conditions are emitted; sql: {}",
-            compiled.sql
-        );
-    }
-
-    #[test]
-    fn variable_length_trailing_pattern_unsupported() {
-        let q = gql::parse("MATCH (a)-[:extends*1..3]->(b)-[:implements]->(c) RETURN b").unwrap();
-        let err = compile(&q, &opts()).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "expected Unsupported, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn variable_length_mixed_chain_unsupported() {
-        let q = gql::parse("MATCH (a)-[:extends]->(b)-[:implements*1..2]->(c) RETURN c").unwrap();
-        let err = compile(&q, &opts()).unwrap_err();
-        assert!(matches!(err, QueryError::Unsupported(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn sparql_star_rejected_as_unsupported() {
-        use crate::parsers::sparql;
-        let err = sparql::parse("SELECT ?a ?b WHERE { ?a :extends* ?b . }").unwrap_err();
-        assert!(matches!(err, QueryError::Unsupported(_)), "got {err:?}");
-    }
-
-    /// Preserves SPARQL subject-to-object edge direction (issue #231).
-    #[test]
-    fn sparql_subject_object_direction_compiles_outbound() {
-        use crate::parsers::sparql;
-
-        let q = sparql::parse("SELECT ?a ?b WHERE { ?a :extends ?b . }").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-
-        assert!(
-            compiled
-                .sql
-                .contains("JOIN graph_edges e0 ON e0.source_id = n0.id"),
-            "SPARQL subject must bind graph_edges.source_id; sql: {}",
-            compiled.sql
-        );
-        assert!(
-            compiled.sql.contains("ON n1.id = e0.target_id"),
-            "SPARQL object must bind graph_edges.target_id; sql: {}",
-            compiled.sql
-        );
-        assert!(
-            compiled.sql.contains("e0.relation = ?1"),
-            "SPARQL predicate must bind graph_edges.relation; sql: {}",
-            compiled.sql
-        );
-    }
-
-    #[test]
-    fn return_property_projection_compiles() {
-        let q =
-            gql::parse("MATCH (a:concept)-[e:extends]->(b:concept) RETURN a.name, b.name LIMIT 5")
-                .unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains(".name AS a_name"),
-            "sql: {}",
-            compiled.sql
-        );
-        assert!(
-            compiled.sql.contains(".name AS b_name"),
-            "sql: {}",
-            compiled.sql
-        );
-        assert!(
-            !compiled.sql.contains("a_kind"),
-            "should not emit full node columns"
-        );
-    }
-
-    #[test]
-    fn return_unknown_node_property_rejected() {
-        let q = gql::parse("MATCH (a:concept)-[:extends]->(b) RETURN a.domain LIMIT 5").unwrap();
-        let err = compile(&q, &opts()).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Compile(ref msg) if msg.contains("unknown node property 'domain'")),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn return_unknown_edge_property_rejected() {
-        let q = gql::parse("MATCH (a)-[e:extends]->(b) RETURN e.label LIMIT 5").unwrap();
-        let err = compile(&q, &opts()).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Compile(ref msg) if msg.contains("unknown edge property 'label'")),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn return_valid_edge_property_compiles() {
-        let q =
-            gql::parse("MATCH (a)-[e:extends]->(b) RETURN e.relation, e.weight LIMIT 5").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains(".relation AS e_relation"),
-            "sql: {}",
-            compiled.sql
-        );
-        assert!(
-            compiled.sql.contains(".weight AS e_weight"),
-            "sql: {}",
-            compiled.sql
-        );
-    }
-
-    #[test]
-    fn documented_single_path_parallel_edge_audit_compiles_exact_projection_aliases() {
-        const QUERY: &str = "MATCH (a)-[e]->(b) RETURN a.id, e.id, e.relation, b.id";
-
-        let query = gql::parse(QUERY).unwrap();
-        let compiled = compile(&query, &opts()).unwrap();
-        let select_list = compiled
-            .sql
-            .strip_prefix("SELECT ")
-            .and_then(|sql| sql.split_once(" FROM ").map(|(select, _)| select))
-            .unwrap_or_else(|| {
-                panic!(
-                    "compiled query must be a SELECT statement: {}",
-                    compiled.sql
-                )
-            });
-        let aliases: Vec<&str> = select_list
-            .split(", ")
-            .map(|projection| {
-                projection
-                    .rsplit_once(" AS ")
-                    .map(|(_, alias)| alias)
-                    .unwrap_or_else(|| panic!("projection must have an alias: {projection}"))
-            })
-            .collect();
-
-        assert_eq!(aliases, ["a_id", "e_id", "e_relation", "b_id"]);
-    }
-
-    #[test]
-    fn entity_type_compiles_as_direct_column_not_json_extract() {
-        let q = gql::parse("MATCH (n:document {entity_type: 'paper'})-[:extends]->(m) RETURN n")
-            .unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains(".entity_type = ?"),
-            "entity_type must compile to a direct column comparison; sql: {}",
-            compiled.sql
-        );
-        assert!(
-            !compiled.sql.contains("json_extract"),
-            "entity_type must NOT use json_extract; sql: {}",
-            compiled.sql
-        );
-        let has_paper_param = compiled
-            .params
-            .iter()
-            .any(|p| matches!(p, QueryValue::Text(s) if s == "paper"));
-        assert!(
-            has_paper_param,
-            "entity_type value 'paper' must appear as a bound parameter"
-        );
-    }
-
-    #[test]
-    fn where_or_compiles_to_sql_or() {
-        let q = gql::parse(
-            "MATCH (a:concept)-[e:extends]->(b) WHERE a.name = 'LoRA' OR a.name = 'QLoRA' RETURN a",
-        )
-        .unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains(" OR "),
-            "WHERE OR must produce SQL OR; sql: {}",
-            compiled.sql
-        );
-        let has_lora = compiled
-            .params
-            .iter()
-            .any(|p| matches!(p, QueryValue::Text(s) if s == "LoRA"));
-        let has_qlora = compiled
-            .params
-            .iter()
-            .any(|p| matches!(p, QueryValue::Text(s) if s == "QLoRA"));
-        assert!(has_lora && has_qlora, "both OR values must be bound params");
-    }
-
-    #[test]
-    fn where_and_or_precedence() {
-        let q = gql::parse(
-            "MATCH (a:concept)-[e:extends]->(b) WHERE a.name = 'X' AND a.kind = 'concept' OR b.kind = 'project' RETURN a"
-        ).unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains(" OR "),
-            "expected OR in sql; sql: {}",
-            compiled.sql
-        );
-    }
-
-    #[test]
-    fn synthetic_edge_joins_event_observations() {
-        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m:memory) RETURN ev, m").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains("event_observations"),
-            "synthetic edge must join event_observations; sql: {}",
-            compiled.sql
-        );
-        assert!(
-            !compiled.sql.contains("graph_edges"),
-            "synthetic edge must NOT join graph_edges; sql: {}",
-            compiled.sql
-        );
-        let has_role_param = compiled
-            .params
-            .iter()
-            .any(|p| matches!(p, QueryValue::Text(s) if s == "selected"));
-        assert!(has_role_param, "role 'selected' must be a bound parameter");
-    }
-
-    #[test]
-    fn synthetic_edge_event_source_binds_events_table() {
-        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m:memory) RETURN ev, m").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains("FROM events "),
-            "CRIT-1: event source must come FROM events table, not entities; sql: {}",
-            compiled.sql
-        );
-        assert!(
-            !compiled
-                .sql
-                .starts_with("SELECT * FROM entities n0 JOIN event_observations"),
-            "CRIT-1: must not join events via entities table; sql: {}",
-            compiled.sql
-        );
-    }
-
-    #[test]
-    fn synthetic_edge_event_observation_join_uses_events_id() {
-        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m) RETURN m").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled
-                .sql
-                .contains("JOIN event_observations e0 ON e0.event_id = n0.id"),
-            "CRIT-1: event_observations must join on events.id (n0 is now events); sql: {}",
-            compiled.sql
-        );
-    }
-
-    #[test]
-    fn synthetic_edge_event_node_projects_event_columns() {
-        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m) RETURN ev").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains("ev_verb"),
-            "CRIT-1: event variable must project verb column; sql: {}",
-            compiled.sql
-        );
-        assert!(
-            compiled.sql.contains("ev_outcome"),
-            "CRIT-1: event variable must project outcome column; sql: {}",
-            compiled.sql
-        );
-        assert!(
-            !compiled.sql.contains("ev_name,") && !compiled.sql.contains("ev_name "),
-            "CRIT-1: event variable must NOT project entity name column; sql: {}",
-            compiled.sql
-        );
-        assert!(
-            !compiled.sql.contains("ev_properties"),
-            "CRIT-1: event variable must NOT project entity properties column; sql: {}",
-            compiled.sql
-        );
-    }
-
-    #[test]
-    fn synthetic_edge_namespace_filter_on_events_table() {
-        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m) RETURN m").unwrap();
-        let compiled = compile(&q, &scoped("test-ns")).unwrap();
-        let ns_count = compiled
-            .params
-            .iter()
-            .filter(|p| matches!(p, QueryValue::Text(s) if s == "test-ns"))
-            .count();
-        assert!(
-            ns_count >= 2,
-            "MIN-2: namespace must be filtered on both events and target; params: {:?}",
-            compiled.params
-        );
-    }
-
-    #[test]
-    fn synthetic_edge_candidate_role() {
-        let q = gql::parse("MATCH (ev)-[:observed_as_candidate]->(m) RETURN ev, m").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains("event_observations"),
-            "sql: {}",
-            compiled.sql
-        );
-        let has_candidate = compiled
-            .params
-            .iter()
-            .any(|p| matches!(p, QueryValue::Text(s) if s == "candidate"));
-        assert!(has_candidate, "role 'candidate' must be bound");
-    }
-
-    #[test]
-    fn synthetic_edge_multi_role() {
-        let q =
-            gql::parse("MATCH (ev)-[:observed_as_candidate|observed_as_selected]->(m) RETURN m")
-                .unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains("event_observations"),
-            "sql: {}",
-            compiled.sql
-        );
-        assert!(
-            compiled.sql.contains("IN"),
-            "multi-role must use IN; sql: {}",
-            compiled.sql
-        );
-    }
-
-    #[test]
-    fn mixed_synthetic_and_canonical_rejected() {
-        let q = gql::parse("MATCH (ev)-[:observed_as_selected|extends]->(m) RETURN m").unwrap();
-        let err = compile(&q, &opts()).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Compile(_)),
-            "mixed synthetic+canonical must be rejected; got {err:?}"
-        );
-    }
-
-    #[test]
-    fn synthetic_edge_inbound_rejected() {
-        let q = gql::parse("MATCH (m)<-[:observed_as_selected]-(ev) RETURN m").unwrap();
-        let err = compile(&q, &opts()).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Compile(_)),
-            "inbound synthetic edge must be rejected; got {err:?}"
-        );
-    }
-
-    #[test]
-    fn variable_length_or_across_endpoints_rejected() {
-        let q = gql::parse(
-            "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'X' OR b.name = 'Y' RETURN a",
-        )
-        .unwrap();
-        let result = compile(&q, &opts());
-        assert!(
-            matches!(result, Err(QueryError::Unsupported(_))),
-            "MAJ-1: OR spanning both endpoints must return Unsupported; got {result:?}"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("separate queries") || err_msg.contains("one endpoint"),
-            "error must be actionable; got: {err_msg}"
-        );
-    }
-
-    #[test]
-    fn variable_length_or_single_endpoint_still_works() {
-        let q = gql::parse(
-            "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'X' OR a.name = 'Y' RETURN a",
-        )
-        .unwrap();
-        let result = compile(&q, &opts());
-        assert!(
-            result.is_ok(),
-            "single-endpoint OR must compile; got {result:?}"
-        );
-    }
-
-    #[test]
-    fn variable_length_and_across_endpoints_still_works() {
-        let q = gql::parse(
-            "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'X' AND b.name = 'Y' RETURN a",
-        )
-        .unwrap();
-        let result = compile(&q, &opts());
-        assert!(
-            result.is_ok(),
-            "AND across endpoints must compile; got {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_variable_length_or_compiles_to_or() {
-        let q = gql::parse(
-            "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'LoRA' OR a.name = 'QLoRA' RETURN b",
-        )
-        .unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains(" OR "),
-            "#379: variable-length single-endpoint OR must produce SQL OR; sql: {}",
-            compiled.sql
-        );
-        let has_lora = compiled
-            .params
-            .iter()
-            .any(|p| matches!(p, QueryValue::Text(s) if s == "LoRA"));
-        let has_qlora = compiled
-            .params
-            .iter()
-            .any(|p| matches!(p, QueryValue::Text(s) if s == "QLoRA"));
-        assert!(has_lora && has_qlora, "both OR values must be bound params");
-    }
-
-    #[test]
-    fn test_single_endpoint_or_at_depth_1() {
-        let q = gql::parse(
-            "MATCH (a)-[r:extends]->(b) WHERE r.weight > 0.5 OR r.relation = 'extends' RETURN a",
-        )
-        .unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains(" OR "),
-            "#379: fixed-length single-endpoint OR must produce SQL OR; sql: {}",
-            compiled.sql
-        );
-        let has_extends = compiled
-            .params
-            .iter()
-            .any(|p| matches!(p, QueryValue::Text(s) if s == "extends"));
-        assert!(
-            has_extends,
-            "relation value 'extends' must be a bound param"
-        );
-    }
-
-    #[test]
-    fn test_and_still_works() {
-        let q = gql::parse(
-            "MATCH (a)-[:extends*1..3]->(b) WHERE a.name = 'LoRA' AND a.kind = 'concept' RETURN b",
-        )
-        .unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            !compiled.sql.contains(" OR "),
-            "#379: AND must not produce OR; sql: {}",
-            compiled.sql
-        );
-        let has_lora = compiled
-            .params
-            .iter()
-            .any(|p| matches!(p, QueryValue::Text(s) if s == "LoRA"));
-        let has_concept = compiled
-            .params
-            .iter()
-            .any(|p| matches!(p, QueryValue::Text(s) if s == "concept"));
-        assert!(
-            has_lora && has_concept,
-            "both AND values must be bound params"
-        );
-    }
-
-    /// Rejects row caps that cannot be represented by SQL's integer parameter.
-    #[test]
-    fn max_limit_overflow_returns_error() {
-        let q = gql::parse("MATCH (a)-[:extends]->(b) RETURN a").unwrap();
-        let opts = CompileOptions {
-            scopes: vec![],
-            max_limit: usize::MAX,
-        };
-        let result = compile(&q, &opts);
-        match result {
-            Err(QueryError::InvalidInput(_)) => {}
-            Ok(compiled) => {
-                let limit_param = compiled.params.last().unwrap();
-                assert!(
-                    matches!(limit_param, QueryValue::Integer(n) if *n >= 0),
-                    "limit must never be negative; got {limit_param:?}"
-                );
-            }
-            Err(e) => panic!("unexpected error: {e:?}"),
-        }
-    }
-
-    /// A zero cap still permits one sentinel row for truncation detection.
-    #[test]
-    fn max_limit_zero_compiles() {
-        let q = gql::parse("MATCH (a)-[:extends]->(b) RETURN a").unwrap();
-        let opts = CompileOptions {
-            scopes: vec![],
-            max_limit: 0,
-        };
-        let compiled = compile(&q, &opts).unwrap();
-        assert_eq!(
-            compiled.truncation_check,
-            Some(TruncationCheck {
-                max_limit: 0,
-                requested_limit: None,
-            })
-        );
-        let limit_param = compiled.params.last().unwrap();
-        assert!(
-            matches!(limit_param, QueryValue::Integer(1)),
-            "max_limit=0 should produce sentinel LIMIT 1; got {limit_param:?}"
-        );
-    }
-
-    #[test]
-    fn variable_length_synthetic_edge_rejected() {
-        let q = gql::parse("MATCH (ev)-[:observed_as_selected*1..3]->(m) RETURN m").unwrap();
-        let err = compile(&q, &opts()).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "variable-length synthetic edge must return Unsupported; got {err:?}"
-        );
-        assert!(
-            err.to_string().contains("synthetic") || err.to_string().contains("observed_as"),
-            "error should mention synthetic edges: {err}"
-        );
-    }
-
-    /// Recursive traversal filters deleted intermediate nodes.
-    #[test]
-    fn variable_length_recursive_member_joins_next_node_for_deleted_filter() {
-        let q = gql::parse("MATCH (a)-[:extends*1..3]->(b) RETURN b").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains("JOIN primary_nodes next_node"),
-            "recursive CTE must join primary_nodes next_node for deleted-intermediate filtering; sql: {}",
-            compiled.sql
-        );
-        assert!(
-            compiled.sql.contains("next_node.deleted_at IS NULL"),
-            "recursive CTE must filter next_node.deleted_at IS NULL; sql: {}",
-            compiled.sql
-        );
-    }
-
-    /// Recursive traversal scopes intermediate nodes.
-    #[test]
-    fn variable_length_recursive_member_namespace_scopes_intermediates() {
-        let q = gql::parse("MATCH (a)-[:extends*1..3]->(b) RETURN b").unwrap();
-        let compiled = compile(&q, &scoped("test-ns")).unwrap();
-        assert!(
-            compiled.sql.contains("next_node.namespace"),
-            "recursive CTE next_node join must filter namespace; sql: {}",
-            compiled.sql
-        );
-    }
-
-    /// Malformed public ASTs return errors rather than panicking.
-    #[test]
-    fn compile_malformed_ast_returns_error_not_panic() {
-        use crate::ast::{EdgeDirection, EdgePattern, GqlQuery, MatchPattern, PatternElement};
-        let q = GqlQuery {
-            pattern: MatchPattern {
-                elements: vec![PatternElement::Edge(EdgePattern {
-                    variable: None,
-                    relations: vec!["extends".to_string()],
-                    direction: EdgeDirection::Out,
-                    min_hops: 1,
-                    max_hops: 1,
-                })],
-            },
-            where_clause: WhereExpr::True,
-            return_items: vec![],
-            offset: 0,
-            limit: None,
-        };
-        let result = compile(&q, &opts());
-        assert!(
-            result.is_err(),
-            "malformed AST (starts with Edge) must return error, not panic"
-        );
-    }
-
-    /// Rejects an edge pattern missing the closing dash.
-    #[test]
-    fn edge_pattern_without_suffix_dash_rejected() {
-        let result = gql::parse("MATCH (a)-[e:extends](b) RETURN a");
-        assert!(
-            result.is_err(),
-            "edge pattern without suffix '-' must be rejected as a parse error"
-        );
-    }
-
-    #[test]
-    fn assert_select_only_accepts_select_and_with() {
-        assert!(
-            assert_select_only("SELECT a FROM entities WHERE 1=1").is_ok(),
-            "SELECT must be accepted"
-        );
-        assert!(
-            assert_select_only("WITH RECURSIVE traverse AS (...) SELECT ...").is_ok(),
-            "WITH must be accepted (recursive CTE)"
-        );
-    }
-
-    #[test]
-    fn assert_select_only_rejects_write_sql_with_readonly_message() {
-        for stmt in &[
-            "INSERT INTO entities VALUES (?)",
-            "UPDATE entities SET name = ?",
-            "DELETE FROM entities WHERE id = ?",
-            "DROP TABLE entities",
-        ] {
-            let err = assert_select_only(stmt).unwrap_err();
-            assert!(
-                matches!(err, QueryError::Compile(_)),
-                "write SQL must return Compile error for '{stmt}'; got {err:?}"
-            );
-            let msg = err.to_string();
-            assert!(
-                msg.contains("read-only"),
-                "error must mention 'read-only' for '{stmt}'; got: {msg}"
-            );
-            assert!(
-                msg.contains("create") && msg.contains("delete"),
-                "error must name the mutation verbs for '{stmt}'; got: {msg}"
-            );
-        }
-    }
-
-    #[test]
-    fn readonly_guard_does_not_break_valid_gql_compile() {
-        let q = gql::parse("MATCH (a:concept)-[:extends]->(b) RETURN a LIMIT 10").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.starts_with("SELECT"),
-            "valid GQL must compile to SELECT; sql: {}",
-            compiled.sql
-        );
-    }
-
-    #[test]
-    fn readonly_guard_does_not_break_valid_cte_compile() {
-        let q = gql::parse("MATCH (a)-[:extends*1..3]->(b) RETURN b LIMIT 10").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.starts_with("WITH RECURSIVE"),
-            "variable-length GQL must compile to WITH RECURSIVE; sql: {}",
-            compiled.sql
-        );
-    }
-
-    #[test]
-    fn gql_write_form_rejected_before_compile() {
-        use crate::parsers::gql;
-        let err = gql::parse("CREATE (n:concept) RETURN n").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "GQL CREATE must be Unsupported; got {err:?}"
-        );
-        assert!(
-            err.to_string().contains("read-only"),
-            "error must mention read-only; got: {err}"
-        );
-    }
-
-    #[test]
-    fn sparql_write_form_rejected_before_compile() {
-        use crate::parsers::sparql;
-        let err = sparql::parse("INSERT DATA { ?a :extends ?b }").unwrap_err();
-        assert!(
-            matches!(err, QueryError::Unsupported(_)),
-            "SPARQL INSERT must be Unsupported; got {err:?}"
-        );
-        assert!(
-            err.to_string().contains("read-only"),
-            "error must mention read-only; got: {err}"
-        );
-    }
-
-    #[test]
-    fn duplicate_inline_property_rejected() {
-        let result = gql::parse("MATCH (n {name: 'A', name: 'B'}) RETURN n");
-        assert!(
-            result.is_err(),
-            "duplicate property 'name' in node props must be rejected"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("duplicate") || err.contains("name"),
-            "error should mention duplicate or key name: {err}"
-        );
-    }
-
-    #[test]
-    fn unknown_synthetic_relation_rejected_at_compile() {
-        let q = gql::parse("MATCH (a)-[:observed_as_bogus]->(b) RETURN a").unwrap();
-        let err = compile(&q, &opts()).unwrap_err();
-        assert!(
-            matches!(err, QueryError::Validation(_)),
-            "unknown synthetic relation must return Validation error; got {err:?}"
-        );
-    }
-
-    /// Canonical `annotates` can bind every legal target substrate (issue #467).
-    #[test]
-    fn canonical_edge_annotates_compiles_note_source_and_any_target_substrate() {
-        let q = gql::parse("MATCH (n)-[:annotates]->(x) RETURN n.id, x.id LIMIT 10").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            !compiled.sql.contains("FROM entities n0"),
-            "endpoint must not be hard-bound to entities only; sql: {}",
-            compiled.sql
-        );
-        for table in ["FROM notes", "FROM events", "FROM graph_edges"] {
-            assert!(
-                compiled.sql.contains(table),
-                "endpoint source must admit {table} rows for annotates; sql: {}",
-                compiled.sql
-            );
-        }
-    }
-
-    /// Canonical `supports` can bind note-to-note endpoints.
-    #[test]
-    fn canonical_edge_supports_compiles_note_note_endpoints() {
-        let q = gql::parse("MATCH (a)-[:supports]->(b) RETURN a.id, b.id LIMIT 10").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert_eq!(
-            compiled.sql.matches("FROM notes").count(),
-            2,
-            "both supports endpoints must admit note rows; sql: {}",
-            compiled.sql
-        );
-    }
-
-    /// Pack-declared relations can bind task-note endpoints.
-    #[test]
-    fn canonical_edge_depends_on_compiles_pack_task_note_endpoints() {
-        let q = gql::parse("MATCH (a:task)-[:depends_on]->(b:task) RETURN a.id, b.id LIMIT 10")
-            .unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert_eq!(
-            compiled.sql.matches("FROM notes").count(),
-            2,
-            "task-kind depends_on endpoints must admit note rows; sql: {}",
-            compiled.sql
-        );
-        let task_params = compiled
-            .params
-            .iter()
-            .filter(|p| matches!(p, QueryValue::Text(s) if s == "task"))
-            .count();
-        assert_eq!(
-            task_params, 2,
-            "kind='task' must be bound for both endpoints"
-        );
-    }
-
-    /// Recursive canonical traversal uses the primary-substrate union throughout.
-    #[test]
-    fn variable_length_canonical_compiles_primary_substrate_nodes() {
-        let q = gql::parse("MATCH (a)-[:supports*1..2]->(b) RETURN b.id LIMIT 10").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            !compiled.sql.contains("FROM entities s"),
-            "seed must not be hard-bound to entities only; sql: {}",
-            compiled.sql
-        );
-        assert!(
-            compiled.sql.contains("JOIN primary_nodes next_node"),
-            "intermediate must join primary_nodes; sql: {}",
-            compiled.sql
-        );
-        assert!(
-            compiled.sql.contains("JOIN primary_nodes r"),
-            "final endpoint must join primary_nodes; sql: {}",
-            compiled.sql
-        );
-    }
-
-    /// `observed_as_target` admits entity and note referents (issue #468).
-    #[test]
-    fn synthetic_edge_observed_as_target_compiles_entity_referents() {
-        let q = gql::parse("MATCH (ev)-[:observed_as_target]->(t) RETURN t.id LIMIT 10").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            !compiled
-                .sql
-                .contains("JOIN notes n1 ON n1.id = e0.entity_id AND e0.referent_kind = 'note'"),
-            "target join must not be hard-bound to notes; sql: {}",
-            compiled.sql
-        );
-        assert!(
-            compiled.sql.contains("FROM entities"),
-            "observation target source must admit entity referents; sql: {}",
-            compiled.sql
-        );
-        assert!(
-            compiled.sql.contains("n1.referent_kind = e0.referent_kind"),
-            "target join must discriminate by referent_kind instead of hard-coding 'note'; sql: {}",
-            compiled.sql
-        );
-    }
-
-    /// `observed_as_signal` admits entity and note referents.
-    #[test]
-    fn synthetic_edge_observed_as_signal_compiles_entity_and_note_referents() {
-        let q = gql::parse("MATCH (ev)-[:observed_as_signal]->(t) RETURN t.id LIMIT 10").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled
-                .sql
-                .contains("e0.role = 'signal' AND e0.referent_kind IN ('entity', 'note')"),
-            "signal role must be admitted against entity or note referents; sql: {}",
-            compiled.sql
-        );
-    }
-
-    /// Search observations may select entities; recall and rerank still emit note referents.
-    #[test]
-    fn synthetic_edge_candidate_and_selected_admit_entity_and_note_referents() {
-        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m:entity) RETURN m.id LIMIT 10")
-            .unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains(
-                "e0.role IN ('candidate', 'selected') AND e0.referent_kind IN ('entity', 'note')"
-            ),
-            "selected/candidate roles must follow the stored entity/note referent kind; sql: {}",
-            compiled.sql
-        );
-    }
-
-    #[test]
-    fn where_is_null_compiles_to_is_null_sql() {
-        let q = gql::parse("MATCH (n:entity) WHERE n.name IS NULL RETURN n").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains("IS NULL") && !compiled.sql.contains("IS NOT NULL"),
-            "expected IS NULL (not IS NOT NULL) in sql: {}",
-            compiled.sql
-        );
-    }
-
-    #[test]
-    fn where_is_not_null_compiles_to_is_not_null_sql() {
-        let q = gql::parse("MATCH (n:entity) WHERE n.name IS NOT NULL RETURN n").unwrap();
-        let compiled = compile(&q, &opts()).unwrap();
-        assert!(
-            compiled.sql.contains("IS NOT NULL"),
-            "expected IS NOT NULL in sql: {}",
-            compiled.sql
-        );
-    }
-}
+#[path = "sql_tests.rs"]
+mod tests;

@@ -1,0 +1,42 @@
+charter pr_gate_job_launch v1
+title "Run a bounded gate for a pull request"
+subject pull_request
+
+roles:
+    gate_operator "prepares the gate and reads its result"
+
+triggers:
+    pull_request.opened
+    pull_request.head_moved
+    checks.concluded
+    message.arrived
+    schedule.fired
+    prompt.received
+
+workflow:
+    phase intake by gate_operator:
+        await pull_request.opened or pull_request.head_moved or checks.concluded or message.arrived or schedule.fired or prompt.received
+        require pull_request.open hard
+        require pull_request.base(branch="main") hard
+        require tree.clean hard
+        goto build
+
+    phase build by gate_operator:
+        action tests.run_targeted by gate_operator
+        action tests.run_mutations by gate_operator
+        goto gate
+
+    phase gate by gate_operator:
+        await checks.concluded
+        require gate.result(name=integration_gate) hard
+        when gate.result(name=integration_gate) is pass: goto ready
+        when gate.result(name=integration_gate) is fail: goto build
+        max_rounds 3 then hold
+
+    phase ready by gate_operator:
+        require checks.required_green(event=pull_request) hard
+        require loop.log_written advisory
+        complete
+
+    phase hold by gate_operator:
+        terminate "the gate did not pass within the bounded retry limit"

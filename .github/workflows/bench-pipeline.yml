@@ -34,6 +34,34 @@ on:
       - "scripts/perf/bench_load_harness.py"
       - "scripts/perf/test_bench_load_harness.py"
       - ".github/workflows/bench-pipeline.yml"
+  push:
+    branches: ["main", "integration/**"]
+    paths:
+      - "crates/khive-pack-memory/**"
+      - "crates/khive-pack-kg/**"
+      - "crates/khive-runtime/**"
+      - "crates/khive-db/**"
+      - "crates/khive-retrieval/**"
+      - "crates/khive-fusion/**"
+      - "crates/khive-bm25/**"
+      - "crates/khive-vamana/**"
+      - "crates/khive-hnsw/**"
+      - "crates/khive-score/**"
+      - "crates/khive-mcp/**"
+      - "crates/kkernel/**"
+      - "scripts/perf/bench_pipeline_daemon.py"
+      - "scripts/perf/test_bench_pipeline_daemon.py"
+      - "scripts/perf/mcp_bench_client.py"
+      - "scripts/perf/test_mcp_bench_client.py"
+      - "scripts/perf/bench_load_harness.py"
+      - "scripts/perf/test_bench_load_harness.py"
+      - ".github/workflows/bench-pipeline.yml"
+
+# A new push to a pull request cancels that pull request's run in progress. Other events keep
+# one group per run, so pushes and manual runs are never cancelled.
+concurrency:
+  group: bench-pipeline-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -44,8 +72,12 @@ env:
 jobs:
   pipeline-gate:
     name: Pipeline Regression Gate
+    # Pull requests from this repository's codex/ branches skip this job; the integration/** push
+    # run that merges them runs it on the merged tree.
+    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'codex/') && github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # A build without a restored cache takes 11-16 minutes; this limit leaves margin for one.
+    timeout-minutes: 25
     defaults:
       run:
         working-directory: crates
@@ -60,10 +92,13 @@ jobs:
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
 
+      # Only main saves: a cache saved by a pull request or an integration branch can be restored by
+      # no other ref, while every pull request can restore the one main saves.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Lock the embedder clustering invariant the vector-leg gate depends on:
       # if same-cluster vectors stop being more similar than cross-cluster ones,

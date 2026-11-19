@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 struct CheckpointClaim {
     ann: Weak<AnnState>,
     key: AnnKey,
+    owner_dropped: CancellationToken,
 }
 
 impl CheckpointClaim {
@@ -19,6 +20,7 @@ impl CheckpointClaim {
         timers.insert(key.clone()).then(|| Self {
             ann: Arc::downgrade(ann),
             key: key.clone(),
+            owner_dropped: ann.owner_dropped.clone(),
         })
     }
 }
@@ -67,84 +69,159 @@ pub(super) async fn schedule_checkpoint(rt: &KhiveRuntime, ann: &SharedAnn, key:
     let Some(claim) = CheckpointClaim::take(ann, key) else {
         return;
     };
-    spawn_checkpoint(
-        rt.clone(),
+    drop(spawn_checkpoint(
+        rt,
         CheckpointTimer {
             claim,
             delay,
             checkpoint,
         },
-    );
+    ));
 }
 
 // Keep spawning synchronous so a deadline handoff has an independent Send future.
-fn spawn_checkpoint(rt: KhiveRuntime, timer: CheckpointTimer) {
+fn spawn_checkpoint(rt: &KhiveRuntime, timer: CheckpointTimer) -> tokio::task::JoinHandle<()> {
     let shutdown = khive_runtime::daemon_shutdown_token();
     let key = timer.claim.key.clone();
-    // Runtime hooks can own ANN state, so a weak claim alone does not bound its
-    // lifetime. Retention is one finite delay plus one cancellable attempt.
-    khive_runtime::track_named_background_task("memory_ann_checkpoint", async move {
-        if let Some(ann) = run_timer(&rt, timer, shutdown).await {
-            // run_timer has released the old claim. Another writer may win this
-            // claim, in which case its deadline already covers the new period.
+    // Pack callbacks can own ANN state; retaining them would keep the weak
+    // claim alive after the last external runtime and pack were dropped.
+    let rt = rt.background_view();
+    let tracking = TrackedJob::register("memory_ann_checkpoint");
+    tokio::spawn(async move {
+        if let Some(ann) = run_timer_tracked(&rt, timer, shutdown, &tracking).await {
+            // The old claim is gone before a moved deadline is re-enqueued.
             schedule_checkpoint(&rt, &ann, &key).await;
         }
-    });
+    })
 }
 
-/// Return a new dirty period only when a publication advanced its deadline.
-/// Errors and an unchanged deadline never enqueue an automatic retry.
-async fn run_timer(
+/// A weak claim sleeps without admission. Queue Maintenance before upgrading
+/// the owner; keep the original registration/claim through the supervised attempt.
+///
+/// Only a newer checkpoint that moves a still-dirty deadline into the future
+/// returns the owner for rescheduling. An unchanged deadline or a failed attempt
+/// never schedules an automatic retry.
+async fn run_timer_tracked(
     rt: &KhiveRuntime,
     timer: CheckpointTimer,
     shutdown: CancellationToken,
+    tracking: &TrackedJob,
 ) -> Option<SharedAnn> {
     let CheckpointTimer {
         claim,
         delay,
         checkpoint,
     } = timer;
-    let result = tokio::select! {
+    let domain = rt.background_domain();
+    tokio::select! {
         biased;
-        _ = shutdown.cancelled() => None,
-        result = async {
-            tokio::time::sleep(delay).await;
-            let ann = claim.ann.upgrade()?;
-            let policy = checkpoint_policy(&ann);
-            let deadline = ann.indexes.read().await.get(&claim.key).and_then(|bridge| {
+        _ = shutdown.cancelled() => return None,
+        _ = domain.closed() => return None,
+        _ = claim.owner_dropped.cancelled() => return None,
+        _ = tokio::time::sleep(delay) => {}
+    }
+    let admitted = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return None,
+        _ = domain.closed() => return None,
+        _ = claim.owner_dropped.cancelled() => return None,
+        result = domain.admit(WorkClass::Maintenance, tracking) => match result {
+            Ok(job) => job,
+            Err(error) => {
+                tracing::debug!(%error, model = %claim.key.model, "memory ANN checkpoint admission refused");
+                return None;
+            }
+        },
+    };
+    let rt = rt.background_view();
+    let submitted = domain.spawn_supervised(admitted, move |job| async move {
+        // This synchronous owner upgrade occurs only after admission. No queued
+        // future owns AnnState or an ANN lock. Cancellation skips the body.
+        if job.is_cancelled() { return JobOutcome::Cancelled; }
+        let Some(ann) = claim.ann.upgrade() else { return JobOutcome::Completed(None); };
+        let policy = checkpoint_policy(&ann);
+        let deadline = match job.run_body(async {
+            ann.indexes.read().await.get(&claim.key).and_then(|bridge| {
                 checkpoint_delay(policy.interval, bridge.dirty_ops, bridge.last_checkpoint.elapsed())
                     .map(|remaining| (remaining, bridge.last_checkpoint))
-            });
-            let (remaining, current_checkpoint) = deadline?;
-            if current_checkpoint > checkpoint && !remaining.is_zero() {
-                return Some(ann);
+            })
+        }).await {
+            BodyOutcome::Finished(deadline) => deadline,
+            BodyOutcome::Cancelled => return JobOutcome::Cancelled,
+        };
+        let Some((remaining, current_checkpoint)) = deadline else { return JobOutcome::Completed(None); };
+        if current_checkpoint > checkpoint && !remaining.is_zero() {
+            drop(claim);
+            return JobOutcome::Completed(Some(ann));
+        }
+        let token = match rt.authorize(Namespace::local()) {
+            Ok(token) => token,
+            Err(error) => {
+                tracing::warn!(%error, model = %claim.key.model, "memory ANN checkpoint authorization failed");
+                return JobOutcome::Completed(None);
             }
-            let token = match rt.authorize(Namespace::local()) {
-                Ok(token) => token,
-                Err(error) => {
-                    tracing::warn!(%error, model = %claim.key.model, "memory ANN checkpoint authorization failed");
-                    return None;
-                }
-            };
-            // Keep the claim through ensure so its completion cannot recursively
-            // schedule the same deadline, including after a failed publication.
-            match ensure_ann_for_model(rt, &token, &ann, &claim.key.model).await {
-                Ok(status) => tracing::debug!(?status, model = %claim.key.model, "memory ANN checkpoint deadline complete"),
-                Err(error) if is_benign_shutdown_cancellation(&error) => {
-                    tracing::debug!(%error, model = %claim.key.model, "memory ANN checkpoint cancelled at shutdown");
-                }
-                Err(error) => tracing::warn!(%error, model = %claim.key.model, "memory ANN checkpoint deadline failed"),
-            }
-            None
-        } => result,
+        };
+        // Nested phase attribution stays `warm`; scheduling remains Maintenance.
+        // ensure never acquires another Warm permit. The claim prevents recursive
+        // scheduling, including failed publications and terminal finalization.
+        let outcome = ensure_ann_for_model_admitted(&rt, &token, &ann, &claim.key.model, &job).await;
+        finish_checkpoint_attempt(claim, outcome)
+
+    });
+    let Ok(background) = submitted else {
+        return None;
+    };
+    // Dropping this join proxy requests cancellation, but does not drop the
+    // supervisor's phase finalizer or a started CPU child's same-lease hold.
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => None,
+        result = background.join() => match result {
+            Ok(JobOutcome::Completed(next)) => next,
+            _ => None,
+        },
+    }
+}
+
+fn finish_checkpoint_attempt(
+    claim: CheckpointClaim,
+    outcome: JobOutcome<Result<AnnEnsureStatus, RuntimeError>>,
+) -> JobOutcome<Option<SharedAnn>> {
+    let disposition = match outcome {
+        JobOutcome::Completed(Ok(status)) => {
+            tracing::debug!(?status, model = %claim.key.model, "memory ANN checkpoint deadline complete");
+            JobOutcome::Completed(None)
+        }
+        JobOutcome::Completed(Err(error)) if is_benign_shutdown_cancellation(&error) => {
+            tracing::debug!(%error, model = %claim.key.model, "memory ANN checkpoint cancelled at shutdown");
+            JobOutcome::Completed(None)
+        }
+        JobOutcome::Completed(Err(error)) => {
+            tracing::warn!(%error, model = %claim.key.model, "memory ANN checkpoint deadline failed");
+            JobOutcome::Completed(None)
+        }
+        JobOutcome::Cancelled => JobOutcome::Cancelled,
+        JobOutcome::Refused(error) => JobOutcome::Refused(error),
+        JobOutcome::FinalizationTimedOut => JobOutcome::FinalizationTimedOut,
     };
     drop(claim);
-    result
+    disposition
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Preserve the existing deterministic timer test entry without double-registering
+    // production timers. The production caller lends its synchronous registration.
+    async fn run_timer(
+        rt: &KhiveRuntime,
+        timer: CheckpointTimer,
+        shutdown: CancellationToken,
+    ) -> Option<SharedAnn> {
+        let tracking = TrackedJob::register("memory_ann_checkpoint");
+        run_timer_tracked(rt, timer, shutdown, &tracking).await
+    }
 
     #[test]
     fn deadline_uses_remaining_interval_and_skips_clean_or_disabled_bridges() {
@@ -191,6 +268,116 @@ mod tests {
             "timer claim must retain ANN state weakly"
         );
         drop(claim);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_task_releases_runtime_and_writer_when_last_ann_owner_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("checkpoint-owner.db");
+        let backend = Arc::new(
+            khive_db::StorageBackend::sqlite_for_test_with_journal_mode_in(
+                &db_path,
+                true,
+                Duration::from_secs(10),
+                dir.path().join("locks"),
+            )
+            .unwrap(),
+        );
+        backend.prepare_core_schema().unwrap();
+        assert!(backend.pool().write_queue_active());
+        assert!(backend.pool().writer_task_handle().unwrap().is_some());
+        let writer = backend.pool().take_writer_task_join().unwrap();
+        let rt = KhiveRuntime::from_prepared_backend(
+            backend.clone(),
+            khive_runtime::RuntimeConfig {
+                db_path: Some(db_path),
+                ..khive_runtime::RuntimeConfig::no_embeddings()
+            },
+        )
+        .unwrap();
+        let background_root = rt
+            .background_root()
+            .expect("external domain owner for ANN-owner lifetime fixture");
+        let ann = new_shared_for_role(true);
+        rt.install_note_search_ann_provider(Arc::new(
+            crate::note_search::MemoryNoteSearchAnnProvider::new(rt.clone(), ann.clone()),
+        ));
+        let key = AnnKey::new("timer-model");
+        let timer = CheckpointTimer {
+            claim: CheckpointClaim::take(&ann, &key).unwrap(),
+            delay: Duration::from_secs(300),
+            checkpoint: Instant::now(),
+        };
+        let retained_owner = ann.clone();
+        let weak = Arc::downgrade(&ann);
+        let owner_dropped = ann.owner_dropped.clone();
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let task = spawn_checkpoint(&rt, timer);
+        drop(rt);
+        drop(backend);
+        drop(ann);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            Arc::strong_count(&retained_owner),
+            1,
+            "checkpoint runtime must not retain its installed ANN provider"
+        );
+        assert!(!owner_dropped.is_cancelled());
+        assert!(
+            !task.is_finished(),
+            "a remaining owner keeps its timer alive"
+        );
+
+        drop(retained_owner);
+        assert!(weak.upgrade().is_none());
+        assert!(owner_dropped.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("last owner drop must end an idle checkpoint before its 300s deadline")
+            .unwrap();
+        assert_eq!(tokio::time::Instant::now(), started);
+        tokio::time::resume();
+        drop(background_root);
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("checkpoint exit must release the file-backed writer")
+            .unwrap();
+        dir.close().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_ann_owner_preserves_the_full_checkpoint_delay_and_releases_claim() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let ann = new_shared_for_role(true);
+        let key = AnnKey::new("timer-model");
+        let timer = CheckpointTimer {
+            claim: CheckpointClaim::take(&ann, &key).unwrap(),
+            delay: Duration::from_secs(300),
+            checkpoint: Instant::now(),
+        };
+        let mut pending = Box::pin(run_timer(&rt, timer, CancellationToken::new()));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(299)).await;
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(CheckpointClaim::take(&ann, &key).is_none());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            pending.await.is_none(),
+            "an absent bridge needs no checkpoint"
+        );
+        assert!(!ann.owner_dropped.is_cancelled());
+        assert!(ann.checkpoint_timers.lock().unwrap().is_empty());
+        let replacement = CheckpointClaim::take(&ann, &key).unwrap();
+        drop(replacement);
     }
 
     #[tokio::test]
@@ -247,3 +434,7 @@ mod tests {
         drop(next_claim);
     }
 }
+
+#[cfg(test)]
+#[path = "checkpoint_admission_tests.rs"]
+mod admission_tests;

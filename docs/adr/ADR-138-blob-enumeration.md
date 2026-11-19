@@ -1,6 +1,6 @@
 # ADR-138: Add read-only blob enumeration to the blob-store contract
 
-- **Status:** Proposed
+- **Status:** withdrawn (2026-10-23). Never implemented; a later need returns as a new proposal against the current code.
 - **Date:** 2026-08-03
 
 ## Context

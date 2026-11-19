@@ -2,7 +2,8 @@
 
 khive's default install loads fourteen production packs
 (`kg, gtd, memory, brain, comm, schedule, knowledge, session, git, code, workspace, blob`, per
-`RuntimeConfig::default()` in `crates/khive-runtime/src/config.rs`). The `code` pack contributes one verb, `code.ingest` (L1 manifest + L1.5
+`RuntimeConfig::default()` in `crates/khive-runtime/src/config.rs`). The `code` pack contributes `code.list`, `code.search`, and `code.deps` for registered-map
+reads ([ADR-139](../adr/ADR-139-code-map-read-access.md)), plus `code.ingest` (L1 manifest + L1.5
 import-scan source ingestion into a dedicated map database, see
 [ADR-085](../adr/ADR-085-code-pack.md)), alongside its `finding` note kind and
 edge rules; `findings.json` ingestion remains an admin CLI path. `workspace`
@@ -121,7 +122,7 @@ ADR-149 adds explicit interaction learning through `moodboard.serve`, `moodboard
 attributed non-`local` actor. Training uses immutable randomized pairwise judgments, deterministic
 unordered-pair train/calibration/test splits, a frozen ten-feature contract, and minimum support
 gates. It fits deterministic logistic binary cross-entropy in the pack, then persists and serves
-the exact zero-intercept `10 -> 1` head through `lattice-fann` 0.9.0. FANN bytes, the calibrated
+the exact zero-intercept `10 -> 1` head through `lattice-fann` 0.15.0. FANN bytes, the calibrated
 model bundle, and their provenance live in BlobStore, an `artifact/moodboard_model`, and immutable
 events. The bundle is attachment role `content`; the separately stored FANN object is role
 `fann-network`, and load fails before network hydration if that role disagrees with the

@@ -40,12 +40,26 @@ then joins the retained supervisor `JoinHandle`.
 
 Concurrent `submit()` calls that arrive while a driver iteration is draining the queue share the
 same generation and the same `append_events_idempotent()` call — this is the batching payoff.
-Each generation retries transient storage failures (`WriteQueueFull`, `WriterTaskBusy`,
-`WriterTaskRequestFailed{TransactionRolledBack}` and
+Each generation retries transient storage failures (`WriteQueueFull`, `WriterTaskBusy`, `Pool`,
+`Timeout`, `WriterTaskRequestFailed` whose cause is itself transient, and
 `WriterTaskTerminated{NotStarted | TransactionRolledBack | SideEffectsUnknown}`) up to
 `AuditBatchConfig::max_commit_attempts` with `retry_backoff` between attempts
 (`classify_store_error`). `Unsupported("append_events_idempotent")` and any other storage error
 are terminal for the generation, not retried.
+
+The writer task wraps any request operation that failed and was rolled back in
+`WriterTaskRequestFailed{TransactionRolledBack}`, whatever the cause, so the wrapper is
+classified by the error it carries: a `Pool`, `Timeout`, `WriteQueueFull` or `WriterTaskBusy`
+cause (a failed COMMIT, or a retryable refusal relayed by the events daemon) or a driver error
+carrying SQLite `BUSY`/`LOCKED` is retried like the same error unwrapped. Any other cause, for
+example a missing column or a constraint violation, would fail identically on every attempt: the
+generation ends as `StoreFailure` after one attempt instead of `RetryExhausted` after all of
+them. A `WriterTaskRequestFailed{SideEffectsUnknown}` is retried whatever its cause, since the
+append is idempotent.
+
+When a generation ends in failure, `RetryExhausted` or any terminal reason, the last store error
+it saw is logged once at `warn` with the attempt count and the reason
+(`audit generation failed; its rows were not committed`).
 
 ## Admission: refusal vs. deadline expiry (khive#2117, khive#2208)
 
@@ -156,13 +170,41 @@ one. These items are `pub`, not `pub(crate)`, because `tests/adr133_audit_batch.
 separate crate and cannot reach `pub(crate)` items; this is a deliberate visibility widening with
 no new wire vocabulary (no MCP verb, no wire field) attached to it.
 
-## Known scope gap: `AuditProducer::RecallExecuted`
+## Recall telemetry: `AuditProducer::RecallExecuted`
 
-`RecallExecuted` is classified (`PureObservability`) but not wired to a live call site.
-`khive-pack-memory`'s recall handler (`emit_recall_executed_event`) only holds a `&KhiveRuntime`
-handle, not a `&VerbRegistry` — `AuditBatch` is owned by `VerbRegistry` (`pack.rs`), and
-`KhiveRuntime`/`runtime.rs` is a separate ownership boundary. Wiring this producer requires either
-threading a batch handle into `KhiveRuntime` or moving the recall audit emission to a layer that
-already holds the registry; both are structural changes out of scope here. The variant carries an
-`#[allow(dead_code)]` with this explanation rather than being wired against a call site it cannot
-reach from this module.
+The recall handler submits `RecallExecuted` through the same registry-owned batch
+as dispatch audit, using its existing `PureObservability` classification. The
+bounded background serve job already holds a clone of the registry; it needs no
+runtime-held batch or second batch instance. Its semantic event is built once and
+stamped from the sealed caller token before reaching the registry's raw sink, so a
+per-request namespace or actor override survives a differently configured registry.
+
+Recall results retain their existing response boundary: telemetry runs in the
+tracked background job, after any brain serve-ledger dispatch. Visibility requires
+that producer to submit and the batch to settle; this does not promise that the row
+is visible when the recall response returns. Producer admission and execution are
+still bounded. Shutdown owners should drain producers before closing the batch when
+they require their rows to be admitted, then drain accepted rows before writer teardown.
+A late producer against a closing batch reports a best-effort refusal.
+
+A batch refusal or terminal failure warns with its typed reason without changing
+the recall handler result. Generation failures use the existing pure-observability
+degradation counters; immediate preflight/closed/full-queue refusals do not promise
+a `degraded_rows` increment. A timed-out or cancelled waiter does not remove an
+accepted row, and the emitter never resubmits or direct-appends after a batch error:
+the original generation may still commit. Recall's separate dispatch obligation and
+brain accounting keep their own durability rules.
+
+When the registry has no batch, recall retains its token-decorated runtime accessor
+and direct best-effort append, including its acquisition/append warnings. This is a
+legacy no-batch route, not a fallback for a failing configured batch. ADR-133's
+baseline and Amendment 3 remain Proposed; this producer wiring changes neither status.
+
+The shared-queue recall fixture drains config-lock rows created during warm-up
+before measuring the queue. Its readiness checks observe accepted rows and the
+in-flight generation, with a 60-second outer failure ceiling. A separate arm delays
+the fourth real recall's admission for six seconds while the first three pairs are
+queued, then requires all eight rows to share the next generation. Production
+admission and resolution deadlines are unchanged: the sentinel wait can expire
+while its accepted row remains owned by the driver. Both arms retain exact stored
+query identities, per-query row uniqueness and real writer-acquisition assertions.

@@ -15,9 +15,10 @@ description = "SQLite storage backend: entities, edges, notes, events, FTS5, sql
 bench = false
 
 [dependencies]
-khive-storage = { version = "0.9.0", path = "../khive-storage" }
-khive-score = { version = "0.9.0", path = "../khive-score" }
-khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde"] }
+khive-storage = { version = "0.20.0", path = "../khive-storage" }
+khive-score = { version = "0.20.0", path = "../khive-score" }
+khive-types = { version = "0.20.0", path = "../khive-types", features = ["serde", "sha2"] }
+khive-fs = { version = "0.20.0", path = "../khive-fs" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
@@ -26,16 +27,16 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-rusqlite = { workspace = true, features = ["bundled", "column_decltype", "hooks", "functions"] }
+rusqlite = { workspace = true, features = ["backup", "bundled", "column_decltype", "hooks", "functions"] }
 crossbeam-queue = { workspace = true }
 parking_lot = { workspace = true }
 sha2 = { workspace = true }
 sqlite-vec = { workspace = true, optional = true }
-blake3 = { workspace = true }
+blake3 = { workspace = true, features = ["std"] }
 fs4 = { workspace = true }
 tempfile = { workspace = true }
 futures = { workspace = true }
-object_store = { workspace = true }
+object_store = { workspace = true, optional = true }
 bytes = "1"
 
 [target.'cfg(unix)'.dependencies]
@@ -54,16 +55,19 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 # Integration binaries opt into explicit fixture constructors.
 khive-db = { path = ".", features = ["test-support"] }
 tokio = { workspace = true, features = ["full", "test-util"] }
 rusqlite = { workspace = true, features = ["bundled", "column_decltype", "hooks", "limits", "functions"] }
-khive-storage = { version = "0.9.0", path = "../khive-storage", features = ["test-support"] }
-khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde"] }
+khive-storage = { version = "0.20.0", path = "../khive-storage", features = ["test-support"] }
+khive-types = { version = "0.20.0", path = "../khive-types", features = ["serde"] }
 uuid = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }
 serial_test = { workspace = true }
+syn = { workspace = true }
+proc-macro2 = "1"
 
 [[bench]]
 name = "db_hot_path"
@@ -71,10 +75,31 @@ harness = false
 path = "benches/db_hot_path.rs"
 required-features = ["vectors"]
 
+[[bench]]
+name = "db_concurrency"
+harness = false
+path = "benches/db_concurrency.rs"
+
+[[bench]]
+name = "db_stores"
+harness = false
+path = "benches/db_stores.rs"
+
+[[bench]]
+name = "db_pool"
+harness = false
+path = "benches/db_pool.rs"
+
+[[bench]]
+name = "db_edge_mutations"
+harness = false
+path = "benches/db_edge_mutations.rs"
+
 [features]
 # Exposes the task-scoped SQLite progress probe for dependent-crate tests.
 test-support = []
 default = []
+blob-s3 = ["dep:object_store", "object_store/aws"]
 vectors = ["dep:sqlite-vec"]
 # Experimental namespace-bounded FTS5 trigram tokenizer; no schema migration.
 namespace-trigram-proto = []

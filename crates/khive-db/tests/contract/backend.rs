@@ -29,6 +29,9 @@ fn memory_backend() -> StorageBackend {
     backend
 }
 
+/// Each file backend runs the full core migration under the volume lease, and
+/// every tempdir here is on one volume, so the file-backed contracts serialize
+/// on one key instead of queueing past the guard deadline.
 fn file_backend(dir: &tempfile::TempDir, name: &str) -> StorageBackend {
     let backend = StorageBackend::sqlite_for_test(dir.path().join(name)).expect("file backend");
     backend.prepare_core_schema().expect("prepare file schema");
@@ -81,6 +84,7 @@ async fn sql_access_memory_contract() {
 }
 
 #[tokio::test]
+#[serial_test::serial(contract_file_volume)]
 async fn sql_access_file_contract() {
     let dir = tempfile::tempdir().unwrap();
     test_sql_access(&file_backend(&dir, "sql_access.db")).await;
@@ -130,6 +134,7 @@ async fn entity_store_memory_contract() {
 }
 
 #[tokio::test]
+#[serial_test::serial(contract_file_volume)]
 async fn entity_store_file_contract() {
     let dir = tempfile::tempdir().unwrap();
     test_entity_store(&file_backend(&dir, "entity.db")).await;
@@ -224,6 +229,7 @@ async fn graph_store_memory_contract() {
 }
 
 #[tokio::test]
+#[serial_test::serial(contract_file_volume)]
 async fn graph_store_file_contract() {
     let dir = tempfile::tempdir().unwrap();
     test_graph_store(&file_backend(&dir, "graph.db")).await;
@@ -292,6 +298,7 @@ async fn note_store_memory_contract() {
 }
 
 #[tokio::test]
+#[serial_test::serial(contract_file_volume)]
 async fn note_store_file_contract() {
     let dir = tempfile::tempdir().unwrap();
     test_note_store(&file_backend(&dir, "notes.db")).await;
@@ -352,6 +359,7 @@ async fn text_search_memory_contract() {
 }
 
 #[tokio::test]
+#[serial_test::serial(contract_file_volume)]
 async fn text_search_file_contract() {
     let dir = tempfile::tempdir().unwrap();
     test_text_search(&file_backend(&dir, "fts.db")).await;
@@ -411,6 +419,7 @@ mod vector_contract {
     }
 
     #[tokio::test]
+    #[serial_test::serial(contract_file_volume)]
     async fn vector_store_file_contract() {
         let dir = tempfile::tempdir().unwrap();
         test_vector_store(&file_backend(&dir, "vectors.db")).await;

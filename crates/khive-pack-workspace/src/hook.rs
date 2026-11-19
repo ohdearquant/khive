@@ -2,7 +2,6 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
-use uuid::Uuid;
 
 use khive_runtime::{KhiveRuntime, KindHook, NamespaceToken, RuntimeError};
 
@@ -36,15 +35,6 @@ impl KindHook for WorkspaceHook {
         args: &mut Value,
     ) -> Result<(), RuntimeError> {
         require_integer_schema_version(args.get("properties"))
-    }
-
-    async fn after_create(
-        &self,
-        _runtime: &KhiveRuntime,
-        _id: Uuid,
-        _args: &Value,
-    ) -> Result<(), RuntimeError> {
-        Ok(())
     }
 
     fn validate_proposal_entity(

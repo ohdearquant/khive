@@ -39,7 +39,21 @@ pub(crate) fn count_new_entries(changeset: &ProposalChangeset) -> u64 {
     match changeset {
         ProposalChangeset::AddEntity { .. } => 1,
         ProposalChangeset::AddNote { .. } => 1,
-        ProposalChangeset::Compound { steps } => steps.iter().map(count_new_entries).sum(),
+        ProposalChangeset::Canonical {
+            schema_version,
+            delta,
+        } => crate::canonical_apply::decode_delta(delta, Some(*schema_version))
+            .map(|changeset| {
+                changeset
+                    .ops
+                    .iter()
+                    .filter(|op| matches!(op, khive_changeset::Op::Create(_)))
+                    .count() as u64
+            })
+            .unwrap_or(u64::MAX),
+        ProposalChangeset::Compound { steps } => steps.iter().fold(0u64, |total, step| {
+            total.saturating_add(count_new_entries(step))
+        }),
         _ => 0,
     }
 }
@@ -92,6 +106,9 @@ pub(crate) fn validate_note_proposal_admission(
     registry: &VerbRegistry,
 ) -> Result<(), RuntimeError> {
     match changeset {
+        ProposalChangeset::Canonical { .. } => {
+            crate::canonical_apply::validate_proposal(changeset, registry)
+        }
         ProposalChangeset::AddNote { note } => {
             let kind = note.kind.trim().to_ascii_lowercase();
             check_note_proposal_admission(note, &kind, registry)

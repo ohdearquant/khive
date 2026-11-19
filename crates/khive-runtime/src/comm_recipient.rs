@@ -20,15 +20,111 @@
 #![allow(dead_code)] // The verified node-loop caller is supplied by #3537.
 use crate::{KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
 use khive_channel::InboundReceiptTicket;
-pub use khive_db::stores::note::recipient::{
-    QuarantineReason, RecipientCommitResult, RecipientDisposition,
-};
 use khive_db::stores::note::recipient::{
-    QuarantineRecord, RecipientCommit, RecipientTransportStore,
+    AckJournalEntry, QuarantineRecord, RecipientCommit, RecipientTransportStore,
+};
+pub use khive_db::stores::note::recipient::{
+    AcknowledgementRetirementReason, QuarantineReason, RecipientCommitResult, RecipientDisposition,
 };
 use khive_storage::Note;
 use serde_json::json;
 use uuid::Uuid;
+
+/// An acknowledgement returned by the runtime's durable journal read.
+///
+/// Callers can inspect the binding and retry bookkeeping, but cannot manufacture
+/// an entry from uncommitted delivery data. This type stores no signed bytes.
+///
+/// ```compile_fail
+/// use khive_db::stores::note::recipient::AckJournalEntry;
+/// use khive_runtime::comm_recipient::DueAcknowledgementEntry;
+/// fn forge(journal: AckJournalEntry) {
+///     let _ = DueAcknowledgementEntry { journal };
+/// }
+/// ```
+#[derive(Debug)]
+pub struct DueAcknowledgementEntry {
+    journal: AckJournalEntry,
+}
+
+impl DueAcknowledgementEntry {
+    /// The binding recorded when the delivery was committed or replayed.
+    pub fn binding(&self) -> &serde_json::Value {
+        &self.journal.binding
+    }
+
+    /// The disposition first committed for this logical message.
+    pub fn disposition(&self) -> RecipientDisposition {
+        self.journal.disposition
+    }
+
+    /// The exact delivery attempt this acknowledgement finishes.
+    pub fn delivery_attempt_id(&self) -> Uuid {
+        self.journal.delivery_attempt_id
+    }
+
+    /// The number of failed acknowledgement tries recorded durably.
+    pub fn attempt_count(&self) -> u64 {
+        self.journal.attempt_count
+    }
+
+    /// The earliest retry time, in microseconds since the Unix epoch.
+    pub fn not_before(&self) -> Option<i64> {
+        self.journal.not_before
+    }
+}
+
+impl KhiveRuntime {
+    /// Read due acknowledgements from comm's assigned runtime, oldest first.
+    /// This is the only construction path for [`DueAcknowledgementEntry`].
+    pub async fn due_acknowledgements(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> RuntimeResult<Vec<DueAcknowledgementEntry>> {
+        let store = RecipientTransportStore::new(self.backend().pool_arc());
+        Ok(store
+            .list_due_acknowledgements(now, limit)
+            .await?
+            .into_iter()
+            .map(|journal| DueAcknowledgementEntry { journal })
+            .collect())
+    }
+
+    /// Finish a pending journal entry. Returns false for an absent or terminal
+    /// attempt, including an entry already finished by an earlier call.
+    pub async fn finish_acknowledgement(&self, delivery_attempt_id: Uuid) -> RuntimeResult<bool> {
+        let store = RecipientTransportStore::new(self.backend().pool_arc());
+        Ok(store.finish_acknowledgement(delivery_attempt_id).await?)
+    }
+
+    /// Record one failed try and its earliest retry time durably. An absent or
+    /// terminal attempt is unchanged and returns false.
+    pub async fn record_acknowledgement_failed_try(
+        &self,
+        delivery_attempt_id: Uuid,
+        not_before: i64,
+    ) -> RuntimeResult<bool> {
+        let store = RecipientTransportStore::new(self.backend().pool_arc());
+        Ok(store
+            .record_acknowledgement_failed_try(delivery_attempt_id, not_before)
+            .await?)
+    }
+
+    /// Retire a pending entry after a permanent transport refusal. The message
+    /// and its committed receipt remain intact. An absent or terminal attempt
+    /// is unchanged and returns false.
+    pub async fn retire_acknowledgement(
+        &self,
+        delivery_attempt_id: Uuid,
+        reason: AcknowledgementRetirementReason,
+    ) -> RuntimeResult<bool> {
+        let store = RecipientTransportStore::new(self.backend().pool_arc());
+        Ok(store
+            .retire_acknowledgement(delivery_attempt_id, reason)
+            .await?)
+    }
+}
 
 /// Local enrollment authority, supplied by the trusted slug owner. Never fill
 /// this from plaintext or a wire request. Actor labels are local, not agent UUIDs.
@@ -288,3 +384,6 @@ impl KhiveRuntime {
 }
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod acknowledgement_journal_tests;

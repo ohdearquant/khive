@@ -1,10 +1,16 @@
 //! Memory verb handlers — split by concern.
 
+mod apply_batch;
+#[cfg(test)]
+mod cjk_model_weighting_tests;
 mod common;
 mod feedback;
 #[cfg(test)]
 mod fresh_tail_tests;
+#[cfg(test)]
+mod fuse_equivalence_tests;
 mod prune;
+mod query_ir_adapter;
 mod recall;
 mod remember;
 #[cfg(test)]

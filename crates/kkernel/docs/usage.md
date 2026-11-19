@@ -29,12 +29,21 @@ kkernel <command> [flags]
   supervisor Launch a supervised daemon or release its startup marker
   backend   Inspect registered backends (list, info <name>)
   git-annotation-repair  Preview/apply historical commit→project links
+  git-dedup              Preview/apply duplicate issue/PR note merges
 ```
 
 The default database is `~/.khive/khive.db`. Override per-command with `--db`
 (or `KHIVE_DB` for `mcp`/`exec`). Use `:memory:` for an ephemeral database.
 
 ---
+
+## `kkernel git-dedup` — duplicate issue and pull-request notes
+
+Preview one canonical project with `kkernel git-dedup --project <full-uuid>
+--namespace local`; add `--refuse-anchor <full-uuid>` (repeatable) to leave an
+anchor's notes untouched, and `--apply` for guarded per-pair merges. `--db` and
+`KHIVE_DB` select the store. The plan summary prints to stderr and the JSON
+report to stdout. See the [repair contract](../../khive-pack-git/docs/git-note-dedup.md).
 
 ## `kkernel git-annotation-repair` — historical project links
 
@@ -89,8 +98,10 @@ Key flags: `--db`, `--actor`/`--namespace`, `--no-embed`, `--pack` (repeatable),
 For stdio, `KHIVE_MCP_STDIO_MAX_LINE_BYTES` sets the maximum raw JSON-RPC
 line length, including its newline. It defaults to 8,454,144 bytes and accepts
 1 through 67,108,864; an invalid value fails startup. An oversized line gets
-a JSON-RPC parse error when it crosses the cap, then the reader discards its
-remainder and serves the next complete request.
+a JSON-RPC Invalid Request error (-32600, without an id) when it crosses the
+cap, then the reader discards its remainder and serves the next complete request.
+With rmcp 2.2 this replaces the previous Parse Error (-32700) response; the
+response deadline and line limits are unchanged.
 
 Every successful startup writes the resolved actor to stderr as
 `actor: "<id>" (resolved; attributed)` or explicitly marks the unattributed
@@ -257,6 +268,14 @@ A value above 86400 is clamped to 86400, and zero or a non-integer uses the
 set. Record this operator setting with run evidence; it is not a wire-limit
 bypass.
 
+The deadline that bounds the work is read by the process that runs it. When
+`kkernel exec` forwards to a daemon that is already running, the daemon applies
+the value from its own environment, and the request carries no deadline; setting
+the variable on the `kkernel exec` command changes only how long the client
+waits for the answer. The example above therefore applies to local dispatch or
+to a daemon that this command starts. For a daemon that is already running, set
+the variable in the daemon's environment.
+
 ### Stable refusal reasons
 
 Refused invocations retain their existing human-readable error and exit-code
@@ -403,15 +422,53 @@ kkernel reindex --db ~/.khive/khive.db --sections-only      # backfill only sect
 | `--no-knowledge`   | only entities/notes (skip knowledge)                                                |
 | `--no-sections`    | within the knowledge pass, embed atoms but skip section embeddings (ADR-051)        |
 | `--sections-only`  | embed only knowledge sections (skip entities/notes and atoms)                       |
+| `--id <UUID>`      | repair only one live entity or note; retain healthy indexes                         |
 | `--model <name>`   | entities/notes use this single engine instead of fanning out                        |
 | `--keep-existing`  | skip records already embedded (incremental top-up) instead of replacing them        |
-| `--batch-size <n>` | records per embedding batch (default 128, max 500)                                  |
+| `--batch-size <n>` | override configured batch size (default 128, max 500)                               |
 | `--best-effort`    | downgrade partial failures to a warning and still exit 0 (default fails closed)     |
 | `--rebuild-fts`    | rebuild + rank-1 integrity-check both global knowledge FTS indexes (see below)      |
 | `--human`          | readable report instead of JSON                                                     |
 
+The batch size is selected from an explicit `--batch-size`, then
+`[embed] batch_size` in the selected config file, then 128. It controls entity,
+note and knowledge embedding batches. Config values must be positive integers;
+values above 500 are capped. A bulk run using a configured value above 500 warns
+once with the selected file, configured value and effective value. An explicit
+CLI override does not produce this configuration warning. The CLI retains its
+zero-to-one clamp. An explicit
+`--batch-size`, including 128, conflicts with `--id`; a configured batch size
+does not. Invalid config values are refused before the database is opened, even
+when a CLI override is present.
+
+This implements only `embed.batch_size`. The other pipeline settings
+`embed.auto_embed` and `embed.fields.include` remain pending; they do not change
+automatic embedding or entity text selection yet.
+
 There is no `--embeds-only`, `--ids`, or `--dry-run` mode. `--keep-existing` narrows
 vector work to missing records, but the selected graph pass still backfills FTS.
+
+**Single-record repair.** `kkernel reindex --id <UUID>` repairs one live entity or
+note in the selected namespace. It restores a missing or stale FTS document and
+fills only missing vectors selected by the record kind's configured embedding
+policy. Healthy model vectors and other records' indexes are preserved. It does
+not scan the namespace or process the knowledge corpus. Unknown, deleted, or
+out-of-scope IDs are refused.
+
+```bash
+kkernel reindex --db ~/.khive/khive.db --namespace local --id <full-record-uuid>
+```
+
+The report identifies `id`, `substrate`, and `namespace`, lists completed stages
+in `repaired` (`fts` or `vector:<model>`), and lists remaining `failures` as
+`{stage, error}` objects. An empty repaired list with no failures means nothing
+needed repair. Successful stages stay committed if a later stage fails; retrying
+fills the remaining gaps. Partial repair exits nonzero unless `--best-effort` is
+explicitly selected. `--human` prints the same outcomes in readable form.
+
+`--id` cannot be combined with `--model`, `--batch-size`, `--knowledge-only`,
+`--no-sections`, `--sections-only`, or `--rebuild-fts`. `--keep-existing` and
+`--no-knowledge` are accepted but redundant for this mode.
 
 **Config resolution.** Engines, db path, and config file are resolved with the
 **same precedence as `kkernel mcp`** — config-file `[[engines]]` (via `--config`
@@ -489,6 +546,7 @@ is reachable only through `kkernel reindex --rebuild-fts` above.
 ```bash
 kkernel db check --config ~/.khive/khive.toml --human # report configured topology
 kkernel db check --backend archive --strict           # inspect one configured backend
+kkernel db check --integrity --strict                # also run PRAGMA integrity_check per file
 kkernel db migrate --config ~/.khive/khive.toml       # secondaries, then main
 kkernel db migrate --backend archive                  # migrate one named secondary
 kkernel db migrate --dry-run                          # read-only topology check
@@ -512,6 +570,20 @@ authenticated. `db check` and migrate's `--dry-run`/`--check` modes never open a
 runtime or mutate the database; absent files report V0. They reuse migration's
 target planner, so selecting `main` or its SQLite alias includes every secondary
 prerequisite, while an independent secondary remains a single target.
+
+For every database file that exists, `db check` also reports `page_size`,
+`page_count` and `freelist_count`. Each is one pragma read through the same
+read-only open, so committed frames not yet checkpointed from the `-wal` are
+counted and the cost does not grow with the file. `freelist_count` is the number
+of pages that later writes can reuse but that stay in the file until a `VACUUM`.
+`--integrity` additionally runs `PRAGMA integrity_check` on each file and reports
+every row it returns, with no row limit (`["ok"]` for a sound file); it reads
+every page, so its time grows with the file. With `--strict`, an integrity
+problem fails the command the same way a behind schema does. These fields are
+`null` for an absent file or a memory backend. The read-only open refuses a WAL
+database whose `-shm` is writable, which is the case whenever a daemon or any
+other writer holds it open, so `db check` reads a stopped database or a frozen
+copy that includes its read-only `-wal` and `-shm`.
 
 Before either command opens a database, the planner rejects physical SQLite
 aliases that disagree on `read_only`; a named target cannot bypass that topology
@@ -537,6 +609,78 @@ compatibility with completed V21. Start the Phase-4b serving fleet only after
 A database whose `_schema_migrations` version is **ahead** of the latest known
 migration is rejected at open time — it predates the consolidation or was written by a
 newer build. Recreate it from the current schema; in-place downgrade is unsupported.
+
+---
+
+## `kkernel kg import` — import with explicit collision policies
+
+```bash
+kkernel kg import archive.json --db knowledge.db
+kkernel kg import archive.json --db knowledge.db --on-conflict skip --dry-run
+kkernel kg import archive.json --db knowledge.db --on-conflict update --force
+```
+
+The default `--on-conflict error` refuses an archive entity or edge UUID already
+held by an entity, note, edge or event before importing rows. `skip` preserves
+existing rows and omits edges incident to a skipped entity. `update` patches
+entities and updates edges under their existing UUIDs, refusing a UUID held by a
+different record substrate.
+A new edge UUID whose canonical source/relation/target tuple is already stored
+refuses every mode. Import never substitutes another UUID or restores a tombstone.
+
+Entity updates preserve kind, namespace, creation time and deletion state. Omitted
+or null optional values remain unchanged. Properties merge at the top level, with
+an archive value replacing the stored value at each supplied key, including nested
+objects. Non-empty tags replace stored tags; empty tags leave them unchanged.
+Edge properties replace the stored properties when present. An update with a
+different entity kind or different edge endpoints refuses the complete import.
+
+Without `--force`, unresolved edge endpoints and endpoint-contract failures refuse
+the complete import. `--force` skips those edges and reports each input edge's UUID
+and cause. It still refuses unknown relations, invalid weights, reserved fields,
+strict-schema unknown kinds and UUID collisions in `error` mode. Adapter formats
+also accept `--continue` as shorthand for `--on-conflict skip`; it cannot be combined
+with an explicit conflict mode and is not an archive flag.
+
+Existing endpoints follow the normal by-ID link rules, including stored notes and
+events and a stored edge as an `annotates` target. Adapter edges may refer to
+endpoints already present in the destination; they need not repeat those records
+in the input. The archive still imports entity records and edges only.
+
+`--dry-run` uses the same preflight and outcome counts without importing rows. It
+opens an existing target read-only and never creates a missing target. On an
+unchanged destination, its inserted/updated/skipped counts and edge skip details
+match the real import. A real import refuses a target that changes during preflight,
+which can be retried against the new state. Each invocation admits at most 10,000
+entities plus edges and 64 MiB of serialized archive data; larger inputs must be
+partitioned into separate invocations with the required endpoints available.
+
+In every conflict mode, import skips archive entities carrying tool-registry tags
+and edges incident to those entities. It never creates or rewrites a tool-registry
+row. Export remains unchanged and may include these records. The JSON summary
+reports nonzero `entities_registry_skipped` and `edges_registry_skipped` counts as
+subsets of `entities_skipped` and `edges_skipped`; zero subset counts are omitted.
+Incident edges have cause `skipped_record`.
+Untagged archive entities still cannot overwrite a stored registry row in `update`
+mode. Tool registrations must go through the owning tool pack.
+
+The JSON summary retains `entities_imported`, `edges_imported`, `edges_skipped`,
+`embedding_truncation` and non-empty `skipped_edges`, adding
+`entities_inserted`, `entities_updated`, `entities_skipped`, `edges_inserted`
+and `edges_updated`. Missing-source/target reports carry the cause; endpoint-contract
+reports additionally carry the validation error. An archive edge whose UUID is
+already held by a record uses `existing_edge`; an edge incident to a skipped
+record uses `skipped_record`.
+Repeated skipped input edges retain separate report entries. Duplicate entity UUIDs,
+or duplicate edge UUIDs/tuples among edges that would be written, refuse preflight.
+
+Row writes share one existing atomic storage owner. A concurrent destination change
+refuses before row changes; a later SQLite statement failure rolls back that unit.
+Index maintenance follows the existing deferred entity update path after commit,
+so a later indexing failure can be reported after row changes have committed.
+Library `import_kg` and its policy/JSON wrappers retain their existing upsert and
+edge-skipping behavior. These CLI rules implement the
+[ADR-020 import amendment](../../../docs/adr/ADR-020-git-native-kg-implementation.md).
 
 ---
 
@@ -607,16 +751,13 @@ kkernel kg --help                          # KG validation, init, pre-commit hoo
 
 ## Distribution model
 
-`kkernel` is the only published binary. The npm package `khive` ships per-platform
-`@khive-ai/kernel-<platform>` subpackages that each contain `bin/kkernel`. Two command
-names route to it:
+`kkernel` is the single shipped binary. Install from a checkout at the repository root:
 
-- `khive <cmd>` → `kkernel <cmd>` (and `khive mcp` → `kkernel mcp`)
-- `khive-mcp [args]` → `kkernel mcp [args]` (compat alias for existing MCP configs)
+```bash
+cargo install --path crates/kkernel --locked
+```
 
-Binary resolution order (npm shims and `cli/lib/kernel.ts` agree): `KKERNEL_BINARY`
-env override → `@khive-ai/kernel-<platform>/bin/kkernel` → monorepo
-`crates/target/{release,debug}/kkernel`.
+Configure MCP clients to run `kkernel mcp` directly.
 
 ### Local development
 

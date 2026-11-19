@@ -1,12 +1,12 @@
 use khive_vamana::{VamanaConfig, VamanaError, VamanaIndex};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 
 fn corpus(rows: usize, dimensions: usize) -> Vec<f32> {
     let mut rng = StdRng::seed_from_u64(0x110a_110a);
     let mut vectors = Vec::with_capacity(rows * dimensions);
     for _ in 0..rows {
         let mut vector: Vec<f32> = (0..dimensions)
-            .map(|_| rng.gen_range(-1.0f32..1.0))
+            .map(|_| rng.random_range(-1.0f32..1.0))
             .collect();
         let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
         for value in &mut vector {
@@ -162,8 +162,11 @@ fn fixed_seed_build_has_feature_independent_graph_and_search_digest() {
             bytes.extend_from_slice(&distance.to_bits().to_le_bytes());
         }
     }
+    // The digest follows rand's generated stream for the fixed seeds, which rand
+    // does not promise to keep across releases, so a rand upgrade re-records it.
+    // The property under test is that every feature set yields this one value.
     assert_eq!(
         blake3::hash(&bytes).to_hex().as_str(),
-        "86afcf6147c2de6da5f7d03e1df9f171e400c1ea4e73134debbc09d42129e91d"
+        "84270bdc1136a8e3781865ae1b35959b203a7d364e350ca6c0b4d5a0dc4521b1"
     );
 }

@@ -32,6 +32,8 @@ pub(crate) enum RuntimeFieldScope {
     RecordContent,
     NameDescription,
     JsonProperties,
+    #[serde(rename = "json-properties-context-v2")]
+    JsonPropertiesContextV2,
     Tags,
     CodeSource,
 }
@@ -43,6 +45,7 @@ impl RuntimeFieldScope {
             RuntimeFieldScope::RecordContent => b"record-content",
             RuntimeFieldScope::NameDescription => b"name-description",
             RuntimeFieldScope::JsonProperties => b"json-properties",
+            RuntimeFieldScope::JsonPropertiesContextV2 => b"json-properties-context-v2",
             RuntimeFieldScope::Tags => b"tags",
             RuntimeFieldScope::CodeSource => b"code-source",
         }
@@ -211,8 +214,19 @@ impl ManifestSnapshot {
         scope: RuntimeFieldScope,
         value: &str,
     ) -> Option<&ManifestEntryMeta> {
+        if scope == RuntimeFieldScope::JsonPropertiesContextV2 {
+            return None;
+        }
         let digest = scoped_digest(scope, value);
         self.entries.get(&(scope, digest))
+    }
+
+    pub(crate) fn lookup_property(
+        &self,
+        atom: &crate::secret_gate::property_context::PropertyAtom,
+    ) -> Option<&ManifestEntryMeta> {
+        self.entries
+            .get(&(RuntimeFieldScope::JsonPropertiesContextV2, *atom.digest()))
     }
 }
 
@@ -231,6 +245,9 @@ pub(crate) fn resolve_match<'a>(
 ) -> Result<Option<&'a ManifestEntryMeta>, ManifestFault> {
     let mut found_key: Option<(RuntimeFieldScope, Digest32)> = None;
     for &(scope, value) in scanned {
+        if scope == RuntimeFieldScope::JsonPropertiesContextV2 {
+            continue;
+        }
         let digest = scoped_digest(scope, value);
         if snapshot.entries.contains_key(&(scope, digest)) {
             match found_key {
@@ -416,6 +433,58 @@ pub(crate) mod fixture {
     }
 
     impl TestOnlyManifestFixture {
+        pub(crate) fn property_snapshot(
+            json: &str,
+            selections: &[(
+                crate::secret_gate::property_context::AtomRole,
+                Vec<crate::secret_gate::property_context::PathSegment>,
+            )],
+        ) -> crate::RuntimeResult<Arc<ManifestSnapshot>> {
+            let value: serde_json::Value = serde_json::from_str(json).map_err(|_| {
+                crate::RuntimeError::InvalidInput("invalid property fixture JSON".into())
+            })?;
+            let context = crate::secret_gate::property_context::PropertyContext::new(&value)?;
+            let mut entries = HashMap::new();
+            for (role, path) in selections {
+                let atom = context.atom(*role, path).ok_or_else(|| {
+                    crate::RuntimeError::InvalidInput("missing property fixture atom".into())
+                })?;
+                entries.insert(
+                    (RuntimeFieldScope::JsonPropertiesContextV2, *atom.digest()),
+                    ManifestEntryMeta {
+                        overridden_detector: "aws-access-key-id".into(),
+                    },
+                );
+            }
+            Ok(Arc::new(ManifestSnapshot {
+                manifest_id: Arc::from(TEST_FIXTURE_SCHEMA_MARKER),
+                entries,
+            }))
+        }
+
+        pub(crate) fn combine(snapshots: &[Arc<ManifestSnapshot>]) -> Arc<ManifestSnapshot> {
+            let entries = snapshots
+                .iter()
+                .flat_map(|snapshot| {
+                    snapshot
+                        .entries
+                        .iter()
+                        .map(|(key, value)| (*key, value.clone()))
+                })
+                .collect();
+            Arc::new(ManifestSnapshot {
+                manifest_id: Arc::from(TEST_FIXTURE_SCHEMA_MARKER),
+                entries,
+            })
+        }
+
+        pub(crate) fn for_scope(scope: RuntimeFieldScope) -> Self {
+            Self {
+                field_scope: scope,
+                ..Self::new()
+            }
+        }
+
         /// Builds one non-empty exact entry. The credential-shaped value is
         /// assembled at runtime from disjoint fragments — never stored as one
         /// contiguous secret-shaped literal in source.

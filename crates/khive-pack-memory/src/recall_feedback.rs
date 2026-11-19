@@ -6,8 +6,7 @@
 //! See `crates/khive-pack-memory/docs/api/memory-lifecycle.md`.
 
 use khive_brain_core::{
-    BalancedRecallState, BetaPosterior, BrainSignal, FeedbackEventKind, FeedbackSignal,
-    ServeAttribution,
+    BalancedRecallState, BrainSignal, FeedbackEventKind, FeedbackSignal, ServeAttribution,
 };
 use uuid::Uuid;
 
@@ -15,7 +14,7 @@ use uuid::Uuid;
 ///
 /// - `relevance`: success (a result was returned)
 /// - `temporal`: success if `latency_us` ≤ 50 ms, failure otherwise
-/// - per-entity posterior: success for `target_id`
+/// - per-entity posteriors: unchanged (a recall hit is exposure, not a judgment)
 pub fn on_recall_hit(state: &mut BalancedRecallState, target_id: Uuid, latency_us: i64) {
     state.apply_signal(&BrainSignal::RecallHit {
         target_id,
@@ -42,49 +41,29 @@ pub fn on_recall_miss(state: &mut BalancedRecallState) {
 ///
 /// Unknown signal strings are silently ignored.
 pub fn on_explicit_feedback(state: &mut BalancedRecallState, target_id: Uuid, signal: &str) {
-    // Try semantic event kind first (weighted updates), then legacy signal.
-    if let Some(event_kind) = FeedbackEventKind::from_signal_str(signal) {
-        let w = event_kind.update_weight();
-        if event_kind.is_positive() {
-            state.salience.update_success_weighted(w);
-        } else {
-            state.salience.update_failure_weighted(w);
+    let feedback = if let Some(event_kind) = FeedbackEventKind::from_signal_str(signal) {
+        let effective_weight = event_kind.update_weight();
+        BrainSignal::SemanticFeedback {
+            target_id,
+            event_kind,
+            effective_weight,
+            served_by_profile_id: None,
+            section_signals: None,
         }
-        // Corrections also penalise the relevance posterior (strongest negative signal).
-        if event_kind == FeedbackEventKind::Correction {
-            state.relevance.update_failure_weighted(w);
-        }
-        // Per-entity posterior (weighted).
-        let posterior = state
-            .entity_posteriors
-            .get_or_insert(target_id, || BetaPosterior::new(1.0, 1.0));
-        if event_kind.is_positive() {
-            posterior.update_success_weighted(w);
-        } else {
-            posterior.update_failure_weighted(w);
-        }
-        state.total_events += 1;
-    } else if let Ok(fb) =
+    } else if let Ok(signal) =
         serde_json::from_value::<FeedbackSignal>(serde_json::Value::String(signal.to_owned()))
     {
-        // Legacy signal: useful / not_useful / wrong
-        let positive = matches!(fb, FeedbackSignal::Useful);
-        if positive {
-            state.salience.update_success();
-        } else {
-            state.salience.update_failure();
+        BrainSignal::Feedback {
+            target_id,
+            signal,
+            served_by_profile_id: None,
+            section_signals: None,
         }
-        let posterior = state
-            .entity_posteriors
-            .get_or_insert(target_id, || BetaPosterior::new(1.0, 1.0));
-        if positive {
-            posterior.update_success();
-        } else {
-            posterior.update_failure();
-        }
-        state.total_events += 1;
-    }
-    // Unknown signal → no-op (don't poison state with bad data).
+    } else {
+        return;
+    };
+    state.apply_feedback_posteriors(&feedback);
+    state.total_events += 1;
 }
 
 #[cfg(test)]
@@ -96,7 +75,7 @@ mod tests {
     }
 
     #[test]
-    fn recall_hit_fast_increments_relevance_temporal_and_entity_alpha() {
+    fn recall_hit_fast_increments_relevance_and_temporal_but_not_entity() {
         let mut s = fresh();
         let id = Uuid::new_v4();
         on_recall_hit(&mut s, id, 10_000); // 10 ms — fast
@@ -108,9 +87,38 @@ mod tests {
         // temporal prior Beta(1,9): alpha should become 2
         assert!((s.temporal.alpha() - 2.0).abs() < 1e-12);
         assert!((s.temporal.beta() - 9.0).abs() < 1e-12);
-        // entity posterior: alpha 1+1=2
-        let ep = s.entity_posteriors.get(&id).unwrap();
-        assert!((ep.alpha() - 2.0).abs() < 1e-12);
+        // A recall hit is exposure, not a judgment: no entity posterior is created.
+        assert!(s.entity_posteriors.is_empty());
+        assert!(s.entity_posteriors.get(&id).is_none());
+    }
+
+    #[test]
+    fn recall_hit_without_judgment_leaves_entity_posteriors_unchanged() {
+        let mut s = fresh();
+        let judged = Uuid::new_v4();
+        let returned = Uuid::new_v4();
+        on_explicit_feedback(&mut s, judged, "useful");
+        let (judged_alpha, judged_beta) = {
+            let ep = s.entity_posteriors.get(&judged).unwrap();
+            (ep.alpha(), ep.beta())
+        };
+        let (rel_alpha, rel_beta) = (s.relevance.alpha(), s.relevance.beta());
+        let (tmp_alpha, tmp_beta) = (s.temporal.alpha(), s.temporal.beta());
+
+        on_recall_hit(&mut s, returned, 10_000);
+        on_recall_hit(&mut s, judged, 10_000);
+
+        // The entity-blind relevance and temporal posteriors still move.
+        assert!((s.relevance.alpha() - (rel_alpha + 2.0)).abs() < 1e-12);
+        assert!((s.relevance.beta() - rel_beta).abs() < 1e-12);
+        assert!((s.temporal.alpha() - (tmp_alpha + 2.0)).abs() < 1e-12);
+        assert!((s.temporal.beta() - tmp_beta).abs() < 1e-12);
+        // No per-entity posterior moved: the returned entity has none, and the
+        // judged entity keeps exactly the evidence its judgment produced.
+        assert!(s.entity_posteriors.get(&returned).is_none());
+        let ep = s.entity_posteriors.get(&judged).unwrap();
+        assert!((ep.alpha() - judged_alpha).abs() < 1e-12);
+        assert!((ep.beta() - judged_beta).abs() < 1e-12);
     }
 
     #[test]

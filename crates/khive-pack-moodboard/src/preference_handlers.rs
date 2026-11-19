@@ -13,7 +13,7 @@ use khive_runtime::{
 };
 use khive_storage::blob::ContentRef;
 use khive_storage::event::{Event, EventFilter};
-use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
+use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{AttachmentSubstrate, BlobStore, Entity, NewAttachment};
 use khive_types::{EdgeRelation, EventKind, EventOutcome, SubstrateKind};
 
@@ -1204,11 +1204,9 @@ async fn load_judgment_snapshot(
 }
 
 /// Collect up to `max_rows` events for `base_filter` by walking a strict
-/// descending `before` cursor at `offset: 0`, requesting at most `page_size`
-/// (clamped to the events-daemon transport cap) rows per query — the same
-/// technique `khive-pack-brain`'s `collect_events_cursor_walk` uses for its
-/// split-store reads (duplicated here rather than shared: that helper is
-/// crate-private to `khive-pack-brain`).
+/// descending `before` cursor at `offset: 0` through the shared runtime visitor,
+/// requesting pages initially sized by `page_size` and widened only up to the
+/// events-daemon transport cap.
 ///
 /// `before` is a strict `created_at <` bound, so stepping the cursor to the
 /// last row's timestamp would drop rows sharing that microsecond beyond the
@@ -1225,93 +1223,24 @@ async fn collect_judgment_events_cursor_walk(
     page_size: u32,
     max_rows: u64,
 ) -> Result<Vec<Event>, RuntimeError> {
-    let cap = khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS;
-    let mut items: Vec<Event> = Vec::new();
-    let mut cursor: Option<i64> = base_filter.before;
-    let mut boundary_at: Option<i64> = None;
-    let mut boundary_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-    let mut fetch_limit = page_size.clamp(1, cap);
-    while (items.len() as u64) < max_rows {
-        let mut filter = base_filter.clone();
-        filter.before = cursor;
-        let page = store
-            .query_events(
-                filter,
-                PageRequest {
-                    offset: 0,
-                    limit: fetch_limit,
-                },
-            )
-            .await?;
-        let fetched = page.items.len() as u64;
-        let fresh: Vec<Event> = page
-            .items
-            .into_iter()
-            .filter(|event| !boundary_ids.contains(&event.id))
-            .collect();
-        if fresh.is_empty() {
-            if fetched < u64::from(fetch_limit) {
-                // The store returned everything under the cursor and all of
-                // it was already collected: the window is exhausted.
-                break;
-            }
-            // A full page of already-collected boundary rows: the tie run at
-            // this microsecond fills the page. Widen and re-read — but only
-            // up to the transport cap, past which the daemon refuses the
-            // request.
-            if fetch_limit >= cap {
-                let boundary = boundary_at.ok_or_else(|| {
-                    RuntimeError::Internal(
-                        "moodboard judgment cursor walk saw duplicate rows before any boundary"
-                            .to_string(),
-                    )
-                })?;
-                let mut ge_boundary = base_filter.clone();
-                ge_boundary.after = boundary.checked_sub(1).or(base_filter.after);
-                let ge_total = store.count_events(ge_boundary).await?;
-                if ge_total == items.len() as u64 {
-                    cursor = Some(boundary);
-                    continue;
-                }
-                return Err(RuntimeError::InvalidInput(format!(
-                    "moodboard.train_preference cannot page this actor's judgment snapshot: \
-                     more than {fetch_limit} judgments share one created_at microsecond, which \
-                     exceeds the event transport's page cap"
-                )));
-            }
-            fetch_limit = fetch_limit.saturating_mul(2).min(cap);
-            continue;
-        }
-        // Pages come back created_at DESC, so the last fresh row carries the
-        // new boundary microsecond.
-        let boundary = fresh
-            .last()
-            .map(|event| event.created_at)
-            .expect("fresh is non-empty");
-        if boundary_at != Some(boundary) {
-            boundary_ids.clear();
-            boundary_at = Some(boundary);
-        }
-        boundary_ids.extend(
-            fresh
-                .iter()
-                .filter(|event| event.created_at == boundary)
-                .map(|event| event.id),
-        );
-        items.extend(fresh);
-        cursor = if boundary == i64::MAX {
-            cursor
-        } else {
-            Some(boundary + 1)
-        };
-        if fetched < u64::from(fetch_limit) {
-            break;
-        }
-    }
-    // A page may carry the collection past `max_rows`; the bound is a row
-    // budget, so surplus rows from the final page are dropped rather than
-    // returned over-budget.
-    items.truncate(usize::try_from(max_rows).unwrap_or(usize::MAX));
+    let mut items = Vec::new();
+    khive_runtime::visit_events_cursor_walk(store, base_filter, page_size, max_rows, |event| {
+        items.push(event)
+    })
+    .await
+    .map_err(|cause| match cause {
+        khive_runtime::EventCursorWalkError::Storage(error) => RuntimeError::from(error),
+        khive_runtime::EventCursorWalkError::MissingBoundary => RuntimeError::Internal(
+            "moodboard judgment cursor walk saw duplicate rows before any boundary".to_string(),
+        ),
+        khive_runtime::EventCursorWalkError::DenseTimestampTie {
+            page_limit: fetch_limit,
+        } => RuntimeError::InvalidInput(format!(
+            "moodboard.train_preference cannot page this actor's judgment snapshot: \
+                 more than {fetch_limit} judgments share one created_at microsecond, which \
+                 exceeds the event transport's page cap"
+        )),
+    })?;
     Ok(items)
 }
 
@@ -1766,37 +1695,45 @@ mod tests {
     }
 
     fn canonical_v20_backend(db_path: &Path) -> Arc<StorageBackend> {
-        let backend = Arc::new(StorageBackend::sqlite(db_path).expect("V20 fixture backend"));
-        let mut writer = backend.pool().try_writer().expect("V20 fixture writer");
-        let conn = writer.conn_mut();
-        conn.execute_batch(
-            "CREATE TABLE _schema_migrations (\
+        let backend =
+            Arc::new(StorageBackend::sqlite_for_test(db_path).expect("V20 fixture backend"));
+        backend
+            .pool()
+            .try_writer()
+            .expect("V20 fixture writer")
+            .autocommit(|conn| {
+                conn.execute_batch(
+                    "CREATE TABLE _schema_migrations (\
                  version INTEGER PRIMARY KEY, \
                  name TEXT NOT NULL, \
                  applied_at INTEGER NOT NULL\
              ) STRICT;",
-        )
-        .expect("create V20 fixture migration ledger");
-        for migration in MIGRATIONS
-            .iter()
-            .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
-        {
-            let tx = conn.transaction().expect("begin V20 fixture migration");
-            tx.execute_batch(migration.up)
-                .unwrap_or_else(|error| panic!("apply V{}: {error}", migration.version));
-            tx.execute(
-                "INSERT INTO _schema_migrations (version, name, applied_at) \
+                )
+                .expect("create V20 fixture migration ledger");
+                for migration in MIGRATIONS
+                    .iter()
+                    .filter(|migration| migration.version < ATTACHMENT_CUTOVER_VERSION)
+                {
+                    let tx = conn
+                        .unchecked_transaction()
+                        .expect("begin V20 fixture migration");
+                    tx.execute_batch(migration.up)
+                        .unwrap_or_else(|error| panic!("apply V{}: {error}", migration.version));
+                    tx.execute(
+                        "INSERT INTO _schema_migrations (version, name, applied_at) \
                  VALUES (?1, ?2, ?3)",
-                (
-                    migration.version,
-                    migration.name,
-                    i64::from(migration.version),
-                ),
-            )
-            .unwrap_or_else(|error| panic!("record V{}: {error}", migration.version));
-            tx.commit().expect("commit V20 fixture migration");
-        }
-        drop(writer);
+                        (
+                            migration.version,
+                            migration.name,
+                            i64::from(migration.version),
+                        ),
+                    )
+                    .unwrap_or_else(|error| panic!("record V{}: {error}", migration.version));
+                    tx.commit().expect("commit V20 fixture migration");
+                }
+                Ok(())
+            })
+            .expect("seed V20 fixture");
         backend
     }
 
@@ -2468,9 +2405,9 @@ mod tests {
                 .try_writer()
                 .expect("legacy fixture writer");
             writer
-                .conn()
-                .execute(
-                    "INSERT INTO entities (\
+                .autocommit(|conn| {
+                    Ok(conn.execute(
+                        "INSERT INTO entities (\
                          id, namespace, kind, entity_type, name, description, properties, tags, \
                          created_at, updated_at, deleted_at, merged_into, merge_event_id, \
                          content_ref\
@@ -2478,17 +2415,18 @@ mod tests {
                          ?1, 'local', 'artifact', 'moodboard_model', 'legacy preference model', \
                          NULL, ?2, '[]', ?3, ?3, NULL, NULL, NULL, ?4\
                      )",
-                    (
-                        model_id.to_string(),
-                        entity
-                            .properties
-                            .as_ref()
-                            .expect("model property mirror")
-                            .to_string(),
-                        entity.created_at,
-                        bundle_content_ref.to_string(),
-                    ),
-                )
+                        (
+                            model_id.to_string(),
+                            entity
+                                .properties
+                                .as_ref()
+                                .expect("model property mirror")
+                                .to_string(),
+                            entity.created_at,
+                            bundle_content_ref.to_string(),
+                        ),
+                    )?)
+                })
                 .expect("insert pre-V21 legacy model");
         }
         {
@@ -2500,8 +2438,7 @@ mod tests {
                 .try_writer()
                 .expect("legacy fixture writer");
             writer
-                .conn()
-                .execute(
+                .autocommit(|conn| Ok(conn.execute(
                     "INSERT INTO events (\
                          id, namespace, verb, substrate, actor, kind, outcome, payload, \
                          payload_schema_version, profile_state_version, duration_us, target_id, \
@@ -2527,7 +2464,7 @@ mod tests {
                         published_event.aggregate_id.map(|id| id.to_string()),
                         published_event.created_at,
                     ),
-                )
+                )?))
                 .expect("insert immutable legacy model event");
         }
 

@@ -69,6 +69,7 @@ fn effective_config_uses_defaults() {
         tag_mode: TagMode::Any,
         exclude_tags: None,
         include_source_id: None,
+        include_timings: None,
         entity_names: None,
         full_content: None,
         profile_id: None,
@@ -103,6 +104,7 @@ fn effective_config_legacy_overrides() {
         tag_mode: TagMode::Any,
         exclude_tags: None,
         include_source_id: None,
+        include_timings: None,
         entity_names: None,
         full_content: None,
         profile_id: None,
@@ -139,6 +141,7 @@ fn effective_config_explicit_config_wins() {
         tag_mode: TagMode::Any,
         exclude_tags: None,
         include_source_id: None,
+        include_timings: None,
         entity_names: None,
         full_content: None,
         profile_id: None,
@@ -179,6 +182,7 @@ fn test_weighted_strategy_preserves_pack_weights() {
         tag_mode: TagMode::Any,
         exclude_tags: None,
         include_source_id: None,
+        include_timings: None,
         entity_names: None,
         full_content: None,
         profile_id: None,
@@ -242,6 +246,7 @@ fn test_weighted_strategy_from_rrf_config_uses_vector_heavy_defaults() {
         tag_mode: TagMode::Any,
         exclude_tags: None,
         include_source_id: None,
+        include_timings: None,
         entity_names: None,
         full_content: None,
         profile_id: None,
@@ -334,7 +339,7 @@ fn fusion_strategy_change_produces_observable_ordering_difference() {
         fuse_strategy: FusionStrategy::Rrf { k: 60 },
         ..RecallConfig::default()
     };
-    let rrf_results = fuse_candidates(&candidates_rrf, &memory_ids, &cfg_rrf, 10);
+    let rrf_results = fuse_candidates(&candidates_rrf, &memory_ids, &cfg_rrf, 10).unwrap();
     let rrf_order: Vec<Uuid> = rrf_results.iter().map(|h| h.entity_id).collect();
 
     let candidates_weighted = RecallCandidateSet {
@@ -353,7 +358,8 @@ fn fusion_strategy_change_produces_observable_ordering_difference() {
         },
         ..RecallConfig::default()
     };
-    let weighted_results = fuse_candidates(&candidates_weighted, &memory_ids, &cfg_weighted, 10);
+    let weighted_results =
+        fuse_candidates(&candidates_weighted, &memory_ids, &cfg_weighted, 10).unwrap();
     let weighted_order: Vec<Uuid> = weighted_results.iter().map(|h| h.entity_id).collect();
 
     assert_ne!(
@@ -413,7 +419,7 @@ fn vector_only_fusion_unions_hits_across_every_engine() {
         ..RecallConfig::default()
     };
 
-    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10);
+    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10).unwrap();
     let ids: Vec<Uuid> = results.iter().map(|h| h.entity_id).collect();
 
     assert!(
@@ -461,7 +467,7 @@ fn vector_only_with_zero_vector_models_never_leaks_text_hits() {
         ..RecallConfig::default()
     };
 
-    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10);
+    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10).unwrap();
 
     assert!(
         results.is_empty(),
@@ -514,7 +520,7 @@ fn keyword_only_with_zero_vector_models_still_returns_text_hits() {
         ..RecallConfig::default()
     };
 
-    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10);
+    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10).unwrap();
     let ids: Vec<Uuid> = results.iter().map(|h| h.entity_id).collect();
 
     assert_eq!(
@@ -577,7 +583,7 @@ fn multi_engine_rrf_gives_each_engine_a_separate_rank_contribution() {
         ..RecallConfig::default()
     };
 
-    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10);
+    let results = fuse_candidates(&candidates, &memory_ids, &cfg, 10).unwrap();
     let ids: Vec<Uuid> = results.iter().map(|h| h.entity_id).collect();
 
     assert_eq!(
@@ -627,6 +633,40 @@ fn compute_score_rrf_strategy_normalizes_to_comparable_range() {
         "RRF rank-1 relevance should normalize to 1.0, got {}",
         bd.relevance
     );
+}
+
+#[test]
+fn compute_score_weighted_rrf_normalizes_by_the_heaviest_weight() {
+    let cfg = RecallConfig {
+        fuse_strategy: FusionStrategy::weighted_rrf(60, vec![2.0, 0.5]),
+        ..RecallConfig::default()
+    };
+    let pipeline = make_pipeline(&cfg);
+    let raw_rank1_in_heaviest = 2.0 / 61.0;
+    let (_, bd) = compute_score(&cfg, &pipeline, raw_rank1_in_heaviest, 1.0, 0.0, 0.0);
+    assert!(
+        (bd.relevance - 1.0).abs() < 1e-10,
+        "rank-1 in the heaviest source should normalize to 1.0, got {}",
+        bd.relevance
+    );
+    let raw_rank1_in_lightest = 0.5 / 61.0;
+    let (_, bd) = compute_score(&cfg, &pipeline, raw_rank1_in_lightest, 1.0, 0.0, 0.0);
+    assert!(
+        (bd.relevance - 0.25).abs() < 1e-10,
+        "rank-1 in the lightest source should normalize to its weight share, got {}",
+        bd.relevance
+    );
+    let unit = RecallConfig {
+        fuse_strategy: FusionStrategy::weighted_rrf(60, vec![1.0, 1.0]),
+        ..RecallConfig::default()
+    };
+    let (_, unit_bd) = compute_score(&unit, &make_pipeline(&unit), 2.0 / 61.0, 1.0, 0.0, 0.0);
+    let rrf = RecallConfig {
+        fuse_strategy: FusionStrategy::Rrf { k: 60 },
+        ..RecallConfig::default()
+    };
+    let (_, rrf_bd) = compute_score(&rrf, &make_pipeline(&rrf), 2.0 / 61.0, 1.0, 0.0, 0.0);
+    assert!((unit_bd.relevance - rrf_bd.relevance).abs() < 1e-12);
 }
 
 #[test]
@@ -1151,6 +1191,70 @@ fn recall_handler_schema_params_are_all_accepted_by_recall_params() {
 }
 
 #[test]
+fn recall_help_states_the_server_side_caps_it_enforces() {
+    use crate::scoring::{MAX_RECALL_CANDIDATES, MAX_RECALL_LIMIT, MAX_TOKEN_BUDGET};
+    use khive_types::Pack;
+
+    let recall_def = <crate::MemoryPack as Pack>::HANDLERS
+        .iter()
+        .find(|h| h.name == "memory.recall")
+        .expect("memory.recall HandlerDef exists");
+    let caps = format!(
+        "clamp config.scoring.max_recall_candidates to {MAX_RECALL_CANDIDATES}, \
+         config.scoring.default_token_budget to {MAX_TOKEN_BUDGET} tokens, \
+         and the result limit (limit or top_k) to {MAX_RECALL_LIMIT}."
+    );
+    assert!(
+        recall_def.description.contains(&caps),
+        "memory.recall help must state the enforced caps: {caps}"
+    );
+    for name in ["limit", "top_k"] {
+        let param = recall_def
+            .params
+            .iter()
+            .find(|p| p.name == name)
+            .expect("memory.recall advertises the param");
+        assert!(
+            param
+                .description
+                .contains(&format!("max {MAX_RECALL_LIMIT})")),
+            "{name} help must state the enforced maximum {MAX_RECALL_LIMIT}: {}",
+            param.description
+        );
+    }
+}
+
+#[test]
+fn recall_help_states_the_scaled_entity_term_and_its_breakdown_fields() {
+    use khive_types::Pack;
+
+    let recall_def = <crate::MemoryPack as Pack>::HANDLERS
+        .iter()
+        .find(|h| h.name == "memory.recall")
+        .expect("memory.recall HandlerDef exists");
+    let param = |name: &str| {
+        recall_def
+            .params
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("memory.recall advertises {name}"))
+            .description
+    };
+    let min_score = param("min_score");
+    assert!(
+        min_score.contains("1 + (t0 - 1) * n / (n + 16)"),
+        "min_score help must state the evidence-scaled entity term: {min_score}"
+    );
+    let breakdown = param("include_breakdown");
+    for field in ["`entity_posterior_mean`", "`entity_evidence_mass`"] {
+        assert!(
+            breakdown.contains(field),
+            "include_breakdown help must list {field}: {breakdown}"
+        );
+    }
+}
+
+#[test]
 fn recall_params_distinguish_missing_session_fields_from_explicit_null() {
     let missing: RecallParams = serde_json::from_value(serde_json::json!({"query": "x"}))
         .expect("missing session controls are optional");
@@ -1168,4 +1272,257 @@ fn recall_params_distinguish_missing_session_fields_from_explicit_null() {
     assert_eq!(explicit_null.consistency.as_ref(), Some(&Value::Null));
     assert_eq!(explicit_null.visibility_token.as_ref(), Some(&Value::Null));
     assert_eq!(explicit_null.timeout_ms.as_ref(), Some(&Value::Null));
+}
+
+// ── fusion_strategy request resolution ───────────────────────────────────
+
+/// Resolve `requested` against `configured` the way `memory.recall` does: take the effective
+/// configuration for the request, then apply the strategy the request names.
+fn resolve_request_config(requested: Option<&str>, configured: RecallConfig) -> RecallConfig {
+    let mut params = serde_json::json!({ "query": "fusion probe" });
+    if let Some(name) = requested {
+        params["fusion_strategy"] = serde_json::json!(name);
+    }
+    let p: RecallParams = serde_json::from_value(params).expect("recall params");
+    let mut cfg = p.effective_config(configured);
+    apply_requested_fusion_strategy(&mut cfg, p.fusion_strategy.as_deref())
+        .expect("named strategy applies");
+    cfg
+}
+
+/// Fuse a fixed pair of ranked lists under `cfg` and return the scores in fused order.
+///
+/// `id_a` ranks first in text and second in vector, `id_c` ranks first in vector and `id_b`
+/// second in text, so under RRF the order is a, c, b and every score depends on the constant.
+fn fused_probe_scores(cfg: &RecallConfig) -> Vec<f64> {
+    use khive_storage::types::{TextSearchHit, VectorSearchHit};
+    use std::collections::HashSet;
+
+    let id_a = Uuid::from_u128(0xAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA);
+    let id_b = Uuid::from_u128(0xBBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB);
+    let id_c = Uuid::from_u128(0xCCCC_CCCC_CCCC_CCCC_CCCC_CCCC_CCCC_CCCC);
+
+    let text_hits = vec![
+        TextSearchHit {
+            subject_id: id_a,
+            score: 0.9_f64.into(),
+            rank: 1,
+            title: None,
+            snippet: None,
+        },
+        TextSearchHit {
+            subject_id: id_b,
+            score: 0.5_f64.into(),
+            rank: 2,
+            title: None,
+            snippet: None,
+        },
+    ];
+    let vector_hits = vec![
+        VectorSearchHit {
+            subject_id: id_c,
+            score: 0.95_f64.into(),
+            rank: 1,
+        },
+        VectorSearchHit {
+            subject_id: id_a,
+            score: 0.3_f64.into(),
+            rank: 2,
+        },
+    ];
+    let memory_ids: HashSet<Uuid> = [id_a, id_b, id_c].into_iter().collect();
+    let candidates = RecallCandidateSet {
+        namespace: "local".to_string(),
+        text_hits,
+        vector_hits_per_model: vec![("mock".to_string(), vector_hits)],
+        visible_namespaces: vec!["local".to_string()],
+        ann_degraded: false,
+        ann_degraded_reason: None,
+        session_unmet_models: Vec::new(),
+        timings: RecallStageTimings::default(),
+    };
+
+    fuse_candidates(&candidates, &memory_ids, cfg, 10)
+        .unwrap()
+        .iter()
+        .map(|h| h.score.to_f64())
+        .collect()
+}
+
+/// The scores `fused_probe_scores` yields under RRF with constant `k`, in fused order.
+fn rrf_probe_expected(k: f64) -> [f64; 3] {
+    [
+        1.0 / (k + 1.0) + 1.0 / (k + 2.0),
+        1.0 / (k + 1.0),
+        1.0 / (k + 2.0),
+    ]
+}
+
+fn assert_scores_match(actual: &[f64], expected: [f64; 3], context: &str) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{context}: expected {expected:?}, got {actual:?}"
+    );
+    for (got, want) in actual.iter().zip(expected) {
+        assert!(
+            (got - want).abs() < 1e-6,
+            "{context}: expected {expected:?}, got {actual:?}"
+        );
+    }
+}
+
+#[test]
+fn request_naming_rrf_fuses_with_the_configured_constant() {
+    let configured = RecallConfig {
+        fuse_strategy: FusionStrategy::Rrf { k: 25 },
+        ..RecallConfig::default()
+    };
+
+    let cfg = resolve_request_config(Some("rrf"), configured);
+
+    assert_eq!(
+        cfg.fuse_strategy,
+        FusionStrategy::Rrf { k: 25 },
+        "a request naming rrf must keep the configured constant, not a literal 60"
+    );
+    assert_scores_match(
+        &fused_probe_scores(&cfg),
+        rrf_probe_expected(25.0),
+        "rrf request under a configured constant of 25",
+    );
+}
+
+#[test]
+fn request_naming_rrf_scores_follow_the_configured_constant() {
+    let at_default = resolve_request_config(Some("rrf"), RecallConfig::default());
+    let at_sixty = resolve_request_config(
+        Some("rrf"),
+        RecallConfig {
+            fuse_strategy: FusionStrategy::Rrf { k: 60 },
+            ..RecallConfig::default()
+        },
+    );
+
+    let default_scores = fused_probe_scores(&at_default);
+    let sixty_scores = fused_probe_scores(&at_sixty);
+
+    assert_scores_match(
+        &default_scores,
+        rrf_probe_expected(10.0),
+        "rrf request under the default configuration",
+    );
+    assert_scores_match(
+        &sixty_scores,
+        rrf_probe_expected(60.0),
+        "rrf request under a configured constant of 60",
+    );
+    for (low_k, high_k) in default_scores.iter().zip(&sixty_scores) {
+        assert!(
+            low_k > high_k,
+            "a smaller configured constant must score every hit higher: \
+             {default_scores:?} vs {sixty_scores:?}"
+        );
+    }
+}
+
+#[test]
+fn request_naming_rrf_without_a_configured_constant_uses_the_fusion_default() {
+    let configured = RecallConfig {
+        fuse_strategy: FusionStrategy::Union,
+        ..RecallConfig::default()
+    };
+
+    let cfg = resolve_request_config(Some("rrf"), configured);
+
+    assert_eq!(
+        cfg.fuse_strategy,
+        FusionStrategy::Rrf { k: 60 },
+        "with no configured constant to keep, rrf falls back to the fusion default"
+    );
+    assert_scores_match(
+        &fused_probe_scores(&cfg),
+        rrf_probe_expected(60.0),
+        "rrf request under a configuration that is not rrf",
+    );
+}
+
+#[test]
+fn request_naming_no_strategy_leaves_the_configured_fusion_unchanged() {
+    let configured = RecallConfig {
+        fuse_strategy: FusionStrategy::Rrf { k: 25 },
+        ..RecallConfig::default()
+    };
+
+    let cfg = resolve_request_config(None, configured);
+
+    assert_eq!(
+        cfg.fuse_strategy,
+        FusionStrategy::Rrf { k: 25 },
+        "a request naming no strategy must keep the configured fusion"
+    );
+    assert_scores_match(
+        &fused_probe_scores(&cfg),
+        rrf_probe_expected(25.0),
+        "request naming no strategy under a configured constant of 25",
+    );
+
+    let at_default = resolve_request_config(None, RecallConfig::default());
+
+    assert_eq!(
+        at_default.fuse_strategy,
+        RecallConfig::default().fuse_strategy,
+        "a request naming no strategy must keep the default fusion"
+    );
+    assert_scores_match(
+        &fused_probe_scores(&at_default),
+        rrf_probe_expected(10.0),
+        "request naming no strategy under the default configuration",
+    );
+}
+
+#[test]
+fn request_naming_weighted_keeps_the_configured_weights() {
+    let configured = RecallConfig {
+        fuse_strategy: FusionStrategy::Weighted {
+            weights: vec![0.8, 0.2],
+        },
+        ..RecallConfig::default()
+    };
+
+    let cfg = resolve_request_config(Some("weighted"), configured);
+
+    assert_eq!(
+        cfg.fuse_strategy,
+        FusionStrategy::Weighted {
+            weights: vec![0.8, 0.2],
+        },
+        "a request naming weighted must keep the configured weights"
+    );
+}
+
+// ── local_factor_from_profile_response ───────────────────────────────────
+
+#[test]
+fn local_factor_is_read_from_the_profile_response_as_an_f32() {
+    for stored in [0.5_f64, 0.7, 1.0] {
+        let resp = serde_json::json!({ "local_factor": stored });
+        assert_eq!(local_factor_from_profile_response(&resp), stored as f32);
+    }
+    let integer = serde_json::json!({ "local_factor": 1 });
+    assert_eq!(local_factor_from_profile_response(&integer), 1.0_f32);
+}
+
+#[test]
+fn local_factor_is_one_when_the_profile_response_has_no_usable_value() {
+    for resp in [
+        serde_json::json!({}),
+        serde_json::json!({ "local_factor": null }),
+        serde_json::json!({ "local_factor": "0.7" }),
+        serde_json::json!({ "local_factor": 0.49 }),
+        serde_json::json!({ "local_factor": 1.01 }),
+        serde_json::json!({ "local_factor": -0.7 }),
+    ] {
+        assert_eq!(local_factor_from_profile_response(&resp), 1.0_f32, "{resp}");
+    }
 }

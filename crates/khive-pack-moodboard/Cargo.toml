@@ -12,17 +12,40 @@ categories.workspace = true
 description = "Experimental Khive-native visual retrieval and pairwise preference learning"
 
 [dependencies]
-khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.9.0", path = "../khive-runtime" }
-khive-storage = { version = "0.9.0", path = "../khive-storage" }
+khive-retrieval = { version = "0.20.0", path = "../khive-retrieval" }
+khive-fusion = { version = "0.20.0", path = "../khive-fusion" }
+khive-score = { version = "0.20.0", path = "../khive-score" }
+khive-fs = { version = "0.20.0", path = "../khive-fs" }
+khive-types = { version = "0.20.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.20.0", path = "../khive-runtime" }
+khive-storage = { version = "0.20.0", path = "../khive-storage" }
 async-trait = { workspace = true }
 base64 = { workspace = true }
-blake3 = { workspace = true }
+blake3 = { workspace = true, features = ["std"] }
 image = { workspace = true }
 inventory = { workspace = true }
 lattice-embed = { workspace = true }
 lattice-inference = { workspace = true }
 lattice-fann = { workspace = true }
+# Not imported. These pin, to the exact version the descriptor records, every lattice
+# crate that lattice-embed, lattice-inference and lattice-fann resolve to, so the published
+# pack graph cannot float the descriptor math under an unchanged fingerprint.
+lattice-arch = { workspace = true }
+lattice-compute = { workspace = true }
+lattice-forecast = { workspace = true }
+lattice-grammar = { workspace = true }
+lattice-inference-core = { workspace = true }
+lattice-lora = { workspace = true }
+lattice-model-bert = { workspace = true }
+lattice-model-embeddinggemma2 = { workspace = true }
+lattice-model-io = { workspace = true }
+lattice-model-qwen3-embedding = { workspace = true }
+lattice-model-qwen35 = { workspace = true }
+lattice-quant = { workspace = true }
+lattice-router = { workspace = true }
+lattice-simd = { workspace = true }
+lattice-tokenizer = { workspace = true }
+lattice-weights = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -30,18 +53,9 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_Storage_FileSystem",
-] }
-
 [dev-dependencies]
-khive-db = { version = "0.9.0", path = "../khive-db" }
-khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
+khive-db = { version = "0.20.0", path = "../khive-db", features = ["test-support"] }
+khive-pack-kg = { version = "0.20.0", path = "../khive-pack-kg" }
 toml = { workspace = true }
 
 [[test]]

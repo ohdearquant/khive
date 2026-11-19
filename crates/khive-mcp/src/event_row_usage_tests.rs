@@ -1,4 +1,5 @@
 //! Real storage writes observed through the production usage-envelope stamper.
+use khive_db::test_hooks::TestHooks;
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -411,8 +412,9 @@ fn pool(file_backed: bool, queued: bool) -> (Arc<ConnectionPool>, Option<tempfil
     );
     pool.writer()
         .unwrap()
-        .conn()
-        .execute_batch(include_str!("../../khive-db/sql/events-ddl.sql"))
+        .autocommit(|conn| {
+            Ok(conn.execute_batch(include_str!("../../khive-db/sql/events-ddl.sql"))?)
+        })
         .unwrap();
     (pool, directory)
 }
@@ -481,8 +483,9 @@ async fn atomic_batch_counts_events_without_observation_or_unrelated_rows() {
         let (pool, _directory) = pool(file_backed, queued);
         pool.writer()
             .unwrap()
-            .conn()
-            .execute_batch("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+            .autocommit(|conn| {
+                Ok(conn.execute_batch("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")?)
+            })
             .unwrap();
         let bridge = khive_db::sql_bridge::SqlBridge::new(Arc::clone(&pool), file_backed);
         let store = khive_db::stores::event::SqlEventStore::new_scoped(
@@ -604,8 +607,7 @@ async fn unknown_atomic_write_outcome_omits_usage_from_the_real_envelope() {
     let (pool, _directory) = pool(false, false);
     pool.writer()
         .unwrap()
-        .conn()
-        .authorizer(Some(deny_rollback))
+        .autocommit(|conn| Ok(conn.test_authorizer(Some(deny_rollback))?))
         .unwrap();
     let bridge = khive_db::sql_bridge::SqlBridge::new(Arc::clone(&pool), false);
     let statements = khive_db::stores::event::event_insert_statements(&event()).unwrap();
@@ -637,7 +639,8 @@ async fn unknown_atomic_write_outcome_omits_usage_from_the_real_envelope() {
                 request_state: WriterTaskRequestState::SideEffectsUnknown,
                 ..
             }) | Err(StorageError::WriterTaskTerminated {
-                request_state: WriterTaskRequestState::SideEffectsUnknown
+                request_state: WriterTaskRequestState::SideEffectsUnknown,
+                ..
             })
         ),
         "{:?}",

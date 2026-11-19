@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
-    KhiveRuntime, KindHook, NamespaceToken, NoteKindSpec, RuntimeError, SchemaPlan, VerbRegistry,
+    KhiveRuntime, KindHook, NamespaceToken, NoteKindSpec, RuntimeError, VerbRegistry,
 };
 use khive_types::{EdgeEndpointRule, HandlerDef, Pack};
 
@@ -29,7 +29,11 @@ impl Pack for FormalPack {
     const EDGE_RULES: &'static [EdgeEndpointRule] = &FORMAL_EDGE_RULES;
     const REQUIRES: &'static [&'static str] = &["kg"];
     const NOTE_KIND_SPECS: &'static [NoteKindSpec] = &[];
-    const SCHEMA_PLAN: Option<khive_runtime::PackSchemaPlan> = None;
+    const SCHEMA_PLAN: Option<khive_runtime::PackSchemaPlan> =
+        Some(khive_runtime::PackSchemaPlan {
+            pack: "formal",
+            statements: &[],
+        });
 }
 
 impl FormalPack {
@@ -42,13 +46,7 @@ impl FormalPack {
 struct FormalPackFactory;
 
 impl khive_runtime::PackFactory for FormalPackFactory {
-    fn name(&self) -> &'static str {
-        "formal"
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        &["kg"]
-    }
+    khive_runtime::pack_factory_metadata!(FormalPack);
 
     fn intentionally_verbless(&self) -> bool {
         true
@@ -63,40 +61,7 @@ inventory::submit! { khive_runtime::PackRegistration(&FormalPackFactory) }
 
 #[async_trait]
 impl PackRuntime for FormalPack {
-    fn name(&self) -> &str {
-        <FormalPack as Pack>::NAME
-    }
-
-    fn note_kinds(&self) -> &'static [&'static str] {
-        <FormalPack as Pack>::NOTE_KINDS
-    }
-
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        <FormalPack as Pack>::ENTITY_KINDS
-    }
-
-    fn handlers(&self) -> &'static [HandlerDef] {
-        <FormalPack as Pack>::HANDLERS
-    }
-
-    fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
-        <FormalPack as Pack>::EDGE_RULES
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        <FormalPack as Pack>::REQUIRES
-    }
-
-    fn note_kind_specs(&self) -> &'static [NoteKindSpec] {
-        <FormalPack as Pack>::NOTE_KIND_SPECS
-    }
-
-    fn schema_plan(&self) -> SchemaPlan {
-        SchemaPlan {
-            pack: "formal",
-            statements: &[],
-        }
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     fn kind_hook(&self, _kind: &str) -> Option<Arc<dyn KindHook>> {
         None
@@ -116,50 +81,5 @@ impl PackRuntime for FormalPack {
 }
 
 #[cfg(test)]
-mod tests {
-    use khive_types::{EdgeRelation, EndpointKind};
-
-    use super::FORMAL_EDGE_RULES;
-
-    #[test]
-    fn formal_edge_rules_contains_variant_of_theorem_to_theorem() {
-        let found = FORMAL_EDGE_RULES.iter().any(|r| {
-            r.relation == EdgeRelation::VariantOf
-                && r.source
-                    == EndpointKind::EntityOfType {
-                        kind: "concept",
-                        entity_type: "theorem",
-                    }
-                && r.target
-                    == EndpointKind::EntityOfType {
-                        kind: "concept",
-                        entity_type: "theorem",
-                    }
-        });
-        assert!(
-            found,
-            "FORMAL_EDGE_RULES must contain variant_of theorem->theorem"
-        );
-    }
-
-    #[test]
-    fn formal_edge_rules_contains_depends_on_goal_to_theorem() {
-        let found = FORMAL_EDGE_RULES.iter().any(|r| {
-            r.relation == EdgeRelation::DependsOn
-                && r.source
-                    == EndpointKind::EntityOfType {
-                        kind: "concept",
-                        entity_type: "goal",
-                    }
-                && r.target
-                    == EndpointKind::EntityOfType {
-                        kind: "concept",
-                        entity_type: "theorem",
-                    }
-        });
-        assert!(
-            found,
-            "FORMAL_EDGE_RULES must contain depends_on goal->theorem"
-        );
-    }
-}
+#[path = "pack_tests.rs"]
+mod tests;

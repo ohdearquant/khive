@@ -3,7 +3,8 @@
 **Status**: accepted
 **Date**: 2026-07-12 (amended 2026-07-13, PR #922; Amendment 2 accepted and implemented
 2026-07-17, PR #1054; Amendment 3
-accepted 2026-07-17; Amendment 4 accepted 2026-07-19; Amendment 5 accepted 2026-09-24; attachment-GC compatibility epoch added
+accepted 2026-07-17; Amendment 4 accepted 2026-07-19; Amendment 5 accepted 2026-09-24; Amendment 6 proposed 2026-10-15;
+attachment-GC compatibility epoch added
 2026-08-16 by ADR-160; a §8 verb clarification accepted 2026-09-25 appears in ADR-121 Amendment 1)
 **Authors**: khive maintainers
 **Amended by**: [ADR-160](ADR-160-shared-pack-infrastructure.md) (accepted 2026-08-16), which requires
@@ -192,7 +193,9 @@ CapacityFloor {
 
 This is a hard refusal: no silent degrade, no auto-spill to another volume (SPEC-gate ruling,
 2026-07-12). The default floor is 100 GB (`FsBlobStore::DEFAULT_FLOOR_BYTES = 100_000_000_000`),
-config-overridable via `StorageBackend::blob_store`'s `floor_bytes` parameter.
+config-overridable via `StorageBackend::blob_store`'s `floor_bytes` parameter. _(Amendment 6, proposed
+2026-10-15: the default becomes 2% of the volume, at least 5 GiB; see
+[Amendment 6](#amendment-6-2026-10-15-the-default-free-space-floor-scales-with-the-volume).)_
 
 `fs4` (not a hand-rolled `libc::statvfs` call) was chosen specifically because khive's release
 pipeline (`release.yml`) cross-builds for a `windows-latest` target; `fs4::available_space` is
@@ -829,6 +832,48 @@ its last release source. The pin moves from an image digest to three parts:
 The job fails if its port already answers before the server starts, and requires the recorded server
 process to be alive when the health probe succeeds, so the suite cannot pass against a different
 process. Layer 2 remains required; layers 1 and 3 are unchanged.
+
+---
+
+## Amendment 6 (2026-10-15): the default free-space floor scales with the volume
+
+**Status:** proposed.
+
+**Trigger.** #5404. §5 fixes the default floor at 100 GB (`FsBlobStore::DEFAULT_FLOOR_BYTES`). A host
+with about 99 GB free refused every blob write, and the visible casualty was email ingest: a quarantined
+message keeps its original only as a blob, so each refused write lost an original. 100 GB is more than many
+laptops and small servers keep free, and the same number applies to a 256 GB disk and a 4 TB one.
+
+### Decision
+
+1. When no floor is configured, the floor for a root is `max(5 GiB, 2% of the capacity of the volume
+   holding the root)`, computed when the store is constructed
+   (`FsBlobStore::resolve_floor`): 5 GiB on any volume up to 250 GiB (about 268 GB), 20 GB on
+   a 1 TB volume. Capacity comes from the same cross-platform crate as the availability check
+   (`fs4::total_space`), so the Windows build needs no new code path.
+2. An explicit `floor_bytes` (`[storage.blob] floor_bytes`, or `StorageBackend::blob_store`'s argument) is
+   used as given, including `0`. `FsBlobStore::DEFAULT_FLOOR_BYTES` stays, deprecated, so code that names it
+   still builds. The write-size-aware comparison, the per-root serialization and the `CapacityFloor`
+   refusal in §5 are unchanged.
+3. If the capacity cannot be read, construction uses the 5 GiB minimum and logs that it did, rather than
+   failing the store or falling back to 100 GB. A root that does not exist yet is measured on the volume of its
+   nearest existing ancestor.
+4. Nothing new reports the floor: the `CapacityFloor` refusal already names the floor in force, which is
+   where an operator meets it.
+
+### Why not keep 100 GB and document the override
+
+The override already exists and the refusals happened anyway: a default that most small hosts cannot
+meet is a default that refuses by surprise. The floor exists to keep the volume from filling, not to
+reserve a fixed amount; a fraction of the volume says that directly, and the 5 GiB minimum keeps small
+volumes from being driven to zero.
+
+### Consequences
+
+Hosts with large volumes get a lower floor than today; hosts that set `floor_bytes` see no change. The
+refusal path is unchanged, so a write that would cross the new floor is still refused. Making a refused
+retention visible to the operator (a counter in `comm.health` and a notice on the first refusal) belongs
+to the channel that loses the original and is specified with #5404's ingest change, not here.
 
 ---
 

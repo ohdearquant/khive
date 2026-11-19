@@ -13,6 +13,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use serde_json::json;
+use std::cell::OnceCell;
 
 use khive_pack_brain::BrainPack;
 use khive_pack_kg::KgPack;
@@ -62,13 +63,14 @@ fn bench_feedback_plain(c: &mut Criterion) {
     let mut group = c.benchmark_group("brain_pack/feedback_plain");
     group.sample_size(50);
 
-    let rt_tokio = tokio::runtime::Runtime::new().expect("tokio");
+    let rt_tokio = OnceCell::new();
 
     group.bench_function("useful", |b| {
+        let rt_tokio = rt_tokio.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio"));
         b.iter_batched(
             || {
                 let registry = build_registry();
-                let target_id = create_target(&registry, &rt_tokio);
+                let target_id = create_target(&registry, rt_tokio);
                 (registry, target_id)
             },
             |(registry, target_id)| {
@@ -125,7 +127,7 @@ fn bench_feedback_with_sections(c: &mut Criterion) {
     let mut group = c.benchmark_group("brain_pack/feedback_sections");
     group.sample_size(50);
 
-    let rt_tokio = tokio::runtime::Runtime::new().expect("tokio");
+    let rt_tokio = OnceCell::new();
 
     // Primed setup: create a section-enabled profile, warm up its section state
     // with 200 positive events outside the timed closure, then measure the cost
@@ -133,13 +135,14 @@ fn bench_feedback_with_sections(c: &mut Criterion) {
     // every SectionPosteriorState update — the capped path that was previously
     // bypassed because no profile was in section_states.
     group.bench_function("capped_200_opposing", |b| {
+        let rt_tokio = rt_tokio.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio"));
         b.iter_batched(
             || {
                 let registry = build_registry();
-                let target_id = create_target(&registry, &rt_tokio);
+                let target_id = create_target(&registry, rt_tokio);
                 // Create a section-enabled profile so section_states has an
                 // entry for this profile_id.
-                let profile_id = create_section_profile(&registry, &rt_tokio);
+                let profile_id = create_section_profile(&registry, rt_tokio);
                 // Prime 200 positive section events outside the timed path.
                 for _ in 0..200 {
                     rt_tokio
@@ -284,10 +287,12 @@ fn bench_profile_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("brain_pack/profile_read");
     group.sample_size(100);
 
-    let rt_tokio = tokio::runtime::Runtime::new().expect("tokio");
-    let registry = build_registry();
+    let rt_tokio = OnceCell::new();
+    let registry = OnceCell::new();
 
     group.bench_function("balanced_recall_v1", |b| {
+        let rt_tokio = rt_tokio.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio"));
+        let registry = registry.get_or_init(build_registry);
         b.iter(|| {
             rt_tokio.block_on(async {
                 black_box(
@@ -312,9 +317,10 @@ fn bench_reset(c: &mut Criterion) {
     let mut group = c.benchmark_group("brain_pack/reset");
     group.sample_size(50);
 
-    let rt_tokio = tokio::runtime::Runtime::new().expect("tokio");
+    let rt_tokio = OnceCell::new();
 
     group.bench_function("balanced_recall_v1", |b| {
+        let rt_tokio = rt_tokio.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio"));
         b.iter_batched(
             build_registry,
             |registry| {
@@ -340,12 +346,14 @@ fn bench_snapshot_roundtrip(c: &mut Criterion) {
     let mut group = c.benchmark_group("brain_pack/snapshot_roundtrip");
     group.sample_size(100);
 
-    let rt_tokio = tokio::runtime::Runtime::new().expect("tokio");
-    let registry = build_registry();
+    let rt_tokio = OnceCell::new();
+    let registry = OnceCell::new();
 
     // Time the full public-path round-trip: brain.state (to_snapshot serialised
     // to JSON) followed by brain.state again (verifying the state is stable).
     group.bench_function("state_read_twice", |b| {
+        let rt_tokio = rt_tokio.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio"));
+        let registry = registry.get_or_init(build_registry);
         b.iter(|| {
             rt_tokio.block_on(async {
                 let snap1 = registry
@@ -379,12 +387,15 @@ fn bench_snapshot_roundtrip(c: &mut Criterion) {
 // updates section_states.
 
 fn bench_section_posterior_gate(c: &mut Criterion) {
-    let rt_tokio = tokio::runtime::Runtime::new().expect("tokio");
-    // Run the correctness assertion once before any timed work.
-    assert_section_posterior_shifted(&rt_tokio);
+    let rt_tokio = OnceCell::new();
+    let checked = OnceCell::new();
     // One trivial timed iteration so Criterion records a result.
     c.benchmark_group("brain_pack/section_posterior_gate")
-        .bench_function("mean_shift_ge_0_3", |b| b.iter(|| black_box(())));
+        .bench_function("mean_shift_ge_0_3", |b| {
+            let rt_tokio = rt_tokio.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio"));
+            checked.get_or_init(|| assert_section_posterior_shifted(rt_tokio));
+            b.iter(|| black_box(()));
+        });
 }
 
 // ── criterion entry points ────────────────────────────────────────────────────

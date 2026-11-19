@@ -34,24 +34,16 @@ use crate::{
     VerbRegistry,
 };
 
+mod truncate;
+
 #[cfg(test)]
 mod append_failure_tests;
 
-fn statement(sql: &str, params: Vec<SqlValue>) -> SqlStatement {
-    SqlStatement {
-        sql: sql.into(),
-        params,
-        label: Some("stream".into()),
-    }
-}
-
 fn validate_stream(stream: &str) -> RuntimeResult<()> {
-    if stream.len() > 512 || stream.contains('\0') {
-        return Err(RuntimeError::InvalidInput(
-            "stream must be at most 512 UTF-8 bytes and contain no U+0000".into(),
-        ));
-    }
-    Ok(())
+    crate::note_validation::validate_key(
+        stream,
+        "stream must be at most 512 UTF-8 bytes and contain no U+0000",
+    )
 }
 
 fn write_failure(message: &str) -> StorageError {
@@ -111,7 +103,7 @@ impl StreamAppendFailure {
             || source.admission_failure_context().is_some()
             || matches!(
                 &source,
-                RuntimeError::Storage(StorageError::WriterTaskBusy { .. })
+                RuntimeError::Storage(error) if matches!(error.without_sqlite_write_stage(), StorageError::WriterTaskBusy { .. })
             )
         {
             StreamAppendDisposition::NotCommitted
@@ -227,12 +219,11 @@ fn stream_batch_fence_count(members: &[StreamBatchMember], fence: Option<&NoteFe
 }
 
 fn validate_stream_batch_fence_count(count: usize) -> RuntimeResult<()> {
-    if count > MAX_BATCH_FENCE_ENTRIES {
-        return Err(RuntimeError::InvalidInput(format!(
+    crate::note_validation::validate_fence_count(count, MAX_BATCH_FENCE_ENTRIES, || {
+        format!(
             "stream.batch admits at most {MAX_BATCH_FENCE_ENTRIES} total fence entries; this call sent {count}: each fence is a read taken while holding the writer"
-        )));
-    }
-    Ok(())
+        )
+    })
 }
 
 /// The member refusal that stopped an atomic batch; nothing was written.
@@ -265,6 +256,13 @@ fn seq_conflict(stream: &str, expected: i64, next: i64, member: Option<usize>) -
         .with_details(Details::new_owned(pairs))
 }
 
+fn sequence_exhausted() -> KhiveError {
+    KhiveError::invalid_input("stream sequence exhausted").with_details(Details::new_owned([(
+        "reason",
+        "sequence_exhausted".into(),
+    )]))
+}
+
 /// A prepared append: the note, its planned statements and the ledger key.
 struct PreparedAppend {
     stream: String,
@@ -280,6 +278,7 @@ fn append_result(prepared: &PreparedAppend, seq: i64) -> Value {
 
 enum BatchOutcome {
     Appended(Vec<i64>),
+    Exhausted,
     Conflict { next: i64 },
     FenceConflict { conflict: NoteWriteConflict },
 }
@@ -600,8 +599,31 @@ fn allocate_sequence(head: &mut i64, expected: Option<i64>) -> Result<i64, Seque
     if let Some(expected) = expected.filter(|expected| *expected != next) {
         return Err(SequenceRefusal::Conflict { expected, next });
     }
+    // Reserve the final i64 for a whole-prefix floor. Check every allocation,
+    // including a number obtained from this transaction's cached stream head.
+    if next == i64::MAX {
+        return Err(SequenceRefusal::Exhausted);
+    }
     *head = next;
     Ok(next)
+}
+
+// The persisted floor retains the head when truncation removes every entry.
+// Scalar users read the first column; read/truncate also consume the floor.
+const STREAM_POSITION_SQL: &str = "SELECT MAX(\
+    COALESCE((SELECT MAX(seq) FROM note_streams WHERE namespace=?1 AND stream=?2),0), \
+    COALESCE((SELECT floor_seq-1 FROM note_stream_floors WHERE namespace=?1 AND stream=?2),0)) AS head_seq, \
+    COALESCE((SELECT floor_seq FROM note_stream_floors WHERE namespace=?1 AND stream=?2),1) AS floor_seq";
+
+fn stream_position_statement(namespace: &str, stream: &str) -> SqlStatement {
+    SqlStatement::new(
+        STREAM_POSITION_SQL,
+        vec![
+            SqlValue::Text(namespace.into()),
+            SqlValue::Text(stream.into()),
+        ],
+    )
+    .labelled("stream")
 }
 
 async fn insert_stream_entry(
@@ -612,15 +634,18 @@ async fn insert_stream_entry(
     note_id: String,
 ) -> Result<(), StorageError> {
     writer
-        .execute(statement(
-            "INSERT INTO note_streams(namespace,stream,seq,note_id) VALUES (?1,?2,?3,?4)",
-            vec![
-                SqlValue::Text(namespace.into()),
-                SqlValue::Text(stream),
-                SqlValue::Integer(seq),
-                SqlValue::Text(note_id),
-            ],
-        ))
+        .execute(
+            SqlStatement::new(
+                "INSERT INTO note_streams(namespace,stream,seq,note_id) VALUES (?1,?2,?3,?4)",
+                vec![
+                    SqlValue::Text(namespace.into()),
+                    SqlValue::Text(stream),
+                    SqlValue::Integer(seq),
+                    SqlValue::Text(note_id),
+                ],
+            )
+            .labelled("stream"),
+        )
         .await?;
     Ok(())
 }
@@ -643,24 +668,24 @@ async fn apply_stream_member(
             let head = match heads.entry(stream.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    let head = writer.query_scalar(statement(
-                        "SELECT COALESCE(MAX(seq), 0) FROM note_streams WHERE namespace=?1 AND stream=?2",
-                        vec![SqlValue::Text(namespace.into()), SqlValue::Text(stream.clone())],
-                    )).await?;
+                    let head = writer
+                        .query_scalar(stream_position_statement(namespace, &stream))
+                        .await?;
                     let Some(SqlValue::Integer(head)) = head else {
                         return Err(RuntimeError::Internal("invalid stream head".into()));
                     };
                     entry.insert(head)
                 }
             };
-            let next = allocate_sequence(head, expected_seq).map_err(|refusal| match refusal {
-                SequenceRefusal::Exhausted => {
-                    RuntimeError::InvalidInput("stream sequence exhausted".into())
-                }
-                SequenceRefusal::Conflict { expected, next } => {
-                    seq_conflict(&stream, expected, next, None).into()
-                }
-            })?;
+            let next =
+                allocate_sequence(head, expected_seq).map_err(|refusal| -> RuntimeError {
+                    match refusal {
+                        SequenceRefusal::Exhausted => sequence_exhausted().into(),
+                        SequenceRefusal::Conflict { expected, next } => {
+                            seq_conflict(&stream, expected, next, None).into()
+                        }
+                    }
+                })?;
             let applied = apply_plan(writer, &plan, false).await.map_err(|error| {
                 RuntimeError::Internal(format!("stream append plan failed: {error:?}"))
             })?;
@@ -703,10 +728,12 @@ async fn apply_stream_member(
             }
             Err(AtomicOpFailure::NoteConflict(conflict)) => Err(conflict.into_error().into()),
             Err(AtomicOpFailure::GuardFailed { .. }) => {
-                let holder = writer.query_row(statement(
-                        "SELECT id, version FROM notes WHERE namespace=?1 AND kind=?2 AND key=?3 AND deleted_at IS NULL",
-                        vec![SqlValue::Text(namespace.into()), SqlValue::Text(kind), SqlValue::Text(key.clone())],
-                    )).await?;
+                let holder = writer
+                    .query_row(
+                        khive_db::statement_lists::live_holder_read(namespace, &kind, &key)
+                            .labelled("stream"),
+                    )
+                    .await?;
                 let Some(holder) = holder else {
                     return Err(missing_write(&key).into());
                 };
@@ -873,65 +900,62 @@ impl KhiveRuntime {
             Box::pin(async move {
                 let mut writes_started = false;
                 let result = async {
-                let mut heads: Vec<(String, i64)> = Vec::new();
-                for (stream, _, _, _, _) in &entries {
-                    if heads.iter().any(|(known, _)| known == stream) {
-                        continue;
-                    }
-                    let head = writer
-                        .query_scalar(statement(
-                            "SELECT COALESCE(MAX(seq), 0) FROM note_streams WHERE namespace=?1 AND stream=?2",
-                            vec![SqlValue::Text(ns.clone()), SqlValue::Text(stream.clone())],
-                        ))
-                        .await?;
-                    let Some(SqlValue::Integer(head)) = head else {
-                        return Err(write_failure("invalid stream head"));
-                    };
-                    heads.push((stream.clone(), head));
-                }
-                let mut assigned = Vec::with_capacity(entries.len());
-                for (stream, expected_seq, _, _, guard) in &entries {
-                    if let Some(conflict) = guard.check_fence(writer).await? {
-                        return Ok(Box::new(BatchOutcome::FenceConflict { conflict })
-                            as Box<dyn Any + Send>);
-                    }
-                    let head = heads
-                        .iter_mut()
-                        .find(|(known, _)| known == stream)
-                        .map(|(_, head)| head)
-                        .ok_or_else(|| write_failure("stream head missing"))?;
-                    let next = match allocate_sequence(head, *expected_seq) {
-                        Ok(next) => next,
-                        Err(SequenceRefusal::Exhausted) => {
-                            return Err(write_failure("stream sequence exhausted"));
+                    let mut heads: Vec<(String, i64)> = Vec::new();
+                    for (stream, _, _, _, _) in &entries {
+                        if heads.iter().any(|(known, _)| known == stream) {
+                            continue;
                         }
-                        Err(SequenceRefusal::Conflict { next, .. }) => {
-                            return Ok(
-                                Box::new(BatchOutcome::Conflict { next }) as Box<dyn Any + Send>
-                            );
-                        }
-                    };
-                    assigned.push(next);
-                }
-                for ((stream, _, note_id, statements, _), seq) in
-                    entries.into_iter().zip(assigned.iter().copied())
-                {
-                    // Set before invoking the first write, including a write
-                    // whose driver returns an error with ambiguous effects.
-                    writes_started = true;
-                    for planned in statements {
-                        let affected = writer.execute(planned.statement).await?;
-                        if planned
-                            .guard
-                            .is_some_and(|guard| !guard.holds_for(affected))
-                        {
-                            return Err(write_failure("prepared note write guard failed"));
-                        }
+                        let head = writer
+                            .query_scalar(stream_position_statement(&ns, stream))
+                            .await?;
+                        let Some(SqlValue::Integer(head)) = head else {
+                            return Err(write_failure("invalid stream head"));
+                        };
+                        heads.push((stream.clone(), head));
                     }
-                    insert_stream_entry(writer, &ns, stream, seq, note_id).await?;
+                    let mut assigned = Vec::with_capacity(entries.len());
+                    for (stream, expected_seq, _, _, guard) in &entries {
+                        if let Some(conflict) = guard.check_fence(writer).await? {
+                            return Ok(Box::new(BatchOutcome::FenceConflict { conflict })
+                                as Box<dyn Any + Send>);
+                        }
+                        let head = heads
+                            .iter_mut()
+                            .find(|(known, _)| known == stream)
+                            .map(|(_, head)| head)
+                            .ok_or_else(|| write_failure("stream head missing"))?;
+                        let next = match allocate_sequence(head, *expected_seq) {
+                            Ok(next) => next,
+                            Err(SequenceRefusal::Exhausted) => {
+                                return Ok(Box::new(BatchOutcome::Exhausted) as Box<dyn Any + Send>);
+                            }
+                            Err(SequenceRefusal::Conflict { next, .. }) => {
+                                return Ok(Box::new(BatchOutcome::Conflict { next })
+                                    as Box<dyn Any + Send>);
+                            }
+                        };
+                        assigned.push(next);
+                    }
+                    for ((stream, _, note_id, statements, _), seq) in
+                        entries.into_iter().zip(assigned.iter().copied())
+                    {
+                        // Set before invoking the first write, including a write
+                        // whose driver returns an error with ambiguous effects.
+                        writes_started = true;
+                        for planned in statements {
+                            let affected = writer.execute(planned.statement).await?;
+                            if planned
+                                .guard
+                                .is_some_and(|guard| !guard.holds_for(affected))
+                            {
+                                return Err(write_failure("prepared note write guard failed"));
+                            }
+                        }
+                        insert_stream_entry(writer, &ns, stream, seq, note_id).await?;
+                    }
+                    Ok(Box::new(BatchOutcome::Appended(assigned)) as Box<dyn Any + Send>)
                 }
-                Ok(Box::new(BatchOutcome::Appended(assigned)) as Box<dyn Any + Send>)
-                }.await;
+                .await;
                 if result.is_err() && !writes_started {
                     refusal_proof.store(true, Ordering::Release);
                 }
@@ -1022,6 +1046,9 @@ impl KhiveRuntime {
         let access = self.sql();
         match Self::run_stream_appends(access.as_ref(), token, &prepared).await? {
             BatchOutcome::Appended(seqs) => Ok(append_result(&prepared[0], seqs[0])),
+            BatchOutcome::Exhausted => Err(StreamAppendFailure::not_committed(
+                sequence_exhausted().into(),
+            )),
             BatchOutcome::FenceConflict { conflict } => Err(StreamAppendFailure::not_committed(
                 conflict.into_error().into(),
             )),
@@ -1447,13 +1474,16 @@ impl KhiveRuntime {
             ));
         }
         let mut reader = self.sql().reader().await?;
-        let rows = reader.query_all(statement(
-            "WITH head AS (SELECT COALESCE(MAX(seq),0) AS head_seq FROM note_streams WHERE namespace=?1 AND stream=?2), \
+        let rows = reader.query_all(SqlStatement::new(
+            format!("WITH position AS ({STREAM_POSITION_SQL}), \
              page AS (SELECT s.seq,n.id,n.content,n.created_at FROM note_streams s JOIN notes n ON n.id=s.note_id \
-                      WHERE s.namespace=?1 AND s.stream=?2 AND s.seq>?3 ORDER BY s.seq LIMIT ?4) \
-             SELECT head.head_seq,page.seq,page.id,page.content,page.created_at FROM head LEFT JOIN page ON 1=1 ORDER BY page.seq",
+                      CROSS JOIN position WHERE s.namespace=?1 AND s.stream=?2 \
+                      AND s.seq>CASE WHEN ?3 < position.floor_seq-1 THEN position.floor_seq-1 ELSE ?3 END \
+                      ORDER BY s.seq LIMIT ?4) \
+             SELECT position.head_seq,position.floor_seq,page.seq,page.id,page.content,page.created_at \
+             FROM position LEFT JOIN page ON 1=1 ORDER BY page.seq"),
             vec![SqlValue::Text(token.namespace().as_str().into()), SqlValue::Text(stream.into()), SqlValue::Integer(after), SqlValue::Integer(limit)],
-        )).await?;
+        ).labelled("stream")).await?;
         let head = rows
             .first()
             .map(|row| {
@@ -1463,6 +1493,12 @@ impl KhiveRuntime {
             })
             .transpose()?
             .unwrap_or(0);
+        let floor = rows
+            .first()
+            .map(|row| row.i64("floor_seq"))
+            .transpose()
+            .map_err(|_| RuntimeError::Internal("stream query missing integer floor_seq".into()))?
+            .unwrap_or(1);
         let mut entries = Vec::new();
         let mut last = None;
         for row in &rows {
@@ -1480,19 +1516,21 @@ impl KhiveRuntime {
             last = Some(seq);
         }
         Ok(
-            json!({"entries": entries, "head_seq": head, "next_after": last.filter(|last| *last < head)}),
+            json!({"entries": entries, "head_seq": head, "floor_seq": floor, "next_after": last.filter(|last| *last < head)}),
         )
     }
 
     /// Independently count entries and read the head in the same statement.
     pub async fn stream_stat(&self, token: &NamespaceToken, stream: &str) -> RuntimeResult<Value> {
         validate_stream(stream)?;
-        let row = self.sql().reader().await?.query_row(statement(
-            "SELECT COUNT(*) AS count, COALESCE(MAX(seq),0) AS head_seq FROM note_streams WHERE namespace=?1 AND stream=?2",
+        let row = self.sql().reader().await?.query_row(SqlStatement::new(
+            format!("WITH position AS ({STREAM_POSITION_SQL}) \
+             SELECT position.head_seq, position.floor_seq, \
+             (SELECT COUNT(*) FROM note_streams WHERE namespace=?1 AND stream=?2) AS count FROM position"),
             vec![SqlValue::Text(token.namespace().as_str().into()), SqlValue::Text(stream.into())],
-        )).await?.ok_or_else(|| RuntimeError::Internal("stream.stat returned no aggregate row".into()))?;
+        ).labelled("stream")).await?.ok_or_else(|| RuntimeError::Internal("stream.stat returned no aggregate row".into()))?;
         Ok(
-            json!({"head_seq": row.i64("head_seq").map_err(|_| RuntimeError::Internal("stream query missing integer head_seq".to_owned()))?, "count": row.i64("count").map_err(|_| RuntimeError::Internal("stream query missing integer count".to_owned()))?}),
+            json!({"head_seq": row.i64("head_seq").map_err(|_| RuntimeError::Internal("stream query missing integer head_seq".to_owned()))?, "floor_seq": row.i64("floor_seq").map_err(|_| RuntimeError::Internal("stream query missing integer floor_seq".to_owned()))?, "count": row.i64("count").map_err(|_| RuntimeError::Internal("stream query missing integer count".to_owned()))?}),
         )
     }
 
@@ -1506,13 +1544,16 @@ impl KhiveRuntime {
             .sql()
             .reader()
             .await?
-            .query_row(statement(
-                "SELECT stream,seq FROM note_streams WHERE namespace=?1 AND note_id=?2",
-                vec![
-                    SqlValue::Text(note.namespace.clone()),
-                    SqlValue::Text(note.id.to_string()),
-                ],
-            ))
+            .query_row(
+                SqlStatement::new(
+                    "SELECT stream,seq FROM note_streams WHERE namespace=?1 AND note_id=?2",
+                    vec![
+                        SqlValue::Text(note.namespace.clone()),
+                        SqlValue::Text(note.id.to_string()),
+                    ],
+                )
+                .labelled("stream"),
+            )
             .await?;
         row.map(|row| {
             Ok(KhiveError::conflict("stream entries are immutable")
@@ -1551,147 +1592,5 @@ impl KhiveRuntime {
 mod batch_tests;
 
 #[cfg(test)]
-mod tests {
-    use super::{allocate_sequence, SequenceRefusal};
-    use crate::atomic_prepare::{prepare_delete, prepare_update};
-    use crate::atomic_runner::{run_atomic_unit, AtomicRunOutcome};
-    use crate::{KhiveRuntime, Namespace, NotePatch, RuntimeError, VerbRegistryBuilder};
-    use serde_json::{json, Value};
-
-    #[test]
-    fn allocate_sequence_exhaustion_preserves_head_at_checked_add_boundary() {
-        // Overflow is logically possible, but no bounded real-store fixture
-        // reaches it: stream_gap requires consecutive inserts from 1, and
-        // ledger UPDATE/DELETE are forbidden. Supply the head at this unit
-        // boundary instead of fabricating an exhausted persisted stream.
-        let mut head = i64::MAX - 1;
-        assert!(matches!(
-            allocate_sequence(&mut head, None),
-            Ok(seq) if seq == i64::MAX
-        ));
-        assert_eq!(head, i64::MAX);
-        assert!(matches!(
-            allocate_sequence(&mut head, None),
-            Err(SequenceRefusal::Exhausted)
-        ));
-        assert_eq!(
-            head,
-            i64::MAX,
-            "refused allocation must not advance the head"
-        );
-    }
-
-    #[tokio::test]
-    async fn stream_atomic_metadata_cas_preserves_record_and_refuses_stale_plan() {
-        let rt = KhiveRuntime::memory().unwrap();
-        let token = rt.authorize(Namespace::local()).unwrap();
-        let registry = VerbRegistryBuilder::new().build().unwrap();
-        let appended = rt
-            .stream_append(
-                &token,
-                "cas",
-                &json!({"n": 1}),
-                None,
-                "observation",
-                None,
-                None,
-                None,
-                None,
-                &registry,
-            )
-            .await
-            .unwrap();
-        let id = uuid::Uuid::parse_str(appended["id"].as_str().unwrap()).unwrap();
-        for args in [
-            json!({"id": id, "content": "changed"}),
-            json!({"id": id, "properties": {"x": 1}}),
-        ] {
-            let err = prepare_update(&rt, &token, &args, None).await.unwrap_err();
-            assert!(matches!(err, RuntimeError::Khive(ref e) if e.details().is_some()));
-            assert!(err.to_string().contains("immutable"));
-        }
-        for hard in [false, true] {
-            let err = prepare_delete(&rt, &token, &json!({"id": id, "hard": hard}), None)
-                .await
-                .unwrap_err();
-            assert!(err.to_string().contains("immutable"));
-        }
-        let plan = prepare_update(&rt, &token, &json!({"id": id, "salience": 0.7}), None)
-            .await
-            .unwrap();
-        assert!(matches!(
-            run_atomic_unit(rt.sql().as_ref(), vec![plan])
-                .await
-                .unwrap(),
-            AtomicRunOutcome::Committed { .. }
-        ));
-        let stale = prepare_update(&rt, &token, &json!({"id": id, "salience": 0.2}), None)
-            .await
-            .unwrap();
-        rt.update_note(
-            &token,
-            id,
-            NotePatch::new(None, None, Some(Some(0.9)), None, None),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            run_atomic_unit(rt.sql().as_ref(), vec![stale])
-                .await
-                .unwrap(),
-            AtomicRunOutcome::RolledBack { .. }
-        ));
-        let note = rt
-            .notes(&token)
-            .unwrap()
-            .get_note(id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(note.salience, Some(0.9));
-        assert_eq!(
-            serde_json::from_str::<Value>(&note.content).unwrap(),
-            json!({"n": 1})
-        );
-    }
-
-    #[tokio::test]
-    async fn stream_namespace_isolation_and_real_stat_count() {
-        let rt = KhiveRuntime::memory().unwrap();
-        let a = rt.authorize(Namespace::parse("a").unwrap()).unwrap();
-        let b = rt.authorize(Namespace::parse("b").unwrap()).unwrap();
-        let registry = VerbRegistryBuilder::new().build().unwrap();
-        for token in [&a, &b] {
-            assert_eq!(
-                rt.stream_append(
-                    token,
-                    "same-name",
-                    &json!(token.namespace().as_str()),
-                    Some(1),
-                    "observation",
-                    None,
-                    None,
-                    None,
-                    None,
-                    &registry
-                )
-                .await
-                .unwrap()["seq"],
-                1
-            );
-        }
-        for token in [&a, &b] {
-            let page = rt.stream_read(token, "same-name", 0, 10).await.unwrap();
-            assert_eq!(page["entries"][0]["record"], token.namespace().as_str());
-        }
-        rt.sql().writer().await.unwrap().execute_script("DROP TRIGGER refuse_stream_ledger_update; UPDATE note_streams SET seq=5 WHERE namespace='a';".into()).await.unwrap();
-        assert_eq!(
-            rt.stream_stat(&a, "same-name").await.unwrap(),
-            json!({"count": 1, "head_seq": 5})
-        );
-        assert_eq!(
-            rt.stream_stat(&b, "same-name").await.unwrap(),
-            json!({"count": 1, "head_seq": 1})
-        );
-    }
-}
+#[path = "streams_unit_tests.rs"]
+mod tests;

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use tempfile::TempDir;
 
 use khive_db::backend::StorageBackend;
@@ -61,9 +61,9 @@ fn gen_body(rng: &mut StdRng, i: usize) -> String {
         "stream",
         "cursor",
     ];
-    let n_words = rng.gen_range(20..35usize);
+    let n_words = rng.random_range(20..35usize);
     let mut words: Vec<&str> = (0..n_words)
-        .map(|_| WORDS[rng.gen_range(0..WORDS.len())])
+        .map(|_| WORDS[rng.random_range(0..WORDS.len())])
         .collect();
     words.push(Box::leak(format!("doc_{i}").into_boxed_str()));
     words.join(" ")
@@ -74,7 +74,7 @@ fn gen_title(i: usize) -> String {
 }
 
 fn gen_vector(rng: &mut StdRng, dims: usize) -> Vec<f32> {
-    let raw: Vec<f32> = (0..dims).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let raw: Vec<f32> = (0..dims).map(|_| rng.random_range(-1.0f32..1.0)).collect();
     let norm: f32 = raw.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
     raw.into_iter().map(|v| v / norm).collect()
 }
@@ -122,7 +122,11 @@ struct FtsFixture {
 fn build_fts_fixture() -> FtsFixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("bench_fts.db");
-    let backend = StorageBackend::sqlite(&path).expect("backend");
+    let backend = StorageBackend::sqlite_with_volume_lock_dir(
+        &path,
+        path.parent().unwrap().join("volume-locks"),
+    )
+    .expect("backend");
     let store = backend.text("bench_notes").expect("text store");
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
@@ -144,7 +148,11 @@ fn build_vec_fixture() -> VecFixture {
     ensure_extensions_loaded();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("bench_vec.db");
-    let backend = StorageBackend::sqlite(&path).expect("backend");
+    let backend = StorageBackend::sqlite_with_volume_lock_dir(
+        &path,
+        path.parent().unwrap().join("volume-locks"),
+    )
+    .expect("backend");
     let store = backend
         .vectors_for_namespace(MODEL_KEY, "all-minilm-l6-v2", VECTOR_DIMS, NAMESPACE)
         .expect("vec store");
@@ -462,7 +470,11 @@ fn bench_fts_upsert_batch(c: &mut Criterion) {
                             .collect();
                         let dir = tempfile::tempdir().expect("tempdir");
                         let path = dir.path().join("bench_upsert.db");
-                        let backend = StorageBackend::sqlite(&path).expect("backend");
+                        let backend = StorageBackend::sqlite_with_volume_lock_dir(
+                            &path,
+                            path.parent().unwrap().join("volume-locks"),
+                        )
+                        .expect("backend");
                         let store = backend.text("upsert_bench").expect("text store");
                         (store, docs, dir)
                     },
@@ -554,7 +566,11 @@ fn bench_vec_insert_batch(c: &mut Criterion) {
                             .collect();
                         let dir = tempfile::tempdir().expect("tempdir");
                         let path = dir.path().join("bench_vec_insert.db");
-                        let backend = StorageBackend::sqlite(&path).expect("backend");
+                        let backend = StorageBackend::sqlite_with_volume_lock_dir(
+                            &path,
+                            path.parent().unwrap().join("volume-locks"),
+                        )
+                        .expect("backend");
                         let store = backend
                             .vectors_for_namespace(
                                 MODEL_KEY,
@@ -602,10 +618,16 @@ fn bench_backend_creation(c: &mut Criterion) {
             || tempfile::tempdir().expect("tempdir"),
             |dir| {
                 let path = dir.path().join("bench_creation.db");
-                let backend = StorageBackend::sqlite(&path).expect("sqlite backend");
+                let backend = StorageBackend::sqlite_with_volume_lock_dir(
+                    &path,
+                    path.parent().unwrap().join("volume-locks"),
+                )
+                .expect("sqlite backend");
                 black_box((backend, dir))
             },
-            BatchSize::SmallInput,
+            // Each output is an open backend; a batch keeps every output alive until it ends, so a batch size
+            // above one holds that many databases open at once and can run out of file descriptors.
+            BatchSize::PerIteration,
         );
     });
 

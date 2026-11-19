@@ -5,16 +5,90 @@
 //!   used by pack-scoped schemas.
 //! - **Versioned migrations** (`MIGRATIONS` / `run_migrations`): the forward-only
 //!   migration pipeline for the core tables.
+//!
+//! Raw migration entry points require a connection opened by rusqlite;
+//! externally owned handles wrapped with `Connection::from_handle` are not
+//! supported. They reject inherited transactions. If rollback and close cannot
+//! establish an outcome, the original connection is retired before its volume
+//! lease is released and the caller receives `WriterSettlementUnknown`.
 
 use khive_storage::blob::ContentRef;
 use rusqlite::{Connection, OptionalExtension};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::SqliteError;
+use crate::pool::WriteAdmission;
 use crate::stores::blob::{try_acquire_database_gc_owner_for_path, DatabaseGcOwnerGuard};
+
+#[path = "raw_migration_settlement.rs"]
+mod raw_migration_settlement;
+use raw_migration_settlement::{RawMigrationTransactions, RawMigrationWriteUnit};
+
+/// The write side of a migration run.
+///
+/// ADR-154 section 4 admits each migration transaction on its own: the volume
+/// lease is taken before the transaction begins and released once it has
+/// settled, so a multi-version upgrade never holds the volume for the whole
+/// run. Implementations own that per-call lease and settlement.
+pub(crate) trait MigrationTransactions {
+    /// Run one write transaction, or one autocommit write, under a fresh
+    /// admission.
+    fn admitted<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Connection) -> Result<T, SqliteError>,
+    ) -> Result<T, SqliteError>;
+}
+
+/// Captured disk-guard settings and shared volume-lock directory for a SQLite
+/// writer.
+///
+/// Construction validates configuration without reading or writing a database.
+/// Cooperating callers must choose the same absolute volume-lock directory.
+#[derive(Clone, Debug)]
+pub struct MigrationWritePolicy {
+    disk_guard: crate::EffectiveDiskGuardConfig,
+    volume_lock_dir: PathBuf,
+}
+
+impl MigrationWritePolicy {
+    pub fn new(
+        disk_guard: crate::EffectiveDiskGuardConfig,
+        volume_lock_dir: impl Into<PathBuf>,
+    ) -> Result<Self, SqliteError> {
+        disk_guard.validate()?;
+        let volume_lock_dir = volume_lock_dir.into();
+        if !volume_lock_dir.is_absolute() {
+            return Err(SqliteError::InvalidConfig(
+                "migration volume-lock directory must be absolute".to_string(),
+            ));
+        }
+        Ok(Self {
+            disk_guard,
+            volume_lock_dir,
+        })
+    }
+
+    /// Resolve both settings from the process environment. The lock directory
+    /// follows [`crate::default_volume_lock_dir`], the same per-user default the
+    /// public SQLite constructors use.
+    pub fn from_environment() -> Result<Self, SqliteError> {
+        let disk_guard = crate::DiskGuardEnvironment::capture().resolve(None, None)?;
+        Self::new(disk_guard, crate::default_volume_lock_dir()?)
+    }
+
+    pub fn disk_guard_config(&self) -> crate::EffectiveDiskGuardConfig {
+        self.disk_guard
+    }
+
+    pub fn volume_lock_dir(&self) -> &Path {
+        &self.volume_lock_dir
+    }
+}
 
 #[path = "session_identity_migration.rs"]
 mod session_identity_migration;
+
+mod memory_visibility;
 
 // =============================================================================
 // Legacy per-service migration API (preserved for backward compatibility)
@@ -47,48 +121,137 @@ pub struct ServiceSchemaPlan {
 const SCHEMA_VERSION_TABLE: &str = include_str!("../sql/schema-version-table.sql");
 
 /// Apply a pack-scoped schema plan, tracking each migration in `_schema_versions`.
-pub fn apply_schema_plan(conn: &Connection, plan: &ServiceSchemaPlan) -> Result<(), SqliteError> {
-    conn.execute_batch(SCHEMA_VERSION_TABLE)?;
+/// A mutable connection lets the wrapper retire an unsettled original handle.
+pub fn apply_schema_plan(
+    conn: &mut Connection,
+    plan: &ServiceSchemaPlan,
+) -> Result<(), SqliteError> {
+    let admission = WriteAdmission::for_canonical_path(canonical_connection_database_path(conn)?)?;
+    apply_schema_plan_with_admission(
+        &mut RawMigrationTransactions::new(conn, &admission),
+        plan,
+        &admission,
+    )
+}
+
+/// Apply a raw connection's schema plan with a captured policy and lock path.
+pub fn apply_schema_plan_with_policy(
+    conn: &mut Connection,
+    plan: &ServiceSchemaPlan,
+    policy: &MigrationWritePolicy,
+) -> Result<(), SqliteError> {
+    let admission =
+        WriteAdmission::for_migration_policy(canonical_connection_database_path(conn)?, policy)?;
+    apply_schema_plan_with_admission(
+        &mut RawMigrationTransactions::new(conn, &admission),
+        plan,
+        &admission,
+    )
+}
+
+/// Apply a service schema plan. The tracking-table bootstrap and each
+/// migration are separate admitted write units (ADR-154 section 4).
+pub(crate) fn apply_schema_plan_with_admission(
+    writes: &mut impl MigrationTransactions,
+    plan: &ServiceSchemaPlan,
+    admission: &WriteAdmission,
+) -> Result<(), SqliteError> {
+    writes.admitted(|conn| {
+        admission.check()?;
+        conn.execute_batch(SCHEMA_VERSION_TABLE)?;
+        require_autocommit(conn, "schema-version bootstrap")
+    })?;
 
     for migration in plan.sqlite {
-        // Serialize the admission decision with other writers. Checking the
-        // predicate or ledger before BEGIN IMMEDIATE lets a second opener see
-        // stale state and replay a migration after the first one commits.
-        let tx =
-            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-
-        // Check if custom predicate says it's already applied
-        if let Some(check) = migration.is_already_applied {
-            if check(&tx) {
-                continue;
-            }
-        }
-
-        // Check if tracked as applied
-        let already: bool = tx.query_row(
-            "SELECT COUNT(*) > 0 FROM _schema_versions WHERE service = ?1 AND migration_id = ?2",
-            rusqlite::params![plan.service, migration.id],
-            |row| row.get(0),
-        )?;
-
-        if already {
-            continue;
-        }
-
-        tx.execute_batch(migration.up_sql)?;
-
-        tx.execute(
-            "INSERT INTO _schema_versions (service, migration_id, applied_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![
-                plan.service,
-                migration.id,
-                chrono::Utc::now().timestamp_micros(),
-            ],
-        )?;
-        tx.commit()?;
+        writes.admitted(|conn| apply_service_migration(conn, plan, migration, admission))?;
     }
 
     Ok(())
+}
+
+/// Apply one service migration in its own IMMEDIATE transaction unless its
+/// predicate or the ledger says it has already been applied.
+fn apply_service_migration(
+    conn: &Connection,
+    plan: &ServiceSchemaPlan,
+    migration: &Migration,
+    admission: &WriteAdmission,
+) -> Result<(), SqliteError> {
+    // Serialize the admission decision with other writers. Checking the
+    // predicate or ledger before BEGIN IMMEDIATE lets a second opener see
+    // stale state and replay a migration after the first one commits.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    if let Err(error) = admission.check() {
+        let rollback = tx.rollback();
+        return Err(capacity_refusal_after_rollback(
+            conn,
+            rollback,
+            error,
+            "service schema migration",
+        ));
+    }
+
+    // Check if custom predicate says it's already applied
+    if let Some(check) = migration.is_already_applied {
+        if check(&tx) {
+            return Ok(());
+        }
+    }
+
+    // Check if tracked as applied
+    let already: bool = tx.query_row(
+        "SELECT COUNT(*) > 0 FROM _schema_versions WHERE service = ?1 AND migration_id = ?2",
+        rusqlite::params![plan.service, migration.id],
+        |row| row.get(0),
+    )?;
+
+    if already {
+        return Ok(());
+    }
+
+    tx.execute_batch(migration.up_sql)?;
+
+    tx.execute(
+        "INSERT INTO _schema_versions (service, migration_id, applied_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![
+            plan.service,
+            migration.id,
+            chrono::Utc::now().timestamp_micros(),
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn require_autocommit(conn: &Connection, operation: &str) -> Result<(), SqliteError> {
+    if conn.is_autocommit() {
+        Ok(())
+    } else {
+        Err(SqliteError::InvalidData(format!(
+            "{operation} did not return the SQLite connection to autocommit"
+        )))
+    }
+}
+
+pub(crate) fn capacity_refusal_after_rollback(
+    conn: &Connection,
+    rollback: rusqlite::Result<()>,
+    refusal: SqliteError,
+    operation: &str,
+) -> SqliteError {
+    if let Err(error) = rollback {
+        return SqliteError::InvalidData(format!(
+            "{operation} capacity refusal could not roll back: {error}; \
+             initial refusal: {refusal}"
+        ));
+    }
+    if !conn.is_autocommit() {
+        return SqliteError::InvalidData(format!(
+            "{operation} capacity refusal rolled back without restoring autocommit; \
+             initial refusal: {refusal}"
+        ));
+    }
+    refusal
 }
 
 // =============================================================================
@@ -238,6 +401,115 @@ const RECIPIENT_TRANSPORT_VERSION: u32 = 45;
 const V45_UP: &str = include_str!("../sql/045-recipient-transport.sql");
 const V46_UP: &str = include_str!("../sql/046-memory-visibility-receipts.sql");
 const V47_UP: &str = include_str!("../sql/047-attachment-role-quarantine.sql");
+const V49_UP: &str = include_str!("../sql/049-git-note-property-indexes.sql");
+
+const V50_UP: &str = include_str!("../sql/050-entity-list-plans.sql");
+const V51_UP: &str = include_str!("../sql/051-schedule-core-indexes.sql");
+const V52_UP: &str = include_str!("../sql/052-comm-core-indexes.sql");
+const V53_UP: &str = include_str!("../sql/053-entity-kind-list-order.sql");
+const MEMORY_VISIBILITY_CUTOVER_VERSION: u32 = 54;
+const V54_UP: &str = include_str!("../sql/054-memory-visibility-epochs.sql");
+
+const V55_UP: &str = include_str!("../sql/055-knowledge-cursor-domain-tags.sql");
+const V56_UP: &str = include_str!("../sql/056-atom-weights.sql");
+const V57_UP: &str = include_str!("../sql/057-retrieval-snapshots.sql");
+const V58_UP: &str = include_str!("../sql/058-proposal-archive.sql");
+const V59_UP: &str = include_str!("../sql/059-comm-legacy-quarantine-index.sql");
+const V60_UP: &str = include_str!("../sql/060-note-stream-truncation.sql");
+const V61_UP: &str = include_str!("../sql/061-edge-governance.sql");
+const V62_UP: &str = include_str!("../sql/062-authority-store.sql");
+const V63_UP: &str = include_str!("../sql/063-pending-entity-indexes.sql");
+const V64_UP: &str = include_str!("../sql/064-node-confirmed-pins.sql");
+const V65_UP: &str = include_str!("../sql/065-graph-edges-target-relation-index.sql");
+const V66_UP: &str = include_str!("../sql/066-comm-undelivered-due-index.sql");
+
+/// Retained V66 schema needs only its ledger restored, not an index rebuild.
+fn migrate_undelivered_due_index(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let installed: Option<String> = tx
+        .query_row(
+            include_str!("../sql/comm-outbound-due-index-definition.sql"),
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let (_, create) = V66_UP
+        .split_once("CREATE INDEX")
+        .ok_or(rusqlite::Error::InvalidQuery)?;
+    let expected = format!("CREATE INDEX{create}");
+    // SQLite omits the terminal semicolon. Preserve every interior byte,
+    // including whitespace in SQL string literals, when comparing definitions.
+    if installed.as_deref().is_some_and(|sql| {
+        sql.trim().trim_end_matches(';') == expected.trim().trim_end_matches(';')
+    }) {
+        return Ok(());
+    }
+    tx.execute_batch(V66_UP)
+}
+
+// Ledger-tail replay may retain the physical column; accept only its exact shape.
+fn migrate_proposal_archive(tx: &rusqlite::Transaction<'_>) -> Result<(), SqliteError> {
+    let migration_error = |error: rusqlite::Error| {
+        SqliteError::migration_with_cause(
+            58,
+            format!("proposals_open.archived_at migration failed: {error}"),
+            error,
+        )
+    };
+    let column = tx
+        .query_row(
+            include_str!("../sql/proposal-archive-column.sql"),
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(migration_error)?;
+    match column {
+        None => tx.execute_batch(V58_UP).map_err(migration_error),
+        Some((declared_type, not_null, default, primary_key, hidden))
+            if declared_type.eq_ignore_ascii_case("INTEGER")
+                && not_null == 0
+                && default.is_none()
+                && primary_key == 0
+                && hidden == 0 =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(SqliteError::migration_message(
+            58,
+            "incompatible proposals_open.archived_at: expected an ordinary nullable INTEGER column without a default or primary key",
+        )),
+    }
+}
+
+const V48_UP: &str = include_str!("../sql/048-acknowledgement-journal-a-table.sql");
+const ACKNOWLEDGEMENT_JOURNAL_INDEX: &str =
+    include_str!("../sql/048-acknowledgement-journal-b-index.sql");
+
+/// A ledger-tail replay keeps already-current journal state and retry metadata.
+pub(crate) fn migrate_acknowledgement_journal(
+    tx: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let columns: i64 = tx.query_row(
+        "SELECT count(*) FROM pragma_table_info('comm_ack_work') \
+         WHERE name IN ('attempt_count','not_before','retirement_reason')",
+        [],
+        |row| row.get(0),
+    )?;
+    match columns {
+        0 => tx.execute_batch(V48_UP)?,
+        3 => {}
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    }
+    tx.execute_batch(ACKNOWLEDGEMENT_JOURNAL_INDEX)
+}
 
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
@@ -533,6 +805,101 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         name: "attachment_role_quarantine",
         up: V47_UP,
     },
+    VersionedMigration {
+        version: 48,
+        name: "acknowledgement_journal",
+        up: V48_UP,
+    },
+    VersionedMigration {
+        version: 49,
+        name: "git_note_property_indexes",
+        up: V49_UP,
+    },
+    VersionedMigration {
+        version: 50,
+        name: "entity_list_plans",
+        up: V50_UP,
+    },
+    VersionedMigration {
+        version: 51,
+        name: "schedule_core_indexes",
+        up: V51_UP,
+    },
+    VersionedMigration {
+        version: 52,
+        name: "comm_core_indexes",
+        up: V52_UP,
+    },
+    VersionedMigration {
+        version: 53,
+        name: "entity_kind_list_order",
+        up: V53_UP,
+    },
+    VersionedMigration {
+        version: MEMORY_VISIBILITY_CUTOVER_VERSION,
+        name: "memory_visibility_epochs",
+        up: V54_UP,
+    },
+    VersionedMigration {
+        version: 55,
+        name: "knowledge_atom_cursor_all_live_tags",
+        up: V55_UP,
+    },
+    VersionedMigration {
+        version: 56,
+        name: "atom_weight_tables",
+        up: V56_UP,
+    },
+    VersionedMigration {
+        version: 57,
+        name: "retrieval_snapshot_tables",
+        up: V57_UP,
+    },
+    VersionedMigration {
+        version: 58,
+        name: "proposal_archive",
+        up: V58_UP,
+    },
+    VersionedMigration {
+        version: 59,
+        name: "comm_legacy_quarantine_index",
+        up: V59_UP,
+    },
+    VersionedMigration {
+        version: 60,
+        name: "note_stream_truncation",
+        up: V60_UP,
+    },
+    VersionedMigration {
+        version: 61,
+        name: "edge_governance",
+        up: V61_UP,
+    },
+    VersionedMigration {
+        version: 62,
+        name: "authority_store",
+        up: V62_UP,
+    },
+    VersionedMigration {
+        version: 63,
+        name: "pending_entity_indexes",
+        up: V63_UP,
+    },
+    VersionedMigration {
+        version: 64,
+        name: "node_confirmed_pins",
+        up: V64_UP,
+    },
+    VersionedMigration {
+        version: 65,
+        name: "graph_edges_target_relation_index",
+        up: V65_UP,
+    },
+    VersionedMigration {
+        version: 66,
+        name: "comm_undelivered_due_index",
+        up: V66_UP,
+    },
 ];
 
 /// Durable state of ADR-121's boot-gated, two-stage attachment cutover.
@@ -625,6 +992,39 @@ fn validate_complete_attachment_schema(conn: &Connection) -> Result<(), SqliteEr
         }
     }
     Ok(())
+}
+
+/// Whether the migration chain would stop at [`ATTACHMENT_CUTOVER_VERSION`] and
+/// leave the store for the host's application-assisted cutover, read without
+/// mutating the connection.
+///
+/// `false` for a store already at or past the cutover version, since the chain
+/// never reaches that step again. Below it, the answer is the chain's own
+/// condition evaluated on the store as it is now: the cutover is `Incomplete`,
+/// or an entity still holds a legacy `content_ref`. A store whose `entities`
+/// table has no `content_ref` column yet (no table, or a store below V10) holds
+/// no legacy reference. An impossible marker and ledger pair is an error, as it
+/// is for the chain.
+pub fn attachment_cutover_would_defer(conn: &Connection) -> Result<bool, SqliteError> {
+    if read_schema_version(conn)? >= ATTACHMENT_CUTOVER_VERSION {
+        return Ok(false);
+    }
+    cutover_defers(conn, attachment_cutover_status(conn)?)
+}
+
+/// The V21 deferral condition, shared by the chain and
+/// [`attachment_cutover_would_defer`] so there is one copy of it.
+fn cutover_defers(conn: &Connection, status: AttachmentCutoverStatus) -> Result<bool, SqliteError> {
+    let legacy_refs: i64 = if schema_column_exists(conn, "entities", "content_ref")? {
+        conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE content_ref IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?
+    } else {
+        0
+    };
+    Ok(status == AttachmentCutoverStatus::Incomplete || legacy_refs != 0)
 }
 
 /// Inspect the coordinated V21 state without mutating the connection.
@@ -879,6 +1279,27 @@ fn stage_attachment_cutover_on_connection(conn: &Connection, now: i64) -> Result
 /// application backfill and finalization. This function owns one IMMEDIATE
 /// SQLite transaction; a failure leaves neither its DDL nor marker visible.
 pub fn stage_attachment_cutover(conn: &mut Connection) -> Result<(), SqliteError> {
+    let admission = WriteAdmission::for_canonical_path(canonical_connection_database_path(conn)?)?;
+    RawMigrationWriteUnit::new(conn, &admission)?
+        .run(|conn| stage_attachment_cutover_with_admission(conn, &admission))
+}
+
+/// Stage attachment cutover with an explicit raw-connection policy.
+pub fn stage_attachment_cutover_with_policy(
+    conn: &mut Connection,
+    policy: &MigrationWritePolicy,
+) -> Result<(), SqliteError> {
+    let admission =
+        WriteAdmission::for_migration_policy(canonical_connection_database_path(conn)?, policy)?;
+    RawMigrationWriteUnit::new(conn, &admission)?
+        .run(|conn| stage_attachment_cutover_with_admission(conn, &admission))
+}
+
+/// Stage attachment cutover using admission already held by a pooled caller.
+pub(crate) fn stage_attachment_cutover_with_admission(
+    conn: &mut Connection,
+    admission: &WriteAdmission,
+) -> Result<(), SqliteError> {
     match attachment_cutover_status(conn)? {
         AttachmentCutoverStatus::Complete => return Ok(()),
         AttachmentCutoverStatus::Pending | AttachmentCutoverStatus::Incomplete => {}
@@ -891,6 +1312,15 @@ pub fn stage_attachment_cutover(conn: &mut Connection) -> Result<(), SqliteError
     }
 
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if let Err(error) = admission.check() {
+        let rollback = tx.rollback();
+        return Err(capacity_refusal_after_rollback(
+            conn,
+            rollback,
+            error,
+            "attachment cutover stage",
+        ));
+    }
     let status = attachment_cutover_status(&tx)?;
     if status == AttachmentCutoverStatus::Complete {
         return Ok(());
@@ -1063,10 +1493,40 @@ fn record_attachment_cutover_migration(conn: &Connection, now: i64) -> Result<()
 /// moodboard model role coverage, replaces the claim fences, removes the old
 /// column, marks the cutover complete, and records V21 in one transaction.
 pub fn finalize_attachment_cutover(conn: &mut Connection) -> Result<(), SqliteError> {
+    let admission = WriteAdmission::for_canonical_path(canonical_connection_database_path(conn)?)?;
+    RawMigrationWriteUnit::new(conn, &admission)?
+        .run(|conn| finalize_attachment_cutover_with_admission(conn, &admission))
+}
+
+/// Finalize attachment cutover with an explicit raw-connection policy.
+pub fn finalize_attachment_cutover_with_policy(
+    conn: &mut Connection,
+    policy: &MigrationWritePolicy,
+) -> Result<(), SqliteError> {
+    let admission =
+        WriteAdmission::for_migration_policy(canonical_connection_database_path(conn)?, policy)?;
+    RawMigrationWriteUnit::new(conn, &admission)?
+        .run(|conn| finalize_attachment_cutover_with_admission(conn, &admission))
+}
+
+/// Finalize attachment cutover using admission already held by a pooled caller.
+pub(crate) fn finalize_attachment_cutover_with_admission(
+    conn: &mut Connection,
+    admission: &WriteAdmission,
+) -> Result<(), SqliteError> {
     if attachment_cutover_status(conn)? == AttachmentCutoverStatus::Complete {
         return Ok(());
     }
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)?;
+    if let Err(error) = admission.check() {
+        let rollback = tx.rollback();
+        return Err(capacity_refusal_after_rollback(
+            conn,
+            rollback,
+            error,
+            "attachment cutover finalization",
+        ));
+    }
     match attachment_cutover_status(&tx)? {
         AttachmentCutoverStatus::Complete => return Ok(()),
         AttachmentCutoverStatus::Pending => {
@@ -1190,17 +1650,20 @@ fn validate_applied_migration_ledger(
 
 const MIGRATION_TRACKING_TABLE: &str = include_str!("../sql/schema-migrations-table.sql");
 
+const SCHEMA_VERSION_PROBE_SQL: &str = "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations";
+
+/// Build the schema-ledger version query without opening a reader or decoding its result.
+pub fn schema_version_probe() -> khive_storage::types::SqlStatement {
+    khive_storage::types::SqlStatement::new(SCHEMA_VERSION_PROBE_SQL, Vec::new())
+}
+
 /// Read the applied schema version from an open connection **without** running
 /// migrations. Returns 0 when the `_schema_migrations` ledger is absent (an
 /// un-migrated or empty database); any other failure (BUSY, IO) propagates —
 /// collapsing it to 0 would misreport a live database as un-migrated. Never
 /// writes.
 pub fn read_schema_version(conn: &Connection) -> Result<u32, SqliteError> {
-    match conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations",
-        [],
-        |row| row.get(0),
-    ) {
+    match conn.query_row(SCHEMA_VERSION_PROBE_SQL, [], |row| row.get(0)) {
         Ok(version) => Ok(version),
         Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
             if msg.contains("no such table: _schema_migrations") =>
@@ -1225,6 +1688,49 @@ pub fn inspect_schema_version(path: &std::path::Path) -> Result<u32, SqliteError
 pub fn inspect_schema_is_current(path: &std::path::Path) -> Result<u32, SqliteError> {
     let conn = crate::pool::open_read_only_snapshot_connection(path)?;
     validate_schema_is_current(&conn)
+}
+
+/// Page accounting for one database file. Each value is a single pragma read,
+/// so the cost does not grow with the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageAccounting {
+    /// `PRAGMA page_size`, in bytes.
+    pub page_size: u64,
+    /// `PRAGMA page_count`: every page in the database, free pages included.
+    pub page_count: u64,
+    /// `PRAGMA freelist_count`: pages that later writes can reuse but that stay
+    /// in the file until a `VACUUM`.
+    pub freelist_count: u64,
+}
+
+/// Open `path` read-only and report its page accounting without creating,
+/// migrating or walking the file. The caller must ensure `path` exists.
+pub fn inspect_page_accounting(path: &std::path::Path) -> Result<PageAccounting, SqliteError> {
+    let conn = crate::pool::open_read_only_snapshot_connection(path)?;
+    let read = |pragma: &str| -> Result<u64, SqliteError> {
+        let value: i64 = conn.query_row(pragma, [], |row| row.get(0))?;
+        u64::try_from(value)
+            .map_err(|_| SqliteError::InvalidData(format!("{pragma} returned {value}")))
+    };
+    Ok(PageAccounting {
+        page_size: read("PRAGMA page_size")?,
+        page_count: read("PRAGMA page_count")?,
+        freelist_count: read("PRAGMA freelist_count")?,
+    })
+}
+
+/// Open `path` read-only and run `PRAGMA integrity_check` over the whole file,
+/// returning every row SQLite reports: exactly `["ok"]` for a sound file. The
+/// check reads every page, so its cost grows with the file. No error limit is
+/// applied: the pragma's default stops at 100 rows, so the largest limit it
+/// accepts is passed instead.
+pub fn inspect_integrity(path: &std::path::Path) -> Result<Vec<String>, SqliteError> {
+    let conn = crate::pool::open_read_only_snapshot_connection(path)?;
+    let mut statement = conn.prepare(&format!("PRAGMA integrity_check({})", i32::MAX))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Require an already-open database to match this build's latest core schema
@@ -1255,7 +1761,7 @@ pub fn validate_schema_is_current(conn: &Connection) -> Result<u32, SqliteError>
     // Numeric equality alone is not enough: a database can carry the current
     // maximum version under renamed or foreign migration ledger entries while
     // exposing a materially different schema. Writable boot runs this same
-    // closed-name validation in `run_migrations_locked`; snapshot inspection
+    // closed-name validation in `bootstrap_migration_ledger`; snapshot inspection
     // must not accept a history that ordinary boot would reject merely because
     // it cannot repair it in place.
     validate_applied_migration_ledger(conn, current_version)?;
@@ -1270,7 +1776,17 @@ pub fn validate_schema_is_current(conn: &Connection) -> Result<u32, SqliteError>
         ));
     }
 
+    if current_version >= MEMORY_VISIBILITY_CUTOVER_VERSION {
+        memory_visibility::validate_cutover(conn)?;
+    }
+
     Ok(current_version)
+}
+
+/// Require the complete core migration ledger and readable memory provenance
+/// schema without applying migrations or inferring an individual note's epoch.
+pub fn validate_memory_visibility_cutover(conn: &Connection) -> Result<(), SqliteError> {
+    validate_schema_is_current(conn).map(|_| ())
 }
 
 #[cfg(test)]
@@ -1278,7 +1794,7 @@ pub(crate) mod test_sync {
     use std::sync::atomic::AtomicU32;
     use std::sync::{Arc, Barrier, Mutex};
 
-    /// When set, `run_migrations_locked` parks after its initial (stale)
+    /// When set, `run_versioned_migrations` parks after its initial (stale)
     /// ledger read until every racing thread has arrived — forcing the
     /// contended interleaving the concurrent-boot test asserts on.
     pub(crate) static STALE_READ_BARRIER: Mutex<Option<Arc<Barrier>>> = Mutex::new(None);
@@ -1343,9 +1859,10 @@ fn canonical_connection_database_path(conn: &Connection) -> Result<Option<PathBu
     if raw_path.is_empty() {
         return Ok(None);
     }
-    std::fs::canonicalize(&raw_path)
-        .map(Some)
-        .map_err(SqliteError::Io)
+    let canonical = std::fs::canonicalize(&raw_path).map_err(SqliteError::Io)?;
+    #[cfg(any(unix, windows))]
+    crate::pool::opened_sqlite_file_identity(conn, &canonical)?;
+    Ok(Some(canonical))
 }
 
 fn validate_database_gc_owner(
@@ -1365,6 +1882,25 @@ fn validate_database_gc_owner(
 
 pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
     let database_path = canonical_connection_database_path(conn)?;
+    let admission = WriteAdmission::for_canonical_path(database_path.clone())?;
+    run_raw_migrations_with_admission(conn, database_path, &admission)
+}
+
+/// Run migrations on a raw connection with a captured admission policy.
+pub fn run_migrations_with_policy(
+    conn: &mut Connection,
+    policy: &MigrationWritePolicy,
+) -> Result<u32, SqliteError> {
+    let database_path = canonical_connection_database_path(conn)?;
+    let admission = WriteAdmission::for_migration_policy(database_path.clone(), policy)?;
+    run_raw_migrations_with_admission(conn, database_path, &admission)
+}
+
+fn run_raw_migrations_with_admission(
+    conn: &mut Connection,
+    database_path: Option<PathBuf>,
+    admission: &WriteAdmission,
+) -> Result<u32, SqliteError> {
     if let Some(database_path) = database_path {
         // This raw API may have been handed a connection behind an opaque pool
         // writer guard. Never wait here and invert the canonical
@@ -1375,57 +1911,139 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
                 "failed to acquire database GC owner before schema migration: {error}"
             ))
         })?;
-        return run_migrations_with_database_gc_owner(conn, &owner);
+        return run_migrations_with_database_gc_owner(
+            &mut RawMigrationTransactions::new(conn, admission),
+            &owner,
+            admission,
+        );
     }
 
     // A raw in-memory connection has no durable/cross-process GC domain. The
     // production in-memory backend still uses the owner-aware path below.
-    run_migrations_with_busy_timeout(conn)
+    run_versioned_migrations(
+        &mut RawMigrationTransactions::new(conn, admission),
+        None,
+        admission,
+    )
 }
 
 pub(crate) fn run_migrations_with_database_gc_owner(
-    conn: &mut Connection,
+    writes: &mut impl MigrationTransactions,
     owner: &DatabaseGcOwnerGuard,
+    admission: &WriteAdmission,
 ) -> Result<u32, SqliteError> {
-    validate_database_gc_owner(conn, owner)?;
-    run_migrations_with_busy_timeout(conn)
+    run_versioned_migrations(writes, Some(owner), admission)
 }
 
-fn run_migrations_with_busy_timeout(conn: &mut Connection) -> Result<u32, SqliteError> {
-    // Concurrent boots (multiple processes migrating the same file) contend on
-    // the write lock below; a short hot-path busy_timeout cannot wait out a
-    // sibling's migration. Raise-only to a 5s floor — never reduce a caller
-    // whose configured timeout is already longer — and restore after.
+/// Raise-only to a 5s busy_timeout floor for one admitted migration unit and
+/// restore the caller's value after it. Concurrent boots (multiple processes
+/// migrating the same file) contend on SQLite's write lock; a short hot-path
+/// busy_timeout cannot wait out a sibling's migration, and a caller whose
+/// configured timeout is already longer is never reduced.
+fn with_migration_busy_timeout<T>(
+    conn: &mut Connection,
+    operation: impl FnOnce(&mut Connection) -> Result<T, SqliteError>,
+) -> Result<T, SqliteError> {
     let prior_busy_ms: i64 = conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
     let raised = prior_busy_ms < 5_000;
     if raised {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
     }
-    let result = run_migrations_locked(conn);
+    let result = operation(conn);
     if raised {
         let _ = conn.busy_timeout(std::time::Duration::from_millis(prior_busy_ms.max(0) as u64));
     }
     result
 }
 
-fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
-    conn.execute_batch(MIGRATION_TRACKING_TABLE)?;
+/// What one admitted versioned-migration transaction did.
+enum MigrationStep {
+    /// This transaction applied the migration and committed.
+    Applied,
+    /// A sibling had already recorded this version or later; the value is the
+    /// ledger maximum read under the write lock.
+    AppliedBySibling(u32),
+    /// V21 on a legacy database: left for the application-assisted cutover.
+    Deferred,
+}
 
-    let current_version: u32 = read_schema_version(conn)?;
+/// Bring the core schema to the latest version.
+///
+/// ADR-154 section 4 admits each migration transaction on its own, so the
+/// ledger bootstrap with the pre-lock ledger read is one admitted unit and
+/// every migration that still has to run is another, re-reading the ledger
+/// under the write lock. No volume lease is held from one version to the next.
+fn run_versioned_migrations(
+    writes: &mut impl MigrationTransactions,
+    owner: Option<&DatabaseGcOwnerGuard>,
+    admission: &WriteAdmission,
+) -> Result<u32, SqliteError> {
+    let current_version = writes.admitted(|conn| {
+        if let Some(owner) = owner {
+            validate_database_gc_owner(conn, owner)?;
+        }
+        with_migration_busy_timeout(conn, |conn| bootstrap_migration_ledger(conn, admission))
+    })?;
 
     // Deterministic-contention hook: parks every caller after the stale ledger
-    // read (no lock held) until all racing test threads have observed it, so
-    // they are then released to compete for the IMMEDIATE write lock below.
+    // read (no SQLite lock and no volume lease held) until all racing test
+    // threads have observed it, so they are then released to compete for the
+    // IMMEDIATE write lock of their first migration.
     #[cfg(test)]
     if test_sync::PARTICIPATE.with(|p| p.get()) {
-        // Replaces the busy_timeout raised by `run_migrations` on this test
-        // connection: records SQLite-observed contention, then keeps retrying.
-        conn.busy_handler(Some(test_sync::record_busy))?;
         let barrier = test_sync::STALE_READ_BARRIER.lock().unwrap().clone();
         if let Some(barrier) = barrier {
             barrier.wait();
         }
     }
+    let latest_version = latest_schema_version();
+
+    let mut applied_version = current_version;
+    // Floor advanced when a sibling's work is observed under the write lock,
+    // so a losing process skips the remaining already-applied migrations
+    // without opening a transaction for each.
+    let mut skip_through = current_version;
+
+    for migration in MIGRATIONS {
+        if migration.version <= skip_through {
+            applied_version = applied_version.max(migration.version);
+            continue;
+        }
+        let step = writes.admitted(|conn| {
+            with_migration_busy_timeout(conn, |conn| {
+                apply_versioned_migration(conn, migration, admission, latest_version)
+            })
+        })?;
+        match step {
+            MigrationStep::Applied => applied_version = migration.version,
+            MigrationStep::AppliedBySibling(sibling_version) => {
+                skip_through = sibling_version.min(latest_version);
+                applied_version = applied_version.max(migration.version);
+            }
+            MigrationStep::Deferred => break,
+        }
+    }
+
+    // Validate again after the loop: our own commits and any under-lock
+    // sibling fast-forward must both leave the exact canonical ledger, not
+    // merely advance its maximum version.
+    writes.admitted(|conn| validate_applied_migration_ledger(conn, applied_version))?;
+
+    Ok(applied_version)
+}
+
+/// Create the migration ledger if it is missing and validate what it records,
+/// returning the recorded version. The read is taken before any migration
+/// write lock; each migration re-reads the ledger under that lock.
+fn bootstrap_migration_ledger(
+    conn: &mut Connection,
+    admission: &WriteAdmission,
+) -> Result<u32, SqliteError> {
+    admission.check()?;
+    conn.execute_batch(MIGRATION_TRACKING_TABLE)?;
+    require_autocommit(conn, "migration-tracking bootstrap")?;
+
+    let current_version: u32 = read_schema_version(conn)?;
 
     // A database whose recorded version is ahead of the latest known migration
     // predates the consolidated V1 baseline (ADR-015) — e.g. it still carries the
@@ -1452,205 +2070,205 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
     validate_applied_migration_versions(&applied, current_version)?;
     validate_applied_migration_names(&applied, current_version, current_version < 19)?;
 
-    let mut applied_version = current_version;
-    // Floor advanced when a sibling's work is observed under the write lock,
-    // so a losing process skips the remaining already-applied migrations
-    // without opening a transaction for each.
-    let mut skip_through = current_version;
+    Ok(current_version)
+}
 
-    for migration in MIGRATIONS {
-        if migration.version <= skip_through {
-            applied_version = applied_version.max(migration.version);
-            continue;
-        }
+/// Apply one versioned migration in its own IMMEDIATE transaction, probing
+/// capacity after BEGIN and before its first statement (ADR-154 section 4).
+fn apply_versioned_migration(
+    conn: &mut Connection,
+    migration: &VersionedMigration,
+    admission: &WriteAdmission,
+    latest_version: u32,
+) -> Result<MigrationStep, SqliteError> {
+    // IMMEDIATE: take the write lock up front so concurrent boots serialize
+    // here instead of failing mid-migration when a DEFERRED transaction
+    // upgrades to a write.
+    #[cfg(test)]
+    let instrumented_first_begin =
+        test_sync::PARTICIPATE.with(|p| p.get()) && !test_sync::FIRST_BEGIN_DONE.with(|f| f.get());
+    #[cfg(test)]
+    if instrumented_first_begin {
+        test_sync::FIRST_BEGIN_DONE.with(|f| f.set(true));
+    }
+    // Replaces the busy_timeout raised for this unit on a participating test
+    // connection: records SQLite-observed contention, then keeps retrying.
+    #[cfg(test)]
+    if test_sync::PARTICIPATE.with(|p| p.get()) {
+        conn.busy_handler(Some(test_sync::record_busy))?;
+    }
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| SqliteError::migration(migration.version, e))?;
+    if let Err(error) = admission.check() {
+        let rollback = tx.rollback();
+        return Err(capacity_refusal_after_rollback(
+            conn,
+            rollback,
+            error,
+            "core schema migration",
+        ));
+    }
 
-        // IMMEDIATE: take the write lock up front so concurrent boots serialize
-        // here instead of failing mid-migration when a DEFERRED transaction
-        // upgrades to a write.
-        #[cfg(test)]
-        let instrumented_first_begin = test_sync::PARTICIPATE.with(|p| p.get())
-            && !test_sync::FIRST_BEGIN_DONE.with(|f| f.get());
-        #[cfg(test)]
-        if instrumented_first_begin {
-            test_sync::FIRST_BEGIN_DONE.with(|f| f.set(true));
-        }
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| SqliteError::Migration {
-                version: migration.version,
-                error: e.to_string(),
-            })?;
-
-        // Re-check under the write lock: a sibling process may have applied
-        // this migration (and possibly later ones) while we waited. Running
-        // its DDL again would fail; fast-forward past everything it applied.
-        let sibling_version: u32 = tx
-            .query_row(
-                "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| SqliteError::Migration {
-                version: migration.version,
-                error: e.to_string(),
-            })?;
-        #[cfg(test)]
-        if instrumented_first_begin {
-            use std::sync::atomic::Ordering::SeqCst;
-            if sibling_version == 0 {
-                // Winner: hold the write lock until SQLite has reported a
-                // busy acquisition to the loser (its busy handler fired) —
-                // proof the loser's BEGIN is actually blocked on this held
-                // lock, not merely intended. Bounded so a regression fails
-                // the assertion instead of hanging the test.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                while !test_sync::BUSY_OBSERVED.load(SeqCst) && std::time::Instant::now() < deadline
-                {
-                    std::thread::yield_now();
-                }
-            } else {
-                // Loser: our first BEGIN just returned. Record whether the
-                // winner had already committed — true means we blocked across
-                // its held lock.
-                test_sync::LOSER_SAW_WINNER_COMMIT
-                    .store(test_sync::WINNER_COMMITTED.load(SeqCst), SeqCst);
+    // Re-check under the write lock: a sibling process may have applied
+    // this migration (and possibly later ones) while we waited. Running
+    // its DDL again would fail; fast-forward past everything it applied.
+    let sibling_version: u32 = tx
+        .query_row(SCHEMA_VERSION_PROBE_SQL, [], |row| row.get(0))
+        .map_err(|e| SqliteError::migration(migration.version, e))?;
+    #[cfg(test)]
+    if instrumented_first_begin {
+        use std::sync::atomic::Ordering::SeqCst;
+        if sibling_version == 0 {
+            // Winner: hold the write lock until SQLite has reported a
+            // busy acquisition to the loser (its busy handler fired) —
+            // proof the loser's BEGIN is actually blocked on this held
+            // lock, not merely intended. Bounded so a regression fails
+            // the assertion instead of hanging the test.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !test_sync::BUSY_OBSERVED.load(SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
             }
-        }
-
-        // The ahead-of-latest guard above ran on a pre-lock read; a newer
-        // build may have committed a version past ours while we waited for
-        // the write lock. Accepting it (clamped) would return Ok on a schema
-        // this binary does not understand — reject it the same way.
-        if sibling_version > latest_version {
-            return Err(SqliteError::InvalidData(format!(
-                "database schema version {sibling_version} is ahead of the latest known \
-                 migration {latest_version} (committed by a concurrent process while this \
-                 one waited for the migration write lock). This build cannot run against \
-                 the newer schema; upgrade the binary or recreate the database."
-            )));
-        }
-
-        if sibling_version >= migration.version {
-            #[cfg(test)]
-            test_sync::LOCKED_FAST_FORWARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            skip_through = sibling_version.min(latest_version);
-            applied_version = applied_version.max(migration.version);
-            continue;
-        }
-
-        if migration.version == ATTACHMENT_CUTOVER_VERSION {
-            let status = attachment_cutover_status(&tx).map_err(|e| SqliteError::Migration {
-                version: migration.version,
-                error: e.to_string(),
-            })?;
-            let legacy_refs: i64 = tx
-                .query_row(
-                    "SELECT COUNT(*) FROM entities WHERE content_ref IS NOT NULL",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|e| SqliteError::Migration {
-                    version: migration.version,
-                    error: e.to_string(),
-                })?;
-
-            // V21 belongs to the boot coordinator. Ordinary backend open may
-            // finish the degenerate zero-ref case atomically, but it must not
-            // expose a dual-source interval or eagerly stage a legacy DB.
-            if status == AttachmentCutoverStatus::Incomplete || legacy_refs != 0 {
-                drop(tx);
-                break;
-            }
-            if status != AttachmentCutoverStatus::Pending {
-                return Err(SqliteError::Migration {
-                    version: migration.version,
-                    error: format!("unexpected attachment cutover state {status:?}"),
-                });
-            }
-
-            let now = chrono::Utc::now().timestamp_micros();
-            stage_attachment_cutover_on_connection(&tx, now).map_err(|e| {
-                SqliteError::Migration {
-                    version: migration.version,
-                    error: e.to_string(),
-                }
-            })?;
-            finalize_attachment_cutover_on_connection(&tx, now).map_err(|e| {
-                SqliteError::Migration {
-                    version: migration.version,
-                    error: e.to_string(),
-                }
-            })?;
-        } else if migration.version == 44 {
-            migrate_outbound_due_key(&tx).map_err(|error| SqliteError::Migration {
-                version: migration.version,
-                error: error.to_string(),
-            })?;
-        } else if migration.name == SESSION_IDENTITY_MIGRATION_NAME {
-            tx.execute_batch(migration.up)
-                .map_err(|error| SqliteError::Migration {
-                    version: migration.version,
-                    error: error.to_string(),
-                })?;
-            session_identity_migration::apply(&tx).map_err(|error| SqliteError::Migration {
-                version: migration.version,
-                error: error.to_string(),
-            })?;
         } else {
-            tx.execute_batch(migration.up)
-                .map_err(|e| SqliteError::Migration {
-                    version: migration.version,
-                    error: e.to_string(),
-                })?;
+            // Loser: our first BEGIN just returned. Record whether the
+            // winner had already committed — true means we blocked across
+            // its held lock.
+            test_sync::LOSER_SAW_WINNER_COMMIT
+                .store(test_sync::WINNER_COMMITTED.load(SeqCst), SeqCst);
         }
+    }
 
-        // V19's repair contract includes normalizing the two known-divergent
-        // recorded names. `_schema_migrations` is created and owned by this
-        // runner (not by any migration file), so the normalization lives
-        // here, in the same transaction that applies V19's SQL. Exact,
-        // closed set — versions 13 and 14 only; any other (version, name)
-        // mismatch still fails startup via validate_applied_migration_ledger.
-        if migration.version == 19 {
-            tx.execute_batch(
-                "UPDATE _schema_migrations SET name = 'list_cursor_sequences' WHERE version = 13;\n\
-                 UPDATE _schema_migrations SET name = 'graph_edges_id_unique' WHERE version = 14;",
-            )
-            .map_err(|e| SqliteError::Migration {
-                version: migration.version,
-                error: e.to_string(),
-            })?;
+    // The ahead-of-latest guard above ran on a pre-lock read; a newer
+    // build may have committed a version past ours while we waited for
+    // the write lock. Accepting it (clamped) would return Ok on a schema
+    // this binary does not understand — reject it the same way.
+    if sibling_version > latest_version {
+        return Err(SqliteError::InvalidData(format!(
+            "database schema version {sibling_version} is ahead of the latest known \
+             migration {latest_version} (committed by a concurrent process while this \
+             one waited for the migration write lock). This build cannot run against \
+             the newer schema; upgrade the binary or recreate the database."
+        )));
+    }
+
+    if sibling_version >= migration.version {
+        #[cfg(test)]
+        test_sync::LOCKED_FAST_FORWARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(MigrationStep::AppliedBySibling(sibling_version));
+    }
+
+    if migration.version == 46 {
+        memory_visibility::capture_pre_v46(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
+        #[cfg(test)]
+        memory_visibility::test_state::stop_at(memory_visibility::test_state::Stop::AfterCapture)?;
+    }
+
+    if migration.version == ATTACHMENT_CUTOVER_VERSION {
+        let status = attachment_cutover_status(&tx)
+            .map_err(|e| SqliteError::migration(migration.version, e))?;
+        let defers = cutover_defers(&tx, status)
+            .map_err(|e| SqliteError::migration(migration.version, e))?;
+
+        // V21 belongs to the boot coordinator. Ordinary backend open may
+        // finish the degenerate zero-ref case atomically, but it must not
+        // expose a dual-source interval or eagerly stage a legacy DB.
+        if defers {
+            drop(tx);
+            return Ok(MigrationStep::Deferred);
+        }
+        if status != AttachmentCutoverStatus::Pending {
+            return Err(SqliteError::migration_message(
+                migration.version,
+                format!("unexpected attachment cutover state {status:?}"),
+            ));
         }
 
         let now = chrono::Utc::now().timestamp_micros();
-        tx.execute(
-            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3) \
-             ON CONFLICT(version) DO NOTHING",
-            rusqlite::params![migration.version, migration.name, now],
-        )
-        .map_err(|e| SqliteError::Migration {
-            version: migration.version,
-            error: e.to_string(),
-        })?;
-
-        #[cfg(test)]
-        if instrumented_first_begin {
-            test_sync::WINNER_COMMITTED.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        tx.commit().map_err(|e| SqliteError::Migration {
-            version: migration.version,
-            error: e.to_string(),
-        })?;
-
-        applied_version = migration.version;
+        stage_attachment_cutover_on_connection(&tx, now)
+            .map_err(|e| SqliteError::migration(migration.version, e))?;
+        finalize_attachment_cutover_on_connection(&tx, now)
+            .map_err(|e| SqliteError::migration(migration.version, e))?;
+    } else if migration.version == 36 {
+        // The events store DDL may already have added these columns.
+        crate::stores::event::ensure_operation_attribution_columns(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
+    } else if migration.version == 44 {
+        migrate_outbound_due_key(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
+    } else if migration.version == 48 {
+        migrate_acknowledgement_journal(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
+    } else if migration.version == 58 {
+        migrate_proposal_archive(&tx)?;
+    } else if migration.version == 66 {
+        migrate_undelivered_due_index(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
+    } else if migration.name == SESSION_IDENTITY_MIGRATION_NAME {
+        tx.execute_batch(migration.up)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
+        session_identity_migration::apply(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
+    } else {
+        tx.execute_batch(migration.up)
+            .map_err(|e| SqliteError::migration(migration.version, e))?;
     }
 
-    // Validate again after the loop: our own commits and any under-lock
-    // sibling fast-forward must both leave the exact canonical ledger, not
-    // merely advance its maximum version.
-    validate_applied_migration_ledger(conn, applied_version)?;
+    let visibility_counts = if migration.version == MEMORY_VISIBILITY_CUTOVER_VERSION {
+        Some(
+            memory_visibility::cutover_counts(&tx)
+                .map_err(|error| SqliteError::migration(migration.version, error))?,
+        )
+    } else {
+        None
+    };
 
-    Ok(applied_version)
+    // V19's repair contract includes normalizing the two known-divergent
+    // recorded names. `_schema_migrations` is created and owned by this
+    // runner (not by any migration file), so the normalization lives
+    // here, in the same transaction that applies V19's SQL. Exact,
+    // closed set — versions 13 and 14 only; any other (version, name)
+    // mismatch still fails startup via validate_applied_migration_ledger.
+    if migration.version == 19 {
+        tx.execute_batch(
+            "UPDATE _schema_migrations SET name = 'list_cursor_sequences' WHERE version = 13;\n\
+             UPDATE _schema_migrations SET name = 'graph_edges_id_unique' WHERE version = 14;",
+        )
+        .map_err(|e| SqliteError::migration(migration.version, e))?;
+    }
+
+    let now = chrono::Utc::now().timestamp_micros();
+    tx.execute(
+        "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(version) DO NOTHING",
+        rusqlite::params![migration.version, migration.name, now],
+    )
+    .map_err(|e| SqliteError::migration(migration.version, e))?;
+
+    #[cfg(test)]
+    if instrumented_first_begin {
+        test_sync::WINNER_COMMITTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    if migration.version == MEMORY_VISIBILITY_CUTOVER_VERSION {
+        memory_visibility::test_state::stop_at(
+            memory_visibility::test_state::Stop::BeforeCutoverCommit,
+        )?;
+    }
+    tx.commit()
+        .map_err(|e| SqliteError::migration(migration.version, e))?;
+    if let Some(counts) = visibility_counts {
+        memory_visibility::log_counts(&counts, conn.path().unwrap_or(":memory:"));
+    }
+    #[cfg(test)]
+    if migration.version == 46 {
+        memory_visibility::test_state::stop_at(
+            memory_visibility::test_state::Stop::AfterV46Commit,
+        )?;
+    }
+
+    Ok(MigrationStep::Applied)
 }
 
 #[derive(Debug)]
@@ -1759,6 +2377,43 @@ pub(crate) fn query_embedding_models_conn(
     }
 }
 
+// Test fixtures use the public policy constructor and a private lock namespace.
+#[cfg(test)]
+pub(crate) fn migration_test_policy() -> MigrationWritePolicy {
+    MigrationWritePolicy::new(
+        crate::DiskGuardEnvironment::capture()
+            .resolve(None, None)
+            .expect("test disk policy"),
+        crate::PoolConfig::for_test()
+            .volume_lock_dir
+            .expect("test volume-lock directory"),
+    )
+    .expect("valid test migration policy")
+}
+
+#[cfg(test)]
+pub(crate) fn run_migrations_for_test(conn: &mut Connection) -> Result<u32, SqliteError> {
+    run_migrations_with_policy(conn, &migration_test_policy())
+}
+
+#[cfg(test)]
+fn apply_schema_plan_for_test(
+    conn: &mut Connection,
+    plan: &ServiceSchemaPlan,
+) -> Result<(), SqliteError> {
+    apply_schema_plan_with_policy(conn, plan, &migration_test_policy())
+}
+
+#[cfg(test)]
+fn stage_attachment_cutover_for_test(conn: &mut Connection) -> Result<(), SqliteError> {
+    stage_attachment_cutover_with_policy(conn, &migration_test_policy())
+}
+
+#[cfg(test)]
+fn finalize_attachment_cutover_for_test(conn: &mut Connection) -> Result<(), SqliteError> {
+    finalize_attachment_cutover_with_policy(conn, &migration_test_policy())
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -1770,3 +2425,27 @@ mod entity_version_measurement;
 #[cfg(test)]
 #[path = "migrations_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "raw_migration_settlement_tests.rs"]
+mod raw_settlement_tests;
+
+#[cfg(test)]
+#[path = "git_note_index_migration_tests.rs"]
+mod git_note_indexes;
+
+#[cfg(test)]
+#[path = "entity_list_index_migration_tests.rs"]
+mod entity_list_indexes;
+
+#[cfg(test)]
+#[path = "schedule_core_index_migration_tests.rs"]
+mod schedule_core_index_migration_tests;
+
+#[cfg(test)]
+#[path = "comm_core_index_migration_tests.rs"]
+mod comm_core_index_migration_tests;
+
+#[cfg(test)]
+#[path = "knowledge_cursor_tag_migration_tests.rs"]
+mod knowledge_cursor_tag_migration_tests;

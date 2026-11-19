@@ -1,10 +1,15 @@
 """SQL fragment dependencies and isolation in the repository lint."""
+import ast
+import os
 import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -32,11 +37,194 @@ class SqlLintTests(unittest.TestCase):
         (self.root / "crates").mkdir()
         shutil.copy2(ROOT / "scripts/lint-sql.sh", self.root / "scripts/lint-sql.sh")
 
-    def run_lint(self):
+    def run_lint(self, env=None):
+        if ((self.root / "crates/khive-db/sql").exists()
+                and not (self.root / "crates/khive-db/src/migrations.rs").exists()):
+            self.write_registry(["schema.sql"])
         return subprocess.run(
             ["sh", str(self.root / "scripts/lint-sql.sh")],
-            text=True, capture_output=True, timeout=20, check=False,
+            text=True, capture_output=True, timeout=20, check=False, env=env,
         )
+
+    def write_registry(self, names):
+        source = self.root / "crates/khive-db/src/migrations.rs"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        constants = [
+            f'const V{index}_UP: &str = include_str!("../sql/{name}");'
+            for index, name in enumerate(names, 1)
+        ]
+        entries = [
+            f'VersionedMigration {{ version: {index}, name: "fixture", up: V{index}_UP }},'
+            for index in range(1, len(names) + 1)
+        ]
+        source.write_text("\n".join(constants)
+                          + "\npub const MIGRATIONS: &[VersionedMigration] = &[\n"
+                          + "\n".join(entries) + "\n];\n")
+
+    def core_fixture(self, schema):
+        core = self.root / "crates/khive-db/sql"
+        core.mkdir(parents=True)
+        (core / "schema.sql").write_text(schema)
+        self.write_registry(["schema.sql"])
+        return core
+
+    def run_with_dqs_enabled(self, option):
+        """Flip just one guard in the copied entrypoint, independent of build defaults."""
+        script = self.root / "scripts/lint-sql.sh"
+        original = script.read_text()
+        disabled = f"con.setconfig(sqlite3.{option}, False)"
+        enabled = f"con.setconfig(sqlite3.{option}, True)"
+        self.assertEqual(original.count(disabled), 1)
+        script.write_text(original.replace(disabled, enabled))
+        try:
+            return self.run_lint()
+        finally:
+            script.write_text(original)
+
+    def test_double_quoted_query_names_must_resolve(self):
+        core = self.core_fixture("CREATE TABLE deliveries (message TEXT);\n")
+        query = core / "message-select.sql"
+        query.write_text('SELECT "message" FROM deliveries WHERE "message" = ?1;\n')
+        positive = self.run_lint()
+        self.assertEqual(positive.returncode, 0, positive.stdout + positive.stderr)
+        self.assertIn("2 file(s) OK (1 prepared, 1 executed)", positive.stdout)
+
+        query.write_text('SELECT "message" FROM deliveries WHERE "message_typo" = ?1;\n')
+        negative = self.run_lint()
+        self.assertNotEqual(negative.returncode, 0)
+        self.assertIn("message-select.sql: FAILED to prepare", negative.stdout)
+        self.assertIn("no such column", negative.stdout)
+        self.assertIn("message_typo", negative.stdout)
+
+        # DDL remains strict; only the DML flag is changed in this control.
+        permissive = self.run_with_dqs_enabled("SQLITE_DBCONFIG_DQS_DML")
+        self.assertEqual(permissive.returncode, 0, permissive.stdout + permissive.stderr)
+        self.assertIn("2 file(s) OK (1 prepared, 1 executed)", permissive.stdout)
+
+    def assert_ddl_quoted_names_must_resolve(self, in_core):
+        schema = (
+            "CREATE TABLE deliveries (\n"
+            "    message TEXT,\n"
+            '    CHECK ("message" <> \'\')\n'
+            ");\n"
+        )
+        if in_core:
+            directory = self.core_fixture(schema)
+            table = directory / "schema.sql"
+            failure = "schema.sql: FAILED to apply on the migration chain"
+        else:
+            directory = self.root / "crates/reader/sql"
+            directory.mkdir(parents=True)
+            table = directory / "table.sql"
+            table.write_text(schema)
+            failure = "table.sql: FAILED to load"
+        positive = self.run_lint()
+        self.assertEqual(positive.returncode, 0, positive.stdout + positive.stderr)
+        self.assertIn("1 file(s) OK (0 prepared, 1 executed)", positive.stdout)
+
+        table.write_text(schema.replace('"message"', '"message_typo"'))
+        negative = self.run_lint()
+        self.assertNotEqual(negative.returncode, 0)
+        self.assertIn(failure, negative.stdout)
+        self.assertIn("no such column", negative.stdout)
+        self.assertIn("message_typo", negative.stdout)
+
+        # DML remains strict; a multiline table avoids an unrelated format error.
+        permissive = self.run_with_dqs_enabled("SQLITE_DBCONFIG_DQS_DDL")
+        self.assertEqual(permissive.returncode, 0, permissive.stdout + permissive.stderr)
+        self.assertIn("1 file(s) OK (0 prepared, 1 executed)", permissive.stdout)
+
+    def test_double_quoted_migration_check_names_must_resolve(self):
+        self.assert_ddl_quoted_names_must_resolve(in_core=True)
+
+    def test_double_quoted_fragment_check_names_must_resolve(self):
+        self.assert_ddl_quoted_names_must_resolve(in_core=False)
+
+    def test_core_parameterized_insert_is_prepared_without_null_execution(self):
+        core = self.core_fixture("CREATE TABLE deliveries (message TEXT NOT NULL);\n")
+        # A numbered name is still a query when it is not registered as a migration.
+        (core / "006-message-insert.sql").write_text(
+            "INSERT INTO deliveries (message) VALUES (?1);\n"
+        )
+        result = self.run_lint()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("2 file(s) OK (1 prepared, 1 executed)", result.stdout)
+
+    def test_core_missing_column_is_refused_during_preparation(self):
+        core = self.core_fixture("CREATE TABLE deliveries (message TEXT);\n")
+        (core / "message-select.sql").write_text("SELECT missing FROM deliveries;\n")
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("message-select.sql: FAILED to prepare", result.stdout)
+        self.assertIn("no such column: missing", result.stdout)
+
+    def test_registered_data_reconciliation_runs_before_its_unique_index(self):
+        core = self.core_fixture(
+            "CREATE TABLE deliveries (message TEXT NOT NULL);\n"
+            "INSERT INTO deliveries VALUES ('same'), ('same');\n"
+        )
+        (core / "002-delivery-status.sql").write_text(
+            "ALTER TABLE deliveries ADD COLUMN ready INTEGER DEFAULT 1;\n"
+        )
+        # Registration, not the filename or first keyword, makes this a migration.
+        (core / "reconcile-deliveries.sql").write_text(
+            "DELETE FROM deliveries WHERE rowid NOT IN "
+            "(SELECT MIN(rowid) FROM deliveries GROUP BY message);\n"
+            "CREATE UNIQUE INDEX one_message ON deliveries(message);\n"
+        )
+        (core / "delivery-select.sql").write_text(
+            "SELECT message FROM deliveries WHERE ready = ?1;\n"
+        )
+        self.write_registry(["schema.sql", "reconcile-deliveries.sql"])
+        # Version constants and comments must not hide an actual up target.
+        source = self.root / "crates/khive-db/src/migrations.rs"
+        source.write_text("const RECONCILE_VERSION: u32 = 2;\n" + source.read_text().replace(
+            "version: 2", "version: RECONCILE_VERSION /* up: NOT_A_MIGRATION */"
+        ))
+        result = self.run_lint()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("4 file(s) OK (1 prepared, 3 executed)", result.stdout)
+
+    def test_core_queries_see_other_ddl_and_never_fire_write_triggers(self):
+        core = self.core_fixture(
+            "CREATE TABLE deliveries (message TEXT NOT NULL);\n"
+            "INSERT INTO deliveries VALUES ('held');\n"
+            "CREATE TRIGGER no_insert BEFORE INSERT ON deliveries "
+            "BEGIN SELECT RAISE(ABORT, 'query executed INSERT'); END;\n"
+            "CREATE TRIGGER no_update BEFORE UPDATE ON deliveries "
+            "BEGIN SELECT RAISE(ABORT, 'query executed UPDATE'); END;\n"
+            "CREATE TRIGGER no_delete BEFORE DELETE ON deliveries "
+            "BEGIN SELECT RAISE(ABORT, 'query executed DELETE'); END;\n"
+        )
+        for name, sql in [
+            ("insert", "INSERT INTO deliveries VALUES ('new');"),
+            ("update", "UPDATE deliveries SET message = 'new';"),
+            ("delete", "DELETE FROM deliveries;"),
+        ]:
+            (core / f"message-{name}.sql").write_text(sql + "\n")
+        other = self.root / "crates/reader/sql"
+        other.mkdir(parents=True)
+        (other / "statuses.sql").write_text("CREATE TABLE statuses (ready INTEGER);\n")
+        (core / "message-select.sql").write_text(
+            "SELECT message FROM deliveries CROSS JOIN statuses WHERE ready = ?1;\n"
+        )
+        result = self.run_lint()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("6 file(s) OK (4 prepared, 2 executed)", result.stdout)
+
+    def test_unresolved_or_missing_registered_migration_fails_closed(self):
+        self.core_fixture("CREATE TABLE deliveries (message TEXT);\n")
+        source = self.root / "crates/khive-db/src/migrations.rs"
+        original = source.read_text()
+        source.write_text(original.replace("up: V1_UP", "up: UNKNOWN_UP"))
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot resolve registered migrations", result.stdout)
+        self.assertIn("UNKNOWN_UP", result.stdout)
+        source.write_text(original.replace("../sql/schema.sql", "../sql/missing.sql"))
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("registered migration is missing", result.stdout)
 
     def copy_git_fragments(self):
         """Git auxiliary DDL and live-note indexes depend on the core notes table."""
@@ -191,6 +379,24 @@ class SqlLintTests(unittest.TestCase):
         self.assertIn("unexpected_core_visibility.sql: FAILED to load", result.stdout)
         self.assertIn("no such table", result.stdout)
 
+    def test_lint_runs_the_interpreter_named_by_the_environment(self):
+        # Hosts whose plain python3 predates Connection.setconfig can still run the
+        # lint through a newer interpreter; only the SQL phase (stdin "-") marks it.
+        marker = self.root / "named-interpreter-ran"
+        wrapper = self.root / "named-python"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f'if [ "$1" = "-" ]; then touch "{marker}"; fi\n'
+            f'exec "{sys.executable}" "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        directory = self.root / "crates/single/sql"
+        directory.mkdir(parents=True)
+        (directory / "table.sql").write_text("CREATE TABLE shared (id INTEGER);\n")
+        result = self.run_lint(env={**os.environ, "KHIVE_SQL_LINT_PYTHON": str(wrapper)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(marker.exists(), "the named interpreter did not run the SQL phase")
+
     def test_each_directory_has_an_independent_database(self):
         for name in ["first", "second"]:
             directory = self.root / "crates" / name / "sql"
@@ -204,6 +410,275 @@ class SqlLintTests(unittest.TestCase):
         result = self.run_lint()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("5 file(s) OK", result.stdout)
+
+    def gtd_fixture(self):
+        directory = self.root / "crates/khive-pack-gtd/sql"
+        directory.mkdir(parents=True, exist_ok=True)
+        statements = {
+            "ddl": "CREATE TABLE IF NOT EXISTS gtd_lifecycle_audit (\n"
+                   "    note_id TEXT NOT NULL,\n    from_state TEXT NOT NULL,\n"
+                   "    to_state TEXT NOT NULL,\n    note TEXT,\n"
+                   "    at INTEGER NOT NULL,\n    namespace TEXT\n)\n",
+            "note-index": "CREATE INDEX IF NOT EXISTS idx_gtd_audit_note "
+                          "ON gtd_lifecycle_audit(note_id, at DESC)\n",
+            "table-info": "PRAGMA table_info(gtd_lifecycle_audit)\n",
+            "add-namespace": "ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespace TEXT\n",
+        }
+        for name, sql in statements.items():
+            (directory / f"task-lifecycle-audit-{name}.sql").write_text(sql)
+        (directory / "audit-insert.sql").write_text(
+            "INSERT INTO gtd_lifecycle_audit "
+            "(note_id, from_state, to_state, note, at, namespace) "
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6)\n"
+        )
+        return directory
+
+    def test_gtd_legacy_upgrade_and_canonical_query_schema_both_validate(self):
+        self.gtd_fixture()
+        result = self.run_lint()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("5 file(s) OK (1 prepared, 4 executed)", result.stdout)
+
+    def test_gtd_upgrade_errors_and_wrong_layouts_are_never_suppressed(self):
+        cases = [
+            ("add-namespace", "ALTER TABLE absent ADD COLUMN namespace TEXT\n", "no such table"),
+            ("add-namespace", "ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespase TEXT\n", "after upgrade"),
+            ("add-namespace", "ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespace BLOB\n", "after upgrade"),
+            ("add-namespace", "ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespace TEXT DEFAULT 'x'\n", "after upgrade"),
+            ("add-namespace", "ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespace TEXT NOT NULL DEFAULT 'x'\n", "after upgrade"),
+            ("add-namespace", "ALTER TABLE gtd_lifecycle_audit ADD COLMN namespace TEXT\n", "after upgrade"),
+            ("add-namespace", "ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespace TEXT; SELECT 1;\n", "one statement"),
+            ("add-namespace", "SELECT 1\n", "must contain pack DDL"),
+            ("table-info", "PRAGMA table_info(absent)\n", "before upgrade"),
+        ]
+        for name, sql, diagnostic in cases:
+            with self.subTest(name=name, sql=sql):
+                directory = self.gtd_fixture()
+                (directory / f"task-lifecycle-audit-{name}.sql").write_text(sql)
+                result = self.run_lint()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(diagnostic, result.stdout)
+
+    def test_gtd_syntax_error_and_missing_bundle_file_fail(self):
+        directory = self.gtd_fixture()
+        path = directory / "task-lifecycle-audit-add-namespace.sql"
+        path.write_text("ALTER TABLE gtd_lifecycle_audit ADD COLUMN (\n")
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FAILED legacy fixture", result.stdout)
+        self.assertIn("syntax error", result.stdout)
+        path.unlink()
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("incomplete GTD upgrade bundle", result.stdout)
+
+    def test_gtd_legacy_fixture_requires_the_exact_old_layout(self):
+        self.gtd_fixture()
+        script = self.root / "scripts/lint-sql.sh"
+        original = script.read_text()
+        for before, after in [
+            ("CREATE TABLE gtd_lifecycle_audit (", "CREATE TABLE wrong_fixture ("),
+            ("    at INTEGER NOT NULL\n)\n", "    at INTEGER NOT NULL,\n    namespace TEXT\n)\n"),
+        ]:
+            with self.subTest(after=after):
+                self.assertEqual(original.count(before), 1)
+                script.write_text(original.replace(before, after))
+                result = self.run_lint()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("legacy fixture: unexpected table layout", result.stdout)
+        script.write_text(original)
+
+    def test_gtd_canonical_layout_must_match_the_upgraded_layout(self):
+        directory = self.gtd_fixture()
+        path = directory / "task-lifecycle-audit-ddl.sql"
+        source = path.read_text()
+        for broken in [source.replace(",\n    namespace TEXT", ""),
+                       source.replace("namespace TEXT", "namespace BLOB")]:
+            with self.subTest(broken=broken):
+                path.write_text(broken)
+                result = self.run_lint()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("canonical schema: unexpected table layout", result.stdout)
+
+    def test_gtd_upgrade_registration_does_not_exempt_neighboring_ddl(self):
+        directory = self.gtd_fixture()
+        (directory / "zz-unregistered.sql").write_text(
+            "ALTER TABLE absent ADD COLUMN missing TEXT\n"
+        )
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("zz-unregistered.sql: FAILED to load", result.stdout)
+        self.assertIn("no such table", result.stdout)
+
+    def test_gtd_queries_keep_name_and_bind_checks_without_executing(self):
+        directory = self.gtd_fixture()
+        query = directory / "audit-insert.sql"
+        original = query.read_text()
+        for broken, diagnostic in [
+            (original.replace("gtd_lifecycle_audit", "absent"), "no such table"),
+            (original.replace("namespace)", "missing)"), "no column named missing"),
+            (original.replace("?6", "?8"), "positional binds must run 1..N"),
+        ]:
+            with self.subTest(broken=broken):
+                query.write_text(broken)
+                result = self.run_lint()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stdout)
+        query.write_text(original)
+        (directory / "zz-no-insert.sql").write_text(
+            "CREATE TRIGGER no_insert BEFORE INSERT ON gtd_lifecycle_audit "
+            "BEGIN SELECT RAISE(ABORT, 'query executed INSERT'); END;\n"
+        )
+        result = self.run_lint()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("6 file(s) OK (1 prepared, 5 executed)", result.stdout)
+
+    def test_gtd_fixture_keeps_ddl_local_and_current_query_schema_shared(self):
+        self.gtd_fixture()
+        unrelated = self.root / "crates/unrelated/sql"
+        unrelated.mkdir(parents=True)
+        index = unrelated / "unexpected_index.sql"
+        index.write_text("CREATE INDEX unexpected ON gtd_lifecycle_audit(namespace)\n")
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected_index.sql: FAILED to load", result.stdout)
+        self.assertIn("no such table", result.stdout)
+        index.unlink()
+        (unrelated / "allowed_query.sql").write_text(
+            "SELECT namespace FROM gtd_lifecycle_audit WHERE note_id = ?1\n"
+        )
+        result = self.run_lint()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("6 file(s) OK (2 prepared, 4 executed)", result.stdout)
+
+
+    def test_quoted_and_commented_bind_spelling_is_not_a_parameter(self):
+        core = self.core_fixture("CREATE TABLE deliveries (message TEXT);\n")
+        query = core / "quoted-bind-select.sql"
+        for name, literal, comment in [
+            ("domain tag", "'%type:domain%'", ""),
+            ("parameter text", "'?999 :name @name $name'", ""),
+            ("doubled quote", "'it''s :name ?999 @name $name'", ""),
+            ("line comment", "'ok'", "-- ?999 :name @name $name\n"),
+            ("line comment EOF", "'ok'", "-- ?999 :name @name $name"),
+            ("block comment", "'ok'", "/* ?999 :name\n @name $name */"),
+            ("block comment EOF", "'ok'", "/* ?999 :name @name $name"),
+        ]:
+            with self.subTest(name=name):
+                query.write_text(
+                    f"SELECT {literal} AS marker, message FROM deliveries "
+                    f"WHERE message = ?1 AND ?2 IS NULL" + (f" {comment}" if comment else "")
+                )
+                result = self.run_lint()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("2 file(s) OK (1 prepared, 1 executed)", result.stdout)
+
+    def test_quoted_identifier_bind_spelling_is_not_a_parameter(self):
+        core = self.core_fixture(
+            "CREATE TABLE deliveries (\n"
+            "    message TEXT,\n"
+            '    ":name" TEXT,\n'
+            '    "@name" TEXT,\n'
+            '    "$name" TEXT,\n'
+            '    "?999" TEXT,\n'
+            '    "double""quote:name?999" TEXT,\n'
+            '    "tick`mark:@name?999" TEXT\n'
+            ");\n"
+        )
+        query = core / "identifier-bind-select.sql"
+        for identifier in [
+            '":name"', '`@name`', '[$name]', '"?999"',
+            '"double""quote:name?999"', '`tick``mark:@name?999`',
+        ]:
+            with self.subTest(identifier=identifier):
+                query.write_text(
+                    f"SELECT {identifier} FROM deliveries WHERE message = ?1\n"
+                )
+                result = self.run_lint()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("2 file(s) OK (1 prepared, 1 executed)", result.stdout)
+
+    def test_real_bind_forms_and_gaps_still_fail(self):
+        core = self.core_fixture("CREATE TABLE deliveries (message TEXT);\n")
+        query = core / "real-bind-select.sql"
+        forbidden = "use numbered binds (?1, ?2), not anonymous or named ones"
+        gap = "positional binds must run 1..N with no gaps"
+        for name, predicate, diagnostic in [
+            ("anonymous", "message = ?", forbidden),
+            ("colon", "message = :name", forbidden),
+            ("at sign", "message = @name", forbidden),
+            ("dollar", "message = $name", forbidden),
+            ("gap", "message = ?1 AND ?3 IS NULL", gap),
+            ("literal cannot fill gap", "message = ?1 AND ?3 IS NULL AND '?2' <> ''", gap),
+            ("comment cannot fill gap", "message = ?1 AND ?3 IS NULL /* ?2 */", gap),
+            ("comment separates anonymous", "message = ?/* ?1 */1", forbidden),
+        ]:
+            with self.subTest(name=name):
+                query.write_text(f"SELECT message FROM deliveries WHERE {predicate}\n")
+                result = self.run_lint()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"real-bind-select.sql: {diagnostic}", result.stdout)
+
+
+class SqlLintConnectionTests(unittest.TestCase):
+    def factory(self, sqlite_module):
+        # Compile only the actual constructor, so capability failures can be
+        # exercised without opening SQLite or running the script's SQL phases.
+        script = (ROOT / "scripts/lint-sql.sh").read_text()
+        embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        functions = [node for node in ast.parse(embedded).body
+                     if isinstance(node, ast.FunctionDef) and node.name == "lint_connection"]
+        self.assertEqual(len(functions), 1)
+        module = ast.Module(body=functions, type_ignores=[])
+        namespace = {"sqlite3": sqlite_module}
+        exec(compile(module, str(ROOT / "scripts/lint-sql.sh"), "exec"), namespace)
+        return namespace["lint_connection"]
+
+    def sqlite_stub(self):
+        connection = mock.Mock(spec=["setconfig", "close", "execute", "executescript"])
+        sqlite_module = types.SimpleNamespace(
+            Connection=types.SimpleNamespace(setconfig=lambda *_: None),
+            SQLITE_DBCONFIG_DQS_DML=1013,
+            SQLITE_DBCONFIG_DQS_DDL=1014,
+            Error=RuntimeError,
+            connect=mock.Mock(return_value=connection),
+        )
+        return sqlite_module, connection
+
+    def test_missing_configuration_capability_fails_before_connect(self):
+        for missing in ["Connection.setconfig", "SQLITE_DBCONFIG_DQS_DML",
+                        "SQLITE_DBCONFIG_DQS_DDL"]:
+            with self.subTest(missing=missing):
+                sqlite_module, connection = self.sqlite_stub()
+                if missing == "Connection.setconfig":
+                    del sqlite_module.Connection.setconfig
+                else:
+                    delattr(sqlite_module, missing)
+                with self.assertRaises(SystemExit) as refused:
+                    self.factory(sqlite_module)()
+                self.assertIn("Python 3.12+", str(refused.exception))
+                self.assertIn(missing, str(refused.exception))
+                sqlite_module.connect.assert_not_called()
+                connection.execute.assert_not_called()
+                connection.executescript.assert_not_called()
+
+    def test_configuration_failure_closes_connection_before_sql(self):
+        for failing_option in [1013, 1014]:
+            with self.subTest(failing_option=failing_option):
+                sqlite_module, connection = self.sqlite_stub()
+
+                def configure(option, enabled):
+                    if option == failing_option:
+                        raise sqlite_module.Error("unsupported DQS option")
+
+                connection.setconfig.side_effect = configure
+                with self.assertRaises(SystemExit) as refused:
+                    self.factory(sqlite_module)()
+                self.assertIn("cannot disable SQLite DQS", str(refused.exception))
+                self.assertIn("unsupported DQS option", str(refused.exception))
+                connection.close.assert_called_once_with()
+                connection.execute.assert_not_called()
+                connection.executescript.assert_not_called()
 
 
 if __name__ == "__main__":

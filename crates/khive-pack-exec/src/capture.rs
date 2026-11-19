@@ -138,12 +138,18 @@ fn read_regular_bounded(
 #[cfg(unix)]
 mod platform {
     use super::{read_regular_bounded, CaptureRead, CapturedContent};
+    use khive_fs::directory_walk::{read_link_at_bounded, BoundedLinkRead};
+    #[cfg(test)]
+    use khive_fs::fd_relative::c_name;
+    use khive_fs::fd_relative::{list_names, open_at, stat_at, stat_fd};
+    use khive_fs::opened_file::opened_file_path;
     use std::collections::BTreeMap;
-    use std::ffi::{CStr, CString, OsStr, OsString};
+    use std::ffi::{OsStr, OsString};
     use std::fs::{File, OpenOptions};
     use std::io;
-    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    #[cfg(test)]
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
     use std::sync::Arc;
@@ -189,7 +195,7 @@ mod platform {
         pub fn missing_root(&self) -> io::Result<Option<String>> {
             use std::os::unix::fs::MetadataExt as _;
 
-            let path = match descriptor_path(&self.directory) {
+            let path = match opened_file_path(&self.directory).map_err(capture_path_error) {
                 Ok(path) => path,
                 Err(error) if error.kind() == io::ErrorKind::Unsupported => return Err(error),
                 Err(error) => {
@@ -226,35 +232,22 @@ mod platform {
     #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
     const DESCRIPTOR_PATH_QUERY: &str = "descriptor path query";
 
-    #[cfg(target_vendor = "apple")]
-    fn descriptor_path(file: &File) -> io::Result<std::path::PathBuf> {
-        let mut buffer = vec![0u8; libc::PATH_MAX as usize + 1];
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) } == -1 {
-            return Err(io::Error::last_os_error());
+    fn capture_path_error(error: io::Error) -> io::Error {
+        if error.raw_os_error().is_some() {
+            return error;
         }
-        let len = buffer.iter().position(|&byte| byte == 0).ok_or_else(|| {
-            io::Error::new(
+        match error.kind() {
+            io::ErrorKind::Unsupported => io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no descriptor-to-path query on this platform",
+            ),
+            #[cfg(target_vendor = "apple")]
+            io::ErrorKind::InvalidData => io::Error::new(
                 io::ErrorKind::InvalidData,
                 "F_GETPATH result is not terminated",
-            )
-        })?;
-        buffer.truncate(len);
-        Ok(std::path::PathBuf::from(OsString::from_vec(buffer)))
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn descriptor_path(file: &File) -> io::Result<std::path::PathBuf> {
-        // A removed directory reads back as "<path> (deleted)", which the
-        // lstat comparison then reports as missing or as a different file.
-        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
-    }
-
-    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-    fn descriptor_path(_file: &File) -> io::Result<std::path::PathBuf> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "no descriptor-to-path query on this platform",
-        ))
+            ),
+            _ => error,
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -290,52 +283,18 @@ mod platform {
         }
     }
 
-    fn c_name(name: &OsStr) -> io::Result<CString> {
-        CString::new(name.as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in capture name"))
-    }
-
-    fn stat_fd(file: &File) -> io::Result<libc::stat> {
-        let mut stat = std::mem::MaybeUninit::uninit();
-        if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
+    /// The shared descriptor helpers refuse a NUL byte in a name with their own wording; capture
+    /// reports it as a capture name. Any other error passes through unchanged.
+    fn capture_name_error(error: io::Error) -> io::Error {
+        if error.kind() == io::ErrorKind::InvalidInput && error.raw_os_error().is_none() {
+            io::Error::new(io::ErrorKind::InvalidInput, "NUL in capture name")
+        } else {
+            error
         }
-        Ok(unsafe { stat.assume_init() })
-    }
-
-    fn stat_at(parent: &File, name: &OsStr) -> io::Result<libc::stat> {
-        let name = c_name(name)?;
-        let mut stat = std::mem::MaybeUninit::uninit();
-        if unsafe {
-            libc::fstatat(
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(unsafe { stat.assume_init() })
     }
 
     fn changed() -> io::Error {
         io::Error::other("capture entry changed after inspection")
-    }
-
-    fn open_at(parent: &File, name: &OsStr, directory: bool) -> io::Result<File> {
-        let name = c_name(name)?;
-        let flags = libc::O_RDONLY
-            | libc::O_CLOEXEC
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK
-            | if directory { libc::O_DIRECTORY } else { 0 };
-        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(unsafe { File::from_raw_fd(fd) })
     }
 
     fn open_checked(
@@ -350,7 +309,7 @@ mod platform {
                 if stat_at(parent, name).is_ok_and(|current| Identity::from(&current) != expected) {
                     return Err(changed());
                 }
-                return Err(error);
+                return Err(capture_name_error(error));
             }
         };
         let stat = stat_fd(&file)?;
@@ -371,123 +330,15 @@ mod platform {
         Ok(opened)
     }
 
-    struct DirStream(*mut libc::DIR);
-
-    impl Drop for DirStream {
-        fn drop(&mut self) {
-            unsafe { libc::closedir(self.0) };
-        }
-    }
-
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "visionos",
-        target_os = "freebsd"
-    ))]
-    fn errno_location() -> *mut libc::c_int {
-        unsafe { libc::__error() }
-    }
-
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "emscripten",
-        target_os = "redox",
-        target_os = "hurd"
-    ))]
-    fn errno_location() -> *mut libc::c_int {
-        unsafe { libc::__errno_location() }
-    }
-
-    #[cfg(any(
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "android",
-        target_os = "cygwin",
-        target_os = "nuttx"
-    ))]
-    fn errno_location() -> *mut libc::c_int {
-        unsafe { libc::__errno() }
-    }
-
-    #[cfg(any(target_os = "solaris", target_os = "illumos"))]
-    fn errno_location() -> *mut libc::c_int {
-        unsafe { libc::___errno() }
-    }
-
-    #[cfg(target_os = "aix")]
-    fn errno_location() -> *mut libc::c_int {
-        unsafe { libc::_Errno() }
-    }
-
-    #[cfg(target_os = "haiku")]
-    fn errno_location() -> *mut libc::c_int {
-        unsafe { libc::_errnop() }
-    }
-
-    fn names(directory: &File) -> io::Result<Vec<OsString>> {
-        let fd = open_at(directory, OsStr::new("."), true)?.into_raw_fd();
-        let stream = unsafe { libc::fdopendir(fd) };
-        if stream.is_null() {
-            let error = io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(error);
-        }
-        let stream = DirStream(stream);
-        let mut result = Vec::new();
-        loop {
-            unsafe { *errno_location() = 0 };
-            let entry = unsafe { libc::readdir(stream.0) };
-            if entry.is_null() {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(0) {
-                    return Err(error);
-                }
-                break;
-            }
-            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-            if name != b"." && name != b".." {
-                result.push(OsString::from_vec(name.to_vec()));
-            }
-        }
-        result.sort();
-        Ok(result)
-    }
-
     fn read_link_at(parent: &File, name: &OsStr, max_bytes: u64) -> io::Result<CaptureRead> {
-        let name = c_name(name)?;
-        let ceiling = max_bytes.saturating_add(1).min(usize::MAX as u64) as usize;
-        let mut capacity = ceiling.clamp(1, 256);
-        loop {
-            let mut bytes = vec![0u8; capacity];
-            let len = unsafe {
-                libc::readlinkat(
-                    parent.as_raw_fd(),
-                    name.as_ptr(),
-                    bytes.as_mut_ptr().cast(),
-                    bytes.len(),
-                )
-            };
-            if len < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if len as usize == capacity {
-                if capacity == ceiling {
-                    return Ok(CaptureRead::TooLarge {
-                        observed_at_least: capacity as u64,
-                    });
-                }
-                capacity = capacity.saturating_mul(2).min(ceiling);
-                continue;
-            }
-            bytes.truncate(len as usize);
-            return Ok(CaptureRead::Complete(CapturedContent {
+        match read_link_at_bounded(parent, name, max_bytes)? {
+            BoundedLinkRead::Complete(bytes) => Ok(CaptureRead::Complete(CapturedContent {
                 digest: blake3::hash(&bytes).to_hex().to_string(),
                 bytes,
-            }));
+            })),
+            BoundedLinkRead::TooLarge { observed_at_least } => {
+                Ok(CaptureRead::TooLarge { observed_at_least })
+            }
         }
     }
 
@@ -496,7 +347,7 @@ mod platform {
             let opened_parent = open_directory_path(&self.root, &self.parent_path)?;
             let parent = opened_parent.as_ref().unwrap_or(&self.root);
             if self.mode == 120000 {
-                let checked = stat_at(parent, &self.name)?;
+                let checked = stat_at(parent, &self.name).map_err(capture_name_error)?;
                 if Identity::from(&checked) != self.identity {
                     return Err(changed());
                 }
@@ -527,17 +378,38 @@ mod platform {
                     )
                 })?;
             let directory = opened_directory.as_ref().unwrap_or(&root.directory);
-            let entries = names(directory).map_err(|error| {
+            let entries = list_names(directory).map_err(|error| {
                 io::Error::new(
                     error.kind(),
                     format!("read capture directory {rel:?}: {error}"),
                 )
             })?;
             for name in entries {
+                let Some(name_str) = name.to_str() else {
+                    let mut escaped = String::from("non-UTF-8 path: ");
+                    let mut append = |byte: u8| {
+                        const HEX: &[u8; 16] = b"0123456789abcdef";
+                        escaped.push_str("\\x");
+                        escaped.push(char::from(HEX[usize::from(byte >> 4)]));
+                        escaped.push(char::from(HEX[usize::from(byte & 0x0f)]));
+                    };
+                    if !rel.is_empty() {
+                        for byte in rel.bytes().chain(std::iter::once(b'/')) {
+                            append(byte);
+                        }
+                    }
+                    for &byte in name.as_bytes() {
+                        append(byte);
+                    }
+                    // Skipping a directory skips its subtree as well: its name
+                    // cannot be represented by the capture's string paths.
+                    skipped.push(escaped);
+                    continue;
+                };
                 let child_rel = if rel.is_empty() {
-                    name.to_string_lossy().into_owned()
+                    name_str.to_string()
                 } else {
-                    format!("{rel}/{}", name.to_string_lossy())
+                    format!("{rel}/{name_str}")
                 };
                 if child_rel.len() > MAX_CAPTURE_PATH_BYTES {
                     return Err(io::Error::new(
@@ -549,6 +421,7 @@ mod platform {
                     ));
                 }
                 let stat = stat_at(directory, &name).map_err(|error| {
+                    let error = capture_name_error(error);
                     io::Error::new(
                         error.kind(),
                         format!("stat capture entry {child_rel:?}: {error}"),
@@ -590,480 +463,151 @@ mod platform {
     }
 
     #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn capture_open_does_not_follow_symlink_in_run_directory() {
-            let run = tempfile::tempdir().unwrap();
-            let outside = tempfile::tempdir().unwrap();
-            std::fs::write(outside.path().join("outside"), b"outside bytes").unwrap();
-            std::os::unix::fs::symlink(outside.path().join("outside"), run.path().join("link"))
-                .unwrap();
-            let root = CaptureRoot::open(run.path()).unwrap();
-            assert!(open_at(&root.directory, OsStr::new("link"), false).is_err());
-        }
-
-        /// Create `levels` nested directories named `name` below `root` by
-        /// descriptor, so the chain may be longer than PATH_MAX.
-        fn mkdir_chain(root: &File, name: &OsStr, levels: usize) {
-            let mut parent = root.try_clone().unwrap();
-            for _ in 0..levels {
-                let c = c_name(name).unwrap();
-                let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), c.as_ptr(), 0o700) };
-                assert_eq!(rc, 0, "mkdirat: {}", io::Error::last_os_error());
-                parent = open_at(&parent, name, true).unwrap();
-            }
-        }
-
-        #[test]
-        fn walk_refuses_a_path_past_the_capture_byte_cap() {
-            let name = OsString::from("d".repeat(200));
-
-            // Five levels: 5 * 200 bytes plus four separators = 1004 bytes.
-            let within = tempfile::tempdir().unwrap();
-            let root = CaptureRoot::open(within.path()).unwrap();
-            mkdir_chain(&root.directory, &name, 5);
-            let (files, skipped) = walk(&root).expect("a path within the cap is captured");
-            assert!(files.is_empty());
-            assert!(skipped.is_empty());
-
-            // Six levels: 1205 bytes, past the cap.
-            let past = tempfile::tempdir().unwrap();
-            let root = CaptureRoot::open(past.path()).unwrap();
-            mkdir_chain(&root.directory, &name, 6);
-            let error = walk(&root).unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-            assert!(
-                error.to_string().contains(&format!(
-                    "capture path exceeds {MAX_CAPTURE_PATH_BYTES} bytes"
-                )),
-                "{error}"
-            );
-        }
-
-        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
-        #[test]
-        fn missing_root_tells_a_removed_or_replaced_run_directory_from_a_renamed_one() {
-            let parent = tempfile::tempdir().unwrap();
-
-            let kept = parent.path().join("kept");
-            std::fs::create_dir(&kept).unwrap();
-            let root = CaptureRoot::open(&kept).unwrap();
-            assert_eq!(root.missing_root().unwrap(), None);
-
-            // Rename-away keeps the pinned directory, so capture stays complete.
-            let renamed = parent.path().join("renamed");
-            std::fs::create_dir(&renamed).unwrap();
-            let root = CaptureRoot::open(&renamed).unwrap();
-            std::fs::rename(&renamed, parent.path().join("moved")).unwrap();
-            assert_eq!(root.missing_root().unwrap(), None);
-
-            // A new directory at the old path does not change that: the pinned
-            // tree is still named at its new path.
-            std::fs::create_dir(&renamed).unwrap();
-            assert_eq!(root.missing_root().unwrap(), None);
-
-            let removed = parent.path().join("removed");
-            std::fs::create_dir(&removed).unwrap();
-            std::fs::write(removed.join("output"), b"x").unwrap();
-            let root = CaptureRoot::open(&removed).unwrap();
-            std::fs::remove_dir_all(&removed).unwrap();
-            let detail = root
-                .missing_root()
-                .unwrap()
-                .expect("removed root is missing");
-            assert!(detail.starts_with("root_missing: "), "{detail}");
-            assert!(detail.contains(DESCRIPTOR_PATH_QUERY), "{detail}");
-            let (files, _) = walk(&root).expect("the pinned directory still lists");
-            assert!(files.is_empty(), "a removed root lists as empty");
-
-            let replaced = parent.path().join("replaced");
-            std::fs::create_dir(&replaced).unwrap();
-            let root = CaptureRoot::open(&replaced).unwrap();
-            std::fs::remove_dir(&replaced).unwrap();
-            std::fs::create_dir(&replaced).unwrap();
-            let detail = root
-                .missing_root()
-                .unwrap()
-                .expect("a new directory at the same path is not the pinned one");
-            assert!(detail.starts_with("root_missing: "), "{detail}");
-            assert!(
-                detail.contains("different file") || detail.contains("no longer exists"),
-                "{detail}"
-            );
-        }
-
-        #[cfg(target_vendor = "apple")]
-        #[test]
-        fn missing_root_reports_an_unqueryable_path_as_unverified() {
-            let parent = tempfile::tempdir().unwrap();
-            let run = parent.path().join("run");
-            std::fs::create_dir(&run).unwrap();
-            let root = CaptureRoot::open(&run).unwrap();
-
-            // Move the run directory under a chain whose path is longer than
-            // the platform limit; each step is relative, so no call passes it.
-            let name = "d".repeat(200);
-            let mut deep = std::fs::File::open(parent.path()).unwrap();
-            for _ in 0..7 {
-                let component = std::ffi::CString::new(name.as_str()).unwrap();
-                // SAFETY: `deep` is an open directory and `component` is a NUL-terminated name.
-                let made = unsafe { libc::mkdirat(deep.as_raw_fd(), component.as_ptr(), 0o700) };
-                assert_eq!(made, 0, "{}", io::Error::last_os_error());
-                // SAFETY: as above; the returned descriptor is owned by the new `File`.
-                let fd = unsafe {
-                    libc::openat(
-                        deep.as_raw_fd(),
-                        component.as_ptr(),
-                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                    )
-                };
-                assert!(fd >= 0, "{}", io::Error::last_os_error());
-                // SAFETY: `fd` was just returned by `openat` and is not owned elsewhere.
-                deep = unsafe { std::fs::File::from_raw_fd(fd) };
-            }
-            let parent_dir = std::fs::File::open(parent.path()).unwrap();
-            let from = std::ffi::CString::new("run").unwrap();
-            // SAFETY: both descriptors are open directories and both names are NUL-terminated.
-            let moved = unsafe {
-                libc::renameat(
-                    parent_dir.as_raw_fd(),
-                    from.as_ptr(),
-                    deep.as_raw_fd(),
-                    from.as_ptr(),
-                )
-            };
-            assert_eq!(moved, 0, "{}", io::Error::last_os_error());
-
-            let detail = root
-                .missing_root()
-                .unwrap()
-                .expect("a path the kernel cannot report is not confirmed");
-            assert!(detail.starts_with("root_unverified: "), "{detail}");
-            let (files, _) = walk(&root).expect("the pinned directory still lists");
-            assert!(files.is_empty());
-        }
-    }
+    #[path = "tests.rs"]
+    mod tests;
 }
 
 #[cfg(unix)]
 pub use platform::{walk, CaptureRoot};
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
+#[path = "capture/tests.rs"]
+mod tests;
 
-    fn captured_bytes(found: &platform::Found) -> Vec<u8> {
-        match found.read_content_bounded(1024).unwrap() {
-            CaptureRead::Complete(content) => content.bytes,
-            CaptureRead::TooLarge { .. } => panic!("small fixture exceeded capture cap"),
+#[cfg(all(test, unix))]
+mod non_utf8_capture_tests {
+    use super::platform::Found;
+    use super::{walk, CaptureRead, CaptureRoot};
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "khive-capture-non-utf8-{}-{}",
+                std::process::id(),
+                NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).expect("create temporary capture directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn invalid_name(bytes: &[u8]) -> OsString {
+        OsString::from_vec(bytes.to_vec())
+    }
+
+    /// Whether this filesystem stores names that are not valid UTF-8. APFS refuses them with
+    /// EILSEQ, so on macOS these tests have nothing to walk and report a skip; on Linux a
+    /// refusal is a test failure, so the platform that can hold such names always runs them.
+    fn filesystem_holds_invalid_names(dir: &Path) -> bool {
+        let probe = dir.join(invalid_name(b"probe\x80"));
+        match std::fs::write(&probe, b"") {
+            Ok(()) => {
+                std::fs::remove_file(&probe).unwrap();
+                true
+            }
+            Err(error)
+                if error.raw_os_error() == Some(libc::EILSEQ) && !cfg!(target_os = "linux") =>
+            {
+                eprintln!("skipped: this filesystem refuses non-UTF-8 names ({error})");
+                false
+            }
+            Err(error) => panic!("could not create a non-UTF-8 name: {error}"),
+        }
+    }
+
+    fn assert_content(found: &Found, expected: &[u8]) {
+        match found.read_content_bounded(64).unwrap() {
+            CaptureRead::Complete(content) => assert_eq!(content.bytes, expected),
+            CaptureRead::TooLarge { .. } => panic!("small file was refused"),
         }
     }
 
     #[test]
-    fn walk_captures_many_directories_under_256_fd_limit() {
-        const CHILD_MARKER: &str = "KHIVE_EXEC_CAPTURE_LOW_NOFILE_CHILD";
-        if std::env::var_os(CHILD_MARKER).is_none() {
-            let marker_dir = tempfile::tempdir().unwrap();
-            let marker = marker_dir.path().join("completed");
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "capture::tests::walk_captures_many_directories_under_256_fd_limit",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(CHILD_MARKER, &marker)
-                .output()
-                .expect("spawn isolated low-fd test process");
-            assert!(
-                output.status.success(),
-                "low-fd capture child failed: status={}\nstdout:\n{}\nstderr:\n{}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert_eq!(
-                std::fs::read(&marker).expect("the filtered child test must run"),
-                b"completed"
-            );
+    fn distinct_invalid_names_are_reported_without_collision() {
+        let tmp = TempDir::new();
+        if !filesystem_holds_invalid_names(tmp.path()) {
             return;
         }
-
-        let dir = tempfile::tempdir().unwrap();
-        for i in 0..400 {
-            let child = dir.path().join(format!("sub-{i:03}"));
-            std::fs::create_dir(&child).unwrap();
-            std::fs::write(child.join("output"), b"captured").unwrap();
-        }
-
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
-            0
-        );
-        assert!(
-            limit.rlim_max >= 256,
-            "test requires a hard fd limit >= 256"
-        );
-        limit.rlim_cur = 256;
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
-
-        let root = CaptureRoot::open(dir.path()).unwrap();
-        let (files, skipped) = walk(&root).expect("capture must not retain one fd per directory");
-        assert!(skipped.is_empty());
-        assert_eq!(files.len(), 400);
-        for i in 0..400 {
-            assert_eq!(
-                captured_bytes(&files[&format!("sub-{i:03}/output")]),
-                b"captured"
-            );
-        }
-        std::fs::write(
-            std::path::PathBuf::from(std::env::var_os(CHILD_MARKER).unwrap()),
-            b"completed",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn tail_keeps_last_bytes_and_counts_all() {
-        let mut t = Tail::new(128);
-        t.push(&[b'A'; 512]);
-        t.push(b"OUT-END");
-        assert_eq!(t.produced(), 519);
-        let r = t.retained();
-        assert_eq!(r.len(), 128);
-        assert!(r.ends_with(b"OUT-END"));
-        assert!(!t.complete());
-        let mut small = Tail::new(128);
-        small.push(b"ok\n");
-        assert!(small.complete());
-        assert_eq!(small.retained(), b"ok\n");
-    }
-
-    #[test]
-    fn sparse_output_is_refused_from_metadata_before_a_whole_file_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sparse-output");
-        let file = std::fs::File::create(&path).unwrap();
-        file.set_len(1024 * 1024 * 1024).unwrap();
-        let root = CaptureRoot::open(dir.path()).unwrap();
-        let (files, _) = walk(&root).unwrap();
-        assert!(matches!(
-            files["sparse-output"].read_content_bounded(1024).unwrap(),
-            CaptureRead::TooLarge { observed_at_least } if observed_at_least == 1024 * 1024 * 1024
-        ));
-    }
-
-    #[test]
-    fn actual_capture_bytes_are_bounded_even_if_metadata_underreports() {
-        let bytes = vec![b'x'; 2048];
-        let result = read_regular_bounded(std::io::Cursor::new(bytes), 0, 1024).unwrap();
-        assert!(matches!(
-            result,
-            CaptureRead::TooLarge { observed_at_least } if observed_at_least > 1024
-        ));
-        let result = read_regular_bounded(std::io::Cursor::new(b"complete"), 0, 1024).unwrap();
-        let CaptureRead::Complete(content) = result else {
-            panic!("small content should be captured");
-        };
-        assert_eq!(content.bytes, b"complete");
-        assert_eq!(
-            content.digest,
-            blake3::hash(b"complete").to_hex().to_string()
-        );
-    }
-
-    #[test]
-    fn walk_reports_missing_root_instead_of_returning_an_empty_tree() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing-run");
-        let error = CaptureRoot::open(&missing).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn walk_reports_unreadable_descendant_instead_of_omitting_its_files() {
-        use std::os::unix::fs::PermissionsExt;
-
-        assert_ne!(unsafe { libc::geteuid() }, 0, "run as a non-root user");
-        let dir = tempfile::tempdir().unwrap();
-        let sealed = dir.path().join("sealed");
-        std::fs::create_dir(&sealed).unwrap();
-        std::fs::write(sealed.join("input"), b"still present").unwrap();
-        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let root = CaptureRoot::open(dir.path()).unwrap();
-        let result = walk(&root);
-        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let error = result.unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(error.to_string().contains("sealed"));
-        assert_eq!(
-            std::fs::read(sealed.join("input")).unwrap(),
-            b"still present"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn walk_captures_file_directory_and_dangling_symlinks_without_following() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a"), b"1").unwrap();
-        std::fs::create_dir(dir.path().join("sub")).unwrap();
-        std::fs::write(dir.path().join("sub/b"), b"2").unwrap();
-        for (name, target) in [
-            ("file-link", "a"),
-            ("dir-link", "sub"),
-            ("dangling-link", "missing"),
-            ("escape-link", "/etc/passwd"),
-        ] {
-            std::os::unix::fs::symlink(target, dir.path().join(name)).unwrap();
-        }
-        let root = CaptureRoot::open(dir.path()).unwrap();
+        std::fs::write(tmp.path().join(invalid_name(b"a\x80")), b"first").unwrap();
+        std::fs::write(tmp.path().join(invalid_name(b"a\x81")), b"second").unwrap();
+        std::fs::write(tmp.path().join("valid"), b"kept").unwrap();
+        let root = CaptureRoot::open(tmp.path()).unwrap();
         let (files, skipped) = walk(&root).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_content(files.get("valid").unwrap(), b"kept");
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped.contains(&"non-UTF-8 path: \\x61\\x80".to_string()));
+        assert!(skipped.contains(&"non-UTF-8 path: \\x61\\x81".to_string()));
+    }
+
+    #[test]
+    fn invalid_name_does_not_hide_literal_replacement_character() {
+        let tmp = TempDir::new();
+        if !filesystem_holds_invalid_names(tmp.path()) {
+            return;
+        }
+        std::fs::write(tmp.path().join(invalid_name(b"a\x80")), b"invalid").unwrap();
+        std::fs::write(tmp.path().join("a\u{fffd}"), b"valid").unwrap();
+        let root = CaptureRoot::open(tmp.path()).unwrap();
+        let (files, skipped) = walk(&root).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_content(files.get("a\u{fffd}").unwrap(), b"valid");
+        assert_eq!(skipped, vec!["non-UTF-8 path: \\x61\\x80".to_string()]);
+    }
+
+    #[test]
+    fn invalid_directory_is_reported_without_walking_its_subtree() {
+        let tmp = TempDir::new();
+        if !filesystem_holds_invalid_names(tmp.path()) {
+            return;
+        }
+        let dir = tmp.path().join("parent");
+        std::fs::create_dir(&dir).unwrap();
+        let invalid = dir.join(invalid_name(b"bad\x80"));
+        std::fs::create_dir(&invalid).unwrap();
+        std::fs::write(invalid.join("inside"), b"not visited").unwrap();
+        std::fs::write(dir.join("valid"), b"kept").unwrap();
+        let root = CaptureRoot::open(tmp.path()).unwrap();
+        let (files, skipped) = walk(&root).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_content(files.get("parent/valid").unwrap(), b"kept");
         assert_eq!(
-            files.keys().cloned().collect::<Vec<_>>(),
+            skipped,
             vec![
-                "a",
-                "dangling-link",
-                "dir-link",
-                "escape-link",
-                "file-link",
-                "sub/b"
+                "non-UTF-8 path: \\x70\\x61\\x72\\x65\\x6e\\x74\\x2f\\x62\\x61\\x64\\x80"
+                    .to_string()
             ]
         );
-        assert!(skipped.is_empty());
-        assert_eq!(captured_bytes(&files["a"]), b"1");
-        assert_eq!(captured_bytes(&files["sub/b"]), b"2");
-        for (name, target) in [
-            ("file-link", "a"),
-            ("dir-link", "sub"),
-            ("dangling-link", "missing"),
-            ("escape-link", "/etc/passwd"),
-        ] {
-            assert_eq!(files[name].mode, 120000);
-            assert_eq!(captured_bytes(&files[name]), target.as_bytes());
-        }
     }
 
-    #[cfg(unix)]
     #[test]
-    fn walk_preserves_non_utf8_and_unnormalized_symlink_target_bytes() {
-        use std::os::unix::ffi::OsStringExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let target = b"../missing//\xff/./target\n";
-        std::os::unix::fs::symlink(
-            std::ffi::OsString::from_vec(target.to_vec()),
-            dir.path().join("link"),
-        )
-        .unwrap();
-        let root = CaptureRoot::open(dir.path()).unwrap();
+    fn valid_replacement_character_path_is_preserved() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.path().join("a\u{fffd}"), b"valid").unwrap();
+        std::fs::write(tmp.path().join(r"literal\x61"), b"literal").unwrap();
+        let root = CaptureRoot::open(tmp.path()).unwrap();
         let (files, skipped) = walk(&root).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_content(files.get("a\u{fffd}").unwrap(), b"valid");
+        assert_content(files.get(r"literal\x61").unwrap(), b"literal");
         assert!(skipped.is_empty());
-        assert_eq!(files["link"].mode, 120000);
-        assert_eq!(captured_bytes(&files["link"]), target);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn walk_still_skips_sockets_and_fifos() {
-        use std::os::unix::ffi::OsStrExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let _socket = std::os::unix::net::UnixListener::bind(dir.path().join("socket")).unwrap();
-        let fifo = std::ffi::CString::new(dir.path().join("fifo").as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        let root = CaptureRoot::open(dir.path()).unwrap();
-        let (files, mut skipped) = walk(&root).unwrap();
-        assert!(files.is_empty());
-        skipped.sort();
-        assert_eq!(skipped, vec!["fifo", "socket"]);
-    }
-
-    #[test]
-    fn capture_refuses_symlink_in_run_directory() {
-        let run = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let outside_file = outside.path().join("outside");
-        std::fs::write(&outside_file, b"outside bytes").unwrap();
-        let path = run.path().join("output");
-        std::fs::write(&path, b"inside bytes").unwrap();
-        let root = CaptureRoot::open(run.path()).unwrap();
-        let (files, skipped) = walk(&root).unwrap();
-        assert!(skipped.is_empty());
-        std::fs::remove_file(&path).unwrap();
-        std::os::unix::fs::symlink(&outside_file, &path).unwrap();
-
-        let error = files["output"].read_content_bounded(1024).unwrap_err();
-        assert!(
-            error.to_string().contains("changed after inspection"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn capture_walk_uses_opened_directory() {
-        let container = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let run = container.path().join("run");
-        std::fs::create_dir(&run).unwrap();
-        std::fs::write(run.join("output"), b"inside bytes").unwrap();
-        std::fs::write(outside.path().join("output"), b"outside bytes").unwrap();
-        let root = CaptureRoot::open(&run).unwrap();
-        std::fs::rename(&run, container.path().join("original")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), &run).unwrap();
-
-        let (files, skipped) = walk(&root).unwrap();
-        assert!(skipped.is_empty());
-        assert_eq!(captured_bytes(&files["output"]), b"inside bytes");
-    }
-
-    #[test]
-    fn reopened_parent_refuses_replaced_directory() {
-        let run = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let parent = run.path().join("parent");
-        std::fs::create_dir(&parent).unwrap();
-        std::fs::write(parent.join("output"), b"inside bytes").unwrap();
-        std::fs::write(outside.path().join("output"), b"outside bytes").unwrap();
-
-        let root = CaptureRoot::open(run.path()).unwrap();
-        let (files, skipped) = walk(&root).unwrap();
-        assert!(skipped.is_empty());
-        std::fs::rename(&parent, run.path().join("original")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), &parent).unwrap();
-
-        let error = files["parent/output"]
-            .read_content_bounded(1024)
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("changed after inspection"),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn deadline_closes_a_held_stream() {
-        use tokio::io::AsyncWriteExt;
-
-        let (mut writer, reader) = tokio::io::duplex(64);
-        writer.write_all(b"before").await.unwrap();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            drain_until(reader, 128, deadline),
-        )
-        .await
-        .expect("output drain exceeded its outer deadline");
-        assert_eq!(result.stop, DrainStop::Deadline);
-        assert_eq!(result.tail.retained(), b"before");
-        assert!(writer.write_all(b"after").await.is_err());
     }
 }

@@ -14,6 +14,7 @@ use crate::pool::ConnectionPool;
 pub mod agents;
 pub mod attachment;
 pub mod blob;
+#[cfg(feature = "blob-s3")]
 pub mod blob_s3;
 pub mod entity;
 pub mod event;
@@ -25,6 +26,58 @@ pub mod text;
 pub mod vectors;
 
 use khive_storage::{BatchWriteErrorClass, BatchWriteRetryability};
+
+fn validate_json_equality_paths(
+    predicates: &[(String, khive_storage::SqlValue)],
+    capability: StorageCapability,
+    operation: &'static str,
+) -> Result<(), StorageError> {
+    for (path, _) in predicates {
+        if !path.starts_with("$.")
+            || !path[2..].split('.').all(|part| {
+                !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+        {
+            return Err(StorageError::InvalidInput {
+                capability,
+                operation: operation.into(),
+                message: format!("invalid JSON equality path: {path:?}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn append_json_equalities(
+    conditions: &mut Vec<String>,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    column: &'static str,
+    predicates: &[(String, khive_storage::SqlValue)],
+) {
+    use khive_storage::SqlValue;
+    use rusqlite::types::Value;
+
+    for (path, value) in predicates {
+        params.push(Box::new(path.clone()));
+        let path_index = params.len();
+        let value = match value {
+            SqlValue::Null => Value::Null,
+            SqlValue::Bool(value) => Value::Integer(i64::from(*value)),
+            SqlValue::Integer(value) => Value::Integer(*value),
+            SqlValue::Float(value) => Value::Real(*value),
+            SqlValue::Text(value) => Value::Text(value.clone()),
+            SqlValue::Blob(value) => Value::Blob(value.clone()),
+            SqlValue::Json(value) => Value::Text(value.to_string()),
+            SqlValue::Uuid(value) => Value::Text(value.to_string()),
+            SqlValue::Timestamp(value) => Value::Integer(value.timestamp_micros()),
+        };
+        params.push(Box::new(value));
+        conditions.push(format!(
+            "json_extract({column}, ?{path_index}) = ?{}",
+            params.len()
+        ));
+    }
+}
 
 /// Stable refusal classification for SQLite errors captured inside a
 /// best-effort per-item batch loop.
@@ -63,6 +116,11 @@ fn classify_batch_sqlite_error(
 /// exhaustion is returned as the canonical retryable `AdmissionTimeout`; a
 /// cancelled request remains the non-retryable `Timeout`. There is no
 /// standalone-reader fallback (ADR-165 Slice 2).
+///
+/// The reader permit is awaited here, before the blocking task starts, so a
+/// read that has to queue holds a task and not a blocking-pool thread. The
+/// permit then moves into the blocking closure, which picks its connection
+/// with the slot already held.
 pub(crate) async fn run_pooled_store_read<F, R>(
     pool: Arc<ConnectionPool>,
     capability: StorageCapability,
@@ -70,22 +128,130 @@ pub(crate) async fn run_pooled_store_read<F, R>(
     read: F,
 ) -> StorageResult<R>
 where
-    F: FnOnce(&rusqlite::Connection) -> Result<R, StorageError> + Send + 'static,
+    F: FnOnce(&crate::ProgressConn) -> Result<R, StorageError> + Send + 'static,
     R: Send + 'static,
 {
+    run_pooled_store_read_with_state(pool, capability, operation, false, read).await
+}
+
+/// A typed read that changes connection-local state must pay the pristine
+/// return check, including when its callback unwinds with an open transaction.
+pub(crate) async fn run_stateful_pooled_store_read<F, R>(
+    pool: Arc<ConnectionPool>,
+    capability: StorageCapability,
+    operation: &'static str,
+    read: F,
+) -> StorageResult<R>
+where
+    F: FnOnce(&crate::ProgressConn) -> Result<R, StorageError> + Send + 'static,
+    R: Send + 'static,
+{
+    run_pooled_store_read_with_state(pool, capability, operation, true, read).await
+}
+
+struct PooledReadStateOwner<'pool> {
+    guard: crate::pool::ReaderGuard<'pool>,
+    stateful: bool,
+}
+
+impl Drop for PooledReadStateOwner<'_> {
+    fn drop(&mut self) {
+        // The scope has already removed its progress handler on return or
+        // unwind. Never release an unfinished transaction as a reusable reader,
+        // including the degraded reader that shares the pool's writer.
+        if self.stateful && !self.guard.conn().is_autocommit() {
+            self.guard.discard();
+        }
+    }
+}
+
+async fn run_pooled_store_read_with_state<F, R>(
+    pool: Arc<ConnectionPool>,
+    capability: StorageCapability,
+    operation: &'static str,
+    stateful: bool,
+    read: F,
+) -> StorageResult<R>
+where
+    F: FnOnce(&crate::ProgressConn) -> Result<R, StorageError> + Send + 'static,
+    R: Send + 'static,
+{
+    let trace = khive_storage::request_context::capture_search_phase_trace();
+    let _admission_phase = trace.as_ref().and_then(|trace| {
+        reader_phase(capability, ReaderPhaseKind::Admission).map(|phase| trace.enter(phase))
+    });
+    let admission = pool.acquire_reader_admission(capability, operation).await?;
+    drop(_admission_phase);
+    let _blocking_phase = trace.as_ref().and_then(|trace| {
+        reader_phase(capability, ReaderPhaseKind::BlockingRead).map(|phase| trace.enter(phase))
+    });
+    let worker_trace = trace.clone();
     crate::read_cancellation::run_declared_interruptible_read(capability, operation, move |scope| {
-        let mut guard = pool.resolve_reader_checkout(
+        let _checkout_phase = worker_trace.as_ref().and_then(|trace| {
+            reader_phase(capability, ReaderPhaseKind::Checkout).map(|phase| trace.enter(phase))
+        });
+        let guard = pool.resolve_reader_checkout(
             capability,
             operation,
-            pool.reader_until(|| scope.should_stop()),
+            pool.reader_with_admission(admission, || scope.should_stop()),
         )?;
-        let result = scope.run_pooled_reader(&mut guard, read);
+        drop(_checkout_phase);
+        let mut owner = PooledReadStateOwner { guard, stateful };
+        if stateful {
+            owner.guard.mark_dirty();
+        }
+        let result = scope.run_pooled_reader(&mut owner.guard, read);
         if let Err(error) = &result {
             pool.record_reader_query_error(error);
         }
         result
     })
     .await
+}
+
+#[derive(Clone, Copy)]
+enum ReaderPhaseKind {
+    Admission,
+    Checkout,
+    BlockingRead,
+}
+
+fn reader_phase(
+    capability: StorageCapability,
+    kind: ReaderPhaseKind,
+) -> Option<khive_storage::request_context::SearchPhase> {
+    use khive_storage::request_context::SearchPhase;
+
+    Some(match (capability, kind) {
+        (StorageCapability::Text, ReaderPhaseKind::Admission) => SearchPhase::TextReaderAdmission,
+        (StorageCapability::Text, ReaderPhaseKind::Checkout) => SearchPhase::TextReaderCheckout,
+        (StorageCapability::Text, ReaderPhaseKind::BlockingRead) => SearchPhase::TextBlockingRead,
+        (StorageCapability::Vectors, ReaderPhaseKind::Admission) => {
+            SearchPhase::VectorReaderAdmission
+        }
+        (StorageCapability::Vectors, ReaderPhaseKind::Checkout) => {
+            SearchPhase::VectorReaderCheckout
+        }
+        (StorageCapability::Vectors, ReaderPhaseKind::BlockingRead) => {
+            SearchPhase::VectorBlockingRead
+        }
+        (StorageCapability::Entities, ReaderPhaseKind::Admission) => {
+            SearchPhase::EntityReaderAdmission
+        }
+        (StorageCapability::Entities, ReaderPhaseKind::Checkout) => {
+            SearchPhase::EntityReaderCheckout
+        }
+        (StorageCapability::Entities, ReaderPhaseKind::BlockingRead) => {
+            SearchPhase::EntityBlockingRead
+        }
+        (StorageCapability::Notes, ReaderPhaseKind::Admission) => SearchPhase::NoteReaderAdmission,
+        (StorageCapability::Notes, ReaderPhaseKind::Checkout) => SearchPhase::NoteReaderCheckout,
+        (StorageCapability::Notes, ReaderPhaseKind::BlockingRead) => SearchPhase::NoteBlockingRead,
+        (StorageCapability::Graph, ReaderPhaseKind::Admission) => SearchPhase::GraphReaderAdmission,
+        (StorageCapability::Graph, ReaderPhaseKind::Checkout) => SearchPhase::GraphReaderCheckout,
+        (StorageCapability::Graph, ReaderPhaseKind::BlockingRead) => SearchPhase::GraphBlockingRead,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -140,5 +306,146 @@ mod batch_error_classification_tests {
                 BatchWriteRetryability::Unknown
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod pooled_read_admission_tests {
+    use super::*;
+    use crate::pool::PoolConfig;
+    use std::time::Duration;
+
+    const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(3);
+    const QUEUE_SETTLE: Duration = Duration::from_millis(250);
+    const WAITING_READS: u64 = 3;
+
+    /// A runtime whose blocking pool holds one thread, so a pooled read that
+    /// parks it makes every other blocking task wait its turn.
+    fn single_blocking_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    }
+
+    /// A file-backed pool with one reader permit and a bounded checkout wait.
+    fn single_reader_pool(dir: &tempfile::TempDir) -> Arc<ConnectionPool> {
+        let config = PoolConfig {
+            path: Some(dir.path().join("pooled_read_admission.db")),
+            max_readers: 1,
+            checkout_timeout: CHECKOUT_TIMEOUT,
+            ..PoolConfig::default()
+        };
+        Arc::new(ConnectionPool::new(config).expect("open the single-reader pool"))
+    }
+
+    /// Reads that must queue for the sole permit wait as tasks. The permit is
+    /// held by a checked-out guard on the test task, because a read that
+    /// blocked inside the runtime would itself take the only blocking thread.
+    #[test]
+    fn queued_pooled_reads_leave_the_blocking_pool_free_and_still_time_out() {
+        let runtime = single_blocking_thread_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let pool = single_reader_pool(&dir);
+            let held_reader = pool.reader().expect("hold the sole reader permit");
+
+            let waiting: Vec<_> = (0..WAITING_READS)
+                .map(|_| {
+                    tokio::spawn(run_pooled_store_read(
+                        Arc::clone(&pool),
+                        StorageCapability::Entities,
+                        "queued_read",
+                        |_conn| Ok(()),
+                    ))
+                })
+                .collect();
+            tokio::time::sleep(QUEUE_SETTLE).await;
+
+            let probe = tokio::time::timeout(
+                Duration::from_secs(1),
+                tokio::task::spawn_blocking(|| "probe ran"),
+            )
+            .await
+            .expect("an unrelated blocking task must not wait behind queued pooled reads")
+            .expect("probe task panicked");
+            assert_eq!(probe, "probe ran");
+            assert!(
+                waiting.iter().all(|read| !read.is_finished()),
+                "the probe must complete while every queued read is still waiting"
+            );
+
+            for read in waiting {
+                let error = read.await.expect("read task panicked").unwrap_err();
+                assert!(
+                    matches!(error, StorageError::AdmissionTimeout { .. }),
+                    "a queued read must fail with the retryable AdmissionTimeout, got {error:?}"
+                );
+            }
+            drop(held_reader);
+            let snapshot = pool.reader_acquisition_snapshot();
+            assert_eq!(snapshot.checkout_timeouts, WAITING_READS);
+            assert_eq!(snapshot.available_reader_admission_slots, 1);
+        });
+    }
+
+    /// Cancelling a queued read releases it without waiting for the blocking
+    /// pool or the checkout timeout, and takes no permit from the read behind it.
+    #[test]
+    fn cancelling_a_queued_pooled_read_returns_at_once_and_leaks_no_permit() {
+        let runtime = single_blocking_thread_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let pool = single_reader_pool(&dir);
+            let held_reader = pool.reader().expect("hold the sole reader permit");
+
+            let surviving = tokio::spawn(run_pooled_store_read(
+                Arc::clone(&pool),
+                StorageCapability::Entities,
+                "surviving_read",
+                |_conn| Ok(()),
+            ));
+            // The surviving read queues first, so it is the one that would hold
+            // the lone blocking thread while the cancelled read waits behind it.
+            tokio::time::sleep(QUEUE_SETTLE).await;
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let cancelled_read = run_pooled_store_read(
+                Arc::clone(&pool),
+                StorageCapability::Entities,
+                "cancelled_read",
+                |_conn| Ok(()),
+            );
+            let cancelled = tokio::spawn(khive_storage::scope_request_read_cancellation(
+                cancel_rx,
+                cancelled_read,
+            ));
+            tokio::time::sleep(QUEUE_SETTLE).await;
+            cancel_tx.send(true).unwrap();
+
+            let error = tokio::time::timeout(Duration::from_secs(1), cancelled)
+                .await
+                .expect("a cancelled queued read waited for the blocking pool or the timeout")
+                .expect("cancelled read task panicked")
+                .unwrap_err();
+            assert!(
+                matches!(error, StorageError::Timeout { .. }),
+                "a cancelled queued read must be the non-retryable Timeout, got {error:?}"
+            );
+            assert!(
+                !surviving.is_finished(),
+                "the read that was not cancelled must keep waiting for its permit"
+            );
+
+            drop(held_reader);
+            surviving
+                .await
+                .expect("surviving read task panicked")
+                .expect("the surviving read must be admitted once the permit is free");
+            let snapshot = pool.reader_acquisition_snapshot();
+            assert_eq!(snapshot.available_reader_admission_slots, 1);
+            assert_eq!(snapshot.checkout_timeouts, 0);
+        });
     }
 }

@@ -1,0 +1,36 @@
+charter inbox_triage v1
+title "Answer a message"
+subject message
+
+roles:
+    agent "the agent that owns the inbox"
+
+triggers:
+    message.arrived
+    schedule.fired
+    prompt.received
+
+workflow:
+    phase orient by agent:
+        await message.arrived or schedule.fired or prompt.received
+        action inbox.read(limit=20) by agent
+        action tasks.list_next by agent
+        when message.kind is stop_order: goto halt
+        when message.kind is directive: goto record
+
+    phase act by agent:
+        action work.unit by agent
+        goto persist
+
+    phase record by agent:
+        require memory.recorded advisory
+        goto act
+
+    phase halt by agent:
+        action agents.halt by agent
+        terminate "stopped on request"
+
+    phase persist by agent:
+        require loop.log_written advisory
+        require inbox.unread_older_than(age=20m) advisory
+        complete

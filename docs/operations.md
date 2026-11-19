@@ -23,7 +23,7 @@ explicitly and describes what the code does.
 | `sync`                               | yes (target DB)                            | Rebuild a SQLite DB from `.khive/kg/{entities,edges}.ndjson`                            |
 | `pack list` / `pack handler <name>`  | no                                         | Introspect registered packs (verbs, note/entity kinds)                                  |
 | `kg validate`                        | no (mutates only with `--fix`)             | Structural + rule-based lint of tracked `.khive/kg/*.ndjson`                            |
-| `kg init`                            | yes (repo scaffolding)                     | Create `.khive/kg/`, `khive.toml`, pre-commit hook, optional CI workflow                |
+| `kg init`                            | yes (repo scaffolding)                     | Create `.khive/kg/`, `config.toml`, pre-commit hook, optional CI workflow               |
 | `kg hook install\|uninstall\|status` | yes (`.git/hooks/`)                        | Wire/unwire the pre-commit hook                                                         |
 | `kg fetch` (alias `kg sync`)         | yes (cache dir)                            | Pull a remote KG archive with SHA-256 pin verification                                  |
 | `kg export`                          | no (writes an output file, not the DB)     | Dump a namespace's entities+edges to one JSON archive                                   |
@@ -82,7 +82,7 @@ effect of listing backends.
   `~/.khive`").
 - **Config / namespace resolution parity with `kkernel mcp`**: `reindex` calls the exact same
   `khive_mcp::serve::resolve_runtime_config` function that `kkernel mcp` uses to build its
-  `RuntimeConfig` (`reindex.rs:498-525`, `khive-mcp/src/serve.rs:1259-1266`, the doc comment on
+  `RuntimeConfig` (`reindex.rs:498-525`, `khive-mcp/src/serve/runtime_config.rs`, the doc comment on
   that function states it was "extracted from `build_server` so `kkernel reindex` reuses the exact
   engine and db resolution, otherwise an admin reindex writes vectors for the default/env model
   set while the MCP server serves recall from the config-file `[[engines]]` set"). The precedence
@@ -93,8 +93,19 @@ effect of listing backends.
   `reindex`/`mcp` do. `kg export`/`import`/`status`/`fetch` take `--namespace` directly with no
   config-file fallback at all.
 - **`~/.khive/.env`**: loaded once at process start via `dotenvy` before argument parsing
-  (`main.rs:198-215`). Real environment variables always win over the file; a missing file is not
-  an error.
+  (`load_khive_dotenv` in `crates/kkernel/src/cli.rs`). Real environment variables always win over
+  the file; a missing file is not an error. The file is not loaded at all when `KHIVE_ACTOR` or
+  `KHIVE_NAMESPACE` in the process environment, or any `--actor` or `--namespace` argument
+  (including one after `--`, such as the daemon arguments of `kkernel supervisor launch`, so the
+  supervisor never holds the values its daemon would inherit), names an `agent:` actor (any case, leading whitespace ignored), or when `KHIVE_LOAD_DOTENV` is `0`,
+  `false`, `no`, `off` or an unrecognized value (an empty value counts as unset); when the file
+  exists, startup prints one line naming the reason. The check runs before config discovery, so an
+  agent identity set only in a config file does not trigger it: such a launch sets
+  `KHIVE_LOAD_DOTENV=0`. A daemon that a client starts on demand inherits the client's environment
+  but not its arguments, so an agent client that names itself only with `--actor` or `--namespace`
+  also sets `KHIVE_LOAD_DOTENV=0`. This keeps the values out of an agent server's environment only:
+  a process that can read the file still gets them, so an agent's filesystem sandbox must deny that
+  path.
 
 ---
 
@@ -117,8 +128,9 @@ kkernel kg import /tmp/my-namespace.khive-kg.json --db /path/to/target.db --name
   resolves to the same path as `--db`: "would overwrite the database" (`archive.rs:20-38`).
   The write itself is atomic: it creates `<output>.<pid>.inprogress` with `O_EXCL` (refusing to
   follow a pre-existing symlink), `fsync`s it, then renames it into place (`archive.rs:54-80`).
-- `kg import <source> --db <path> [--namespace local] [--format archive|json|ndjson] [--verbose]`:
-  `source` and `--db` are required, `--format` defaults to `archive`.
+- `kg import <source> --db <path> [--namespace local] [--format archive|json|ndjson|csv|tsv|bibtex] [--verbose]`:
+  `source` and `--db` are required. `--format` is inferred from a `.csv`, `.tsv` or `.bib`
+  extension and otherwise defaults to `archive`.
   - `--format archive` (default): parses `source` directly as a `KgArchive` JSON envelope and
     completes format/version, entity kind/name, timestamp, and edge-weight validation before the
     target runtime is constructed. Kind validation uses the **full merged pack kind registry**
@@ -133,6 +145,11 @@ kkernel kg import /tmp/my-namespace.khive-kg.json --db /path/to/target.db --name
     is rejected as ambiguous. Required names must be non-blank and present timestamps must be valid
     RFC 3339 strings. Entity labels retain their original nonblank bytes. Edge properties and the
     two timestamps remain top-level portable fields and persist as storage metadata/provenance.
+  - `--format bibtex`: streamed through `khive_vcs_adapters::BibtexFormatAdapter`, which maps
+    entries to paper entities and resolves crossrefs to edges. A malformed entry is skipped with a
+    warning and its neighbours are kept; duplicate keys, unresolved crossrefs, invalid UTF-8, read
+    errors and oversized entries abort before `--db` is opened. `--default-kind` is refused. The
+    JSON summary adds an `adapter` object with `entries`, `skipped` and `warnings`.
   - A malformed record anywhere in an archive, `json`, or `ndjson` input aborts before the target
     runtime is constructed; `--db` is neither created nor migrated and earlier valid records are
     not partially applied.
@@ -423,9 +440,11 @@ kkernel kg init [--repo .] [--ci] [--add-hooks]
 ```
 
 Creates `.khive/kg/`, `.khive/kg/hooks/`, empty `entities.ndjson`/`edges.ndjson`, `.khive/.gitignore`,
-a default `.khive/khive.toml`, and the tracked pre-commit hook script, every artifact is written
-only `if !path.exists()`, so re-running is safe and never clobbers existing content
-(`kg/init.rs:82-145`, confirmed by an explicit non-overwrite regression test). `--ci` additionally
+a default `.khive/config.toml`, and the tracked pre-commit hook script. Re-running is safe and never
+clobbers existing content: the config is created atomically and kept when it, or a root `khive.toml`,
+already exists; the other artifacts are written only when absent; and only the byte-exact ignore
+file written by the old initializer is migrated. A legacy `.khive/khive.toml` makes init fail before
+it writes anything. `--ci` additionally
 writes `.github/workflows/kg-validate.yml` (also existence-gated). `--add-hooks` short-circuits to
 the same logic as `kg hook install` below and skips the rest of scaffolding; use it to (re-)wire
 the git hook without touching anything else.
@@ -586,13 +605,15 @@ computation happens today. Do not script against these as if they perform work.
 
 `vector capabilities [--human] [--engine <name>] [--db <path>]` prints a **static** capability
 record matching the sqlite-vec backend's compiled-in `OnceLock` (`supports_filter` /
-`supports_batch_search` / `supports_quantization` / `supports_update` / `supports_multi_field`
-all `false`, `supports_orphan_sweep: true`, `supports_vector_read: true`,
+`supports_quantization` / `supports_update` / `supports_multi_field` all `false`,
+`supports_batch_search: true`, `supports_orphan_sweep: true`, `supports_vector_read: true`,
 `max_dimensions: 8192`, `index_kinds: ["sqlite_vec"]`). Every capability field is pinned to the backend's
 `capabilities()` value by a comparison test. The command does not open the database named by
 `--db` or inspect the configured engines; `--engine` only sets the report's `engine_name` label
 (default `"default"`). The capability values describe the compiled sqlite-vec backend
 (`crates/kkernel/src/vector.rs`).
+For a nonempty batch, the SQLite backend runs every query on one admitted reader
+and one read snapshot.
 
 `vector sweep [--namespace <ns>...] [--max-delete <n>] [--dry-run] [--engine <name>] [--db <path>]`
 removes vector rows whose subject has no live entity, note, or knowledge atom. A soft-deleted

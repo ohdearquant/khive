@@ -1277,3 +1277,225 @@ amendment.
 
 **Refs.** #2378 (and its corrections), #2878 (A4), #2307 (query-intent vector must not be
 substituted).
+
+---
+
+## Amendment 6 — paged enumeration of stored vectors (#3686)
+
+**Status: Proposed.** This additive interface proposal does not change the accepted
+status or decisions above. Source preparation is authorized by #3686; architectural
+acceptance and executed native verification remain pending.
+
+### Interface and compatibility
+
+Add an object-safe, defaulted `VectorStore::scan_vectors(VectorScanRequest)` method
+returning `StorageResult<VectorScanPage>`. The request has required exact string
+selectors `namespace`, `embedding_model` and `field`, optional `SubstrateKind`
+`kind`, optional UUID `after`, and a `NonZeroU32` `limit`. A page contains
+`items: Vec<VectorScanEntry>` and `next_after: Option<Uuid>`; each entry contains
+`subject_id: Uuid` and `vectors: Vec<Vec<f32>>`.
+
+The default returns Vectors/`Unsupported` with operation `scan_vectors`; it neither
+returns empty success nor falls back to similarity search. No capability flag is
+added or reinterpreted. The requested-ID `get_vectors` read remains separate.
+
+### Ordered interval contract
+
+All string selectors are literal, including empty or punctuation-bearing values;
+no trimming, implicit defaults or wildcard semantics apply. `kind=None` includes
+all kinds. The handle chooses the physical store; the model selector filters that
+store rather than constructing a different one. Supporting implementations return
+one complete vector record per matching subject in ascending UUID order, strictly
+after the supplied boundary. The boundary need not name an existing row. Reuse the
+same selectors when continuing; changed selectors describe a new interval.
+
+At most `limit` entries are returned. Only an observed extra matching record
+causes `next_after=Some(last emitted subject_id)`; otherwise it is `None`. Empty
+pages and exactly full terminal pages have no continuation. The nonzero limit
+bounds materialized records, not total scan work or vector byte volume. The result
+contains no count or hidden cross-request cursor state.
+
+Each call is an independent read observation, not a snapshot spanning pages. With
+unchanged data, continuation enumerates the scope once. Between calls, insertions
+above the cursor can appear, insertions at or below it cannot, and future rows can
+change or disappear. An advertised continuation can therefore return empty. No
+watermark, restart lease or multi-page transaction is implied.
+
+Rows are stored vectors, including those with missing or tombstoned owners. This
+operation makes no lifecycle, orphan-cleanup or authorization decision. Namespace
+is an exact metadata selector under the existing attribution contract.
+
+### SQLite representation and errors
+
+SQLite uses one admitted reader and one SELECT per page, binding selectors and
+fetching `limit + 1` rows after filtering and binary UUID-text ordering. Only the
+constructor-validated model-table identifier is interpolated. No MATCH, model
+loading, ANN access or write runs. Existing request stop and driver classifications
+are preserved under operation `vec_scan_vectors`.
+
+Typed writers persist canonical lowercase dashed UUID text. Any encountered
+malformed or noncanonical ID is a whole-page conversion error, so a normalized
+cursor cannot disagree with the stored ordering. The public typed cursor keeps
+the existing UUID serde grammar. Embeddings require the checked expected native
+f32 byte length and use the shared native decoder without scoring or normalization.
+SQLite returns one vector per subject; the capability keeps the multi-vector
+shape. All returned rows, including lookahead, must decode successfully before a
+page is returned. No nonfinite JSON round-trip guarantee is introduced.
+
+### Scope and verification gates
+
+Issue #3686 also permits making shared model-key derivation public instead of
+migrating builders. The public `khive_runtime::config::sanitize_key` already serves
+both memory and knowledge builders. Their existing corpus scans and same-statement
+ANN-log watermark reads remain unchanged; ordinary pages cannot substitute for
+that stronger contract.
+
+Required native verification covers file reopen and memory vec0 reads with exact
+float bits; every filter before LIMIT; boundary, lookahead and terminal cursors;
+trait-object Unsupported and wire refusal; deterministic inter-page mutations;
+raw owner/tombstone behavior; malformed ID/blob and overflow refusal; and request
+cancellation/deadline precedence with subsequent healthy reads. The source change
+and authored tests do not establish that those executions passed. Acceptance of
+this amendment and native results are separate gates before claiming completion.
+
+---
+
+## Amendment 7: Entity-filter pushdown for exact vector search (#3687)
+
+**Status**: Accepted 2026-11-16 (#6730). The accepted decisions and the separate Proposed status of Amendment 6 remain unchanged.
+
+### Scope and capability
+
+Entity hybrid search must apply its resolved canonical entity-kind and entity-type predicates before the exact SQLite vector arm chooses its bounded candidate window. This decision covers entity exact search; it does not extend generic ANN, note search or memory recall, add an MCP parameter, or add a candidate-ID field to the metadata filter.
+
+The candidate-completeness concern in #3687 is already addressed by the separate exact candidate-scoring route described in [ADR-012](ADR-012-retrieval-composition.md). `rerank_in` validates the named embedding space, calls `score_candidates` with the entire supplied ID set, and only then truncates (`crates/khive-runtime/src/retrieval/single_engine.rs:174–195`). The storage contract expressly forbids namespace-wide top-K followed by candidate intersection (`crates/khive-storage/src/vectors.rs:91–112`). The stored regression `rerank_scores_every_candidate_before_cutting_and_breaks_ties_by_id` in `crates/khive-runtime/tests/candidate_rerank.rs` puts requested distant candidates behind closer outsiders and verifies their scores and final limit. This amendment preserves that mechanism rather than adding an unused hybrid candidate-ID selector. Amendment A5 remains unchanged: its distinct contract is `knowledge.search` reranking from stored `knowledge.atom` vectors with its specified fallback. It is not the authority for entity candidate scoring. The existing entity rerank regressions must still run with this change.
+
+`VectorStoreCapabilities` gains `supports_entity_filter: bool`, with a serde default of `false`. It advertises only the entity subset defined below. The trait default advertises neither filtering capability. SQLite may advertise the new flag only when it implements that subset and passes its acceptance conditions. Its `supports_filter` remains false unless the complete existing generic namespace/kind/property compliance suite passes. The two flags are independent: neither implies the other, and the old generic suite does not establish support for the new entity fields. Entity-kind/type predicates require the entity-filter capability; the old generic flag alone is insufficient. The runtime entity-eligibility route checks `supports_entity_filter` for every nonempty supported filter, including namespace-only and `kinds=[Entity]` filters. It must not use `supports_filter || supports_entity_filter` as a substitute. A generic caller using only the old namespace/substrate/property contract checks `supports_filter` and retains those generic semantics; that flag does not promise authoritative live-entity eligibility or orphan removal. When both flags are present, the requested contract still determines the gate: runtime entity eligibility requires the entity flag. Both-empty filters retain the ordinary unfiltered contract.
+
+For a filtered entity hybrid request, unavailable entity-filter capability or missing route authority returns `StorageError::Unsupported` with `StorageCapability::Vectors` and fails the whole request. This applies to the ordinary hybrid entrypoints, outcome-reporting entrypoints, and per-kind execution, even when lexical hits are available. These refusals must bypass vector-error tolerance: they cannot become an empty vector arm with successful lexical-only/degraded output. This governs a requested vector arm; it does not require an embedder for intentionally lexical-only calls or change unrelated text/query error precedence. No route may silently substitute global top-N followed by filtering.
+
+Other vector-arm failures follow the existing entrypoint policy equally for filtered and unfiltered requests. For a capable, correctly bound store, an ordinary driver error, backend-local timeout or embedder failure returned inside the vector-error tolerance boundary has this determinate result:
+
+| Entrypoint                                                                                                                             | Ordinary non-`Unsupported` vector-arm failure                                | Capability or authority `Unsupported` for the filtered vector arm |
+| -------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| `hybrid_search` / `hybrid_search_with_text_mode`                                                                                       | Fail the request.                                                            | Fail the request.                                                 |
+| `hybrid_search_each_kind`                                                                                                              | Fail the request; no successful partial kind lists.                          | Fail the request.                                                 |
+| `hybrid_search_outcome` / `hybrid_search_outcome_with_text_mode`, with existing outcome tolerance enabled and a successful lexical arm | Retain the lexical hits and report the underlying failure in `vector_error`. | Fail the request, even with lexical hits.                         |
+
+Text-arm failure, request cancellation and read-phase/outer deadline expiry remain fatal under their existing precedence; they are not reclassified as tolerable backend-local failures. This matrix preserves the strict ordinary/per-kind calls and outcome-only tolerance in `crates/khive-runtime/src/retrieval.rs:820–985`. It introduces neither universal filtered degradation nor a new failure policy for intentionally lexical-only calls.
+
+### Required search and inherited methods
+
+The existing `VectorSearchRequest.filter: Option<VectorMetadataFilter>` is a request carrier, not a new field introduced here. Section 2's method separation and the Alternatives table's rejection of this field do not describe the current source: the field was present in the initial Rust crate implementation, and no later authorizing decision was identified. This amendment explicitly supersedes that rejection and specifies the carrier's behavior. A required `search(request)` implementation must honor every nonempty supported request filter or return typed `Unsupported`; silently ignoring it is noncompliant. `None` and `Some(VectorMetadataFilter::default())` carry no predicates.
+
+Advertising either filtering flag requires a corresponding `search_with_filter` override; the inherited method's diagnostic guard checks both flags on a filtered call. The inherited method inspects both `request.filter` and the explicit filter and delegates to `search` only when both are empty. Otherwise it returns typed `Unsupported`. An empty explicit filter must not create a bypass. Overrides preserve the combined-filter contract for the predicates they support.
+
+Section 3's default batch body is replaced by this guarded delegation. It remains sequential and nontransactional, preserves input order, and isolates each query's error in its inner result; it introduces no cross-query or cross-backend transaction:
+
+```rust
+async fn search_batch(
+    &self,
+    requests: &[VectorSearchRequest],
+) -> StorageResult<Vec<StorageResult<Vec<VectorSearchHit>>>> {
+    let empty = VectorMetadataFilter::default();
+    let mut out = Vec::with_capacity(requests.len());
+    for request in requests {
+        out.push(self.search_with_filter(request, &empty).await);
+    }
+    Ok(out)
+}
+```
+
+A deliberately noncompliant test backend whose required `search` ignores filters is useful only as a tripwire: inherited filtered search and batch must refuse before reaching it. It is not an allowed backend implementation. Direct `search` compliance is tested separately. The operator capability report exposes both flags; Amendment A3's account of the then-shipped implementation stays historical.
+
+### Filter fields and composition
+
+Add these serde-defaulted fields to the existing `VectorMetadataFilter`, without adding mandatory fields to `VectorSearchRequest`:
+
+| Field                       | Exact meaning                                                                                                                                                                                     |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `entity_kinds: Vec<String>` | Canonical `entities.kind` values, already resolved by the caller's vocabulary. Empty means unrestricted; a nonempty list is an OR. It is distinct from existing `kinds: Vec<SubstrateKind>`.      |
+| `entity_types: Vec<String>` | Exact non-null `entities.entity_type` values. Empty means unrestricted; a nonempty list is an OR. No fallback to `properties.type`, case folding, alias resolution or trimming occurs in storage. |
+
+Amend Section 2's `VectorMetadataFilter::is_empty()` to include both new lists:
+
+```rust
+self.namespaces.is_empty()
+    && self.kinds.is_empty()
+    && self.property_filters.is_empty()
+    && self.entity_kinds.is_empty()
+    && self.entity_types.is_empty()
+```
+
+An entity-kind-only or entity-type-only filter is nonempty in either carrier. This definition governs inherited delegation, default batch guards and SQLite eligibility activation; it is not merely a serialization detail. `None` and an all-default filter still carry no predicates.
+
+All fields are ANDed. Empty kind/type lists contribute no restriction; nonempty lists select exact strings, with duplicates having no effect. `search_with_filter` conjunctively combines the request and explicit filters; neither replaces the other. Across sources, nonempty list restrictions intersect, with an empty list acting as the unrestricted identity. A disjoint intersection is represented internally as an empty selection, never as an empty unrestricted list.
+
+The narrow capability applies to a request explicitly selecting `SubstrateKind::Entity`. Validate **each original filter source before intersection**: its existing `kinds` must be empty or contain only Entity, its property predicates must be empty, and a nonempty filter with an absent/non-Entity request kind is unsupported. Thus `[Entity, Note]` intersected with `[Entity]` refuses, as does `[Entity]` intersected with `[Note]`; normalization cannot erase an unsupported member. Unsupported predicates also refuse when another valid conjunct selects nothing. This does not remove predicates supported under the separate generic capability.
+
+Each nonempty existing `filter.namespaces` list restricts the one effective request namespace (request value, otherwise the handle's existing default); it cannot widen it. A valid restriction excluding that namespace selects nothing. In SQLite's narrow entity-filter route, any nonempty original supported filter activates authoritative live-entity eligibility, including a filter containing only `kinds=[Entity]` or only a namespace list. The runtime requests this eligibility contract through `supports_entity_filter`, even when these are the only predicates. A generic-only backend remains usable through the old generic contract, but cannot satisfy that runtime eligibility request by advertising `supports_filter` alone. This does not impose authoritative entity joins on generic-only calls. Both original filters empty means ordinary unfiltered behavior, including its existing orphan visibility. The request's ordinary `kind` or `namespace` fields alone do not activate the new eligibility path.
+
+For example, canonical kind restrictions `["concept"]` and `["project"]` select nothing; an absent kind restriction and `["concept"]` select concepts. An empty original request filter and a type restriction in the explicit filter preserve that type restriction. A namespace list containing only another namespace selects nothing; adding an unsupported property predicate still refuses.
+
+### Population and execution
+
+For an activated SQLite entity filter, the authoritative entity must be live under existing `EntityStore` exact-column semantics. Its namespace must equal the effective request namespace; a null type does not match a nonempty type restriction. Missing/deleted entity rows cannot consume the filtered window. The vector row must independently match the effective namespace, selected model/table, exact embedding-model predicate, substrate kind and existing field-eligibility rule. In particular runtime entity retrieval must continue excluding the pack-owned `knowledge.atom` field before its candidate window. These dimensions are distinct; no new field selector or model inference is introduced. Final live-row/visibility hydration remains a backstop against changes after selection.
+
+The entire logical population formed by these entity and vector predicates constrains native MATCH before its limit. A JOIN around an already limited MATCH result is insufficient. Equal-distance order remains ascending subject ID with one-based ranks. Every tie-widening step and both existing exact scalar fallback causes use identical population and score semantics. Scalar fallback remains for its existing reasons; ordinary supported searches must not silently switch to scalar-only execution to claim native prefiltering.
+
+A known-empty selection is not an escape from validation or admission. Runtime engine/model resolution and query validation still run. In the SQLite kernel, preparation first validates each original filter source against the supported subset, then checks the required same-pool authority binding for an activated entity route. Missing binding is typed `Unsupported` in that unsupported-filter phase, after source validation and before query arity or coordinate validation. Arity follows; with the expected dimension, nonfinite coordinates then produce pre-acquisition `InvalidInput`. A single search returns any preparation refusal before reader acquisition, including authority refusal combined with invalid arity, a nonfinite vector or an otherwise empty selection. If preparation succeeds, a wrong dimension retains its admitted `Driver` error and takes precedence over a nonfinite coordinate in that wrong-length vector. Preserve this ordering for disjoint restrictions, cancellation and deadlines. Old JSON validation still rejects zero `top_k`; the existing Rust zero-limit behavior is unchanged. Native undefined-cosine or overflow errors remain errors when scoring is evaluated, without requiring distance evaluation for a valid empty population.
+
+The SQLite batch override retains its existing ordering: an empty request list returns an empty batch without a reader; a nonempty list prepares every slot, including source-filter validation and any missing-binding `Unsupported`, then acquires one reader and a shared deferred transaction even when every slot has a preparation error. Preparation before acquisition does not permit returning those errors early. If that acquisition fails, the outer admission/transport error wins even for an all-unbound or otherwise all-invalid batch; if it succeeds, each preparation error appears in its original inner slot. Errors arising during query execution remain inner results, while transaction/admission errors remain outer. This preserves the current behavior at `crates/khive-db/src/stores/vectors/vector_store_impl.rs:576–620`; it does not impose that transaction on the generic default.
+
+Both existing public entity selectors reach the vector arm. `hybrid_search_each_kind` must equal separate hybrid searches for each requested kind: it may share the query embedding, but not a globally bounded unfiltered vector pool.
+
+### Storage representation and route authority
+
+Resolve eligibility from authoritative entity rows at read time, avoiding duplicated subtype metadata. Construction of the SQLite entity-capable route binds the vector handle to the authoritative entity source in the **same backend/pool**. This is an explicit trusted construction binding, not a check that some table named `entities` happens to exist. The current runtime's entity and vector accessors resolve through its selected backend; that backend constructs both accessors from its pool. Preserve configured secondary/core routing when establishing the binding.
+
+The static `supports_entity_filter` flag describes an implemented backend capability, not proof that every instance has an authority binding. A standalone or differently routed SQLite vector handle without the required same-pool binding detects typed `Unsupported` during the unsupported-filter preparation phase specified above; it cannot consult a shadow entity table, read a different pool, or return a false empty success. A single search returns this refusal before acquisition; a nonempty SQLite batch still performs its shared acquisition before returning prepared slot errors. Unfiltered search and exact candidate scoring retain their current contracts. A correctly configured supported runtime route must receive the binding during construction; forgetting it is an implementation defect, not an allowed new route refusal.
+
+Eligibility, native KNN and tie retries share one SQLite read snapshot. SQLite batch uses its existing shared deferred transaction. This does not make lexical search or later hydration part of that snapshot or promise cross-store atomicity.
+
+Build one deduplicated ID restriction from authoritative live entity rows matching the canonical kind/type and effective entity namespace. Before native IN, intersect it only with IDs **present in the selected physical model table**, because sqlite-vec 0.1.9 fails text-ID-to-rowid mapping for absent IDs. Physical presence is not vector metadata eligibility: do not repeat the vector namespace predicate in this ID-presence stage. Apply authoritative entity namespace exactly once in entity eligibility, and vector namespace exactly once in each returned MATCH/scalar query, alongside its model/substrate/field predicates. Thus an entity in B with a stale vector in A fails the entity predicate for A; an entity in A with a vector in B fails the vector predicate for A. Neither independent control is masked by a second copy of the same namespace condition. Unfiltered query predicates remain unchanged.
+
+sqlite-vec 0.1.9 accepts one primary-key IN constraint. All entity selectors therefore compose into that one ID restriction, which every native attempt and scalar fallback consumes without an earlier population cap. Eligible sets larger than the connection's host-parameter limit must work without one unbounded placeholder per ID; a set-valued binding or subquery can be considered, but stored-data acceptance must establish its native behavior. Deadline and cancellation checks cover eligibility construction, ID mapping, KNN and retries.
+
+### Cost and representation trade-off
+
+This decision fixes which rows can consume the candidate window; it does not promise to eliminate a whole-table/chunk scan or meet a latency threshold. The chosen read-time representation avoids subtype-copy synchronization, but constructing and transporting a large eligible set has a cost. For 100,000 supplied native IN IDs, the current sqlite-vec implementation performs 100,000 text-ID lookup preparations/executions/finalizations per native attempt, allocates at least 800,000 bytes for its 64-bit rowid array, and sorts that array. Its KNN path also walks selected chunks and reads vector blobs before applying rowid membership masking; filtering does not make that I/O independent of the scanned population. Tie retries can repeat this work. These are source-derived cost components, not measured elapsed times or an assertion of a speedup.
+
+Acceptance records the physical vector population, entity/ID eligibility sizes, dimension, number of KNN attempts, and elapsed eligibility, native/scalar and total search time on the stored fixture, including an eligible population of 100,000. There is no timing threshold. The record makes the read-time trade-off against persisted metadata visible; it does not certify cost improvement from correct IDs alone.
+
+A later persisted-metadata alternative must first specify and implement synchronization for single/batch/atomic insert and replacement, kind/type/namespace changes, delete/restore/merge, existing-model backfill, rollback, model isolation and reopen. Passing only new-row tests does not meet those obligations.
+
+### Acceptance and causal controls
+
+1. Real stored-vector entity searches find a rare canonical kind and separately a rare entity type despite more than `limit * 4` closer unrelated vectors. Expected IDs are literal and lexical hits cannot rescue the vector arm. Removing each prefilter fails its own result assertion. Record the population sizes, dimensions, attempts and elapsed components above; no performance threshold or completed measurement is implied.
+2. Missing physical-model vector IDs are removed before native IN; duplicate entity selectors have no multiplicity. Disjoint restrictions return a validated empty result. A complete ID population exceeding a deliberately bounded connection host-parameter limit still returns literal expected IDs through native KNN, with room left for fixed query arguments. Truncating eligibility, treating a disjoint selection as unrestricted, or removing the ID restriction fails its own row assertion. Existing exact rerank tests retain distant requested candidates, missing/out-of-scope/duplicate handling, deterministic scores/order, named model selection and post-scoring truncation; no new `candidate_ids` metadata field is required.
+3. Direct `search`, `search_with_filter` and default batch honor/refuse request filters. Independently test entity-kind-only and entity-type-only filters in each carrier with the other empty. On a backend advertising neither flag, inherited filtered search/batch must return typed `Unsupported` without reaching the deliberately ignoring required `search`; an unfiltered slot still delegates, and mixed slots preserve order. Removing either new `is_empty()` term fails the corresponding named nonempty/refusal assertion or the bound SQLite stored-ID assertion, not a debug guard or setup check. A direct-search backend ignoring its request predicate is noncompliant.
+
+   Request-only, explicit-only, conjunction and disjoint selections retain their literal expected IDs. Source-drop controls use independently constraining kind/type lists: for example `request.filter.entity_kinds` containing `concept` and `project`, and explicit `entity_kinds` containing `concept` and `service`, select only concepts, with closer project/service decoys; dropping either source admits its decoy. Use an analogous overlapping type fixture. For namespace lists, test the single effective namespace's include/include, include/exclude, exclude/include and exclude/exclude cases, plus empty-list identity. Exclusion is absorbing. These namespace cases do not promise that dropping either source must change the result. Validate unsupported members in each original source, including `[Entity, Note]` against `[Entity]`, even when the other source excludes the namespace or selects nothing. Controls skipping source validation or turning an excluding restriction into unrestricted selection fail their own assertions; restoring direct default-batch delegation fails the inherited refusal assertion.
+4. Closer decoys cover both namespace mismatches, model, field and live/deleted entity state with all other relevant dimensions eligible in each isolated fixture. The entity-namespace control removes its one eligibility predicate; the vector-namespace control removes its one predicate in the selected returned query. Wrong-type and NULL-type decoys are both excluded by the same nonempty type restriction; remove that restriction for their result control, not an independently removable null check. Their other entity/vector dimensions match.
+
+   An absent entity is excluded by authoritative entity-row membership itself. Use separate namespace-only and `kinds=[Entity]` fixtures with a stored orphan vector and no additional entity-kind/type selector. Their control coherently bypasses the authoritative-row membership requirement while retaining the applicable vector predicates and valid SQL; assert the vector-arm IDs before later hydration can remove the orphan. Deleting a JOIN into invalid SQL or relying on a later hydrated result is not this control. Both-empty filters preserve ordinary orphan behavior.
+
+   Two configured stores contain conflicting same-ID entity metadata: the selected route's explicit construction binding controls the result. An unbound vector handle with a convincing shadow entity table refuses; removing the binding check must fail that typed-refusal assertion. A bound secondary route must succeed from its own authority, not the core store's conflicting metadata.
+5. Each execution-branch fixture forces the branch whose output is asserted. Initial MATCH uses `top_k=1` and strict distances with no boundary tie (one attempt). Widened MATCH uses `top_k=2`, three equal-distance eligible rows and a strictly farther fourth: initial `k=3` ties, `k=6` exhausts and returns (two attempts). Tie-overflow scalar uses more than 4096 equal-distance eligible rows and reaches `tie_exhausted_limit`. Direct scalar uses `top_k=4096`, whose initial `k=4097` exceeds the native cap, and reaches `direct_over_limit` with no KNN attempt. Bypass the composed ID restriction at only the selected branch's use; do not pretend separately composed predicates exist in every branch. Choose decoys so the mutant still returns through that branch, and assert its attempts/fallback reason in both pristine and mutant runs. An intact later retry must not mask the mutation. Check identical eligible IDs, cosine scores, tie order/ranks, insert-order independence and reopen.
+6. Batch slots match individual searches after successful shared admission, retain the SQLite snapshot, isolate inner errors and release admission after error/cancellation. Combined-invalid cases pin runtime engine/query checks and storage source-filter validation, authority, arity, expected-length nonfinite, admission and wrong-dimension precedence, including empty selections. On a single unbound handle, unsupported source members take precedence over missing authority; with valid source predicates, missing authority takes precedence over invalid arity, expected-length NaN and wrong-length NaN, without acquiring a reader. Bound variants retain the existing arity/finite/dimension ordering.
+
+   A nonempty all-unbound or otherwise all-invalid SQLite batch still acquires its shared reader once: with available admission its prepared errors occupy their original inner slots; with blocked or cancelled admission it returns the outer admission error. Mixed unfiltered-valid, activated-unbound and other-invalid slots retain input order. An empty batch alone bypasses acquisition. Moving authority checks after arity/finite or inside admitted execution fails its own precedence/acquisition assertion; returning prepared batch errors before acquisition fails the one-checkout/outer-error assertion. The generic default remains sequential and nontransactional. Retain exact rerank's farther-candidate regression: substituting global KNN plus intersection must fail its requested-candidate assertion.
+7. Actual vector-backed `hybrid_search_each_kind` equals separate per-kind searches while query embedding remains shared. The existing lexical-only per-kind fixture is insufficient for this condition. With healthy lexical hits and entity selectors present, unavailable capability and unbound authority must fail ordinary, per-kind and outcome-reporting hybrid entrypoints with typed `Unsupported`; suppressing that error into a degraded vector arm fails the refusal assertion.
+
+   A capable, bound filtered route also exercises an ordinary non-`Unsupported` driver/embedder failure and backend-local timeout within the existing tolerance boundary. Ordinary hybrid and per-kind calls must fail; outcome-reporting calls retain the literal healthy lexical hits and a nonempty `vector_error` identifying the underlying failure. Controls making strict calls swallow the error, or making the outcome call rethrow it, fail their respective own assertions. Preserve the existing unfiltered pair `hybrid_search_still_fails_loud_on_vector_arm_error` and `hybrid_search_outcome_preserves_text_hits_on_vector_arm_error`, plus fatal text-error, request-cancellation and read-phase/outer-deadline cases. The runtime currently owns a concrete SQLite backend; a narrow test-only failure seam can exercise propagation without inventing a configurable third-party runtime backend. Public selector normalization and final hydration remain intact.
+8. Old capabilities/filters deserialize with false/unrestricted defaults; empty filters and nonempty/disjoint normalized selections remain distinct. Entity-kind-only and entity-type-only filters each make the amended five-term `is_empty()` false; old default JSON still makes it true. Operator output distinguishes the independent flags. The inherited-method guard detects either flag advertised without an override, and the old generic suite does not confer support for the new entity fields.
+
+   Test neither/generic-only/entity-only/both capability combinations. Runtime entity-eligibility requests require `supports_entity_filter` for namespace-only and `kinds=[Entity]` filters as well as kind/type selectors; generic-only cannot satisfy that request. Changing the runtime gate to an OR of the two flags fails the generic-only refusal assertion. A generic caller on a generic-only backend retains its old generic semantics without acquiring an authoritative orphan-removal promise. Bound narrow-route orphan exclusion and both-empty compatibility remain distinct; treating namespace-only or kinds-only filters as inactive fails the vector-arm orphan assertion. Controls that misreport capability or delegate a nonempty request predicate must fail their own assertions.
+
+For each causal control, the unchanged implementation passes its named test, the changed implementation builds and fails at the intended semantic assertion, and restoration rebuilds and passes the same test. Compilation or fixture failures, invalid SQL, timeouts, ignored/zero-selected tests and unrelated panics do not establish the behavior. All new acceptance conditions and timing records are prospective.
+
+### Compatibility
+
+The two new list fields and capability flag have serde defaults, so older valid JSON remains readable. Empty lists add no restriction; a normalized disjoint selection is internal state rather than an empty list written back into the public filter. Existing mandatory JSON fields and validation remain unchanged. No candidate-ID filter field or associated null/empty-list API is introduced.
+
+Adding public struct fields is a Rust source-compatibility change for exhaustive `VectorMetadataFilter` and `VectorStoreCapabilities` literals. Callers must supply them or use an available default update expression; serde defaults do not make old Rust literals compile. No required `VectorStore` method, mandatory `VectorSearchRequest` field, MCP argument, vector-table migration or change to exact candidate-scoring rerank is introduced. The required search contract, inherited filtered-search guard and default batch delegation are strengthened as specified above.

@@ -10,7 +10,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use khive_quant::{u8_l2sq_u32, GsSq8Codec};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 
 const DIM: usize = 384;
 const SEED: u64 = 0xA052_BE42;
@@ -32,7 +32,9 @@ fn assert_cost_bars(f32_ns: f64, u8_ns: f64, codec_ns: f64) {
 
 fn rand_f32_vecs(n: usize, dims: usize, seed: u64) -> Vec<f32> {
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut raw: Vec<f32> = (0..n * dims).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let mut raw: Vec<f32> = (0..n * dims)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
     for row in raw.chunks_mut(dims) {
         let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 0.0 {

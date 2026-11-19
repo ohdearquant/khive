@@ -13,7 +13,11 @@ pub(crate) struct Section {
     pub id: uuid::Uuid,
     pub atom_id: String,
     pub namespace: String,
-    pub section_type: SectionType,
+    /// The stored `section_type` text: a current [`SectionType`] value, or a retired
+    /// name (see `retired`) kept unchanged on rows written before the retirement.
+    pub section_type: String,
+    /// True when `section_type` is one of [`SectionType::RETIRED_NAMES`].
+    pub retired: bool,
     pub heading: String,
     pub content: String,
     pub content_hash: String,
@@ -128,6 +132,17 @@ pub(crate) struct UpsertAtomsParams {
     // REASON: chunk_size is accepted from callers as a hint for client-side pagination;
     // server-side chunking is not yet implemented but the field must be deserialized
     // so callers that send it don't receive unexpected errors.
+    pub chunk_size: Option<usize>,
+}
+
+/// Public-upsert admission decodes each item independently, retaining its index.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct UpsertAtomsAdmissionParams {
+    pub atoms: Vec<Value>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
     pub chunk_size: Option<usize>,
 }
 

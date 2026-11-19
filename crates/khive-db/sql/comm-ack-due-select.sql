@@ -1,0 +1,1 @@
+SELECT delivery_attempt_id,binding,disposition,attempt_count,not_before,created_at,updated_at FROM comm_ack_work WHERE state='pending' AND (not_before IS NULL OR not_before<=?1) ORDER BY created_at,delivery_attempt_id LIMIT ?2

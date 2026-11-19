@@ -5,7 +5,8 @@
 **Amended**: 2026-08-07 (missed-event grace policy, Amendment A; implementation note,
 Amendment B; reminder delivery and failure observability, Amendment C; process-local
 ticker liveness, Amendment D; ADR-119 supervision and creator-bound replay, Amendment E;
-durable dispatch receipts and renewable leases, Amendment F)
+durable dispatch receipts and renewable leases, Amendment F); 2026-09-21 (interval and
+cron recurrence, Amendment G); 2026-10-14 (per-event missed-schedule policy, Amendment H)
 **Depends on**: [ADR-040](ADR-040-communication-and-schedule-packs.md) (schedule pack
 verbs and `scheduled_event` note kind), [ADR-049](ADR-049-khived-daemon.md) (warm daemon
 process model), [ADR-016](ADR-016-request-dsl.md) (request DSL, replayed at fire time),
@@ -1092,15 +1093,14 @@ In every case the missed occurrence itself is recorded as missed and never dispa
 exactly one future occurrence is armed. Legacy rows carrying an expression the parser
 rejects fail closed before invocation, as before.
 
-## Proposed Amendment H (2026-09-29): per-event missed-schedule policy (#1508)
+## Amendment H: Per-event missed-schedule policy (2026-09-29)
 
-**Status**: proposed; acceptance and a signed document hash are required before
-dependent source merges. This amendment would refine Amendment A's global
+**Status**: Accepted (2026-10-14). This amendment refines Amendment A's global
 skip-and-mark rule for events whose creator explicitly opts in. Amendment F's
 claim, receipt, lease, identity, and indeterminate-outcome guarantees remain in
-force. It also proposes additive arguments to the two creation verbs governed
-by ADR-040; the accepted ADR-040 verb table remains unchanged until this
-amendment is signed and its corresponding contract update lands.
+force. It also adds optional arguments to the two creation verbs governed by
+ADR-040; the ADR-040 verb table remains unchanged until the corresponding
+contract update lands with the first implementation.
 
 ### Intent and write contract
 
@@ -1117,20 +1117,13 @@ rather than silently ignoring a safety bound. Malformed or unknown stored
 policy values fail closed before action invocation and retain a
 `not_invoked` failure receipt.
 
-For `catch_up_once`, a caller may supply `max_lateness` for any recurrence. If
-it is omitted on a repeating event, the effective bound is **that due
-occurrence's own period**: the duration from the selected latest due
-occurrence to its next scheduled occurrence. This is 24 hours for `daily`,
-seven days for `weekly`, the fixed interval for `every:<N><unit>`, and the
-actual adjacent-occurrence gap for `monthly` and five-field UTC cron. The
-period is computed at drain time, since calendar and cron gaps vary; an
-omitted bound is not frozen into a numeric value at creation. A non-repeating
-event has no period, so `catch_up_once` on a one-shot requires an explicit
-positive `max_lateness`. The pack rejects an omitted bound in that case; it
-must never acquire an unbounded catch-up window by default. Existing rows
-require no migration and continue to use `skip`. Sparse cron patterns can
-have a long default period; callers that need a shorter safety window supply
-an explicit bound.
+For `catch_up_once`, an explicit positive `max_lateness` is required on every
+event, repeating or one-shot; the pack rejects an omitted bound at creation,
+before any note is written. Issue #1508 proposed defaulting the bound to the
+schedule's own period. That default is not adopted: the drain dispatches only
+the latest occurrence at or before its evaluation time (`L` below), whose age
+is always less than the period, so a period default would never prevent a
+dispatch. Existing rows require no migration and continue to use `skip`.
 
 ### Selection and disposition
 
@@ -1157,12 +1150,11 @@ uses the pre-invocation `missed` receipt. A successful late dispatch records
 its actual completion in `fired_at`; if older occurrences were collapsed,
 `missed_at` also records that skip without claiming they fired.
 
-For example, if a daily reminder first due Monday at 09:00 is drained
-Thursday at 09:10, `L` is Thursday 09:00, `F` is Friday 09:00, and the
-omitted bound is one day: one Thursday delivery is eligible and the row next
-arms for Friday. With an explicit one-hour bound and a Thursday 12:00 drain,
-Thursday's occurrence is too old; nothing is delivered and the row next arms
-for Friday. Restoring a much older backup does not replay Monday, Tuesday,
+For example, if a daily reminder with a one-hour bound, first due Monday at
+09:00, is drained Thursday at 09:10, `L` is Thursday 09:00 and `F` is Friday
+09:00: one Thursday delivery is eligible and the row next arms for Friday. If
+the same row is drained Thursday at 12:00, Thursday's occurrence is too old;
+nothing is delivered and the row next arms for Friday. Restoring a much older backup does not replay Monday, Tuesday,
 and Wednesday; each opted-in repeating row can yield at most one current
 catch-up invocation per drain, while default `skip` rows retain their prior
 safe behavior. Opt-in permits one side effect per eligible row, so the
@@ -1198,9 +1190,9 @@ The existing version-1 receipt remains valid for pre-amendment claims and
 default `skip` rows; the new version must not reinterpret a version-1
 `occurrence_id` as a catch-up occurrence.
 
-The claim records `effective_max_lateness` (positive integer seconds) used
-for its decision so recovery can audit the choice without consulting a later
-daemon environment. If a
+The claim records `effective_max_lateness`, the row's stored `max_lateness` in
+positive integer seconds, used for its decision so recovery can audit the
+choice without consulting a later daemon environment. If a
 durable success or known failure survives a crash, recovery finalizes that
 same `L` without invoking it again and computes the next future trigger from
 the recovery finalization time. The receipt's `scheduled_for` stays `L` after
@@ -1208,3 +1200,170 @@ the stored `trigger_at` advances to `F`; only the active claim is required to
 match the row's source trigger. Concurrent cancel or reschedule continues to
 lose or win at the existing claim/finalize CAS seams, never by rewriting a
 claimed occurrence's identity.
+
+## Amendment I: One drain core, two replay paths (2026-10-24)
+
+**Status**: Accepted (2026-10-24). This amendment moves the pending-event drain's core into
+`khive-pack-schedule` and adds a second entry that replays stored actions through a host's own
+`VerbRegistry`. Amendment E's creator-bound replay, Amendment F's claim, receipt, lease,
+identity and indeterminate-outcome guarantees, and Amendment H's missed-schedule policy remain
+in force on both entries. The existing entry `run_pending_events_on(rt, server, verbose)` keeps
+its behaviour.
+
+**Addresses**: [#5904](https://github.com/ohdearquant/khive/issues/5904).
+
+Source line references in this amendment refer to revision
+`e5019b795d23ddde46f0d78ff2aae20684661f3d`.
+
+### Context
+
+`run_pending_events_on` (`crates/khive-mcp/src/pending_events/drain.rs:101`) takes a
+`KhiveMcpServer`, and the drain uses that server in exactly two places. The first is the replay
+of each stored action, `server.dispatch_request_replay_as(...)`
+(`crates/khive-mcp/src/pending_events/dispatch.rs:405-428`), whose JSON envelope the drain then
+parses for each operation's `ok` (`dispatch.rs:431-455`). The second is the reminder
+delivery-failure audit, which appends to `server.event_store()`
+(`crates/khive-mcp/src/pending_events/recurrence.rs:212-244`). Discovery, claim, lease renewal,
+reclaim, recurrence, receipt persistence and finalize all go through the schedule pack's runtime
+`rt`. The one-shot command-line entry builds a server from its arguments (`drain.rs:18-84`), and
+the daemon-resident tick passes the daemon's live server
+(`crates/khive-mcp/src/pending_events.rs:582-595`). Apart from the server, the drain modules
+reach into `khive-mcp` only for `RequestParams`, inside the server replay call (`dispatch.rs:407`),
+and the two entries just named.
+
+A host that embeds the runtime and serves every request through its own `VerbRegistry`, with
+its own gate installed, cannot fire its store's schedules without linking `khive-mcp` and
+building a second request executor whose only job is replay. Replay then takes a different path
+from every other request that host serves.
+
+### Decision 1: the drain core lives in `khive-pack-schedule`
+
+The scan, claim, lease renewal, reclaim, recurrence, receipt, outcome persistence, finalize and
+failure-classification code under `crates/khive-mcp/src/pending_events/` moves into
+`khive-pack-schedule`, the crate that owns `scheduled_event` and already depends on
+`khive-runtime`, `khive-storage` and `khive-request` (`crates/khive-pack-schedule/Cargo.toml`).
+The command-line entries `run_pending_events` and `run_pending_events_with_config`, and the
+daemon's `schedule_tick_loop`, stay in `khive-mcp`, because they build or hold a server.
+`khive-mcp` keeps `run_pending_events_on` as a public entry. What stays in `khive-mcp` is exactly
+the code that names a `khive-mcp` item: the command-line entries (`crate::args::Args`,
+`crate::serve::build_server_with_explicit_namespace`, `DatabaseOverrideConflict` and
+`resolved_actor_disclosure`, `drain.rs:45-78`), `schedule_tick_loop` (`crate::components::HostContext`
+and `ComponentError`, `pending_events.rs:584-586` and `:620`), and the server's implementation of
+the replay interface (`KhiveMcpServer` and `RequestParams`, `pending_events.rs:73-74`,
+`dispatch.rs:405-428`).
+
+`khive-pack-schedule` gains no dependency on `khive-mcp`. Its new direct dependencies are limited
+to crates already in the workspace dependency table that the moved code uses; the moving pull
+request lists each one. The moved code's behaviour does not change, and its tests move with it.
+
+### Decision 2: one replay interface with two implementations
+
+The core takes a replay interface with two operations:
+
+1. replay one operation, given its tool, its arguments and a `RequestIdentity`, and return that
+   operation's per-op result entry, or a failure that carries no per-op result;
+2. return the event store that receives the reminder delivery-failure audit, if the host has one.
+
+`khive-pack-schedule` implements it for `VerbRegistry`, through `dispatch_with_disposition`
+(`crates/khive-runtime/src/pack/dispatch.rs:673`) and `event_store`
+(`crates/khive-runtime/src/pack/registry_access.rs:310`), and exposes the new entry:
+
+```rust
+pub async fn run_pending_events_on_registry(
+    rt: &KhiveRuntime,       // the schedule pack's runtime: scan, claim, renew, finalize
+    registry: &VerbRegistry, // replays each stored action; its installed gate runs on the op
+    verbose: bool,
+) -> Result<DrainSummary>;
+```
+
+`khive-mcp` implements the same interface for its server, through `dispatch_request_replay_as`
+and `event_store` as today. `run_pending_events_on(rt, server, verbose)` is the core called with
+that implementation. It is not a wrapper over the registry entry: its replay still passes through
+the request executor and its envelope, so its behaviour does not change. The registry entry is the
+only new path. The interface's name and exact signature are the implementer's; its two
+operations and their inputs and outputs are the contract.
+
+### Decision 3: the registry replay uses today's replay identity and visibility
+
+On the registry path, each event is one registry dispatch. Non-single stored actions are
+already refused before any replay (`drain.rs:796-797`), and that refusal moves with the core. The
+arguments are the stored literal arguments plus the injected `namespace`, built exactly as
+`dispatch.rs:356-403` builds them today, including the refusal of non-literal arguments. The
+identity is the one the server replay constructs (`crates/khive-mcp/src/server/request_dispatch.rs:179-198`):
+
+- `namespace`: the event's namespace;
+- `actor_id`: the creator from the immutable provenance event (`dispatch.rs:56-115`), with the
+  provenance-verified anonymous creator kept as `None`;
+- `visible_namespaces`: empty;
+- `process_ref`: `process_ref_from_env()`;
+- `request_id`: `None`.
+
+`dispatch_as` does not fit, because it takes the registry's default namespace and visible
+namespaces, while replay is scoped to the event's namespace alone.
+
+The server replay sets `from_wire = true` so that a stored action cannot reach a subhandler verb
+(`request_dispatch.rs:176-178`, passed at `request_dispatch.rs:197`). The server gate exempts a
+`help: true` call (`crates/khive-mcp/src/server/execution.rs:267-271`), which the registry answers
+with the verb's description before any gate or pack (`crates/khive-runtime/src/pack/dispatch.rs:679-691`).
+The registry implementation gives the same protection by refusing any tool for which
+`VerbRegistry::is_subhandler_verb` (`crates/khive-runtime/src/pack/catalog.rs:726`) is true and
+whose stored arguments do not carry `help: true`, before dispatch, as a known failure whose
+disposition is `not_committed`. On both paths a subhandler's handler is never entered.
+
+### Decision 4: one per-op failure entry, built by one function
+
+The drain classifies a failed operation from its per-op entry. `action_failures`
+(`dispatch.rs:297-348`) and its two uncertainty checks (`dispatch.rs:253-295`) read the error's
+`kind`, `code`, `message`, `request_state` and `details.outbound_id`, and the `domain_disposition`
+on both the error and the entry. A heuristic uncertainty ends the event indeterminate, while a
+disposition-only uncertainty is decided at finalization, where a repeat advances and a one-shot
+ends indeterminate (`crates/khive-mcp/src/pending_events.rs:364-403`).
+
+On the server path, a `DispatchError` reaches the entry through `DispatchError::into_parts`,
+khive-mcp's `runtime_error_value` wrapper over the runtime projection
+(`crates/khive-mcp/src/server/dispatch_helpers.rs:392-398`; `crates/khive-runtime/src/error_projection.rs:17`),
+and `failure_entry` with `error_with_disposition` (`crates/khive-mcp/src/server/batch_types.rs:167,180-191,217-249`).
+That builder does more than drop a nested `domain_result`. It turns a bare string error into an
+object with `kind = "runtime_error"`, and any other non-object error into one whose message is
+`operation failed` (`batch_types.rs:228`). For a committed error whose `domain_result` exceeds the
+nesting depth limit it replaces `code` and `message`. The wrapper sets the error's `domain_disposition`
+to the projection's own (`dispatch_helpers.rs:396`); `into_entry` reads that value back
+(`batch_types.rs:167`) and `failure_entry` writes it on both the entry (`batch_types.rs:188`) and the
+error (`batch_types.rs:247`), so on this path the two fields always agree, on the projection's
+disposition. All of these are classifier
+inputs, so an entry assembled from the runtime projection alone can classify differently from the
+server's entry for the same error.
+
+Therefore the pipeline from `DispatchError` to per-op failure entry becomes one public function
+in `khive-runtime`, called by the server's request executor and by the registry replay. `khive-mcp`
+keeps no second copy of it, and its envelopes do not change. The classifier moves into the drain
+core and runs on that entry on both paths. A replay that returns no per-op result at all stays
+indeterminate, as `dispatch.rs:421-428` treats it today.
+
+### Decision 5: the reminder audit goes to the replaying host's store
+
+The reminder delivery-failure audit appends to the event store the replay interface returns:
+`registry.event_store()` on the registry path and the server's store on the server path. Its
+event (`schedule.remind.fire`, kind audit, outcome error, masked error text) is unchanged.
+
+### Acceptance
+
+The following are acceptance obligations for the implementing pull request, not claims that the
+tests exist. Each test runs against the registry entry unless it says otherwise.
+
+| ID | Statement                                                                                                                                                                                                                                    |
+| -- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| I1 | A gate that refuses the replayed operation yields a known failure with nothing committed, and a one-shot follows Amendment F's retry rule.                                                                                                   |
+| I2 | A stored action naming a subhandler verb is refused before dispatch and its handler is never entered; with `help: true` it returns the verb's description, as on the server path.                                                            |
+| I3 | The handler sees the provenance creator as its actor, the event's namespace as its namespace, and no other visible namespace.                                                                                                                |
+| I4 | A provenance-verified anonymous creator stays anonymous: the handler sees no actor id, never `local`.                                                                                                                                        |
+| I5 | An error whose disposition may have committed is classified as on the server path: a repeat advances and a one-shot ends indeterminate.                                                                                                      |
+| I6 | The same failing operation driven through both entries produces byte-identical per-op failure entries and the same completion, including a committed too-deep result.                                                                        |
+| I7 | A reminder delivery failure on the registry path appends exactly one `schedule.remind.fire` error event to `registry.event_store()`.                                                                                                         |
+| I8 | `khive-pack-schedule`'s manifest names no `khive-mcp` dependency, the drain's existing tests pass unchanged after the move, run from their new crate, and the items Decision 1 lists as staying are the only drain code left in `khive-mcp`. |
+
+### Not decided here
+
+Whether the server's builder should keep the original `code` when it replaces a too-deep committed
+result's `message` is a question about the server's envelope, which this amendment does not
+change. The registry entry inherits whatever that one function does.

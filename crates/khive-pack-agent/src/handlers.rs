@@ -10,10 +10,10 @@ use std::sync::Arc;
 use chrono::Utc;
 use serde_json::{json, Value};
 
-use khive_runtime::agent_lifecycle::{apply_transition, Trigger};
+use khive_runtime::agent_lifecycle::{apply_transition, Transition, Trigger};
 use khive_runtime::RuntimeError;
 use khive_storage::AgentStore;
-use khive_types::{AgentRecord, AgentState, TerminalReason};
+use khive_types::{AgentRecord, TerminalReason};
 
 fn require_str<'a>(params: &'a Value, name: &str, verb: &str) -> Result<&'a str, RuntimeError> {
     params
@@ -27,30 +27,11 @@ fn require_str<'a>(params: &'a Value, name: &str, verb: &str) -> Result<&'a str,
         })
 }
 
-fn state_str(state: AgentState) -> &'static str {
-    match state {
-        AgentState::Spawned => "spawned",
-        AgentState::Running => "running",
-        AgentState::Suspended => "suspended",
-        AgentState::Terminal => "terminal",
-    }
-}
-
-fn terminal_reason_str(reason: TerminalReason) -> &'static str {
-    match reason {
-        TerminalReason::Completed => "completed",
-        TerminalReason::Failed => "failed",
-        TerminalReason::Killed => "killed",
-        TerminalReason::Abandoned => "abandoned",
-        TerminalReason::HostRestart => "host_restart",
-    }
-}
-
 fn record_to_json(record: &AgentRecord) -> Value {
     json!({
         "agent_id": record.agent_id,
-        "state": state_str(record.state),
-        "terminal_reason": record.terminal_reason.map(terminal_reason_str),
+        "state": record.state.as_str(),
+        "terminal_reason": record.terminal_reason.map(TerminalReason::as_str),
         "provider": record.provider,
         "provider_session_id": record.provider_session_id,
         "checkpoint_session_id": record.checkpoint_session_id,
@@ -75,6 +56,54 @@ async fn load(
         .get(id)
         .await?
         .ok_or_else(|| RuntimeError::NotFound(format!("{verb}: unknown agent_id {id:?}")))
+}
+
+async fn transition(
+    store: &Arc<dyn AgentStore>,
+    verb: &str,
+    id: &str,
+    trigger: Trigger,
+) -> Result<(AgentRecord, Transition), RuntimeError> {
+    let mut record = load(store, verb, id).await?;
+    let mut attempts = 0;
+    loop {
+        let outcome =
+            apply_transition(record.state, record.terminal_reason, trigger).map_err(|e| {
+                RuntimeError::InvalidInput(format!(
+                    "{verb}: illegal transition from {} for agent_id {id:?}",
+                    e.from.as_str()
+                ))
+            })?;
+        if !outcome.changed {
+            return Ok((record, outcome));
+        }
+        if attempts == 3 {
+            return Err(khive_types::KhiveError::conflict(format!(
+                "{verb}: state changed concurrently; retry"
+            ))
+            .with_details(khive_types::Details::new_owned([
+                ("reason", "state_changed_concurrently".into()),
+                ("agent_id", id.to_owned()),
+            ]))
+            .into());
+        }
+        attempts += 1;
+        if store
+            .transition_state(
+                id,
+                record.state,
+                outcome.state,
+                outcome.terminal_reason,
+                Utc::now().timestamp_micros(),
+            )
+            .await?
+        {
+            return Ok((record, outcome));
+        }
+        // Reapply the same sequential lifecycle rules to every missed CAS,
+        // including the last attempt: a new no-op or refusal wins over retry.
+        record = load(store, verb, id).await?;
+    }
 }
 
 /// Refuse providers until a runtime adapter can actually start the process.
@@ -111,26 +140,11 @@ pub(crate) async fn handle_suspend(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let id = require_str(&params, "id", "agent.suspend")?;
-    let record = load(store, "agent.suspend", id).await?;
-
-    let outcome = apply_transition(record.state, record.terminal_reason, Trigger::Suspend)
-        .map_err(|e| {
-            RuntimeError::InvalidInput(format!(
-                "agent.suspend: illegal transition from {} for agent_id {id:?}",
-                state_str(e.from)
-            ))
-        })?;
-
-    if outcome.changed {
-        let now = Utc::now().timestamp_micros();
-        store
-            .update_state(id, outcome.state, outcome.terminal_reason, now)
-            .await?;
-    }
+    let (record, outcome) = transition(store, "agent.suspend", id, Trigger::Suspend).await?;
 
     Ok(json!({
         "agent_id": record.agent_id,
-        "state": state_str(outcome.state),
+        "state": outcome.state.as_str(),
         "checkpoint_session_id": record.checkpoint_session_id,
     }))
 }
@@ -144,26 +158,11 @@ pub(crate) async fn handle_resume(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let id = require_str(&params, "id", "agent.resume")?;
-    let record = load(store, "agent.resume", id).await?;
-
-    let outcome =
-        apply_transition(record.state, record.terminal_reason, Trigger::Resume).map_err(|e| {
-            RuntimeError::InvalidInput(format!(
-                "agent.resume: illegal transition from {} for agent_id {id:?}",
-                state_str(e.from)
-            ))
-        })?;
-
-    if outcome.changed {
-        let now = Utc::now().timestamp_micros();
-        store
-            .update_state(id, outcome.state, outcome.terminal_reason, now)
-            .await?;
-    }
+    let (record, outcome) = transition(store, "agent.resume", id, Trigger::Resume).await?;
 
     Ok(json!({
         "agent_id": record.agent_id,
-        "state": state_str(outcome.state),
+        "state": outcome.state.as_str(),
     }))
 }
 
@@ -176,26 +175,11 @@ pub(crate) async fn handle_kill(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let id = require_str(&params, "id", "agent.kill")?;
-    let record = load(store, "agent.kill", id).await?;
-
-    let outcome =
-        apply_transition(record.state, record.terminal_reason, Trigger::Kill).map_err(|e| {
-            RuntimeError::InvalidInput(format!(
-                "agent.kill: illegal transition from {} for agent_id {id:?}",
-                state_str(e.from)
-            ))
-        })?;
-
-    if outcome.changed {
-        let now = Utc::now().timestamp_micros();
-        store
-            .update_state(id, outcome.state, outcome.terminal_reason, now)
-            .await?;
-    }
+    let (record, outcome) = transition(store, "agent.kill", id, Trigger::Kill).await?;
 
     Ok(json!({
         "agent_id": record.agent_id,
-        "state": state_str(outcome.state),
-        "terminal_reason": outcome.terminal_reason.map(terminal_reason_str),
+        "state": outcome.state.as_str(),
+        "terminal_reason": outcome.terminal_reason.map(TerminalReason::as_str),
     }))
 }

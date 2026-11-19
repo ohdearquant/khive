@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import pathlib
@@ -18,6 +19,27 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 REPLAY_NAME_PREFIX = "${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}"
+# `git commit` and `git fetch` start a detached `git maintenance run --auto` that can still be writing
+# under `.git` when a fixture's temporary directory is removed, which fails the cleanup. Every fixture
+# repository in this file turns automatic maintenance off.
+NO_AUTO_MAINTENANCE = {
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "maintenance.auto",
+    "GIT_CONFIG_VALUE_0": "false",
+}
+
+
+def commit_maintenance_runs(repo: pathlib.Path, env: dict[str, str], name: str) -> list[str]:
+    """Commit one new file in `repo` under `env`; return the trace2 events naming a `git maintenance run`."""
+    trace = repo.parent / f"{name}.trace2.json"
+    (repo / f"{name}.txt").write_text(f"{name}\n")
+    for args in (["add", "--", f"{name}.txt"], ["commit", "-q", "-m", name]):
+        subprocess.run(
+            ["git", "-c", "core.hooksPath=" + os.devnull, *args], cwd=repo,
+            env={**env, "GIT_TRACE2_EVENT": str(trace)}, text=True, capture_output=True,
+            timeout=10, check=True,
+        )
+    return [line for line in trace.read_text().splitlines() if '"maintenance","run"' in line]
 
 
 def workflow_text(name: str) -> str:
@@ -143,6 +165,7 @@ class MinioStorageChangeWorkflowTests(unittest.TestCase):
             "core.hooksPath": str(hooks),
             "core.autocrlf": "false",
             "core.quotePath": "true",
+            "maintenance.auto": "false",
         }
         env["GIT_CONFIG_COUNT"] = str(len(config))
         for index, (key, value) in enumerate(config.items()):
@@ -221,6 +244,11 @@ class MinioStorageChangeWorkflowTests(unittest.TestCase):
             0,
             "COMPARISON_BASE_WAS_FETCHED",
         )
+
+    def test_fixture_git_turns_off_auto_maintenance(self):
+        checkout, _base, env = self._shallow_fixture()
+        result = self._git(checkout, env, "config", "--get", "maintenance.auto")
+        self.assertEqual(result.stdout.strip(), "false")
 
     def test_pull_request_nonstorage_change_fetches_missing_base(self):
         checkout, base, env = self._shallow_fixture()
@@ -431,7 +459,7 @@ class CoverageRatchetWorkflowTests(unittest.TestCase):
         ratchet = indented_block(workflow, "coverage-ratchet", 2)
         gate = indented_block(workflow, "ci-gate", 2)
 
-        self.assertIn("needs: [resolve-revision, coverage-measurement]", ratchet)
+        self.assertIn("needs: [resolve-revision, coverage-measurement, changed-paths]", ratchet)
         self.assertIn(
             "if: needs.resolve-revision.result == 'success' && "
             "needs.coverage-measurement.result == 'success' && "
@@ -475,9 +503,9 @@ class CoverageRatchetWorkflowTests(unittest.TestCase):
         compute = step_block(measurement, "Compute coverage")
         step = re.findall(r"(?m)^        timeout-minutes: (\d+)$", compute)
         self.assertEqual((len(job), len(step)), (1, 1))
-        # Preserve the original 1.37x margin against the known 39-minute
-        # successful instrumented run, rounding up to whole minutes.
-        derived_floor = (39 * 137 + 99) // 100
+        # Preserve the 1.37x margin against the slowest completed instrumented
+        # run, 54m04s (3244 s), rounding up to whole minutes.
+        derived_floor = (3244 * 137 + 5999) // 6000
         self.assertGreaterEqual(int(step[0]), derived_floor)
         # A job-level timeout cancels the job, and a cancelled job is neither
         # success nor skipped, so the step budget has to expire first for the
@@ -494,10 +522,34 @@ class AutoMergeGuardWorkflowTests(unittest.TestCase):
 
 
 class AggregateGateWorkflowTests(unittest.TestCase):
-    # The push guard is the only remaining job with an eligibility predicate.
-    # always() admits a job after failed dependencies; it is not such a predicate.
+    # The push guard has its own eligibility predicate. The lane jobs carry
+    # DOCS_LANE_PREDICATE and skip on a change that touches only Markdown no
+    # code names. The coverage jobs also carry SCOPE_PREDICATE and skip on a
+    # pull request whose test scope is a crate list (ADR-205). always() admits
+    # a job after failed dependencies; it is not such a predicate.
     CONDITIONAL_JOBS = {"automerge-push-guard"}
     FORGIVEN_SKIPS = {"automerge-push-guard"}
+    DOCS_LANE_PREDICATE = "needs.changed-paths.outputs.docs_only != 'true'"
+    SCOPE_PREDICATE = ("(needs.changed-paths.outputs.test_scope == 'full'"
+                       " || needs.changed-paths.outputs.test_scope == '')")
+    SCOPED_SKIP_JOBS = {"coverage-measurement", "coverage-ratchet"}
+    # A draft pull request skips every lane job until it is marked ready; the gate refuses a draft by name.
+    DRAFT_PREDICATE = "github.event.pull_request.draft != true"
+    # Coverage runs on main pushes, the nightly run and manual dispatches only; the gate forgives its skip
+    # on pull requests and integration pushes (COVERAGE_SKIPS).
+    EVENT_PREDICATE = ("github.event_name != 'pull_request'"
+                       " && !startsWith(github.ref, 'refs/heads/integration/')")
+    EVENT_SKIP_JOBS = SCOPED_SKIP_JOBS
+    DOCS_LANE_JOBS = {
+        "ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
+        "dependency-review", "coverage-measurement", "coverage-ratchet",
+        "wasm-parity", "vamana-portability", "minio-blob-compat",
+        "msrv-check", "core-only", "release-checks", "channel-tests", "s3-blob-tests",
+        "clippy-checks",
+    }
+    # The Windows compile check is not a gate dependency, so nothing forgives its skip; the lane skips it to
+    # save the runner, like the gated lane jobs.
+    UNGATED_DOCS_LANE_JOBS = {"check-windows"}
 
     def setUp(self):
         self.workflow = workflow_text("ci.yml")
@@ -509,20 +561,136 @@ class AggregateGateWorkflowTests(unittest.TestCase):
         step = self.gate.split("- name: Check aggregated job results\n", 1)[1]
         self.script = textwrap.dedent(step.split("        run: |\n", 1)[1])
 
-    def run_gate(self, results):
+    def run_gate(self, results, docs_only="false", classifier=None, test_scope="full", coverage_skips=None):
+        """test_scope=None leaves the output unset, as when the scope step did not run."""
+        needs = {job: {"result": result} for job, result in results.items()}
+        if "changed-paths" in needs:
+            if classifier is not None:
+                needs["changed-paths"]["result"] = classifier
+            needs["changed-paths"]["outputs"] = {"docs_only": docs_only}
+            if test_scope is not None:
+                needs["changed-paths"]["outputs"]["test_scope"] = test_scope
         return subprocess.run(
             ["bash", "-e", "-c", self.script],
-            env={**os.environ, "NEEDS": json.dumps({
-                job: {"result": result} for job, result in results.items()
-            })},
+            env={**{k: v for k, v in os.environ.items() if k != "COVERAGE_SKIPS"}, "NEEDS": json.dumps(needs),
+                 **({} if coverage_skips is None else {"COVERAGE_SKIPS": coverage_skips})},
             capture_output=True, text=True, timeout=5, check=False,
         )
+
+    def job_conditions(self, job):
+        return re.findall(r"(?m)^    if: (.+)$", indented_block(self.workflow, job, 2))
+
+    def lane_conditions(self, job):
+        predicate = self.DOCS_LANE_PREDICATE
+        if job in self.SCOPED_SKIP_JOBS:
+            predicate = f"{predicate} && {self.SCOPE_PREDICATE} && {self.EVENT_PREDICATE}"
+        else:
+            predicate = f"{predicate} && {self.DRAFT_PREDICATE}"
+        return [[predicate], [f"always() && {predicate}"]]
+
+    def test_docs_lane_jobs_and_the_gate_list_are_one_set(self):
+        # Every job in the workflow, not only the gate's dependencies: a job that takes the predicate and is
+        # missing from the gate's needs would otherwise be invisible here.
+        jobs = re.findall(r"(?m)^  ([a-z][a-z0-9-]*):$", self.workflow.split("jobs:\n", 1)[1])
+        self.assertIn("ci-gate", jobs)
+        carrying = {
+            job for job in jobs
+            if any(self.DOCS_LANE_PREDICATE in condition for condition in self.job_conditions(job))
+        }
+        self.assertEqual(carrying, self.DOCS_LANE_JOBS | self.UNGATED_DOCS_LANE_JOBS)
+        self.assertEqual(carrying & self.needs, self.DOCS_LANE_JOBS)
+        self.assertEqual(carrying - self.needs, self.UNGATED_DOCS_LANE_JOBS)
+        lists = [set(re.findall(r'"([a-z0-9-]+)"', block.split("]", 1)[0]))
+                 for block in self.script.split("then [")[1:]]
+        self.assertEqual(lists, [self.DOCS_LANE_JOBS, self.SCOPED_SKIP_JOBS, self.EVENT_SKIP_JOBS])
+        scoped = {
+            job for job in jobs
+            if any(self.SCOPE_PREDICATE in condition for condition in self.job_conditions(job))
+        }
+        self.assertEqual(scoped, self.SCOPED_SKIP_JOBS)
+        for job in sorted(self.DOCS_LANE_JOBS | self.UNGATED_DOCS_LANE_JOBS):
+            with self.subTest(job=job):
+                self.assertIn(self.job_conditions(job), self.lane_conditions(job))
+                needs_line = re.search(r"(?m)^    needs: (.+)$", indented_block(self.workflow, job, 2))
+                self.assertIn("changed-paths", needs_line.group(1))
+        for job in ["changed-paths", "docs", "secret-scan", "data-leak-guard", "marketplace",
+                    "resolve-revision", "ci-gate"]:
+            with self.subTest(kept=job):
+                self.assertNotIn(self.DOCS_LANE_PREDICATE, indented_block(self.workflow, job, 2))
+        self.assertIn("- changed-paths", indented_block(self.gate, "needs", 4))
+
+    def test_coverage_skips_are_forgiven_only_on_pull_requests_and_integration_pushes(self):
+        for coverage_skips in ("true", "false", None, "TRUE"):
+            for job in sorted(self.needs):
+                with self.subTest(coverage_skips=coverage_skips, job=job):
+                    results = dict.fromkeys(self.needs, "success")
+                    results[job] = "skipped"
+                    result = self.run_gate(results, coverage_skips=coverage_skips)
+                    accepted = job in self.FORGIVEN_SKIPS or (
+                        coverage_skips == "true" and job in self.EVENT_SKIP_JOBS)
+                    self.assertEqual(result.returncode, 0 if accepted else 1, result.stdout + result.stderr)
+                    if job in self.EVENT_SKIP_JOBS:
+                        failed = dict.fromkeys(self.needs, "success")
+                        failed[job] = "failure"
+                        refused = self.run_gate(failed, coverage_skips=coverage_skips)
+                        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+
+    def test_the_gate_refuses_a_draft_pull_request_by_name(self):
+        steps = self.gate.split("- name: Check aggregated job results\n", 1)[0]
+        self.assertIn("- name: Refuse a draft pull request\n", steps)
+        self.assertIn("if: github.event_name == 'pull_request' && github.event.pull_request.draft == true\n", steps)
+        self.assertIn("exit 1\n", steps)
+        env = indented_block(self.gate.split("- name: Check aggregated job results\n", 1)[1], "env", 8)
+        self.assertIn("COVERAGE_SKIPS: ${{ github.event_name == 'pull_request' || "
+                      "startsWith(github.ref, 'refs/heads/integration/') }}", env)
+        triggers = indented_block(self.workflow, "pull_request", 2)
+        self.assertIn("types: [opened, synchronize, reopened, ready_for_review]", triggers)
+
+    def test_failed_classifier_does_not_forgive_the_lane_skips(self):
+        # A failed classifier already fails the gate by itself; the rejected list shows
+        # that the lane skips are rejected too rather than hidden behind it.
+        results = dict.fromkeys(self.needs, "success")
+        results["ci"] = "skipped"
+        result = self.run_gate(results, docs_only="true", classifier="failure")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        rejected = result.stdout.split("Gate failure — jobs not green: ", 1)[1].splitlines()
+        self.assertEqual(sorted(rejected), ["changed-paths", "ci"])
+
+    def test_gate_forgives_docs_lane_skips_only_after_a_successful_docs_only_classification(self):
+        for job in sorted(self.needs):
+            for outcome in ("success", "skipped", "failure", "cancelled"):
+                for docs_only, test_scope, classifier in (
+                        ("true", None, "success"), ("false", "full", "success"),
+                        ("true", None, "failure"), ("true", None, "skipped"),
+                        ("TRUE", "full", "success"), ("", "full", "success"),
+                        ("false", "khive-hnsw kkernel", "success"), ("false", "khive-hnsw", "failure"),
+                        ("false", "khive-hnsw", "skipped"), ("false", "FULL", "success"),
+                        ("false", "", "success"), ("false", None, "success"), ("", "", "success")):
+                    with self.subTest(job=job, outcome=outcome, docs_only=docs_only,
+                                      test_scope=test_scope, classifier=classifier):
+                        results = dict.fromkeys(self.needs, "success")
+                        results[job] = outcome
+                        classifier_result = outcome if job == "changed-paths" else classifier
+                        result = self.run_gate(results, docs_only=docs_only, classifier=classifier_result,
+                                               test_scope=test_scope)
+                        lane = classifier_result == "success" and docs_only == "true"
+                        scoped = classifier_result == "success" and test_scope not in (None, "", "full", "FULL")
+                        accepted = classifier_result == "success" and (outcome == "success" or (
+                            outcome == "skipped" and (
+                                job in self.FORGIVEN_SKIPS or (lane and job in self.DOCS_LANE_JOBS)
+                                or (scoped and job in self.SCOPED_SKIP_JOBS))
+                        ))
+                        self.assertEqual(
+                            result.returncode, 0 if accepted else 1,
+                            f"DOCS_LANE_SKIP_POLICY: {job}={outcome}\n" + result.stdout + result.stderr,
+                        )
 
     def test_gate_forgives_skips_only_for_jobs_on_its_allow_list(self):
         conditional = {
             job for job in self.needs
             if re.search(r"(?m)^    if:", indented_block(self.workflow, job, 2))
             and "    if: always()" not in indented_block(self.workflow, job, 2)
+            and self.job_conditions(job) not in self.lane_conditions(job)
         }
         self.assertEqual(conditional, self.CONDITIONAL_JOBS)
         self.assertTrue(self.needs - conditional)
@@ -570,7 +738,7 @@ class AggregateGateWorkflowTests(unittest.TestCase):
 
 
 class CiConcurrencyWorkflowTests(unittest.TestCase):
-    def test_main_pushes_run_newest_commit_without_cancelling_running_run(self):
+    def test_main_pushes_run_newest_commit_and_cancel_superseded_runs(self):
         concurrency = indented_block(workflow_text("ci.yml"), "concurrency", 0)
         self.assertEqual(
             mapping_entries(concurrency),
@@ -579,13 +747,162 @@ class CiConcurrencyWorkflowTests(unittest.TestCase):
                 "github.event_name == 'pull_request' && github.ref || "
                 "github.event_name == 'push' && github.ref == 'refs/heads/main' "
                 "&& github.ref || github.run_id }}",
-                "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+                "cancel-in-progress: ${{ github.event_name == 'pull_request' || "
+                "(github.event_name == 'push' && github.ref == 'refs/heads/main') }}",
             },
-            "Main pushes must share one group whose running run is never "
-            "cancelled and whose waiting run is replaced by the newest push "
-            "(the default single-slot queue); PRs retain ref-scoped "
+            "Main pushes must share one group in which the newest push cancels "
+            "the running run and replaces the waiting one, so a burst of merges "
+            "leaves one main run at the newest head; PRs retain ref-scoped "
             "cancellation, and other events retain independent run groups.",
         )
+
+
+def steps_before_checkout_in_missing_directory(text: str) -> list[str]:
+    """Name each `run` step that executes before `actions/checkout` in a job whose default
+    working directory is a relative path, without setting its own working directory.
+
+    Such a step runs in a directory the checkout has not created yet and fails with
+    "No such file or directory" before its command starts.
+    """
+    offenders = []
+    jobs = re.split(r"(?m)^  (?=[A-Za-z0-9_-]+:\n)", text.split("\njobs:\n", 1)[1])
+    for job in jobs:
+        name = job.split(":", 1)[0]
+        workdir = re.search(r"(?m)^    defaults:\n      run:\n(?:        .*\n)*?        working-directory: (\S+)", job)
+        if not workdir or workdir.group(1).startswith(("/", "${{")):
+            continue
+        steps = job.split("\n    steps:\n", 1)
+        if len(steps) < 2:
+            continue
+        for step in re.split(r"(?m)^      - ", steps[1])[1:]:
+            if re.search(r"uses: actions/checkout@", step):
+                break
+            if re.search(r"(?m)^(?:        )?run:", step) and "working-directory:" not in step:
+                offenders.append(f"{name}: {step.splitlines()[0].strip()}")
+    return offenders
+
+
+class StepOrderWorkflowTests(unittest.TestCase):
+    def test_no_run_step_precedes_checkout_in_a_missing_working_directory(self):
+        names = sorted(path.name for path in WORKFLOWS.glob("*.yml"))
+        self.assertIn("ci.yml", names)
+        offenders = {name: steps_before_checkout_in_missing_directory(workflow_text(name)) for name in names}
+        self.assertEqual({name: found for name, found in offenders.items() if found}, {})
+
+    def test_the_check_finds_a_run_step_before_checkout(self):
+        text = textwrap.dedent(
+            """\
+            on: push
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                defaults:
+                  run:
+                    working-directory: crates
+                steps:
+                  - name: Too early
+                    run: echo early
+                  - uses: actions/checkout@v7
+                  - name: After
+                    run: echo late
+              other:
+                runs-on: ubuntu-latest
+                steps:
+                  - name: No default directory
+                    run: echo fine
+                  - uses: actions/checkout@v7
+            """
+        )
+        self.assertEqual(steps_before_checkout_in_missing_directory(text), ["build: name: Too early"])
+
+
+class CiMatrixWorkflowTests(unittest.TestCase):
+    """Evaluates the `ci` job's matrix expression for each event shape.
+
+    The expression uses only `&&`, `||`, `==`, `startsWith` and string literals,
+    which map onto Python's short-circuit operators with the same operand-returning
+    semantics, so the test runs the expression itself rather than matching its text.
+    """
+
+    UBUNTU = [{"os": "ubuntu-latest", "shard": 1}, {"os": "ubuntu-latest", "shard": 2}]
+
+    def matrix_for(self, event_name, head_ref="", head_repo=None, repository="ohdearquant/khive",
+                   ref="refs/heads/main"):
+        text = workflow_text("ci.yml")
+        match = re.search(r"include: \$\{\{ fromJSON\((.*?)\) \}\}", text, re.S)
+        self.assertIsNotNone(match, "the ci job's matrix include expression was not found")
+        expression = " ".join(match.group(1).split())
+        names = {
+            "github.event.pull_request.head.repo.full_name": "head_repo",
+            "github.event_name": "event_name",
+            "github.head_ref": "head_ref",
+            "github.repository": "repository",
+            "github.ref": "ref",
+        }
+        for name, local in names.items():
+            expression = expression.replace(name, local)
+        expression = expression.replace("startsWith(", "starts_with(")
+        expression = expression.replace("&&", " and ").replace("||", " or ")
+        self.assertNotRegex(expression, r"github\.", "an unmapped context name is left in the expression")
+
+        def starts_with(value, prefix):
+            # GitHub's startsWith is case-insensitive and treats null as "".
+            return (value or "").lower().startswith(prefix.lower())
+
+        scope = {
+            "starts_with": starts_with,
+            "event_name": event_name,
+            "head_ref": head_ref,
+            "head_repo": head_repo,
+            "repository": repository,
+            "ref": ref,
+        }
+        return json.loads(eval(expression, {"__builtins__": {}}, scope))
+
+    def test_own_codex_split_and_docs_branch_pull_requests_run_the_linux_shards_only(self):
+        for head_ref in ["codex/some-change", "split/khive-runtime-daemon-3943", "docs/retrieval-crate-doc"]:
+            with self.subTest(head_ref=head_ref):
+                self.assertEqual(
+                    self.matrix_for("pull_request", head_ref, "ohdearquant/khive"),
+                    self.UBUNTU,
+                )
+
+    def test_other_pull_requests_keep_the_macos_lane(self):
+        expected = self.UBUNTU + [{"os": "macos-latest", "shard": 1}]
+        for head_ref, head_repo in [
+            ("batch/125", "ohdearquant/khive"),
+            ("feature/codex/x", "ohdearquant/khive"),
+            ("feature/split/x", "ohdearquant/khive"),
+            ("splitter/x", "ohdearquant/khive"),
+            ("documents/x", "ohdearquant/khive"),
+            ("codex/some-change", "contributor/khive"),
+            ("codex/some-change", None),
+            ("split/some-change", "contributor/khive"),
+            ("docs/some-change", "contributor/khive"),
+            ("docs/some-change", None),
+        ]:
+            with self.subTest(head_ref=head_ref, head_repo=head_repo):
+                self.assertEqual(self.matrix_for("pull_request", head_ref, head_repo), expected)
+
+    def test_push_schedule_and_dispatch_runs_keep_all_four_jobs(self):
+        expected = self.UBUNTU + [
+            {"os": "macos-latest", "shard": 1},
+            {"os": "macos-latest", "shard": 2},
+        ]
+        for event_name in ["push", "schedule", "workflow_dispatch"]:
+            with self.subTest(event_name=event_name):
+                self.assertEqual(self.matrix_for(event_name), expected)
+        # Integration pushes other than trains keep all four, and so does a train-named ref on another event.
+        for event_name, ref in [("push", "refs/heads/integration/batch-7"), ("push", "refs/heads/main"),
+                                ("workflow_dispatch", "refs/heads/integration/train-12"),
+                                ("schedule", "refs/heads/integration/train-12")]:
+            with self.subTest(event_name=event_name, ref=ref):
+                self.assertEqual(self.matrix_for(event_name, ref=ref), expected)
+
+    def test_integration_train_pushes_run_the_linux_shards_only(self):
+        for ref in ["refs/heads/integration/train-12", "refs/heads/integration/train-213-a"]:
+            with self.subTest(ref=ref):
+                self.assertEqual(self.matrix_for("push", ref=ref), self.UBUNTU)
 
 
 class WasmtimeParityWorkflowTests(unittest.TestCase):
@@ -626,6 +943,16 @@ class WasmtimeParityWorkflowTests(unittest.TestCase):
 
 
 class BenchTrackWorkflowTests(unittest.TestCase):
+    def test_trend_points_are_nightly_and_per_release_not_per_merge(self):
+        on = indented_block(workflow_text("bench-track.yml"), "on", 0)
+        self.assertRegex(on, r'(?m)^  schedule:\n    - cron: "[^"]+"$')
+        self.assertRegex(on, r"(?m)^  workflow_dispatch:$")
+        push = indented_block(on, "push", 2)
+        # The one branch push is a merge train's integration branch, which runs the train's dependents
+        # closure and records no trend point (ADR-206 Amendment 1); a push to main never runs it.
+        self.assertEqual(re.findall(r"(?m)^    branches: (.+)$", push), ['["integration/train-*"]'])
+        self.assertIn('tags: ["v*"]', push)
+
     def test_publish_failure_is_advisory_and_records_incident(self):
         for workflow_name, publish_name in (
             ("bench-component.yml", "Publish ledger to perf-data branch"),
@@ -779,7 +1106,7 @@ class BenchTrackWorkflowTests(unittest.TestCase):
         self.assertEqual(positions, sorted(positions), "failure must follow both publication steps")
         self.assertIn("id: criterion", step(criterion_name))
         for name in (record_name, final_name):
-            self.assertIn("if: ${{ !cancelled() }}", step(name))
+            self.assertIn("if: ${{ !cancelled() && steps.select.outputs.empty != 'true' }}", step(name))
             self.assertIn("COMPILE_EXIT_CODE: ${{ steps.compile.outputs.exit_code }}", step(name))
             self.assertIn("CRITERION_EXIT_CODE: ${{ steps.criterion.outputs.exit_code }}", step(name))
         self.assertIn("if: always()", step(artifact_name))
@@ -787,7 +1114,9 @@ class BenchTrackWorkflowTests(unittest.TestCase):
             "component-phases.log", "crates/target/criterion", "bench-data/components.jsonl",
         ):
             self.assertIn(evidence_path, step(artifact_name))
-        self.assertIn("github.event_name == 'push'", step(publish_name))
+        publish_if = step(publish_name)
+        self.assertIn("github.event_name != 'pull_request'", publish_if)
+        self.assertIn("github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')", publish_if)
 
         # Execute the workflow's real shell and real recorder. Only the native
         # benchmark, remote publisher and upload service are fixture boundaries.
@@ -903,6 +1232,154 @@ class BenchTrackWorkflowTests(unittest.TestCase):
         self.assertEqual(len(quick_commands), 1)
         self.assertIn("--benches", quick_commands[0])
         self.assertIn("--criterion-dir crates/target/criterion", workflow)
+
+    def test_every_benchmarked_library_stays_out_of_cargo_bench(self):
+        # `cargo bench --benches` also runs every target whose `bench` flag is on, and a library's defaults to on.
+        # Its libtest harness rejects the Criterion flags the quick profile passes (`--quick`, `--noplot`), so a
+        # benchmarked crate whose library is not `bench = false` fails the whole component run.
+        _, benchmarked, offenders = BenchmarkInventoryTests.inventory(REPO_ROOT / "crates")
+        self.assertIn("khive-channel", benchmarked, "the inventory missed a known benchmarked workspace crate")
+        self.assertEqual(offenders, [], "set `[lib] bench = false` in these crates' Cargo.toml")
+
+    SELECT_NAME = "Select the component's crates that have a bench target"
+
+    def component_step(self, name):
+        # Up to the next step of any shape: the select step is followed by a `uses:` step, not a named one.
+        return workflow_text("bench-component.yml").split(f"      - name: {name}\n", 1)[1].split("\n      - ", 1)[0] + "\n"
+
+    def test_component_runs_only_crates_that_have_a_bench_target(self):
+        # A component may name a crate before its first benchmark lands. The select step reads cargo metadata and
+        # passes compile and Criterion only the crates with a bench target; a name outside the workspace fails it.
+        workflow = workflow_text("bench-component.yml")
+        select = self.component_step(self.SELECT_NAME)
+        self.assertIn("id: select", select)
+        self.assertIn("COMPONENT_CRATES: ${{ inputs.crates }}", select)
+        self.assertEqual(workflow.count("inputs.crates"), 1, "only the select step reads the declared crate list")
+        for name in ("Compile-check this component's bench targets",
+                     "Run Criterion benches (quick profile, bounded to 10 minutes)"):
+            self.assertIn("COMPONENT_CRATES: ${{ steps.select.outputs.crates }}", self.component_step(name))
+        order = [workflow.index(marker) for marker in (
+            f"      - name: {self.SELECT_NAME}\n", "      - uses: Swatinem/rust-cache@v2\n",
+            "      - name: Compile-check this component's bench targets\n")]
+        self.assertEqual(order, sorted(order), "select runs before the cache restore and the compile")
+        script = textwrap.dedent(select.split("        run: |\n", 1)[1])
+        packages = {"khive-alpha": ["lib", "bench"], "khive-beta": ["lib", "test"], "khive-gamma": ["bench", "lib"],
+                    "khive-delta": ["lib"]}
+        metadata = {"packages": [{"name": name, "targets": [{"kind": [kind]} for kind in kinds]}
+                                 for name, kinds in packages.items()]}
+
+        def run(source, crates):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                (root / "crates").mkdir()
+                bins = root / "bin"
+                bins.mkdir()
+                (root / "metadata.json").write_text(json.dumps(metadata))
+                for tool, text in {"cargo": '#!/bin/sh\ncat "$FAKE_METADATA"\n',
+                                   "python3": f'#!/bin/sh\nexec "{sys.executable}" "$@"\n'}.items():
+                    (bins / tool).write_text(text)
+                    (bins / tool).chmod(0o755)
+                output = root / "output"
+                output.write_text("")
+                result = subprocess.run(
+                    ["bash", "-c", source], cwd=root / "crates", capture_output=True, text=True, timeout=10, check=False,
+                    env={**os.environ, "PATH": f"{bins}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(output),
+                         "FAKE_METADATA": str(root / "metadata.json"), "COMPONENT": "fixture-component",
+                         "COMPONENT_CRATES": crates})
+                values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                log = root / "component-phases.log"
+                return result, values, log.read_text() if log.exists() else ""
+
+        result, values, log = run(script, "khive-alpha khive-beta khive-gamma")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(values, {"crates": "khive-alpha khive-gamma", "empty": "false"})
+        self.assertIn("phase=select selected=khive-alpha,khive-gamma left_out=khive-beta", log)
+        self.assertNotIn("::notice::", result.stdout)
+
+        result, values, log = run(script, "khive-beta khive-delta")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(values, {"crates": "", "empty": "true"})
+        self.assertIn("::notice::component fixture-component has no crate with a bench target", result.stdout)
+        self.assertIn("no ledger record", result.stdout)
+
+        # A name outside the workspace, or no name at all, fails the step and writes no `empty` output, so the
+        # record, report and page steps run as for a compile failure.
+        for crates in ("khive-alpha khive-omega", ""):
+            with self.subTest(crates=crates):
+                result, values, _ = run(script, crates)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("empty", values)
+                self.assertIn("::error::", result.stdout)
+        self.assertIn("khive-omega", run(script, "khive-alpha khive-omega")[0].stdout)
+
+        # Must-fail arm: a selector that keeps every named crate hands khive-beta, which has no bench target, to
+        # compile and Criterion, and this fixture tells the two apart.
+        keep_all = script.replace('if "bench" in kinds[c]', "if True")
+        self.assertNotEqual(keep_all, script)
+        self.assertNotEqual(run(keep_all, "khive-alpha khive-beta khive-gamma")[1]["crates"], "khive-alpha khive-gamma")
+
+    def test_an_empty_component_records_and_pages_nothing(self):
+        # Evaluates each step's `if:` as GitHub does: an expression with no status function is ANDed with success(),
+        # and an output of a skipped or failed step reads as the empty string.
+        workflow = workflow_text("bench-component.yml")
+
+        def condition(block):
+            found = re.findall(r"(?m)^        if: (.+)$", block)
+            self.assertEqual(len(found), 1, block)
+            return found[0]
+
+        cache = workflow.split("      - uses: Swatinem/rust-cache@v2\n", 1)[1].split("      - ", 1)[0]
+        conditions = {
+            "cache": condition(cache),
+            "compile": condition(self.component_step("Compile-check this component's bench targets")),
+            "record": condition(self.component_step("Record component trend ledger entry")),
+            "publish": condition(self.component_step("Publish ledger to perf-data branch")),
+            "page": condition(self.component_step("Warn if trend ledger record errored (advisory, never fails)")),
+            "report": condition(self.component_step("Report benchmark failures after publication")),
+        }
+
+        def evaluate(expression, select_ok, empty, record_exit):
+            expression = expression.strip()
+            if expression.startswith("${{"):
+                expression = expression.removeprefix("${{").removesuffix("}}").strip()
+            implicit = not re.search(r"\b(?:cancelled|always|success|failure)\(\)", expression)
+            for name, local in {
+                "!cancelled()": "True",
+                "steps.select.outputs.empty": "empty",
+                "steps.record.outputs.exit_code": "record_exit",
+                "github.event_name": "event_name",
+                "github.ref": "ref",
+                "startsWith(": "starts_with(",
+                "&&": " and ",
+                "||": " or ",
+            }.items():
+                expression = expression.replace(name, local)
+            self.assertNotRegex(expression, r"github\.|steps\.|!(?!=)", "an unmapped name or operator is left")
+            scope = {"empty": empty, "record_exit": record_exit, "event_name": "push", "ref": "refs/heads/main",
+                     "starts_with": lambda value, prefix: value.lower().startswith(prefix.lower())}
+            value = eval(expression, {"__builtins__": {}}, scope)
+            return bool(value) and (select_ok or not implicit)
+
+        # (select step succeeded, its `empty` output, the record step's exit code output) -> steps that run.
+        cases = {
+            (True, "true", ""): set(),
+            (True, "false", "0"): {"cache", "compile", "record", "publish", "report"},
+            (True, "false", "1"): {"cache", "compile", "record", "publish", "page", "report"},
+            (False, "", "1"): {"record", "publish", "page", "report"},
+        }
+        for (select_ok, empty, record_exit), expected in cases.items():
+            with self.subTest(select_ok=select_ok, empty=empty, record_exit=record_exit):
+                ran = {name for name, expression in conditions.items()
+                       if evaluate(expression, select_ok, empty, record_exit)}
+                self.assertEqual(ran, expected)
+
+        # Must-fail arm: without the select guard the record step runs for an empty component and its error record
+        # pages the tracking issue, which is what the guard exists to prevent.
+        unguarded = {name: expression.replace(" && steps.select.outputs.empty != 'true'", "")
+                     for name, expression in conditions.items() if name in ("record", "page")}
+        self.assertNotEqual(unguarded, {name: conditions[name] for name in unguarded})
+        self.assertTrue(evaluate(unguarded["record"], True, "true", ""))
+        self.assertTrue(evaluate(unguarded["page"], True, "true", ""))
 
 
 class FilteredCargoTestWorkflowTests(unittest.TestCase):
@@ -1515,7 +1992,7 @@ class HarnessEnvironmentTests(unittest.TestCase):
             "scripts/tests/test_ci_workflows.py",
             # An enumerated contract test whose FIRST assertion is equality with
             # the declaration, so the enumeration below it cannot drift silently.
-            "crates/khive-runtime/src/runtime.rs",
+            "crates/khive-runtime/src/runtime_tests.rs",
             # Same shape: the description scan pairs each pack name with the
             # handler table it publishes, and its first assertion is that the
             # names cover built_in_packs() with a declared, checked remainder.
@@ -1600,6 +2077,68 @@ class DocsFormatPhaseTests(unittest.TestCase):
         self.assertIn("run: scripts/ci.sh docs-fmt", docs_job)
         self.assertNotIn("deno fmt", docs_job)
         self.assertIn("denoland/setup-deno@v2", docs_job)
+        # The documentation lane skips every other job that reads Markdown by content, so the docs job runs
+        # those readers: the ADR lints and the repository-wide identifier ban, with the ripgrep it needs.
+        self.assertIn("run: scripts/ci.sh adr-lint", docs_job)
+        self.assertIn("astral-sh/setup-uv@v5", docs_job)
+        install = docs_job.index("run: scripts/ci-install-ripgrep.sh")
+        self.assertLess(install, docs_job.index("run: scripts/ci.sh content-sweeps"))
+
+    def test_docs_job_checks_generated_benchmark_reference_blocks(self):
+        # The benchmark reference block is generated from a committed file. A
+        # shallow checkout can hold the document without the baseline commit the
+        # renderer must date, so the docs job fetches full history before running
+        # the renderer's own tests and its fail-closed drift check.
+        job = indented_block(workflow_text("ci.yml"), "docs", 2)
+        self.assertIn("fetch-depth: 0", job)
+        self.assertIn("actions/setup-python@v6", job)
+        self.assertIn(
+            "run: python3 -m unittest scripts.tests.test_render_bench_reference -v",
+            job,
+        )
+        self.assertIn("run: python3 scripts/render-bench-reference.py --check", job)
+        tests = job.index("test_render_bench_reference")
+        check = job.index("render-bench-reference.py --check")
+        self.assertLess(tests, check)
+
+    def test_ripgrep_install_has_one_copy(self):
+        workflow = workflow_text("ci.yml")
+        self.assertNotIn("apt-get install", workflow)
+        # khive-contract, the one phase that needs rg, runs in the release-checks job.
+        release_job = indented_block(workflow, "release-checks", 2)
+        self.assertIn("run: ../scripts/ci-install-ripgrep.sh", release_job)
+        script = (REPO_ROOT / "scripts" / "ci-install-ripgrep.sh").read_text()
+        self.assertIn("apt-get install --yes ripgrep", script)
+        self.assertIn("set -euo pipefail", script)
+
+    def test_content_sweeps_phase_runs_the_identifier_ban_by_node_id(self):
+        # A node id, not a -k filter: a renamed test fails collection instead of selecting nothing.
+        script = (REPO_ROOT / "scripts" / "ci.sh").read_text()
+        body = script.split("phase_content_sweeps() {", 1)[1].split("\n}\n", 1)[0]
+        # The ban reads this file too; a line that names its test file is on its allow-list.
+        node = "tests/test_no_importance_in_manifest.py::test_no_importance_identifiers_in_repo"
+        self.assertIn(node, body)
+        contract_file, function = node.split("::")
+        contract = REPO_ROOT / "tests" / "khive-contract" / contract_file
+        self.assertIn(f"def {function}(", contract.read_text())
+
+    def test_content_sweeps_phase_runs_the_pack_set_copy_check_by_name(self):
+        # This check reads Markdown by content and otherwise runs only in phase_lint, which the
+        # documentation lane skips.
+        script = (REPO_ROOT / "scripts" / "ci.sh").read_text()
+        body = script.split("phase_content_sweeps() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('"$SCRIPT_DIR/tests/test_ci_workflows.py"', body)
+        self.assertIn("HarnessEnvironmentTests.test_no_new_hand_typed_copy_of_the_shipping_pack_set", body)
+        self.assertTrue(callable(getattr(HarnessEnvironmentTests,
+                                         "test_no_new_hand_typed_copy_of_the_shipping_pack_set", None)))
+
+    def test_content_sweeps_phase_runs_the_guide_table_checks(self):
+        # The directory-map comparison needs only the tree, so it runs in the lane every change runs.
+        script = (REPO_ROOT / "scripts" / "ci.sh").read_text()
+        body = script.split("phase_content_sweeps() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('python3 "$SCRIPT_DIR/../tests/test_documented_guide_tables.py"', body)
+        tests = (REPO_ROOT / "tests" / "test_documented_guide_tables.py").read_text()
+        self.assertIn("def test_repository_directory_map_matches_the_tree(", tests)
 
     def test_docs_fmt_refuses_when_deno_is_absent(self):
         # The absence arm decides whether this gate can be emptied in silence: a
@@ -1634,119 +2173,105 @@ class DocsFormatPhaseTests(unittest.TestCase):
             self.assertEqual(argv_log.read_text().split(), ["fmt", "--check"])
 
 
-class NpmReleaseWorkflowTests(unittest.TestCase):
-    def test_release_publishes_cli_alias_after_exact_version_umbrella(self):
-        workflow = workflow_text("release.yml")
-
-        self.assertIn("ALIAS_VERSION=$(node -p", workflow)
-        self.assertIn("ALIAS_KHIVE_VERSION=$(node -p", workflow)
-        self.assertIn('if [ "$VERSION" != "$ALIAS_VERSION" ]', workflow)
-        self.assertIn('if [ "$VERSION" != "$ALIAS_KHIVE_VERSION" ]', workflow)
-
-        umbrella_publish = workflow.index("- name: Publish khive (umbrella)")
-        alias_rewrite = workflow.index(
-            "- name: Set CLI alias version and khive dependency"
+class CiPhaseListTests(unittest.TestCase):
+    def test_unknown_phase_message_lists_every_dispatched_phase(self):
+        script = (REPO_ROOT / "scripts" / "ci.sh").read_text()
+        dispatched = re.findall(r"(?m)^        ([a-z-]+)\) phase_", script)
+        self.assertIn("adr-lint", dispatched)
+        completed = subprocess.run(
+            ["sh", str(REPO_ROOT / "scripts" / "ci.sh"), "no-such-phase"],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=30, check=False,
         )
-        alias_publish = workflow.index(
-            "- name: Publish @khive-ai/cli (compatibility alias)"
-        )
-        self.assertLess(umbrella_publish, alias_rewrite)
-        self.assertLess(alias_rewrite, alias_publish)
-        self.assertIn("working-directory: npm/cli-alias", workflow[alias_publish:])
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        listed = re.search(r"(?m)^Valid phases: (.+)$", completed.stderr)
+        self.assertIsNotNone(listed, completed.stderr)
+        self.assertEqual(listed.group(1).split(), dispatched)
 
-    def test_local_publish_dry_run_includes_cli_alias_after_umbrella(self):
-        publish_script = REPO_ROOT / "scripts" / "npm-publish.sh"
-        with tempfile.TemporaryDirectory() as temp_dir:
-            npm_stub = pathlib.Path(temp_dir) / "npm"
-            npm_stub.write_text(
+
+class CoreOnlyFeatureWorkflowTests(unittest.TestCase):
+    def run_feature_checks(self, failing_feature):
+        job = indented_block(workflow_text("ci.yml"), "core-only", 2)
+        step = step_block(job, "Check each optional pack independently")
+        self.assertIn("if: ${{ !cancelled() }}", step)
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory(prefix="core-features-") as directory:
+            root = pathlib.Path(directory)
+            calls = root / "calls"
+            summary = root / "summary"
+            cargo = root / "cargo"
+            cargo.write_text(
                 "#!/bin/sh\n"
-                "if [ \"${1:-}\" = view ]; then echo 'npm ERR! code E404' >&2; exit 1; fi\n"
-                'echo "unexpected npm command: $*" >&2\n'
-                "exit 97\n"
+                'printf "%s\\n" "$*" >> "$FEATURE_CALLS"\n'
+                'case "$*" in *"--features $FAILING_FEATURE "*) exit 19;; esac\n'
             )
-            npm_stub.chmod(0o755)
-            env = os.environ.copy()
-            env["PATH"] = f"{temp_dir}:{env['PATH']}"
-            completed = subprocess.run(
-                ["bash", str(publish_script), "--dry-run"],
-                cwd=REPO_ROOT,
-                env=env,
+            cargo.chmod(0o700)
+            env = {key: value for key, value in os.environ.items()
+                   if key not in {"BASH_ENV", "ENV"} and not key.startswith("BASH_FUNC_")}
+            env.update(PATH=str(root) + os.pathsep + env.get("PATH", ""),
+                       FEATURE_CALLS=str(calls), FAILING_FEATURE=failing_feature,
+                       GITHUB_STEP_SUMMARY=str(summary))
+            result = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+                cwd=root, env=env, text=True, capture_output=True, timeout=10,
                 check=False,
-                capture_output=True,
-                text=True,
             )
-
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        version = json.loads((REPO_ROOT / "npm" / "package.json").read_text())[
-            "version"
-        ]
-        umbrella = f"[dry-run] would publish khive@{version}"
-        alias = f"[dry-run] would publish @khive-ai/cli@{version}"
-        self.assertIn(umbrella, completed.stdout)
-        self.assertIn(alias, completed.stdout)
-        self.assertLess(completed.stdout.index(umbrella), completed.stdout.index(alias))
-
-    def test_local_publish_refuses_published_alias_with_wrong_khive_dependency(self):
-        publish_script = REPO_ROOT / "scripts" / "npm-publish.sh"
-        with tempfile.TemporaryDirectory() as temp_dir:
-            npm_stub = pathlib.Path(temp_dir) / "npm"
-            npm_stub.write_text(
-                "#!/bin/sh\n"
-                'if [ "${1:-}" = view ]; then\n'
-                '  case "${2:-}" in @khive-ai/cli@*) echo 0.0.1; exit 0;; esac\n'
-                "  exit 1\n"
-                "fi\n"
-                'echo "unexpected npm command: $*" >&2\n'
-                "exit 97\n"
+            invocations = [shlex.split(line) for line in calls.read_text().splitlines()]
+            manifest = (REPO_ROOT / "crates/kkernel/Cargo.toml").read_text()
+            feature_table = re.search(r"(?ms)^\[features\]\n(.*?)(?=^\[|\Z)", manifest)
+            self.assertIsNotNone(feature_table, "manifest features table exists")
+            features = set(re.findall(r"(?m)^(pack-[a-z0-9-]+)\s*=", feature_table.group(1)))
+            self.assertTrue(features, "optional pack features are declared")
+            self.assertEqual(len(invocations), len(features), "one check per optional pack")
+            self.assertEqual(
+                {tuple(args) for args in invocations},
+                {("check", "-p", "kkernel", "--no-default-features", "--features", name, "--locked")
+                 for name in features},
+                "each feature compiles independently with defaults disabled",
             )
-            npm_stub.chmod(0o755)
-            env = os.environ.copy()
-            env["PATH"] = f"{temp_dir}:{env['PATH']}"
-            completed = subprocess.run(
-                ["bash", str(publish_script), "--dry-run"],
-                cwd=REPO_ROOT,
-                env=env,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+            return result, summary.read_text()
 
-        version = json.loads((REPO_ROOT / "npm" / "package.json").read_text())[
-            "version"
-        ]
-        self.assertEqual(completed.returncode, 1, completed.stdout)
-        self.assertIn(f"depends on khive 0.0.1, expected {version}", completed.stderr)
-        self.assertNotIn("would publish @khive-ai/cli", completed.stdout)
+    def test_all_optional_features_pass_without_enabling_defaults(self):
+        result, summary = self.run_feature_checks("not-a-feature")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(": failed", summary)
 
-    def test_local_publish_stops_when_the_alias_lookup_fails_for_another_reason(self):
-        publish_script = REPO_ROOT / "scripts" / "npm-publish.sh"
-        with tempfile.TemporaryDirectory() as temp_dir:
-            npm_stub = pathlib.Path(temp_dir) / "npm"
-            npm_stub.write_text(
-                "#!/bin/sh\n"
-                'if [ "${1:-}" = view ]; then\n'
-                "  case \"${2:-}\" in @khive-ai/cli@*) echo 'npm ERR! code ECONNREFUSED' >&2; exit 1;; esac\n"
-                "  echo 'npm ERR! code E404' >&2; exit 1\n"
-                "fi\n"
-                'echo "unexpected npm command: $*" >&2\n'
-                "exit 97\n"
-            )
-            npm_stub.chmod(0o755)
-            env = os.environ.copy()
-            env["PATH"] = f"{temp_dir}:{env['PATH']}"
-            completed = subprocess.run(
-                ["bash", str(publish_script), "--dry-run"],
-                cwd=REPO_ROOT,
-                env=env,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+    def test_middle_failure_does_not_skip_later_features_or_turn_green(self):
+        result, summary = self.run_feature_checks("pack-web")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("pack-web: failed (", summary)
+        self.assertIn("pack-moodboard: passed (", summary)
 
-        self.assertEqual(completed.returncode, 1, completed.stdout)
-        self.assertIn("could not look up @khive-ai/cli@", completed.stderr)
-        self.assertIn("ECONNREFUSED", completed.stderr)
-        self.assertNotIn("would publish @khive-ai/cli", completed.stdout)
+    def test_core_steps_build_and_test_with_defaults_disabled(self):
+        job = indented_block(workflow_text("ci.yml"), "core-only", 2)
+        expected = {
+            "Compile every target without the optional packs": [
+                "cargo", "check", "-p", "kkernel", "-p", "khive-mcp",
+                "--no-default-features", "--all-targets", "--locked",
+            ],
+            "Run the library tests without the optional packs": [
+                "cargo", "test", "-p", "kkernel", "-p", "khive-mcp",
+                "--no-default-features", "--lib", "--locked",
+            ],
+            "Run the pack composition tests without the optional packs": [
+                "cargo", "test", "-p", "kkernel", "--no-default-features", "--locked",
+                "--test", "optional_pack_features", "--test", "gate_operation_census",
+                "--test", "descriptions_are_written_for_callers",
+            ],
+        }
+        for name, argv in expected.items():
+            step = step_block(job, name)
+            command = step.split("        run: ", 1)[1].splitlines()[0]
+            self.assertEqual(shlex.split(command), argv, name)
+        for test in ("optional_pack_features", "gate_operation_census",
+                     "descriptions_are_written_for_callers"):
+            self.assertTrue((REPO_ROOT / "crates/kkernel/tests" / f"{test}.rs").is_file(), test)
+
+    def test_core_only_job_is_required_by_the_gate(self):
+        workflow = workflow_text("ci.yml")
+        gate_needs = indented_block(indented_block(workflow, "ci-gate", 2), "needs", 4)
+        needs = {line.strip().removeprefix("- ") for line in gate_needs.splitlines() if line.strip()}
+        self.assertIn("msrv-check", needs, "the needs list was read")
+        self.assertIn("core-only", needs)
 
 
 class HistoricalReplayWorkflowTests(unittest.TestCase):
@@ -1766,8 +2291,14 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         "minio-blob-compat": "MinIO BlobStore compatibility (ADR-111 Amendment 2)",
         "check-windows": "Windows compile check",
         "msrv-check": "MSRV compile check",
+        "core-only": "Core-only feature set build and tests",
+        "release-checks": "Release build and release checks (${{ matrix.os }})",
+        "channel-tests": "Channel feature tests (${{ matrix.os }})",
+        "s3-blob-tests": "S3 blob store library tests",
+        "clippy-checks": "Clippy and forward-deployed checks (${{ matrix.os }})",
         "coverage-measurement": "Coverage measurement",
         "coverage-ratchet": "Coverage ratchet",
+        "changed-paths": "Classify changed paths",
     }
 
     def setUp(self):
@@ -1781,6 +2312,7 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
                     if not key.startswith("GIT_")}
         self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                         GITHUB_OUTPUT=str(self.output), GITHUB_STEP_SUMMARY=str(self.summary))
+        self.env.update(NO_AUTO_MAINTENANCE)
 
     def script(self, job_name, step_name):
         job = indented_block(self.workflow, job_name, 2)
@@ -1832,6 +2364,9 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         self.git(work, "push", "origin", "main", "side", "--tags")
         return work, {"parent": parent, "tip": tip, "side": side,
                       "tag": tag, "tree": tree, "blob": blob}
+
+    def test_fixture_git_turns_off_auto_maintenance(self):
+        self.assertEqual(self.git(self.root, "config", "--get", "maintenance.auto"), "false")
 
     def test_input_is_strict_hex_and_never_shell_source(self):
         script = self.script("resolve-revision", "Validate replay input")
@@ -1910,7 +2445,8 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
                 self.assertIn("ref: ${{ github.sha }}\n          fetch-depth: 0", job)
                 self.assertNotIn("run: scripts/", job)
                 continue
-            self.assertRegex(job, r"(?m)^    needs: (?:resolve-revision|\[resolve-revision, coverage-measurement\])$",
+            self.assertRegex(job, r"(?m)^    needs: (?:resolve-revision|\[resolve-revision(?:, coverage-measurement)?"
+                                  r"(?:, changed-paths)?\])$",
                              "every source job must wait for validation")
             self.assertEqual(job.count("uses: actions/checkout@v7"), 1)
             self.assertIn("ref: ${{ needs.resolve-revision.outputs.checkout_sha }}", job,
@@ -1937,19 +2473,43 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         # Hosted R2 evidence showed literal name expressions when job-level
         # eligibility skipped a job. This prevents that source pattern; only a
         # hosted run can establish how GitHub renders the resulting check names.
+        # Two job-level predicates are admitted: the documentation lane, and
+        # on the coverage jobs the test scope beside it. A job they skip is
+        # reported under its unevaluated name, which is neither a required
+        # check name nor an ordinary job name, so the replay distinction holds;
+        # CI gate and the secret scan never carry them, and the gate accepts
+        # those skips only on a successful docs_only=true classification or,
+        # for the coverage jobs, a successful crate-list test scope
+        # (AggregateGateWorkflowTests). Gating the same jobs per step would
+        # still start every runner, the macOS one included.
+        docs_lane = ("needs.changed-paths.outputs.docs_only != 'true'"
+                     " && github.event.pull_request.draft != true")
+        scoped_lane = ("needs.changed-paths.outputs.docs_only != 'true'"
+                       " && (needs.changed-paths.outputs.test_scope == 'full'"
+                       " || needs.changed-paths.outputs.test_scope == '')"
+                       " && github.event_name != 'pull_request'"
+                       " && !startsWith(github.ref, 'refs/heads/integration/')")
         for name in [*self.CHECKOUT_NAMES, "ci-gate"]:
             with self.subTest(job=name):
                 job = indented_block(self.workflow, name, 2)
                 conditions = re.findall(r"(?m)^    if: (.+)$", job)
                 self.assertNotRegex(job, r"(?m)^    if: [>|]",
                                     "CHECK_NAME_ADMISSION: no folded eligibility predicate")
-                self.assertIn(conditions, [[], ["always()"]],
+                self.assertIn(conditions, [[], ["always()"], [docs_lane], [f"always() && {docs_lane}"],
+                                           [scoped_lane], [f"always() && {scoped_lane}"]],
                               "CHECK_NAME_ADMISSION: eligibility belongs on steps")
-                if name in {"dependency-review", "coverage-ratchet"}:
+                if name == "dependency-review":
                     self.assertEqual(
-                        conditions, ["always()"],
+                        conditions, [f"always() && {docs_lane}"],
                         "CHECK_NAME_ADMISSION: admit even after failed or skipped dependencies",
                     )
+                if name == "coverage-ratchet":
+                    self.assertEqual(
+                        conditions, [f"always() && {scoped_lane}"],
+                        "CHECK_NAME_ADMISSION: admit even after failed or skipped dependencies",
+                    )
+                if name in {"ci-gate", "secret-scan", "docs", "changed-paths", "resolve-revision"}:
+                    self.assertNotIn("needs.changed-paths.outputs.docs_only != 'true'", job)
 
     def test_dependency_review_work_is_pr_only_after_revision_validation(self):
         job = indented_block(self.workflow, "dependency-review", 2)
@@ -2062,6 +2622,2440 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         self.assertIn('range="${before}..${{ github.sha }}"', job)
         minio = indented_block(self.workflow, "minio-blob-compat", 2)
         self.assertIn("no comparable base SHA -- running the MinIO leg to be safe", minio)
+
+
+class PythonPathIsolationTests(unittest.TestCase):
+    def test_classifier_python_invocations_use_isolated_path_mode(self):
+        ci_job = indented_block(workflow_text("ci.yml"), "changed-paths", 2)
+        ci_scope = textwrap.dedent(ci_job.split("- name: Scope\n", 1)[1])
+        train_job = indented_block(indented_block(workflow_text("bench-track.yml"), "jobs", 0), "changes", 2)
+        train_step = train_job.split("- name: Scope the train\n", 1)[1]
+        train_scope = textwrap.dedent(
+            re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", train_step + "\n").group(1)
+        )
+
+        self.assertIn(
+            "timeout 60 python3 -P scripts/ci-test-scope.py \"$base\" \"$HEAD_SHA\" --paths-only",
+            ci_scope,
+        )
+        self.assertIn(
+            "timeout 300 python3 -P scripts/ci-test-scope.py \"$base\" \"$HEAD_SHA\" --kkernel \"$binary\"",
+            ci_scope,
+        )
+        self.assertIn(
+            "timeout 60 python3 -P scripts/ci-test-scope.py \"$base\" \"$HEAD_SHA\" --paths-only",
+            train_scope,
+        )
+        self.assertIn(
+            "timeout 300 python3 -P scripts/ci-test-scope.py \"$base\" \"$HEAD_SHA\" --kkernel \"$binary\"",
+            train_scope,
+        )
+        self.assertIn(
+            'python3 -P "$scanner" --published-markdown "$path" < /dev/null',
+            (REPO_ROOT / "scripts" / "ci-docs-only.sh").read_text(),
+        )
+        self.assertIn("python3 -P -c '", (REPO_ROOT / "scripts" / "ci.sh").read_text())
+
+
+class DocsOnlyClassifierTests(unittest.TestCase):
+    """scripts/ci-docs-only.sh on real temporary repositories, and the classifier job's event routing."""
+
+    CLASSIFIER = REPO_ROOT / "scripts" / "ci-docs-only.sh"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = pathlib.Path(self.temp.name) / "repo"
+        self.repo.mkdir()
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
+        self.env.update(NO_AUTO_MAINTENANCE)
+        self.git("init", "-q", "-b", "main")
+        self.write("src/lib.rs", "pub fn f() {}\n")
+        self.write("notes/guide.md", "# Guide\n")
+        self.write("notes/wire.md", "# Wire\n")
+        self.write("tests/wire.rs", 'const DOC: &str = include_str!("../notes/wire.md");\n')
+        self.write("docs/guide/counts.md", "# Counts\n")
+        self.write("docs/adr/ADR-001-guide.md", "# ADR\n")
+        self.base = self.commit("base")
+        self.remote = pathlib.Path(self.temp.name) / "origin.git"
+        self.git("init", "--bare", "-q", str(self.remote))
+        self.git("remote", "add", "origin", str(self.remote))
+        self.git("push", "-q", "origin", "main:refs/heads/main")
+
+    def git(self, *args):
+        return subprocess.run(
+            ["git", "-c", "core.hooksPath=" + os.devnull, *args], cwd=self.repo, env=self.env,
+            text=True, capture_output=True, timeout=10, check=True,
+        ).stdout.strip()
+
+    def write(self, path, text):
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+
+    def commit(self, message):
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def classify(self, base, head):
+        completed = subprocess.run(
+            ["bash", str(self.CLASSIFIER), base, head], cwd=self.repo, env=self.env,
+            text=True, capture_output=True, timeout=30, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(completed.stdout, ["true\n", "false\n"], completed.stderr)
+        return completed.stdout.strip(), completed.stderr
+
+    def test_markdown_no_other_file_names_takes_the_documentation_lane(self):
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, reasons = self.classify(self.base, self.commit("guide"))
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: notes/guide.md", reasons)
+
+    def test_fixture_commits_start_no_background_maintenance(self):
+        # Control: with maintenance kept in the foreground the same commit records the child, so the
+        # empty list for the fixture environment is an absence the trace could have shown.
+        foreground = {**self.env, "GIT_CONFIG_KEY_0": "maintenance.autoDetach"}
+        self.assertNotEqual(commit_maintenance_runs(self.repo, foreground, "control"), [])
+        self.assertEqual(commit_maintenance_runs(self.repo, self.env, "fixture"), [])
+
+    def test_markdown_named_by_code_runs_the_full_suite(self):
+        self.write("notes/wire.md", "# Wire\n\nChanged.\n")
+        verdict, reasons = self.classify(self.base, self.commit("wire"))
+        self.assertEqual(verdict, "false")
+        self.assertIn("notes/wire.md is named by a non-Markdown file", reasons)
+
+    def test_markdown_the_count_scanner_reads_runs_the_full_suite(self):
+        # No file names it, but the smoke tests check its verb and pack counts against the
+        # live registry, which only the full suite builds.
+        self.write("docs/guide/counts.md", "# Counts\n\nThe kg pack has twenty verbs.\n")
+        verdict, reasons = self.classify(self.base, self.commit("counts"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("docs/guide/counts.md carries verb or pack counts", reasons)
+
+    def test_an_adr_takes_the_documentation_lane(self):
+        self.write("docs/adr/ADR-001-guide.md", "# ADR\n\nAmended.\n")
+        verdict, reasons = self.classify(self.base, self.commit("adr"))
+        self.assertEqual(verdict, "true", reasons)
+
+    def shared_readme_base(self):
+        """An ADR index and a crate readme share the base name README.md; the crate's code names its own."""
+        self.write("docs/adr/README.md", "# ADR index\n")
+        self.write("crates/widget/README.md", "# Widget\n")
+        self.write("crates/widget/src/lib.rs", '#![doc = include_str!("../README.md")]\n')
+        self.write("crates/widget/Cargo.toml", '[package]\nname = "widget"\nreadme = "README.md"\n')
+        return self.commit("shared readme base")
+
+    def test_a_shared_base_name_named_only_by_other_directories_takes_the_documentation_lane(self):
+        base = self.shared_readme_base()
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-001\n")
+        verdict, reasons = self.classify(base, self.commit("index row"))
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: docs/adr/README.md", reasons)
+        # CONTROL: the crate's own readme, which its code names relatively, still runs the full suite.
+        self.write("crates/widget/README.md", "# Widget\n\nChanged.\n")
+        verdict, reasons = self.classify(base, self.commit("crate readme"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("crates/widget/README.md is named by a non-Markdown file in crates/widget", reasons)
+
+    def test_a_shared_base_name_reached_by_path_runs_the_full_suite(self):
+        cases = [
+            ("tools/index.py", 'INDEX = "docs/adr/README.md"\n', "named as adr/README.md"),
+            ("tools/index.py", 'INDEX = ROOT / "docs" / "adr" / "README.md"\n', "named as a joined adr and README.md"),
+            ("tools/index.py", "index = join('adr', 'README.md')\n", "named as a joined adr and README.md"),
+            ("docs/adr/index.json", '{"index": "README.md"}\n', "named by a non-Markdown file in docs/adr"),
+        ]
+        for reader, text, reason in cases:
+            with self.subTest(reader=reader, text=text):
+                base = self.shared_readme_base()
+                self.write(reader, text)
+                with_reader = self.commit("reader")
+                self.write("docs/adr/README.md", "# ADR index\n\n- ADR-002\n")
+                verdict, reasons = self.classify(with_reader, self.commit("index row"))
+                self.assertEqual(verdict, "false", reasons)
+                self.assertIn(f"docs/adr/README.md is {reason}", reasons)
+                self.git("rm", "-q", "-r", "--cached", "tools", "docs/adr/index.json", "--ignore-unmatch")
+                for leftover in ("tools/index.py", "docs/adr/index.json"):
+                    (self.repo / leftover).unlink(missing_ok=True)
+                self.commit("drop reader")
+
+    def test_a_symlink_inside_the_directory_of_a_shared_base_name_runs_the_full_suite(self):
+        base = self.shared_readme_base()
+        (self.repo / "docs/adr/INDEX.md").symlink_to("README.md")
+        with_link = self.commit("link")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-003\n")
+        verdict, reasons = self.classify(with_link, self.commit("index row"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("docs/adr/README.md is named by a symlink in docs/adr", reasons)
+
+    def test_the_classifier_naming_a_path_in_its_comments_takes_the_documentation_lane(self):
+        base = self.shared_readme_base()
+        comment = '# the parent directory and the name as one path ("adr/README.md")\n'
+        self.write("scripts/ci-docs-only.sh", comment)
+        with_classifier = self.commit("classifier")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-004\n")
+        verdict, reasons = self.classify(with_classifier, self.commit("index row"))
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: docs/adr/README.md", reasons)
+        # CONTROL: the same line in any other script still names the index.
+        self.git("checkout", "-q", "--detach", base)
+        self.write("scripts/other.sh", comment)
+        with_other = self.commit("other script")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-005\n")
+        verdict, reasons = self.classify(with_other, self.commit("index row"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("docs/adr/README.md is named as adr/README.md by a non-Markdown file", reasons)
+
+    def test_a_fixture_pair_exempts_its_reader_for_that_one_path_only(self):
+        base = self.shared_readme_base()
+        self.write("scripts/tests/test_ci_workflows.py",
+                   'self.write("docs/adr/README.md", "# ADR index\\n")\nself.write("notes/guide.md", "# Guide\\n")\n')
+        with_tests = self.commit("fixture tests")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-006\n")
+        verdict, reasons = self.classify(with_tests, self.commit("index row"))
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: docs/adr/README.md", reasons)
+        # CONTROL: the same file naming a path outside its pair still runs the full suite.
+        self.git("checkout", "-q", "--detach", with_tests)
+        self.write("notes/guide.md", "# Guide\n\nChanged.\n")
+        verdict, reasons = self.classify(with_tests, self.commit("guide"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("notes/guide.md is named by a non-Markdown file", reasons)
+        # CONTROL: the same fixture line in another test file is not exempt.
+        self.git("checkout", "-q", "--detach", base)
+        self.write("scripts/tests/test_other.py", 'self.write("docs/adr/README.md", "# ADR index\\n")\n')
+        with_other = self.commit("other tests")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-007\n")
+        verdict, reasons = self.classify(with_other, self.commit("index row"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("docs/adr/README.md is named as adr/README.md by a non-Markdown file", reasons)
+
+    def test_named_paths_are_judged_alone(self):
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        self.write("notes/wire.md", "# Wire\n\nChanged.\n")
+        head = self.commit("guide and wire")
+        def judge(*paths):
+            completed = subprocess.run(
+                ["bash", str(self.CLASSIFIER), self.base, head, *paths], cwd=self.repo, env=self.env,
+                text=True, capture_output=True, timeout=30, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return completed.stdout.strip(), completed.stderr
+        verdict, reasons = judge("notes/guide.md")
+        self.assertEqual(verdict, "true", reasons)
+        self.assertNotIn("notes/wire.md", reasons)
+        # CONTROL: the whole change, and the code-named file alone, still run the full suite.
+        self.assertEqual(judge()[0], "false")
+        verdict, reasons = judge("notes/wire.md")
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("notes/wire.md is named by a non-Markdown file", reasons)
+        # A path the change does not touch is refused rather than judged.
+        verdict, reasons = judge("docs/guide/counts.md")
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("docs/guide/counts.md is not a path changed between", reasons)
+
+    def test_a_failing_count_scanner_runs_the_full_suite(self):
+        # A copy of the classifier beside no scanner: the question cannot be answered, so the
+        # change takes the full suite rather than the documentation lane.
+        self.write("docs/adr/ADR-001-guide.md", "# ADR\n\nAmended.\n")
+        head = self.commit("adr")
+        (self.repo / "scripts").mkdir(exist_ok=True)
+        shutil.copy(self.CLASSIFIER, self.repo / "scripts" / "ci-docs-only.sh")
+        shutil.copy(REPO_ROOT / "scripts/ci-inert-docs-data.txt", self.repo / "scripts/ci-inert-docs-data.txt")
+        completed = subprocess.run(
+            ["bash", "scripts/ci-docs-only.sh", self.base, head], cwd=self.repo, env=self.env,
+            text=True, capture_output=True, timeout=30, check=False,
+        )
+        self.assertEqual((completed.returncode, completed.stdout), (0, "false\n"), completed.stderr)
+        self.assertIn("count scanner failed for docs/adr/ADR-001-guide.md", completed.stderr)
+
+    def test_scanner_cannot_truncate_unread_changed_paths(self):
+        self.write("README.md", "# Readme\n\nChanged.\n")
+        self.write("src/lib.rs", "pub fn f() {} // changed\n")
+        head = self.commit("readme and source")
+        scripts = self.repo / "scripts"
+        scripts.mkdir(exist_ok=True)
+        shutil.copy(self.CLASSIFIER, scripts / "ci-docs-only.sh")
+        shutil.copy(REPO_ROOT / "scripts" / "ci-inert-docs-data.txt", scripts / "ci-inert-docs-data.txt")
+        scanner = self.repo / "tests" / "documented_verb_counts.py"
+        scanner.parent.mkdir(exist_ok=True)
+        marker = scanner.with_name("list-truncated")
+        scanner.write_text(
+            "import os\n"
+            "from pathlib import Path\n"
+            "tmpdir = Path(os.environ['TMPDIR'])\n"
+            "for candidate in tmpdir.iterdir():\n"
+            "    try:\n"
+            "        contents = candidate.read_bytes()\n"
+            "    except OSError:\n"
+            "        continue\n"
+            "    if b'README.md\\0' in contents and b'src/lib.rs\\0' in contents:\n"
+            "        candidate.write_bytes(b'')\n"
+            "        Path(__file__).with_name('list-truncated').write_text(candidate.name)\n"
+            "        break\n"
+            "else:\n"
+            "    raise SystemExit('change list not found')\n"
+            "raise SystemExit(1)\n"
+        )
+        tmpdir = pathlib.Path(self.temp.name) / "tmp"
+        tmpdir.mkdir()
+        bin_dir = pathlib.Path(self.temp.name) / "bin"
+        bin_dir.mkdir()
+        bash = bin_dir / "bash"
+        bash.write_text('#!/bin/sh\nexec /bin/bash "$@"\n')
+        bash.chmod(0o755)
+        mktemp = bin_dir / "mktemp"
+        mktemp.write_text(
+            "#!/bin/bash\n"
+            "counter=0\n"
+            "if [[ -f \"$TMPDIR/counter\" ]]; then read -r counter < \"$TMPDIR/counter\"; fi\n"
+            "counter=$((counter + 1))\n"
+            "printf '%s\\n' \"$counter\" > \"$TMPDIR/counter\"\n"
+            "path=\"$TMPDIR/tmp.$counter\"\n"
+            ": > \"$path\"\n"
+            "printf '%s\\n' \"$path\"\n"
+        )
+        mktemp.chmod(0o755)
+        completed = subprocess.run(
+            ["bash", "scripts/ci-docs-only.sh", self.base, head], cwd=self.repo,
+            env={**self.env, "PATH": f"{bin_dir}:{os.environ['PATH']}", "TMPDIR": str(tmpdir)},
+            text=True, capture_output=True,
+            timeout=30, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(
+            marker.is_file(),
+            f"the scanner did not truncate the classifier's change list\n{completed.stdout}{completed.stderr}",
+        )
+        self.assertEqual(completed.stdout, "false\n", completed.stderr)
+        self.assertIn("not Markdown: src/lib.rs", completed.stderr)
+
+    def test_job_pull_request_that_edits_the_count_scanner_runs_full_suite(self):
+        head = self.merge_ref("tests/documented_verb_counts.py", "print('changed scanner')\n")
+        verdict, log = self.classify_job("pull_request", head)
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn(
+            f"{self.CLASSIFIER_CHANGED}: tests/documented_verb_counts.py\n", log
+        )
+
+    def test_job_pull_request_that_edits_the_inert_docs_data_runs_full_suite(self):
+        data = (REPO_ROOT / "scripts" / "ci-inert-docs-data.txt").read_text()
+        head = self.merge_ref("scripts/ci-inert-docs-data.txt", data + "# Changed.\n")
+        verdict, log = self.classify_job("pull_request", head)
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn(
+            f"{self.CLASSIFIER_CHANGED}: scripts/ci-inert-docs-data.txt\n", log
+        )
+
+    def test_code_that_starts_like_a_comment_still_names_markdown(self):
+        cases = [
+            ("src/attr.rs", '#![doc = include_str!("../notes/attr.md")]\n', "notes/attr.md"),
+            ("src/deref.rs", 'fn f(s: &mut &str) {\n    *s = include_str!("../notes/deref.md");\n}\n',
+             "notes/deref.md"),
+            ("scripts/build.sh", 'render \\\n    --input notes/flag.md\n', "notes/flag.md"),
+        ]
+        for code_path, code, markdown in cases:
+            with self.subTest(code_path=code_path):
+                self.write(markdown, "# Notes\n")
+                self.write(code_path, code)
+                base = self.commit("base " + code_path)
+                self.write(markdown, "# Notes\n\nChanged.\n")
+                verdict, reasons = self.classify(base, self.commit("change " + markdown))
+                self.assertEqual(verdict, "false", reasons)
+                self.assertIn(f"{markdown} is named by a non-Markdown file", reasons)
+
+    def test_doc_comments_are_code(self):
+        # rustdoc compiles and runs the examples in ///, //!, /** and /*! comments, so a Markdown file they
+        # name may be read by a doctest.
+        cases = [
+            ("src/outer.rs", '/// ```\n/// let s = include_str!("../notes/outer.md");\n/// ```\nfn o() {}\n',
+             "notes/outer.md"),
+            ("src/inner.rs", '//! let s = include_str!("../notes/inner.md");\n', "notes/inner.md"),
+            ("src/block.rs", '/** let s = include_str!("../notes/block.md"); */\nfn b() {}\n', "notes/block.md"),
+            ("src/iblock.rs", '/*! let s = include_str!("../notes/iblock.md"); */\n', "notes/iblock.md"),
+        ]
+        for code_path, code, markdown in cases:
+            with self.subTest(code_path=code_path):
+                self.write(markdown, "# Notes\n")
+                self.write(code_path, code)
+                base = self.commit("base " + code_path)
+                self.write(markdown, "# Notes\n\nChanged.\n")
+                verdict, reasons = self.classify(base, self.commit("change " + markdown))
+                self.assertEqual(verdict, "false", reasons)
+                self.assertIn(f"{markdown} is named by a non-Markdown file", reasons)
+
+    def test_a_dot_named_markdown_file_follows_the_same_rules(self):
+        # The count scanner's globs and its path predicate agree on dot-named paths, so a dot-named file
+        # needs no rule of its own: unnamed it takes the lane, named by code it runs the full suite.
+        self.write("notes/.hidden.md", "# Hidden\n")
+        base = self.commit("hidden")
+        self.write("notes/.hidden.md", "# Hidden\n\nChanged.\n")
+        verdict, reasons = self.classify(base, self.commit("change hidden"))
+        self.assertEqual(verdict, "true", reasons)
+        self.write("tests/hidden.rs", 'const H: &str = include_str!("../notes/.hidden.md");\n')
+        base = self.commit("name hidden")
+        self.write("notes/.hidden.md", "# Hidden\n\nAgain.\n")
+        verdict, reasons = self.classify(base, self.commit("change hidden again"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("notes/.hidden.md is named by a non-Markdown file", reasons)
+
+    def test_the_scanner_predicate_and_its_globs_agree_on_dot_named_paths(self):
+        sys.path.insert(0, str(REPO_ROOT / "tests"))
+        try:
+            import documented_verb_counts as scanner
+        finally:
+            sys.path.remove(str(REPO_ROOT / "tests"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            paths = ["docs/.hidden.md", "docs/.d/a.md", "marketplace/.m.md", "scripts/.s.md"]
+            for rel in paths:
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text("# x\n")
+            globbed = {p.relative_to(root).as_posix() for g in scanner.PUBLISHED_GLOBS for p in root.glob(g)}
+            for rel in paths:
+                with self.subTest(path=rel):
+                    self.assertTrue(scanner.is_published_markdown(rel))
+                    self.assertIn(rel, globbed)
+
+    def test_a_name_on_a_line_that_starts_like_a_comment_runs_the_full_suite(self):
+        # Plain comments with each marker, then lines that only look like comments: code after a closed
+        # /* */, a raw string line, a Python string line and a continued shell argument. A line read on its
+        # own cannot tell these apart, so every one of them counts.
+        cases = [
+            ("tools/check.py", "# see notes/hash.md\nprint(1)\n", "notes/hash.md"),
+            ("web/star.js", "/*\n * see notes/star.md\n */\nlet s = 1;\n", "notes/star.md"),
+            ("src/line.rs", "// see notes/line.md\nfn l() {}\n", "notes/line.md"),
+            ("src/open.rs", "/* see notes/open.md */\nfn p() {}\n", "notes/open.md"),
+            ("sql/q.sql", "-- see notes/dash.md\nSELECT 1;\n", "notes/dash.md"),
+            ("web/page.html", "<!-- see notes/html.md -->\n<p></p>\n", "notes/html.md"),
+            ("src/inline.rs", '/* a */ const D: &str = include_str!("../notes/inline.md");\n', "notes/inline.md"),
+            ("src/raw.rs", 'const T: &str = r#"\n// notes/raw.md\n"#;\n', "notes/raw.md"),
+            ("tools/doc.py", 'DOCS = """\n# notes/pystr.md\n"""\n', "notes/pystr.md"),
+            ("scripts/run.sh", "render \\\n    -- notes/dashdash.md\n", "notes/dashdash.md"),
+        ]
+        for code_path, code, markdown in cases:
+            with self.subTest(code_path=code_path):
+                self.write(markdown, "# Notes\n")
+                self.write(code_path, code)
+                base = self.commit("base " + code_path)
+                self.write(markdown, "# Notes\n\nChanged.\n")
+                verdict, reasons = self.classify(base, self.commit("change " + markdown))
+                self.assertEqual(verdict, "false", reasons)
+                self.assertIn(f"{markdown} is named by a non-Markdown file", reasons)
+
+    def test_a_binary_file_that_names_the_markdown_runs_the_full_suite(self):
+        fixture = self.repo / "fixtures" / "guide.bin"
+        fixture.parent.mkdir(parents=True, exist_ok=True)
+        fixture.write_bytes(b"\x00\x01notes/guide.md\x00")
+        base = self.commit("binary fixture")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, reasons = self.classify(base, self.commit("guide"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("notes/guide.md is named by a non-Markdown file", reasons)
+
+    def test_a_symlink_whose_target_names_the_markdown_runs_the_full_suite(self):
+        link = self.repo / "fixtures" / "guide.json"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to("../notes/guide.md")
+        base = self.commit("symlink")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, reasons = self.classify(base, self.commit("guide"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("notes/guide.md is named by a symlink's target", reasons)
+
+    def test_a_symlink_to_another_file_leaves_the_documentation_lane(self):
+        link = self.repo / "fixtures" / "lib.rs"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to("../src/lib.rs")
+        base = self.commit("symlink")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, reasons = self.classify(base, self.commit("guide"))
+        self.assertEqual(verdict, "true", reasons)
+
+    def test_any_change_while_the_tree_has_a_submodule_runs_the_full_suite(self):
+        # The gitlink has no checkout here, so both commits stage by path: add -A would record its removal.
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{self.base},vendor/sub")
+        self.git("commit", "-q", "-m", "submodule")
+        base = self.git("rev-parse", "HEAD")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        self.git("add", "notes/guide.md")
+        self.git("commit", "-q", "-m", "guide")
+        verdict, reasons = self.classify(base, self.git("rev-parse", "HEAD"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("has a submodule, whose files are not searched", reasons)
+
+    def test_any_non_markdown_path_runs_the_full_suite(self):
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        self.write("src/lib.rs", "pub fn g() {}\n")
+        verdict, reasons = self.classify(self.base, self.commit("mixed"))
+        self.assertEqual(verdict, "false")
+        self.assertIn("not Markdown: src/lib.rs", reasons)
+
+    def test_a_source_file_renamed_to_markdown_runs_the_full_suite(self):
+        self.git("mv", "tests/wire.rs", "tests/wire-notes.md")
+        verdict, reasons = self.classify(self.base, self.commit("rename"))
+        self.assertEqual(verdict, "false")
+        self.assertIn("not Markdown: tests/wire.rs", reasons)
+
+    def test_deleting_an_unnamed_markdown_file_takes_the_documentation_lane(self):
+        self.git("rm", "-q", "notes/guide.md")
+        verdict, reasons = self.classify(self.base, self.commit("delete"))
+        self.assertEqual(verdict, "true", reasons)
+
+    def test_no_change_and_an_unknown_revision_run_the_full_suite(self):
+        verdict, reasons = self.classify(self.base, self.commit("empty"))
+        self.assertEqual(verdict, "false")
+        self.assertIn("no changed paths", reasons)
+        verdict, reasons = self.classify("0" * 40, self.base)
+        self.assertEqual(verdict, "false")
+        self.assertIn("git diff", reasons)
+
+    def test_many_code_references_are_still_found(self):
+        # Many matching lines make an early-exiting grep -q close its input while the
+        # writer is still writing; read through a pipe under pipefail, that would report
+        # "not named", the unsafe direction.
+        self.write("src/big.rs", 'const G: &str = "notes/guide.md";\n' * 20000)
+        base = self.commit("big")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, reasons = self.classify(base, self.commit("guide"))
+        self.assertEqual(verdict, "false", reasons)
+
+    def classify_job(self, event_name, head_sha, ref="refs/heads/main", gh_script=None, head_ref=None,
+                     head_repository=None, classifier=None, default_branch="main"):
+        """Runs the Classify step and returns its docs_only line. head_ref and head_repository are left
+        unset unless given, as on a push. classifier, when given, is the text of the checked-out
+        scripts/ci-docs-only.sh in place of this repository's own."""
+        workflow = workflow_text("ci.yml")
+        job = indented_block(workflow, "changed-paths", 2)
+        step = job.split("- name: Classify\n", 1)[1]
+        match = re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", step + "\n")
+        self.assertIsNotNone(match)
+        script = textwrap.dedent(match.group(1))
+        (self.repo / "scripts").mkdir(exist_ok=True)
+        if classifier is None:
+            shutil.copy(self.CLASSIFIER, self.repo / "scripts" / "ci-docs-only.sh")
+        else:
+            self.write("scripts/ci-docs-only.sh", classifier)
+        shutil.copy(REPO_ROOT / "scripts/ci-inert-docs-data.txt", self.repo / "scripts/ci-inert-docs-data.txt")
+        (self.repo / "tests").mkdir(exist_ok=True)
+        shutil.copy(REPO_ROOT / "tests" / "documented_verb_counts.py",
+                    self.repo / "tests" / "documented_verb_counts.py")
+        bin_dir = pathlib.Path(self.temp.name) / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        if gh_script is not None:
+            gh = bin_dir / "gh"
+            gh.write_text("#!/bin/bash\n" + gh_script)
+            gh.chmod(0o755)
+        output = pathlib.Path(self.temp.name) / "output"
+        output.write_text("")
+        pull = {key: value for key, value in (("HEAD_REF", head_ref), ("HEAD_REPOSITORY", head_repository))
+                if value is not None}
+        completed = subprocess.run(
+            ["bash", "-e", "-c", script], cwd=self.repo, text=True, capture_output=True, timeout=30,
+            env={**self.env, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(output),
+                 "EVENT_NAME": event_name, "REF": ref, "HEAD_SHA": head_sha,
+                 "REPOSITORY": "o/r", "GH_TOKEN": "x", "DEFAULT_BRANCH": default_branch, **pull},
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        lines = output.read_text().splitlines()
+        # A push that found a fully tested base also records it, for the Scope step, before docs_only.
+        self.assertIn([line.split("=", 1)[0] for line in lines], (["docs_only"], ["base", "docs_only"]), lines)
+        self.outputs = dict(line.split("=", 1) for line in lines)
+        return lines[-1], completed.stdout + completed.stderr
+
+    def merge_ref(self, path, text):
+        self.git("checkout", "-q", "-b", "topic")
+        self.write(path, text)
+        topic = self.commit("topic")
+        self.git("checkout", "-q", "main")
+        self.write("other.md", "# Other\n")
+        self.commit("main moved")
+        self.git("merge", "-q", "--no-ff", "-m", "merge", topic)
+        return self.git("rev-parse", "HEAD")
+
+    def stacked_merge_ref(self):
+        self.git("checkout", "-q", "-b", "parent")
+        self.write("scripts/ci-docs-only.sh", self.LENIENT_CLASSIFIER)
+        self.commit("parent changes the documentation classifier")
+        self.git("checkout", "-q", "-b", "child")
+        self.write("src/lib.rs", "pub fn f() { let _ = 1; }\n")
+        child = self.commit("child changes Rust")
+        self.git("checkout", "-q", "main")
+        self.write("default-branch.md", "# Default branch advanced\n")
+        self.commit("default branch advances")
+        self.git("push", "-q", "origin", "main:refs/heads/main")
+        self.git("checkout", "-q", "parent")
+        self.git("merge", "-q", "--no-ff", "-m", "merge stacked child", child)
+        head = self.git("rev-parse", "HEAD")
+        self.assertNotEqual(self.git("merge-base", head, "main"), self.git("rev-parse", "main"))
+        return head
+
+    def test_job_pull_request_compares_the_merge_ref_with_its_base_parent(self):
+        head = self.merge_ref("notes/guide.md", "# Guide\n\nMore.\n")
+        self.assertEqual(self.classify_job("pull_request", head)[0], "docs_only=true")
+
+    def test_job_pull_request_with_code_runs_the_full_suite(self):
+        head = self.merge_ref("src/lib.rs", "pub fn h() {}\n")
+        self.assertEqual(self.classify_job("pull_request", head)[0], "docs_only=false")
+
+    def test_stacked_pull_request_compares_classifiers_with_the_default_branch(self):
+        head = self.stacked_merge_ref()
+        verdict, log = self.classify_job(
+            "pull_request", head, classifier=self.LENIENT_CLASSIFIER
+        )
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn(
+            f"{self.CLASSIFIER_CHANGED}: scripts/ci-docs-only.sh\n", log
+        )
+
+    def test_pull_request_without_a_fetchable_default_branch_runs_full_suite(self):
+        head = self.merge_ref("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, log = self.classify_job("pull_request", head, default_branch="missing")
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn("the default branch could not be fetched for classifier comparison", log)
+
+    # A classifier that answers "documentation only" for every change, as a change could carry.
+    LENIENT_CLASSIFIER = "#!/bin/bash\necho true\n"
+    CLASSIFIER_CHANGED = "full suite: the change edits a path classifier"
+
+    def test_job_pull_request_that_edits_the_docs_classifier_runs_the_full_suite(self):
+        head = self.merge_ref("scripts/ci-docs-only.sh", self.LENIENT_CLASSIFIER)
+        verdict, log = self.classify_job("pull_request", head, classifier=self.LENIENT_CLASSIFIER)
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn(f"{self.CLASSIFIER_CHANGED}: scripts/ci-docs-only.sh\n", log)
+
+    def test_job_pull_request_that_edits_the_scope_script_reports_a_classifier_change(self):
+        head = self.merge_ref("scripts/ci-test-scope.py", "print('map')\n")
+        verdict, log = self.classify_job("pull_request", head)
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertIn(f"{self.CLASSIFIER_CHANGED}: scripts/ci-test-scope.py\n", log)
+
+    def test_job_pull_request_with_only_documentation_does_not_report_a_classifier_change(self):
+        head = self.merge_ref("notes/guide.md", "# Guide\n\nMore.\n")
+        verdict, log = self.classify_job("pull_request", head)
+        self.assertEqual(verdict, "docs_only=true", log)
+        self.assertNotIn(self.CLASSIFIER_CHANGED, log)
+
+    def test_job_integration_push_that_edits_a_classifier_runs_the_full_suite(self):
+        self.write("scripts/ci-docs-only.sh", self.LENIENT_CLASSIFIER)
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("a lenient classifier beside documentation")
+        verdict, log = self.classify_job("push", head, ref="refs/heads/integration/train-1",
+                                         gh_script=self.gh_listing(self.base, "success"),
+                                         classifier=self.LENIENT_CLASSIFIER)
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertEqual(self.outputs.get("base"), self.base, log)
+        self.assertIn(f"{self.CLASSIFIER_CHANGED}: scripts/ci-docs-only.sh\n", log)
+
+    def test_job_own_codex_pull_request_with_crate_source_is_not_a_lane(self):
+        # The integration-only lane is retired (ADR-205 D7): the branch name changes nothing.
+        head = self.merge_ref("crates/k/src/lib.rs", "pub fn h() {}\n")
+        verdict, log = self.classify_job("pull_request", head, head_ref="codex/change", head_repository="o/r")
+        self.assertEqual(verdict, "docs_only=false", log)
+
+    def gh_listing(self, run_sha, shard_conclusion, conclusion="success", record="test-scope-full"):
+        return self.gh_runs((101, run_sha, conclusion, shard_conclusion, record))
+
+    def gh_runs(self, *runs):
+        """A fake gh answering the tested-base lookup: each run is (id, head sha, run conclusion, Linux shard 1
+        conclusion, recorded scope artifact name or None), newest first, after the step's own jq."""
+        listing = "\\n".join(f"{run_id} {sha} {conclusion}" for run_id, sha, conclusion, _, _ in runs)
+        cases = [f'  */workflows/ci.yml/runs*) printf "{listing}\\n" ;;\n']
+        for run_id, _, _, shard, record in runs:
+            cases.append(f'  */runs/{run_id}/jobs*) echo {1 if shard == "success" else 0} ;;\n')
+            cases.append(f'  */runs/{run_id}/artifacts*) echo {1 if record == "test-scope-full" else 0} ;;\n')
+        return 'case "$2" in\n' + "".join(cases) + '  *) exit 1 ;;\nesac\n'
+
+    def test_job_main_push_compares_with_the_newest_fully_tested_main_commit(self):
+        self.write("src/lib.rs", "pub fn untested() {}\n")
+        untested = self.commit("code that replaced a waiting run")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation")
+        # Baseline before the untested code commit: the code is in the range, so the full suite runs.
+        verdict, log = self.classify_job("push", head, gh_script=self.gh_listing(self.base, "success"))
+        self.assertEqual(verdict, "docs_only=false", log)
+        # Baseline at the untested commit itself: only Markdown since then.
+        verdict, log = self.classify_job("push", head, gh_script=self.gh_listing(untested, "success"))
+        self.assertEqual(verdict, "docs_only=true", log)
+        self.assertIn(f"Compared with {untested}", log)
+
+    def test_job_main_push_fetches_main_history_into_a_one_commit_checkout(self):
+        self.write("src/lib.rs", "pub fn untested() {}\n")
+        untested = self.commit("code that replaced a waiting run")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation")
+        # The runner checks out the pushed commit alone from a remote that holds main's history.
+        remote = pathlib.Path(self.temp.name) / "remote.git"
+        self.git("clone", "-q", "--bare", str(self.repo), str(remote))
+        self.git("-C", str(remote), "config", "uploadpack.allowFilter", "true")
+        checkout = pathlib.Path(self.temp.name) / "checkout"
+        self.git("clone", "-q", "--depth", "1", "--no-tags", remote.as_uri(), str(checkout))
+        self.repo = checkout
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "true")
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        verdict, log = self.classify_job("push", head, gh_script=self.gh_listing(untested, "success"))
+        self.assertEqual(verdict, "docs_only=true", log)
+        self.assertIn(f"Compared with {untested}", log)
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "false")
+
+    def test_job_main_push_without_a_full_run_or_with_a_failing_api_runs_the_full_suite(self):
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation")
+        for gh_script in (self.gh_listing(self.base, "skipped"), "exit 1\n"):
+            with self.subTest(gh_script=gh_script):
+                verdict, log = self.classify_job("push", head, gh_script=gh_script)
+                self.assertEqual(verdict, "docs_only=false", log)
+                self.assertIn("no main commit with a completed full run", log)
+
+    def test_job_other_events_run_the_full_suite(self):
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation")
+        for event_name, ref in (("schedule", "refs/heads/main"), ("workflow_dispatch", "refs/heads/main"),
+                                ("push", "refs/heads/release/v1")):
+            with self.subTest(event_name=event_name, ref=ref):
+                self.assertEqual(self.classify_job(event_name, head, ref=ref)[0], "docs_only=false")
+                self.assertNotIn("base", self.outputs)
+
+    def test_job_integration_push_compares_with_the_newest_fully_tested_main_commit(self):
+        train = "refs/heads/integration/train-1"
+        self.write("src/lib.rs", "pub fn untested() {}\n")
+        untested = self.commit("code that a train carries")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation in the same train")
+        verdict, log = self.classify_job("push", head, ref=train, gh_script=self.gh_listing(self.base, "success"))
+        self.assertEqual(verdict, "docs_only=false", log)
+        self.assertEqual(self.outputs.get("base"), self.base, log)
+        verdict, log = self.classify_job("push", head, ref=train, gh_script=self.gh_listing(untested, "success"))
+        self.assertEqual(verdict, "docs_only=true", log)
+        self.assertEqual(self.outputs.get("base"), untested, log)
+        self.assertIn(f"Compared with {untested}", log)
+
+    def test_job_integration_push_fetches_main_and_its_own_branch_into_a_one_commit_checkout(self):
+        self.write("src/lib.rs", "pub fn tested() {}\n")
+        tested = self.commit("main's newest fully tested commit")
+        self.git("checkout", "-q", "-b", "integration/train-1")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("a documentation-only train")
+        self.git("checkout", "-q", "main")
+        remote = pathlib.Path(self.temp.name) / "remote.git"
+        self.git("clone", "-q", "--bare", str(self.repo), str(remote))
+        self.git("-C", str(remote), "config", "uploadpack.allowFilter", "true")
+        checkout = pathlib.Path(self.temp.name) / "checkout"
+        self.git("clone", "-q", "--depth", "1", "--no-tags", "-b", "integration/train-1", remote.as_uri(),
+                 str(checkout))
+        self.repo = checkout
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "true")
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        verdict, log = self.classify_job("push", head, ref="refs/heads/integration/train-1",
+                                         gh_script=self.gh_listing(tested, "success"))
+        self.assertEqual(verdict, "docs_only=true", log)
+        self.assertEqual(self.outputs.get("base"), tested, log)
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "false")
+
+    def test_job_checks_out_integration_pushes(self):
+        job = indented_block(workflow_text("ci.yml"), "changed-paths", 2)
+        checkout = job.split("- uses: actions/checkout@", 1)[1].split("\n      - ", 1)[0]
+        condition = re.search(r"(?m)^        if: (.+)$", checkout).group(1)
+        self.assertIn("startsWith(github.ref, 'refs/heads/integration/')", condition)
+        self.assertIn("github.ref == 'refs/heads/main'", condition)
+
+    def test_job_tested_base_skips_a_failed_run_an_unrecorded_run_and_a_scoped_run(self):
+        # ADR-205 Amendment 1, verify-by 1: the newest candidate is unusable, an older one is the base. If the
+        # newest were used, only Markdown would follow it and the push would take the documentation lane.
+        self.write("src/lib.rs", "pub fn untested() {}\n")
+        untested = self.commit("code that a train carries")
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation")
+        for label, newest in (("run concluded with a failure", (102, untested, "failure", "success", "test-scope-full")),
+                              ("scope recorded as scoped", (102, untested, "success", "success", "test-scope-scoped")),
+                              ("no scope record", (102, untested, "success", "success", None)),
+                              ("shard 1 failed", (102, untested, "success", "failure", "test-scope-full"))):
+            for ref in ("refs/heads/integration/train-1", "refs/heads/main"):
+                with self.subTest(label=label, ref=ref):
+                    gh = self.gh_runs(newest, (101, self.base, "success", "success", "test-scope-full"))
+                    verdict, log = self.classify_job("push", head, ref=ref, gh_script=gh)
+                    self.assertEqual(verdict, "docs_only=false", log)
+                    self.assertEqual(self.outputs.get("base"), self.base, log)
+        # control: the same newest candidate, usable, is the base
+        gh = self.gh_runs((102, untested, "success", "success", "test-scope-full"),
+                          (101, self.base, "success", "success", "test-scope-full"))
+        verdict, log = self.classify_job("push", head, ref="refs/heads/integration/train-1", gh_script=gh)
+        self.assertEqual(verdict, "docs_only=true", log)
+        self.assertEqual(self.outputs.get("base"), untested, log)
+
+    def record_step(self, event_name, docs_only, test_scope):
+        """Runs the Record step and returns (recorded, the record file's text)."""
+        job = indented_block(workflow_text("ci.yml"), "changed-paths", 2)
+        step = job.split("- name: Record the test scope\n", 1)[1].split("\n      - name: ", 1)[0]
+        self.assertIn("if: github.event_name != 'pull_request'", step)
+        script = textwrap.dedent(re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", step + "\n").group(1))
+        temp = pathlib.Path(self.temp.name) / f"record-{docs_only}-{test_scope}"
+        temp.mkdir()
+        output = temp / "output"
+        output.write_text("")
+        env = {**self.env, "RUNNER_TEMP": str(temp), "GITHUB_OUTPUT": str(output), "DOCS_ONLY": docs_only}
+        # The CI job exports its own TEST_SCOPE, so the unset arm removes it rather than inheriting it.
+        env.pop("TEST_SCOPE", None)
+        if test_scope is not None:
+            env["TEST_SCOPE"] = test_scope
+        subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True, text=True, timeout=30)
+        lines = output.read_text().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        return lines[0].split("=", 1)[1], (temp / "test-scope" / "test_scope").read_text()
+
+    def test_record_step_names_the_scope_the_suites_ran(self):
+        for docs_only, test_scope, recorded, text in (("false", "full", "full", "full\n"),
+                                                      ("false", "", "full", "full\n"),
+                                                      ("false", None, "full", "full\n"),
+                                                      ("false", "j k", "scoped", "j k\n"),
+                                                      ("true", None, "docs", "docs\n"),
+                                                      ("true", "", "docs", "docs\n")):
+            with self.subTest(docs_only=docs_only, test_scope=test_scope):
+                self.assertEqual(self.record_step("push", docs_only, test_scope), (recorded, text))
+        job = indented_block(workflow_text("ci.yml"), "changed-paths", 2)
+        upload = job.split("- name: Upload the test scope record\n", 1)[1].split("\n      - name: ", 1)[0]
+        self.assertIn("name: test-scope-${{ steps.record.outputs.recorded }}", upload)
+        self.assertIn("if: github.event_name != 'pull_request'", upload)
+        self.assertIn("continue-on-error: true", upload)
+        # the lookup reads exactly the name a full run records
+        classify = job.split("- name: Classify\n", 1)[1].split("\n      - name: ", 1)[0]
+        self.assertIn('select(.name == "test-scope-full")', classify)
+
+    def test_job_integration_push_without_a_full_run_runs_the_full_suite(self):
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        head = self.commit("documentation")
+        for gh_script in (self.gh_listing(self.base, "skipped"), "exit 1\n"):
+            with self.subTest(gh_script=gh_script):
+                verdict, log = self.classify_job("push", head, ref="refs/heads/integration/train-1",
+                                                 gh_script=gh_script)
+                self.assertEqual(verdict, "docs_only=false", log)
+                self.assertNotIn("base", self.outputs)
+                self.assertIn("no main commit with a completed full run", log)
+
+
+FAKE_KKERNEL = r'''#!{python}
+"""A stand-in for `kkernel exec --strict <ops>` answering the three code-map verbs from graph.json."""
+import json, pathlib, re, sys
+
+here = pathlib.Path(__file__).resolve().parent
+spec = json.loads((here / "graph.json").read_text())
+ops = sys.argv[-1]
+with open(here / "calls.log", "a") as log:
+    log.write(ops + "\n")
+ingested = re.search(r'code\.ingest\(path="([^"]*)"', ops)
+if ingested:
+    # what the binary was handed: every manifest under the ingested directory, as it read them
+    root = pathlib.Path(ingested.group(1))
+    (here / "ingested.json").write_text(json.dumps({"path": str(root), "manifests": {
+        str(p.relative_to(root)): p.read_text() for p in sorted(root.rglob("Cargo.toml"))}}))
+if spec.get("exit"):
+    print(json.dumps({"results": [{"ok": False, "error": {"message": "refused"}}]}))
+    sys.exit(spec["exit"])
+results = []
+deps_batch = False
+for verb, args in re.findall(r"code\.(\w+)\(([^)]*)\)", ops):
+    if verb == "ingest":
+        report = spec.get("ingest", {"projects_created": len(spec["projects"]), "edges_created": len(spec["edges"])})
+        results.append({"ok": True, "result": report})
+    elif verb == "list":
+        cursor = re.search(r'cursor="([^"]*)"', args)
+        pages = spec.get("pages") or [sorted(spec["projects"])]
+        index = int(cursor.group(1)) if cursor else 0
+        items = [{"id": spec["projects"][name], "kind": spec.get("list_kind", "project"), "name": name,
+                  "project_id": spec["projects"][name]} for name in pages[index]]
+        following = str(index + 1) if index + 1 < len(pages) else None
+        results.append({"ok": True, "result": {"items": items, "next_cursor": following}})
+    elif verb == "deps":
+        deps_batch = True
+        ident = re.search(r'id="([^"]*)"', args).group(1)
+        edges = [{"source": source, "target": target} for source, target in spec["edges"] if target == ident]
+        kinds = spec.get("kinds", {})
+        nodes = [{"id": node, "kind": kinds.get(node, "project")}
+                 for node in sorted({ident} | {edge["source"] for edge in edges})]
+        graph = {"map": "workspace", "root": ident, "nodes": nodes,
+                 "edges": edges, "truncated": spec.get("truncated", False)}
+        if spec.get("deps_missing_nodes"):
+            del graph["nodes"]
+        if spec.get("deps_missing_edges"):
+            del graph["edges"]
+        if spec.get("deps_nodes_not_list"):
+            graph["nodes"] = {}
+        if spec.get("deps_wrong_root"):
+            graph["root"] = "p-unrequested"
+        if spec.get("deps_wrong_map"):
+            graph["map"] = "another-map"
+        if spec.get("deps_node_missing_kind"):
+            nodes[0].pop("kind")
+        if spec.get("deps_edge_missing_target"):
+            edges[0].pop("target")
+        if spec.get("deps_duplicate_node"):
+            nodes.append(dict(nodes[0]))
+        # an edge kept while the node it names is dropped from the reply
+        if spec.get("deps_omit_source_node") and edges:
+            nodes[:] = [node for node in nodes if node["id"] != edges[0]["source"]]
+        if spec.get("deps_omit_root_node"):
+            nodes[:] = [node for node in nodes if node["id"] != ident]
+        if spec.get("deps_unknown_kind"):
+            nodes[0]["kind"] = "Project"
+        results.append({"ok": True, "result": graph})
+    else:
+        results.append({"ok": False, "error": {"message": "unknown verb " + verb}})
+if spec.get("short_batch") and deps_batch:
+    results = results[:-1]
+if spec.get("results_not_list") and deps_batch:
+    results = {str(index): outcome for index, outcome in enumerate(results)}
+print(json.dumps({"results": results}))
+'''
+
+
+class ScopeFixture(unittest.TestCase):
+    """A temporary repository with three crates and a nested one, and a fake kkernel that serves its map."""
+
+    TREE = {
+        "crates/Cargo.toml": "[workspace]\nmembers = [\"k\", \"k/sub\", \"j\", \"m\"]\n",
+        "crates/Cargo.lock": "version = 4\n",
+        "crates/k/Cargo.toml": "[package]\nname = \"k\"\n",
+        "crates/k/src/lib.rs": "pub fn f() {}\n",
+        "crates/k/build.rs": "fn main() {}\n",
+        "crates/k/tests/t.rs": "#[test]\nfn t() {}\n",
+        "crates/k/README.md": "# k\n",
+        "crates/k/Cargo.lock": "version = 4\n",
+        "crates/k/clippy.toml": "msrv = \"1.85\"\n",
+        "crates/k/sub/Cargo.toml": "[package]\nname = \"ksub\"\n",
+        "crates/k/sub/src/lib.rs": "pub fn s() {}\n",
+        "crates/j/Cargo.toml": "[package]\nname = \"j\"\n",
+        "crates/j/src/lib.rs": "pub fn g() {}\n",
+        "crates/m/Cargo.toml": "[package]\nname = \"m\"\n",
+        "crates/m/src/lib.rs": "pub fn h() {}\n",
+        # m compiles a file of k, and j reads a file of m, by naming the path; neither is a dependency edge.
+        "crates/k/src/shared.rs": "pub fn shared() {}\n",
+        "crates/m/tests/reader.rs": "#[path = \"../../k/src/shared.rs\"]\nmod shared;\n",
+        "crates/m/src/table.txt": "rows\n",
+        "crates/j/src/census.rs": "pub const S: &str = include_str!(\"../../m/src/table.txt\");\n",
+        # an include inside its own crate is not a foreign reader
+        "crates/k/tests/own.rs": "#[path = \"../src/lib.rs\"]\nmod own;\n",
+        # j reads files of m through each argument form the scan resolves: a literal on the line after the opener,
+        # a raw string, concat! led by the manifest directory, and a literal prefix with a computed tail (a partial
+        # file name, so only the prefix rule can match it).
+        "crates/m/src/multi.txt": "rows\n",
+        "crates/j/src/multi.rs": "pub const M: &str = include_str!(\n    \"../../m/src/multi.txt\"\n);\n",
+        "crates/m/src/raw.txt": "rows\n",
+        "crates/j/src/raw.rs": "pub const R: &str = include_str!(r#\"../../m/src/raw.txt\"#);\n",
+        "crates/m/src/env.txt": "rows\n",
+        "crates/j/tests/env.rs": "const E: &str = include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../m/src/env.txt\"));\n",
+        "crates/m/sql/q.sql": "select 1;\n",
+        "crates/j/src/prefix.rs": "macro_rules! q {\n    ($n:literal) => {\n        include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../m/sql/q\", $n, \".sql\"))\n    };\n}\n",
+        # the same names inside a string literal and comments are not include sites
+        "crates/m/src/ghost.txt": "rows\n",
+        "crates/k/src/fixture.rs": "pub const F: &str = \"include_str!(\\\"../../m/src/ghost.txt\\\")\";\n// include!(\"../../m/src/ghost.txt\")\n/* #[path = \"../../m/src/ghost.txt\"] */\n",
+        "crates/.cargo/config.toml": "[build]\n",
+        "crates/.config/nextest.toml": "[profile.default]\n",
+        "crates/rust-toolchain.toml": "[toolchain]\n",
+        "crates/deny.toml": "[bans]\n",
+        "crates/rustfmt.toml": "edition = \"2021\"\n",
+        "notes/k-notes.md": "# Notes\n",
+        "docs/diagram.svg": "<svg/>\n",
+        ".github/workflows/ci.yml": "name: CI\n",
+        ".github/actions/a/action.yml": "name: a\n",
+        "scripts/ci.sh": "echo ci\n",
+        "python/pkg/__init__.py": "\n",
+        "tests/contract.py": "\n",
+        "benches/b.rs": "\n",
+        "apps/a/index.ts": "\n",
+        "Makefile": "ci:\n",
+        "rust-toolchain.toml": "[toolchain]\n",
+    }
+    # Paths the path rules admit to the map; every other path in TREE runs the full suite by itself.
+    CRATE_SOURCE = {"crates/k/src/lib.rs", "crates/k/build.rs", "crates/k/tests/t.rs",
+                    "crates/k/sub/src/lib.rs", "crates/j/src/lib.rs", "crates/m/src/lib.rs",
+                    "crates/m/tests/reader.rs", "crates/j/src/census.rs", "crates/k/tests/own.rs",
+                    "crates/k/src/shared.rs", "crates/m/src/table.txt", "crates/j/src/multi.rs",
+                    "crates/m/src/multi.txt", "crates/j/src/raw.rs", "crates/m/src/raw.txt", "crates/j/tests/env.rs",
+                    "crates/m/src/env.txt", "crates/j/src/prefix.rs", "crates/m/sql/q.sql", "crates/m/src/ghost.txt",
+                    "crates/k/src/fixture.rs"}
+    # Crate source that a reader in another crate names: the path rules admit it, the include scan sends it to full.
+    NAMED_ELSEWHERE = {"crates/k/src/shared.rs", "crates/m/src/table.txt", "crates/m/src/multi.txt",
+                       "crates/m/src/raw.txt", "crates/m/src/env.txt", "crates/m/sql/q.sql"}
+    # j depends on k, and k on ksub.
+    GRAPH = {"projects": {"k": "p-k", "ksub": "p-ksub", "j": "p-j", "m": "p-m"},
+             "edges": [["p-j", "p-k"], ["p-k", "p-ksub"]]}
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = pathlib.Path(self.temp.name).resolve()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
+        self.env.update(NO_AUTO_MAINTENANCE)
+        self.git("init", "-q", "-b", "main")
+        for path, text in self.TREE.items():
+            self.write(path, text)
+        shutil.copy(REPO_ROOT / "scripts" / "ci-test-scope.py", self.repo / "scripts" / "ci-test-scope.py")
+        # The scope classifier admits Markdown by running the documentation-lane classifier on it.
+        for script in ("ci-docs-only.sh", "ci-inert-docs-data.txt"):
+            shutil.copy(REPO_ROOT / "scripts" / script, self.repo / "scripts" / script)
+        shutil.copy(REPO_ROOT / "tests" / "documented_verb_counts.py",
+                    self.repo / "tests" / "documented_verb_counts.py")
+        self.base = self.commit("base")
+        self.fake = self.root / "fake"
+        self.fake.mkdir()
+        kernel = self.fake / "kkernel"
+        kernel.write_text(FAKE_KKERNEL.replace("{python}", sys.executable, 1))
+        kernel.chmod(0o755)
+        self.set_graph(self.GRAPH)
+
+    def set_graph(self, graph):
+        (self.fake / "graph.json").write_text(json.dumps(graph))
+
+    def calls(self, directory=None):
+        log = (directory or self.fake) / "calls.log"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def git(self, *args):
+        return subprocess.run(
+            ["git", "-c", "core.hooksPath=" + os.devnull, *args], cwd=self.repo, env=self.env,
+            text=True, capture_output=True, timeout=10, check=True,
+        ).stdout.strip()
+
+    def write(self, path, text):
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+
+    def commit(self, message):
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def change(self, *paths):
+        # Each edit stays valid TOML where the file is TOML, so a manifest or lockfile reaches the rule a test names
+        # instead of failing to parse: a crate manifest gains a [features] table, which the manifest rules refuse.
+        self.git("checkout", "-q", "--detach", self.base)
+        for path in paths:
+            if path.endswith("/Cargo.toml") and path != "crates/Cargo.toml":
+                edit = "\n[features]\nchanged = []\n"
+            elif path.endswith((".toml", ".lock")):
+                edit = "# changed\n"
+            else:
+                edit = "// changed\n"
+            self.write(path, (self.TREE.get(path) or "") + edit)
+        return self.commit("change " + " ".join(paths))
+
+
+class TestScopeClassifierTests(ScopeFixture):
+    """scripts/ci-test-scope.py on real temporary repositories, against a fake kkernel."""
+
+    def scope(self, base, head, *mode):
+        mode = mode or ("--kkernel", str(self.fake / "kkernel"))
+        completed = subprocess.run(
+            [sys.executable, str(self.repo / "scripts" / "ci-test-scope.py"), base, head, *mode],
+            cwd=self.repo, env=self.env, text=True, capture_output=True, timeout=60, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.count("\n"), 1, completed.stdout)
+        return completed.stdout.strip(), completed.stderr
+
+    def test_fixture_git_turns_off_auto_maintenance(self):
+        self.assertEqual(self.git("config", "--get", "maintenance.auto"), "false")
+
+    def test_each_path_alone_under_the_path_rules(self):
+        # Every fixture path changed alone: crate source reaches the map, everything else is the full suite.
+        for path in sorted(self.TREE):
+            with self.subTest(path=path):
+                verdict, reasons = self.scope(self.base, self.change(path), "--paths-only")
+                admitted = path in self.CRATE_SOURCE and path not in self.NAMED_ELSEWHERE
+                self.assertEqual(verdict, "map" if admitted else "full", reasons)
+                self.assertNotIn("does not parse", reasons)
+        self.assertEqual(self.calls(), [], "--paths-only never runs the binary")
+
+    def test_a_full_suite_path_never_reaches_the_binary(self):
+        # ADR-205 D4 ordering arm: a manifest beside crate source prints its reason and no ingest line.
+        verdict, reasons = self.scope(self.base, self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
+        self.assertEqual(verdict, "full")
+        self.assertIn("full suite: manifest: crates/k/Cargo.toml changes features", reasons)
+        self.assertNotIn("ingest:", reasons)
+        self.assertEqual(self.calls(), [])
+
+    def test_crate_source_prints_the_ingest_line_and_the_closure(self):
+        verdict, reasons = self.scope(self.base, self.change("crates/k/src/lib.rs"))
+        self.assertEqual(verdict, "j k", reasons)
+        self.assertIn("changed: crates/k/src/lib.rs -> k", reasons)
+        self.assertIn("ingest: ", reasons)
+        self.assertIn("closure (2 of 4 crates): j k", reasons)
+        self.assertTrue(self.calls()[0].startswith("code.ingest("), self.calls())
+
+    def test_a_nested_crate_takes_the_longest_manifest_prefix_and_its_transitive_dependents(self):
+        verdict, reasons = self.scope(self.base, self.change("crates/k/sub/src/lib.rs"))
+        self.assertEqual(verdict, "j k ksub", reasons)
+        self.assertIn("changed: crates/k/sub/src/lib.rs -> ksub", reasons)
+
+    def test_a_crate_nothing_depends_on_is_its_own_scope(self):
+        self.assertEqual(self.scope(self.base, self.change("crates/m/src/lib.rs"))[0], "m")
+
+    def test_markdown_beside_crate_source(self):
+        verdict, reasons = self.scope(self.base, self.change("crates/m/src/lib.rs", "notes/k-notes.md"))
+        self.assertEqual(verdict, "m", reasons)
+        self.assertIn("documentation only: notes/k-notes.md", reasons)
+        # A Markdown file that code names puts the run on the full suite.
+        self.write("crates/m/src/lib.rs", 'pub const DOC: &str = include_str!("../../../notes/k-notes.md");\n')
+        named = self.commit("name the notes")
+        self.write("notes/k-notes.md", "# Notes\n\nMore.\n")
+        self.write("crates/m/src/extra.rs", "\n")
+        verdict, reasons = self.scope(named, self.commit("notes and source"))
+        self.assertEqual(verdict, "full")
+        self.assertIn("notes/k-notes.md is named by a non-Markdown file", reasons)
+
+    def test_markdown_beside_crate_source_follows_the_documentation_lane_rule(self):
+        # An ADR index shares its base name with a crate readme, and the copied documentation-lane classifier names
+        # "adr/README.md" in its comments. The scope step applies that classifier's own rule, so the index is admitted
+        # beside crate source, as it would be on its own.
+        self.write("docs/adr/README.md", "# ADR index\n")
+        with_index = self.commit("adr index")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-001\n")
+        self.write("crates/m/src/extra.rs", "\n")
+        verdict, reasons = self.scope(with_index, self.commit("index and source"))
+        self.assertEqual(verdict, "m", reasons)
+        self.assertIn("documentation only: docs/adr/README.md", reasons)
+        # CONTROL: a script that names the index by path still puts the run on the full suite.
+        self.git("checkout", "-q", "--detach", with_index)
+        self.write("scripts/index.py", 'INDEX = "docs/adr/README.md"\n')
+        named = self.commit("name the index")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-002\n")
+        self.write("crates/m/src/extra.rs", "\n")
+        verdict, reasons = self.scope(named, self.commit("index and source"))
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("docs/adr/README.md is named as adr/README.md by a non-Markdown file", reasons)
+
+    def test_markdown_beside_crate_source_runs_full_when_the_documentation_rule_cannot_run(self):
+        (self.repo / "scripts" / "ci-docs-only.sh").unlink()
+        without_rule = self.commit("drop the documentation-lane classifier")
+        self.write("notes/k-notes.md", "# Notes\n\nMore.\n")
+        self.write("crates/m/src/extra.rs", "\n")
+        verdict, reasons = self.scope(without_rule, self.commit("notes and source"))
+        self.assertEqual(verdict, "full", reasons)
+
+    def test_the_map_is_read_across_pages(self):
+        self.set_graph({**self.GRAPH, "pages": [["k"], ["j", "ksub"], ["m"]]})
+        verdict, reasons = self.scope(self.base, self.change("crates/k/src/lib.rs"))
+        self.assertEqual(verdict, "j k", reasons)
+        self.assertEqual(sum(call.startswith("code.list(") for call in self.calls()), 3)
+
+    def test_every_map_defect_runs_the_full_suite(self):
+        head = self.change("crates/k/src/lib.rs")
+        projects = self.GRAPH["projects"]
+        for label, graph, reason in (
+                ("refused", {**self.GRAPH, "exit": 1}, "kkernel exec exited 1"),
+                ("warning", {**self.GRAPH, "ingest": {"warnings": ["skipped a file"]}}, "reported warnings"),
+                ("blocked", {**self.GRAPH, "ingest": {"blocked_count": 1}}, "blocked writes"),
+                ("refused manifest", {**self.GRAPH, "ingest": {"manifest_files_refused": 1}},
+                 "manifest_files_refused=1"),
+                ("truncated", {**self.GRAPH, "truncated": True}, "was truncated"),
+                ("short batch", {**self.GRAPH, "short_batch": True}, "0 outcomes for 1 ops"),
+                ("results not a list", {**self.GRAPH, "results_not_list": True}, "results that are not a list"),
+                ("missing nodes", {**self.GRAPH, "deps_missing_nodes": True}, "nodes is not a list"),
+                ("missing edges", {**self.GRAPH, "deps_missing_edges": True}, "edges is not a list"),
+                ("non-list nodes", {**self.GRAPH, "deps_nodes_not_list": True}, "nodes is not a list"),
+                ("wrong root", {**self.GRAPH, "deps_wrong_root": True}, "wrong root"),
+                ("wrong map", {**self.GRAPH, "deps_wrong_map": True}, "wrong map"),
+                ("node without kind", {**self.GRAPH, "deps_node_missing_kind": True},
+                 "node without string id and kind"),
+                ("edge without target", {**self.GRAPH, "deps_edge_missing_target": True},
+                 "edge without string source and target"),
+                ("duplicate node id", {**self.GRAPH, "deps_duplicate_node": True}, "duplicate node id"),
+                ("edge source not a node", {**self.GRAPH, "deps_omit_source_node": True},
+                 "edge source missing from nodes: p-j"),
+                ("edge target not a node", {**self.GRAPH, "deps_omit_root_node": True},
+                 "edge target missing from nodes: p-k"),
+                ("node of unknown kind", {**self.GRAPH, "deps_unknown_kind": True},
+                 "node of unknown kind: 'Project'"),
+                ("not in the map", {**self.GRAPH, "projects": {"j": "p-j", "m": "p-m"}},
+                 "changed crate k is not a project"),
+                ("unlisted dependent", {**self.GRAPH, "edges": [["p-x", "p-k"]]},
+                 "a project that code.list did not"),
+                ("duplicate name", {**self.GRAPH, "pages": [["k", "j"], ["k"]]}, "two projects in the map"),
+                ("non-project row", {**self.GRAPH, "list_kind": "module"}, "returned a 'module' row"),
+                ("empty map", {"projects": {}, "edges": []}, "the map holds no projects")):
+            with self.subTest(label=label):
+                self.set_graph(graph)
+                verdict, reasons = self.scope(self.base, head)
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn(reason, reasons)
+        # A dependent that is not a project (a module, say) is not a crate to test.
+        self.set_graph({**self.GRAPH, "kinds": {"p-j": "module"}})
+        self.assertEqual(self.scope(self.base, head)[0], "k")
+        self.assertEqual(projects, self.GRAPH["projects"])
+
+    def test_a_nonempty_partial_reply_to_a_two_root_batch_runs_the_full_suite(self):
+        head = self.change("crates/k/src/lib.rs", "crates/m/src/lib.rs")
+        self.set_graph({**self.GRAPH, "short_batch": True})
+        verdict, reasons = self.scope(self.base, head)
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("1 outcomes for 2 ops", reasons)
+        deps_calls = [call for call in self.calls() if call.startswith("[code.deps(")]
+        self.assertEqual(len(deps_calls), 1)
+        self.assertEqual(deps_calls[0].count("code.deps("), 2)
+
+    def test_a_file_another_crate_includes_runs_the_full_suite(self):
+        # The closure of k (or m) never reaches m (or j): only the include names the file.
+        for path, reader in (("crates/k/src/shared.rs", "m (crates/m/tests/reader.rs:1)"),
+                             ("crates/m/src/table.txt", "j (crates/j/src/census.rs:1)"),
+                             ("crates/m/src/multi.txt", "j (crates/j/src/multi.rs:1)"),
+                             ("crates/m/src/raw.txt", "j (crates/j/src/raw.rs:1)"),
+                             ("crates/m/src/env.txt", "j (crates/j/tests/env.rs:1)"),
+                             ("crates/m/sql/q.sql", "j (crates/j/src/prefix.rs:3)")):
+            for mode in (("--paths-only",), ()):
+                with self.subTest(path=path, mode=mode):
+                    verdict, reasons = self.scope(self.base, self.change(path), *mode)
+                    self.assertEqual(verdict, "full", reasons)
+                    self.assertIn(f"{path} is compiled or read by another crate: {reader}", reasons)
+                    self.assertNotIn("ingest:", reasons)
+        self.assertEqual(self.calls(), [])
+
+    def test_the_include_scan_prints_its_population_and_skips_same_crate_includes(self):
+        verdict, reasons = self.scope(self.base, self.change("crates/k/src/lib.rs"))
+        self.assertEqual(verdict, "j k", reasons)
+        self.assertIn("include scan: 7 sites in 8 files, 0 unreadable, 6 naming a path outside the reader's crate", reasons)
+        self.assertIn("named from another crate: crates/k/src/shared.rs <- m (crates/m/tests/reader.rs:1)", reasons)
+        self.assertIn("named from another crate: crates/m/sql/q* <- j (crates/j/src/prefix.rs:3)", reasons)
+
+    def test_includes_in_comments_and_string_literals_are_not_sites(self):
+        verdict, reasons = self.scope(self.base, self.change("crates/m/src/ghost.txt"), "--paths-only")
+        self.assertEqual(verdict, "map", reasons)
+        self.assertNotIn("ghost.txt <-", reasons)
+
+    def test_an_include_the_scan_cannot_resolve_runs_the_full_suite(self):
+        self.write("crates/j/src/bad.rs", "pub const B: &str = include_str!(chosen_path());\n")
+        unresolved = self.commit("computed include")
+        self.write("crates/m/src/lib.rs", "pub fn h2() {}\n")
+        verdict, reasons = self.scope(unresolved, self.commit("change m"), "--paths-only")
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("include scan: cannot resolve 1 include(s) in code: crates/j/src/bad.rs:1", reasons)
+
+    def test_a_path_attribute_inside_an_inline_module_resolves_below_the_module_directory(self):
+        # rustc resolves these below the inline module's directory: from the file's directory for a crate root
+        # (tests/inline.rs), from a directory named after the file otherwise (src/deep.rs). Both name a file of m.
+        self.write("crates/m/src/inl.rs", "pub fn i() {}\n")
+        self.write("crates/m/src/deep.rs", "pub fn d() {}\n")
+        self.write("crates/j/tests/inline.rs", "mod inner {\n    #[path = \"../../../m/src/inl.rs\"]\n    mod x;\n}\n")
+        self.write("crates/j/src/deep.rs", "mod inner {\n    #[path = \"../../../../m/src/deep.rs\"]\n    mod x;\n}\n")
+        # an inline module that carries its own path attribute contributes that path as its directory: only the
+        # two-level "a/b" reaches m, the one-level module name does not
+        self.write("crates/m/src/esc.rs", "pub fn e() {}\n")
+        self.write("crates/j/tests/over.rs",
+                   "#[path = \"a/b\"]\nmod thread {\n    #[path = \"../../../../m/src/esc.rs\"]\n    mod local;\n}\n")
+        base = self.commit("inline module readers")
+        for path, reader in (("crates/m/src/inl.rs", "j (crates/j/tests/inline.rs:2)"),
+                             ("crates/m/src/deep.rs", "j (crates/j/src/deep.rs:2)"),
+                             ("crates/m/src/esc.rs", "j (crates/j/tests/over.rs:3)")):
+            with self.subTest(path=path):
+                self.git("checkout", "-q", "--detach", base)
+                self.write(path, "pub fn changed() {}\n")
+                verdict, reasons = self.scope(base, self.commit("change " + path), "--paths-only")
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn(f"{path} is compiled or read by another crate: {reader}", reasons)
+
+    def test_a_path_attribute_nested_in_cfg_attr_at_any_depth_is_a_site(self):
+        self.write("crates/m/src/nested.rs", "pub fn n() {}\n")
+        self.write("crates/j/src/nested.rs",
+                   "#[cfg_attr(all(), cfg_attr(not(any()), path = \"../../m/src/nested.rs\"))]\nmod y;\n")
+        base = self.commit("nested cfg_attr reader")
+        self.write("crates/m/src/nested.rs", "pub fn changed() {}\n")
+        verdict, reasons = self.scope(base, self.commit("change nested"), "--paths-only")
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("crates/m/src/nested.rs is compiled or read by another crate: j (crates/j/src/nested.rs:1)", reasons)
+
+    def test_an_include_path_with_a_line_break_runs_the_full_suite_and_is_never_printed(self):
+        # a raw string can hold a newline; printed as is, the text after it would start a new job-log line
+        self.write("crates/j/src/broken.rs", "pub const B: &str = include_str!(r\"../../m/src/x\n::error::injected\");\n")
+        base = self.commit("include with a line break")
+        self.write("crates/m/src/lib.rs", "pub fn h2() {}\n")
+        verdict, reasons = self.scope(base, self.commit("change m"), "--paths-only")
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("crates/j/src/broken.rs:1 (a path with a line break)", reasons)
+        self.assertFalse([line for line in reasons.splitlines() if line.startswith("::")], reasons)
+
+    def test_an_include_scan_that_finds_nothing_runs_the_full_suite(self):
+        for path in ("crates/m/tests/reader.rs", "crates/j/src/census.rs", "crates/k/tests/own.rs",
+                     "crates/j/src/multi.rs", "crates/j/src/raw.rs", "crates/j/tests/env.rs", "crates/j/src/prefix.rs"):
+            (self.repo / path).unlink()
+        stripped = self.commit("no include sites")
+        self.write("crates/m/src/lib.rs", "pub fn h2() {}\n")
+        verdict, reasons = self.scope(stripped, self.commit("change m"), "--paths-only")
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("include scan: BROKEN", reasons)
+
+    def test_a_missing_binary_runs_the_full_suite(self):
+        head = self.change("crates/k/src/lib.rs")
+        verdict, reasons = self.scope(self.base, head, "--kkernel", str(self.root / "absent"))
+        self.assertEqual(verdict, "full")
+        self.assertIn("no executable kkernel binary", reasons)
+
+    def test_no_change_an_unknown_revision_and_a_submodule_run_the_full_suite(self):
+        verdict, reasons = self.scope(self.base, self.commit("empty"))
+        self.assertEqual(verdict, "full")
+        self.assertIn("no changed paths", reasons)
+        verdict, reasons = self.scope("0" * 40, self.base)
+        self.assertEqual(verdict, "full")
+        self.assertIn("git diff", reasons)
+        self.write("crates/k/src/lib.rs", "pub fn g() {}\n")
+        self.git("add", "-A")
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{self.base},crates/vendored")
+        self.git("commit", "-q", "-m", "submodule")
+        verdict, reasons = self.scope(self.base, self.git("rev-parse", "HEAD"))
+        self.assertEqual(verdict, "full")
+        self.assertIn("has a submodule", reasons)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_move_out_of_crates_is_classified_by_its_new_name(self):
+        self.git("checkout", "-q", "--detach", self.base)
+        self.git("mv", "crates/k/src/lib.rs", "scripts/lib.rs")
+        verdict, reasons = self.scope(self.base, self.commit("moved"), "--paths-only")
+        self.assertEqual(verdict, "full")
+        self.assertIn("CI or lint script: scripts/lib.rs", reasons)
+
+    def test_usage(self):
+        for args in ([], ["a", "b"], ["a", "b", "--kkernel"], ["a", "b", "--paths-only", "x"], ["a", "b", "--other"]):
+            with self.subTest(args=args):
+                completed = subprocess.run(
+                    [sys.executable, str(self.repo / "scripts" / "ci-test-scope.py"), *args],
+                    cwd=self.repo, env=self.env, text=True, capture_output=True, timeout=30, check=False,
+                )
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertIn("usage:", completed.stderr)
+
+
+REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
+
+
+def lockfile(*packages, version=4):
+    """A Cargo.lock: each package is (name, version, source or None, checksum or None, [dependency strings])."""
+    blocks = [f"version = {version}\n"]
+    for name, number, source, checksum, dependencies in packages:
+        lines = [f'[[package]]\nname = "{name}"\nversion = "{number}"\n']
+        if source:
+            lines.append(f'source = "{source}"\n')
+        if checksum:
+            lines.append(f'checksum = "{checksum}"\n')
+        if dependencies:
+            lines.append("dependencies = [\n" + "".join(f' "{d}",\n' for d in dependencies) + "]\n")
+        blocks.append("".join(lines))
+    return "\n".join(blocks)
+
+
+class ManifestAndLockfileScopeTests(ScopeFixture):
+    """ADR-205 Amendment 1, D2 and D3: a crate's own manifest and crates/Cargo.lock are read as data."""
+
+    # j depends on k and rand 0.8, k on ksub and serde (inherited from the workspace with a feature), m has a
+    # development dependency on rand 0.7: two versions of one package, each reached by a different crate.
+    PACKAGES = (("j", "0.1.0", None, None, ["k", "rand 0.8.0"]),
+                ("k", "0.1.0", None, None, ["ksub", "serde"]),
+                ("ksub", "0.1.0", None, None, []),
+                ("m", "0.1.0", None, None, ["rand 0.7.0"]),
+                ("rand", "0.7.0", REGISTRY, "a7", []),
+                ("rand", "0.8.0", REGISTRY, "a8", []),
+                ("serde", "1.0.0", REGISTRY, "c1", []))
+    K = ('[package]\nname = "k"\nversion = "0.1.0"\n\n[dependencies]\nksub = { path = "sub" }\n'
+         'serde = { workspace = true }\n\n[[test]]\nname = "t"\npath = "tests/t.rs"\n')
+    J = '[package]\nname = "j"\nversion = "0.1.0"\n\n[dependencies]\nk = { path = "../k" }\nrand = "0.8"\n'
+    M = '[package]\nname = "m"\nversion = "0.1.0"\n\n[dev-dependencies]\nrand = "0.7"\n'
+    TREE = {**ScopeFixture.TREE,
+            "crates/Cargo.toml": ('[workspace]\nmembers = ["k", "k/sub", "j", "m"]\n\n[workspace.dependencies]\n'
+                                  'serde = { version = "1", features = ["derive"] }\n'),
+            "crates/Cargo.lock": lockfile(*PACKAGES),
+            "crates/k/Cargo.toml": K,
+            "crates/k/sub/Cargo.toml": '[package]\nname = "ksub"\nversion = "0.1.0"\n',
+            "crates/j/Cargo.toml": J,
+            "crates/m/Cargo.toml": M}
+
+    scope = TestScopeClassifierTests.scope
+
+    def edit(self, files, base=None, links=()):
+        """A commit on base (the fixture base by default) writing files and adding (link, target) symlinks."""
+        self.git("checkout", "-q", "--detach", base or self.base)
+        for path, text in files.items():
+            if (self.repo / path).is_symlink():
+                (self.repo / path).unlink()
+            self.write(path, text)
+        for path, target in links:
+            (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / path).unlink(missing_ok=True)
+            os.symlink(target, self.repo / path)
+        return self.commit("edit " + " ".join(sorted(files)))
+
+    def ingested(self):
+        return json.loads((self.fake / "ingested.json").read_text())
+
+    def lock_with(self, **changes):
+        """The fixture lockfile with packages replaced by name@version: {"rand@0.8.0": (name, version, ...)}."""
+        packages = [changes.pop(f"{p[0]}@{p[1]}", p) for p in self.PACKAGES]
+        return lockfile(*[p for p in packages if p is not None], *changes.values())
+
+    # --- crate manifests (Amendment 1 verify-by 2 and 5; Amendment 2 verify-by 1) ---
+
+    def test_an_edit_to_an_existing_entry_runs_the_crate_and_every_member_reaching_the_package(self):
+        # A version requirement added to a path dependency: the entry stays and the lockfile does not change.
+        head = self.edit({"crates/j/Cargo.toml": self.J.replace('k = { path = "../k" }',
+                                                                'k = { path = "../k", version = "0.1" }')})
+        verdict, reasons = self.scope(self.base, head)
+        self.assertEqual(verdict, "j k", reasons)
+        self.assertIn("changed: crates/j/Cargo.toml -> j (manifest; changed dependency entries name: k)", reasons)
+        self.assertIn("members reaching k in either lockfile: j k", reasons)
+        self.assertIn("ingest: the base tree", reasons)
+        # the binary was handed the base commit's manifests, never one the change wrote
+        seen = self.ingested()
+        self.assertNotEqual(seen["path"], str(self.repo / "crates"))
+        self.assertEqual(seen["manifests"]["j/Cargo.toml"], self.J)
+        self.assertEqual(seen["manifests"]["k/Cargo.toml"], self.K)
+        self.assertEqual(self.scope(self.base, head, "--paths-only")[0], "map")
+
+    def test_an_edited_entry_named_by_neither_lockfile_runs_the_full_suite(self):
+        stale = self.edit({"crates/m/Cargo.toml": self.M + 'itoa = "1"\n'})
+        head = self.edit({"crates/m/Cargo.toml": self.M + 'itoa = "1.0"\n'}, base=stale)
+        verdict, reasons = self.scope(stale, head)
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("lockfile: neither side lists itoa", reasons)
+
+    def test_a_dependency_entry_that_appears_or_disappears_runs_the_full_suite(self):
+        twice = self.edit({"crates/j/Cargo.toml": self.J + 'rand2 = { package = "rand", version = "0.8" }\n'})
+        with_serde = self.lock_with(**{"m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.0", "serde"])})
+        for label, base, files, reason in (
+                ("a path package outside the workspace", None,
+                 {"crates/m/Cargo.toml": self.M + '\n[dependencies]\nfoo = { path = "../../outside/foo" }\n'},
+                 "adds the dependency entry dependencies.foo"),
+                ("a development dependency on a package the lockfile lists", None,
+                 {"crates/m/Cargo.toml": self.M + 'serde = "1"\n', "crates/Cargo.lock": with_serde},
+                 "adds the dependency entry dev-dependencies.serde"),
+                ("a removed entry", None, {"crates/j/Cargo.toml": self.J.replace('rand = "0.8"\n', "")},
+                 "removes the dependency entry dependencies.rand"),
+                ("another path", None,
+                 {"crates/k/Cargo.toml": self.K.replace('ksub = { path = "sub" }', 'ksub = { path = "sub2" }')},
+                 "adds the dependency entry dependencies.ksub"),
+                ("another package under the same key", None,
+                 {"crates/j/Cargo.toml": self.J.replace('rand = "0.8"', 'rand = { package = "fastrand", version = "0.8" }')},
+                 "adds the dependency entry dependencies.rand"),
+                ("another table", None, {"crates/m/Cargo.toml": self.M.replace("[dev-dependencies]", "[dependencies]")},
+                 "adds the dependency entry dependencies.rand"),
+                ("another target", None,
+                 {"crates/m/Cargo.toml": self.M + "\n[target.'cfg(unix)'.dependencies]\nrand = \"0.7\"\n"},
+                 "adds the dependency entry target.cfg(unix).dependencies.rand"),
+                ("one of two entries naming one package", twice, {"crates/j/Cargo.toml": self.J},
+                 "removes the dependency entry dependencies.rand2")):
+            with self.subTest(label=label):
+                (self.fake / "calls.log").unlink(missing_ok=True)  # each arm reads only its own binary calls
+                start = base or self.base
+                verdict, reasons = self.scope(start, self.edit(files, base=start))
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn(f"full suite: manifest: crates/", reasons)
+                self.assertIn(reason, reasons)
+                self.assertNotIn("ingest:", reasons)
+                self.assertEqual(self.calls(), [])
+
+    def test_features_runs_the_full_suite(self):
+        for label, path, text, reason in (
+                ("[features]", "crates/m/Cargo.toml", self.M + "\n[features]\nx = []\n", "changes features"),
+                ("dependency features", "crates/j/Cargo.toml",
+                 self.J.replace('rand = "0.8"', 'rand = { version = "0.8", features = ["small_rng"] }'),
+                 "changes features, default-features or optional of dependencies.rand"),
+                ("default-features", "crates/j/Cargo.toml",
+                 self.J.replace('rand = "0.8"', 'rand = { version = "0.8", default-features = false }'),
+                 "of dependencies.rand"),
+                ("optional", "crates/j/Cargo.toml",
+                 self.J.replace('rand = "0.8"', 'rand = { version = "0.8", optional = true }'),
+                 "of dependencies.rand"),
+                ("inherited entry gains a local feature", "crates/k/Cargo.toml",
+                 self.K.replace("serde = { workspace = true }", 'serde = { workspace = true, features = ["std"] }'),
+                 "of dependencies.serde"),
+                # a new entry inheriting the workspace's feature list gains features it did not have
+                ("new inherited entry", "crates/m/Cargo.toml", self.M + "serde = { workspace = true }\n",
+                 "of dev-dependencies.serde"),
+                ("target-specific features", "crates/m/Cargo.toml",
+                 self.M + '\n[target.\'cfg(unix)\'.dependencies]\nrand = { version = "0.7", features = ["x"] }\n',
+                 "of target.cfg(unix).dependencies.rand")):
+            with self.subTest(label=label):
+                verdict, reasons = self.scope(self.base, self.edit({path: text}))
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn(f"full suite: manifest: {path} ", reasons)
+                self.assertIn(reason, reasons)
+                self.assertNotIn("ingest:", reasons)
+                self.assertEqual(self.calls(), [])
+
+    def test_a_target_outside_the_crate_or_with_changed_required_features_runs_the_full_suite(self):
+        test_table = '[[test]]\nname = "t"\npath = "tests/t.rs"\n'
+        for label, text, reason in (
+                ("outside path", self.K.replace(test_table, '[[test]]\nname = "t"\npath = "../j/src/lib.rs"\n'),
+                 "gives [[test]] t the path ../j/src/lib.rs, which resolves to crates/j/src/lib.rs, outside the crate"),
+                ("nested crate's file", self.K + '\n[[test]]\nname = "s"\npath = "sub/src/lib.rs"\n',
+                 "gives [[test]] s the path sub/src/lib.rs, which resolves to crates/k/sub/src/lib.rs"),
+                ("required features", self.K.replace(test_table, test_table + 'required-features = ["x"]\n'),
+                 "changes the required features of [[test]] t"),
+                ("absolute path", self.K + '\n[[bench]]\nname = "b"\npath = "/etc/b.rs"\n',
+                 "gives [[bench]] b a path that is not relative")):
+            with self.subTest(label=label):
+                verdict, reasons = self.scope(self.base, self.edit({"crates/k/Cargo.toml": text}))
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn(reason, reasons)
+
+    def test_a_symbolic_link_under_crates_runs_the_full_suite(self):
+        # Amendment 2, D3: a link in k naming a file of j. The path rules would admit each change below.
+        linked = self.edit({}, links=[("crates/k/tests/link.rs", "../../j/src/lib.rs")])
+        self.git("checkout", "-q", "--detach", linked)
+        (self.repo / "crates/k/tests/link.rs").unlink()
+        removed = self.commit("remove the link")
+        for label, base, head in (
+                ("a new link", self.base, linked),
+                # the closure of j alone would omit k, whose test reads the changed file through the link
+                ("an unchanged link whose target changed", linked,
+                 self.edit({"crates/j/src/lib.rs": "pub fn g2() {}\n"}, base=linked)),
+                ("a link removed at the head", linked, removed),
+                ("a target path through a link inside the crate", linked,
+                 self.edit({"crates/k/Cargo.toml": self.K + '\n[[test]]\nname = "l"\npath = "tests/link.rs"\n'},
+                           base=linked))):
+            with self.subTest(label=label):
+                (self.fake / "calls.log").unlink(missing_ok=True)  # each arm reads only its own binary calls
+                verdict, reasons = self.scope(base, head)
+                self.assertEqual(verdict, "full", reasons)
+                self.assertRegex(reasons, r"full suite: 1 symbolic link\(s\) under crates/ at [0-9a-f]{40}, "
+                                          r"first crates/k/tests/link\.rs")
+                self.assertEqual(self.calls(), [])
+                self.assertEqual(self.scope(base, head, "--paths-only")[0], "full")
+        # control: the same source change with no link in either tree runs its closure
+        self.assertEqual(self.scope(self.base, self.edit({"crates/j/src/lib.rs": "pub fn g2() {}\n"}))[0], "j")
+
+    def test_a_new_bench_inside_the_crate_runs_the_crate_closure(self):
+        head = self.edit({"crates/k/Cargo.toml": self.K + '\n[[bench]]\nname = "kb"\npath = "benches/kb.rs"\n',
+                          "crates/k/benches/kb.rs": "fn main() {}\n"})
+        verdict, reasons = self.scope(self.base, head)
+        self.assertEqual(verdict, "j k", reasons)
+        self.assertIn("changed: crates/k/Cargo.toml -> k (manifest; changed dependency entries name: none)", reasons)
+        self.assertEqual(self.ingested()["manifests"]["k/Cargo.toml"], self.K)
+
+    def test_any_other_manifest_difference_runs_the_full_suite(self):
+        for label, path, text, reason in (
+                ("[package]", "crates/m/Cargo.toml", self.M.replace('version = "0.1.0"', 'version = "0.2.0"'),
+                 "manifest: crates/m/Cargo.toml changes package.version, outside the dependency and target tables"),
+                ("[package.metadata]", "crates/m/Cargo.toml", self.M + "\n[package.metadata.docs]\nall = true\n",
+                 "changes package.metadata"),
+                ("[lints]", "crates/m/Cargo.toml", self.M + "\n[lints.rust]\nunsafe_code = \"forbid\"\n",
+                 "changes lints"),
+                ("workspace manifest", "crates/Cargo.toml", self.TREE["crates/Cargo.toml"] + "resolver = \"2\"\n",
+                 "manifest: crates/Cargo.toml"),
+                ("a manifest that is not a crate's", "crates/k/tests/fixture/Cargo.toml", "[workspace]\n",
+                 "manifest: crates/k/tests/fixture/Cargo.toml is not the manifest of a crate at"),
+                ("a new crate", "crates/n/Cargo.toml", '[package]\nname = "n"\n',
+                 "manifest: crates/n/Cargo.toml cannot be read at")):
+            with self.subTest(label=label):
+                verdict, reasons = self.scope(self.base, self.edit({path: text}))
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn(reason, reasons)
+                self.assertEqual(self.calls(), [])
+
+    def test_a_manifest_another_crate_reads_runs_the_full_suite(self):
+        reader = self.edit({"crates/j/tests/manifest.rs": 'const M: &str = include_str!("../../m/Cargo.toml");\n'})
+        head = self.edit({"crates/m/Cargo.toml": self.M + '\n[[example]]\nname = "e"\n'}, base=reader)
+        verdict, reasons = self.scope(reader, head)
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("crates/m/Cargo.toml is compiled or read by another crate: j (crates/j/tests/manifest.rs:1)",
+                      reasons)
+
+    # --- the lockfile (verify-by 3) ---
+
+    def test_a_lockfile_change_to_member_entries_runs_the_members_that_reach_them(self):
+        for label, changes, expected in (
+                ("a member's dependency list", {"m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.0", "serde"])}, "m"),
+                ("a nested member's dependency list", {"ksub@0.1.0": ("ksub", "0.1.0", None, None, ["serde"])},
+                 "j k ksub")):
+            with self.subTest(label=label):
+                head = self.edit({"crates/Cargo.lock": self.lock_with(**changes)})
+                verdict, reasons = self.scope(self.base, head)
+                self.assertEqual(verdict, expected, reasons)
+                self.assertIn("lockfile: ", reasons)
+                self.assertNotIn("ingest: the base tree", reasons)
+
+    def test_a_lockfile_change_outside_the_workspace_runs_the_full_suite(self):
+        for label, changes, reason in (
+                # the lockfile records a version, never the features the new version requests of its dependencies
+                ("bump one external package", {"rand@0.7.0": ("rand", "0.7.1", REGISTRY, "a71", []),
+                                               "m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.1"])},
+                 "first rand 0.7.0"),
+                ("checksum alone", {"serde@1.0.0": ("serde", "1.0.0", REGISTRY, "c2", [])}, "first serde 1.0.0"),
+                ("dependency list alone", {"rand@0.8.0": ("rand", "0.8.0", REGISTRY, "a8", ["serde"])},
+                 "first rand 0.8.0"),
+                ("one of two versions", {"rand@0.7.0": ("rand", "0.7.0", REGISTRY, "a7x", [])}, "first rand 0.7.0"),
+                ("a new external entry", {"itoa@1.0.0": ("itoa", "1.0.0", REGISTRY, "i1", []),
+                                          "m@0.1.0": ("m", "0.1.0", None, None, ["itoa", "rand 0.7.0"])},
+                 "first itoa 1.0.0"),
+                ("a removed external entry", {"rand@0.7.0": None, "m@0.1.0": ("m", "0.1.0", None, None, [])},
+                 "first rand 0.7.0")):
+            with self.subTest(label=label):
+                (self.fake / "calls.log").unlink(missing_ok=True)  # each arm reads only its own binary calls
+                head = self.edit({"crates/Cargo.lock": self.lock_with(**changes)})
+                verdict, reasons = self.scope(self.base, head)
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn("full suite: lockfile: crates/Cargo.lock changes ", reasons)
+                self.assertIn(f"entries outside the workspace, {reason} ", reasons)
+                self.assertEqual(self.calls(), [])
+
+    def test_a_lockfile_header_change_a_parse_failure_or_a_change_reaching_every_member_runs_the_full_suite(self):
+        everyone = self.lock_with(**{"ksub@0.1.0": ("ksub", "0.1.0", None, None, ["serde"]),
+                                     "m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.0", "serde"])})
+        for label, text, reason in (
+                ("header", lockfile(*self.PACKAGES, version=3), "lockfile: crates/Cargo.lock changes its version header"),
+                ("unparseable", self.TREE["crates/Cargo.lock"] + "// changed\n",
+                 "lockfile: crates/Cargo.lock does not parse at"),
+                ("ambiguous dependency", self.lock_with(**{"m@0.1.0": ("m", "0.1.0", None, None, ["rand"])}),
+                 "depends on 'rand', which matches 2 entries"),
+                ("every member", everyone, "lockfile: the change reaches every workspace member (4)")):
+            with self.subTest(label=label):
+                verdict, reasons = self.scope(self.base, self.edit({"crates/Cargo.lock": text}))
+                self.assertEqual(verdict, "full", reasons)
+                self.assertIn(reason, reasons)
+                self.assertEqual(self.calls(), [])
+
+    def test_a_lockfile_a_crate_reads_runs_the_full_suite(self):
+        reader = self.edit({"crates/j/tests/lock.rs": 'const L: &str = include_str!("../../Cargo.lock");\n'})
+        head = self.edit({"crates/Cargo.lock": self.lock_with(**{"m@0.1.0": ("m", "0.1.0", None, None,
+                                                                             ["rand 0.7.0", "serde"])})}, base=reader)
+        verdict, reasons = self.scope(reader, head)
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("crates/Cargo.lock is read by a crate: j (crates/j/tests/lock.rs:1)", reasons)
+
+    # --- symbolic links: git stores a link's target text, cargo reads the file the link names ---
+    # Each link's target text is itself an admissible change, so only the file mode separates these from "map".
+
+    def test_a_manifest_that_becomes_a_symbolic_link_runs_the_full_suite(self):
+        lock = self.lock_with(**{"m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.0", "serde"])})
+        head = self.edit({"crates/Cargo.lock": lock}, links=[("crates/m/Cargo.toml", self.M + 'serde = "1"\n')])
+        self.assertEqual(self.git("ls-tree", head, "crates/m/Cargo.toml").split()[0], "120000")
+        verdict, reasons = self.scope(self.base, head)
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn(f"full suite: crates/m/Cargo.toml is a symbolic link at {head}", reasons)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.scope(self.base, head, "--paths-only")[0], "full")
+
+    def test_a_manifest_that_was_a_symbolic_link_runs_the_full_suite(self):
+        linked = self.edit({}, links=[("crates/m/Cargo.toml", self.M)])
+        lock = self.lock_with(**{"m@0.1.0": ("m", "0.1.0", None, None, ["rand 0.7.0", "serde"])})
+        head = self.edit({"crates/m/Cargo.toml": self.M + 'serde = "1"\n', "crates/Cargo.lock": lock}, base=linked)
+        self.assertEqual(self.git("ls-tree", head, "crates/m/Cargo.toml").split()[0], "100644")
+        verdict, reasons = self.scope(linked, head, "--paths-only")
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn(f"full suite: crates/m/Cargo.toml is a symbolic link at {linked}", reasons)
+
+    def test_a_lockfile_that_becomes_a_symbolic_link_runs_the_full_suite(self):
+        lock = self.lock_with(**{"rand@0.7.0": ("rand", "0.7.0", REGISTRY, "a7x", [])})
+        head = self.edit({}, links=[("crates/Cargo.lock", lock)])
+        self.assertEqual(self.git("ls-tree", head, "crates/Cargo.lock").split()[0], "120000")
+        verdict, reasons = self.scope(self.base, head)
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn(f"full suite: crates/Cargo.lock is a symbolic link at {head}", reasons)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.scope(self.base, head, "--paths-only")[0], "full")
+
+
+class ScopeStepTests(ScopeFixture):
+    """The Classify job's Scope step: the path rules first, then the binary from main, never a failure."""
+
+    FAKE_GH = """#!/bin/bash
+echo "$*" >> "$GH_LOG"
+case "$1 $2" in
+  "api "*) [ -n "$GH_RUNS" ] || exit 1; printf '%s\\n' $GH_RUNS ;;
+  "run download")
+    dir="${@: -1}"
+    for run in $GH_ARTIFACT_RUNS; do
+      if [ "$run" = "$3" ]; then mkdir -p "$dir"; cp "$FAKE_DIR/kkernel" "$FAKE_DIR/graph.json" "$dir/"; exit 0; fi
+    done
+    exit 1 ;;
+  *) exit 1 ;;
+esac
+"""
+
+    def setUp(self):
+        super().setUp()
+        self.remote = self.root / "origin.git"
+        self.git("init", "--bare", "-q", str(self.remote))
+        self.git("remote", "add", "origin", str(self.remote))
+        self.git("push", "-q", "origin", "main:refs/heads/main")
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        tools = {"gh": self.FAKE_GH, "python3": f'#!/bin/bash\nexec "{sys.executable}" "$@"\n'}
+        if shutil.which("timeout") is None:
+            tools["timeout"] = '#!/bin/bash\nshift\nexec "$@"\n'
+        for name, text in tools.items():
+            (self.bin / name).write_text(text)
+            (self.bin / name).chmod(0o755)
+        self.runner_temp = self.root / "runner-temp"
+        self.runner_temp.mkdir()
+        self.gh_log = self.root / "gh.log"
+
+    def run_step(self, event_name, head, runs="201 202", artifact_runs="202", extra_env=None):
+        step = indented_block(workflow_text("ci.yml"), "changed-paths", 2).split("- name: Scope\n", 1)[1]
+        match = re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", step + "\n")
+        self.assertIsNotNone(match)
+        output = self.root / "output"
+        output.write_text("")
+        completed = subprocess.run(
+            ["bash", "-c", textwrap.dedent(match.group(1))], cwd=self.repo, text=True, capture_output=True,
+            timeout=60, check=False,
+            env={**self.env, "PATH": f"{self.bin}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(output),
+                 "RUNNER_TEMP": str(self.runner_temp), "EVENT_NAME": event_name, "HEAD_SHA": head,
+                 "REPOSITORY": "o/r", "GH_TOKEN": "x", "DEFAULT_BRANCH": "main",
+                 "GH_LOG": str(self.gh_log), "GH_RUNS": runs,
+                 "GH_ARTIFACT_RUNS": artifact_runs, "FAKE_DIR": str(self.fake), **(extra_env or {})},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        lines = output.read_text().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("test_scope="), lines)
+        return lines[0].split("=", 1)[1], completed.stdout + completed.stderr
+
+    def gh_calls(self):
+        return self.gh_log.read_text().splitlines() if self.gh_log.exists() else []
+
+    def test_a_crate_source_pull_request_is_scoped_with_the_binary_from_main(self):
+        scope, log = self.run_step("pull_request", self.change("crates/k/src/lib.rs"))
+        self.assertEqual(scope, "j k", log)
+        self.assertIn("kkernel from main push run 202", log)
+        downloads = [call for call in self.gh_calls() if call.startswith("run download")]
+        self.assertEqual([call.split()[2] for call in downloads], ["201", "202"])
+        self.assertTrue(self.calls(self.runner_temp / "kkernel-main-202"))
+
+    def stacked_pull_request(self):
+        self.git("checkout", "-q", "-b", "parent")
+        self.write("scripts/ci-docs-only.sh", "#!/bin/bash\necho true\n")
+        self.commit("parent changes the documentation classifier")
+        self.git("checkout", "-q", "-b", "child")
+        self.write("crates/k/src/lib.rs", "pub fn f() { let _ = 1; }\n")
+        child = self.commit("child changes Rust")
+        self.git("checkout", "-q", "main")
+        self.write("docs/default-branch.md", "# Default branch advanced\n")
+        self.commit("default branch advances")
+        self.git("push", "-q", "origin", "main:refs/heads/main")
+        self.git("checkout", "-q", "parent")
+        self.git("merge", "-q", "--no-ff", "-m", "merge stacked child", child)
+        head = self.git("rev-parse", "HEAD")
+        self.assertNotEqual(self.git("merge-base", head, "main"), self.git("rev-parse", "main"))
+        return head
+
+    def test_stacked_pull_request_classifier_change_forces_full_scope(self):
+        head = self.stacked_pull_request()
+        scope, log = self.run_step("pull_request", head)
+        self.assertEqual(scope, "full", log)
+        self.assertIn("full suite: the change edits a path classifier: scripts/ci-docs-only.sh", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_a_manifest_skips_the_binary_lookup(self):
+        scope, log = self.run_step("pull_request", self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
+        self.assertEqual(scope, "full", log)
+        self.assertIn("full suite: manifest: crates/k/Cargo.toml changes features", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_pull_request_without_a_fetchable_default_branch_runs_full_scope(self):
+        head = self.change("crates/k/src/lib.rs")
+        scope, log = self.run_step("pull_request", head, extra_env={"DEFAULT_BRANCH": "missing"})
+        self.assertEqual(scope, "full", log)
+        self.assertIn("the default branch could not be fetched for classifier comparison", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_other_events_are_never_scoped(self):
+        head = self.change("crates/k/src/lib.rs")
+        for event_name in ("push", "schedule", "workflow_dispatch"):
+            with self.subTest(event_name=event_name):
+                scope, log = self.run_step(event_name, head)
+                self.assertEqual(scope, "full", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def train(self):
+        """Two commits after the tested base: k's source, then m's. The pushed head's parent holds only k's change."""
+        self.change("crates/k/src/lib.rs")
+        self.write("crates/m/src/lib.rs", self.TREE["crates/m/src/lib.rs"] + "// changed\n")
+        return self.commit("change crates/m/src/lib.rs")
+
+    def test_an_integration_push_is_scoped_from_the_tested_main_base(self):
+        head = self.train()
+        scope, log = self.run_step("push", head, extra_env={"REF": "refs/heads/integration/train-1",
+                                                            "TESTED_BASE": self.base})
+        self.assertEqual(scope, "j k m", log)
+        self.assertIn("kkernel from main push run 202", log)
+
+    def test_an_integration_push_without_a_tested_base_runs_the_full_suite(self):
+        head = self.train()
+        for tested_base in ("", None):
+            with self.subTest(tested_base=tested_base):
+                extra = {"REF": "refs/heads/integration/train-1"}
+                if tested_base is not None:
+                    extra["TESTED_BASE"] = tested_base
+                scope, log = self.run_step("push", head, extra_env=extra)
+                self.assertEqual(scope, "full", log)
+                self.assertIn("no fully tested main commit is an ancestor of this push", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    # A scope script that scopes every change to crate k and leaves a mark when it runs.
+    LENIENT_SCOPE = ("import pathlib, sys\n"
+                     "pathlib.Path(__file__).with_name('lenient-ran').write_text(' '.join(sys.argv[1:]))\n"
+                     "print('map' if '--paths-only' in sys.argv else 'k')\n")
+
+    def lenient_scope_change(self):
+        """Crate k's source and m's, with a scope script that would scope both to k."""
+        self.change("crates/k/src/lib.rs")
+        self.write("crates/m/src/lib.rs", self.TREE["crates/m/src/lib.rs"] + "// changed\n")
+        self.write("scripts/ci-test-scope.py", self.LENIENT_SCOPE)
+        return self.commit("a lenient scope script beside crate source")
+
+    def test_a_change_that_edits_a_classifier_runs_the_full_suite_without_running_it(self):
+        head = self.lenient_scope_change()
+        for event_name, extra in (("pull_request", None),
+                                  ("push", {"REF": "refs/heads/integration/train-1", "TESTED_BASE": self.base})):
+            with self.subTest(event_name=event_name):
+                scope, log = self.run_step(event_name, head, extra_env=extra)
+                self.assertEqual(scope, "full", log)
+                self.assertIn("full suite: the change edits a path classifier: scripts/ci-test-scope.py\n", log)
+                self.assertFalse((self.repo / "scripts" / "lenient-ran").exists(), log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_a_range_that_cannot_be_compared_counts_as_a_classifier_change(self):
+        head = self.train()
+        missing = "0" * 40
+        scope, log = self.run_step("push", head, extra_env={"REF": "refs/heads/integration/train-1",
+                                                            "TESTED_BASE": missing})
+        self.assertEqual(scope, "full", log)
+        self.assertIn(f"full suite: the path classifiers could not be compared with {missing}\n", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_a_main_push_is_never_scoped_even_with_a_tested_base(self):
+        head = self.train()
+        scope, log = self.run_step("push", head, extra_env={"REF": "refs/heads/main", "TESTED_BASE": self.base})
+        self.assertEqual(scope, "full", log)
+        self.assertIn("full suite: push runs on refs/heads/main are never scoped", log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_an_unavailable_binary_runs_the_full_suite(self):
+        head = self.change("crates/k/src/lib.rs")
+        for runs, artifact_runs in (("", "202"), ("201 202", ""), ("201", "202")):
+            with self.subTest(runs=runs, artifact_runs=artifact_runs):
+                scope, log = self.run_step("pull_request", head, runs=runs, artifact_runs=artifact_runs)
+                self.assertEqual(scope, "full", log)
+                self.assertIn("no successful main push run", log)
+
+    def test_a_failing_classifier_runs_the_full_suite(self):
+        self.set_graph({**self.GRAPH, "exit": 3})
+        scope, log = self.run_step("pull_request", self.change("crates/k/src/lib.rs"))
+        self.assertEqual(scope, "full", log)
+        (self.repo / "scripts" / "ci-test-scope.py").write_text("import sys\nsys.exit(1)\n")
+        scope, log = self.run_step("pull_request", self.commit("broken classifier"))
+        self.assertEqual(scope, "full", log)
+
+
+class BenchTrainScopeTests(ScopeFixture):
+    """bench-track.yml on a merge train's push: the train's closure, mapped to the components."""
+
+    COMPONENTS = ("scoring_retrieval", "ann_query", "storage_brain", "packs", "runtime_mcp", "gate_channel_code")
+
+    def setUp(self):
+        super().setUp()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        tools = {"gh": ScopeStepTests.FAKE_GH, "python3": f'#!/bin/bash\nexec "{sys.executable}" "$@"\n'}
+        if shutil.which("timeout") is None:
+            tools["timeout"] = '#!/bin/bash\nshift\nexec "$@"\n'
+        for name, text in tools.items():
+            (self.bin / name).write_text(text)
+            (self.bin / name).chmod(0o755)
+        self.runner_temp = self.root / "runner-temp"
+        self.runner_temp.mkdir()
+        self.gh_log = self.root / "gh.log"
+
+    def step(self, name):
+        job = indented_block(indented_block(workflow_text("bench-track.yml"), "jobs", 0), "changes", 2)
+        step = job.split(f"- name: {name}\n", 1)[1]
+        match = re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", step + "\n")
+        self.assertIsNotNone(match)
+        return textwrap.dedent(match.group(1))
+
+    def run_script(self, script, env, cwd):
+        output = self.root / "output"
+        output.write_text("")
+        completed = subprocess.run(
+            ["bash", "-c", script], cwd=cwd, text=True, capture_output=True, timeout=60, check=False,
+            env={**self.env, "PATH": f"{self.bin}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(output), **env},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        return values, completed.stdout + completed.stderr
+
+    def scope(self, head, main_ref="main", runs="201 202", artifact_runs="202"):
+        values, log = self.run_script(self.step("Scope the train"), {
+            "RUNNER_TEMP": str(self.runner_temp), "HEAD_SHA": head, "MAIN_REF": main_ref, "REPOSITORY": "o/r",
+            "GH_TOKEN": "x", "GH_LOG": str(self.gh_log), "GH_RUNS": runs, "GH_ARTIFACT_RUNS": artifact_runs,
+            "FAKE_DIR": str(self.fake)}, self.repo)
+        self.assertEqual(list(values), ["test_scope"], log)
+        return values["test_scope"], log
+
+    def components(self, train_scope):
+        values, log = self.run_script(self.step("Map changed paths to components"), {
+            "EVENT_NAME": "push", "BASE_SHA": "", "HEAD_SHA": "", "TRAIN_SCOPE": train_scope}, self.root)
+        self.assertEqual(values.pop("selective"), "true", log)
+        return {name for name in self.COMPONENTS if values[name] == "true"}
+
+    def gh_calls(self):
+        return self.gh_log.read_text().splitlines() if self.gh_log.exists() else []
+
+    def test_a_train_is_scoped_over_its_range_from_the_merge_base_with_main(self):
+        scope, log = self.scope(self.change("crates/k/src/lib.rs"))
+        self.assertEqual(scope, "j k", log)
+        self.assertIn(f"train range: {self.base}..", log)
+        self.assertIn("kkernel from main push run 202", log)
+
+    def test_a_train_that_edits_the_scope_classifier_runs_full_scope(self):
+        self.git("checkout", "-q", "--detach", self.base)
+        self.write("scripts/ci-test-scope.py", ScopeStepTests.LENIENT_SCOPE)
+        head = self.commit("edit the scope classifier")
+        scope, log = self.scope(head)
+        self.assertEqual(scope, "full", log)
+        self.assertIn("full suite: the change edits a path classifier: scripts/ci-test-scope.py", log)
+        self.assertFalse((self.repo / "scripts" / "lenient-ran").exists(), log)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_a_manifest_in_the_train_selects_every_component_before_any_fetch(self):
+        scope, log = self.scope(self.change("crates/k/src/lib.rs", "crates/k/Cargo.toml"))
+        self.assertEqual(scope, "full", log)
+        self.assertIn("manifest: crates/k/Cargo.toml changes features", log)
+        self.assertEqual(self.gh_calls(), [])
+        self.assertEqual(self.components(scope), set(self.COMPONENTS))
+
+    def test_every_failure_selects_every_component(self):
+        head = self.change("crates/k/src/lib.rs")
+        for main_ref, runs, artifact_runs in (("no-such-ref", "201 202", "202"), ("main", "", "202"),
+                                              ("main", "201", "202")):
+            with self.subTest(main_ref=main_ref, runs=runs):
+                scope, log = self.scope(head, main_ref=main_ref, runs=runs, artifact_runs=artifact_runs)
+                self.assertEqual(scope, "full", log)
+        self.assertEqual(self.components(""), set(self.COMPONENTS))
+
+    def test_the_closure_maps_to_the_components_that_hold_its_crates(self):
+        self.assertEqual(self.components("khive-score khive-db khive-runtime"),
+                         {"scoring_retrieval", "storage_brain", "runtime_mcp"})
+        self.assertEqual(self.components("khive-pack-kg"), {"packs"})
+        self.assertEqual(self.components("khive-runtime kkernel"), {"runtime_mcp"})
+        self.assertEqual(self.components("khive-channel khive-pack-code"), {"gate_channel_code"})
+        self.assertEqual(self.components("khive-changeset khive-wire-protocol"), {"gate_channel_code"})
+        self.assertEqual(self.components("khive-types khive-storage"), set())
+
+    def test_the_binary_lookup_is_the_ci_scope_steps_own(self):
+        ci = indented_block(workflow_text("ci.yml"), "changed-paths", 2).split("- name: Scope\n", 1)[1]
+        ci_run = textwrap.dedent(re.search(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", ci + "\n").group(1))
+
+        def classifier_guard(script):
+            lines = script.splitlines()
+            function_start = next(
+                (i for i, line in enumerate(lines) if line.strip() == "classifiers_changed() {"), None
+            )
+            self.assertIsNotNone(function_start, "classifier guard function is missing")
+            function_end = next(i for i in range(function_start + 1, len(lines)) if lines[i].strip() == "}")
+            call_start = next(
+                (i for i, line in enumerate(lines)
+                 if line.strip() == 'if [[ -n "$base" ]] && classifiers_changed "$classifier_base"; then'),
+                None,
+            )
+            self.assertIsNotNone(call_start, "classifier guard call is missing")
+            indent = len(lines[call_start]) - len(lines[call_start].lstrip())
+            call_end = next(
+                i for i in range(call_start + 1, len(lines)) if lines[i] == " " * indent + "fi"
+            )
+            return (
+                textwrap.dedent("\n".join(lines[function_start:function_end + 1])),
+                textwrap.dedent("\n".join(lines[call_start:call_end + 1])),
+            )
+
+        self.assertEqual(classifier_guard(self.step("Scope the train")), classifier_guard(ci_run))
+
+        def shared(script):
+            lines = script.splitlines()
+            start = next(
+                i for i, line in enumerate(lines)
+                if line.strip() == 'if [[ "$mode" == "map" ]]; then'
+            )
+            indent = len(lines[start]) - len(lines[start].lstrip())
+            end = next(i for i in range(start + 1, len(lines)) if lines[i] == " " * indent + "fi")
+            return textwrap.dedent("\n".join(lines[start:end + 1]))
+
+        self.assertEqual(shared(self.step("Scope the train")), shared(ci_run))
+
+    def test_every_benchmarked_crate_is_in_exactly_one_component(self):
+        # A component may name a crate whose first benchmark has not landed yet (the component job leaves it out),
+        # so the components cover the benchmarked crates rather than equal them. Every name is a workspace package.
+        text = workflow_text("bench-track.yml")
+        inputs = dict(re.findall(r"(?m)^      component: (\S+)\n      crates: (.+)$", text))
+        inputs = {name.replace("-", "_"): sorted(crates.split()) for name, crates in inputs.items()}
+        self.assertEqual(sorted(inputs), sorted(self.COMPONENTS))
+        table = re.findall(r"(?m)^                ((?:crates/[a-z0-9-]+/\*\|?)+)\)\n                  (\w+)=true$",
+                           text)
+        table = {flag: sorted(path.split("/")[1] for path in paths.split("|")) for paths, flag in table}
+        self.assertEqual(table, inputs, "the path table and the component jobs name different crates")
+        packages, benchmarked, _ = BenchmarkInventoryTests.inventory(REPO_ROOT / "crates")
+        for name in benchmarked:
+            self.assertEqual(packages[name].parent.name, name, packages[name])
+        members = [crate for crates in inputs.values() for crate in crates]
+        self.assertEqual(len(members), len(set(members)), "a crate is in two components")
+        self.assertIn("khive-channel", benchmarked, "the inventory missed a known benchmarked workspace crate")
+        self.assertEqual(benchmarked - set(members), set(), "a benchmarked crate is in no component")
+        # The train maps a crate to crates/<name>/Cargo.toml, so every member's directory is its package name.
+        self.assertEqual({m for m in members if m not in packages or packages[m].parent.name != m}, set(),
+                         "a component names a crate that is not a package of that directory name")
+
+
+class InertDocumentationDataTests(unittest.TestCase):
+    """An explicit inert-data exception cannot hide a source reader from CI."""
+
+    DOCS = "docs" + "/"
+    DATA = DOCS + "testing/fixture-exclusions.tsv"
+    LIST = "scripts/ci-inert-docs-data.txt"
+
+    @classmethod
+    def entries(cls, root):
+        paths = []
+        for number, line in enumerate((root / cls.LIST).read_text().splitlines(), 1):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            path, marker, reason = line.partition("#")
+            path = path.strip()
+            parts = pathlib.PurePosixPath(path).parts
+            if (not marker or not reason.strip() or not path.startswith(cls.DOCS)
+                    or any(part in (".", "..") for part in path.split("/"))
+                    or "//" in path or not re.fullmatch(r"[A-Za-z0-9_./-]+", path)
+                    or pathlib.PurePosixPath(path).suffix not in (".tsv", ".csv", ".txt")
+                    or path in paths or len(parts) < 2):
+                raise ValueError(f"invalid inert data entry at line {number}: {path}")
+            if not (root / path).is_file() or (root / path).is_symlink():
+                raise ValueError(f"inert data is not a regular file: {path}")
+            paths.append(path)
+        return paths
+
+    @staticmethod
+    def path_pieces(line):
+        def expand(token):
+            brace = re.search(r"\{([^{}]*)\}", token)
+            if brace is None:
+                return [token]
+            return [expanded for arm in brace[1].split(",")
+                    for expanded in expand(token[:brace.start()] + arm + token[brace.end():])]
+
+        pieces = []
+        for token in re.findall(r"[A-Za-z0-9_.*/?\[\]{},-]+", line):
+            candidates = re.split(r"[{},]", token)
+            candidates += [part for expanded in expand(token) for part in expanded.split(",")]
+            for piece in candidates:
+                while piece.startswith(("[", "./", "../", "/")):
+                    if piece.startswith("../"):
+                        piece = piece[3:]
+                    elif piece.startswith("./"):
+                        piece = piece[2:]
+                    else:
+                        piece = piece[1:]
+                pieces.append(piece.rstrip("].,"))
+        return pieces
+
+    @classmethod
+    def permitted_root_line(cls, source, line):
+        allowed = {
+            "Makefile": {"deno fmt " + cls.DOCS, "deno fmt --check " + cls.DOCS},
+            "deno.json": {'"include": ["' + cls.DOCS + '", "README.md", "CLAUDE.md", "AGENTS.md"],'},
+            ".github/workflows/ci.yml": {
+                "# Pull requests from this repository's `split/` and `" + cls.DOCS + "` branches run",
+                "|| startsWith(github.head_ref, '" + cls.DOCS + "'))",
+            },
+            "scripts/ci.sh": {
+                "# Reads Markdown under " + cls.DOCS
+                + ", crates/ and scripts/ by content, so the documentation lane must run it.",
+            },
+        }
+        return line.strip() in allowed.get(source, set())
+
+    @classmethod
+    def naming_error(cls, source, line, listed):
+        target = pathlib.PurePosixPath(listed)
+        if target.name in line:
+            return "file name"
+        directories = {str(parent) for parent in target.parents if len(parent.parts) >= 2}
+        for piece in cls.path_pieces(line):
+            if piece in (cls.DOCS, cls.DOCS + "*", cls.DOCS + "**"):
+                if not cls.permitted_root_line(source, line):
+                    return "documentation root"
+            if any(piece in (directory, directory + "/", directory + "/*", directory + "/**")
+                   for directory in directories):
+                return "containing directory"
+            segment = piece.rsplit("/", 1)[-1]
+            if any(char in segment for char in "*?[") and segment.endswith(target.suffix):
+                return "extension pattern"
+        return None
+
+    @classmethod
+    def inventory_errors(cls, root):
+        listed = cls.entries(root)
+        tracked = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True, check=True,
+                                 timeout=10).stdout.decode().split("\0")
+        errors = []
+        for source in tracked:
+            # The inventory declares exceptions; it is not a consumer of the data it lists.
+            if not source or source == cls.LIST or source.startswith(cls.DOCS) or source.endswith(".md"):
+                continue
+            for number, line in enumerate((root / source).read_bytes().decode("utf-8", errors="replace").splitlines(), 1):
+                for path in listed:
+                    reason = cls.naming_error(source, line, path)
+                    if reason:
+                        errors.append(f"{source}:{number}: {reason} names {path}")
+        return errors
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = pathlib.Path(self.temp.name)
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
+        self.env.update(NO_AUTO_MAINTENANCE)
+        self.git("init", "-q", "-b", "main")
+        self.write(self.LIST, self.DATA + " # Historical exclusions, not read by source.\n")
+        self.write(self.DATA, "CHANGELOG.md\thistorical exclusion\n")
+        self.write("CHANGELOG.md", "# Changes\n")
+        self.classifier = self.repo / "scripts/ci-docs-only.sh"
+        shutil.copy(REPO_ROOT / "scripts/ci-docs-only.sh", self.classifier)
+        (self.repo / "tests").mkdir()
+        shutil.copy(REPO_ROOT / "tests/documented_verb_counts.py", self.repo / "tests/documented_verb_counts.py")
+        self.base = self.commit("base")
+
+    def git(self, *args):
+        return subprocess.run(["git", "-c", "core.hooksPath=" + os.devnull, *args], cwd=self.repo,
+                              env=self.env, text=True, capture_output=True, timeout=10, check=True).stdout.strip()
+
+    def write(self, path, text):
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+
+    def commit(self, message):
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def classify_change(self):
+        self.write("CHANGELOG.md", "# Changes\n\nA documented change.\n")
+        head = self.commit("changelog")
+        result = subprocess.run(["bash", str(self.classifier), self.base, head], cwd=self.repo,
+                                env=self.env, text=True, capture_output=True, timeout=30, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip(), result.stderr
+
+    def test_listed_changelog_takes_documentation_lane(self):
+        verdict, reasons = self.classify_change()
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: CHANGELOG.md", reasons)
+
+    def test_inert_list_reader_does_not_execute_checkout_modules(self):
+        """A Python stdin reader must not execute import-shadowing modules from the checkout."""
+        marker = self.repo / "inert-reader-shadow-imported"
+        self.write("re.py", 'with open("inert-reader-shadow-imported", "w") as marker:\n'
+                            '    marker.write("checkout module executed\\n")\n')
+        source = self.classifier.read_text()
+        scanner_call = '    python3 -P "$scanner" --published-markdown "$path" < /dev/null'
+        self.assertEqual(source.count(scanner_call), 1)
+        # The existing scanner is a separate import site; only the new stdin reader is under test here.
+        self.classifier.write_text(source.replace(scanner_call, "    false"))
+        self.env.pop("PYTHONPATH", None)
+        self.env.pop("PYTHONSAFEPATH", None)
+        self.base = self.commit("checkout shadow module and isolated reader")
+        verdict, reasons = self.classify_change()
+        self.assertFalse(marker.exists(), "the inert-list reader imported the checkout's re.py")
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: CHANGELOG.md", reasons)
+
+    def test_unlisted_changelog_takes_full_suite(self):
+        self.write(self.LIST, "# No exceptions.\n")
+        self.base = self.commit("unlisted")
+        verdict, reasons = self.classify_change()
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("named by a non-Markdown file", reasons)
+
+    def test_unreadable_or_malformed_list_takes_full_suite(self):
+        malformed = ["missing", self.DATA + "\n", self.DATA + " # \n",
+                     "elsewhere/file.tsv # Outside documentation\n",
+                     self.DOCS + "testing/../file.tsv # Traversal\n",
+                     self.DOCS + "testing/file.json # Wrong extension\n"]
+        for content in malformed:
+            with self.subTest(content=content):
+                if content == "missing":
+                    (self.repo / self.LIST).unlink(missing_ok=True)
+                else:
+                    self.write(self.LIST, content)
+                self.base = self.commit("invalid list")
+                self.write("CHANGELOG.md", "# Before\n")
+                self.base = self.commit("before markdown change")
+                verdict, reasons = self.classify_change()
+                self.assertEqual(verdict, "false", reasons)
+                self.assertIn("cannot read or parse inert documentation data list", reasons)
+
+    def test_inventory_rejects_non_documentation_and_other_extensions(self):
+        for path in ("elsewhere/file.tsv", self.DOCS + "testing/file.json"):
+            with self.subTest(path=path):
+                self.write(path, "data\n")
+                self.write(self.LIST, path + " # Invalid location or extension\n")
+                with self.assertRaises(ValueError):
+                    self.inventory_errors(self.repo)
+
+    def assert_reader_rejected(self, text):
+        self.write("scripts/consumer.txt", text + "\n")
+        self.git("add", "scripts/consumer.txt")
+        errors = self.inventory_errors(self.repo)
+        self.assertTrue(any(error.startswith("scripts/consumer.txt:1:") for error in errors), errors)
+
+    def test_inventory_rejects_file_directory_and_extension_readers(self):
+        directory = self.DOCS + "testing"
+        suffix = pathlib.PurePosixPath(self.DATA).suffix
+        for text in (pathlib.PurePosixPath(self.DATA).name, self.DATA, directory, directory + "/",
+                     directory + "/*", directory + "/**", "*" + suffix, "?" + suffix,
+                     "row[ab]" + suffix, self.DOCS + "**/*" + suffix):
+            with self.subTest(text=text):
+                self.assert_reader_rejected(text)
+
+    def test_inventory_rejects_root_readers_except_exact_documented_lines(self):
+        for text in (self.DOCS, self.DOCS + "*", self.DOCS + "**"):
+            with self.subTest(text=text):
+                self.assert_reader_rejected(text)
+        for source in ("Makefile", "deno.json", ".github/workflows/ci.yml", "scripts/ci.sh"):
+            self.assertIsNotNone(self.naming_error(source, "cat " + self.DOCS, self.DATA))
+        permitted = {
+            "Makefile": ["deno fmt " + self.DOCS, "deno fmt --check " + self.DOCS],
+            "deno.json": ['"include": ["' + self.DOCS + '", "README.md", "CLAUDE.md", "AGENTS.md"],'],
+            ".github/workflows/ci.yml": [
+                "# Pull requests from this repository's `split/` and `" + self.DOCS + "` branches run",
+                "|| startsWith(github.head_ref, '" + self.DOCS + "'))"],
+            "scripts/ci.sh": ["# Reads Markdown under " + self.DOCS
+                              + ", crates/ and scripts/ by content, so the documentation lane must run it."],
+        }
+        for source, lines in permitted.items():
+            for line in lines:
+                with self.subTest(source=source, line=line):
+                    self.assertIsNone(self.naming_error(source, line, self.DATA))
+                    self.assertIsNotNone(self.naming_error("scripts/consumer.txt", line, self.DATA))
+                    self.assertIsNotNone(self.naming_error(source, line + " extra", self.DATA))
+
+    def test_inventory_rejects_list_and_variable_path_pieces(self):
+        directory = self.DOCS + "testing"
+        for text in ("{" + directory + ",elsewhere}", "[" + directory + ",elsewhere]",
+                     "elsewhere," + directory, "${ROOT}/" + directory,
+                     self.DOCS + "{testing,guide}", "*." + "{tsv,csv}", "[*" + ".tsv,*" + ".csv]",
+                     "${ROOT}/*" + ".tsv", "elsewhere,*" + ".tsv"):
+            with self.subTest(text=text):
+                self.assert_reader_rejected(text)
+
+    def test_inventory_normalizes_relative_and_punctuated_path_pieces(self):
+        directory = self.DOCS + "testing"
+        for text in ("./" + directory, "../../" + directory, "/" + directory,
+                     "[../" + directory + "].", directory + ".", directory + ","):
+            with self.subTest(text=text):
+                self.assert_reader_rejected(text)
+
+    def test_longer_paths_do_not_name_containing_directories(self):
+        for text in ("docs/testing/sibling.csv", self.DOCS + "testing-extra", self.DOCS + "testing/other/file"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.naming_error("scripts/consumer.txt", text, self.DATA))
+
+    def test_repository_inventory_has_no_source_readers(self):
+        self.assertNotEqual(self.entries(REPO_ROOT), [])
+        self.assertEqual(self.inventory_errors(REPO_ROOT), [])
+
+
+
+class OptionalWorkflowCodexSkipTests(unittest.TestCase):
+    """Optional pull-request workflows skip own codex/ pull requests and still run on the merged tree."""
+
+    SKIP = ("${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'codex/') "
+            "&& github.event.pull_request.head.repo.full_name == github.repository) }}")
+    JOBS = {
+        "bench-pipeline.yml": "pipeline-gate",
+        "tz-database-audit.yml": "tz-database-audit",
+        "sqlite-capacity.yml": "sqlite-capacity",
+        "bench-1m.yml": "ann-ci-gate",
+        "bench-track.yml": "changes",
+    }
+    # Each of these has a pull_request trigger with paths and a push trigger on integration/** with the same paths.
+    INTEGRATION_PUSH = ("bench-pipeline.yml", "tz-database-audit.yml", "sqlite-capacity.yml", "bench-1m.yml")
+
+    def evaluate(self, event_name, head_ref, head_repo, repository="ohdearquant/khive"):
+        expression = self.SKIP.removeprefix("${{ ").removesuffix(" }}")
+        for name, local in {
+            "github.event.pull_request.head.repo.full_name": "head_repo",
+            "github.event_name": "event_name",
+            "github.head_ref": "head_ref",
+            "github.repository": "repository",
+        }.items():
+            expression = expression.replace(name, local)
+        expression = expression.replace("!(", "not (").replace("startsWith(", "starts_with(")
+        expression = expression.replace("&&", " and ")
+        self.assertNotRegex(expression, r"github\.|!", "an unmapped name or operator is left in the expression")
+
+        def starts_with(value, prefix):
+            # GitHub's startsWith is case-insensitive and treats null as "".
+            return (value or "").lower().startswith(prefix.lower())
+
+        scope = {"starts_with": starts_with, "event_name": event_name, "head_ref": head_ref,
+                 "head_repo": head_repo, "repository": repository}
+        return eval(expression, {"__builtins__": {}}, scope)
+
+    def trigger(self, text, event):
+        return indented_block(indented_block(text, "on", 0), event, 2)
+
+    def paths(self, block):
+        return [line.strip() for line in indented_block(block, "paths", 4).splitlines()
+                if line.strip().startswith("- ")]
+
+    def test_each_optional_job_carries_the_codex_skip(self):
+        for workflow, job in self.JOBS.items():
+            with self.subTest(workflow=workflow):
+                block = indented_block(workflow_text(workflow), job, 2)
+                self.assertEqual(re.findall(r"(?m)^    if: (.+)$", block), [self.SKIP])
+
+    def test_the_skip_applies_to_own_codex_pull_requests_only(self):
+        self.assertFalse(self.evaluate("pull_request", "codex/change", "ohdearquant/khive"))
+        self.assertFalse(self.evaluate("pull_request", "Codex/change", "ohdearquant/khive"))
+        for event_name, head_ref, head_repo in (
+                ("pull_request", "codex/change", "contributor/khive"),
+                ("pull_request", "codex/change", None),
+                ("pull_request", "feature/codex/x", "ohdearquant/khive"),
+                ("pull_request", "batch/1", "ohdearquant/khive"),
+                ("push", "", None), ("workflow_dispatch", "", None)):
+            with self.subTest(event_name=event_name, head_ref=head_ref, head_repo=head_repo):
+                self.assertTrue(self.evaluate(event_name, head_ref, head_repo))
+
+    def test_skipped_workflows_run_on_integration_pushes_with_their_pull_request_paths(self):
+        for workflow in self.INTEGRATION_PUSH:
+            with self.subTest(workflow=workflow):
+                text = workflow_text(workflow)
+                push = self.trigger(text, "push")
+                branches = re.search(r"(?m)^    branches: \[(.*)\]$", push)
+                self.assertIsNotNone(branches)
+                self.assertIn('"integration/**"', branches.group(1))
+                self.assertTrue(self.paths(push))
+                self.assertEqual(self.paths(push), self.paths(self.trigger(text, "pull_request")))
+
+    def test_bench_track_publishes_from_main_only(self):
+        # A merge train's push runs the components of its dependents closure (ADR-206 Amendment 1). The
+        # performance ledger is written from main and release tags only, so every step that publishes
+        # carries that ref guard, and the e2e job, which the train does not run, excludes integration pushes.
+        text = workflow_text("bench-track.yml")
+        push = self.trigger(text, "push")
+        self.assertEqual(re.findall(r"(?m)^    branches: (.+)$", push), ['["integration/train-*"]'])
+        guard = "(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))"
+        for workflow in ("bench-track.yml", "bench-component.yml"):
+            steps = re.split(r"(?m)^      - ", workflow_text(workflow))[1:]
+            publishing = [step for step in steps if "run: bash scripts/perf/publish_ledger.sh" in step]
+            with self.subTest(workflow=workflow):
+                self.assertEqual(len(publishing), 1)
+                condition = re.search(r"(?m)^        if: (.+)$", publishing[0])
+                self.assertIsNotNone(condition)
+                self.assertIn(guard, condition.group(1))
+        e2e = indented_block(indented_block(text, "jobs", 0), "e2e", 2)
+        self.assertIn("!(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/integration/'))", e2e)
+
+
+class PipelineGateCacheTests(unittest.TestCase):
+    """A pull request run can restore only a cache saved by its own ref or by main, so the pipeline gate saves
+    from main alone and main pushes run it; without that every run builds from cold against the time limit."""
+
+    def test_main_pushes_run_the_gate_and_only_main_saves_its_cache(self):
+        text = workflow_text("bench-pipeline.yml")
+        push = indented_block(indented_block(text, "on", 0), "push", 2)
+        branches = re.search(r"(?m)^    branches: \[(.*)\]$", push)
+        self.assertIsNotNone(branches)
+        self.assertIn('"main"', branches.group(1))
+        job = indented_block(indented_block(text, "jobs", 0), "pipeline-gate", 2)
+        caches = [step for step in re.split(r"(?m)^      - ", job)[1:] if step.startswith("uses: Swatinem/rust-cache@")]
+        self.assertEqual(len(caches), 1)
+        self.assertEqual(re.findall(r"(?m)^          save-if: (.+)$", caches[0]),
+                         ["${{ github.ref == 'refs/heads/main' }}"])
+        self.assertEqual(re.findall(r"(?m)^    timeout-minutes: (.+)$", job), ["25"])
+
+
+class BenchmarkInventoryTests(unittest.TestCase):
+    @staticmethod
+    @functools.cache
+    def inventory(workspace: pathlib.Path) -> tuple[dict[str, pathlib.Path], set[str], list[str]]:
+        """Discover the workflow's Cargo targets once, without resolving or building dependencies."""
+        import tomllib
+
+        result = subprocess.run(
+            ["cargo", "metadata", "--no-deps", "--format-version", "1", "--offline"],
+            cwd=workspace, capture_output=True, text=True, timeout=60, check=True,
+        )
+        packages, benchmarked, offenders = {}, set(), []
+        library_kinds = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
+        for package in json.loads(result.stdout)["packages"]:
+            name = package["name"]
+            manifest = pathlib.Path(package["manifest_path"])
+            packages[name] = manifest
+            kinds = {kind for target in package["targets"] for kind in target["kind"]}
+            if "bench" not in kinds:
+                continue
+            benchmarked.add(name)
+            # Metadata decides whether a library exists, including autolib=false and custom paths.
+            # It does not expose the library's `bench` flag, so read only that setting from TOML.
+            if kinds & library_kinds:
+                data = tomllib.loads(manifest.read_text())
+                if data.get("lib", {}).get("bench", True) is not False:
+                    offenders.append(name)
+        return packages, benchmarked, sorted(offenders)
+
+    def test_benchmark_inventory_uses_cargo_target_discovery(self):
+        # Real manifests exercise Cargo's discovery rather than hard-coding metadata-shaped answers.
+        cases = {
+            "nested-default": ("", "", ["src/lib.rs", "benches/nested/main.rs"]),
+            "disabled-lib": ('autolib = false\n', "",
+                             ["src/lib.rs", "src/main.rs", "benches/flat.rs"]),
+            "explicit-lib": ('autolib = false\n', '[lib]\npath = "library/entry.rs"\nbench = false\n',
+                             ["library/entry.rs", "benches/nested/main.rs"]),
+            "plain-lib": ("", "", ["src/lib.rs"]),
+            "disabled-benches": ('autobenches = false\n', "",
+                                 ["src/lib.rs", "benches/decoy.rs", "benches/nested/main.rs"]),
+            "explicit-bench": ('autobenches = false\n',
+                               '[lib]\nbench = false\n[[bench]]\nname = "manual"\n'
+                               'path = "perf/main.rs"\nharness = false\n',
+                               ["src/lib.rs", "perf/main.rs"]),
+            "rlib-default": ("", '[lib]\ncrate-type = ["rlib"]\n',
+                             ["src/lib.rs", "benches/flat.rs"]),
+            "library-example": ('autolib = false\n',
+                                '[[example]]\nname = "demo"\ncrate-type = ["lib"]\n',
+                                ["src/main.rs", "examples/demo.rs", "benches/flat.rs"]),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "Cargo.toml").write_text(
+                '[workspace]\nresolver = "2"\nmembers = ' + json.dumps(list(cases)) + '\n')
+            for name, (settings, targets, files) in cases.items():
+                package = root / name
+                package.mkdir()
+                (package / "Cargo.toml").write_text(
+                    f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2021"\n'
+                    + settings + targets)
+                for file in files:
+                    path = package / file
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("fn main() {}\n")
+            packages, benchmarked, offenders = self.inventory(root)
+            self.assertEqual(set(packages), set(cases))
+            self.assertEqual(benchmarked, {
+                "nested-default", "disabled-lib", "explicit-lib", "explicit-bench",
+                "rlib-default", "library-example",
+            })
+            self.assertEqual(offenders, ["nested-default", "rlib-default"])
 
 
 if __name__ == "__main__":

@@ -1,6 +1,5 @@
 //! Shared SQL helpers and row-to-type converters for knowledge handlers.
 
-use chrono::Utc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -52,11 +51,27 @@ pub(super) fn is_stop(w: &str) -> bool {
 
 // ─── content hash and validation ─────────────────────────────────────────────
 
-/// Minimum section content length in bytes.
+/// Minimum section content length in Unicode scalar values.
 pub(super) const MIN_SECTION_CONTENT_LEN: usize = 80;
 
 /// Minimum atom content length in words.
 pub(super) const MIN_ATOM_CONTENT_WORDS: usize = 20;
+
+/// SQL predicate on `knowledge_sections.section_type` that leaves out rows typed with a
+/// retired section type (ADR-048, 2026-10-04 amendment). Stored rows keep their retired
+/// type unchanged, under any spelling the earlier alias table resolved to it, so every
+/// query that reads sections for serving appends this predicate. It normalizes the stored
+/// value the way `SectionType::normalize_name` does (Unicode whitespace trimmed, each
+/// character listed by code point, `-` and space mapped to `_`, ASCII lowercased) and
+/// compares the result with every retired spelling. Unit tests pin it to
+/// `SectionType::RETIRED_SPELLINGS`, to the characters `str::trim` removes, and to
+/// `SectionType::normalize_name` on the same inputs.
+pub(super) const SERVABLE_SECTION: &str = "lower(replace(replace(trim(section_type, \
+     char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, \
+     8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)), '-', '_'), ' ', '_')) \
+     NOT IN ('references', 'reference', 'bibliography', 'related', 'see_also', \
+     'further_reading', 'citations', 'links', 'other', 'misc', 'miscellaneous', 'notes', \
+     'appendix')";
 
 /// Compute sha256(content)[:16] as a hex string for dedup keying.
 pub(super) fn content_hash(content: &str) -> String {
@@ -68,11 +83,11 @@ pub(super) fn content_hash(content: &str) -> String {
 
 /// Validate that section content meets the 80-character minimum.
 pub(super) fn validate_section_content(content: &str) -> Result<(), RuntimeError> {
-    if content.len() < MIN_SECTION_CONTENT_LEN {
+    let character_count = content.chars().count();
+    if character_count < MIN_SECTION_CONTENT_LEN {
         return Err(RuntimeError::InvalidInput(format!(
             "section content must be at least {} characters (got {})",
-            MIN_SECTION_CONTENT_LEN,
-            content.len()
+            MIN_SECTION_CONTENT_LEN, character_count
         )));
     }
     Ok(())
@@ -93,13 +108,10 @@ pub(super) fn validate_atom_content(content: &str) -> Result<(), RuntimeError> {
 // ─── error helpers ───────────────────────────────────────────────────────────
 
 pub(super) fn sql_err(ctx: &str, e: impl std::fmt::Display) -> RuntimeError {
-    RuntimeError::Internal(format!("{ctx}: {e}"))
+    RuntimeError::internal_with_context(ctx, e)
 }
 
-pub(super) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params)
-        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
-}
+pub(super) use khive_runtime::deser_params as deser;
 
 // ─── token estimation ────────────────────────────────────────────────────────
 
@@ -118,9 +130,7 @@ pub(super) fn estimate_compose_item_tokens(title: &str, content: &str) -> usize 
 
 // ─── SQL helpers ─────────────────────────────────────────────────────────────
 
-pub(super) fn now_us() -> i64 {
-    Utc::now().timestamp_micros()
-}
+pub(super) use khive_storage::now_micros as now_us;
 
 pub(super) fn new_id() -> String {
     Uuid::new_v4().to_string()
@@ -133,22 +143,22 @@ pub(super) fn tags_to_json(tags: Option<&Vec<String>>) -> String {
     }
 }
 
+/// Classify valid stored tag arrays by exact element, retaining the historical
+/// guard for malformed or non-array legacy tag text.
+pub(super) fn has_domain_mirror_tag(tags: &str) -> bool {
+    khive_types::tag_contains(tags, "type:domain")
+}
+
 pub(super) fn row_str(row: &khive_storage::types::SqlRow, col: &str) -> Option<String> {
-    match row.get(col) {
-        Some(SqlValue::Text(s)) => Some(s.clone()),
-        _ => None,
-    }
+    row.text_or_none(col).map(str::to_owned)
 }
 
 pub(super) fn row_i64(row: &khive_storage::types::SqlRow, col: &str) -> Option<i64> {
-    match row.get(col) {
-        Some(SqlValue::Integer(n)) => Some(*n),
-        _ => None,
-    }
+    row.i64_or_none(col)
 }
 
 pub(super) fn row_bool(row: &khive_storage::types::SqlRow, col: &str) -> bool {
-    matches!(row.get(col), Some(SqlValue::Integer(1)))
+    row.i64_or_none(col) == Some(1)
 }
 
 pub(crate) fn atom_from_row(row: &khive_storage::types::SqlRow) -> Option<Atom> {
@@ -350,7 +360,7 @@ pub(super) async fn resolve_atom_id(
         // value's canonical form, not the spelling the caller used.
         reader
             .query_row(SqlStatement {
-                sql: "SELECT id FROM knowledge_atoms WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                sql: khive_runtime::sql!("knowledge_atom_resolve_id").into(),
                 params: vec![
                     SqlValue::Text(uuid.as_hyphenated().to_string()),
                     SqlValue::Text(ns.to_owned()),
@@ -362,7 +372,7 @@ pub(super) async fn resolve_atom_id(
     } else {
         reader
             .query_row(SqlStatement {
-                sql: "SELECT id FROM knowledge_atoms WHERE slug = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                sql: khive_runtime::sql!("knowledge_atom_resolve_slug").into(),
                 params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.to_owned())],
                 label: None,
             })
@@ -399,14 +409,14 @@ pub(super) async fn compute_embedding_coverage(
         .await
         .map_err(|e| sql_err("stats embedding coverage reader", e))?;
 
-    let count = reader
-        .query_scalar(SqlStatement {
+    let atoms_with_vector = reader
+        .count(SqlStatement {
             sql: format!(
                 "SELECT COUNT(DISTINCT a.id) \
                  FROM knowledge_atoms a \
                  WHERE a.namespace = ?1 \
                    AND a.deleted_at IS NULL \
-                   AND a.tags NOT LIKE '%type:domain%' \
+                   AND NOT khive_tag_contains(a.tags, 'type:domain') \
                    AND a.id IN ( \
                        SELECT v.subject_id FROM {table_name} v \
                        WHERE v.namespace = ?1 \
@@ -420,15 +430,9 @@ pub(super) async fn compute_embedding_coverage(
         .await
         .map_err(|e| sql_err("stats embedding coverage", e))?;
 
-    let atoms_with_vector = match count {
-        Some(SqlValue::Integer(n)) => n,
-        Some(other) => {
-            return Err(RuntimeError::Internal(format!(
-                "stats embedding coverage returned non-integer count: {other:?}"
-            )));
-        }
-        None => 0,
-    };
-
     Ok(atoms_with_vector as f64 / total_atoms as f64)
 }
+
+#[cfg(test)]
+#[path = "util_tests.rs"]
+mod tests;

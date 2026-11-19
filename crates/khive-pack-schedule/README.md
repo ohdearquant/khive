@@ -59,7 +59,25 @@ On the MCP surface, the host decorates `schedule.agenda` with
 and then advances on every tick, including empty agendas. The value is process-local and
 never stored with schedule intent, so restarting the server resets it instead of exposing
 a predecessor's heartbeat as current liveness. Direct `SchedulePack` registry dispatch has
-no host loop to report and therefore retains the pack-only `{events, count}` result.
+no host loop to report and therefore returns the pack-only `{events, count, next}` result.
+
+`schedule.agenda` applies inclusive RFC 3339 `from` and `to` bounds and orders pending
+events by UTC trigger instant, stored timestamp text, then UUID. To continue past a full page, pass both
+`after` and `after_id` from the returned `next` object, retaining the same time window.
+Preserve the returned `after` text verbatim. The continuation excludes that exact
+`(instant, stored timestamp text, UUID)` tuple and every earlier tuple,
+so events sharing one trigger instant can span any number of pages. Missing half of
+the pair, an invalid timestamp or an invalid UUID is refused.
+
+Every nonempty page returns `next={after, after_id}` for its last event. This is a
+position, not a promise that another row exists. Continue until an empty page returns
+`next=null`. Calls without continuation keep their existing rows and ordering. Paging
+does not pin a snapshot; concurrently created, fired or cancelled events can change
+later pages.
+
+Default Agent JSON preserves the continuation's original timestamp text and full
+UUID, and keeps the empty-page completion fields. Event metadata keeps its usual
+presentation.
 
 To inspect scheduled events by state and creator, use the KG `list` verb:
 

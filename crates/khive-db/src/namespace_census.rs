@@ -356,13 +356,23 @@ fn index_key_columns(conn: &Connection, index: &str) -> rusqlite::Result<Vec<Opt
 
 /// The tables a move must not write, whatever the census finds.
 ///
-/// `events` is the record of what happened under the namespace it happened
+/// `events` and `weight_events` record what happened under the namespace it happened
 /// under. The two `ann_consumer_*` tables are excluded by the write-log
 /// decision: the log is appended to at a fresh `seq` and no watermark is edited,
 /// so moving a watermark would claim a consumer is caught up on entries it has
-/// never seen.
-pub const TABLES_EXCLUDED_FROM_MOVE: &[&str] =
-    &["events", "ann_consumer_watermark", "ann_consumer_pending"];
+/// never seen. `retrieval_snapshots` is only deleted from, never written for a
+/// target, so its `(namespace, index_type)` key has nothing to collide with.
+/// Stream floors and truncation permits retain their original stream identity;
+/// a subject move leaves both tables behind and reports their remaining rows.
+pub const TABLES_EXCLUDED_FROM_MOVE: &[&str] = &[
+    "events",
+    "weight_events",
+    "ann_consumer_watermark",
+    "ann_consumer_pending",
+    "retrieval_snapshots",
+    "note_stream_floors",
+    "note_stream_truncations",
+];
 
 /// `note_streams` is read by a move and never written by one. Four triggers in
 /// the stream schema abort an `UPDATE` of a member note's namespace, the delete,
@@ -391,7 +401,7 @@ pub fn reachable_constraints(census: &NamespaceCensus) -> Vec<&NamespaceConstrai
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations::run_migrations;
+    use crate::migrations::run_migrations_for_test as run_migrations;
 
     fn migrated() -> Connection {
         let mut conn = Connection::open_in_memory().expect("in-memory connection");
@@ -440,6 +450,8 @@ mod tests {
             "ann_consumer_watermark",
             "ann_consumer_pending",
             "note_streams",
+            "note_stream_floors",
+            "note_stream_truncations",
             "fts_notes_rowids",
             "fts_entities_rowids",
         ] {
@@ -603,6 +615,8 @@ mod tests {
 
         for out_of_reach in [
             "note_streams",
+            "note_stream_floors",
+            "note_stream_truncations",
             "ann_consumer_watermark",
             "ann_consumer_pending",
         ] {

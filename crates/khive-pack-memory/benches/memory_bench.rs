@@ -5,6 +5,9 @@
 //! cd crates && cargo bench -p khive-pack-memory --bench memory_bench
 //! ```
 
+#[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
+mod receipt_credentials;
+
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use khive_pack_kg::KgPack;
 use khive_pack_memory::MemoryPack;
@@ -24,7 +27,9 @@ fn make_runtime() -> KhiveRuntime {
 fn make_registry(rt: KhiveRuntime) -> khive_runtime::VerbRegistry {
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt),
+    ));
     builder.build().expect("registry builds")
 }
 

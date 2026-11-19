@@ -1,5 +1,7 @@
 //! Event storage capability — append-only operation log.
 
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -9,7 +11,7 @@ use khive_types::{EventKind, EventOutcome, RefResolution, SubstrateKind};
 
 use crate::capability::StorageCapability;
 use crate::error::StorageError;
-use crate::types::{BatchWriteSummary, Page, PageRequest, StorageResult};
+use crate::types::{BatchWriteSummary, Page, PageRequest, SqlValue, StorageResult};
 
 /// Storage-level event record. Every verb execution produces one.
 /// Immutable once appended; projection rows are written beside it at append time.
@@ -50,7 +52,7 @@ impl Event {
     ) -> Self {
         let operation = crate::operation_context::current_operation_attribution();
         Self {
-            id: Uuid::new_v4(),
+            id: Uuid::now_v7(),
             namespace: namespace.into(),
             verb: verb.into(),
             substrate,
@@ -183,7 +185,33 @@ pub struct EventView {
     pub observations: Vec<EventObservation>,
 }
 
+/// Closed grouping keys for storage-level event counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventGroupBy {
+    /// Exact stored verb name.
+    Verb,
+    /// Canonical stored event kind.
+    Kind,
+    /// Exact stored actor attribution.
+    Actor,
+}
+
+impl EventGroupBy {
+    /// Return the fixed stored column name; never caller-supplied SQL.
+    pub const fn column(self) -> &'static str {
+        match self {
+            Self::Verb => "verb",
+            Self::Kind => "kind",
+            Self::Actor => "actor",
+        }
+    }
+}
+
 /// Filter for querying events. Namespace is implicit in the scoped EventStore.
+///
+/// New fields deserialize to defaults for older serialized filters. Complete
+/// external Rust struct literals must specify them or use `..Default::default()`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EventFilter {
     pub ids: Vec<Uuid>,
@@ -200,6 +228,70 @@ pub struct EventFilter {
     pub observed: Vec<Uuid>,
     pub selected: Vec<Uuid>,
     pub payload_proposal_id: Option<Uuid>,
+    /// Exact outcome; no restriction when absent.
+    #[serde(default)]
+    pub outcome: Option<EventOutcome>,
+    /// ANDed SQL JSON equalities; see [`EventFilter::payload_eq`].
+    #[serde(default)]
+    pub payload_equalities: Vec<(String, SqlValue)>,
+}
+
+impl EventFilter {
+    /// Match one outcome, replacing any previous outcome selection.
+    pub fn outcome(mut self, outcome: EventOutcome) -> Self {
+        self.outcome = Some(outcome);
+        self
+    }
+
+    /// Require SQL `json_extract(payload, path) = value` equality.
+    ///
+    /// Paths must be `$.field[.subfield]` with nonempty ASCII alphanumeric or
+    /// underscore segments; queries reject other paths. Calls are ANDed.
+    /// SQL NULL matches neither a missing field nor explicit JSON null.
+    /// JSON booleans compare as 0/1, including numeric coercion. JSON objects
+    /// and arrays compare their serialized SQL text, not structural JSON equality.
+    pub fn payload_eq(mut self, path: impl Into<String>, value: SqlValue) -> Self {
+        self.payload_equalities.push((path.into(), value));
+        self
+    }
+}
+
+/// Persisted ordering key; the physical UUID spelling is not normalized.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventOrderKey {
+    pub created_at_us: i64,
+    pub physical_id: String,
+}
+
+/// Count-free ascending window within one scoped event store.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventPageQuery {
+    pub since_us: i64,
+    pub until_us: i64,
+    pub kinds: Vec<EventKind>,
+    pub actors: Vec<String>,
+    pub exclude_namespaces: Vec<String>,
+    pub after: Option<EventOrderKey>,
+    pub max_rows: u32,
+}
+
+/// A decoded event with its exact persisted seek key.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventPageRow {
+    pub event: Event,
+    pub order_key: EventOrderKey,
+}
+
+/// A bounded prefix, without a count of the complete matching window.
+///
+/// `budget_stop` names the row the leaf did not return because reading it would
+/// pass the leaf's raw-text budget; `rows` then holds every row ordered before it,
+/// whole, and is shorter than the requested row bound.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventPageWindow {
+    pub rows: Vec<EventPageRow>,
+    #[serde(default)]
+    pub budget_stop: Option<EventOrderKey>,
 }
 
 /// Per-row outcome of an [`EventStore::append_events_idempotent`] call, in
@@ -241,8 +333,36 @@ pub trait EventStore: Send + Sync + 'static {
         filter: EventFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Event>>;
+    /// Read at most 4096 rows in ascending physical time/ID order, without counting.
+    /// Filters and exclusions apply before the row bound. A backend must refuse
+    /// unsupported paging rather than substitute an offset query.
+    async fn query_event_page(&self, query: EventPageQuery) -> StorageResult<EventPageWindow> {
+        let _ = query;
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Events,
+            operation: "query_event_page".into(),
+            message: "this EventStore backend does not implement query_event_page".into(),
+        })
+    }
+
     /// Count events matching a filter.
     async fn count_events(&self, filter: EventFilter) -> StorageResult<u64>;
+
+    /// Count matching rows per stored verb, kind, or actor in this store's namespace.
+    /// Empty groups are omitted. Backends must aggregate in storage rather than
+    /// substitute a bounded row query that could silently undercount.
+    async fn count_events_grouped(
+        &self,
+        filter: EventFilter,
+        group_by: EventGroupBy,
+    ) -> StorageResult<BTreeMap<String, u64>> {
+        let _ = (filter, group_by);
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Events,
+            operation: "count_events_grouped".into(),
+            message: "this EventStore backend does not implement grouped counts".into(),
+        })
+    }
 
     /// Validate `event` against the exact insert/observation shape the
     /// backend would build at append time, performing no I/O. Rejects a
@@ -299,22 +419,5 @@ pub trait EventStore: Send + Sync + 'static {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn event_filter_target_id_roundtrips_and_defaults_for_legacy_frames() {
-        let target = Uuid::new_v4();
-        let filter = EventFilter {
-            target_id: Some(target),
-            ..EventFilter::default()
-        };
-        let mut wire = serde_json::to_value(&filter).unwrap();
-        assert_eq!(wire["target_id"], target.to_string());
-        let decoded: EventFilter = serde_json::from_value(wire.clone()).unwrap();
-        assert_eq!(decoded.target_id, Some(target));
-        wire.as_object_mut().unwrap().remove("target_id");
-        let legacy: EventFilter = serde_json::from_value(wire).unwrap();
-        assert_eq!(legacy.target_id, None);
-    }
-}
+#[path = "event/tests.rs"]
+mod tests;

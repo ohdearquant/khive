@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use khive_fusion::FusionStrategy;
 use khive_runtime::RuntimeError;
-use khive_storage::types::{TextGatherMode, TextSearchOptions};
+use khive_storage::types::TextSearchOptions;
 
 /// Error returned when `min_score` is outside the accepted dual-scale range.
 #[derive(Debug, Clone)]
@@ -95,9 +95,10 @@ pub struct RecallConfig {
     /// Pass `Some(1)` to disable widening entirely.
     pub ann_overfetch_max_rounds: Option<usize>,
 
-    /// Bounded wait (milliseconds) for a cold-miss `ensure_ann_for_model` call
-    /// on the recall path before degrading that model's contribution to
-    /// FTS-only (#836). When `None`, falls back to the
+    /// Bounded receiver wait (milliseconds) for detached writable cold-miss
+    /// Warm work, including queued admission. Expiry drops only the receiver;
+    /// tracked work can continue. Not-ready results use degraded FTS/bounded
+    /// fresh-tail recall (#836). When `None`, falls back to the
     /// `KHIVE_MEMORY_ANN_READY_TIMEOUT_MS` env var (default 8000ms — see
     /// `handlers::common::ann_ready_timeout_ms`).
     ///
@@ -141,25 +142,8 @@ pub enum RecallFtsSelectionRule {
     HighestIdf,
 }
 
-/// Pack-level alias for the DB gather mode enum, serializable identically.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RecallFtsGatherMode {
-    #[default]
-    Ranked,
-    Unranked,
-    RankWithinCap,
-}
-
-impl From<RecallFtsGatherMode> for TextGatherMode {
-    fn from(m: RecallFtsGatherMode) -> Self {
-        match m {
-            RecallFtsGatherMode::Ranked => TextGatherMode::Ranked,
-            RecallFtsGatherMode::Unranked => TextGatherMode::Unranked,
-            RecallFtsGatherMode::RankWithinCap => TextGatherMode::RankWithinCap,
-        }
-    }
-}
+/// Public recall path for the canonical storage gather mode, including variant imports.
+pub use khive_storage::types::TextGatherMode as RecallFtsGatherMode;
 
 /// Configuration for the FTS candidate-gather optimization (default: disabled, existing behavior).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,25 +342,13 @@ impl RecallFtsGatherConfig {
     ) -> Result<TextSearchOptions, RuntimeError> {
         let gather_limit = self.effective_gather_limit(candidate_limit)?;
         Ok(TextSearchOptions {
-            gather_mode: self.gather_mode.into(),
+            gather_mode: self.gather_mode,
             gather_limit: Some(gather_limit),
         })
     }
 }
 
-// The historical 2026-05-25 tuning artifact swept 116 configs, but the synthetic corpus
-// produced an identical recall@10 = 0.9333 for every config — i.e. a flat landscape that
-// cannot empirically distinguish these parameters. Defaults below stay at the prior values
-// until a harder corpus (embed-enabled, synonym queries, partial matches) provides signal.
-// See tests/khive-contract/tune/README.md for the retained limitation.
-//
-// Default strategy: RRF k=10 (restored 2026-07-21). CC-6 flipped this to
-// Weighted [0.7, 0.3] to let salience act as a tiebreaker, but the live golden-suite
-// sweep showed the flip regressed adversarial-paraphrase recall (hit@5 0.471 -> 0.353,
-// MRR 0.321 -> 0.153) while RRF k=10 held the holdout suite at its best tier: min-max
-// weighted fusion lets a keyword-only text hit outrank paraphrase hits visible only to
-// the vector leg. Salience still contributes through the composite score weights.
-// The RRF strategy remains available via `fusion_strategy="rrf"`.
+// Default selection rationale: crates/khive-pack-memory/docs/api/configuration.md#default-selection-rationale.
 impl Default for RecallConfig {
     fn default() -> Self {
         Self {
@@ -388,12 +360,6 @@ impl Default for RecallConfig {
             decay_model: DecayModel::default(),
             candidate_multiplier: 20,
             candidate_limit: Some(150),
-            // RRF k=10 is the calibrated default (2026-06 pen-default, reconfirmed by
-            // the 2026-07-21 live sweep). The CC-6 Weighted [0.7, 0.3] flip regressed
-            // the adversarial-paraphrase suite (hit@5 0.471 -> 0.353, MRR halved):
-            // min-max weighted fusion lets a strong text-leg score on a keyword-only
-            // match outrank paraphrase hits that only the vector leg sees. RRF's
-            // rank-based fusion is robust to that magnitude mismatch.
             fuse_strategy: FusionStrategy::Rrf { k: 10 },
             min_score: 0.0,
             min_salience: 0.0,
@@ -520,37 +486,86 @@ impl DecayModel {
 /// Per-component score contributions for a single recall result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoreBreakdown {
-    /// Raw RRF fusion score (before weighting).
+    /// The relevance the ranking composite received for this hit: the fused score after the
+    /// calibrated normalization, with no further scaling. `memory.recall_score` reports its
+    /// input after the configured fusion strategy's normalization instead.
     pub relevance: f64,
+    /// The fused score before the normalization that produced `relevance`.
+    #[serde(default)]
+    pub fused_score: f64,
     /// Raw salience from the note (before decay).
     pub salience_raw: f64,
-    /// Salience after applying the decay model.
+    /// Salience after applying the decay model. Feeds the weighted reranker and
+    /// `weighted.salience_contribution`, not the ranking composite.
     pub salience_decayed: f64,
     /// Temporal recency score (half-life decay, independent of note's own decay_factor).
+    /// Feeds the weighted reranker and `weighted.temporal_contribution`, not the ranking
+    /// composite, which uses `temporal_boost`.
     pub temporal: f64,
-    /// Weighted contributions summing to the total score.
+    /// Additive split of the `RecallConfig` weights over `relevance`, the amplified
+    /// `salience_decayed` and `temporal`: the composite `memory.recall_score` scores with. A
+    /// recall without `reranker_weights` ranks by the multiplicative composite in `composite`
+    /// instead, so in a recall these do not sum to `pre_entity_score`.
     pub weighted: WeightedContributions,
-    /// ADR-104 §3: multiplicative contribution of serve-time profile-weight
-    /// projection relative to configured-default weights for this hit —
-    /// `score_with_projected_weights / score_with_default_weights`. `1.0`
-    /// when no profile served the request (component 1 never ran) or the
-    /// default-weight score is ~0 (div-by-zero guard).
+    /// The factors of the multiplicative composite a recall ranks by when no `reranker_weights`
+    /// are configured; with them, `pre_entity_score` is the reranker output and these describe
+    /// the default composite. Absent from `memory.recall_score`, which scores additively, and
+    /// absent when the composite arithmetic fell back to a zero score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composite: Option<CompositeFactors>,
+    /// This hit's composite under the weights the serving profile's posteriors
+    /// project to, divided by its composite under the configured default weights.
+    /// Reported for the breakdown only: the hit is scored with the default weights
+    /// (see `weights_served`), so this ratio never enters `rank_score`. `1.0` when no
+    /// profile served the request or the default-weight score is ~0 (div-by-zero guard).
     pub profile_component: f64,
-    /// ADR-104 §3: the serving profile's per-entity Beta posterior mean for
-    /// this hit's UUID. `None` when no profile served the request, or the
-    /// profile holds no posterior for this UUID beyond the uninformative
-    /// prior. As of Stage B (§2), this value is not just reported: it is
-    /// the input to the bounded per-entity term
-    /// `clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15)` that
-    /// multiplies the response's `rank_score` — so a value here other than
-    /// the neutral case (`None`, or a mean of exactly 0.5) means this hit's
-    /// `rank_score` was moved by up to +/-15% relative to the same
-    /// candidate under a profile with no posterior for it.
+    /// ADR-104 Section 2: the serving profile's per-entity Beta posterior mean for this UUID.
+    /// `None` without a serving profile or without a posterior for this UUID.
+    /// With `entity_evidence_mass` it gives `entity_term`:
+    /// `t0 = clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15)`, then
+    /// `1 + (t0 - 1) * n / (n + 16)` with `n = entity_evidence_mass` (ADR-104 Amendment 6);
+    /// `None`, a mean of 0.5 or `n = 0` is neutral. See
+    /// `crates/khive-pack-memory/docs/api/configuration.md#score-breakdowns`.
     pub entity_posterior_mean: Option<f64>,
+    /// ADR-104 Amendment 6: the evidence mass `n` of the same posterior, `max(0, alpha + beta - 2)`.
+    /// Present exactly when `entity_posterior_mean` is.
+    pub entity_evidence_mass: Option<f64>,
+    /// Which weights scored this hit. Always `"default"`: a served profile scores with the
+    /// configured default weights; the weights its posteriors project to appear only in
+    /// `profile_component`.
+    #[serde(default = "default_weights_served")]
+    pub weights_served: String,
+    /// Namespace of the hit.
+    #[serde(default)]
+    pub namespace: String,
+    /// Rank score before the entity term: the weighted composite, or the weighted reranker's
+    /// output when one is configured. The 32-bit value used.
+    #[serde(default)]
+    pub pre_entity_score: f32,
+    /// Multiplier the entity posterior applied (1 when none). The 32-bit value used.
+    #[serde(default = "neutral_factor")]
+    pub entity_term: f32,
+    /// Shared-pool factor applied to this hit (1 when none). The 32-bit value used.
+    #[serde(default = "neutral_factor")]
+    pub local_factor: f32,
+    /// Amount the duplicate penalty subtracted from this hit's rank score (0 when none).
+    /// A returned hit's `rank_score` equals `pre_entity_score * entity_term * local_factor
+    /// - duplicate_penalty`, in 32-bit arithmetic, evaluated left to right.
+    #[serde(default)]
+    pub duplicate_penalty: f32,
+}
+
+fn default_weights_served() -> String {
+    "default".to_string()
+}
+
+fn neutral_factor() -> f32 {
+    1.0
 }
 
 impl ScoreBreakdown {
-    /// Total composite score.
+    /// Sum of the three additive contributions in `weighted`. A recall does not rank by this
+    /// sum; see `composite`.
     pub fn total(&self) -> f64 {
         self.weighted.relevance_contribution
             + self.weighted.salience_contribution
@@ -558,7 +573,7 @@ impl ScoreBreakdown {
     }
 }
 
-/// The three weighted components that make up the final score.
+/// The three additive components of the `RecallConfig` composite.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WeightedContributions {
     pub relevance_contribution: f64,
@@ -566,536 +581,47 @@ pub struct WeightedContributions {
     pub temporal_contribution: f64,
 }
 
+/// The factors of the default multiplicative composite. All four are the 32-bit values used, and
+/// with no `reranker_weights` configured
+/// `relevance_term * temporal_boost * salience_boost * adjustment_factor` is the hit's
+/// `pre_entity_score`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompositeFactors {
+    /// `weights.relevance × relevance`.
+    pub relevance_term: f32,
+    /// `1 + weights.temporal × recency`.
+    pub temporal_boost: f32,
+    /// `1 + weights.salience × salience`.
+    pub salience_boost: f32,
+    /// Net multiplier of the configured score adjustments and the final clamp to `[0, 1]`.
+    /// `None` when the product of the other three is not a positive finite number: the
+    /// adjustments then act on zero or less, and no multiplier describes the score they leave.
+    pub adjustment_factor: Option<f32>,
+}
+
+// ── English-only embedding models ─────────────────────────────────────────────
+
+/// Canonical names of registered embedding models that cannot read CJK text.
+///
+/// Neither lattice's `EmbeddingModel` nor the runtime's embedder registry records which
+/// languages a model covers, so the models recall must not fuse for a CJK-dominant query are
+/// named here. `all-minilm-l6-v2` uses an English WordPiece vocabulary in which most CJK
+/// characters map to `[UNK]`, so its similarity scores for CJK text carry no signal. Add the
+/// canonical name of any other model with the same limitation.
+pub(crate) const ENGLISH_ONLY_EMBEDDING_MODELS: &[&str] = &["all-minilm-l6-v2"];
+
+/// Whether `model` is listed in [`ENGLISH_ONLY_EMBEDDING_MODELS`], compared ASCII
+/// case-insensitively.
+pub(crate) fn is_english_only_embedding_model(model: &str) -> bool {
+    ENGLISH_ONLY_EMBEDDING_MODELS
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(model))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 // INLINE TEST JUSTIFICATION: tests exercise private validation methods and
 // DecayModel::apply, which are not accessible from the integration test harness.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde::Deserialize;
-
-    // ── DecayModel ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn exponential_halves_at_decay_factor_half_life() {
-        // exponential decay: salience * exp(-decay_factor * age_days)
-        // Half-life = ln(2) / decay_factor ≈ 69.3 days for decay_factor=0.01
-        let model = DecayModel::Exponential;
-        let salience = 1.0;
-        let decay_factor = 0.01;
-        let half_life_days = std::f64::consts::LN_2 / decay_factor;
-        let result = model.apply(salience, half_life_days, decay_factor, 30.0);
-        let diff = (result - 0.5).abs();
-        assert!(
-            diff < 1e-10,
-            "exponential should give 0.5 at ln(2)/decay_factor days, got {result}"
-        );
-    }
-
-    #[test]
-    fn exponential_full_salience_at_zero_age() {
-        let model = DecayModel::Exponential;
-        let result = model.apply(0.8, 0.0, 0.01, 30.0);
-        let diff = (result - 0.8).abs();
-        assert!(
-            diff < 1e-12,
-            "at age=0 salience should be unchanged, got {result}"
-        );
-    }
-
-    #[test]
-    fn exponential_uses_note_decay_factor_not_half_life() {
-        // Verify the formula uses decay_factor param, not the half_life param.
-        // At age=1 day, decay_factor=1.0 → exp(-1.0) ≈ 0.3679.
-        // If we were using half_life=10 days, exp(-ln2/10) ≈ 0.933.
-        let model = DecayModel::Exponential;
-        let result = model.apply(1.0, 1.0, 1.0, 10.0);
-        let expected = (-1.0f64).exp();
-        assert!(
-            (result - expected).abs() < 1e-12,
-            "expected {expected}, got {result}"
-        );
-    }
-
-    #[test]
-    fn hyperbolic_halves_at_one_over_decay_factor() {
-        // salience / (1 + k * age) = 0.5 when age = 1/k
-        let model = DecayModel::Hyperbolic;
-        let salience = 1.0;
-        let k = 0.05;
-        let age = 1.0 / k; // 20 days
-        let result = model.apply(salience, age, k, 30.0);
-        let diff = (result - 0.5).abs();
-        assert!(
-            diff < 1e-10,
-            "hyperbolic at age=1/k should give 0.5, got {result}"
-        );
-    }
-
-    #[test]
-    fn hyperbolic_full_salience_at_zero_age() {
-        let model = DecayModel::Hyperbolic;
-        let result = model.apply(0.7, 0.0, 0.05, 30.0);
-        let diff = (result - 0.7).abs();
-        assert!(
-            diff < 1e-12,
-            "at age=0 salience should be unchanged, got {result}"
-        );
-    }
-
-    #[test]
-    fn powerlaw_halves_at_half_life() {
-        let hl = 30.0;
-        let model = DecayModel::PowerLaw { half_life_days: hl };
-        let salience = 1.0;
-        // salience * hl / (hl + age) = 0.5 when age = hl
-        let result = model.apply(salience, hl, 0.01, hl);
-        let diff = (result - 0.5).abs();
-        assert!(
-            diff < 1e-10,
-            "power-law should give 0.5 at half-life, got {result}"
-        );
-    }
-
-    #[test]
-    fn decay_none_returns_salience_unchanged() {
-        let model = DecayModel::None;
-        let result = model.apply(0.6, 100.0, 0.99, 30.0);
-        let diff = (result - 0.6).abs();
-        assert!(
-            diff < 1e-12,
-            "None model must not alter salience, got {result}"
-        );
-    }
-
-    // ── RecallConfig ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn default_config_validates() {
-        assert!(RecallConfig::default().validate().is_ok());
-    }
-
-    #[test]
-    fn negative_relevance_weight_fails_validation() {
-        let cfg = RecallConfig {
-            relevance_weight: -0.1,
-            ..RecallConfig::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn negative_salience_weight_fails_validation() {
-        let cfg = RecallConfig {
-            salience_weight: -1.0,
-            ..RecallConfig::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn negative_temporal_weight_fails_validation() {
-        let cfg = RecallConfig {
-            temporal_weight: -0.5,
-            ..RecallConfig::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn all_zero_weights_fails_validation() {
-        let cfg = RecallConfig {
-            relevance_weight: 0.0,
-            salience_weight: 0.0,
-            temporal_weight: 0.0,
-            ..RecallConfig::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn zero_half_life_fails_validation() {
-        let cfg = RecallConfig {
-            temporal_half_life_days: 0.0,
-            ..RecallConfig::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn negative_half_life_fails_validation() {
-        let cfg = RecallConfig {
-            temporal_half_life_days: -5.0,
-            ..RecallConfig::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn non_uniform_weights_validate() {
-        let cfg = RecallConfig {
-            relevance_weight: 0.5,
-            salience_weight: 0.3,
-            temporal_weight: 0.2,
-            ..RecallConfig::default()
-        };
-        assert!(cfg.validate().is_ok());
-    }
-
-    // ── Serde roundtrips ──────────────────────────────────────────────────────
-
-    #[test]
-    fn default_config_roundtrip() {
-        let cfg = RecallConfig::default();
-        let json = serde_json::to_string(&cfg).expect("serialize");
-        let back: RecallConfig = serde_json::from_str(&json).expect("deserialize");
-        let diff = (cfg.relevance_weight - back.relevance_weight).abs();
-        assert!(diff < 1e-12);
-        assert_eq!(cfg.decay_model, back.decay_model);
-    }
-
-    #[test]
-    fn decay_model_exponential_roundtrip() {
-        let m = DecayModel::Exponential;
-        let json = serde_json::to_string(&m).expect("serialize");
-        let back: DecayModel = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(m, back);
-    }
-
-    #[test]
-    fn decay_model_hyperbolic_roundtrip() {
-        let m = DecayModel::Hyperbolic;
-        let json = serde_json::to_string(&m).expect("serialize");
-        let back: DecayModel = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(m, back);
-    }
-
-    #[test]
-    fn decay_model_powerlaw_roundtrip() {
-        let m = DecayModel::PowerLaw {
-            half_life_days: 14.0,
-        };
-        let json = serde_json::to_string(&m).expect("serialize");
-        let back: DecayModel = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(m, back);
-    }
-
-    #[test]
-    fn decay_model_none_roundtrip() {
-        let m = DecayModel::None;
-        let json = serde_json::to_string(&m).expect("serialize");
-        let back: DecayModel = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(m, back);
-    }
-
-    #[test]
-    fn partial_config_deserializes_with_defaults() {
-        // Only override one field — the rest should default.
-        let json = r#"{"relevance_weight": 0.5}"#;
-        let cfg: RecallConfig = serde_json::from_str(json).expect("deserialize partial");
-        // specified field
-        let diff = (cfg.relevance_weight - 0.5).abs();
-        assert!(diff < 1e-12);
-        // unspecified fields keep defaults
-        let diff2 = (cfg.salience_weight - 0.20).abs();
-        assert!(diff2 < 1e-12);
-        assert_eq!(cfg.decay_model, DecayModel::Exponential);
-    }
-
-    // ── RecallConfig new fields ───────────────────────────────────────────────
-
-    #[test]
-    fn new_fields_have_correct_defaults() {
-        let cfg = RecallConfig::default();
-        assert_eq!(cfg.candidate_limit, Some(150));
-        // Calibrated default: RRF k=10 (2026-06 pen-default, reconfirmed 2026-07-21).
-        assert!(
-            matches!(cfg.fuse_strategy, FusionStrategy::Rrf { k: 10 }),
-            "default fuse_strategy should be Rrf {{ k: 10 }}, got {:?}",
-            cfg.fuse_strategy
-        );
-        assert!(!cfg.include_breakdown);
-    }
-
-    #[test]
-    fn tuning_grid_contains_the_runtime_default() {
-        #[derive(Deserialize)]
-        struct CandidatePool {
-            candidate_multiplier: u32,
-            candidate_limit: u32,
-        }
-
-        #[derive(Deserialize)]
-        struct FixedDimensions {
-            min_score: f64,
-        }
-
-        #[derive(Deserialize)]
-        struct TuningGrid {
-            weight_triples: Vec<[f64; 3]>,
-            candidate_pools: Vec<CandidatePool>,
-            fusion_configs: Vec<FusionStrategy>,
-            decay_models: Vec<DecayModel>,
-            temporal_half_life_days: Vec<f64>,
-            min_salience_values: Vec<f64>,
-            fixed: FixedDimensions,
-        }
-
-        let grid: TuningGrid =
-            serde_json::from_str(include_str!("../testdata/recall_tuning_grid.json"))
-                .expect("recall tuning grid must be valid JSON");
-        let cfg = RecallConfig::default();
-
-        assert!(grid.weight_triples.iter().any(|weights| {
-            (weights[0] - cfg.relevance_weight).abs() < 1e-12
-                && (weights[1] - cfg.salience_weight).abs() < 1e-12
-                && (weights[2] - cfg.temporal_weight).abs() < 1e-12
-        }));
-        assert!(grid.candidate_pools.iter().any(|pool| {
-            pool.candidate_multiplier == cfg.candidate_multiplier
-                && Some(pool.candidate_limit) == cfg.candidate_limit
-        }));
-        assert!(grid.fusion_configs.contains(&cfg.fuse_strategy));
-        assert!(grid.decay_models.contains(&cfg.decay_model));
-        assert!(grid
-            .temporal_half_life_days
-            .contains(&cfg.temporal_half_life_days));
-        assert!(grid.min_salience_values.contains(&cfg.min_salience));
-        assert!((grid.fixed.min_score - cfg.min_score).abs() < 1e-12);
-    }
-
-    #[test]
-    fn candidate_limit_zero_fails_validation() {
-        let cfg = RecallConfig {
-            candidate_limit: Some(0),
-            ..RecallConfig::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn candidate_limit_some_positive_validates() {
-        let cfg = RecallConfig {
-            candidate_limit: Some(100),
-            ..RecallConfig::default()
-        };
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn min_score_nan_fails_validation() {
-        let cfg = RecallConfig {
-            min_score: f64::NAN,
-            ..RecallConfig::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn min_salience_nan_fails_validation() {
-        let cfg = RecallConfig {
-            min_salience: f64::NAN,
-            ..RecallConfig::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn new_fields_roundtrip() {
-        let cfg = RecallConfig {
-            candidate_limit: Some(50),
-            fuse_strategy: FusionStrategy::Union,
-            include_breakdown: true,
-            ..RecallConfig::default()
-        };
-        let json = serde_json::to_string(&cfg).expect("serialize");
-        let back: RecallConfig = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.candidate_limit, Some(50));
-        assert_eq!(back.fuse_strategy, FusionStrategy::Union);
-        assert!(back.include_breakdown);
-    }
-
-    #[test]
-    fn partial_config_new_fields_use_defaults() {
-        // Parse JSON that omits all new fields — they should fall back to defaults.
-        // With #[serde(default)] on the struct, missing fields use RecallConfig::default(),
-        // so candidate_limit falls back to Some(150), not Option::default() == None.
-        let json = r#"{"temporal_weight": 0.15}"#;
-        let cfg: RecallConfig = serde_json::from_str(json).expect("deserialize partial");
-        assert_eq!(cfg.candidate_limit, Some(150));
-        assert!(
-            matches!(cfg.fuse_strategy, FusionStrategy::Rrf { k: 10 }),
-            "partial config must deserialize fuse_strategy to the Rrf {{ k: 10 }} default"
-        );
-        assert!(!cfg.include_breakdown);
-    }
-
-    // ── ScoreBreakdown ────────────────────────────────────────────────────────
-
-    #[test]
-    fn score_breakdown_total_sums_contributions() {
-        let bd = ScoreBreakdown {
-            relevance: 0.5,
-            salience_raw: 0.8,
-            salience_decayed: 0.6,
-            temporal: 0.3,
-            weighted: WeightedContributions {
-                relevance_contribution: 0.35,
-                salience_contribution: 0.12,
-                temporal_contribution: 0.03,
-            },
-            profile_component: 1.0,
-            entity_posterior_mean: None,
-        };
-        let expected = 0.35 + 0.12 + 0.03;
-        let diff = (bd.total() - expected).abs();
-        assert!(
-            diff < 1e-12,
-            "total() should sum weighted contributions, got {}",
-            bd.total()
-        );
-    }
-
-    // ── RecallFtsGatherConfig ─────────────────────────────────────────────────
-
-    #[test]
-    fn fts_gather_default_is_disabled() {
-        let cfg = RecallFtsGatherConfig::default();
-        assert!(!cfg.enabled);
-        assert_eq!(cfg.term_k, 10);
-        assert_eq!(cfg.selection_rule, RecallFtsSelectionRule::Original);
-        assert_eq!(cfg.gather_mode, RecallFtsGatherMode::Ranked);
-        assert!(cfg.gather_limit.is_none());
-        assert_eq!(cfg.gather_cap_multiplier, 4);
-        assert!(cfg.cjk_bypass_ranked);
-    }
-
-    #[test]
-    fn fts_gather_validates_zero_term_k() {
-        let cfg = RecallFtsGatherConfig {
-            term_k: 0,
-            ..RecallFtsGatherConfig::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn fts_gather_validates_zero_multiplier() {
-        let cfg = RecallFtsGatherConfig {
-            gather_cap_multiplier: 0,
-            ..RecallFtsGatherConfig::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn fts_gather_validates_zero_gather_limit() {
-        let cfg = RecallFtsGatherConfig {
-            gather_limit: Some(0),
-            ..RecallFtsGatherConfig::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn fts_gather_effective_gather_limit_uses_multiplier() {
-        let cfg = RecallFtsGatherConfig {
-            gather_cap_multiplier: 4,
-            ..RecallFtsGatherConfig::default()
-        };
-        assert_eq!(cfg.effective_gather_limit(150).unwrap(), 600);
-    }
-
-    #[test]
-    fn fts_gather_effective_gather_limit_explicit_wins() {
-        let cfg = RecallFtsGatherConfig {
-            gather_limit: Some(500),
-            gather_cap_multiplier: 4,
-            ..RecallFtsGatherConfig::default()
-        };
-        assert_eq!(cfg.effective_gather_limit(150).unwrap(), 500);
-    }
-
-    #[test]
-    fn fts_gather_effective_gather_limit_too_small_fails() {
-        let cfg = RecallFtsGatherConfig {
-            gather_limit: Some(100),
-            ..RecallFtsGatherConfig::default()
-        };
-        assert!(cfg.effective_gather_limit(150).is_err());
-    }
-
-    #[test]
-    fn fts_gather_from_env_returns_none_when_no_env_set() {
-        // Ensure none of the relevant vars are set in CI/test environment.
-        // If they are set by a prior test, this test may be flaky; the vars
-        // are prefixed to avoid collisions.
-        if std::env::var("KHIVE_RECALL_FTS_GATHER").is_ok()
-            || std::env::var("KHIVE_RECALL_FTS_TERM_K").is_ok()
-        {
-            return; // skip if env is already configured
-        }
-        let result = RecallFtsGatherConfig::from_env().unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn fts_gather_invalid_gather_value_fails() {
-        // We can't easily set env vars in unit tests without affecting other
-        // tests. This exercises the validation branch directly.
-        // Manually simulate what from_env would produce for an invalid value.
-        let cfg = RecallFtsGatherConfig {
-            term_k: 0,
-            ..RecallFtsGatherConfig::default()
-        };
-        assert!(cfg.validate().is_err(), "term_k=0 must fail validation");
-    }
-
-    #[test]
-    fn fts_gather_from_into_gather_mode() {
-        assert_eq!(
-            TextGatherMode::from(RecallFtsGatherMode::Ranked),
-            TextGatherMode::Ranked
-        );
-        assert_eq!(
-            TextGatherMode::from(RecallFtsGatherMode::Unranked),
-            TextGatherMode::Unranked
-        );
-        assert_eq!(
-            TextGatherMode::from(RecallFtsGatherMode::RankWithinCap),
-            TextGatherMode::RankWithinCap
-        );
-    }
-
-    #[test]
-    fn recall_config_default_has_fts_gather() {
-        let cfg = RecallConfig::default();
-        assert!(!cfg.fts_gather.enabled);
-    }
-
-    #[test]
-    fn recall_config_roundtrip_with_fts_gather() {
-        let cfg = RecallConfig {
-            fts_gather: RecallFtsGatherConfig {
-                enabled: true,
-                term_k: 5,
-                selection_rule: RecallFtsSelectionRule::HighestIdf,
-                gather_mode: RecallFtsGatherMode::RankWithinCap,
-                gather_limit: Some(600),
-                gather_cap_multiplier: 4,
-                cjk_bypass_ranked: true,
-            },
-            ..RecallConfig::default()
-        };
-        let json = serde_json::to_string(&cfg).expect("serialize");
-        let back: RecallConfig = serde_json::from_str(&json).expect("deserialize");
-        assert!(back.fts_gather.enabled);
-        assert_eq!(back.fts_gather.term_k, 5);
-        assert_eq!(
-            back.fts_gather.gather_mode,
-            RecallFtsGatherMode::RankWithinCap
-        );
-        assert_eq!(back.fts_gather.gather_limit, Some(600));
-    }
-}
+#[path = "config_tests.rs"]
+mod tests;

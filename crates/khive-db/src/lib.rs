@@ -2,23 +2,53 @@
 //!
 //! Provides entity, note, event, edge, FTS5 text search, and optional
 //! `sqlite-vec` vector storage over a WAL-mode connection pool.
+//!
+//! # Terminal write settlement
+//! Pooled, standalone, and lifetime write owners retain their volume lease
+//! through rollback or successful owned connection close. If a retired
+//! connection remains outside autocommit and close also fails, cleanup reports
+//! the path, volume, rollback and close errors, returns a terminal
+//! outcome-unknown error, and poisons the pool so it refuses every later write
+//! and releases the lease. The process keeps running: the host decides whether
+//! to exit.
 
+/// Transaction-scoped persistence for shared authority records.
+pub mod authority;
 /// Concrete storage backend providing capability-trait factories.
 pub mod backend;
 /// Periodic WAL checkpoint task.
 pub mod checkpoint;
+// Kept internal while the code-map constructor and SQLite callback wiring land.
+#[allow(dead_code)]
+mod code_map_vfs;
+mod connection_settlement;
 /// Durable database owner identity paired with the opened physical file.
 pub mod database_owner_identity;
 /// Read-only-by-intent database-integrity and WAL/checkpoint diagnostics.
 pub mod diagnostics;
+/// Physical-volume identity and bounded cooperative SQLite admission lease.
+mod disk_guard;
+mod disk_guard_config;
+/// Environment readers with explicit parse/default and boolean policies.
+pub mod env;
 /// Error types for the SQLite layer.
 pub mod error;
+
+/// Bounded prune of expendable polling-dispatch audit rows (ADR-212 §4, operator maintenance).
+pub mod events_prune;
+#[cfg(test)]
+mod events_prune_tests;
 /// SQLite extension registration (sqlite-vec auto-extension).
 pub mod extension;
 /// Physical file identity shared by pool admission and backend alias routing.
 #[cfg(any(unix, windows))]
 pub mod file_identity;
 mod fts_maintenance;
+/// Read predicates and transaction assertions for the graph-lint caller.
+pub mod graph_lint;
+/// Canonical physical store sets for cooperative maintenance metadata.
+#[cfg(unix)]
+pub mod maintenance;
 /// Schema migration system (versioned migrations).
 pub mod migrations;
 /// What a live store's schema says about `namespace` (ADR-189).
@@ -31,17 +61,28 @@ pub mod namespace_move_fixture;
 /// Feature-gated namespace-bounded FTS5 trigram prototype.
 #[cfg(feature = "namespace-trigram-proto")]
 pub mod namespace_trigram_proto;
+/// Durable deferred entity-index obligations (ADR-014 Amendment 7).
+pub mod pending_index;
 /// WAL-mode connection pool: one writer, N concurrent readers.
 pub mod pool;
+mod progress_conn;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_hooks;
+#[doc(hidden)]
+pub use progress_conn::ProgressConn;
 mod read_cancellation;
 /// `SqlAccess` trait bridge to `ConnectionPool`.
 pub mod sql_bridge;
+/// Pure statement-list builders for caller-owned SQL execution.
+pub mod statement_lists;
 #[cfg(any(test, feature = "test-support"))]
 mod statement_observer;
 /// Per-substrate store implementations (entity, note, graph, event, text, vectors, sparse).
 pub mod stores;
 /// Append-only NDJSON writer-timeout event sink (crate-internal).
 mod timeout_sink;
+/// Metadata-only copy-size estimate for guarded VACUUM admission.
+mod vacuum_capacity;
 /// Cross-process WAL-pin attribution sidecar (ADR-091 Amendment 2 Plank B).
 /// The sidecar write path (heartbeat/beacon) and identity primitives are
 /// portable; directory collection (`enumerate_live`/`housekeep_live`) is
@@ -49,7 +90,17 @@ mod timeout_sink;
 /// mode itself requires Unix (see `khive-mcp/src/serve.rs`).
 pub mod walpin;
 /// Single-writer task and bounded write queue (ADR-067 Component A).
+mod writer_admission_metrics;
 pub mod writer_task;
+
+#[cfg(test)]
+mod writer_busy_fixture;
+
+#[cfg(test)]
+mod test_process;
+
+#[cfg(test)]
+mod lease_latency_tests;
 
 pub use backend::StorageBackend;
 pub use checkpoint::{
@@ -58,6 +109,12 @@ pub use checkpoint::{
 };
 pub use checkpoint::{run_session_sweep_task, SessionSweepConfig, SweepBackend};
 pub use database_owner_identity::{DatabaseOwnerIdentity, DatabaseOwnerIdentityError};
+pub use disk_guard::harness_scoped_process_leases;
+pub use disk_guard::{ScopedFuture, WriteClassContext};
+pub use disk_guard_config::{
+    default_volume_lock_dir, require_volume_lock_dir, resolve_disk_guard_config,
+    DiskGuardConfigSource, DiskGuardEnvironment, EffectiveDiskGuardConfig,
+};
 pub use error::{
     SqliteError, SQLITE_WAL_CAPACITY_REFUSED_STAGE, SQLITE_WAL_CAPACITY_UNAVAILABLE_STAGE,
 };
@@ -73,13 +130,14 @@ pub use khive_storage::{
     DEFAULT_REQUEST_READ_TIMEOUT_SECS,
 };
 pub use migrations::{
-    inspect_schema_is_current, inspect_schema_version, query_embedding_models, read_schema_version,
-    run_migrations, EmbeddingModelRegistryRecord, Migration, ServiceSchemaPlan, VersionedMigration,
-    MIGRATIONS,
+    inspect_integrity, inspect_page_accounting, inspect_schema_is_current, inspect_schema_version,
+    query_embedding_models, read_schema_version, run_migrations, run_migrations_with_policy,
+    EmbeddingModelRegistryRecord, Migration, MigrationWritePolicy, PageAccounting,
+    ServiceSchemaPlan, VersionedMigration, MIGRATIONS,
 };
 pub use pool::{
     CheckpointGuard, CheckpointResult, ConnectionPool, PoolConfig, ReaderGuard, ReaderRow,
-    WalCeilingPolicy, WalCeilingSource, WriterGuard,
+    StandaloneCheckpoint, WalCeilingPolicy, WalCeilingSource, WriterGuard,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use read_cancellation::scope_test_read_progress;
@@ -96,3 +154,6 @@ mod stream_schema_tests;
 
 #[cfg(test)]
 mod reader_lease_tests;
+
+#[cfg(test)]
+mod raw_sql_reader_admission_tests;

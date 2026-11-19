@@ -116,25 +116,7 @@ pub(crate) static AGENT_HANDLERS: [HandlerDef; 5] = [
 
 #[async_trait]
 impl PackRuntime for AgentPack {
-    fn name(&self) -> &str {
-        PACK_NAME
-    }
-
-    fn note_kinds(&self) -> &'static [&'static str] {
-        crate::vocab::NOTE_KINDS
-    }
-
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        crate::vocab::ENTITY_KINDS
-    }
-
-    fn handlers(&self) -> &'static [HandlerDef] {
-        &AGENT_HANDLERS
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        &[]
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     async fn dispatch(
         &self,
@@ -158,12 +140,8 @@ impl PackRuntime for AgentPack {
 
 struct AgentPackFactory;
 impl khive_runtime::PackFactory for AgentPackFactory {
-    fn name(&self) -> &'static str {
-        PACK_NAME
-    }
-    fn requires(&self) -> &'static [&'static str] {
-        &[]
-    }
+    khive_runtime::pack_factory_metadata!(AgentPack);
+
     fn create(&self, runtime: khive_runtime::KhiveRuntime) -> Box<dyn PackRuntime> {
         Box::new(AgentPack::from_runtime(runtime))
     }

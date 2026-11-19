@@ -1,0 +1,40 @@
+charter inbox_sweep v1
+title "Sweep an inbox"
+subject message
+
+roles:
+    operator "reads and handles inbox messages"
+
+triggers:
+    message.arrived
+    schedule.fired
+    prompt.received
+    review.posted
+    fix.pushed
+    checks.concluded
+    approval.recorded
+
+workflow:
+    phase arrive by operator:
+        await message.arrived or schedule.fired or prompt.received or review.posted or fix.pushed or checks.concluded or approval.recorded
+        goto read
+
+    phase read by operator:
+        action inbox.read(limit=20) by operator
+        when message.kind is stop_order: goto stop
+        when message.kind is directive: goto handle
+        when message.kind is question: goto handle
+        when message.kind is report: goto handle
+        when message.kind is other: goto handle
+
+    phase handle by operator:
+        action tasks.list_next by operator
+        action work.unit by operator
+        goto record
+
+    phase record by operator:
+        require loop.log_written advisory
+        complete
+
+    phase stop by operator:
+        terminate "the inbox instruction requests work to stop"

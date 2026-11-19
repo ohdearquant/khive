@@ -3,7 +3,6 @@
 use async_trait::async_trait;
 use khive_runtime::{effective_create_tags, KhiveRuntime, KindHook, RuntimeError};
 use serde_json::{json, Value};
-use uuid::Uuid;
 
 use crate::handlers::{deser, StoreParams};
 
@@ -43,14 +42,5 @@ impl KindHook for SessionKindHook {
             "tags": tags,
         }))?;
         fields.validate("session")
-    }
-
-    async fn after_create(
-        &self,
-        _runtime: &KhiveRuntime,
-        _id: Uuid,
-        _args: &Value,
-    ) -> Result<(), RuntimeError> {
-        Ok(())
     }
 }

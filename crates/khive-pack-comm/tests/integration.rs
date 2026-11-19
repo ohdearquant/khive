@@ -11,6 +11,19 @@ use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 use khive_storage::Note;
 use khive_types::{Pack, Visibility};
 
+#[path = "../../test_support/timing.rs"]
+mod timing;
+
+const LONG_POLL_TIMING_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const LONG_POLL_TIMING_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn long_poll_return_bound() -> std::time::Duration {
+    // Keep the strict one-second ordinary contract; coverage must still beat
+    // the fixture's five-second fallback rather than merely avoid a hang.
+    timing::duration_bound(LONG_POLL_TIMING_WAIT / 5, Some(LONG_POLL_TIMING_WAIT / 2))
+        .expect("both timing modes retain a numeric long-poll bound")
+}
+
 fn list_items(response: &serde_json::Value) -> &[serde_json::Value] {
     response["items"]
         .as_array()
@@ -125,12 +138,14 @@ async fn pack_registered_message_notes_are_queryable_through_gql() {
 }
 
 #[test]
-fn comm_pack_declares_fifteen_handlers() {
+fn comm_pack_declares_twenty_handlers() {
     assert_eq!(
         CommPack::HANDLERS.len(),
-        15,
-        "comm pack must declare 15 handlers: send, delivered, inbox, read, mark_read, unread, reply, \
-         thread, ingest, cleanup_expired_quarantine, heartbeat, health, probe, cursor_get, cursor_commit \
+        20,
+        "comm pack must declare 20 handlers: send, delivered, transport_status, inbox, read, \
+         mark_read, unread, reply, \
+         thread, ingest, cleanup_expired_quarantine, heartbeat, health, probe, cursor_get, cursor_commit, \
+         suppression_add, suppression_list, suppression_remove, withheld_body \
          (khive #1387, #1447, #449, #66)"
     );
     let names: Vec<&str> = CommPack::HANDLERS.iter().map(|h| h.name).collect();
@@ -139,6 +154,7 @@ fn comm_pack_declares_fifteen_handlers() {
         names.contains(&"comm.delivered"),
         "comm.delivered verb must be registered (khive #1447)"
     );
+    assert!(names.contains(&"comm.transport_status"));
     assert!(names.contains(&"comm.inbox"));
     assert!(names.contains(&"comm.read"));
     assert!(
@@ -188,6 +204,11 @@ fn comm_pack_declares_fifteen_handlers() {
         names.contains(&"comm.health"),
         "comm.health verb must be registered (khive #606)"
     );
+    let withheld_body = CommPack::HANDLERS
+        .iter()
+        .find(|handler| handler.name == "comm.withheld_body")
+        .expect("comm.withheld_body verb must be registered (ADR-200 Amendment 1)");
+    assert_eq!(withheld_body.visibility, Visibility::Verb);
 }
 
 #[test]
@@ -434,6 +455,7 @@ async fn delivered_rejects_short_or_malformed_ids() {
 async fn inbox_long_poll_wakes_after_concurrent_ingest() {
     let (registry, _rt) = build_registry_for_ns("local");
     let waiter_registry = registry.clone();
+    let bound = long_poll_return_bound();
     let started = std::time::Instant::now();
     let mut waiter = tokio::spawn(async move {
         waiter_registry
@@ -443,7 +465,7 @@ async fn inbox_long_poll_wakes_after_concurrent_ingest() {
                     "status": "all",
                     "from_actor": "email:sender@example.com",
                     "content_contains": "wake the blocked inbox",
-                    "wait_ms": 5_000,
+                    "wait_ms": LONG_POLL_TIMING_WAIT.as_millis(),
                 }),
             )
             .await
@@ -508,18 +530,19 @@ async fn inbox_long_poll_wakes_after_concurrent_ingest() {
         .expect("concurrent ingest succeeds");
     assert_eq!(ingest["deduplicated"].as_bool(), Some(false));
 
-    let inbox = match tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiter).await {
+    let inbox = match tokio::time::timeout(LONG_POLL_TIMING_WATCHDOG, &mut waiter).await {
         Ok(joined) => joined
             .expect("long-poll task must not panic")
             .expect("long-poll inbox succeeds"),
         Err(_) => {
             waiter.abort();
-            panic!("long-poll inbox did not wake within one second of ingest");
+            let _ = waiter.await;
+            panic!("long-poll inbox exceeded the hang watchdog after ingest");
         }
     };
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(1),
-        "signal wake must beat the five-second polling baseline"
+        started.elapsed() < bound,
+        "signal wake must finish within {bound:?}, before the five-second polling baseline"
     );
     assert_eq!(inbox["count"].as_u64(), Some(1));
     assert_eq!(
@@ -648,18 +671,25 @@ async fn inbox_long_poll_returns_immediately_when_matches_exist() {
         .await
         .expect("send succeeds");
 
+    let bound = long_poll_return_bound();
     let started = std::time::Instant::now();
-    let inbox = registry
-        .dispatch(
+    let inbox = tokio::time::timeout(
+        LONG_POLL_TIMING_WATCHDOG,
+        registry.dispatch(
             "comm.inbox",
-            serde_json::json!({ "status": "all", "wait_ms": 5_000 }),
-        )
-        .await
-        .expect("long poll over a non-empty inbox succeeds");
+            serde_json::json!({
+                "status": "all",
+                "wait_ms": LONG_POLL_TIMING_WAIT.as_millis(),
+            }),
+        ),
+    )
+    .await
+    .expect("non-empty inbox must finish within the hang watchdog")
+    .expect("long poll over a non-empty inbox succeeds");
 
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(1),
-        "an initial query with matches must return without waiting out the budget"
+        started.elapsed() < bound,
+        "an initial query with matches must return within {bound:?}, without waiting out the budget"
     );
     assert_eq!(inbox["count"].as_u64(), Some(1));
     assert_eq!(
@@ -3557,35 +3587,36 @@ async fn comm_pack_exposes_non_empty_schema_plan() {
         "CommPack must return a non-empty SchemaPlan"
     );
     assert_eq!(plan.pack, "comm", "SchemaPlan.pack must be 'comm'");
-    assert!(
-        !plan.statements.is_empty(),
-        "schema plan must have at least one DDL statement"
-    );
-
-    let combined = plan.statements.join(" ");
-    assert!(
-        combined.contains("idx_comm_message_direction"),
-        "schema plan must declare idx_comm_message_direction; got: {combined}"
-    );
-    assert!(
-        combined.contains("idx_comm_message_thread"),
-        "schema plan must declare idx_comm_message_thread; got: {combined}"
-    );
-    assert!(
-        combined.contains("idx_comm_message_outbound_ref"),
-        "schema plan must declare idx_comm_message_outbound_ref; got: {combined}"
-    );
-    assert!(
-        !combined.contains("idx_comm_message_outbound_due"),
-        "the function-backed channel deadline index must be installed by a numbered core migration"
-    );
-    assert!(
-        combined.contains("CREATE INDEX IF NOT EXISTS"),
-        "schema plan DDL must be idempotent; got: {combined}"
-    );
-    assert!(
-        combined.contains("deleted_at IS NULL"),
-        "schema plan indexes must use WHERE deleted_at IS NULL partial condition; got: {combined}"
+    assert_eq!(
+        plan.statements,
+        &[
+            "CREATE TABLE IF NOT EXISTS comm_channel_cursor (
+    channel_kind TEXT NOT NULL CHECK (length(trim(channel_kind)) > 0),
+    channel_slug TEXT NOT NULL CHECK (length(trim(channel_slug)) > 0),
+    source TEXT NOT NULL CHECK (length(trim(source)) > 0),
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    high_water INTEGER CHECK (high_water IS NULL OR high_water > 0),
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (channel_kind, channel_slug)
+)",
+            "CREATE TABLE IF NOT EXISTS comm_suppression (
+    id TEXT PRIMARY KEY CHECK (length(id) = 36),
+    scope TEXT NOT NULL CHECK (scope IN ('outbound', 'inbound')),
+    kind TEXT NOT NULL CHECK (kind IN ('address', 'domain', 'recipient_key')),
+    value TEXT NOT NULL CHECK (length(value) > 0),
+    source TEXT NOT NULL CHECK (source IN ('operator', 'mailto_token', 'one_click', 'reply_stop')),
+    created_by TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    UNIQUE (scope, kind, value, source)
+)",
+            "CREATE TABLE IF NOT EXISTS comm_suppression_mirror (
+    mirror TEXT PRIMARY KEY CHECK (mirror = 'one_click'),
+    refreshed_at INTEGER NOT NULL,
+    remote_as_of TEXT NOT NULL CHECK (length(remote_as_of) > 0),
+    remote_count INTEGER NOT NULL CHECK (remote_count >= 0)
+)"
+        ]
     );
 }
 
@@ -3602,9 +3633,12 @@ async fn verb_registry_aggregates_comm_schema_plan() {
         .iter()
         .find(|p| p.pack == "comm")
         .expect("comm plan present");
-    assert!(
-        !comm_plan.is_empty(),
-        "comm schema plan must have DDL statements"
+    assert!(!comm_plan.is_empty(), "auxiliary schema stays pack-owned");
+    assert_eq!(comm_plan.statements.len(), 3);
+    let pack = CommPack::new(_rt);
+    assert_eq!(
+        comm_plan.statements,
+        khive_runtime::PackRuntime::schema_plan(&pack).statements
     );
 }
 
@@ -4119,10 +4153,7 @@ fn build_crossns_registry(
 
 fn shared_backend() -> Arc<khive_db::StorageBackend> {
     let backend = khive_db::StorageBackend::memory().expect("in-memory backend");
-    {
-        let mut writer = backend.pool().try_writer().expect("writer");
-        khive_db::run_migrations(writer.conn_mut()).expect("migrations");
-    }
+    backend.pool().run_migrations().expect("migrations");
     Arc::new(backend)
 }
 
@@ -4160,11 +4191,12 @@ async fn t1_send_within_namespace_unchanged() {
 #[tokio::test]
 async fn t2_send_cross_ns_denied_when_allowlist_empty() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_sender, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (_registry_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    let result = registry_leo
+    let result = registry_sender
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "actor-addressed" }),
@@ -4175,10 +4207,10 @@ async fn t2_send_cross_ns_denied_when_allowlist_empty() {
         "T2: actor-addressed send must succeed even with empty allowlist; got {result:?}"
     );
 
-    let local_tok = rt_leo
+    let local_tok = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let local_notes = rt_leo
+    let local_notes = rt_sender
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
@@ -4220,11 +4252,12 @@ async fn t2_send_cross_ns_denied_when_allowlist_empty() {
 #[tokio::test]
 async fn t3_send_cross_ns_delivers_when_allowed() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_sender, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (_reg_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    let result = registry_leo
+    let result = registry_sender
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "hello cross-ns" }),
@@ -4240,10 +4273,10 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
         "T3: response must carry full_id"
     );
 
-    let local_tok = rt_leo
+    let local_tok = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let local_notes = rt_leo
+    let local_notes = rt_sender
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
@@ -4322,11 +4355,12 @@ async fn t3_send_cross_ns_delivers_when_allowed() {
 #[tokio::test]
 async fn t4_inbound_note_namespace_is_recipient() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_sender, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (_reg_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    registry_leo
+    registry_sender
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "ns stamp check" }),
@@ -4334,10 +4368,10 @@ async fn t4_inbound_note_namespace_is_recipient() {
         .await
         .expect("T4: send must succeed");
 
-    let local_tok = rt_leo
+    let local_tok = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let local_notes = rt_leo
+    let local_notes = rt_sender
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
@@ -4545,13 +4579,13 @@ async fn t5b_reply_always_writes_same_namespace() {
 #[tokio::test]
 async fn t6_sender_inbox_does_not_see_inbound_copy() {
     let backend = shared_backend();
-    let (registry_leo, _rt_leo) = build_crossns_registry(
+    let (registry_sender, _rt_sender) = build_crossns_registry(
         Arc::clone(&backend),
         "lambda:leo",
         vec![Namespace::parse("lambda:khive").unwrap()],
     );
 
-    registry_leo
+    registry_sender
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "isolation check" }),
@@ -4559,7 +4593,7 @@ async fn t6_sender_inbox_does_not_see_inbound_copy() {
         .await
         .expect("T6: send must succeed");
 
-    let inbox = registry_leo
+    let inbox = registry_sender
         .dispatch("comm.inbox", serde_json::json!({ "status": "all" }))
         .await
         .expect("T6: sender inbox dispatch must succeed");
@@ -4573,7 +4607,7 @@ async fn t6_sender_inbox_does_not_see_inbound_copy() {
 #[tokio::test]
 async fn t7_with_namespace_token_scoping() {
     let backend = shared_backend();
-    let (_registry_leo, rt_leo) = build_crossns_registry(
+    let (_registry_sender, rt_sender) = build_crossns_registry(
         Arc::clone(&backend),
         "lambda:leo",
         vec![Namespace::parse("lambda:khive").unwrap()],
@@ -4581,12 +4615,12 @@ async fn t7_with_namespace_token_scoping() {
     let (_registry_khive, rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    let leo_tok = rt_leo
+    let sender_tok = rt_sender
         .authorize(Namespace::parse("lambda:leo").unwrap())
         .unwrap();
-    let sender_note = rt_leo
+    let sender_note = rt_sender
         .create_note(
-            &leo_tok,
+            &sender_tok,
             "observation",
             None,
             "sender-ns note",
@@ -4614,9 +4648,9 @@ async fn t7_with_namespace_token_scoping() {
         .expect("T7: create recipient note");
 
     let recipient_tok: NamespaceToken =
-        leo_tok.with_namespace(Namespace::parse("lambda:khive").unwrap());
+        sender_tok.with_namespace(Namespace::parse("lambda:khive").unwrap());
 
-    let can_see_sender = rt_leo
+    let can_see_sender = rt_sender
         .get_note_including_deleted(&recipient_tok, sender_note.id)
         .await;
     match can_see_sender {
@@ -4651,11 +4685,12 @@ async fn t7_with_namespace_token_scoping() {
 #[tokio::test]
 async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_sender, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (_reg_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    registry_leo
+    registry_sender
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "append-only check" }),
@@ -4663,10 +4698,10 @@ async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
         .await
         .expect("T8: send must succeed");
 
-    let local_tok = rt_leo
+    let local_tok = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let local_notes = rt_leo
+    let local_notes = rt_sender
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
@@ -4683,7 +4718,7 @@ async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
         .map(|n| n.id)
         .expect("T8: must find inbound note in local ns (ADR-007 all-local)");
 
-    let can_read = rt_leo
+    let can_read = rt_sender
         .get_note_including_deleted(&local_tok, inbound_id)
         .await;
     match can_read {
@@ -4792,12 +4827,12 @@ async fn t9_reply_cross_ns_delivers_when_allowed() {
 #[tokio::test]
 async fn t10_reply_cross_ns_denied_when_empty() {
     let backend = shared_backend();
-    let (registry_leo, _rt_leo) =
+    let (registry_sender, _rt_sender) =
         build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (registry_khive, _rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    registry_leo
+    registry_sender
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "setup for T10" }),
@@ -4828,9 +4863,10 @@ async fn t10_reply_cross_ns_denied_when_empty() {
 #[tokio::test]
 async fn t11_inbound_write_failure_rolls_back_outbound() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_sender, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
 
-    let result = registry_leo
+    let result = registry_sender
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "actor-addressed always succeeds" }),
@@ -4841,10 +4877,10 @@ async fn t11_inbound_write_failure_rolls_back_outbound() {
         "T11: actor-addressed send must succeed; got {result:?}"
     );
 
-    let local_tok = rt_leo
+    let local_tok = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let local_notes = rt_leo
+    let local_notes = rt_sender
         .list_notes(&local_tok, Some("message"), 100, 0)
         .await
         .unwrap();
@@ -4861,30 +4897,31 @@ async fn t11_inbound_write_failure_rolls_back_outbound() {
 #[tokio::test]
 async fn t12_allowlist_is_one_directional() {
     let backend = shared_backend();
-    let (registry_leo, rt_leo) = build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
+    let (registry_sender, rt_sender) =
+        build_crossns_registry(Arc::clone(&backend), "lambda:leo", vec![]);
     let (registry_khive, rt_khive) =
         build_crossns_registry(Arc::clone(&backend), "lambda:khive", vec![]);
 
-    let result_leo = registry_leo
+    let sender_result = registry_sender
         .dispatch(
             "comm.send",
             serde_json::json!({ "to": "lambda:khive", "content": "leo to khive" }),
         )
         .await;
     assert!(
-        result_leo.is_ok(),
-        "T12: leo→khive send must succeed under ADR-057; got {result_leo:?}"
+        sender_result.is_ok(),
+        "T12: leo→khive send must succeed under ADR-057; got {sender_result:?}"
     );
 
-    let local_tok_leo = rt_leo
+    let sender_local_token = rt_sender
         .authorize(Namespace::parse("local").unwrap())
         .unwrap();
-    let leo_local_notes = rt_leo
-        .list_notes(&local_tok_leo, Some("message"), 100, 0)
+    let sender_local_notes = rt_sender
+        .list_notes(&sender_local_token, Some("message"), 100, 0)
         .await
         .unwrap();
     assert_eq!(
-        leo_local_notes
+        sender_local_notes
             .iter()
             .filter(|n| n.deleted_at.is_none())
             .count(),
@@ -7261,6 +7298,304 @@ async fn ingest_routing_reply_matches_legacy_urn_and_upper_hex_thread_id() {
     );
 }
 
+/// The external-marking metadata every `pending_owner_candidates` ingest requires.
+fn external_ingest_metadata() -> serde_json::Value {
+    serde_json::json!({ "origin": "external", "trust": "untrusted" })
+}
+
+/// Plant a message row with an explicit id and an explicit `created_at`, so the
+/// store's `created_at DESC, id ASC` page order is deterministic across fixture
+/// rows. A larger `created_at` sorts first.
+async fn plant_message_note_at(
+    rt: &KhiveRuntime,
+    id: uuid::Uuid,
+    content: &str,
+    props: serde_json::Value,
+    created_at: i64,
+) {
+    use khive_storage::note::Note;
+    let token = rt
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize");
+    let store = rt.notes(&token).expect("notes store");
+    let note = Note {
+        version: 1,
+        key: None,
+        id,
+        namespace: "local".into(),
+        kind: "message".into(),
+        status: "active".into(),
+        name: None,
+        content: content.into(),
+        salience: None,
+        decay_factor: None,
+        expires_at: None,
+        properties: Some(props),
+        created_at,
+        updated_at: created_at,
+        deleted_at: None,
+    };
+    store.upsert_note(note).await.expect("upsert planted note");
+}
+
+/// Outbound-email row properties for a thread, for tests that plant rows directly.
+/// The row is an email by its `email:` addresses. It carries no `channel_kind` or
+/// `channel_slug`: the note store refuses those transport-owned keys from this
+/// path, and a row without a slug is verified by its Message-ID alone.
+fn outbound_email_props(thread_id: &str, from_actor: &str, message_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "direction": "outbound",
+        "from": "email:mailbox@khive.ai",
+        "to": "email:user@example.com",
+        "from_actor": from_actor,
+        "to_actor": "email:user@example.com",
+        "external_id": message_id,
+        "thread_id": thread_id,
+        "sent_at": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+/// An external ingest whose thread UUID names a thread holding an outbound
+/// email whose Message-ID verifies (ADR-200 Amendment 1, decision 4) routes to
+/// that email's sending actor and thread.
+#[tokio::test]
+async fn external_thread_uuid_routes_to_verified_outbound_email_owner() {
+    let (registry, rt) = build_registry_for_ns_with_email("local");
+    let thread_uuid = uuid::Uuid::new_v4().as_hyphenated().to_string();
+    let owner_message_id = uuid::Uuid::new_v4();
+    // The thread's oldest row is a non-email `comm.send` whose `from_actor` is
+    // NOT the verified owner: the unproven first-row pass 2 would take it.
+    plant_message_note_at(
+        &rt,
+        uuid::Uuid::new_v4(),
+        "non-email row planted at the thread",
+        serde_json::json!({
+            "direction": "outbound",
+            "from": "lambda:decoy",
+            "to": "lambda:other",
+            "from_actor": "lambda:decoy",
+            "to_actor": "lambda:other",
+            "thread_id": thread_uuid,
+            "sent_at": chrono::Utc::now().to_rfc3339(),
+        }),
+        1,
+    )
+    .await;
+    // A second non-email row written later sorts first under `created_at DESC`;
+    // proof must page past it to the verified email below.
+    plant_message_note_at(
+        &rt,
+        uuid::Uuid::new_v4(),
+        "newer non-email row planted at the thread",
+        serde_json::json!({
+            "direction": "outbound",
+            "from": "lambda:decoy",
+            "to": "lambda:other",
+            "from_actor": "lambda:decoy",
+            "to_actor": "lambda:other",
+            "thread_id": thread_uuid,
+            "sent_at": chrono::Utc::now().to_rfc3339(),
+        }),
+        3,
+    )
+    .await;
+    // The verified outbound email, stranded between two decoys in page order.
+    plant_message_note_at(
+        &rt,
+        owner_message_id,
+        "outbound email that owns the thread",
+        outbound_email_props(
+            &thread_uuid,
+            "lambda:owner",
+            &format!("<{owner_message_id}@khive.ai>"),
+        ),
+        2,
+    )
+    .await;
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:stranger@example.com",
+            "to": "email:mailbox@khive.ai",
+            "content": "external reply via the thread header",
+            "channel_kind": "email",
+            "channel_slug": "adr200",
+            "external_id": "imap:external-thread-route:positive:1",
+            "default_inbound_actor": "actor:external",
+            "metadata": external_ingest_metadata(),
+            "pending_owner_candidates": [thread_uuid],
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        props["to_actor"].as_str(),
+        Some("lambda:owner"),
+        "an external thread UUID with a verified outbound email must route to \
+         that message's sending actor; got props={props}"
+    );
+    assert_eq!(
+        props["thread_id"].as_str(),
+        Some(thread_uuid.as_str()),
+        "the verified email thread must be preserved as the ingested root; \
+         got props={props}"
+    );
+}
+
+/// The same external ingest naming a thread whose only outbound message is NOT
+/// an email does not route there; it lands on the external inbound actor (the
+/// fixture supplies no recipient alias).
+#[tokio::test]
+async fn external_thread_uuid_does_not_route_to_non_email_thread() {
+    let (registry, rt) = build_registry_for_ns_with_email("local");
+    let thread_uuid = uuid::Uuid::new_v4().as_hyphenated().to_string();
+    plant_message_note(
+        &rt,
+        "outbound comm.send between actors",
+        serde_json::json!({
+            "direction": "outbound",
+            "from": "lambda:copier",
+            "to": "lambda:other",
+            "from_actor": "lambda:copier",
+            "to_actor": "lambda:other",
+            "thread_id": thread_uuid,
+            "sent_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .await;
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:stranger@example.com",
+            "to": "email:mailbox@khive.ai",
+            "content": "external reply naming a non-email thread",
+            "channel_kind": "email",
+            "channel_slug": "adr200",
+            "external_id": "imap:external-thread-route:non-email:1",
+            "default_inbound_actor": "actor:external",
+            "metadata": external_ingest_metadata(),
+            "pending_owner_candidates": [thread_uuid],
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        props["to_actor"].as_str(),
+        Some("actor:external"),
+        "a thread UUID naming a non-email thread must fall through to the \
+         external inbound actor, not that thread's actor; got props={props}"
+    );
+    assert_ne!(
+        props["thread_id"].as_str(),
+        Some(thread_uuid.as_str()),
+        "the non-email thread must not be adopted; got props={props}"
+    );
+}
+
+/// A thread holding an outbound email whose Message-ID does not verify under the
+/// configured domains does not route there either.
+#[tokio::test]
+async fn external_thread_uuid_does_not_route_to_unverified_outbound_email() {
+    let (registry, rt) = build_registry_for_ns_with_email("local");
+    let thread_uuid = uuid::Uuid::new_v4().as_hyphenated().to_string();
+    // An email row whose Minted Message-ID embeds its own UUID but names a
+    // foreign domain: an email, but not one this mailbox can prove it sent.
+    let foreign_id = uuid::Uuid::new_v4();
+    plant_message_note_at(
+        &rt,
+        foreign_id,
+        "outbound email with a copied Message-ID",
+        outbound_email_props(
+            &thread_uuid,
+            "lambda:owner",
+            &format!("<{foreign_id}@outside.example>"),
+        ),
+        1,
+    )
+    .await;
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:stranger@example.com",
+            "to": "email:mailbox@khive.ai",
+            "content": "external reply naming an unverified email thread",
+            "channel_kind": "email",
+            "channel_slug": "adr200",
+            "external_id": "imap:external-thread-route:unverified:1",
+            "default_inbound_actor": "actor:external",
+            "metadata": external_ingest_metadata(),
+            "pending_owner_candidates": [thread_uuid],
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        props["to_actor"].as_str(),
+        Some("actor:external"),
+        "an outbound email whose Message-ID does not verify must not own the \
+         thread for an external sender; got props={props}"
+    );
+}
+
+/// Scope control: maintainer mail (the `correlation_external_id` path) naming the
+/// non-email thread still resolves the way it did before this change.
+#[tokio::test]
+async fn maintainer_thread_uuid_keeps_unverified_resolution() {
+    let (registry, rt) = build_registry_for_ns_with_email("local");
+    let thread_uuid = uuid::Uuid::new_v4().as_hyphenated().to_string();
+    plant_message_note(
+        &rt,
+        "outbound comm.send between actors",
+        serde_json::json!({
+            "direction": "outbound",
+            "from": "lambda:copier",
+            "to": "lambda:other",
+            "from_actor": "lambda:copier",
+            "to_actor": "lambda:other",
+            "thread_id": thread_uuid,
+            "sent_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .await;
+
+    let props = ingest_and_get_props(
+        &registry,
+        &rt,
+        serde_json::json!({
+            "from": "email:maintainer@example.com",
+            "to": "email:mailbox@khive.ai",
+            "content": "maintainer mail naming a non-email thread",
+            "channel_kind": "email",
+            "channel_slug": "adr200",
+            "correlation_external_id": thread_uuid,
+            "external_id": "imap:maintainer-thread-route:1",
+            "default_inbound_actor": "actor:fallback",
+            "namespace": "local",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        props["to_actor"].as_str(),
+        Some("lambda:copier"),
+        "maintainer mail keeps the thread-UUID resolution unchanged; got props={props}"
+    );
+    assert_eq!(
+        props["thread_id"].as_str(),
+        Some(thread_uuid.as_str()),
+        "maintainer mail must remain attached to the named thread; got props={props}"
+    );
+}
+
 /// Helper: plant a message note directly with the given properties, returning its UUID.
 async fn plant_message_note(
     rt: &KhiveRuntime,
@@ -9063,10 +9398,25 @@ async fn health_surfaces_quarantine_channel_without_a_heartbeat_in_that_namespac
         "last_failure_at",
         "last_error",
         "consecutive_failures",
+        "consecutive_held_polls",
+        "held_messages",
+        "last_held_at",
+        "last_quarantined_after_hold_at",
+        "originals_not_retained",
+        "last_original_not_retained_at",
+        "last_original_not_retained_reason",
+        "original_retention_state",
+        "notices_failed",
+        "last_notice_failed_at",
+        "notice_config_error",
     ] {
+        // `get` rather than indexing: indexing a missing key also yields null, so it
+        // would pass with the field absent from the entry.
         assert!(
-            channels[0][field].is_null(),
-            "without a heartbeat, `{field}` is unknown rather than fabricated: {}",
+            channels[0]
+                .get(field)
+                .is_some_and(serde_json::Value::is_null),
+            "without a heartbeat, `{field}` is present and null rather than fabricated: {}",
             channels[0]
         );
     }
@@ -9595,6 +9945,251 @@ async fn heartbeat_rejects_invalid_outcome() {
     );
 }
 
+/// ADR-056 (2026-10-15 amendment), decision 7: the retention/notice fields are
+/// accepted only with a success outcome. A failed poll wrote no records and
+/// sent no notices, so each of the five is refused on a failure outcome, the
+/// same way the hold fields are.
+#[tokio::test]
+async fn heartbeat_rejects_retention_and_notice_fields_on_failure() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    for field in [
+        ("originals_not_retained", serde_json::json!(2)),
+        (
+            "original_not_retained_reason",
+            serde_json::json!("retention-limit"),
+        ),
+        ("original_retention_state", serde_json::json!("retained")),
+        ("notices_failed", serde_json::json!(1)),
+        (
+            "notice_config_error",
+            serde_json::json!("missing notice target"),
+        ),
+    ] {
+        let mut params = serde_json::json!({
+            "namespace": "local",
+            "channel_kind": "email",
+            "channel_slug": "recipient@example.com",
+            "outcome": "failure",
+            "error_class": "transport",
+        });
+        params[field.0] = field.1.clone();
+        let err = registry
+            .dispatch("comm.heartbeat", params)
+            .await
+            .expect_err("a failure heartbeat must refuse retention/notice fields");
+        assert!(
+            err.to_string().contains("success"),
+            "the refusal must name the success-only rule for `{}`: {err}",
+            field.0
+        );
+    }
+}
+
+/// ADR-056 (2026-10-15 amendment), decision 7: `original_not_retained_reason`
+/// is required exactly when `originals_not_retained` is above zero, refused
+/// when it is zero or absent, and accepted only as a known token; and
+/// `original_retention_state` is accepted only as `retained` or `failing`.
+#[tokio::test]
+async fn heartbeat_validates_retention_reason_and_state() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let cases = [
+        (
+            "count above zero without a reason",
+            serde_json::json!({"originals_not_retained": 2}),
+            "original_not_retained_reason",
+        ),
+        (
+            "reason with a zero count",
+            serde_json::json!({
+                "originals_not_retained": 0,
+                "original_not_retained_reason": "retention-limit",
+            }),
+            "original_not_retained_reason",
+        ),
+        (
+            "reason with an absent count",
+            serde_json::json!({"original_not_retained_reason": "retention-limit"}),
+            "original_not_retained_reason",
+        ),
+        (
+            "unknown reason token",
+            serde_json::json!({
+                "originals_not_retained": 1,
+                "original_not_retained_reason": "not-a-reason",
+            }),
+            "unknown",
+        ),
+        (
+            "unknown retention state",
+            serde_json::json!({"original_retention_state": "ok"}),
+            "original_retention_state",
+        ),
+    ];
+    for (label, extra, needle) in cases {
+        let mut params = serde_json::json!({
+            "namespace": "local",
+            "channel_kind": "email",
+            "channel_slug": "recipient@example.com",
+            "outcome": "success",
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            params[key.as_str()] = value.clone();
+        }
+        let err = registry
+            .dispatch("comm.heartbeat", params)
+            .await
+            .expect_err("a malformed retention/notice report must be refused");
+        assert!(
+            err.to_string().contains(needle),
+            "the refusal for `{label}` must name `{needle}`: {err}"
+        );
+    }
+}
+
+/// ADR-056 (2026-10-15 amendment), decision 7: `originals_not_retained` and
+/// `notices_failed` are running totals, the last-reason/last-timestamp facts
+/// track the most recent count above zero, `original_retention_state` is
+/// replaced, `notice_config_error` is cleared by a later success that omits it,
+/// and a failure heartbeat in between changes none of them.
+#[tokio::test]
+async fn heartbeat_accumulates_retention_totals_and_clears_config_error() {
+    let (registry, _rt) = build_registry_for_ns("local");
+    let slug = "retention-totals@example.com";
+
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": slug,
+                "outcome": "success",
+                "originals_not_retained": 3,
+                "original_not_retained_reason": "retention-limit",
+                "original_retention_state": "failing",
+                "notices_failed": 1,
+                "notice_config_error": "no notice target configured",
+            }),
+        )
+        .await
+        .expect("first success heartbeat");
+
+    // A failed transport poll in between must leave every retention/notice fact
+    // exactly as the last success left it.
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": slug,
+                "outcome": "failure",
+                "error_class": "transport",
+            }),
+        )
+        .await
+        .expect("intervening failure heartbeat");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let channel = health["channels"]
+        .as_array()
+        .expect("channels array")
+        .iter()
+        .find(|channel| channel["channel_slug"] == slug)
+        .expect("the heartbeat row appears");
+    assert_eq!(
+        channel["originals_not_retained"].as_u64(),
+        Some(3),
+        "the failure leaves the first total: {channel}"
+    );
+    assert_eq!(
+        channel["notices_failed"].as_u64(),
+        Some(1),
+        "the failure leaves the first notice total: {channel}"
+    );
+    assert_eq!(
+        channel["last_original_not_retained_reason"].as_str(),
+        Some("retention-limit"),
+        "the failure leaves the first reason: {channel}"
+    );
+    assert_eq!(
+        channel["original_retention_state"].as_str(),
+        Some("failing"),
+        "the failure leaves the first retention state: {channel}"
+    );
+    assert_eq!(
+        channel["notice_config_error"].as_str(),
+        Some("no notice target configured"),
+        "a success that carries a config error stores it, and the failure keeps it: {channel}"
+    );
+
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": slug,
+                "outcome": "success",
+                "originals_not_retained": 2,
+                "original_not_retained_reason": "original-store-failed",
+                "original_retention_state": "retained",
+                "notices_failed": 4,
+            }),
+        )
+        .await
+        .expect("second success heartbeat");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let channel = health["channels"]
+        .as_array()
+        .expect("channels array")
+        .iter()
+        .find(|channel| channel["channel_slug"] == slug)
+        .expect("the heartbeat row appears");
+
+    assert_eq!(
+        channel["originals_not_retained"].as_u64(),
+        Some(5),
+        "originals_not_retained must be a running total: {channel}"
+    );
+    assert_eq!(
+        channel["notices_failed"].as_u64(),
+        Some(5),
+        "notices_failed must be a running total across the failure: {channel}"
+    );
+    assert_eq!(
+        channel["last_original_not_retained_reason"].as_str(),
+        Some("original-store-failed"),
+        "the last reason is from the most recent count above zero: {channel}"
+    );
+    assert!(
+        channel["last_original_not_retained_at"].as_str().is_some(),
+        "last_original_not_retained_at must be set: {channel}"
+    );
+    assert_eq!(
+        channel["original_retention_state"].as_str(),
+        Some("retained"),
+        "the retention state is replaced by the latest report: {channel}"
+    );
+    assert!(
+        channel["notice_config_error"].is_null(),
+        "a success without a config error clears the row's value: {channel}"
+    );
+    assert!(
+        channel["last_notice_failed_at"].as_str().is_some(),
+        "last_notice_failed_at must be set: {channel}"
+    );
+}
+
 /// Spec: "report TIMESTAMPS only ... never a computed `healthy: bool`" — the channel entry shape must not carry any boolean health verdict.
 #[tokio::test]
 async fn health_channel_entry_never_carries_a_healthy_bool() {
@@ -9626,6 +10221,47 @@ async fn health_channel_entry_never_carries_a_healthy_bool() {
         !ch.contains_key("healthy"),
         "channel entry must never carry a computed healthy bool: {ch:?}"
     );
+}
+
+/// ADR-056 (2026-10-15 amendment), decision 7: a writer that does not report
+/// the retention/notice fields leaves every one of them `null` on its row,
+/// rather than a fabricated zero or empty string.
+#[tokio::test]
+async fn health_nulls_retention_and_notice_fields_a_writer_never_reports() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    registry
+        .dispatch(
+            "comm.heartbeat",
+            serde_json::json!({
+                "namespace": "local",
+                "channel_kind": "email",
+                "channel_slug": "recipient@example.com",
+                "outcome": "success",
+            }),
+        )
+        .await
+        .expect("heartbeat succeeds");
+
+    let health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+    let channel = &health["channels"][0];
+    for field in [
+        "originals_not_retained",
+        "last_original_not_retained_at",
+        "last_original_not_retained_reason",
+        "original_retention_state",
+        "notices_failed",
+        "last_notice_failed_at",
+        "notice_config_error",
+    ] {
+        assert!(
+            channel.get(field).is_some_and(serde_json::Value::is_null),
+            "a writer that never reports `{field}` must leave it a present null: {channel}"
+        );
+    }
 }
 
 /// khive #877: `comm.health` must read `channel_health` rows from the caller's injected namespace (`token.namespace()`), not the fixed `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` constant.
@@ -10536,16 +11172,19 @@ async fn t94_thread_excludes_messages_not_addressed_to_or_from_caller() {
         .expect("A sends to B");
     let root_id = sent["full_id"].as_str().expect("full_id").to_string();
 
+    let missing = uuid::Uuid::new_v4();
+    let unknown_from_c = registry_c
+        .dispatch("comm.thread", serde_json::json!({ "id": missing }))
+        .await
+        .expect_err("unknown thread root must be refused");
     let thread_from_c = registry_c
         .dispatch("comm.thread", serde_json::json!({ "id": root_id }))
         .await
-        .expect("C can resolve the root id but must see zero messages");
+        .expect_err("an unrelated actor must not resolve the hidden root");
     assert_eq!(
-        thread_from_c["count"].as_u64().unwrap_or(99),
-        0,
-        "an actor who is neither sender nor addressee must see zero thread messages \
-         (issue #94: thread previously exposed every actor's copies unfiltered); \
-         got {thread_from_c}"
+        thread_from_c.to_string(),
+        unknown_from_c.to_string(),
+        "an unrelated actor must receive the same error as for an unknown root"
     );
 
     let thread_from_a = registry_a
@@ -15662,6 +16301,14 @@ mod mailbox_views {
                         "{actor}/{verb} changed message rows"
                     );
                 }
+                let unknown = call_as(
+                    &fixture.registry,
+                    Some(actor),
+                    "comm.thread",
+                    json!({"id":Uuid::new_v4()}),
+                )
+                .await
+                .expect_err("unknown thread root must be refused");
                 let thread = call_as(
                     &fixture.registry,
                     Some(actor),
@@ -15669,8 +16316,9 @@ mod mailbox_views {
                     json!({"id":id}),
                 )
                 .await
-                .unwrap();
-                assert_eq!(thread["count"], 0, "{actor}: {thread}");
+                .expect_err("hidden thread root must be refused");
+                assert_eq!(thread.to_string(), unknown.to_string(), "{actor}");
+                assert_eq!(message_snapshot(&fixture).await, before);
             }
         }
         // An enrolled mailbox reader's delegated read grant does not enlarge
@@ -15906,11 +16554,15 @@ mod mailbox_views {
             )
             .await
             .expect_err("matching sender must not reopen the legacy pool");
+        let unknown = fixture
+            .call(OWNER, "comm.thread", json!({"id":Uuid::new_v4()}))
+            .await
+            .expect_err("unknown thread root must be refused");
         let thread = fixture
             .call(OWNER, "comm.thread", json!({"id":missing_recipient}))
             .await
-            .unwrap();
-        assert_eq!(thread["count"], 0);
+            .expect_err("hidden thread root must be refused");
+        assert_eq!(thread.to_string(), unknown.to_string());
         assert_eq!(message_snapshot(&fixture).await, before);
     }
 
@@ -16312,7 +16964,7 @@ mod mailbox_views {
     async fn delegated_thread_filters_physical_rows_before_dedup_and_cursor_projection() {
         let fixture = Fixture::new(true, OWNER);
         let root = Uuid::from_u128(100);
-        // Root insertion itself must pass strict filtering, even without thread_id.
+        // The legacy root is retained in storage but excluded from this mailbox.
         fixture
             .seed(
                 root,
@@ -16340,9 +16992,8 @@ mod mailbox_views {
         fixture.seed(Uuid::from_u128(104), "valid pair", p).await;
         let mut p = props(Some(json!(OWNER)), None, "inbound", false);
         p["thread_id"] = json!(root);
-        fixture
-            .seed(Uuid::from_u128(105), "unattributed sender", p)
-            .await;
+        let anchor = Uuid::from_u128(105);
+        fixture.seed(anchor, "unattributed sender", p).await;
         for (n, recipient) in [
             None,
             Some(Value::Null),
@@ -16366,11 +17017,28 @@ mod mailbox_views {
             .seed(Uuid::from_u128(120), "unrelated attributed", p)
             .await;
         let before = fixture.owner_state().await;
-        let full = fixture
+        let unknown = fixture
+            .call(
+                HELPER,
+                "comm.thread",
+                json!({"mailbox_actor":OWNER,"id":Uuid::new_v4()}),
+            )
+            .await
+            .expect_err("unknown root must be refused");
+        let hidden = fixture
             .call(
                 HELPER,
                 "comm.thread",
                 json!({"mailbox_actor":OWNER,"id":root}),
+            )
+            .await
+            .expect_err("hidden legacy root must be refused");
+        assert_eq!(hidden.to_string(), unknown.to_string());
+        let full = fixture
+            .call(
+                HELPER,
+                "comm.thread",
+                json!({"mailbox_actor":OWNER,"id":anchor}),
             )
             .await
             .unwrap();
@@ -16393,10 +17061,10 @@ mod mailbox_views {
         assert_eq!(rows[1]["read"], true, "eligible twins still fold normally");
         // Descending `after` advances to a smaller (created_at, UUID) tuple.
         // All fixture timestamps are equal, so the oldest retained row has no successor.
-        let empty = fixture.call(HELPER,"comm.thread",json!({"mailbox_actor":OWNER,"id":root,"after":outbound,"order":"desc","limit":1,"fields":["full_id","read"]})).await.unwrap();
+        let empty = fixture.call(HELPER,"comm.thread",json!({"mailbox_actor":OWNER,"id":anchor,"after":outbound,"order":"desc","limit":1,"fields":["full_id","read"]})).await.unwrap();
         assert_eq!(empty["count"], 0);
         assert_eq!(empty["messages"], json!([]));
-        let page = fixture.call(HELPER,"comm.thread",json!({"mailbox_actor":OWNER,"id":root,"after":Uuid::from_u128(105),"order":"desc","limit":1,"fields":["full_id","read"]})).await.unwrap();
+        let page = fixture.call(HELPER,"comm.thread",json!({"mailbox_actor":OWNER,"id":anchor,"after":anchor,"order":"desc","limit":1,"fields":["full_id","read"]})).await.unwrap();
         assert_eq!(page["count"], 1, "the projection control must have a row");
         assert_eq!(page["messages"][0]["full_id"], json!(valid_out));
         assert_eq!(page["messages"][0]["read"], true);
@@ -16405,7 +17073,7 @@ mod mailbox_views {
             .call(
                 HELPER,
                 "comm.thread",
-                json!({"mailbox_actor":OWNER,"id":root,"after":outbound,"limit":1}),
+                json!({"mailbox_actor":OWNER,"id":anchor,"after":outbound,"limit":1}),
             )
             .await
             .unwrap();
@@ -16415,14 +17083,14 @@ mod mailbox_views {
             "equal-timestamp UUID cursor remains stable"
         );
         let own = fixture
-            .call(OWNER, "comm.thread", json!({"id":root}))
+            .call(OWNER, "comm.thread", json!({"id":anchor}))
             .await
             .unwrap();
         let explicit = fixture
             .call(
                 OWNER,
                 "comm.thread",
-                json!({"id":root,"mailbox_actor":OWNER}),
+                json!({"id":anchor,"mailbox_actor":OWNER}),
             )
             .await
             .unwrap();
@@ -16727,17 +17395,291 @@ async fn wire_ingest_cannot_select_verified_recipient_commit() {
     let (registry, runtime) = build_registry();
     registry.dispatch("comm.ingest",serde_json::json!({"from":"remote","to":"local","content":"ordinary wire message","verified":true,"verified_recipient":true,"receipt_ticket":{"logical_message_id":uuid::Uuid::new_v4(),"sender_agent_id":uuid::Uuid::new_v4()},"disposition":"stored"})).await.expect("ordinary ingest remains accepted");
     let guard = runtime.backend().pool().writer().unwrap();
-    for table in [
-        "comm_recipient_replay",
-        "comm_ack_work",
-        "comm_recipient_quarantine",
-    ] {
-        let count: i64 = guard
-            .conn()
-            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                row.get(0)
-            })
+    guard
+        .autocommit(|conn| {
+            for table in [
+                "comm_recipient_replay",
+                "comm_ack_work",
+                "comm_recipient_quarantine",
+            ] {
+                let count: i64 = conn
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0, "wire parameters must not select verified ingest");
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+mod transport_status_tests {
+    use super::*;
+    use khive_runtime::comm_transport::{
+        FailureClass, SenderAssurance, SenderEnvelope, TransportState,
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn envelope(outbound_note_id: Uuid) -> SenderEnvelope {
+        SenderEnvelope {
+            namespace: "local".into(),
+            logical_message_id: Uuid::new_v4(),
+            outbound_note_id,
+            kind: "khive".into(),
+            slug: "device".into(),
+            credential_ref: "keys/device".into(),
+            recipient_address: format!("khive1:example/{}", Uuid::nil()),
+            protocol_version: 1,
+            sender_agent_id: Uuid::new_v4().to_string(),
+            sender_assurance: SenderAssurance::Claimed,
+            recipient_agent_id: Uuid::nil().to_string(),
+            recipient_device_id: Uuid::new_v4(),
+            recipient_key_epoch: 1,
+            contact_generation: 1,
+            sender_key_epoch: 1,
+            recipient_key_fingerprint: "ab".repeat(32),
+            enc: vec![1; 32],
+            ciphertext: vec![2, 0, 255],
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn dispatch_returns_exact_status_object_and_full_uuid_in_agent_mode() {
+        let (registry, runtime) = build_registry();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let e = envelope(Uuid::new_v4());
+        runtime
+            .create_sender_transport(&token, e.clone())
+            .await
             .unwrap();
-        assert_eq!(count, 0, "wire parameters must not select verified ingest");
+        let response = registry
+            .dispatch("comm.transport_status", json!({"id": e.outbound_note_id}))
+            .await
+            .unwrap();
+        let expected = json!({"id": e.outbound_note_id, "status": "pending"});
+        assert_eq!(
+            response, expected,
+            "the real dispatch returns exactly two fields"
+        );
+        let handler = CommPack::HANDLERS
+            .iter()
+            .find(|h| h.name == "comm.transport_status")
+            .unwrap();
+        assert_eq!(handler.visibility, Visibility::Verb);
+        assert_eq!(handler.category, khive_types::VerbCategory::Assertive);
+        assert_eq!(
+            khive_runtime::presentation::present_with_policy(
+                response,
+                khive_runtime::presentation::PresentationMode::Agent,
+                0,
+                handler.presentation_policy(),
+            ),
+            expected,
+            "Agent presentation preserves the canonical outbound UUID"
+        );
+        let unknown = Uuid::new_v4();
+        assert_eq!(
+            registry
+                .dispatch("comm.transport_status", json!({"id": unknown}))
+                .await
+                .unwrap(),
+            json!({"id": unknown, "status": "unknown"})
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn email_admission_keeps_all_five_transport_status_wire_values() {
+        let (registry, runtime) = build_registry();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let unknown = Uuid::new_v4();
+        assert_eq!(
+            registry
+                .dispatch("comm.transport_status", json!({"id":unknown}))
+                .await
+                .unwrap(),
+            json!({"id":unknown,"status":"unknown"})
+        );
+        for (state, disposition, expected) in [
+            (
+                TransportState::RecipientStored,
+                "stored",
+                "recipient_stored",
+            ),
+            (
+                TransportState::RecipientQuarantined,
+                "quarantined",
+                "recipient_quarantined",
+            ),
+        ] {
+            let e = envelope(Uuid::new_v4());
+            runtime
+                .create_sender_transport(&token, e.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                registry
+                    .dispatch("comm.transport_status", json!({"id":e.outbound_note_id}))
+                    .await
+                    .unwrap(),
+                json!({"id":e.outbound_note_id,"status":"pending"})
+            );
+            runtime
+                .record_sender_transport_failure(e.key(), FailureClass::Permanent, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                registry
+                    .dispatch("comm.transport_status", json!({"id":e.outbound_note_id}))
+                    .await
+                    .unwrap(),
+                json!({"id":e.outbound_note_id,"status":"failed"})
+            );
+            // Receipt verification stays covered by the runtime's signed-receipt
+            // matrix; this fixture pins the actual wire projection independently.
+            khive_db::stores::note::transport::SenderTransportStore::new(
+                runtime.backend().pool_arc(),
+            )
+            .accept_receipt(
+                e.key(),
+                state,
+                json!({
+                    "binding": {
+                        "protocol_version": e.protocol_version,
+                        "logical_message_id": e.logical_message_id,
+                        "sender_agent_id": e.sender_agent_id,
+                        "recipient_agent_id": e.recipient_agent_id,
+                        "recipient_device_id": e.recipient_device_id,
+                        "recipient_key_epoch": e.recipient_key_epoch,
+                        "contact_generation": e.contact_generation,
+                        "delivery_attempt_id": Uuid::new_v4(),
+                    },
+                    "disposition": disposition,
+                    "signature": [1],
+                }),
+            )
+            .await
+            .unwrap();
+            let before = runtime.sender_transport(e.key()).await.unwrap();
+            assert_eq!(
+                registry
+                    .dispatch("comm.transport_status", json!({"id":e.outbound_note_id}))
+                    .await
+                    .unwrap(),
+                json!({"id":e.outbound_note_id,"status":expected})
+            );
+            assert_eq!(runtime.sender_transport(e.key()).await.unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn dispatch_refuses_short_uuid_and_normalizes_complete_spellings() {
+        let (registry, _) = build_registry();
+        let id = Uuid::new_v4();
+        let error = registry
+            .dispatch("comm.transport_status", json!({"id": &id.to_string()[..8]}))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            khive_runtime::RuntimeError::InvalidInput(_)
+        ));
+        let message = error.to_string();
+        assert!(
+            message.contains("short prefix")
+                && message.contains("scoped resolution")
+                && message.contains("full outbound UUID"),
+            "{message}"
+        );
+        assert_eq!(
+            registry
+                .dispatch(
+                    "comm.transport_status",
+                    json!({"id": format!("  {}  ", id.simple().to_string().to_uppercase())})
+                )
+                .await
+                .unwrap(),
+            json!({"id": id, "status": "unknown"})
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn delivered_ignores_failed_and_recipient_stored_transport_rows() {
+        let (registry, runtime) = build_registry();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        // One real dual-write and one UUID with no internal sibling pin both outcomes.
+        let sent = registry
+            .dispatch(
+                "comm.send",
+                json!({"to": "agent:recipient", "content": "transport independence"}),
+            )
+            .await
+            .unwrap();
+        let sent_id = Uuid::parse_str(sent["full_id"].as_str().unwrap()).unwrap();
+        for (id, count) in [(sent_id, 1), (Uuid::new_v4(), 0)] {
+            let expected = json!({
+                "id": id,
+                "status": if count > 0 { "delivered" } else { "undelivered" },
+                "delivered": count > 0,
+                "inbound_count": count,
+            });
+            let before = registry
+                .dispatch("comm.delivered", json!({"id": id}))
+                .await
+                .unwrap();
+            assert_eq!(before, expected, "the internal sibling fixture is real");
+            let e = envelope(id);
+            runtime
+                .create_sender_transport(&token, e.clone())
+                .await
+                .unwrap();
+            runtime
+                .record_sender_transport_failure(e.key(), FailureClass::Permanent, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                registry
+                    .dispatch("comm.delivered", json!({"id": id}))
+                    .await
+                    .unwrap(),
+                before,
+                "a failed transport row cannot alter dual-write confirmation"
+            );
+            // The trusted store boundary is sufficient here: signature verification is
+            // exercised by the runtime status matrix, not by this independent read.
+            let receipt = json!({
+                "binding": {
+                    "protocol_version": e.protocol_version,
+                    "logical_message_id": e.logical_message_id,
+                    "sender_agent_id": e.sender_agent_id,
+                    "recipient_agent_id": e.recipient_agent_id,
+                    "recipient_device_id": e.recipient_device_id,
+                    "recipient_key_epoch": e.recipient_key_epoch,
+                    "contact_generation": e.contact_generation,
+                    "delivery_attempt_id": Uuid::new_v4(),
+                },
+                "disposition": "stored",
+                "signature": [1],
+            });
+            khive_db::stores::note::transport::SenderTransportStore::new(
+                runtime.backend().pool_arc(),
+            )
+            .accept_receipt(e.key(), TransportState::RecipientStored, receipt)
+            .await
+            .unwrap();
+            assert_eq!(
+                registry
+                    .dispatch("comm.delivered", json!({"id": id}))
+                    .await
+                    .unwrap(),
+                before,
+                "a recipient-stored transport row cannot alter dual-write confirmation"
+            );
+        }
     }
 }

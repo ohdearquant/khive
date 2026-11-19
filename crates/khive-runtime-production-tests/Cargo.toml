@@ -1,0 +1,22 @@
+[package]
+name = "khive-runtime-production-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Audit batch behavior through the ordinary runtime dependency."
+
+[lib]
+bench = false
+
+# Run this package alone to avoid unifying the runtime's self dev-dependency.
+[dependencies]
+khive-runtime = { path = "../khive-runtime", default-features = false }
+khive-storage = { path = "../khive-storage" }
+khive-types = { path = "../khive-types" }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+uuid = { workspace = true }

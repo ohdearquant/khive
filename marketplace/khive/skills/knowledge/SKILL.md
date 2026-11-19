@@ -21,8 +21,11 @@ in the corpus.
 request(ops="knowledge.search(query=\"attention sink quantization\", rerank=true)")
 ```
 
-`rerank=true` normalizes scores to [0,1] so results are directly comparable. For queries
-that span multiple concepts, add `decompose=true` to split the query before retrieval.
+Embedding rerank is on by default when an embedder is configured (`rerank=false` opts out).
+Scores are request-relative and squash-normalized to [0,1), and every result reports
+`calibrated: false` in its `score_provenance`: compare results by rank within one response,
+never by absolute score across queries. For queries that span multiple concepts, add
+`decompose=true` to split the query before retrieval.
 
 ```
 request(ops="knowledge.search(query=\"RoPE positional encoding and flash attention\", rerank=true, decompose=true)")

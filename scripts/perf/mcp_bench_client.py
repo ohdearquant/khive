@@ -154,6 +154,19 @@ def call_verb(proc, verb, args):
     return first.get("result")
 
 
+def require_all_audit_success_rows(proc):
+    """Refuse benchmark measurements unless diagnostics explicitly reports all."""
+    try:
+        diagnostics = call_verb(proc, "db_diagnostics", {"size_composition": False})
+    except Exception as exc:
+        raise RuntimeError("Cannot verify benchmark success-audit mode through db_diagnostics") from exc
+    mode = diagnostics.get("audit_success_rows_mode") if isinstance(diagnostics, dict) else None
+    if mode != "all":
+        raise RuntimeError(
+            f"Benchmark requires audit_success_rows_mode='all'; db_diagnostics reported {mode!r}"
+        )
+
+
 def handshake(proc, client_name="bench-pipeline", client_version="1.0.0"):
     """Perform the MCP `initialize` / `notifications/initialized` round trip."""
     send(proc, "initialize", {

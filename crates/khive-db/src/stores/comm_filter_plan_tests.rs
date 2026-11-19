@@ -2,9 +2,9 @@
 
 use super::{
     build_note_filter_read_clause, build_note_filter_where, comm_filter_index_clause,
-    note_filter_page_order_clause, NOTE_COLUMNS,
+    note_filter_page_order_clause, note_filter_page_sql, NOTE_COLUMNS,
 };
-use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
+use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
 use khive_storage::types::SqlValue;
 use rusqlite::{Connection, StatementStatus};
 use serde_json::{json, Value};
@@ -31,7 +31,7 @@ CREATE INDEX idx_comm_message_outbound_recipient
  json_extract(properties, '$.to_actor'), created_at DESC, id ASC)
  WHERE deleted_at IS NULL;";
 
-const OUTBOX_DUE_INDEX: &str = include_str!("../../sql/044-comm-outbound-due-b-index.sql");
+const OUTBOX_DUE_INDEX: &str = include_str!("../../sql/066-comm-undelivered-due-index.sql");
 
 const RECIPIENT_ONLY: &str = "CREATE INDEX idx_candidate_recipient_only
  ON notes(namespace, kind, ifnull(json_extract(properties, '$.to_actor'), ''))
@@ -271,6 +271,23 @@ fn measure_with_sql(
         params.len() - 1,
         params.len(),
     ));
+    measure_statement(conn, sql, params)
+}
+
+fn measure_due_page(conn: &Connection, filter: &NoteFilter) -> Value {
+    let (sql, params) = note_filter_page_sql("default", filter, 21_i64, 0_i64).unwrap();
+    assert!(
+        !sql.contains("INDEXED BY"),
+        "due page must not force an index: {sql}"
+    );
+    measure_statement(conn, sql, params)
+}
+
+fn measure_statement(
+    conn: &Connection,
+    sql: String,
+    params: Vec<Box<dyn rusqlite::types::ToSql>>,
+) -> Value {
     let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let plan: Vec<String> = conn
         .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
@@ -399,6 +416,388 @@ fn outbox_zero_due_scan_cost_stays_bounded_as_same_channel_future_rows_grow() {
             large_steps <= small_steps + 128,
             "{stage}: future same-channel backlog must not add row-proportional due-scan work: {small_steps} -> {large_steps}"
         );
+    }
+}
+
+fn outbox_row_snapshot(conn: &Connection) -> Vec<Vec<rusqlite::types::Value>> {
+    conn.prepare("SELECT * FROM notes ORDER BY id")
+        .unwrap()
+        .query_map([], |row| {
+            (0..row.as_ref().column_count())
+                .map(|i| row.get(i))
+                .collect()
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn history_outbox_filter(legacy: bool) -> NoteFilter {
+    let mut filter = outbox_filter();
+    if !legacy {
+        let slug = filter.property_filters.last_mut().unwrap();
+        assert_eq!(slug.json_path, "$.channel_slug");
+        slug.op = FilterOp::Eq;
+        slug.value = SqlValue::Text("sender".into());
+    }
+    filter
+}
+
+fn delivered_history_fixture(history: usize) -> (tempfile::TempDir, Connection) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut conn = Connection::open(dir.path().join("outbox.db")).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.pragma_update(None, "cache_size", crate::pool::sqlite_cache_size_pragma())
+        .unwrap();
+    conn.pragma_update(None, "mmap_size", crate::pool::sqlite_mmap_size_pragma())
+        .unwrap();
+    conn.execute_batch(include_str!("../../sql/notes-ddl.sql"))
+        .unwrap();
+    register_comm_indexes(&conn);
+    seed_delivered_history(&mut conn, history);
+    (dir, conn)
+}
+
+fn seed_delivered_history(conn: &mut Connection, history: usize) {
+    let tx = conn.transaction().unwrap();
+    {
+        let mut insert = tx.prepare(
+            "INSERT INTO notes(id,namespace,kind,content,properties,created_at,updated_at,strict_due_key,due_source)
+             VALUES (?1,'default','message','retained message',?2,?3,?3,?4,?5)",
+        ).unwrap();
+        for i in 0..25 {
+            let due = i < 3 || (15..17).contains(&i);
+            let deadline = if due {
+                "1990-01-01T00:00:00Z"
+            } else {
+                "2999-01-01T00:00:00Z"
+            };
+            let mut props = json!({"direction":"outbound", "to_actor":"test:recipient",
+                "next_attempt_at":deadline});
+            if i < 15 {
+                props["channel_slug"] = json!("sender");
+            }
+            insert
+                .execute(rusqlite::params![
+                    format!("00000000-0000-4000-8000-{:012}", i + 1),
+                    props.to_string(),
+                    i64::from(i / 2),
+                    crate::pool::strict_rfc3339_key(deadline),
+                    deadline,
+                ])
+                .unwrap();
+        }
+        for i in 0..history {
+            insert.execute(rusqlite::params![
+                format!("10000000-0000-4000-8000-{i:012}"),
+                json!({"direction":"outbound","to_actor":"test:recipient","channel_slug":"sender"}).to_string(),
+                1000_i64, Option::<Vec<u8>>::None, Option::<String>::None,
+            ]).unwrap();
+        }
+        // Keep other buckets present after ANALYZE, independently of delivered history.
+        for i in 0..1000 {
+            for (prefix, direction) in [("20000000", "outbound"), ("30000000", "inbound")] {
+                insert
+                    .execute(rusqlite::params![
+                        format!("{prefix}-0000-4000-8000-{i:012}"),
+                        json!({"direction":direction,"to_actor":"other:recipient"}).to_string(),
+                        2000_i64,
+                        Option::<Vec<u8>>::None,
+                        Option::<String>::None,
+                    ])
+                    .unwrap();
+            }
+        }
+    }
+    assert_eq!(tx.execute(
+        "UPDATE notes SET properties=json_set(properties,'$.delivered_at','2020-01-01T00:00:00Z')
+         WHERE id >= '10000000' AND id < '20000000'", [],
+    ).unwrap(), history);
+    tx.commit().unwrap();
+}
+
+#[test]
+fn outbox_due_work_is_independent_of_delivered_history() {
+    let (_small_dir, small) = delivered_history_fixture(1000);
+    let (_large_dir, large) = delivered_history_fixture(10_000);
+    for stage in ["fresh", "analyzed"] {
+        if stage == "analyzed" {
+            small.execute_batch("ANALYZE").unwrap();
+            large.execute_batch("ANALYZE").unwrap();
+        }
+        let small_before = outbox_row_snapshot(&small);
+        let large_before = outbox_row_snapshot(&large);
+        assert_eq!(small_before.len(), 3025);
+        assert_eq!(large_before.len(), 12_025);
+        for legacy in [false, true] {
+            let expected: Vec<_> = if legacy { vec![17, 16] } else { vec![3, 1, 2] }
+                .into_iter()
+                .map(|i| format!("00000000-0000-4000-8000-{i:012}"))
+                .collect();
+            let filter = history_outbox_filter(legacy);
+            let small_read = measure(&small, &filter);
+            let large_read = measure(&large, &filter);
+            assert_eq!(
+                small_read["ids"],
+                json!(expected),
+                "{stage}, legacy={legacy}"
+            );
+            assert_eq!(large_read["ids"], small_read["ids"]);
+            for read in [&small_read, &large_read] {
+                let plan = read["plan"].to_string();
+                assert!(
+                    plan.contains("idx_comm_message_outbound_due")
+                        && plan.contains("namespace=? AND kind=? AND <expr>=? AND <expr>=?")
+                        && plan.contains("<expr><?"),
+                    "{stage}, legacy={legacy}: bucket/deadline seek missing: {plan}"
+                );
+            }
+            let small_steps = small_read["vm_steps"].as_i64().unwrap();
+            let large_steps = large_read["vm_steps"].as_i64().unwrap();
+            assert!(large_steps <= small_steps + 128,
+                "{stage}, legacy={legacy}: delivered history added due-page work: {small_steps} -> {large_steps}");
+        }
+        assert_eq!(outbox_row_snapshot(&small), small_before);
+        assert_eq!(outbox_row_snapshot(&large), large_before);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MigratedHistorySchema {
+    Fresh,
+    V65Upgrade,
+}
+
+fn history_migration_ledger(conn: &Connection) -> Vec<(u32, String, i64)> {
+    conn.prepare("SELECT version, name, applied_at FROM _schema_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn installed_outbox_due_index(conn: &Connection) -> String {
+    conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='index' AND name='idx_comm_message_outbound_due'",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn assert_migrated_outbox_due_index(conn: &Connection) {
+    let (_, create) = OUTBOX_DUE_INDEX.split_once("CREATE INDEX").unwrap();
+    let expected = format!("CREATE INDEX{create}");
+    assert_eq!(
+        installed_outbox_due_index(conn)
+            .trim()
+            .trim_end_matches(';'),
+        expected.trim().trim_end_matches(';'),
+        "migration must install the complete authored index definition"
+    );
+}
+
+fn migrate_history_through_v65(conn: &mut Connection) {
+    conn.execute_batch(include_str!("../../sql/schema-migrations-table.sql"))
+        .unwrap();
+    for migration in crate::migrations::MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= 65)
+    {
+        let tx = conn.transaction().unwrap();
+        // The bounded DDL-history fixture includes the two Rust-owned schema
+        // bodies; the populated V65-to-current transition uses the real runner.
+        if migration.version == 44 {
+            crate::migrations::migrate_outbound_due_key(&tx).unwrap();
+        } else if migration.version == 48 {
+            crate::migrations::migrate_acknowledgement_journal(&tx).unwrap();
+        } else {
+            tx.execute_batch(migration.up).unwrap();
+        }
+        tx.execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
+            rusqlite::params![migration.version, migration.name],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+}
+
+fn migrated_delivered_history_fixture(
+    history: usize,
+    schema: MigratedHistorySchema,
+) -> (tempfile::TempDir, Connection) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut conn = Connection::open(dir.path().join("outbox.db")).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.pragma_update(None, "cache_size", crate::pool::sqlite_cache_size_pragma())
+        .unwrap();
+    conn.pragma_update(None, "mmap_size", crate::pool::sqlite_mmap_size_pragma())
+        .unwrap();
+    // Register the read function without replacing any migrated index.
+    crate::pool::register_rfc3339_key(&conn).unwrap();
+    let latest = crate::migrations::latest_schema_version();
+    match schema {
+        MigratedHistorySchema::Fresh => {
+            assert_eq!(
+                crate::migrations::run_migrations_for_test(&mut conn).unwrap(),
+                latest
+            );
+            assert_eq!(
+                crate::migrations::read_schema_version(&conn).unwrap(),
+                latest
+            );
+            seed_delivered_history(&mut conn, history);
+        }
+        MigratedHistorySchema::V65Upgrade => {
+            migrate_history_through_v65(&mut conn);
+            assert_eq!(crate::migrations::read_schema_version(&conn).unwrap(), 65);
+            assert!(
+                !installed_outbox_due_index(&conn).contains("$.delivered_at"),
+                "predecessor index must still include delivered history"
+            );
+            seed_delivered_history(&mut conn, history);
+            let rows_before = outbox_row_snapshot(&conn);
+            let ledger_before = history_migration_ledger(&conn);
+            assert_eq!(ledger_before.last().unwrap().0, 65);
+            assert_eq!(
+                crate::migrations::run_migrations_for_test(&mut conn).unwrap(),
+                latest
+            );
+            assert_eq!(outbox_row_snapshot(&conn), rows_before);
+            let ledger_after = history_migration_ledger(&conn);
+            assert_eq!(ledger_after.len(), crate::migrations::MIGRATIONS.len());
+            assert_eq!(
+                &ledger_after[..ledger_before.len()],
+                ledger_before.as_slice()
+            );
+            let first_new = &ledger_after[ledger_before.len()];
+            assert_eq!(
+                (first_new.0, first_new.1.as_str()),
+                (66, "comm_undelivered_due_index")
+            );
+        }
+    }
+    assert_eq!(
+        crate::migrations::read_schema_version(&conn).unwrap(),
+        latest
+    );
+    assert_migrated_outbox_due_index(&conn);
+    (dir, conn)
+}
+
+#[test]
+fn outbox_due_migrated_schemas_preserve_plans_and_work_bounds() {
+    for schema in [
+        MigratedHistorySchema::Fresh,
+        MigratedHistorySchema::V65Upgrade,
+    ] {
+        let (_small_dir, small) = migrated_delivered_history_fixture(1000, schema);
+        let (_large_dir, large) = migrated_delivered_history_fixture(10_000, schema);
+        for stage in ["fresh", "analyzed"] {
+            if stage == "analyzed" {
+                small.execute_batch("ANALYZE").unwrap();
+                large.execute_batch("ANALYZE").unwrap();
+            }
+            let small_before = outbox_row_snapshot(&small);
+            let large_before = outbox_row_snapshot(&large);
+            assert_eq!(small_before.len(), 3025);
+            assert_eq!(large_before.len(), 12_025);
+            for legacy in [false, true] {
+                let expected: Vec<_> = if legacy { vec![17, 16] } else { vec![3, 1, 2] }
+                    .into_iter()
+                    .map(|i| format!("00000000-0000-4000-8000-{i:012}"))
+                    .collect();
+                let filter = history_outbox_filter(legacy);
+                let small_read = measure_due_page(&small, &filter);
+                let large_read = measure_due_page(&large, &filter);
+                assert_eq!(
+                    small_read["ids"],
+                    json!(expected),
+                    "{schema:?}, {stage}, legacy={legacy}"
+                );
+                assert_eq!(large_read["ids"], small_read["ids"]);
+                for read in [&small_read, &large_read] {
+                    let plan = read["plan"].to_string();
+                    assert!(
+                        plan.contains("idx_comm_message_outbound_due")
+                            && plan.contains("namespace=? AND kind=? AND <expr>=? AND <expr>=?")
+                            && plan.contains("<expr><?"),
+                        "{schema:?}, {stage}, legacy={legacy}: bucket/deadline seek missing: {plan}"
+                    );
+                }
+                let small_steps = small_read["vm_steps"].as_i64().unwrap();
+                let large_steps = large_read["vm_steps"].as_i64().unwrap();
+                assert!(large_steps <= small_steps + 128,
+                    "{schema:?}, {stage}, legacy={legacy}: delivered history added due-page work: {small_steps} -> {large_steps}");
+            }
+            assert_eq!(outbox_row_snapshot(&small), small_before);
+            assert_eq!(outbox_row_snapshot(&large), large_before);
+        }
+    }
+}
+
+#[test]
+fn outbox_due_preserves_delivered_marker_types_and_raw_updates() {
+    for legacy in [false, true] {
+        let conn = future_outbox_fixture(0);
+        let mut props = json!({"direction":"outbound","to_actor":"test:recipient"});
+        if !legacy {
+            props["channel_slug"] = json!("sender");
+        }
+        for (id, created) in [("target", 2), ("control", 1)] {
+            conn.execute(
+                "INSERT INTO notes(id,namespace,kind,properties,created_at,updated_at)
+                 VALUES (?1,'default','message',?2,?3,?3)",
+                rusqlite::params![id, props.to_string(), created],
+            )
+            .unwrap();
+        }
+        let filter = history_outbox_filter(legacy);
+        for marker in [
+            None,
+            Some(Value::Null),
+            Some(json!("")),
+            Some(json!("2020-01-01T00:00:00Z")),
+            Some(json!("invalid")),
+            Some(json!(0)),
+            Some(json!(42)),
+            Some(json!(false)),
+            Some(json!(true)),
+            Some(json!([])),
+            Some(json!({})),
+            None,
+            Some(Value::Null),
+        ] {
+            let eligible = marker.as_ref().is_none_or(Value::is_null);
+            let mut edited = props.clone();
+            if let Some(value) = marker {
+                edited["delivered_at"] = value;
+            }
+            conn.execute(
+                "UPDATE notes SET properties=?1 WHERE id='target'",
+                [edited.to_string()],
+            )
+            .unwrap();
+            let before = outbox_row_snapshot(&conn);
+            let result = measure(&conn, &filter);
+            assert_eq!(
+                result["ids"],
+                if eligible {
+                    json!(["target", "control"])
+                } else {
+                    json!(["control"])
+                },
+                "legacy={legacy}, properties={edited}"
+            );
+            assert_eq!(outbox_row_snapshot(&conn), before);
+        }
+        conn.execute("UPDATE notes SET properties=NULL WHERE id='target'", [])
+            .unwrap();
+        let before = outbox_row_snapshot(&conn);
+        assert_eq!(measure(&conn, &filter)["ids"], json!(["control"]));
+        assert_eq!(outbox_row_snapshot(&conn), before);
     }
 }
 
@@ -1056,4 +1455,208 @@ fn missing_pinned_comm_indexes_are_errors_without_fallback() {
         let error = conn.prepare(result["sql"].as_str().unwrap()).err().unwrap();
         assert!(error.to_string().contains(index), "{error}");
     }
+}
+
+const THREAD_ID: &str = "0193a5b2-7c41-7d2e-8f00-1a2b3c4d5e6f";
+
+/// The base mailbox fixture plus one five-message thread, optionally analyzed.
+fn thread_fixture(foreign_count: usize, analyzed: bool) -> Connection {
+    let conn = fixture(foreign_count, 0);
+    for i in 0..5 {
+        let direction = if i % 2 == 0 { "outbound" } else { "inbound" };
+        conn.execute(
+            "INSERT INTO notes(id, namespace, kind, properties, created_at, updated_at)
+             VALUES (?1, 'default', 'message', ?2, ?3, ?3)",
+            rusqlite::params![
+                format!("thread-row-{i}"),
+                json!({"direction":direction, "thread_id":THREAD_ID,
+                       "from_actor":"test:sender",
+                       "sent_at":format!("2026-10-12T00:00:0{i}Z")})
+                .to_string(),
+                (500 + i) as i64
+            ],
+        )
+        .unwrap();
+    }
+    if analyzed {
+        conn.execute_batch("ANALYZE").unwrap();
+    }
+    conn
+}
+
+/// The `comm.thread` read: every accepted spelling of the thread id in one IN.
+fn thread_filter() -> NoteFilter {
+    NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![PropertyFilter {
+            json_path: "$.thread_id".to_string(),
+            op: FilterOp::In(vec![
+                SqlValue::Text(THREAD_ID.to_string()),
+                SqlValue::Text(THREAD_ID.to_uppercase()),
+                SqlValue::Text(format!("{{{THREAD_ID}}}")),
+            ]),
+            value: SqlValue::Null,
+        }],
+        ..Default::default()
+    }
+}
+
+/// The inbound-mail correlation probe: one spelling, outbound copies only.
+fn thread_outbound_probe_filter() -> NoteFilter {
+    NoteFilter {
+        kind: Some("message".to_string()),
+        property_filters: vec![
+            PropertyFilter {
+                json_path: "$.thread_id".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text(THREAD_ID.to_string()),
+            },
+            PropertyFilter {
+                json_path: "$.direction".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("outbound".to_string()),
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+/// The `comm.reply` root lookup: every spelling, a text `sent_at`, earliest first.
+fn thread_root_filter() -> NoteFilter {
+    let mut filter = thread_filter();
+    filter.property_filters.push(PropertyFilter {
+        json_path: "$.sent_at".to_string(),
+        op: FilterOp::JsonTypeEq,
+        value: SqlValue::Text("text".to_string()),
+    });
+    filter.order_by = Some(("$.sent_at".to_string(), SortDir::Asc));
+    filter
+}
+
+/// Every thread-keyed read shape the comm pack compiles, with its row count in
+/// `thread_fixture`.
+fn thread_filters() -> [(&'static str, NoteFilter, usize); 3] {
+    [
+        ("thread", thread_filter(), 5),
+        ("outbound probe", thread_outbound_probe_filter(), 3),
+        ("reply root", thread_root_filter(), 5),
+    ]
+}
+
+fn thread_pin(filter: &NoteFilter) -> &'static str {
+    let (predicate, _) = build_note_filter_where("default", filter).unwrap();
+    comm_filter_index_clause(filter, &predicate)
+}
+
+/// The pin is matched against the predicate the compiler emits, for one
+/// namespace and for a namespace set.
+#[test]
+fn thread_reads_pin_the_thread_index() {
+    for (name, filter, _) in thread_filters() {
+        for namespaces in [vec![], vec!["default".to_owned(), "other".to_owned()]] {
+            let mut filter = filter.clone();
+            filter.namespaces = namespaces;
+            assert_eq!(
+                thread_pin(&filter),
+                " INDEXED BY idx_comm_message_thread",
+                "{name}"
+            );
+        }
+    }
+}
+
+/// A thread read seeks the thread index, so the thread's own rows decide the
+/// work: 10,000 unrelated conversations in the namespace leave the page and the
+/// VM step count unchanged, with and without planner statistics, and with the
+/// creation-order listing index present to compete for the plan. The pinned
+/// page equals the unpinned one.
+#[test]
+fn thread_read_work_is_bounded_by_the_threads_own_rows() {
+    for (name, filter, rows) in thread_filters() {
+        for analyzed in [false, true] {
+            let small = measure(&thread_fixture(0, analyzed), &filter);
+            let conn = thread_fixture(10_000, analyzed);
+            assert_listing_index_present(&conn);
+            let large = measure(&conn, &filter);
+            let plan = large["plan"].to_string();
+            assert!(
+                plan.contains("USING INDEX idx_comm_message_thread"),
+                "{name} (analyzed {analyzed}) must seek the thread index, got plan: {plan}"
+            );
+            assert_eq!(large["ids"], small["ids"], "{name} (analyzed {analyzed})");
+            assert_eq!(large["ids"].as_array().unwrap().len(), rows, "{name}");
+            assert_eq!(
+                large["ids"],
+                measure_unpinned(&conn, &filter)["ids"],
+                "{name} (analyzed {analyzed}): the pin must not change the page"
+            );
+            let small_steps = small["vm_steps"].as_i64().unwrap();
+            let large_steps = large["vm_steps"].as_i64().unwrap();
+            assert!(
+                large_steps <= small_steps + 128,
+                "{name} (analyzed {analyzed}): unrelated messages must not add \
+                 row-proportional work: {small_steps} -> {large_steps}"
+            );
+        }
+    }
+}
+
+/// Shapes the thread index cannot serve, or that another pin owns, emit no
+/// thread pin and return the same rows as the planner's own choice.
+#[test]
+fn thread_reads_outside_the_index_shape_keep_their_plan() {
+    let conn = thread_fixture(30, false);
+    let mut recipient = inbox_filter("all", false);
+    recipient.property_filters.push(PropertyFilter {
+        json_path: "$.thread_id".to_string(),
+        op: FilterOp::Eq,
+        value: SqlValue::Text(THREAD_ID.to_string()),
+    });
+    assert_eq!(
+        thread_pin(&recipient),
+        " INDEXED BY idx_notes_message_recipient_direction"
+    );
+
+    let mut deleted = thread_filter();
+    deleted.include_deleted = true;
+    let mut other_kind = thread_filter();
+    other_kind.kind = Some("task".into());
+    let mut no_kind = thread_filter();
+    no_kind.kind = None;
+    let mut empty_set = thread_filter();
+    empty_set.property_filters[0].op = FilterOp::In(vec![]);
+    let mut not_equal = thread_outbound_probe_filter();
+    not_equal.property_filters[0].op = FilterOp::Ne;
+    for (name, filter) in [
+        ("include_deleted", deleted),
+        ("other kind", other_kind),
+        ("no kind", no_kind),
+        ("empty set", empty_set),
+        ("not equal", not_equal),
+    ] {
+        assert_eq!(thread_pin(&filter), "", "{name}");
+        let result = measure(&conn, &filter);
+        assert!(
+            !result["sql"].as_str().unwrap().contains("INDEXED BY"),
+            "{name}"
+        );
+        assert_eq!(
+            result["ids"],
+            measure_unpinned(&conn, &filter)["ids"],
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn missing_thread_index_is_an_error_without_fallback() {
+    let conn = thread_fixture(0, false);
+    let result = measure(&conn, &thread_filter());
+    conn.execute_batch("DROP INDEX idx_comm_message_thread")
+        .unwrap();
+    let error = conn.prepare(result["sql"].as_str().unwrap()).err().unwrap();
+    assert!(
+        error.to_string().contains("idx_comm_message_thread"),
+        "{error}"
+    );
 }

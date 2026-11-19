@@ -6,17 +6,35 @@ stale/dead one, and forwards request frames over the daemon socket. This
 document is the extended rationale for the concurrency and safety properties
 that the inline doc comments summarize.
 
-## Supervised startup (ADR-185 Amendments 1–3)
+## Supervised startup (ADR-185 Amendments 1–4)
 
 A supervisor launches the daemon through `kkernel supervisor launch`. The
-launcher publishes `~/.khive/khived.supervisor` before replacing itself with
+launcher publishes a marker for its socket before replacing itself with
 the daemon. Its four lines contain the supervisor job label, the launcher's
 PID, the restart interval in whole seconds, and a fresh UUID v4 incarnation
 claim. Unix exec preserves that PID. A client may ignore the fourth line;
 the launcher uses it to distinguish a live job from a daemon whose PID was reused.
 The interval must match the supervisor's restart policy. A legacy two-line
-marker has a ten-second interval. `KHIVE_SUPERVISOR_MARKER` overrides the path
-for isolated tests; it is not a second ownership declaration.
+marker has a ten-second interval. A nonempty `KHIVE_SUPERVISOR_MARKER` overrides
+the path for isolated tests; it is not a second ownership declaration.
+
+Without that override, the default socket retains `~/.khive/khived.supervisor`,
+including when `KHIVE_SOCKET` explicitly spells the default path. A private
+socket appends `.supervisor-marker` to its complete pathname: `/tmp/x.sock`
+uses `/tmp/x.sock.supervisor-marker`. Empty overrides are ignored. Launcher,
+client, daemon claim checks, release and the local installer use this rule;
+Launcher/client ownership locks remain `<marker>.lock`; the installer retains
+the separate boot-lock protocol described below. A default supervisor's marker
+therefore does not delay a private socket's startup. Path spellings are compared
+without filesystem canonicalization; participants must agree on the rendezvous
+spelling or explicit marker path.
+
+Upgrade an older private supervisor that used the implicit global marker by
+stopping the job first, releasing its old marker with the matching label and
+an explicit old-path override, then restarting the upgraded launcher and clients.
+An old global marker is never automatically removed or adopted. Mixed-version
+private deployments can keep an agreed explicit marker path during upgrade.
+Default deployments and explicit overrides keep their existing marker files.
 
 With a marker and no responsive socket, a client waits for at most three
 restart intervals from the start of its request. The bound applies to both
@@ -39,6 +57,29 @@ a responsive incumbent, bypass configuration checks, or replay an ambiguous
 mutation. No permanent “not yours to start” refusal remains on this path. An
 unreadable marker is still a claim; it is not treated as absent.
 
+Degraded bootstrap starts a daemon only where none is alive. If the PID file
+names a live daemon that does not answer and a marker (readable or not) claims
+the rendezvous, the client sends no signal and returns
+`supervised_daemon_unresponsive` (`not_committed`) naming the PID-file pid, the
+marker's job and pid, and the marker path. Restarting that daemon is the
+supervisor's job; a marker left behind by a removed supervisor must be removed
+by hand before clients recover the rendezvous again.
+
+Recovery also requires the socket and the PID file to belong to one
+rendezvous. When exactly one of `KHIVE_SOCKET` / `KHIVE_PID` is set and the
+socket does not answer, the request is refused with `rendezvous_split`
+(`not_committed`) before any marker read, signal or spawn; the data names both
+variables and both resolved paths. A socket that answers is forwarded to as
+before. Set both variables for a private rendezvous, or neither.
+
+The daemon records how each incarnation ended in `<pid file>.exit`:
+`running pid=<p> started=<time>` after it claims the PID file, then
+`exited pid=<p> reason=<signal SIGTERM|signal SIGINT|idle|error>
+sender_pid=<n|unknown> at=<time>` when shutdown begins. The next boot logs the
+previous line at WARN on `khive.boot`, or `recorded no exit (killed or crashed)`
+when the record still says running, together with the effective descriptor
+limit (`RLIMIT_NOFILE`).
+
 The launcher probes the socket while holding the lock. If a same-uid
 client-started khive daemon answers, the launcher asks for handover on the same
 credential-bound socket connection. The daemon acknowledges and sends SIGTERM
@@ -60,13 +101,12 @@ start-to-bind time and allow it to fit within two intervals. A marker's PID
 alone cannot prove that the supervisor is healthy: a reused PID and a crash
 loop are both bounded by the same client wait.
 
-The temporary marker written by `make local` is still a legacy two-line
-producer. Its publication is not atomic, its existence check does not use
-the launcher lock, and its cleanup does not re-check the job label. These
-limits are tracked in [#3086](https://github.com/ohdearquant/khive/issues/3086);
-the client continues to honor that marker with the ten-second default
-interval. The launcher's serialization guarantee covers cooperating
-`supervisor launch` and `supervisor release` commands, not that older producer.
+The temporary marker written by `make local` has three lines and follows the
+same socket-derived path rule. It publishes atomically and rechecks its label
+and PID before cleanup under the configured boot lock. That lock remains
+distinct from the launcher's marker lock. The launcher's serialization guarantee
+covers cooperating `supervisor launch` and `supervisor release` commands; this
+path change does not extend that guarantee to the installer's separate protocol.
 
 ## Long-poll deadlines and one read replay (#3045)
 
@@ -221,7 +261,7 @@ means something different: "the daemon itself answered slowly").
 
 ## Strict-mode fallback accounting (D2-R1/D2-R3, #947)
 
-`is_daemon_strict_mode` (`KHIVE_DAEMON_STRICT=1`) elevates `Illegitimate`-
+`is_daemon_strict_mode` elevates `Illegitimate`-
 severity fallbacks (`ConfigMismatch`, `NamespaceMismatch`) from a WARN to an
 error-level structured event plus `FALLBACK_STRICT_VIOLATIONS` (D2-R1), and
 independently, `fallback_or_reject` rejects the request outright instead of
@@ -233,10 +273,15 @@ on this. Every `FallbackReason` is rejected under strict mode, not just the
 `Illegitimate` tier — that tier only governs the WARN vs ERROR log level
 inside `record_fallback`, an orthogonal concern.
 
-No hosted-vs-local auto-detection signal exists in this codebase; strict
-mode is a plain opt-in, default OFF (matching `is_strict_actor_mode`'s
-`KHIVE_REQUIRE_ATTRIBUTED_ACTOR` shape) — the hosted/fleet image sets
-`KHIVE_DAEMON_STRICT=1` explicitly in its own deployment environment.
+`KHIVE_DAEMON_STRICT` is a tri-state (ADR-049 Amendment 14 §2). An explicit
+false value (`0`, `false`, `no`, `off`, any case) turns strict mode off; any
+other non-empty value turns it on; unset or empty means strict exactly when a
+daemon rendezvous (the resolved socket path or PID file) was on disk when the
+request entered `forward_or_spawn`, or is on disk at the decision. The entry
+reading is a task-local snapshot taken before recovery can remove a dead
+daemon's socket and PID file. With no rendezvous either time, the quiet
+`no_socket` fallback applies. `KHIVE_NO_DAEMON=1` remains the way to run
+without a daemon.
 
 `fallback_total()` derives its total by summing the five per-reason counters
 on read rather than tracking a separate atomic, so total == sum-of-reasons is
@@ -309,12 +354,21 @@ absence (`Unreachable`) returns `Some(Err)` immediately because the client
 cannot know whether a healthy daemon is serving other processes. It never
 returns `None` after the real frame has been written — `Some(Ok)`/`Some(Err)`
 both mean the caller must not dispatch locally.
-Under `KHIVE_DAEMON_STRICT=1`, the `NoSocket` case becomes `Some(Err(..))`
+Under strict mode, the `NoSocket` case becomes `Some(Err(..))`
 instead (see `fallback_or_reject`) — `KHIVE_NO_DAEMON` itself is unaffected,
 since it is the caller's explicit, unconditional opt-out (nothing is ever
-recorded or counted for it). Once the real frame IS fully written
-(`ParseFailure`/`ProtocolMismatch`), this returns a hard error immediately
-instead of killing/respawning/retrying or falling back locally.
+recorded or counted for it). In both modes, a `NoSocket` outcome whose daemon
+launch preflight refuses the current configuration (for example an events
+socket path over the platform limit) returns `Some(Err(..))` with `reason`
+`daemon_launch_preflight` and `domain_disposition: "not_committed"`, before any
+recovery wait: a daemon launched from that configuration would exit before
+binding. Once the real frame IS fully written
+(`ResponseTimeout`/`ResponseLost`/`ParseFailure`/`ProtocolMismatch`), this
+returns a hard error immediately instead of killing/respawning/retrying or
+falling back locally. The first three carry `reason` `daemon_slow` (with
+`phase: "after_write"`), `daemon_connection_lost` and `parse_failure`, all with
+`domain_disposition: "unknown"`; a boot-fence identity probe that times out
+returns `daemon_slow` with `phase: "before_dispatch"` and `not_committed`.
 
 Connection classification is intentionally narrow (#1242): `ENOENT` and
 `ECONNREFUSED` are `NoSocket`, preserving first-spawn and stale-socket

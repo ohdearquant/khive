@@ -4,8 +4,8 @@
 //! before any pack schema plan or mirror worker can run. A fresh database gets
 //! the final mirror schema in this same versioned transaction.
 
+use khive_types::hash::framed_text_sha256;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
-use sha2::{Digest, Sha256};
 
 use crate::error::SqliteError;
 
@@ -84,24 +84,6 @@ fn row_count(conn: &Connection, table: &str) -> Result<i64, SqliteError> {
         _ => return Err(SqliteError::InvalidData("invalid mirror table name".into())),
     };
     Ok(conn.query_row(&sql, [], |row| row.get(0))?)
-}
-
-/// Matches the ingest path's framed hash exactly: an optional-text marker,
-/// byte length and bytes, then raw-line byte length and bytes.
-fn content_hash(text: Option<&str>, raw: &str) -> String {
-    let mut hash = Sha256::new();
-    match text {
-        Some(value) => {
-            hash.update([1]);
-            hash.update((value.len() as u64).to_be_bytes());
-            hash.update(value.as_bytes());
-        }
-        None => hash.update([0]),
-    }
-    hash.update((raw.len() as u64).to_be_bytes());
-    hash.update(raw.as_bytes());
-    let digest = hash.finalize();
-    format!("{digest:x}")
 }
 
 /// Called only from the global versioned migration runner's transaction.
@@ -206,7 +188,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> Result<(), SqliteError> {
             let raw: String = row.get(2)?;
             tx.execute(
                 "UPDATE session_messages_scope_new SET content_hash=?1 WHERE mirror_rowid=?2",
-                params![content_hash(text.as_deref(), &raw), rowid],
+                params![framed_text_sha256(text.as_deref(), &raw).to_string(), rowid],
             )?;
         }
     }

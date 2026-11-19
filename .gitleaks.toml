@@ -11,7 +11,11 @@ description = "The two non-credential keys in the cache lock serialization fixtu
 condition = "AND"
 regexTarget = "secret"
 regexes = ['''^(abcdef0123456789|fedcba9876543210)$''']
-paths = ['''^crates/khive-pack-git/src/cache\.rs$''']
+# Keep the original exact path for history scans after moving the fixture.
+paths = [
+  '''^crates/khive-pack-git/src/cache\.rs$''',
+  '''^crates/khive-pack-git/src/cache_tests\.rs$''',
+]
 
 # The secret gate's own tests must contain values the gate refuses, so these two constants are
 # inputs rather than credentials. They are exempted by value and by path, not by fingerprint: a
@@ -22,12 +26,18 @@ description = "The two synthetic credential-shaped constants in the secret gate'
 condition = "AND"
 regexTarget = "secret"
 regexes = ['''^(a3f5c2e9d1b8047e63a1f4c2d5b6e8f1a9c3d2e4|Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh)$''']
-paths = ['''^crates/khive-runtime/src/secret_gate\.rs$''']
+# Keep the original exact path for history scans after the test extraction.
+paths = [
+  '''^crates/khive-runtime/src/secret_gate\.rs$''',
+  '''^crates/khive-runtime/src/secret_gate_tests\.rs$''',
+  '''^crates/khive-storage/src/secret_scan/tests\.rs$''',
+]
 
 # The node wire protocol appendix publishes an HPKE test vector, and its shared secret is an
 # intermediate derived from test seeds the appendix also publishes. It is a specification value,
-# not a credential, and the node crate's vector fixture carries the same value. Exempted by value
-# and by path, as above.
+# not a credential, and the node crate's vector fixture carried the same value until the crate left
+# this repository. The entry stays because the full-history scan still reads that fixture. Exempted
+# by value and by path, as above.
 [[rules.allowlists]]
 description = "The HPKE shared secret in the node wire protocol appendix's published test vector"
 condition = "AND"
@@ -38,12 +48,16 @@ paths = [
   '''^crates/khive-channel-node/tests/fixtures/node-v1-vectors\.json$''',
 ]
 
-# The node crate's HPKE conformance fixture copies RFC 9180 Appendix A.2.3 verbatim, and its
-# shared secret is derived from seeds the same appendix publishes. It is a specification value,
-# not a credential. Exempted by value and by path, as above.
+# RFC 9180 Appendix A.2.3 publishes an auth-mode HPKE test vector for DHKEM(X25519, HKDF-SHA256)
+# with ChaCha20-Poly1305, and the node crate kept it as a test fixture until the crate left this
+# repository; the entry stays because the full-history scan still reads that fixture. Its shared
+# secret is a specification value derived from the seeds the RFC also publishes, not a credential.
+# Exempted by value and by path, as above.
 [[rules.allowlists]]
-description = "The HPKE shared secret in the RFC 9180 conformance fixture"
+description = "The HPKE shared secret in RFC 9180's published auth-mode X25519 test vector, a node crate test fixture"
 condition = "AND"
 regexTarget = "secret"
 regexes = ['''^d2d67828c8bc9fa661cf15a31b3ebf1febe0cafef7abfaaca580aaf6d471e3eb$''']
-paths = ['''^crates/khive-channel-node/tests/fixtures/rfc9180-auth-x25519-chacha\.json$''']
+paths = [
+  '''^crates/khive-channel-node/tests/fixtures/rfc9180-auth-x25519-chacha\.json$''',
+]

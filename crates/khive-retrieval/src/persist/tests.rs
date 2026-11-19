@@ -1,18 +1,14 @@
 use super::*;
 use crate::NodeId;
 use khive_bm25::Bm25Index;
+use khive_db::StorageBackend;
 use khive_hnsw::HnswIndex;
-use rusqlite::Connection;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use khive_storage::types::{SqlStatement, SqlValue};
 
 async fn setup_test_persistence() -> RetrievalPersistence {
-    let conn = Connection::open_in_memory().expect("open in-memory db");
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-        .expect("set pragmas");
-    let persist = RetrievalPersistence::new(Arc::new(Mutex::new(conn)), "test");
-    persist.init_schema().await.expect("init schema");
-    persist
+    let backend = StorageBackend::memory().expect("open in-memory backend");
+    backend.prepare_core_schema().expect("migrate core schema");
+    RetrievalPersistence::new(backend.sql(), "test")
 }
 
 #[tokio::test]
@@ -272,17 +268,12 @@ async fn test_hnsw_shadow_validation_with_tombstones() {
 
 #[tokio::test]
 async fn test_namespace_isolation() {
-    let conn = Connection::open_in_memory().expect("open in-memory db");
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-        .expect("set pragmas");
-    let conn = Arc::new(Mutex::new(conn));
+    let backend = StorageBackend::memory().expect("open in-memory backend");
+    backend.prepare_core_schema().expect("migrate core schema");
 
-    // Create two persistence layers with different namespaces
-    let persist_ns1 = RetrievalPersistence::new(conn.clone(), "namespace1");
-    let persist_ns2 = RetrievalPersistence::new(conn.clone(), "namespace2");
-
-    // Initialize schema (only needed once since they share the connection)
-    persist_ns1.init_schema().await.expect("init schema");
+    // Create two persistence layers with different namespaces on the shared backend.
+    let persist_ns1 = RetrievalPersistence::new(backend.sql(), "namespace1");
+    let persist_ns2 = RetrievalPersistence::new(backend.sql(), "namespace2");
 
     // Persist different data to each namespace
     let mut index1 = Bm25Index::default();
@@ -341,23 +332,27 @@ async fn test_corrupted_bm25_data_returns_error() {
 
     // Manually insert corrupted JSON
     {
-        let conn = persist.conn.clone();
         let namespace = "test".to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            conn.execute(
+        let mut writer = persist
+            .sql
+            .writer()
+            .await
+            .expect("admit snapshot corruption");
+        writer
+            .execute(SqlStatement::new(
                 r#"
                 INSERT OR REPLACE INTO retrieval_snapshots
                     (namespace, index_type, snapshot, created_at)
                 VALUES
                     (?1, 'bm25', ?2, strftime('%s', 'now'))
                 "#,
-                rusqlite::params![namespace, b"not valid json {{{{"],
-            )
+                vec![
+                    SqlValue::Text(namespace),
+                    SqlValue::Blob(b"not valid json {{{{".to_vec()),
+                ],
+            ))
+            .await
             .expect("insert corrupted");
-        })
-        .await
-        .expect("spawn");
     }
 
     // Attempt to load should return an error
@@ -373,23 +368,27 @@ async fn test_corrupted_hnsw_data_returns_error() {
 
     // Manually insert corrupted JSON
     {
-        let conn = persist.conn.clone();
         let namespace = "test".to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            conn.execute(
+        let mut writer = persist
+            .sql
+            .writer()
+            .await
+            .expect("admit snapshot corruption");
+        writer
+            .execute(SqlStatement::new(
                 r#"
                 INSERT OR REPLACE INTO retrieval_snapshots
                     (namespace, index_type, snapshot, created_at)
                 VALUES
                     (?1, 'hnsw', ?2, strftime('%s', 'now'))
                 "#,
-                rusqlite::params![namespace, b"truncated json {\"total_nodes\":"],
-            )
+                vec![
+                    SqlValue::Text(namespace),
+                    SqlValue::Blob(b"truncated json {\"total_nodes\":".to_vec()),
+                ],
+            ))
+            .await
             .expect("insert corrupted");
-        })
-        .await
-        .expect("spawn");
     }
 
     // Attempt to load should return an error
@@ -407,25 +406,29 @@ async fn test_valid_json_wrong_schema_bm25() {
 
     // Insert valid JSON but wrong schema (missing required fields)
     {
-        let conn = persist.conn.clone();
         let namespace = "test".to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            // Valid JSON but wrong structure for Bm25Index
-            let wrong_schema = br#"{"some_field": "value", "other": 123}"#;
-            conn.execute(
+        let mut writer = persist
+            .sql
+            .writer()
+            .await
+            .expect("admit snapshot corruption");
+        // Valid JSON but wrong structure for Bm25Index
+        let wrong_schema = br#"{"some_field": "value", "other": 123}"#;
+        writer
+            .execute(SqlStatement::new(
                 r#"
                 INSERT OR REPLACE INTO retrieval_snapshots
                     (namespace, index_type, snapshot, created_at)
                 VALUES
                     (?1, 'bm25', ?2, strftime('%s', 'now'))
                 "#,
-                rusqlite::params![namespace, wrong_schema.as_slice()],
-            )
+                vec![
+                    SqlValue::Text(namespace),
+                    SqlValue::Blob(wrong_schema.to_vec()),
+                ],
+            ))
+            .await
             .expect("insert wrong schema");
-        })
-        .await
-        .expect("spawn");
     }
 
     // Attempt to load should return an error (missing required fields)
@@ -444,11 +447,13 @@ async fn test_schema_valid_bad_bm25_snapshot_returns_deserialize() {
     // out of range because next_internal_id is 0. This must be rejected by
     // Bm25Index's cross-field validation (issue #446), not just its shape.
     {
-        let conn = persist.conn.clone();
         let namespace = "test".to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            let bad_snapshot = br#"{
+        let mut writer = persist
+            .sql
+            .writer()
+            .await
+            .expect("admit snapshot corruption");
+        let bad_snapshot = br#"{
                 "inverted_index": {},
                 "doc_lengths": {"0": 1},
                 "id_to_internal": {},
@@ -459,19 +464,21 @@ async fn test_schema_valid_bad_bm25_snapshot_returns_deserialize() {
                 "block_size": 128,
                 "config": {"k1": 1.2, "b": 0.75, "memory_budget": null}
             }"#;
-            conn.execute(
+        writer
+            .execute(SqlStatement::new(
                 r#"
                 INSERT OR REPLACE INTO retrieval_snapshots
                     (namespace, index_type, snapshot, created_at)
                 VALUES
                     (?1, 'bm25', ?2, strftime('%s', 'now'))
                 "#,
-                rusqlite::params![namespace, bad_snapshot.as_slice()],
-            )
+                vec![
+                    SqlValue::Text(namespace),
+                    SqlValue::Blob(bad_snapshot.to_vec()),
+                ],
+            ))
+            .await
             .expect("insert schema-valid but inconsistent snapshot");
-        })
-        .await
-        .expect("spawn");
     }
 
     let result = persist.load_bm25_index().await;
@@ -489,25 +496,29 @@ async fn test_valid_json_wrong_schema_hnsw() {
 
     // Insert valid JSON but wrong schema (missing required fields for HnswSnapshot)
     {
-        let conn = persist.conn.clone();
         let namespace = "test".to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            // Valid JSON but wrong structure for HnswSnapshot
-            let wrong_schema = br#"{"total_nodes": 5, "wrong_field": true}"#;
-            conn.execute(
+        let mut writer = persist
+            .sql
+            .writer()
+            .await
+            .expect("admit snapshot corruption");
+        // Valid JSON but wrong structure for HnswSnapshot
+        let wrong_schema = br#"{"total_nodes": 5, "wrong_field": true}"#;
+        writer
+            .execute(SqlStatement::new(
                 r#"
                 INSERT OR REPLACE INTO retrieval_snapshots
                     (namespace, index_type, snapshot, created_at)
                 VALUES
                     (?1, 'hnsw', ?2, strftime('%s', 'now'))
                 "#,
-                rusqlite::params![namespace, wrong_schema.as_slice()],
-            )
+                vec![
+                    SqlValue::Text(namespace),
+                    SqlValue::Blob(wrong_schema.to_vec()),
+                ],
+            ))
+            .await
             .expect("insert wrong schema");
-        })
-        .await
-        .expect("spawn");
     }
 
     // Attempt to load should return an error (missing required fields)
@@ -523,23 +534,24 @@ async fn test_empty_blob_returns_error() {
 
     // Insert empty blob
     {
-        let conn = persist.conn.clone();
         let namespace = "test".to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            conn.execute(
+        let mut writer = persist
+            .sql
+            .writer()
+            .await
+            .expect("admit snapshot corruption");
+        writer
+            .execute(SqlStatement::new(
                 r#"
                 INSERT OR REPLACE INTO retrieval_snapshots
                     (namespace, index_type, snapshot, created_at)
                 VALUES
                     (?1, 'bm25', ?2, strftime('%s', 'now'))
                 "#,
-                rusqlite::params![namespace, &[] as &[u8]],
-            )
+                vec![SqlValue::Text(namespace), SqlValue::Blob(Vec::new())],
+            ))
+            .await
             .expect("insert empty blob");
-        })
-        .await
-        .expect("spawn");
     }
 
     // Attempt to load should return an error
@@ -660,24 +672,26 @@ async fn test_hnsw_shadow_validation_calls_verify() {
 
 /// Helper: insert raw bytes into the HNSW snapshot slot for a persistence instance.
 async fn inject_raw_hnsw_snapshot(persist: &RetrievalPersistence, data: &[u8]) {
-    let conn = persist.conn.clone();
-    let namespace = persist.namespace.clone();
-    let data = data.to_vec();
-    tokio::task::spawn_blocking(move || {
-        let conn = conn.blocking_lock();
-        conn.execute(
-            r#"
-            INSERT OR REPLACE INTO retrieval_snapshots
-                (namespace, index_type, snapshot, created_at)
-            VALUES
-                (?1, 'hnsw', ?2, strftime('%s', 'now'))
-            "#,
-            rusqlite::params![&*namespace, data],
-        )
+    let statement = SqlStatement::new(
+        r#"
+        INSERT OR REPLACE INTO retrieval_snapshots
+            (namespace, index_type, snapshot, created_at)
+        VALUES
+            (?1, 'hnsw', ?2, strftime('%s', 'now'))
+        "#,
+        vec![
+            SqlValue::Text(persist.namespace.to_string()),
+            SqlValue::Blob(data.to_vec()),
+        ],
+    );
+    persist
+        .sql
+        .writer()
+        .await
+        .expect("admit snapshot corruption")
+        .execute(statement)
+        .await
         .expect("inject raw snapshot");
-    })
-    .await
-    .expect("spawn");
 }
 
 /// Helper: build a valid HNSW index with some vectors and persist it.

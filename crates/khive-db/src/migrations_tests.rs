@@ -1,5 +1,35 @@
 use super::query_embedding_models_conn;
 use super::*;
+use super::{
+    apply_schema_plan_for_test as apply_schema_plan,
+    finalize_attachment_cutover_for_test as finalize_attachment_cutover,
+    run_migrations_for_test as run_migrations,
+    stage_attachment_cutover_for_test as stage_attachment_cutover,
+};
+#[path = "migrations_tests/admission.rs"]
+mod admission;
+#[path = "migrations_tests/atom_weights.rs"]
+mod atom_weights;
+#[path = "migrations_tests/comm_legacy_quarantine.rs"]
+mod comm_legacy_quarantine;
+#[path = "migrations_tests/edge_governance_invalidation_tests.rs"]
+mod edge_governance_invalidation;
+#[path = "migrations_tests/edge_governance_schema_tests.rs"]
+mod edge_governance_schema;
+#[path = "migrations_tests/error_cause.rs"]
+mod error_cause;
+#[path = "migrations_tests/node_confirmed_pins.rs"]
+mod node_confirmed_pins;
+#[path = "migrations_tests/page_accounting.rs"]
+mod page_accounting;
+#[path = "migrations_tests/pending_entity_indexes.rs"]
+mod pending_entity_indexes;
+#[path = "migrations_tests/proposal_archive.rs"]
+mod proposal_archive;
+#[path = "migrations_tests/retrieval_snapshots.rs"]
+mod retrieval_snapshots;
+#[path = "migrations_tests/stream_truncation_tests.rs"]
+mod stream_truncation;
 
 fn open_memory() -> Connection {
     Connection::open_in_memory().expect("in-memory connection")
@@ -41,6 +71,8 @@ fn migrate_through(conn: &mut Connection, through_version: u32) {
         // the migration runner.
         if migration.version == 44 {
             migrate_outbound_due_key(&tx).expect("apply historical migration body");
+        } else if migration.version == 48 {
+            migrate_acknowledgement_journal(&tx).expect("apply historical migration body");
         } else {
             tx.execute_batch(migration.up)
                 .expect("apply historical migration body");
@@ -103,7 +135,6 @@ fn insert_dependency_test_edge(
         rusqlite::params![id, source_id, target_id, relation, deleted_at],
     )
 }
-
 #[test]
 fn read_only_schema_validation_requires_exact_current_version_without_writes() {
     let mut current = open_memory();
@@ -185,7 +216,6 @@ fn read_only_schema_validation_requires_exact_current_version_without_writes() {
         "ahead-version diagnostic must be actionable: {ahead_error}"
     );
 }
-
 #[test]
 fn writable_upgrade_rejects_noncanonical_ledger_before_applying_next_migration() {
     let mut missing_middle = open_memory();
@@ -244,47 +274,6 @@ fn writable_upgrade_rejects_noncanonical_ledger_before_applying_next_migration()
         "ledger validation must fail before V19 is recorded"
     );
 }
-
-#[test]
-fn apply_schema_plan_rolls_back_migration_when_ledger_insert_fails() {
-    static MIGRATIONS: &[Migration] = &[Migration {
-        id: "001_atomic",
-        up_sql: "CREATE TABLE migration_effect (id INTEGER PRIMARY KEY);",
-        down_sql: None,
-        is_already_applied: None,
-    }];
-    let plan = ServiceSchemaPlan {
-        service: "atomicity_test",
-        sqlite: MIGRATIONS,
-        postgres: &[],
-    };
-    let conn = open_memory();
-    conn.execute_batch(SCHEMA_VERSION_TABLE).unwrap();
-    conn.execute_batch(
-        "CREATE TRIGGER reject_schema_version
-         BEFORE INSERT ON _schema_versions
-         BEGIN
-             SELECT RAISE(ABORT, 'injected ledger failure');
-         END;",
-    )
-    .unwrap();
-
-    apply_schema_plan(&conn, &plan).expect_err("ledger failure must abort the migration");
-
-    assert!(
-        !table_exists(&conn, "migration_effect"),
-        "migration body must roll back when its ledger insert fails"
-    );
-    let ledger_rows: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM _schema_versions WHERE service = 'atomicity_test'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(ledger_rows, 0);
-}
-
 #[test]
 fn concurrent_service_schema_opens_apply_a_migration_once() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -333,11 +322,11 @@ fn concurrent_service_schema_opens_apply_a_migration_once() {
         let path = path.clone();
         let start = std::sync::Arc::clone(&start);
         workers.push(std::thread::spawn(move || {
-            let conn = Connection::open(&path).expect("open worker connection");
+            let mut conn = Connection::open(&path).expect("open worker connection");
             conn.busy_timeout(std::time::Duration::from_secs(5))
                 .expect("busy timeout");
             start.wait();
-            apply_schema_plan(&conn, &PLAN).map_err(|error| error.to_string())
+            apply_schema_plan(&mut conn, &PLAN).map_err(|error| error.to_string())
         }));
     }
     start.wait();
@@ -1997,6 +1986,323 @@ fn v44_backfills_strict_due_keys_from_preexisting_notes() {
 }
 
 #[test]
+fn outbound_due_partial_index_upgrade_preserves_rows_and_reopens() {
+    fn index_sql(conn: &Connection) -> String {
+        conn.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='index' AND name='idx_comm_message_outbound_due'",
+            [], |row| row.get(0),
+        ).unwrap()
+    }
+    fn rows(conn: &Connection) -> Vec<Vec<rusqlite::types::Value>> {
+        conn.prepare("SELECT * FROM notes ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                (0..row.as_ref().column_count())
+                    .map(|i| row.get(i))
+                    .collect()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+    fn ledger(conn: &Connection) -> Vec<(u32, String, i64)> {
+        conn.prepare("SELECT version,name,applied_at FROM _schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+    fn members(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT id FROM notes INDEXED BY idx_comm_message_outbound_due
+             WHERE deleted_at IS NULL AND (json_type(properties,'$.delivered_at') IS NULL
+                OR json_type(properties,'$.delivered_at')='null') ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+    fn schema(conn: &Connection) -> Vec<(String, String, String, i64, Option<String>)> {
+        conn.prepare("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("outbox-upgrade.db");
+    let mut conn = Connection::open(&path).unwrap();
+    migrate_through(&mut conn, 65);
+    assert_eq!(read_schema_version(&conn).unwrap(), 65);
+    assert!(!index_sql(&conn).contains("$.delivered_at"));
+    let deadline = "2999-01-01T00:00:00Z";
+    for (id, marker, deleted) in [
+        ("missing", None, None),
+        ("null", Some(serde_json::Value::Null), None),
+        (
+            "stamped",
+            Some(serde_json::json!("2020-01-01T00:00:00Z")),
+            None,
+        ),
+        ("deleted", None, Some(99_i64)),
+    ] {
+        let mut props = serde_json::json!({"direction":"outbound","to_actor":"email:recipient",
+            "next_attempt_at":deadline,"untouched":{"number":42}});
+        if let Some(value) = marker {
+            props["delivered_at"] = value;
+        }
+        conn.execute(
+            "INSERT INTO notes(id,namespace,kind,status,name,content,salience,decay_factor,
+                expires_at,properties,created_at,updated_at,deleted_at,key,version,strict_due_key,due_source)
+             VALUES (?1,'local','message','active','retained name','retained content',0.7,0.3,
+                1234,?2,10,20,?3,?1,7,?4,?5)",
+            rusqlite::params![id,props.to_string(),deleted,crate::pool::strict_rfc3339_key(deadline),deadline],
+        ).unwrap();
+    }
+    conn.execute(
+        "INSERT INTO notes(id,namespace,kind,content,properties,created_at,updated_at)
+         VALUES ('sql-null','local','message','no routing',NULL,30,40)",
+        [],
+    )
+    .unwrap();
+    let before = rows(&conn);
+    let old_ledger = ledger(&conn);
+    run_migrations(&mut conn).unwrap();
+    assert_eq!(read_schema_version(&conn).unwrap(), latest_schema_version());
+    let upgraded_ledger = ledger(&conn);
+    assert_eq!(upgraded_ledger.len(), MIGRATIONS.len());
+    assert_eq!(&upgraded_ledger[..old_ledger.len()], old_ledger.as_slice());
+    let last = upgraded_ledger
+        .get(old_ledger.len())
+        .expect("V66 must follow the preserved predecessor ledger");
+    assert_eq!(
+        (last.0, last.1.as_str()),
+        (66, "comm_undelivered_due_index")
+    );
+    assert_eq!(rows(&conn), before);
+    let migrated_sql = index_sql(&conn);
+    let ddl = include_str!("../sql/066-comm-undelivered-due-index.sql");
+    let expected_sql = format!("CREATE INDEX{}", ddl.split_once("CREATE INDEX").unwrap().1);
+    assert_eq!(
+        migrated_sql.trim().trim_end_matches(';'),
+        expected_sql.trim().trim_end_matches(';')
+    );
+    assert!(!migrated_sql.contains("khive_rfc3339_strict_key"));
+    assert_eq!(members(&conn), ["missing", "null", "sql-null"]);
+    run_migrations(&mut conn).unwrap();
+    assert_eq!(ledger(&conn), upgraded_ledger);
+    assert_eq!(rows(&conn), before);
+    drop(conn);
+
+    let mut reopened = Connection::open(&path).unwrap();
+    assert_eq!(index_sql(&reopened), migrated_sql);
+    assert_eq!(rows(&reopened), before);
+    run_migrations(&mut reopened).unwrap();
+    assert_eq!(ledger(&reopened), upgraded_ledger);
+    assert_eq!(rows(&reopened), before);
+    let before_schema = schema(&reopened);
+    let schema_version: i64 = reopened
+        .pragma_query_value(None, "schema_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        reopened
+            .execute("DELETE FROM _schema_migrations WHERE version>=66", [])
+            .unwrap(),
+        MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version >= 66)
+            .count()
+    );
+    run_migrations(&mut reopened).unwrap();
+    assert_eq!(
+        reopened
+            .pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        schema_version,
+        "retained current outbox index must not be rebuilt on ledger-tail replay"
+    );
+    assert_eq!(schema(&reopened), before_schema);
+    assert_eq!(index_sql(&reopened), migrated_sql);
+    assert_eq!(rows(&reopened), before);
+    let replayed_ledger = ledger(&reopened);
+    assert_eq!(&replayed_ledger[..old_ledger.len()], old_ledger.as_slice());
+    assert_eq!(
+        replayed_ledger
+            .iter()
+            .map(|(version, name, _)| (*version, name.as_str()))
+            .collect::<Vec<_>>(),
+        MIGRATIONS
+            .iter()
+            .map(|migration| (migration.version, migration.name))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(members(&reopened), ["missing", "null", "sql-null"]);
+    reopened.execute(
+        "UPDATE notes SET properties=json_set(properties,'$.delivered_at','delivered') WHERE id='missing'", [],
+    ).unwrap();
+    assert_eq!(members(&reopened), ["null", "sql-null"]);
+    reopened.execute(
+        "UPDATE notes SET properties=json_set(properties,'$.delivered_at',NULL) WHERE id='missing'", [],
+    ).unwrap();
+    assert_eq!(members(&reopened), ["missing", "null", "sql-null"]);
+    let integrity: String = reopened
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    assert_eq!(rows(&reopened).len(), before.len());
+
+    let mut fresh = open_memory();
+    run_migrations(&mut fresh).unwrap();
+    assert_eq!(index_sql(&fresh), migrated_sql);
+}
+
+#[test]
+fn outbound_due_partial_index_replay_repairs_missing_or_wrong_definition() {
+    fn snapshot(conn: &Connection, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        conn.prepare(sql)
+            .unwrap()
+            .query_map([], |row| {
+                (0..row.as_ref().column_count())
+                    .map(|i| row.get(i))
+                    .collect()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+    fn definition(conn: &Connection) -> Option<String> {
+        conn.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='index' AND name='idx_comm_message_outbound_due'",
+            [], |row| row.get(0),
+        ).optional().unwrap()
+    }
+    for missing in [false, true] {
+        let mut conn = open_memory();
+        run_migrations(&mut conn).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO notes(id,namespace,kind,content,properties,created_at,updated_at)
+               VALUES ('local-pending','local','message','retained local',
+                       '{"direction":"outbound","to_actor":"email:r","keep":[1,2]}',11,12),
+                      ('other-pending','other','message','retained other',
+                       '{"direction":"outbound","to_actor":"email:r","delivered_at":null}',21,22),
+                      ('other-delivered','other','message','retained history',
+                       '{"direction":"outbound","to_actor":"email:r","delivered_at":"done"}',31,32);"#,
+        ).unwrap();
+        let canonical = definition(&conn).expect("fresh migration installs the canonical index");
+        let before_notes = snapshot(&conn, "SELECT rowid,* FROM notes ORDER BY id");
+        let prefix = snapshot(
+            &conn,
+            "SELECT * FROM _schema_migrations WHERE version<66 ORDER BY version",
+        );
+        conn.execute_batch("DROP INDEX idx_comm_message_outbound_due")
+            .unwrap();
+        if !missing {
+            let wrong = canonical.replacen(
+                "WHERE deleted_at IS NULL",
+                "WHERE deleted_at IS NULL AND namespace = 'local'",
+                1,
+            );
+            assert_ne!(
+                wrong, canonical,
+                "wrong-definition fixture must alter the predicate"
+            );
+            assert!(wrong.contains("$.delivered_at"));
+            conn.execute_batch(&wrong).unwrap();
+            assert_eq!(definition(&conn), Some(wrong));
+        }
+        assert_eq!(
+            conn.execute("DELETE FROM _schema_migrations WHERE version>=66", [])
+                .unwrap(),
+            MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version >= 66)
+                .count()
+        );
+        assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+        assert_eq!(
+            definition(&conn).as_deref(),
+            Some(canonical.as_str()),
+            "missing={missing}: restore the complete index definition"
+        );
+        assert_eq!(
+            snapshot(&conn, "SELECT rowid,* FROM notes ORDER BY id"),
+            before_notes
+        );
+        assert_eq!(
+            snapshot(
+                &conn,
+                "SELECT * FROM _schema_migrations WHERE version<66 ORDER BY version"
+            ),
+            prefix
+        );
+        let members: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT namespace,id FROM notes INDEXED BY idx_comm_message_outbound_due
+             WHERE deleted_at IS NULL AND (json_type(properties,'$.delivered_at') IS NULL
+                OR json_type(properties,'$.delivered_at')='null') ORDER BY namespace,id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            members,
+            vec![
+                ("local".into(), "local-pending".into()),
+                ("other".into(), "other-pending".into())
+            ]
+        );
+        let repaired_schema = snapshot(
+            &conn,
+            "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name",
+        );
+        let schema_version: i64 = conn
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .unwrap();
+        conn.execute("DELETE FROM _schema_migrations WHERE version>=66", [])
+            .unwrap();
+        assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+        assert_eq!(
+            conn.pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            schema_version
+        );
+        assert_eq!(
+            snapshot(
+                &conn,
+                "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name"
+            ),
+            repaired_schema
+        );
+        assert_eq!(
+            snapshot(&conn, "SELECT rowid,* FROM notes ORDER BY id"),
+            before_notes
+        );
+        assert_eq!(
+            snapshot(
+                &conn,
+                "SELECT * FROM _schema_migrations WHERE version<66 ORDER BY version"
+            ),
+            prefix
+        );
+        assert!(conn.is_autocommit());
+    }
+}
+
+#[test]
 fn reopened_unregistered_raw_notes_connection_can_delete_check_and_vacuum() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("outbound-due-raw-writer.db");
@@ -2911,8 +3217,8 @@ fn v24_migration_and_runtime_backfill_reconcile_identical_malformed_state() {
     let table = format!("fts_{table_key}");
     let map = format!("{table}_rowids");
     let state = format!("{map}_state");
-    // Establishes the schema; the table is empty so the marker is left
-    // deliberately unwritten (see `ensure_fts_rowid_map_backfilled`'s doc).
+    // Establishes the schema and writes the completion marker for the still
+    // empty table (see `ensure_fts_rowid_map_backfilled`'s doc).
     let _ = backend.text(table_key).unwrap();
     {
         let writer = backend.pool().writer().unwrap();
@@ -2921,10 +3227,11 @@ fn v24_migration_and_runtime_backfill_reconcile_identical_malformed_state() {
         writer
             .conn()
             .execute(&format!("DELETE FROM {state} WHERE key = 'backfill'"), [])
-            .expect("clear the marker the empty-table open above did not write anyway");
+            .expect("clear the marker the empty-table open above wrote");
         writer.conn().execute_batch("COMMIT").unwrap();
     }
     // Triggers the real runtime reconciliation.
+    backend.forget_proven_text_tables_for_test();
     let _ = backend.text(table_key).unwrap();
 
     let migrated_fts: Vec<(i64, String, String, i64)> = migrated
@@ -5180,6 +5487,14 @@ fn event_operation_attribution_upgrade_keeps_legacy_rows_unknown() {
 }
 
 #[test]
+fn event_operation_attribution_upgrade_follows_the_event_store_schema() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 35);
+    crate::stores::event::ensure_events_schema(&conn).unwrap();
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+}
+
+#[test]
 fn issue2673_v37_initializes_and_guards_entity_versions() {
     let upgraded = rusqlite::Connection::open_in_memory().unwrap();
     upgraded.execute_batch("CREATE TABLE entities(id TEXT PRIMARY KEY, name TEXT NOT NULL); INSERT INTO entities(id,name) VALUES('old','kept');").unwrap();
@@ -5385,4 +5700,307 @@ fn recipient_transport_migration_fresh_and_previous_tail() {
             "replaying V45 must preserve recipient state"
         );
     }
+}
+
+fn acknowledgement_schema(conn: &Connection) -> Vec<(String, String, Option<String>)> {
+    conn.prepare(
+        "SELECT type,name,sql FROM sqlite_master \
+         WHERE tbl_name='comm_ack_work' AND type IN ('table','index') ORDER BY type,name",
+    )
+    .unwrap()
+    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+fn acknowledgement_columns(
+    conn: &Connection,
+    retry_columns: bool,
+) -> Vec<Vec<rusqlite::types::Value>> {
+    let columns = if retry_columns {
+        "delivery_attempt_id,sender_agent_id,logical_message_id,binding,disposition,state,\
+         created_at,updated_at,attempt_count,not_before,retirement_reason"
+    } else {
+        "delivery_attempt_id,sender_agent_id,logical_message_id,binding,disposition,state,\
+         created_at,updated_at"
+    };
+    conn.prepare(&format!(
+        "SELECT {columns} FROM comm_ack_work ORDER BY delivery_attempt_id"
+    ))
+    .unwrap()
+    .query_map([], |row| {
+        (0..row.as_ref().column_count())
+            .map(|column| row.get(column))
+            .collect()
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+#[test]
+fn acknowledgement_journal_upgrade_preserves_every_legacy_column_and_matches_fresh_schema() {
+    let mut upgraded = open_memory();
+    migrate_through(&mut upgraded, 47);
+    for (attempt, state, disposition, created_at, updated_at) in [
+        ("pending-attempt", "pending", "stored", 17, 23),
+        ("finished-attempt", "acknowledged", "quarantined", 31, 47),
+    ] {
+        upgraded
+            .execute(
+                "INSERT INTO comm_ack_work \
+                 (delivery_attempt_id,sender_agent_id,logical_message_id,binding,\
+                  disposition,state,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                rusqlite::params![
+                    attempt,
+                    format!("sender-{attempt}"),
+                    format!("message-{attempt}"),
+                    format!("{{ \"attempt\":\"{attempt}\", \"version\": 1 }}"),
+                    disposition,
+                    state,
+                    created_at,
+                    updated_at
+                ],
+            )
+            .unwrap();
+    }
+    let legacy_rows = acknowledgement_columns(&upgraded, false);
+    assert_eq!(legacy_rows.len(), 2);
+    run_migrations(&mut upgraded).unwrap();
+    assert_eq!(
+        acknowledgement_columns(&upgraded, false),
+        legacy_rows,
+        "upgrading must preserve every legacy acknowledgement column byte for byte"
+    );
+    let mut fresh = open_memory();
+    run_migrations(&mut fresh).unwrap();
+    assert_eq!(
+        acknowledgement_schema(&upgraded),
+        acknowledgement_schema(&fresh),
+        "fresh and upgraded acknowledgement table and index SQL must match"
+    );
+    assert!(acknowledgement_schema(&fresh)
+        .iter()
+        .any(|(_, name, _)| name == "idx_comm_ack_due"));
+    let bookkeeping = upgraded
+        .prepare("SELECT attempt_count,not_before,retirement_reason FROM comm_ack_work")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(bookkeeping, vec![(0, None, None), (0, None, None)]);
+}
+
+#[test]
+fn acknowledgement_journal_tail_replay_preserves_retry_and_terminal_rows() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).unwrap();
+    for (attempt, state, counter, not_before, reason) in [
+        ("pending", "pending", 3, Some(101), None),
+        ("finished", "acknowledged", 7, None, None),
+        (
+            "retired",
+            "retired",
+            11,
+            Some(103),
+            Some("permanent_transport"),
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO comm_ack_work \
+             (delivery_attempt_id,sender_agent_id,logical_message_id,binding,disposition,\
+              state,created_at,updated_at,attempt_count,not_before,retirement_reason) \
+             VALUES (?1,'sender','message','{\"version\":1}','stored',?2,17,23,?3,?4,?5)",
+            rusqlite::params![attempt, state, counter, not_before, reason],
+        )
+        .unwrap();
+    }
+    let before_rows = acknowledgement_columns(&conn, true);
+    let before_schema = acknowledgement_schema(&conn);
+    conn.execute("DELETE FROM _schema_migrations WHERE version>=45", [])
+        .unwrap();
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+    assert_eq!(
+        acknowledgement_columns(&conn, true),
+        before_rows,
+        "replaying the recipient migration tail must preserve retries and terminal states"
+    );
+    assert_eq!(
+        acknowledgement_schema(&conn),
+        before_schema,
+        "tail replay must restore only the canonical acknowledgement indexes"
+    );
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+    assert_eq!(acknowledgement_columns(&conn, true), before_rows);
+}
+
+fn assert_acknowledgement_journal_partial_columns_refused(with_not_before: bool) {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 47);
+    conn.execute_batch(
+        "ALTER TABLE comm_ack_work ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
+    )
+    .unwrap();
+    if with_not_before {
+        conn.execute_batch("ALTER TABLE comm_ack_work ADD COLUMN not_before INTEGER")
+            .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO comm_ack_work \
+         (delivery_attempt_id,sender_agent_id,logical_message_id,binding,disposition,\
+          state,created_at,updated_at,attempt_count) \
+         VALUES ('partial-attempt','original-sender','original-message',\
+                 '{ \"version\": 1, \"transport\": \"original\" }','quarantined',\
+                 'pending',17,23,29)",
+        [],
+    )
+    .unwrap();
+    if with_not_before {
+        conn.execute("UPDATE comm_ack_work SET not_before=103", [])
+            .unwrap();
+    }
+    let before_rows = acknowledgement_columns(&conn, false);
+    let before_schema = acknowledgement_schema(&conn);
+    assert_eq!(before_rows.len(), 1);
+
+    let error = run_migrations(&mut conn)
+        .expect_err("V48 must refuse an acknowledgement table with only some retry columns");
+    assert!(
+        matches!(&error, SqliteError::Migration { version: 48, .. }),
+        "the real migration runner must report V48 refusal: {error:?}"
+    );
+    assert_eq!(
+        acknowledgement_columns(&conn, false),
+        before_rows,
+        "refusal must preserve every stored legacy acknowledgement column"
+    );
+    let attempt_count: i64 = conn
+        .query_row("SELECT attempt_count FROM comm_ack_work", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        attempt_count, 29,
+        "refusal must preserve retries already recorded in the partial schema"
+    );
+    if with_not_before {
+        let not_before: i64 = conn
+            .query_row("SELECT not_before FROM comm_ack_work", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(not_before, 103, "refusal must preserve the retry deadline");
+    }
+    assert_eq!(
+        acknowledgement_schema(&conn),
+        before_schema,
+        "refusal must leave the partial table and indexes untouched"
+    );
+    let latest_applied: u32 = conn
+        .query_row("SELECT max(version) FROM _schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(latest_applied, 47, "refusal must not advance the ledger");
+}
+
+#[test]
+fn acknowledgement_journal_partial_one_column_refuses_without_changing_rows() {
+    assert_acknowledgement_journal_partial_columns_refused(false);
+}
+
+#[test]
+fn acknowledgement_journal_partial_two_columns_refuses_without_changing_rows() {
+    assert_acknowledgement_journal_partial_columns_refused(true);
+}
+
+#[cfg(test)]
+#[path = "migrations/memory_visibility_tests.rs"]
+mod memory_visibility_tests;
+
+/// Runs the chain on `conn` and reports whether it stopped below the cutover.
+fn chain_defers(conn: &mut Connection) -> bool {
+    run_migrations(conn).unwrap() < ATTACHMENT_CUTOVER_VERSION
+}
+
+fn insert_legacy_content_ref(conn: &Connection) {
+    let content = khive_storage::blob::ContentRef::from_hex("c".repeat(64)).unwrap();
+    conn.execute(
+        "INSERT INTO entities \
+         (id, namespace, kind, entity_type, name, tags, created_at, updated_at, deleted_at, content_ref) \
+         VALUES ('legacy', 'local', 'document', NULL, 'legacy', '[]', 1, 1, NULL, ?1)",
+        [content.as_str()],
+    )
+    .unwrap();
+}
+
+#[test]
+fn the_v21_deferral_reader_agrees_with_the_chain() {
+    // A fresh store: no entities table, so no legacy reference; the chain completes V21.
+    let mut fresh = open_memory();
+    assert!(!attachment_cutover_would_defer(&fresh).unwrap());
+    assert!(!chain_defers(&mut fresh));
+
+    // Below V10: the entities table exists but has no content_ref column yet, so
+    // there is no legacy reference; the chain adds the column empty at V10.
+    let mut early = open_memory();
+    migrate_through(&mut early, 9);
+    assert!(!attachment_cutover_would_defer(&early).unwrap());
+    assert!(!chain_defers(&mut early));
+
+    // Pending at V20 with no legacy reference: the chain completes V21 itself.
+    let mut pending = open_memory();
+    migrate_through(&mut pending, 20);
+    assert!(!attachment_cutover_would_defer(&pending).unwrap());
+    assert!(!chain_defers(&mut pending));
+
+    // Pending at V20 with a legacy reference: the chain stops for the host.
+    let mut legacy = open_memory();
+    migrate_through(&mut legacy, 20);
+    insert_legacy_content_ref(&legacy);
+    assert!(attachment_cutover_would_defer(&legacy).unwrap());
+    assert!(chain_defers(&mut legacy));
+    assert_eq!(
+        attachment_cutover_status(&legacy).unwrap(),
+        AttachmentCutoverStatus::Pending
+    );
+
+    // Staged but not finalized: incomplete, and the chain still stops.
+    stage_attachment_cutover(&mut legacy).unwrap();
+    assert_eq!(
+        attachment_cutover_status(&legacy).unwrap(),
+        AttachmentCutoverStatus::Incomplete
+    );
+    assert!(attachment_cutover_would_defer(&legacy).unwrap());
+    assert!(chain_defers(&mut legacy));
+
+    // Finalized: past the cutover, so the chain never reaches that step again.
+    let mut complete = open_memory();
+    migrate_through(&mut complete, 20);
+    finalize_after_stage(&mut complete);
+    assert!(read_schema_version(&complete).unwrap() >= ATTACHMENT_CUTOVER_VERSION);
+    assert!(!attachment_cutover_would_defer(&complete).unwrap());
+    assert!(!chain_defers(&mut complete));
+}
+
+fn finalize_after_stage(conn: &mut Connection) {
+    stage_attachment_cutover(conn).unwrap();
+    finalize_attachment_cutover(conn).unwrap();
+}
+
+#[test]
+fn the_v21_deferral_reader_does_not_write() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 20);
+    insert_legacy_content_ref(&conn);
+    let changes_before = conn.total_changes();
+    assert!(attachment_cutover_would_defer(&conn).unwrap());
+    assert_eq!(conn.total_changes(), changes_before);
+    assert_eq!(read_schema_version(&conn).unwrap(), 20);
 }

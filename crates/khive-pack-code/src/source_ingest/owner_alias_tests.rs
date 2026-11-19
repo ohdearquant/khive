@@ -148,14 +148,14 @@ fn assert_edge_stamp(edge: &Edge, expected: DateTime<Utc>) {
 }
 
 #[tokio::test]
-async fn l2_known_limitation_shared_project_owner_leaves_unchanged_natural_edges_stale() {
+async fn l2_fallback_shared_project_owner_reobserves_unchanged_natural_edges() {
     let t1 = DateTime::parse_from_rfc3339("2026-10-02T00:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
     let t2 = t1 + chrono::Duration::seconds(1);
     let t3 = t2 + chrono::Duration::seconds(1);
     assert!(t1 < t2 && t2 < t3);
-    for interleave_shared_owner in [false, true] {
+    for interleave_shared_owner in [true, false] {
         let fixture = TempDir::new().expect("fixture");
         let a = fixture.path().join("A/proj");
         let b = fixture.path().join("B/proj");
@@ -229,14 +229,10 @@ async fn l2_known_limitation_shared_project_owner_leaves_unchanged_natural_edges
         let final_edge = natural_call_edge(&rt, &token).await;
         assert_eq!(final_edge.id, initial.id);
         assert_eq!(final_edge.created_at, initial.created_at);
-        if interleave_shared_owner {
-            assert_edge_stamp(&final_edge, t1);
-            assert_eq!(final_edge.updated_at, initial.updated_at);
-            assert_eq!(final_l2.symbol_edges_stamped, 0);
-        } else {
-            assert_edge_stamp(&final_edge, t3);
-            assert!(final_edge.updated_at >= t3);
-            assert_eq!(final_l2.symbol_edges_stamped, 1);
-        }
+        // Both roots use the basename fallback. Neither run may reuse an
+        // owner clock, even when another root advanced it between A ingests.
+        assert_edge_stamp(&final_edge, t3);
+        assert!(final_edge.updated_at >= t3);
+        assert_eq!(final_l2.symbol_edges_stamped, 1);
     }
 }

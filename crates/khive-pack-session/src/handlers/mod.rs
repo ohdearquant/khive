@@ -14,14 +14,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, Resolved, RuntimeError};
 use khive_storage::note::Note;
 
 use crate::vocab::SESSION_KIND;
 
-pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params)
-        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
+pub(crate) use khive_runtime::deser_params as deser;
+
+/// Resolve the shared inclusive limit range; callers retain their error wording.
+pub(crate) fn validate_limit(requested: Option<u32>, default: u32, max: u32) -> Result<u32, u32> {
+    let limit = requested.unwrap_or(default);
+    if (1..=max).contains(&limit) {
+        Ok(limit)
+    } else {
+        Err(limit)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -161,7 +169,8 @@ pub(crate) async fn resolve_session_uuid(
     }
 
     Err(RuntimeError::InvalidInput(format!(
-        "{verb}: id must be a full UUID or 8+ hex prefix; valid values: full UUID or 8+ hex prefix; got {raw}"
+        "{verb}: id must be a full UUID or 8+ hex prefix; valid values: full UUID or 8+ hex prefix; got {}",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, raw)
     )))
 }
 

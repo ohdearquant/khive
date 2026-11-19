@@ -23,6 +23,9 @@ use crate::pool::ConnectionPool;
 use crate::sql_bridge::bind_params;
 use crate::writer_task::WriterTaskHandle;
 
+#[path = "text/short_tokens.rs"]
+mod short_tokens;
+
 /// Name of the sidecar rowid map for a given FTS table: `{namespace,
 /// subject_id} -> rowid`, `WITHOUT ROWID`, `PRIMARY KEY (namespace,
 /// subject_id)`.
@@ -358,12 +361,6 @@ impl Fts5TextSearch {
         }
     }
 
-    fn open_standalone_writer(&self) -> Result<rusqlite::Connection, StorageError> {
-        self.pool
-            .open_standalone_writer()
-            .map_err(|e| map_sqlite_err(e, "open_fts_writer"))
-    }
-
     /// Re-derive writer-task availability at write time instead of trusting
     /// only the field cached at construction (ADR-136 D1 gate 3 amendment).
     /// `self.writer_task` permanently caches `None` when this store was
@@ -395,7 +392,7 @@ impl Fts5TextSearch {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|e| map_err(e, op)), op)
                 .await;
         }
 
@@ -404,33 +401,22 @@ impl Fts5TextSearch {
         self.with_writer_unmanaged(op, f).await
     }
 
-    /// Legacy standalone-connection / pool-mutex write path, bypassing the
-    /// WriterTask channel unconditionally regardless of
-    /// `KHIVE_WRITE_QUEUE`.
-    ///
-    /// Reserved for closures that manage their own transaction (a bare
-    /// `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK`) — those cannot be sent through
-    /// the WriterTask channel, which already wraps every request in its own
-    /// transaction. `rename_namespace` is the only caller.
+    /// Direct standalone or pooled typed transaction path, bypassing the
+    /// WriterTask channel after routing has selected a compatibility fallback.
+    /// Callbacks contain DML only; this seam owns BEGIN and settlement.
     async fn with_writer_unmanaged<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        let result = if self.is_file_backed {
-            let conn = self.open_standalone_writer()?;
-            tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))
-                .await
-                .map_err(|e| StorageError::driver(StorageCapability::Text, op, e))?
-        } else {
-            let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn()).map_err(|e| map_err(e, op))
+        let pool = Arc::clone(&self.pool);
+        let result = tokio::task::spawn_blocking(move || {
+            pool.execute_direct_transaction(StorageCapability::Text, op, move |conn| {
+                f(conn).map_err(|error| map_err(error, op))
             })
-            .await
-            .map_err(|e| StorageError::driver(StorageCapability::Text, op, e))?
-        };
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Text, op, e))?;
         if let Err(err) = &result {
             let msg = err.to_string();
             if msg.contains("locked") || msg.contains("busy") {
@@ -1151,37 +1137,23 @@ impl TextSearch for Fts5TextSearch {
         // owns the transaction. `current_writer_task("fts_upsert")`
         // (ADR-136 D1 gate 3
         // amendment) re-checks past a construction-time `None` cache so a
-        // handle that only became available later is still used here rather
-        // than falling to `with_writer`'s BEGIN-IMMEDIATE-wrapped closure
-        // below (that closure is not safe to send through the queue, which
-        // already wraps its own transaction).
+        // handle that only became available later is still used here.
         if let Some(writer_task) = self.current_writer_task("fts_upsert")? {
             let table2 = table.clone();
             return writer_task
-                .send_bounded(move |conn| {
-                    upsert_document_dml(conn, &table2, &document)
-                        .map_err(|e| map_err(e, "fts_upsert"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        upsert_document_dml(conn, &table2, &document)
+                            .map_err(|e| map_err(e, "fts_upsert"))
+                    },
+                    "fts_upsert",
+                )
                 .await;
         }
 
-        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
-        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
-        let origin = self.pool.origin();
+        // The direct typed unit owns the transaction around this DML body.
         self.with_writer("fts_upsert", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("text_upsert_document".to_string()),
-                origin,
-            );
-
-            if let Err(e) = upsert_document_dml(conn, &table, &document) {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
-
-            conn.execute_batch("COMMIT")?;
-            Ok(())
+            upsert_document_dml(conn, &table, &document)
         })
         .await
     }
@@ -1203,28 +1175,19 @@ impl TextSearch for Fts5TextSearch {
         if let Some(writer_task) = self.current_writer_task("fts_upsert_batch")? {
             let table2 = table.clone();
             return writer_task
-                .send_bounded(move |conn| {
-                    batch_upsert_documents_dml(conn, &table2, &documents, attempted)
-                        .map_err(|e| map_err(e, "fts_upsert_batch"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        batch_upsert_documents_dml(conn, &table2, &documents, attempted)
+                            .map_err(|e| map_err(e, "fts_upsert_batch"))
+                    },
+                    "fts_upsert_batch",
+                )
                 .await;
         }
 
-        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
-        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT.
-        let origin = self.pool.origin();
+        // The direct typed unit owns the transaction around the complete batch.
         self.with_writer("fts_upsert_batch", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("text_upsert_batch".to_string()),
-                origin,
-            );
-
-            let summary = batch_upsert_documents_dml(conn, &table, &documents, attempted)?;
-
-            conn.execute_batch("COMMIT")?;
-
-            Ok(summary)
+            batch_upsert_documents_dml(conn, &table, &documents, attempted)
         })
         .await
     }
@@ -1259,34 +1222,21 @@ impl TextSearch for Fts5TextSearch {
             let table2 = table.clone();
             let namespace2 = namespace.clone();
             return writer_task
-                .send_bounded(move |conn| {
-                    delete_document_dml(conn, &table2, &namespace2, subject_id)
-                        .map_err(|e| map_sqlite_err(e, "fts_delete"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        delete_document_dml(conn, &table2, &namespace2, subject_id)
+                            .map_err(|e| map_sqlite_err(e, "fts_delete"))
+                    },
+                    "fts_delete",
+                )
                 .await;
         }
 
-        let origin = self.pool.origin();
         self.with_writer("fts_delete", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("text_delete_document".to_string()),
-                origin,
-            );
-
-            match delete_document_dml(conn, &table, &namespace, subject_id) {
-                Ok(deleted) => {
-                    conn.execute_batch("COMMIT")?;
-                    Ok(deleted)
-                }
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    Err(match e {
-                        SqliteError::Rusqlite(inner) => inner,
-                        other => rusqlite::Error::InvalidParameterName(other.to_string()),
-                    })
-                }
-            }
+            delete_document_dml(conn, &table, &namespace, subject_id).map_err(|error| match error {
+                SqliteError::Rusqlite(inner) => inner,
+                other => rusqlite::Error::InvalidParameterName(other.to_string()),
+            })
         })
         .await
     }
@@ -1372,6 +1322,8 @@ impl TextSearch for Fts5TextSearch {
 
         let result = self
             .with_reader("fts_search", move |conn| {
+                let short_signals =
+                    short_tokens::Signals::for_query(&request.query, &request.mode, request.top_k);
                 let match_expr = match build_filtered_match_expr(
                     &request.query,
                     request.mode,
@@ -1380,6 +1332,22 @@ impl TextSearch for Fts5TextSearch {
                     Some(expr) => expr,
                     None => return Ok(Vec::new()),
                 };
+
+                if let Some(signals) = short_signals {
+                    return short_tokens::search(
+                        conn,
+                        &table,
+                        &match_expr,
+                        short_tokens::Search {
+                            filter: request.filter.as_ref(),
+                            top_k: request.top_k,
+                            snippet_chars: request.snippet_chars,
+                            window: short_tokens::Window::Ranked,
+                        },
+                        signals,
+                        usage.as_ref(),
+                    );
+                }
 
                 // Snippet column index 3 = body in the FTS5 schema.
                 // snippet_chars == 0 is the sentinel for "no snippet" — skip the
@@ -1701,6 +1669,8 @@ impl Fts5TextSearch {
         let usage = khive_storage::usage::current();
 
         self.with_reader("fts_search_unranked", move |conn| {
+            let short_signals =
+                short_tokens::Signals::for_query(&request.query, &request.mode, request.top_k);
             let match_expr = match build_filtered_match_expr(
                 &request.query,
                 request.mode,
@@ -1709,6 +1679,22 @@ impl Fts5TextSearch {
                 Some(expr) => expr,
                 None => return Ok(Vec::new()),
             };
+
+            if let Some(signals) = short_signals {
+                return short_tokens::search(
+                    conn,
+                    &table,
+                    &match_expr,
+                    short_tokens::Search {
+                        filter: request.filter.as_ref(),
+                        top_k: request.top_k,
+                        snippet_chars: request.snippet_chars,
+                        window: short_tokens::Window::Unranked,
+                    },
+                    signals,
+                    usage.as_ref(),
+                );
+            }
 
             let (filter_clause, filter_params) = if let Some(ref filter) = request.filter {
                 build_filter_clause(filter, &table, 3)
@@ -1766,7 +1752,7 @@ impl Fts5TextSearch {
         .await
     }
 
-    /// Two-stage gather: cheap unranked LIMIT gather_limit, then BM25-rank the subset.
+    /// Score a bounded unranked gather, then sort only those materialized rows.
     async fn search_rank_within_cap(
         &self,
         request: TextSearchRequest,
@@ -1776,6 +1762,8 @@ impl Fts5TextSearch {
         let usage = khive_storage::usage::current();
 
         self.with_reader("fts_search_rank_within_cap", move |conn| {
+            let short_signals =
+                short_tokens::Signals::for_query(&request.query, &request.mode, request.top_k);
             let match_expr = match build_filtered_match_expr(
                 &request.query,
                 request.mode,
@@ -1785,68 +1773,57 @@ impl Fts5TextSearch {
                 None => return Ok(Vec::new()),
             };
 
+            if let Some(signals) = short_signals {
+                return short_tokens::search(
+                    conn,
+                    &table,
+                    &match_expr,
+                    short_tokens::Search {
+                        filter: request.filter.as_ref(),
+                        top_k: request.top_k,
+                        snippet_chars: request.snippet_chars,
+                        window: short_tokens::Window::Capped(gather_limit),
+                    },
+                    signals,
+                    usage.as_ref(),
+                );
+            }
+
             let (filter_clause, filter_params) = if let Some(ref filter) = request.filter {
-                build_filter_clause(filter, &table, 3)
+                build_filter_clause(filter, &table, 4)
             } else {
                 (String::new(), Vec::new())
             };
 
-            // Stage 1: cheap unranked gather of rowids.
-            let gather_sql = format!(
-                "SELECT subject_id FROM {table} WHERE {table} MATCH ?1{filter_clause} LIMIT ?2"
-            );
-
-            let mut stmt = conn.prepare(&gather_sql)?;
-            count_fts_pass(usage.as_ref());
-            stmt.raw_bind_parameter(1, &match_expr)?;
-            stmt.raw_bind_parameter(2, gather_limit as i64)?;
-            for (i, param) in filter_params.iter().enumerate() {
-                param
-                    .to_sql()
-                    .map(|val| stmt.raw_bind_parameter(3 + i, val))
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
-            }
-
-            let mut gathered_ids: Vec<String> = Vec::new();
-            let mut rows = stmt.raw_query();
-            while let Some(row) = rows.next()? {
-                gathered_ids.push(row.get::<_, String>(0)?);
-            }
-
-            if gathered_ids.is_empty() {
-                return Ok(Vec::new());
-            }
-
-            // Stage 2: BM25-rank only the gathered subset via subject_id IN (...).
             let snippet_expr = if request.snippet_chars == 0 {
                 "NULL AS snippet".to_string()
             } else {
                 let chars = i32::try_from(request.snippet_chars).unwrap_or(i32::MAX);
-                format!("snippet({table}, 3, '', '', '...', {chars})")
+                format!("snippet({table}, 3, '', '', '...', {chars}) AS snippet")
             };
 
-            // Build IN clause for the gathered IDs.
-            let id_placeholders: Vec<String> = gathered_ids
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("?{}", 3 + i))
-                .collect();
-            let in_clause = id_placeholders.join(", ");
-
-            let rank_sql = format!(
-                "SELECT subject_id, rank, title, {snippet_expr} \
+            // Materialization fences the unranked LIMIT from the outer sort.
+            // Cache rank/snippet on the same filtered physical rows: looking up
+            // subject IDs again can admit a same-ID row from another namespace.
+            let sql = format!(
+                "WITH gathered AS MATERIALIZED (\
+                 SELECT subject_id, rank AS raw_rank, title, {snippet_expr} \
                  FROM {table} WHERE {table} MATCH ?1 \
-                 AND rank MATCH '{LEXICAL_BM25_RANK}' \
-                 AND subject_id IN ({in_clause}) \
-                 ORDER BY rank LIMIT ?2",
+                 AND rank MATCH '{LEXICAL_BM25_RANK}'{filter_clause} LIMIT ?2) \
+                 SELECT subject_id, raw_rank, title, snippet FROM gathered \
+                 ORDER BY raw_rank LIMIT ?3",
             );
 
-            let mut stmt2 = conn.prepare(&rank_sql)?;
+            let mut stmt2 = conn.prepare(&sql)?;
             count_fts_pass(usage.as_ref());
             stmt2.raw_bind_parameter(1, &match_expr)?;
-            stmt2.raw_bind_parameter(2, request.top_k as i64)?;
-            for (i, id_str) in gathered_ids.iter().enumerate() {
-                stmt2.raw_bind_parameter(3 + i, id_str.as_str())?;
+            stmt2.raw_bind_parameter(2, gather_limit as i64)?;
+            stmt2.raw_bind_parameter(3, request.top_k as i64)?;
+            for (i, param) in filter_params.iter().enumerate() {
+                param
+                    .to_sql()
+                    .map(|val| stmt2.raw_bind_parameter(4 + i, val))
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))??;
             }
 
             let mut hits = Vec::new();
@@ -1933,36 +1910,22 @@ impl Fts5TextSearch {
         if let Some(writer_task) = self.current_writer_task("fts_rename_namespace")? {
             let table2 = table.clone();
             return writer_task
-                .send_bounded(move |conn| {
-                    rename_namespace_dml(conn, &table2, &old_ns, &new_ns)
-                        .map_err(|e| map_err(e, "fts_rename_namespace"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        rename_namespace_dml(conn, &table2, &old_ns, &new_ns)
+                            .map_err(|e| map_err(e, "fts_rename_namespace"))
+                    },
+                    "fts_rename_namespace",
+                )
                 .await;
         }
 
         self.pool
             .record_direct_route(crate::timeout_sink::Site::DirectRouteFtsRenameNamespace);
 
-        let origin = self.pool.origin();
         self.with_writer_unmanaged("fts_rename_namespace", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("text_rename_namespace".to_string()),
-                origin,
-            );
-            // The SELECT now runs inside this same `BEGIN IMMEDIATE` — same
-            // TOCTOU fix as the queue path above, applied to the legacy
-            // standalone-connection path too.
-            match rename_namespace_dml(conn, &table, &old_ns, &new_ns) {
-                Ok(moved) => {
-                    conn.execute_batch("COMMIT")?;
-                    Ok(moved)
-                }
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    Err(e)
-                }
-            }
+            // The SELECT and writes share the typed unit's transaction.
+            rename_namespace_dml(conn, &table, &old_ns, &new_ns)
         })
         .await
     }
@@ -2062,3 +2025,11 @@ fn rename_namespace_dml(
 #[cfg(test)]
 #[path = "text_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "text_busy_tests.rs"]
+mod direct_busy_tests;
+
+#[cfg(test)]
+#[path = "text_short_token_tests.rs"]
+mod short_token_tests;

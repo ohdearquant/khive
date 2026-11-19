@@ -61,9 +61,18 @@ async fn ingest_disk_file(
     relative_path: &str,
     bytes: Vec<u8>,
 ) -> Result<Uuid, RuntimeError> {
-    let target_url = origin.join(relative_path).map_err(|error| {
+    let mut target_url = origin.join(".").map_err(|error| {
         RuntimeError::Internal(format!("bad relative path {relative_path:?}: {error}"))
     })?;
+    target_url
+        .path_segments_mut()
+        .map_err(|()| {
+            RuntimeError::Internal(format!(
+                "bad relative path {relative_path:?}: origin has no path"
+            ))
+        })?
+        .pop_if_empty()
+        .extend(relative_path.split('/'));
     let content_type = guess_content_type(Path::new(relative_path));
 
     let settled = crate::fetch::settle_content(
@@ -407,9 +416,8 @@ mod tests {
     mod descriptor_tests;
 
     use super::*;
-    use khive_pack_kg::KgPack;
     use khive_runtime::engine_config::WebSectionConfig;
-    use khive_runtime::{RuntimeConfig, VerbRegistryBuilder};
+    use khive_runtime::RuntimeConfig;
     use khive_types::Namespace;
     use std::sync::Arc;
 
@@ -426,17 +434,6 @@ mod tests {
             },
         });
         assert_eq!(extracted_target_count(&extraction), 3);
-    }
-
-    /// See `fetch::tests::install_web_edge_rules` for why this is needed:
-    /// the in-crate test runtime carries no `VerbRegistry`, so the web
-    /// pack's own `EDGE_RULES` are never installed on it by default.
-    fn install_web_edge_rules(runtime: &KhiveRuntime) {
-        let mut builder = VerbRegistryBuilder::new();
-        builder.register(KgPack::new(runtime.clone()));
-        builder.register(WebPack::new(runtime.clone()));
-        let registry = builder.build().expect("kg+web registry builds");
-        runtime.install_edge_rules(registry.all_edge_rules());
     }
 
     async fn test_runtime() -> (KhiveRuntime, NamespaceToken, tempfile::TempDir) {
@@ -463,7 +460,7 @@ mod tests {
             ..RuntimeConfig::no_embeddings()
         })
         .expect("file-backed runtime");
-        install_web_edge_rules(&runtime);
+        crate::test_support::install_web_edge_rules(&runtime);
         runtime
             .install_blob_store(Arc::new(store))
             .expect("install blob store");

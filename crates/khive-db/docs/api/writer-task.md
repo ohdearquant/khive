@@ -42,42 +42,77 @@ writer-task acquisition class once per dequeued top-level request or successful
 `PoolConfig::write_queue_capacity` resolves the default from
 `KHIVE_WRITE_QUEUE_CAPACITY`).
 
-## Proposed disk-reserve admission (#1844; not implemented)
+## Disk-reserve admission
 
-[ADR-154](../../../../docs/adr/ADR-154-sqlite-disk-reserve-admission.md) proposes
-the disk-reserve contract. This section is an implementation map, not a claim
-about current behavior.
+[ADR-154](../../../../docs/adr/ADR-154-sqlite-disk-reserve-admission.md) defines
+the accepted contract. The drain-loop behavior below is implemented; the
+[SQLite disk admission](disk-admission.md) inventory records the remaining
+admission boundaries, so this is not a claim of complete ADR conformance.
 
 The writer task does not sample free space when a caller enters the bounded
 channel. At execution time it acquires the shared volume lease, successfully
 executes `BEGIN IMMEDIATE`, and then probes the volume before invoking the
 request closure. A refusal or probe failure runs `ROLLBACK` and replies with
-the typed capacity error; a successful rollback does not retire the task. The
-lease remains held through the ordinary `COMMIT` or `ROLLBACK`.
+the typed capacity error if autocommit is restored; that refusal does not retire
+the task. The lease remains held through ordinary `COMMIT` or `ROLLBACK`.
 
-Every path follows the same lock order: volume lease, SQLite writer
-acquisition, capacity probe, first logical write. Top-level requests acquire
-the same lease and probe immediately before their first SQLite call because
-they deliberately have no explicit `BEGIN`. Pooled/standalone writers and
-startup migrations receive equivalent admission outside this drain loop.
-Volume-lease acquisition has its own configured deadline; it does not reuse
-the queue-only `write_admission_deadline_ms` governed by ADR-131.
+The lock order is volume lease, SQLite writer acquisition, capacity probe, first
+logical write. Non-checkpoint top-level requests have no explicit `BEGIN`, so
+they take the lease and probe immediately before execution. Typed VACUUM dispatch
+also requires a copy-sized database/WAL headroom estimate and refuses if that
+estimate is unavailable or overflows. Typed checkpoint requests, including
+`TopLevelMaintenance::WalCheckpointTruncate` sent through
+`send_checkpoint_bounded`, skip both the lease and capacity probe while remaining
+serialized by the writer task. The standalone SQL route makes the same
+checkpoint/VACUUM distinction.
 
-The two current migration bootstrap writes happen before a migration
-transaction exists: `apply_schema_plan` executes `SCHEMA_VERSION_TABLE`, and
-`run_migrations_locked` executes `MIGRATION_TRACKING_TABLE`. Each acquires the
-volume lease and probes immediately before its autocommit `execute_batch`,
-skips that call on refusal, and holds the lease until the connection returns
-to autocommit. Subsequent migration transactions use the ordinary
-post-`BEGIN` probe.
+Volume-lease acquisition uses `disk_guard_deadline_ms` (backend override, then
+`KHIVE_SQLITE_DISK_GUARD_DEADLINE_MS`, then 2,000 ms; valid range 100–10,000 ms).
+It does not reuse the queue-only `write_admission_deadline_ms` governed by
+ADR-131. `CapacityUnavailable` identifies `identity`, `lock`, `lock_contended` and
+`probe` phases. Only `lock_contended`, a lease wait that reached its deadline,
+is retryable within the caller's bounded retry budget. `CapacityFloor` and the
+other unavailable phases remain non-retryable. Same-thread nesting
+returns `VolumeLeaseReentry` immediately with both call sites instead of waiting
+as ordinary contention. A manual atomic unit's lease is detached from the thread
+that took it, so a later request from that thread waits as ordinary contention.
 
-Transaction terminators, checkpointing, diagnostics, reader release, and
-recovery are explicit refusal bypasses. The guard therefore belongs at the
-logical-request boundary, never inside generic statement execution. Native
-`SQLITE_FULL` remains a separate higher-severity stage and is not rendered as
-a successful capacity refusal. Checkpoint bypass includes PASSIVE,
-ADR-091's scheduled threshold-armed `maybe_truncate`, and operator-authorized
-stronger checkpoints.
+If admission's rollback cannot prove autocommit, the request receives
+`WriterTaskTerminated` with `SideEffectsUnknown` and the task retires. Terminal
+return and unwind retain the volume lease through owned-connection cleanup.
+Cleanup attempts to establish autocommit or close the connection; if neither
+succeeds, it returns `WriterSettlementUnknown` internally and poisons shared
+admission, so later writes are refused before starting (`WriterPoisoned`,
+projected as `NotStarted`). The task preserves its terminal reply and closes and
+fails the queued requests without restarting. A cleanup failure does not turn an
+unknown outcome into an ordinary capacity refusal.
+
+When native `SQLITE_FULL` automatically ends an admitted transaction, the
+shared finalizer retains its primary and extended codes on the terminal outcome.
+The request remains `SideEffectsUnknown`, the writer still retires, and caller
+projection reports `sqlite_disk_full` rather than a capacity refusal. The
+original operation or COMMIT error is escalated once before it is discarded;
+the retained code pair is not an error source, so the outer sink hook does not
+emit it again. Ordinary terminal failures carry no pair. COMMIT failures whose
+rollback succeeds keep their existing request-failed pool-error representation.
+
+The two migration bootstrap writes happen before a migration transaction exists:
+`apply_schema_plan` executes `SCHEMA_VERSION_TABLE`, and
+`bootstrap_migration_ledger` executes `MIGRATION_TRACKING_TABLE`. Their admitted
+wrappers hold the volume lease; each probes immediately before its autocommit
+`execute_batch`, skips that call on refusal, and retains the lease through
+settlement. Subsequent migration transactions use the ordinary post-`BEGIN`
+probe.
+
+Transaction terminators, checkpointing, read-only diagnostics, reader release and
+recovery bypass disk-floor refusal. The guard belongs at the logical-write
+boundary, never inside generic statement execution. A bypass does not suppress
+SQLite errors, and a sample does not reserve capacity or guarantee recovery
+headroom. Native `SQLITE_FULL` is distinct from preflight capacity refusal; its
+caller-visible code propagation after automatic rollback is still tracked by
+[#4405](https://github.com/ohdearquant/khive/issues/4405). Checkpoint bypass includes
+PASSIVE, ADR-091's scheduled threshold-armed `maybe_truncate`, and
+operator-authorized stronger checkpoints.
 
 ## Writer-stage telemetry (#1849)
 
@@ -202,6 +237,38 @@ either the delay schedule or the shared `busy_timeout` budget runs out moves
 `writer_task_begin_busy` N times and `writer_task_begin_busy_absorbed`
 N-1 times (every refusal but the final, unretried one).
 
+### Direct writer busy refusals
+
+`writer_acquisition_snapshot().direct_busy_refusals` is an additive per-pool
+counter, serialized as `writer_contention.direct_writer_busy_refusals`. An
+instrumented direct write increments it once only when its final returned error
+retains a typed SQLite primary `SQLITE_BUSY` cause. This covers ordinary legacy
+pooled/file-backed store writes, explicit typed transactions, graph composition,
+standalone and pool-backed SQL execution, and direct manual atomic units.
+
+The observer follows the complete preserved `Error::source` chain, including
+`WriterTaskRequestFailed` and nested `StorageError::Driver` nodes, and recognizes
+bare rusqlite errors and the SQLite-layer wrapper. It inspects at most 32 nodes,
+counting the returned StorageError as node one, and makes at most 32 `source()`
+calls. A BUSY cause deeper than that bound is conservatively undercounted; a
+cycle or exhausted budget without positive BUSY evidence contributes zero. An
+arbitrary individual `source()` implementation may itself fail to return; the
+node budget does not bound that call's behavior. Error messages are never used
+as SQLite-code evidence.
+
+A rolled-back typed body error preserves its cause and can contribute one.
+The existing wrapped COMMIT failure instead retains a text-only `Pool` error;
+its original SQLite code is unavailable and therefore contributes zero. This
+undercount does not change the returned COMMIT error or transaction cleanup.
+For a manual atomic unit, the outer unit is the observation boundary: inner
+execution and rollback cleanup do not increment separately. An absorbed inner
+BUSY followed by final success also contributes zero.
+
+Success, primary `SQLITE_LOCKED`, reader errors, writer-task queue execution and
+BEGIN counters, connection opening, checkout/admission/infrastructure errors,
+cause-free unknown outcomes, and raw connection escapes are excluded. The
+observer does not change errors, retry policy, writer retirement or admission.
+
 ### Bounded enqueue admission (#1382)
 
 Production store write paths and the SQL bridge's writer requests use
@@ -237,3 +304,61 @@ request. This check is especially important for top-level requests: because
 they intentionally skip `BEGIN IMMEDIATE`, dispatching one on a connection
 left inside an earlier failed transaction would silently join that stale
 transaction.
+
+## FIFO admission observations
+
+`db_diagnostics.writer_contention.writer_admission` describes one pool writer's
+lifetime. `admission_stage: "fifo_channel"` identifies the current admission stage.
+It does not claim per-call rotation or shared accounting across pools using the
+same database. The snapshot is memory-only and never starts a writer. An absent
+snapshot has `writer_admission_unavailable_reason`: `writer_queue_disabled`,
+`writer_not_initialized`, or `writer_unavailable`. Invalid accounting remains
+unavailable for that writer's lifetime with `telemetry_poisoned`,
+`counter_overflow`, or `telemetry_invariant_violation`; it does not change storage
+results.
+
+The fields follow [ADR-131 Decision 4](../../../../docs/adr/ADR-131-batch-write-admission-control.md)
+with the FIFO stage identified explicitly:
+
+| Field                                         | Population or boundary                                                                                                            |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `writer_admission_queue_depth`                | Offered at entry to bounded channel admission and not yet execution-started, including capacity waiters; excludes executing work. |
+| `queue_depth_high_water`                      | Highest pending depth since this accumulator started.                                                                             |
+| `writer_admission_wait_seconds`               | Entry to channel admission through accepted publication.                                                                          |
+| `writer_admission_accepted_queue_age_seconds` | Accepted publication through normal receiver dequeue, before blocking-pool scheduling.                                            |
+| `writer_admission_service_seconds`            | Execution-start at dequeue through the typed-reply attempt, including blocking-pool, volume-lease and SQLite acquisition time.    |
+| `writer_admission_saturation_total`           | Exactly one per capacity-deadline rejection, with reason `writer_queue_saturated` and stage `channel_capacity`.                   |
+| `writer_admission_active_calls`               | Null, with reason `no_call_identity`.                                                                                             |
+| `writer_admission_scheduler_wait_seconds`     | Null, with reason `no_rotation_stage`.                                                                                            |
+
+The absent rotation stage is unavailable, not a measured zero. A caller cancelled
+before acceptance releases pending membership without a latency sample. After
+acceptance, dropping the caller's reply receiver does not end the request's
+storage lifetime. A terminal queue drain releases its accepted requests without
+inventing execution or service samples. An execution-started refusal still has a
+service sample; an unexpected request drop without a reply attempt does not.
+Channel closure, caller abandonment, execution errors and writer retirement do
+not increment saturation. Existing queue-depth, slow-write and typed-error
+contracts retain their meanings.
+
+Each duration histogram contains 18 disjoint finite buckets with these inclusive
+upper bounds in seconds, followed by a separate overflow count:
+
+```text
+0.000244140625, 0.00048828125, 0.0009765625, 0.001953125,
+0.00390625, 0.0078125, 0.015625, 0.03125, 0.0625, 0.125,
+0.25, 0.5, 1, 2, 4, 8, 16, 32
+```
+
+`buckets` contains `{le_seconds, count}` entries: the first bucket includes zero,
+and each later bucket excludes the preceding upper bound. Samples above 32
+seconds increment `overflow_count`. Finite bucket counts plus overflow equal
+`count`; `sum_seconds` is the sum of measured durations. Accounting stores exact
+`Duration` values and integer counts; only JSON conversion rounds seconds.
+
+`p95_le_seconds` is the upper bound containing nearest rank `ceil(95 * count / 100)`,
+not an exact or interpolated percentile. It is null with
+`p95_le_seconds_unavailable_reason: "no_samples"` when empty, or
+`"overflow_bucket"` when that rank is above the largest finite bound. Finite
+quantiles have a null reason. No samples, identifiers or labels are retained;
+storage is fixed-size and no exporter is installed.

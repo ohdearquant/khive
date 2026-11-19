@@ -7,8 +7,10 @@
 //! not compiled.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -30,14 +32,38 @@ use uuid::Uuid;
 // Shared harness (mirrors tests/source_ingest.rs's conventions).
 // ---------------------------------------------------------------------------
 
+// Wire tests that open explicit maps need a physical parent on macOS;
+// /var/folders is a symlinked alias and must remain a VFS refusal.
+fn physical_tempdir() -> std::io::Result<TempDir> {
+    let physical_temp = std::env::temp_dir().canonicalize()?;
+    tempfile::tempdir_in(physical_temp)
+}
+
 fn rust_only() -> BTreeSet<&'static str> {
     ["rust"].into_iter().collect()
+}
+
+// Each runtime takes its own volume-lock namespace, kept outside the walked
+// tree: a long ingest in one test then cannot hold the lease that an
+// unrelated test in the same binary is waiting on.
+fn private_volume_lock_dir() -> PathBuf {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    ROOT.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("khive-code-test-volume-locks-")
+            .tempdir()
+            .expect("private volume-lock root")
+            .keep()
+    })
+    .join(NEXT.fetch_add(1, Ordering::Relaxed).to_string())
 }
 
 fn rt_at(db_path: &Path) -> KhiveRuntime {
     let config = RuntimeConfig {
         db_path: Some(db_path.to_path_buf()),
         packs: vec![],
+        volume_lock_dir: Some(private_volume_lock_dir()),
         ..RuntimeConfig::no_embeddings()
     };
     KhiveRuntime::new(config).expect("target runtime opens")
@@ -685,7 +711,7 @@ async fn dispatch(registry: &VerbRegistry, verb: &str, args: Value) -> Result<Va
 /// Omitted `tiers` on the wire selects L1 + L1.5 with L2 disabled.
 #[tokio::test]
 async fn wire_omitted_tiers_defaults_to_l1_and_l1_5() {
-    let root = TempDir::new().expect("tempdir");
+    let root = physical_tempdir().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_default");
     let db = root.path().join("default.db");
     std::fs::File::create(&db).expect("pre-create explicit ingest target");
@@ -751,7 +777,7 @@ async fn wire_unknown_arguments_are_rejected_before_db_open() {
 
 #[tokio::test]
 async fn wire_report_languages_describe_observed_sources() {
-    let root = TempDir::new().expect("tempdir");
+    let root = physical_tempdir().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_observed_language");
     let db = root.path().join("observed-language.db");
     std::fs::File::create(&db).expect("pre-create explicit ingest target");
@@ -774,7 +800,7 @@ async fn wire_report_languages_describe_observed_sources() {
 /// Explicit `null` tiers behaves identically to omitted.
 #[tokio::test]
 async fn wire_null_tiers_defaults_to_l1_and_l1_5() {
-    let root = TempDir::new().expect("tempdir");
+    let root = physical_tempdir().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_null");
     let db = root.path().join("null.db");
     std::fs::File::create(&db).expect("pre-create explicit ingest target");
@@ -825,7 +851,7 @@ async fn direct_empty_tier_selection_writes_nothing() {
 
 #[tokio::test]
 async fn wire_empty_tiers_write_no_map_rows() {
-    let root = TempDir::new().expect("tempdir");
+    let root = physical_tempdir().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_wire_empty");
     let db = root.path().join("wire-empty.db");
     std::fs::File::create(&db).expect("pre-create explicit ingest target");
@@ -900,7 +926,7 @@ async fn wire_malformed_tiers_rejected_before_db_open() {
 /// Duplicate tier entries dedupe to the same flags as the deduplicated set.
 #[tokio::test]
 async fn wire_duplicate_tiers_canonicalize() {
-    let root = TempDir::new().expect("tempdir");
+    let root = physical_tempdir().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_dup");
     let db_dup = root.path().join("dup.db");
     std::fs::File::create(&db_dup).expect("pre-create explicit ingest target");
@@ -936,7 +962,7 @@ async fn wire_duplicate_tiers_canonicalize() {
 /// L1.5 then L2 always, regardless of `["l2","l1"]` vs `["l1","l2"]`.
 #[tokio::test]
 async fn wire_tier_order_is_caller_independent() {
-    let root = TempDir::new().expect("tempdir");
+    let root = physical_tempdir().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_order");
     let rt = KhiveRuntime::memory().expect("memory runtime");
     let reg = registry(rt);
@@ -977,7 +1003,7 @@ async fn wire_tier_order_is_caller_independent() {
 /// sweeps (one on each path) still compare equal.
 #[tokio::test]
 async fn default_and_explicit_l1_l1_5_are_report_byte_equivalent() {
-    let root = TempDir::new().expect("tempdir");
+    let root = physical_tempdir().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_bytes");
     let pkg = root.path().join("pkg_bytes");
 
@@ -2653,18 +2679,18 @@ async fn unchanged_l2_file_refreshes_only_edges_current_at_previous_project_swee
 
     let third = run_code_ingest(&rt, &token, ingest(third_sweep))
         .await
-        .expect("T3 reuses the unchanged file");
+        .expect("T3 re-observes the unchanged file");
     assert_eq!(
         l2_edge_metadata(&rt, "pkg_edge_history", "depends_on", "caller", "helper").await
             ["last_seen_at"],
         first_sweep.to_rfc3339(),
-        "unchanged-file refresh must not revive the removed call"
+        "unchanged source must not revive the removed call"
     );
     assert_eq!(
         l2_edge_metadata(&rt, "pkg_edge_history", "depends_on", "stable", "helper").await
             ["last_seen_at"],
         third_sweep.to_rfc3339(),
-        "a still-current call must advance using the pre-L1 project clock"
+        "a still-observed call advances with this invocation"
     );
     assert_eq!(third.l2.expect("T3 L2 report").symbol_edges_stamped, 1);
 }

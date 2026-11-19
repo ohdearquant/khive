@@ -66,7 +66,10 @@ fn bench_fuse_rrf(c: &mut Criterion) {
             // each call to fuse_search_results takes owned Vecs so we must clone per iteration.
             b.iter_batched(
                 || vec![source1.clone(), source2.clone()],
-                |sources| fuse_search_results(black_box(sources), black_box(&config)),
+                |sources| {
+                    fuse_search_results(black_box(sources), black_box(&config))
+                        .expect("valid benchmark fusion")
+                },
                 BatchSize::SmallInput,
             );
         });
@@ -87,7 +90,10 @@ fn bench_fuse_weighted(c: &mut Criterion) {
                 .with_fusion_strategy(FusionStrategy::weighted(vec![0.7, 0.3]));
             b.iter_batched(
                 || vec![source1.clone(), source2.clone()],
-                |sources| fuse_search_results(black_box(sources), black_box(&config)),
+                |sources| {
+                    fuse_search_results(black_box(sources), black_box(&config))
+                        .expect("valid benchmark fusion")
+                },
                 BatchSize::SmallInput,
             );
         });
@@ -108,7 +114,10 @@ fn bench_fuse_union(c: &mut Criterion) {
                 .with_fusion_strategy(FusionStrategy::Union);
             b.iter_batched(
                 || vec![source1.clone(), source2.clone()],
-                |sources| fuse_search_results(black_box(sources), black_box(&config)),
+                |sources| {
+                    fuse_search_results(black_box(sources), black_box(&config))
+                        .expect("valid benchmark fusion")
+                },
                 BatchSize::SmallInput,
             );
         });
@@ -134,7 +143,10 @@ fn bench_fuse_three_sources(c: &mut Criterion) {
                 .with_fusion_strategy(FusionStrategy::Rrf { k: 60 });
             b.iter_batched(
                 || vec![s1.clone(), s2.clone(), s3.clone()],
-                |sources| fuse_search_results(black_box(sources), black_box(&config)),
+                |sources| {
+                    fuse_search_results(black_box(sources), black_box(&config))
+                        .expect("valid benchmark fusion")
+                },
                 BatchSize::SmallInput,
             );
         });

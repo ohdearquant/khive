@@ -17,6 +17,7 @@
 //! | `KHIVE_EMAIL_MAINTAINER_ADDRESS` | yes | — | Single authorized maintainer address |
 //! | `KHIVE_EMAIL_AUTHSERV_ID` | yes | — | `authserv-id` this deployment trusts in `Authentication-Results` headers (ADR-056 Amendment 2026-07-02) |
 //! | `KHIVE_EMAIL_QUARANTINE_STORE` | no | `true` | Store messages that fail the attribution gate (unattributed) instead of dropping them |
+//! | `KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL` | no | `false` | Trust Exchange Online's internal-hop stamp for same-domain maintainer mail. Use only when the mailbox is hosted by Exchange Online and its receiving boundary strips sender-supplied AuthAs headers; khive does not verify these preconditions |
 //! | `KHIVE_EMAIL_QUARANTINE_MAX_RETAINED` | no | `256` | Most live quarantine records that may hold a stored original message; further records are kept without the original and marked. `0` stores no originals |
 //!
 //! ## Auth variables
@@ -41,8 +42,22 @@ pub mod backoff;
 pub mod channel;
 pub mod config;
 pub mod connector;
+pub mod external_host;
+pub mod external_inbound;
 pub(crate) mod oauth;
+pub mod screening;
+pub mod suppression_mirror;
+pub(crate) mod unsubscribe;
 
 pub use backoff::{is_backoff_eligible, BackoffTick, ImapBackoff, ImapSingleFlight};
 pub use channel::EmailChannel;
-pub use config::EmailChannelConfig;
+pub use config::{EmailChannelConfig, ExternalInboundConfig};
+pub use external_host::{ExternalEmailHost, InboundSuppression};
+pub use external_inbound::{
+    external_delivery_marking, route_inbound, ExternalDeliveryMarking, ExternalMarkingError,
+    InboundRoute, InboundRoutes, InboundRoutesError, ThreadOwner, ORIGIN_EXTERNAL, TRUST_UNTRUSTED,
+};
+pub use screening::{
+    screen, screen_message, AttachmentInput, Disposition, Family, Rule, RuleSet, ScreeningError,
+    ScreeningInput, ScreeningOutcome,
+};

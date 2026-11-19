@@ -392,7 +392,18 @@ fn strip_fields(mut value: Value, fields: &[&str]) -> Vec<u8> {
 type SerializedRows = BTreeMap<Uuid, Vec<u8>>;
 type FileSnapshot = (SerializedRows, SerializedRows, SerializedRows);
 
+// Independent invocations have different UUIDs. Validate each persisted observation
+// against its own completed run before projecting only that field for comparison.
+fn project_run_observation(properties: &mut Value, run_id: Uuid) {
+    assert!(observation_matches(Some(properties), run_id));
+    properties["l2_observed_run_id"] = json!("11111111-1111-4111-8111-111111111111");
+}
+
 async fn snapshot_file(rt: &KhiveRuntime, token: &NamespaceToken, ids: &[Uuid]) -> FileSnapshot {
+    let project = stored(rt, token, project_uuid("fixture")).await;
+    let run_id = completed_l2_observation(project.properties.as_ref().unwrap(), "rust")
+        .expect("completed invocation identity")
+        .run_id;
     let mut entities = BTreeMap::new();
     let mut documents = BTreeMap::new();
     let mut edges = BTreeMap::new();
@@ -406,20 +417,21 @@ async fn snapshot_file(rt: &KhiveRuntime, token: &NamespaceToken, ids: &[Uuid]) 
             .expect("actual FTS read")
             .expect("indexed row");
         assert_eq!(doc.updated_at.timestamp_micros(), entity.updated_at);
-        entities.insert(
-            *id,
-            strip_fields(
-                serde_json::to_value(&entity).expect("serialize entity"),
-                &["updated_at", "version"],
-            ),
-        );
-        documents.insert(
-            *id,
-            strip_fields(
-                serde_json::to_value(doc).expect("serialize FTS"),
-                &["updated_at"],
-            ),
-        );
+        let mut entity_value = serde_json::to_value(&entity).expect("serialize entity");
+        let mut document_value = serde_json::to_value(doc).expect("serialize FTS");
+        if entity.entity_type.as_deref() != Some("module") {
+            project_run_observation(&mut entity_value["properties"], run_id);
+            project_run_observation(&mut document_value["metadata"], run_id);
+        } else {
+            assert!(entity_value["properties"]
+                .get("l2_observed_run_id")
+                .is_none());
+            assert!(document_value["metadata"]
+                .get("l2_observed_run_id")
+                .is_none());
+        }
+        entities.insert(*id, strip_fields(entity_value, &["updated_at", "version"]));
+        documents.insert(*id, strip_fields(document_value, &["updated_at"]));
     }
     let graph = rt
         .graph(token)
@@ -443,13 +455,11 @@ async fn snapshot_file(rt: &KhiveRuntime, token: &NamespaceToken, ids: &[Uuid]) 
             edge.updated_at >= edge.created_at,
             "graph_edges.updated_at history invariant"
         );
-        edges.insert(
-            Uuid::from(edge.id),
-            strip_fields(
-                serde_json::to_value(edge).expect("serialize edge"),
-                &["created_at", "updated_at"],
-            ),
-        );
+        let id = Uuid::from(edge.id);
+        let mut edge_value = serde_json::to_value(edge).expect("serialize edge");
+        assert_eq!(edge_value["metadata"]["l2_derived"], true);
+        project_run_observation(&mut edge_value["metadata"], run_id);
+        edges.insert(id, strip_fields(edge_value, &["created_at", "updated_at"]));
     }
     (entities, documents, edges)
 }
@@ -640,9 +650,20 @@ async fn l2_failed_file_retry_denylists_only_five_history_fields_and_reindexes()
             ingest_at(&clean, &clean_token, &root, time(3))
                 .await
                 .expect("clean");
+            let retry_project = stored(&retry, &token, project_uuid("fixture")).await;
+            let clean_project = stored(&clean, &clean_token, project_uuid("fixture")).await;
+            assert_ne!(
+                completed_l2_observation(retry_project.properties.as_ref().unwrap(), "rust")
+                    .unwrap()
+                    .run_id,
+                completed_l2_observation(clean_project.properties.as_ref().unwrap(), "rust")
+                    .unwrap()
+                    .run_id,
+                "independent ingests must retain distinct invocation identities"
+            );
             let retried = snapshot_file(&retry, &token, &ids).await;
             let clean_rows = snapshot_file(&clean, &clean_token, &ids).await;
-            assert_eq!(retried, clean_rows, "every serialized field outside five exact deny-list fields (future fields included)");
+            assert_eq!(retried, clean_rows, "every serialized field outside five history fields and independently validated run identities (future fields included)");
             assert!(
                 failed_stamp_absent,
                 "C1 no completion stamp at failed flush"
@@ -1253,18 +1274,24 @@ async fn l2_replay_rebases_concurrent_reference_and_impl_additions_in_both_modes
                 type_path: vec!["concurrent".into()],
                 trait_path: vec!["Trait".into()],
             };
-            let owner = if impl_path { module } else { symbol };
+            let owner = module;
+            let file_ref = |reference| FileReference {
+                declaration_id: symbol,
+                module_path: "crate".into(),
+                reference,
+            };
+            let source_key = file_pending::file_key("source.rs");
             let key = if impl_path {
                 "l2_pending_impls"
             } else {
-                "l2_unresolved_references"
+                "l2_file_pending"
             };
             let initial = if impl_path {
                 json!([resolved_impl, remaining_impl])
             } else {
-                json!([reference("resolved", "call"), reference("missing", "call")])
+                json!({(source_key.clone()):file_pending::FilePending { content_hash: "hash".into(), declaration_ids: vec![symbol], references: vec![file_ref(reference("resolved", "call")), file_ref(reference("missing", "call"))], scanner_version: RUST_L2_SCANNER_IDENTITY_VERSION, natural_edge_ids: Some(vec![]), implementations: vec![] }})
             };
-            seed(&rt, &token, owner, "concept", if impl_path { "module" } else { "function" }, "owner", json!({"source_project":"fixture","language":"rust","module_path":"crate",(key):initial,"unrelated":[2,1]})).await;
+            seed(&rt, &token, owner, "concept", "module", "owner", json!({"source_project":"fixture","language":"rust","module_path":"crate",(key):initial,"unrelated":[2,1]})).await;
             seed(
                 &rt,
                 &token,
@@ -1287,8 +1314,23 @@ async fn l2_replay_rebases_concurrent_reference_and_impl_additions_in_both_modes
                 )
                 .await;
             }
+            if !impl_path {
+                seed(
+                    &rt,
+                    &token,
+                    symbol,
+                    "concept",
+                    "function",
+                    "owner",
+                    json!({"source_project":"fixture","language":"rust","module_path":"crate"}),
+                )
+                .await;
+            }
             let mut state = L2SweepState::default();
             state.mark_current_module(module, "fixture", "rust");
+            state
+                .current_files
+                .insert((module, "source.rs".into()), "hash".into());
             state.mark_current_declarations(&[symbol, target, trait_id], "fixture", "rust");
             let mut report = CodeSourceIngestReport {
                 l2: Some(CodeSourceIngestL2Report::default()),
@@ -1304,14 +1346,17 @@ async fn l2_replay_rebases_concurrent_reference_and_impl_additions_in_both_modes
                     pause.entered.wait().await;
                     let mut row = stored(&other, &other_token, owner).await;
                     let props = row.properties.as_mut().expect("properties");
-                    props[key]
-                        .as_array_mut()
-                        .expect("array")
-                        .push(if impl_path {
-                            serde_json::to_value(&concurrent_impl).expect("impl")
-                        } else {
-                            serde_json::to_value(reference("concurrent", "call")).expect("ref")
-                        });
+                    if impl_path {
+                        props[key]
+                            .as_array_mut()
+                            .expect("array")
+                            .push(json!(concurrent_impl));
+                    } else {
+                        props[key][&source_key]["references"]
+                            .as_array_mut()
+                            .expect("array")
+                            .push(json!(file_ref(reference("concurrent", "call"))));
+                    }
                     props["concurrent_property"] = json!([4, 3]);
                     other
                         .entities(&other_token)
@@ -1333,8 +1378,19 @@ async fn l2_replay_rebases_concurrent_reference_and_impl_additions_in_both_modes
                     reference("missing", "call")
                 ])
             };
+            let actual = if impl_path {
+                props[key].clone()
+            } else {
+                json!(serde_json::from_value::<Vec<FileReference>>(
+                    props[key][&source_key]["references"].clone()
+                )
+                .expect("references")
+                .into_iter()
+                .map(|entry| entry.reference)
+                .collect::<Vec<_>>())
+            };
             assert_eq!(
-                props[key], expected,
+                actual, expected,
                 "fresh rebase keeps concurrent entries first and remaining originals in order"
             );
             assert_eq!(props["concurrent_property"], json!([4, 3]));
@@ -1415,4 +1471,111 @@ async fn l2_unsafe_repeated_candidates_owner_refusal_and_soft_delete_history() {
     let row = stored(&rt, &token, id).await;
     assert!(row.deleted_at.is_none());
     assert_eq!(row.created_at, time(1).timestamp_micros());
+}
+
+#[tokio::test]
+async fn l2_late_cleanup_preserves_a_newer_accepted_producer_replacement() {
+    let source_key = file_pending::file_key("source.rs");
+    for wal in [true, false] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("replacement.db");
+        let (rt, token) = runtime(&path, wal);
+        let (other, other_token) = runtime(&path, wal);
+        let module = module_uuid("fixture", "rust", "crate");
+        let target = symbol_uuid("fixture", "rust", "crate", "resolved", "function");
+        seed(&rt, &token, module, "concept", "module", "crate", json!({"source_project":"fixture","language":"rust","module_path":"crate","unrelated":[2,1]})).await;
+        let before = "fn owner(){resolved();missing();}";
+        let parsed = parse_rust_file(before).unwrap();
+        let before_hash = content_hash(before);
+        let mut state = L2SweepState::default();
+        let mut report = CodeSourceIngestReport {
+            l2: Some(CodeSourceIngestL2Report::default()),
+            ..Default::default()
+        };
+        let ids = persist_l2_file(
+            &rt,
+            &token,
+            "fixture",
+            "rust",
+            module,
+            "crate",
+            "source.rs",
+            "unversioned",
+            &before_hash,
+            Ok(&parsed),
+            time(1),
+            "source.rs",
+            &mut state,
+            &mut report,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        seed(
+            &rt,
+            &token,
+            target,
+            "concept",
+            "function",
+            "resolved",
+            json!({}),
+        )
+        .await;
+        state.mark_current_module(module, "fixture", "rust");
+        state.mark_current_declarations(&ids, "fixture", "rust");
+        state.mark_current_declarations(&[target], "fixture", "rust");
+        state
+            .current_files
+            .insert((module, "source.rs".into()), before_hash.clone());
+        let pause = Pause::new();
+        let (result, expected) = tokio::join!(
+            BEFORE_REBASE.scope(
+                Arc::clone(&pause),
+                l2_reresolve_pass(&rt, &token, time(3), &mut state, &mut report)
+            ),
+            async {
+                pause.entered.wait().await;
+                let after = "fn owner(){resolved();missing();} fn newer(){new_missing();}";
+                let parsed = parse_rust_file(after).unwrap();
+                let mut next_state = L2SweepState::default();
+                let mut next_report = CodeSourceIngestReport::default();
+                assert!(persist_l2_file(
+                    &other,
+                    &other_token,
+                    "fixture",
+                    "rust",
+                    module,
+                    "crate",
+                    "source.rs",
+                    "unversioned",
+                    &content_hash(after),
+                    Ok(&parsed),
+                    time(4),
+                    "source.rs",
+                    &mut next_state,
+                    &mut next_report
+                )
+                .await
+                .unwrap()
+                .is_some());
+                let expected = stored(&other, &other_token, module)
+                    .await
+                    .properties
+                    .unwrap()["l2_file_pending"][&source_key]
+                    .clone();
+                assert_eq!(expected["references"].as_array().unwrap().len(), 3);
+                assert_ne!(expected["content_hash"], before_hash);
+                pause.release.wait().await;
+                expected
+            }
+        );
+        result.unwrap();
+        let row = stored(&rt, &token, module).await;
+        assert_eq!(
+            row.properties.as_ref().unwrap()["l2_file_pending"][&source_key],
+            expected,
+            "old cleanup cannot erase a newly accepted declaration/reference"
+        );
+        assert_eq!(row.properties.unwrap()["unrelated"], json!([2, 1]));
+    }
 }

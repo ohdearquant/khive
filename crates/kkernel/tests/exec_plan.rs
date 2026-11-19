@@ -88,6 +88,7 @@ mod daemon {
             .arg(temp.path().join("must-stay-absent.db"))
             .current_dir(temp.path())
             .env("HOME", temp.path())
+            .env("KHIVE_VOLUME_LOCK_DIR", temp.path().join("volume-locks"))
             .env("KHIVE_SOCKET", socket)
             .env("KHIVE_PACKS", "kg,comm")
             .env("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1")

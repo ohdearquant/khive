@@ -247,3 +247,112 @@ fn gate_mailbox_boot_conversion_requires_explicit_file_owner_and_fails_closed() 
         matches!(check_with_mailbox_policy(empty.gate.as_ref(), &req).unwrap(), GateDecision::Deny { reason } if reason == "mailbox_read_not_granted")
     );
 }
+
+#[test]
+fn probe_view_requires_an_exact_grant_and_preserves_caller_identity() {
+    let reader = token("lambda:reader");
+    let args = json!({"actor":"lambda:owner", "mailbox_actor":"lambda:reader"});
+    let ungranted = KhiveRuntime::new(config(Arc::new(AllowAllGate))).unwrap();
+    assert!(matches!(
+        ungranted.authorize_mailbox_view(&reader, "comm.probe", Some("lambda:owner"), &args),
+        Err(RuntimeError::PermissionDenied { reason, .. }) if reason == "mailbox_read_not_granted"
+    ));
+    let granted = KhiveRuntime::new(config(policy(Arc::new(AllowAllGate)))).unwrap();
+    assert_eq!(
+        granted
+            .authorize_mailbox_view(&reader, "comm.probe", Some("lambda:owner"), &args)
+            .unwrap(),
+        MailboxView {
+            actor_id: "lambda:owner".into(),
+            delegated: true
+        }
+    );
+    assert_eq!(reader.actor(), &ActorRef::new("actor", "lambda:reader"));
+    for other in [
+        token("lambda:reader:child"),
+        NamespaceToken::mint_authorized(
+            Namespace::local(),
+            ActorRef::new("agent", "lambda:reader"),
+        ),
+    ] {
+        assert!(matches!(
+            granted.authorize_mailbox_view(&other, "comm.probe", Some("lambda:owner"), &args),
+            Err(RuntimeError::PermissionDenied { reason, .. }) if reason == "mailbox_read_not_granted"
+        ));
+    }
+    assert!(matches!(
+        granted.authorize_mailbox_view(
+            &reader, "comm.probe", Some("lambda:owner:child"),
+            &json!({"actor":"lambda:owner:child"})
+        ),
+        Err(RuntimeError::PermissionDenied { reason, .. }) if reason == "mailbox_read_not_granted"
+    ));
+}
+
+#[test]
+fn probe_view_keeps_own_named_and_anonymous_local_access() {
+    let runtime = KhiveRuntime::new(config(Arc::new(AllowAllGate))).unwrap();
+    let anonymous = NamespaceToken::mint_authorized(Namespace::local(), ActorRef::anonymous());
+    for (caller, selected) in [
+        (token("lambda:owner"), "lambda:owner"),
+        (token("lambda:reader"), "lambda:reader"),
+        (anonymous.clone(), "local"),
+    ] {
+        assert_eq!(
+            runtime
+                .authorize_mailbox_view(
+                    &caller,
+                    "comm.probe",
+                    Some(selected),
+                    &json!({"actor":selected})
+                )
+                .unwrap(),
+            MailboxView {
+                actor_id: selected.into(),
+                delegated: false
+            }
+        );
+    }
+    assert!(matches!(
+        runtime.authorize_mailbox_view(&anonymous, "comm.probe", Some("lambda:owner"), &json!({"actor":"lambda:owner"})),
+        Err(RuntimeError::PermissionDenied { reason, .. }) if reason == "mailbox_read_not_granted"
+    ));
+    assert!(matches!(
+        runtime.authorize_mailbox_view(&token("lambda:reader"), "comm.probe", Some("local"), &json!({"actor":"local"})),
+        Err(RuntimeError::PermissionDenied { reason, .. }) if reason == "mailbox_read_not_granted"
+    ));
+}
+
+#[test]
+fn probe_view_validates_original_actor_and_preserves_failures() {
+    let reader = token("lambda:reader");
+    let runtime = KhiveRuntime::new(config(policy(Arc::new(AllowAllGate)))).unwrap();
+    for (selector, args) in [
+        (None, json!({"actor":null})),
+        (None, json!({"actor":7})),
+        (Some(" "), json!({"actor":" "})),
+        (Some("lambda:owner"), json!({})),
+        (None, json!({"actor":"lambda:owner"})),
+        (Some("lambda:owner"), json!({"actor":"lambda:reader"})),
+    ] {
+        assert!(matches!(
+            runtime.authorize_mailbox_view(&reader, "comm.probe", selector, &args),
+            Err(RuntimeError::InvalidInput(_))
+        ));
+    }
+    let args = json!({"actor":"lambda:owner"});
+    let denied = KhiveRuntime::new(config(policy(Arc::new(CallerEnrollmentGate::new(
+        vec![],
+        false,
+    )))))
+    .unwrap();
+    assert!(matches!(
+        denied.authorize_mailbox_view(&reader, "comm.probe", Some("lambda:owner"), &args),
+        Err(RuntimeError::PermissionDenied { reason, .. }) if reason == "actor is not enrolled"
+    ));
+    let broken = KhiveRuntime::new(config(Arc::new(BrokenMailboxBackend))).unwrap();
+    assert!(matches!(
+        broken.authorize_mailbox_view(&reader, "comm.probe", Some("lambda:owner"), &args),
+        Err(RuntimeError::GateUnavailable { reason, .. }) if reason == "gate backend unavailable"
+    ));
+}

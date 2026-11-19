@@ -41,14 +41,12 @@ pub(crate) static GIT_NOTE_KIND_SPECS: [NoteKindSpec; 2] = [
 
 /// Pack-auxiliary schema: the git-ingest cursor table (ADR-088 §5). See
 /// crates/khive-pack-git/docs/api/vocab.md#git_schema_plan_stmts.
-pub(crate) static GIT_SCHEMA_PLAN_STMTS: [&str; 7] = [
+pub(crate) static GIT_SCHEMA_PLAN_STMTS: [&str; 5] = [
     crate::receipts::RECEIPTS_TABLE_SQL,
     crate::receipts::RECEIPTS_ACTOR_INDEX_SQL,
     crate::receipts::RECEIPTS_SESSION_INDEX_SQL,
     sql!("git_mirror_cursor_table_create"),
     sql!("git_mirror_cursor_updated_index_create"),
-    sql!("git_notes_live_commit_sha_index_create"),
-    sql!("git_notes_live_number_project_index_create"),
 ];
 
 /// ADR-088 Amendment 1: parent→child commit lineage as `precedes` edges

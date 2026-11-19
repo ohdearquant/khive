@@ -66,6 +66,10 @@ impl Fixture {
             .env("KHIVE_EVENTS_SPLIT", "0")
             .env("KHIVE_LOCK", self.root.path().join("boot.lock"))
             .env(
+                "KHIVE_VOLUME_LOCK_DIR",
+                self.root.path().join("volume-locks"),
+            )
+            .env(
                 "KHIVE_RECOVERER_LOCK",
                 self.root.path().join("recover.lock"),
             )

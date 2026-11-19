@@ -3,14 +3,12 @@ use super::*;
 use khive_channel::ChannelRegistry;
 
 async fn pass(runtime: &KhiveRuntime, registry: &ChannelRegistry, kind: &str, slug: &str) {
-    let allowlist = vec!["recipient@example.com".to_string()];
     let domains = khive_runtime::EmailMessageIdDomains::from_mailbox_and_history(slug, "")
         .expect("fixture mailbox domain");
     let policy = if kind == "email" {
         outbox::OutboxPolicy::Email {
             mailbox: slug,
             domains: &domains,
-            allowlist: &allowlist,
         }
     } else {
         outbox::OutboxPolicy::Telegram(std::marker::PhantomData)

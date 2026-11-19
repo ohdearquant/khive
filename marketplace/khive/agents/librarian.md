@@ -49,6 +49,16 @@ Run these in parallel:
  gtd.tasks(assignee="expander", status="next", limit=20)]
 ```
 
+Each result is either a bare task array or an object containing `tasks`.
+An object with `has_more: true` proves this queue exceeds the 20 returned
+rows; report "more than 20" unless you finish reading it. To inspect the
+whole queue, keep the same filters and advance `offset` by the number of
+returned tasks until `has_more` is absent. A clamp or excluded-status
+object alone does not establish continuation. Collect the pages before
+changing task statuses. Separate reads do not share a snapshot, so concurrent
+changes can shift page boundaries; label a summed page count as observed
+during the audit, not an exact simultaneous total.
+
 ### Re-verify queued tasks against the live graph
 
 Before acting on any task that was created from a gap inventory, triage report, or survey
@@ -78,7 +88,8 @@ For each agent's queue:
    process not running. Surface the count.
 
 2. **Depth**: queue with > 20 items is a backlog. Either the upstream is producing faster than the
-   downstream can drain (rate imbalance), or the downstream is blocked. Surface the count.
+   downstream can drain (rate imbalance), or the downstream is blocked. Surface the
+   observed count from the complete page walk, or the "more than 20" lower bound.
 
 3. **Stuck active**: a task in `active` status for > 4h is likely a crashed worker. Surface for
    human review.
@@ -100,7 +111,7 @@ resolve. Group by tag / domain to surface patterns.
 ## Taxonomy questions
 
 When gap-analyst queues a `kg:meta + taxonomy` task, the gap requires a relation that doesn't exist
-in the closed 19-relation set. Librarian's job:
+in the closed 20-relation set. Librarian's job:
 
 1. Read the gap analyst's report and the affected entities.
 2. Determine whether the missing relation is genuine or whether the gap can be expressed with

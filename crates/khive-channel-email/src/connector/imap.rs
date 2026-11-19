@@ -705,6 +705,8 @@ pub(crate) fn parse_raw_bytes(
     // Always set; never depends on Message-ID.
     let imap_external_id = format!("imap:{host}:{uidvalidity}:{uid}");
 
+    // Preserve non-ASCII mailbox characters for the sender allowlist. Unicode
+    // lowercasing can turn a distinct local part (for example K) into ASCII k.
     // Collect all From addresses as addr-specs (display names stripped by mail_parser).
     let from_addrs: Vec<String> = msg
         .from()
@@ -712,7 +714,7 @@ pub(crate) fn parse_raw_bytes(
             addrs
                 .iter()
                 .filter_map(|a| a.address())
-                .map(|s| s.to_lowercase())
+                .map(|s| s.to_ascii_lowercase())
                 .collect()
         })
         .unwrap_or_default();
@@ -722,7 +724,7 @@ pub(crate) fn parse_raw_bytes(
         .sender()
         .and_then(|a| a.first())
         .and_then(|a| a.address())
-        .map(|s| s.to_lowercase());
+        .map(|s| s.to_ascii_lowercase());
 
     let to: Vec<String> = msg
         .to()

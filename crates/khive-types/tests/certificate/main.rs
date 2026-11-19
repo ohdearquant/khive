@@ -20,6 +20,7 @@ mod cites;
 
 /// Certificate fixtures for the `located_in` relation (ADR-196).
 mod located_in;
+mod owns;
 
 /// Coverage gate: every EdgeRelation must have a cert entry or system-role exception.
 mod coverage;

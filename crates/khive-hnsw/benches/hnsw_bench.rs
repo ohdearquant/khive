@@ -1,12 +1,14 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkGroup, Criterion};
 use khive_hnsw::{DistanceMetric, HnswConfig, HnswIndex, HnswSearchContext, NodeId};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 
 const DIMS: usize = 384;
 const SEED: u64 = 42;
 
 fn random_unit_vector(rng: &mut StdRng) -> Vec<f32> {
-    let raw: Vec<f32> = (0..DIMS).map(|_| rng.gen_range(-1.0f32..1.0f32)).collect();
+    let raw: Vec<f32> = (0..DIMS)
+        .map(|_| rng.random_range(-1.0f32..1.0f32))
+        .collect();
     let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 1e-10 {
         raw.iter().map(|x| x / norm).collect()
@@ -153,8 +155,12 @@ fn bench_distance(c: &mut Criterion) {
     group.sample_size(200);
 
     let mut rng = StdRng::seed_from_u64(SEED);
-    let a: Vec<f32> = (0..DIMS).map(|_| rng.gen_range(-1.0f32..1.0f32)).collect();
-    let b: Vec<f32> = (0..DIMS).map(|_| rng.gen_range(-1.0f32..1.0f32)).collect();
+    let a: Vec<f32> = (0..DIMS)
+        .map(|_| rng.random_range(-1.0f32..1.0f32))
+        .collect();
+    let b: Vec<f32> = (0..DIMS)
+        .map(|_| rng.random_range(-1.0f32..1.0f32))
+        .collect();
 
     group.bench_function("cosine_384d", |b_bench| {
         let a_ref = &a;

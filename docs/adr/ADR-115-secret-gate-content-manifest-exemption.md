@@ -1908,3 +1908,693 @@ publication/commit/checkpoint faults; delayed cleanup/unsupported GC; and later 
 and proposal routes. Controls must reach the relevant runtime boundary after a selected normal
 passes, then fail semantically rather than through an absent API or setup error. This docs-only
 proposal supplies no executable acceptance or native verdict and selects no option for activation.
+
+## Amendment 7 (2026-10-25): masking caller values echoed in refusals
+
+**Status**: Proposed.
+
+Originating issue(s): #5897
+
+Some refusal paths mask rejected values through `GateProbe`; others interpolate them without
+masking. Ordinary entropy detection requires credential context, so an isolated bare credential can
+remain visible in either case. This amendment adds bounded refusal masking without changing write
+admission or the content preview policy.
+
+### Decision
+
+**Surface and population.** Add one surface, `RedactionSurface::Refusal`. It covers
+caller-controlled text rendered in request refusals, including rejected operands, deserializer
+diagnostics, parser causes, string detail fields, and repeated copies in refusal results.
+Classification follows the value's use, not whether its current implementation calls a masker or
+returns a particular Rust error variant. Within this amendment's scope, never-masked refusal paths
+are part of the migration. Include caller-derived operation labels and diagnostic object keys when
+failures echo them outside the error message. Protocol keys and authoritative registered operation
+names remain trusted metadata. An unknown caller-supplied operation name is not trusted merely
+because it occupies a field named `tool`. A consumer that correlates result rows with submitted
+operations by that label, such as `kkernel exec --ops-file` (`classify_ordered_chunk` in
+`crates/kkernel/src/exec/ops_file_apply.rs`), compares a failed or aborted row's label with the
+`Refusal`-masked form of the submitted label. A masked label then counts as that operation's
+failure, not as a row mismatch, and the consumer's own diagnostics and saved manifests render only
+the masked label.
+
+The scope includes pack and runtime validation, MCP request and envelope validation, `kkernel exec`
+validation, per-operation failure entries, and refusal rows inside otherwise successful results.
+Charter and moodboard sources are excluded from this migration and its completeness claim. Existing
+backend transport diagnostics retain `McpDiagnostic`; an envelope parameter refusal is a request
+refusal, not a backend transport diagnostic. Successful content results and scanner previews retain
+their existing policies. This amendment does not establish a general log or persistence redactor.
+
+`Refusal` and the existing preview-only `GateProbe` extend Amendment 2's closed table explicitly:
+
+| Surface     | Mode                | Final stored target | Stamp property | Exemption-success event |
+| ----------- | ------------------- | ------------------- | -------------- | ----------------------- |
+| `Refusal`   | `PermanentMaskOnly` | None                | None           | None                    |
+| `GateProbe` | `PermanentMaskOnly` | None                | None           | None                    |
+
+The Git ingestion, session mirror and MCP diagnostic rows retain their exact contracts. Every
+surface remains permanently mask-only. Masking never consumes a manifest exemption, performs stored
+UUID admission, stamps a record, or emits an event. Existing dispatch and domain events are separate
+effects. Identity, namespace, verb and request arguments cannot select a weaker refusal policy.
+
+**Candidates and spans.** On the original retained input, retain every ordinary detector span and
+independently enumerate these three candidate classes:
+
+1. Maximal runs of printable ASCII bytes, `0x21` through `0x7e`, except double quote, single quote,
+   backtick, backslash, comma, semicolon, colon, parentheses, square brackets and braces. Remove all
+   consecutive trailing periods from each run before evaluating it. Keep internal periods and all
+   other admitted bytes, including `+`, `/`, `=`, `-` and `_`. In particular, retain base64 padding.
+2. Maximal runs matching `[A-Za-z0-9_-]+`, independently of the first class. This class isolates a
+   URL-safe credential from path separators or other punctuation even when the larger run has low
+   entropy.
+3. Maximal runs matching `[A-Za-z0-9]+`, independently of both preceding classes. This class
+   isolates an alphanumeric credential from low-entropy filler connected by hyphens or underscores.
+
+Every other byte or character terminates the corresponding run. Non-ASCII characters, whitespace and
+ASCII control characters are delimiters for all three classes. Empty candidates are discarded. There
+is no recursive splitting, arbitrary substring enumeration or escape decoding. Evaluate each
+candidate's own bytes with the existing Shannon entropy calculation. A candidate qualifies when its
+length is at least `MIN_ENTROPY_LEN`, 24 ASCII bytes, and its entropy is at least
+`ENTROPY_THRESHOLD`, 4.5 bits per byte. Equality qualifies. The added pass has no trigger
+requirement and no path, structured-identifier, name, revision, content-hash or typed-value
+exemption. Ordinary detectors, their constants and exemptions are unchanged; their early returns
+cannot skip this pass.
+
+Each qualifying candidate contributes exactly its own half-open byte interval in the original
+retained input. An inner-run hit never contributes its enclosing token. A qualifying larger
+candidate still contributes its full interval, even if it contains a qualifying smaller candidate.
+Deduplicate intervals, sort by start offset, and union overlapping or directly adjacent intervals
+from both ordinary and added detection. Replace each resulting interval once with `***MASKED***`.
+All other bytes remain unchanged. Never detect on the other pass's already-masked output.
+
+The added intervals exclude structural wrappers and removed terminal periods. Thus they preserve the
+quotes, brackets and punctuation around an isolated candidate in compact JSON or prose. They can
+still cover a complete path or name when that larger candidate qualifies. Ordinary detectors retain
+their existing, sometimes wider intervals, including their fail-closed tail behavior. This amendment
+does not narrow those intervals to preserve punctuation. Constructed refusal metadata must therefore
+remain outside caller-value masking inputs wherever its boundaries are known.
+
+**Rendering and transformed copies.** Pass the raw caller string to the bounded refusal helper
+before diagnostic quoting, escaping, normalization or additional truncation. Keep validation with
+the parameter's existing parser. When a rejected non-string JSON operand is displayed as JSON, its
+compact serialization is the masking input; do not replace the enclosing array or object merely
+because a contained candidate qualifies. The existing parsing and serialization costs are not new
+bounds on request processing.
+
+Build constructed errors from trusted template text, parameter names, authoritative accepted-value
+lists and masked caller operands. Preserve the error kind, parameter names and accepted-value lists.
+Every repeated occurrence must use the sanitized operand. A parser cause can contain a case-folded,
+trimmed, escaped or truncated copy that no longer qualifies for masking. Such a route must not
+interpolate that cause's display text and rely on rescanning it. Use the parser's trusted diagnostic
+metadata and the masked original instead. `parse_event_kind` is a required instance: retain its
+parser, use the error's authoritative domain and valid variants, and replace both diagnostic value
+occurrences from the masked original without rendering the error's normalized `value`. A call
+site's own normalized binding is the same case: `handle_review` in
+`crates/khive-pack-kg/src/handlers/proposal.rs` matches a trimmed, lowercased decision and formats
+that binding in its unknown-decision refusal, so it must format the masked original instead. When a
+diagnostic joins several caller-derived segments, such as the key path of a `$prev` substitution
+failure, each segment is a separate operand, masked before joining. The joined rendering is not the
+masking input, because low-entropy sibling segments can dilute a qualifying segment below the
+threshold.
+
+Opaque deserializer diagnostics use the same refusal surface only after establishing their operand
+and metadata handling. If a formatter can transform an operand or the added pass can erase trusted
+metadata, adapt that formatting boundary to retain the rejected original and trusted metadata
+separately. Internal diagnostic types or adapters may carry those parts. Do not guess trusted spans
+from words such as `expected`, and do not recover operand boundaries by parsing an error's prose.
+Keep leaf parsers independent of the runtime; consuming boundaries apply the masking policy. No
+route may retain an unsafe raw cause as a fallback. This requires no wire or stored schema change.
+
+For `knowledge.upsert_atoms`, mask slug operands in both the domain-mirror collision and
+deleted-slug refusals. In a dry-run row with `would_refuse: true`, every caller-derived diagnostic
+field, including `slug`, `message` and any dynamic location, uses refusal rendering.
+`identity_masked` reflects whether the displayed identity was masked or truncated. A non-refused
+row's identity and the `scan` content preview retain ordinary `GateProbe` behavior. A strict message
+beside an ordinary unmasked copy of the same slug in a refused row does not satisfy this contract.
+Reuse a constructed message already assembled from sanitized parts without rescanning its trusted
+template.
+
+**Bounded call path.** Production refusal rendering enters a shared helper which calls
+`mask_bounded(Refusal, text, MASK_WINDOW_CHARS, output_cap_chars)`. Use an existing smaller output
+cap where one exists; otherwise use `MASK_WINDOW_CHARS`, currently 4,096 characters. The helper
+returns `BoundedMask`. Callers render its sanitized `text` and consume its flags without restoring
+the original value. Direct production calls to `mask_for_redaction_surface(Refusal, raw_text)` are
+not permitted outside the bounded path.
+
+`mask_bounded` alone owns input windowing, conservative removal back to whitespace on truncated
+input, `trailing_bridge_fragment_cut`, output capping and the existing ellipsis marker. Preserve
+that backward fragment removal even when no trigger is visible. It then calls
+`mask_for_redaction_surface(Refusal, retained_window)` exactly once. That canonical entry collects
+ordinary spans and the added refusal spans on the retained window; it neither calls `mask_bounded`
+nor applies another window. Other surfaces keep their existing dispatch behavior.
+
+A single oversized whitespace token leaves only the existing truncation marker. A bounded result
+already includes that marker when truncated; do not append a duplicate. Preserve any separate
+transport disclosure once at its existing boundary. `truncated` remains a reason never to restore
+raw text, independently of `redacted`. Do not scan beyond the window to complete a token, decode an
+escape or recover a dropped cause. Do not treat a retained fragment as a successfully parsed value.
+
+The new candidate pass performs bounded linear enumeration over the retained input, with at most
+three candidate evaluations per byte across the three classes and interval storage bounded by that
+input. Retain the ordinary scan-work budget and fail-closed behavior. Instrument the ordinary scan,
+boundary fragment handling and new candidate work separately. The existing one-tokenization
+assertion for `mask_secrets` does not imply one tokenization for an entire truncated `mask_bounded`
+call, which also tokenizes for its backward fragment cut.
+
+**Migration evidence.** Derive the inventory from refusal construction and output sites at the
+implementation revision, independently of existing redaction references. Include runtime and domain
+error constructors, fallible parameter decoders, conversions that render causes, MCP errors, CLI
+refusal output, value-based per-operation failures and refusal-bearing result rows. Record static
+operand-free sites as such, with evidence. Trace aliases, wrappers and shared-helper consumers;
+unrecognized dynamic construction is an inventory gap, not an exemption.
+
+Each entry identifies its source location and construction, output consumers, caller-derived fields,
+transformations, reachable input shapes, intended policy and acceptance witness or a
+source-supported reason a particular witness cannot reach it. Discover redaction references as a
+second cross-check so a refusal cannot silently retain `GateProbe` or call the canonical refusal
+entry without bounding. The refreshed source population, including construction changes and helper
+expansion, is what the closure check compares with the classified inventory. The census at 415e1e86
+predates the implementation base and is only a starting list, never the checked population or a
+required final count.
+
+No blanket masking pass is added to `runtime_error_value`. Typed runtime failures commonly use it,
+but MCP parse and envelope errors, CLI preflight errors, value-based failure entries and successful
+dry-run results can bypass it. It also cannot repair an already transformed cause or protect an
+earlier log or persistence copy. Source rendering is the enforcement point for this amendment.
+
+**Tradeoffs and limits.** The rule is deterministic and adds no dependency or storage change.
+Parameter syntax and record existence grant no masking bypass. Lowercase canonical UUIDs have the
+upper bound `log2(17)`, about 4.087463 bits per byte; this is not an attainable maximum for their
+fixed hyphen layout. For a 36-byte mixed-case canonical UUID, four hyphens leave 32 positions over
+22 hex symbols. The maximizing counts have ten hex symbols occurring twice and twelve once, giving
+about 4.392147 bits per byte. Both bounds are below 4.5. Pure mixed-case hex is bounded by
+`log2(22)`, about 4.459432. These observations explain useful surviving diagnostics, not secrecy.
+
+False positives remain intentional. `QuarterlyBudgetReview_2026-10-25_East_XYZ` has 41 bytes and
+entropy 4.570609, so its whole candidate is masked. `CustomerSupportEscalationRoutingPolicy_v2.7`
+has 43 bytes and entropy 4.423488; its longest URL-safe candidate has 41 bytes and entropy 4.305859,
+and its longest alphanumeric run has 38 bytes and entropy 4.113206. None qualifies. The 60-byte path
+`/srv/BuildArtifacts/WestRegion42/QuarterlyReports/Q3-2026_v7` has entropy 4.667912 and is masked as
+one candidate. These examples assume no ordinary detector match. A short typo such as `inbxo`
+remains visible. Bare hex credentials, shorter or low-entropy values, and some encoded, split or
+diluted values remain explicit residuals. For example, the single caller value
+`aaaa/aaaa/aaaa/aaaa/aaaa/Ab3Cd4Ef5Gh6+Jk7/Lm8Np9Qr0StUvY=` is one 57-byte broad candidate with
+entropy about 4.044323, and its URL-safe and alphanumeric pieces are shorter than 24 bytes, so it
+stays visible. This is bounded diagnostic hygiene, not detection of every secret.
+
+### Acceptance
+
+1. **Closed contract and isolation.** Exhaustively exercise the surface table, including `Refusal`
+   and `GateProbe`. All surfaces remain permanently mask-only; existing durable targets stay exact.
+   Masking cannot consult an exemption, perform admission, stamp a record or emit an event. Write
+   scanning, accepted parameter syntax, ordinary previews and backend diagnostic policy remain
+   unchanged. Charter and moodboard sources are unchanged. Accept this amendment and its contract
+   declaration before accepting the dependent implementation.
+2. **Refusal population.** Exercise each dynamic inventory route through a reachable public path or
+   its shared boundary, covering every distinct output consumer. Include previously unmasked
+   parameter decoders, direct echoes, MCP options and DSL errors, CLI preflight, value-based
+   failures, and atom collision and deletion refusals. Check caller-derived operation labels outside
+   the error object too. In `kkernel exec --ops-file`, a line naming an unknown high-entropy tool
+   counts as one failed operation, and the label appears in neither the output nor a saved manifest.
+   Use a prefixed credential, a qualifying bare value and a benign input
+   wherever that branch accepts their shapes. Assert error kinds, parameter names, accepted-value
+   lists, absence of every unsafe copy, and the literal canonical marker independently of the
+   production masker's return value. Expected output must not call the masker under test.
+3. **Reachability.** Record the guards for the no-prefix-match branch in `resolve_uuid_or_prefix`,
+   the corresponding memory `source_id` branch, and the `comm.thread.after` not-a-message branch.
+   Their UUID or pure-hex shapes cannot supply the general qualifying bare or prefixed credential
+   witnesses. Exercise reachable unknown, wrong-kind and prefix values there, and exercise secrets
+   through the sibling shape-rejection routes. Do not claim an unexecuted branch or require deletion
+   of a masking call to fail behaviorally when masking is a no-op for all reachable inputs.
+4. **Executed red baseline.** Pass `Ab3Cd4Ef5Gh6Jk7Lm8Np9Qr0` as an unknown `comm.inbox` projection
+   field against f689534b642d3dd421f65b6aa89e5a52293f989b. It has 24 distinct ASCII bytes and
+   entropy 4.584963. The independent non-disclosure assertion must fail there and pass on the
+   implementation. Retain the same test input and assertions in both runs. Record both source
+   revisions, the test patch or its digest, command, exit status and relevant assertion output in
+   the implementation's acceptance evidence. A compilation failure, ignored test, source prediction
+   or implementation-only run does not establish this result. Cover `comm.thread` as the other
+   projection-helper consumer.
+5. **Candidate discrimination.** Pin literal outputs for compact arrays and objects containing the
+   bare witness, quotes and a following period, repeated matches, and overlapping classes. Require
+   `["***MASKED***"]` and `{"k":"***MASKED***"}` for the respective compact forms. Require
+   `["aaaaaaaaaaaaaaaaaaaaaaaaaaaa","***MASKED***"]` for the compact array whose second item is
+   `Ab3Cd4Ef5Gh6-Jk7Lm8Np9Qr0`. Require `aaaa/aaaa/aaaa/aaaa/aaaa/***MASKED***` for that same value
+   after the path prefix. For `aaaaaaaaaaaaaaaaaaaaaaaaaaaa_Ab3Cd4Ef5Gh6Jk7Lm8Np9Qr0`, retain the
+   filler and underscore and replace only the alphanumeric value. These inputs distinguish the
+   URL-safe and alphanumeric classes from enclosing-run masking.
+6. **Base64 and numeric boundaries.** Pin `Ab3Cd4Ef5Gh6+Jk7/Lm8Np9Qr0StUvY=` as a single masked
+   candidate, alone and inside compact JSON. Its 32 distinct bytes have entropy 5.0; its shorter
+   URL-safe and alphanumeric pieces cannot satisfy the length floor. The broad class must include
+   `+`, `/` and the final `=`. A 23-byte input of 23 distinct bytes, entropy log2(23) (about
+   4.523562), remains visible under the added pass because it is below the 24-byte floor; a 24-byte
+   input of 24 distinct bytes, entropy about 4.584963, qualifies.
+   `ABCDEFGHIJKLMNOPQRSTUVWXABCDEFGH` has 32 bytes and entropy exactly 4.5 and qualifies. Exercise
+   whitespace, controls, non-ASCII delimiters, terminal periods, ordinary early returns, all
+   documented false positives and retained ordinary detector matches.
+7. **Transformed diagnostics and refusal rows.** Use `AaBbCcDdEeFfGgHhJjKkLl12` in
+   `parse_event_kind`: the original has entropy 4.584963, while its lowercase copy has entropy
+   3.668296. Neither copy may appear in any refusal field. Pass the same value as the `review`
+   decision; neither copy may appear in its unknown-decision refusal. In a `$prev` substitution
+   failure whose key path holds `aaaaaaaaaaaaaaaaaaaa` and then `Ab3Cd4Ef5Gh6+Jk7/Lm8Np9Qr0StUvY=`,
+   the first key stays visible and the second is masked; their dotted join, 53 bytes with entropy
+   about 4.097004, would not qualify as one candidate. Preserve authoritative valid variants and
+   template punctuation. Cover trimming, escaping and truncation at affected diagnostic boundaries.
+   In refused atom dry-run rows, verify the slug and message together, `identity_masked`, and any
+   dynamic location. In non-refused rows and `scan` previews, pin ordinary behavior with off-trigger
+   bare values, prefixed credentials, benign text and UUIDs.
+8. **Typed values and limits.** Preserve the quoted unknown canonical UUID
+   `ffffffff-ffff-4fff-8fff-ffffffffffff` and current `comm.thread.after` refusal wording. Retain
+   wrong-kind and valid-prefix witnesses and add uppercase and mixed-case canonical UUID cases.
+   Cover failed parsing, appended credentials and trigger-labeled lookalikes. Pin the survival of an
+   off-trigger synthetic 32-hex value as a disclosed residual, including in an untyped operand.
+   Exercise timestamps only where a reachable refusal actually renders them.
+9. **Bounds and work.** Exercise inputs below, at and above `MASK_WINDOW_CHARS`, a straddling token,
+   a single oversized token, complete bridge fragments removed at the truncated tail without a
+   visible trigger, UTF-8 boundaries, and smaller output caps. Verify the exact ellipsis and flags,
+   with no restored raw tail or duplicate disclosure. Check the acyclic call path and bounded work
+   for ordinary scanning, fragment removal and each added candidate class. Keep the existing
+   ordinary-masker tokenization regression; do not apply its count to the whole bounded wrapper.
+10. **Inventory closure.** Regenerate discovery at the implementation revision and compare
+    identities, constructions, consumers and policies, not only totals. Fail for missing, extra,
+    duplicate or changed entries without corresponding classification. Positive controls must
+    discover an added unmasked error constructor, a raw deserializer conversion, a new wrapper
+    consumer, a refusal row inside a success result, and a refusal routed through `GateProbe`. Cover
+    aliases and indirect surfaces or prohibit them outside classified helpers. The historical census
+    is not acceptance evidence for the refreshed population.
+
+### Alternatives considered
+
+- **Two refusal variants.** Rejected because operands and opaque diagnostics use the same masking
+  and exemption contract. The inventory records their different construction and provenance needs
+  without duplicating the runtime policy.
+- **Projection backstop plus a smaller migration.** Rejected for this amendment. A typed projection
+  is useful for failures that reach it, but cannot replace the bypass and source-rendering work.
+  Generic projected error kinds also group refusals with operational failures. Scanning them all
+  would mask unrelated diagnostics and trusted metadata; selecting them by message spelling is not a
+  stable contract. A future backstop needs an explicit typed population and bounded field policy.
+- **Migrate only existing `GateProbe` calls and defer never-masked routes.** Rejected because direct
+  echoes, deserializer errors and refused-row siblings expose the same caller values now. Existing
+  masker references do not define the refusal population.
+- **One broad candidate class or only alphanumeric candidates.** Rejected. A broad run alone can
+  dilute a path-embedded value below threshold; alphanumeric runs alone miss punctuation-split
+  URL-safe and base64 values. The three explicit classes close those cases without arbitrary
+  substring search. Masking an enclosing token on an inner hit unnecessarily loses surrounding text.
+- **Strict `GateProbe`, forced trigger context or a successful-parse bypass.** Rejected because they
+  respectively change previews, activate other detector families, or confuse syntax with secrecy. No
+  new shape exemption or lower entropy threshold is introduced.
+- **Keep current masking or erase every diagnostic wholesale.** Rejected for request refusals. The
+  former retains the demonstrated bare-value leakage; the latter removes parameter metadata needed
+  to repair a request. Existing ordinary preview behavior and the stated heuristic residuals remain
+  deliberate limits.
+
+## Amendment 9 (2026-11-16): contextual property scanning and note-key write admission
+
+**Status**: Accepted 2026-11-16 (#6725).
+
+Originating issues: [#6562](https://github.com/ohdearquant/khive/issues/6562) and
+[#6273](https://github.com/ohdearquant/khive/issues/6273).
+
+Amendment 8 is proposed separately in
+[#6261](https://github.com/ohdearquant/khive/pull/6261). This amendment does not
+depend on it, and the gap between Amendments 7 and 9 is intended whether Amendment 8
+lands later or not at all.
+
+This amendment must be accepted before dependent implementation merges. It does not
+change the status of the base ADR or earlier amendments.
+
+### Context and scope
+
+Decision §2 explicitly requires reconsidering per-string property exemptions when
+property detection becomes key-aware. Scanning a property key and its value as
+independent strings loses the owning-key context already defined for JSON content
+by the structured scalar attribution amendment. A value under `password`, nested
+under a credential container, or inside its array must reach that same contextual
+rule. Changing only the basic JSON walker is insufficient: the runtime finalizer
+also constructs property candidates for admission.
+
+Note keys have a separate write-admission gap. The keyed `memory.remember` guard
+introduced by #6276 already checks a key before replay lookup and remains in force.
+Generic keyed note creation, atomic creation and direct key assignment must enforce
+the same scalar detector. A runtime-only guard cannot protect a direct store call.
+
+This amendment changes property-context admission and incoming note-key writes. It
+preserves the host-trust and nonauthentication limits of this ADR and
+[ADR-096](ADR-096-warm-daemon-per-request-identity.md), authorization through the
+existing Gate, and the admission-capable versus reservation-only route distinction.
+It creates no database migration, legacy-key rewrite, new admission-capable route,
+manifest activation mechanism or public API for supplying trusted scan results.
+Existing mask-only surfaces remain mask-only.
+
+### 1. Canonical property context and source atoms
+
+Construct one immutable context from the actual parsed `serde_json::Value` that is
+to be checked. The context is the complete property tree, not a caller-supplied
+rendering, digest or path. Serialize it once using this compatibility profile:
+
+- Recursively sort object members by decoded key UTF-8 bytes in ascending order,
+  independently of the map implementation and input member order.
+- Preserve array order. Emit no insignificant whitespace.
+- Preserve decoded Unicode scalar values, without case folding or Unicode
+  normalization. Use the default compact string escaping of `serde_json` 1.0.150
+  for both keys and string values.
+- Use that version's typed `Number` serialization. Do not collapse integer and
+  floating representations or introduce alternate rounding. `1` and `1.0` remain
+  distinct context bytes. Emit `null`, `true` and `false` normally.
+
+This profile fixes the bytes used for both contextual coordinates and identity. A
+serialization dependency change that alters them requires an explicit contract
+version change; silently changing digests is not permitted. Alternate outer-wire
+escape spellings that parse to the same value have the same canonical context.
+
+Every object key and every string value is a separate **source atom**. An atom
+records its original decoded UTF-8 bytes, key or string-value role, and typed path
+through the property tree. A key atom and the value at that key share the path but
+have different roles. Nulls, booleans and numbers affect the context identity but
+are not string-value atoms; their object keys are still scanned. Root strings and
+strings in root arrays remain atoms even without an owning credential label.
+
+Enumerate atoms in the established key-before-value traversal. Basic
+`check_json`/`check_json_at` and the runtime finalizer's property checks and final
+candidate scan must consume the same contextual candidate construction. Empty and
+test-only nonempty manifest snapshots may change authorized lookup, never which
+atoms or detector views are checked. Reuse the existing structured-scalar traversal
+and detector semantics rather than adding a second ancestry algorithm. The shared
+context is not reserialized for each leaf.
+
+### 2. Owning labels, arrays and decoded views
+
+The existing
+[structured scalar rule](../../crates/khive-runtime/docs/api/secret_gate.md#structured-scalar-trigger-context-2026-09-15-2756)
+defines label attribution. Decode an owning key before applying the existing
+trigger matcher. A matching child key supplies its own label; otherwise a
+credential-shaped ancestor remains applicable through objects and arrays within
+the existing byte radius. A benign child does not erase that ancestor. Scalar
+array elements retain the enclosing label. Objects in arrays apply the same rule
+to their own keys and inherited container label. A sibling key, path, diagnostic or
+value does not supply context to another atom.
+
+Object keys retain their standalone checks and their role as label evidence for
+descendant string values. Keys containing quotes, newlines, braces, punctuation or
+Unicode are JSON keys, never raw text inserted into a fabricated key/value
+wrapper. An unlabelled root string or root-array element retains its standalone
+detector behavior. Traversal reaches every depth under the existing bounds; this
+is not an unlimited-distance ancestor rule.
+
+Preserve the existing standalone raw and decoded-string checks on every key and
+string value, including detector ordering, fragment recovery and the eight-level
+escaped-JSON limit. Existing content-text scans retain their original-byte
+coordinates and behavior, including #2756 and #6100. The property repair adds
+owning context; it does not replace those checks or relax any refusal they produce.
+Canonical property serialization does not consume an escaped-string decoding level.
+
+The added contextual pass requires **origin-preserving decoded views**. This is new
+implementation work: the current escaped-string helper returns decoded strings
+without their source spans. Track monotone origin intervals while serializing each
+source string and through each subsequent escape-decoding layer. Every emitted
+Unicode scalar, including all its UTF-8 bytes, maps to the full contributing source
+interval. A simple escape maps to its complete spelling; a surrogate pair maps to
+both escapes. Compose the maps through nested views back to the one canonical
+property byte sequence.
+
+For inherited property context, the candidate start is the earliest canonical
+origin byte contributing to its first byte. Its end covers all contributing bytes.
+The label endpoint follows the existing convention: the byte position of the
+owning key's closing quote, immediately after its encoded content. Compute:
+
+```text
+label_distance = canonical_candidate_start.saturating_sub(canonical_label_end)
+owning context applies only when label_distance <= 120
+```
+
+Decoding contraction or expansion, nested decoding, array serialization and
+recovery of a later valid fragment must not reset this distance. Recovered spans
+retain their original positions. Quotes inserted only to validate a fragment carry
+no label authority. Invalid escapes continue to separate spans; they cannot join
+credentials. Missing or ambiguous origin evidence must refuse with a sanitized
+mapping failure instead of guessing a coordinate.
+
+This added attribution is distinct from the existing standalone scan of a decoded
+view. A benign inner key cannot cancel a still-in-range outer property label. An
+inner credential label still activates the existing standalone rule when the
+outer key is benign or its inherited label is out of range. No new reconstruction
+across separate source atoms is introduced.
+
+### 3. Context-bound property exemption identity
+
+Add the exact runtime-owned field scope `json-properties-context-v2` to the closed
+scope set under manifest document `schema_version: 1`. Its suffix versions property
+identity, not the document schema or the global digest domain. Existing document
+fields, `algorithm: sha256`, corpus-identity requirements, malformed-document
+handling and failure taxonomy remain unchanged.
+
+Only the new identity can authorize a property atom, including a key, an unlabelled
+root string or a root-array string. Well-formed legacy `json-properties` entries
+remain parse-valid but **inert for all property admission**. They neither authorize
+an atom nor contribute to distinct-match counts. They do not invalidate an
+otherwise valid mixed document or disable its entries in other scopes. Unknown
+scopes, malformed entries and conflicting duplicates remain document faults. No
+legacy entry is silently migrated.
+
+The other scope spellings and identities are unchanged: `record-content`,
+`name-description`, `tags` and `code-source`. The old `json-properties` spelling and
+historical digest vectors also remain unchanged; their preservation grants no
+property-admission fallback. The global prefix stays `khive-secret-gate-v1` followed
+by one NUL byte.
+
+Use the following exact framing. `||` denotes byte concatenation; `SHA256` returns
+32 bytes, not their hexadecimal rendering. All lengths, segment counts and indices
+are unsigned 64-bit big-endian integers. Lengths count UTF-8 bytes, not characters;
+overflow refuses rather than truncates.
+
+```text
+D = ASCII("khive-secret-gate-v1") || 0x00
+S = ASCII("json-properties-context-v2") || 0x00
+C = complete canonical property bytes
+A = original decoded source atom UTF-8 bytes
+
+context_digest = SHA256(D || S || 0x01 || u64be(len(C)) || C)
+atom_digest = SHA256(D || S || 0x02 || context_digest || role ||
+                     encoded_path || u64be(len(A)) || A)
+
+role = 0x00 for an object-key atom; 0x01 for a string-value atom
+encoded_path = u64be(segment_count) || encoded_segment_0 || ...
+object-key segment = 0x00 || u64be(len(key_utf8)) || key_utf8
+array-index segment = 0x01 || u64be(zero_based_index)
+```
+
+The root path has zero segments. An empty key is one zero-length key segment and
+therefore differs from the root. Key `"0"` differs from array index zero. For an
+object key and its value, the path includes that key and the role distinguishes
+them. The atom digest always uses the original source atom, never its decoded
+intermediate view. Unframed key/value concatenation, display-string paths and
+caller-chosen origins are not equivalent encodings.
+
+The new manifest entry stores the atom digest under the new scope using the
+existing full-digest representation. Its full-context binding intentionally
+invalidates reuse after an unrelated sibling edit, even when detector behavior
+would be unchanged. This conservative loss of reuse is not whole-document
+exemption authority.
+
+These literal atom-digest vectors pin framing and typed context. Each string value
+shown has atom bytes `v`, except the last row, whose atom bytes are `x`, newline,
+`y`. The listed canonical JSON is compact; the last row encodes the newline as
+`\n` and the key as literal UTF-8 `é`.
+
+| Canonical context   | Atom role and path | Atom SHA-256                                                       |
+| ------------------- | ------------------ | ------------------------------------------------------------------ |
+| `"v"`               | value, root        | `6baa9872cfb3f833c9d30bd33b7068806836662c69fa7dac9e15255deed80a08` |
+| `{"":"v"}`          | value, key `""`    | `de069468674f0725d5bcc394de90455f872bc545056a5eda6d952c0dd2c1b455` |
+| `{"0":"v"}`         | value, key `"0"`   | `6d642df340b229234d9e1d1afe43edb1a7ab96cd0335fe207dcdaff3b2082355` |
+| `["v"]`             | value, index 0     | `eaab483f55046f48186f1f1b331cedb8cfb969291e6e550c52b376ff8e78639b` |
+| `{"v":"v"}`         | key, key `"v"`     | `cfbb041d6ed6f465e0e4d43ecb9f56ad3eec484a5684c1d18d36dd3370b769fb` |
+| `{"v":"v"}`         | value, key `"v"`   | `3f7a18463fa2df89b139cad73fe170c73762853ff505da04c54a845d6165ecc9` |
+| `{"k":"v","n":1}`   | value, key `"k"`   | `84fd13741dab27225ac85f2234fe7597e55262d4894f2681fc30019170b58beb` |
+| `{"k":"v","n":1.0}` | value, key `"k"`   | `9efc8e124fc41049943b01e0639cab31305d83f41649817dd70cf6c40d1de0a4` |
+| `{"é":"x\ny"}`      | value, key `"é"`   | `ae3bdf06c0415acf49966579a6f1b087684d35d95fbb7313c8be30df987388c9` |
+
+These are contract vectors, not evidence that an implementation or serializer has
+passed them. Builder and runtime must independently reach the same bytes through
+their actual parsing and canonicalization paths.
+
+### 4. Complete scanning before exemption acceptance
+
+Capture the existing one immutable manifest snapshot per record. Runtime constructs
+and seals the context, atom roles and typed paths and recomputes digests from the
+actual candidate bytes. Caller-supplied matched IDs, atom IDs, scopes, digests,
+paths, actors, namespaces or verbs have no eligibility authority. Such names in
+ordinary JSON are scanned data. The reserved runtime stamp remains reserved.
+
+A matching entry is tentative and local to its source atom. It cannot skip a later
+raw, contextual or decoded-view check of that atom, skip another atom, or authorize
+the record. Before accepting any exemption, complete every required check across
+all atoms and reject every unmatched refusal or invalid mapping/manifest condition.
+A refusal may fail fast; acceptance may not. Preserve the existing detector-metadata
+contract and field/traversal refusal order, without inventing a new global error
+precedence.
+
+Raw, contextual and decoded views of one atom share one identity. Two distinct
+active identities retain the existing `MultipleMatches` refusal, including a
+property identity and a match in another field scope. Inert legacy property entries
+do not count. Different roles or array positions remain distinct even when their
+atom bytes are identical.
+
+An exempt key remains in the immutable context as a label for its descendants;
+its exemption never covers those descendants. Do not mask or remove exempt atoms
+before rescanning. A whole-document first-match result followed by filtering is
+not a complete per-atom scan. The existing atomic record/stamp/success-event
+transaction and rollback guarantees remain unchanged.
+
+Production remains limited to an absent or exact-empty v1 manifest. Nonempty
+fixtures remain test-only and are not evidence of operator adjudication. This
+amendment does not satisfy or waive the separate nonempty-manifest activation
+rung, enable note exemption consumption, or change the reserved stamp value.
+
+### 5. One pure detector below runtime and direct note-key enforcement
+
+Introduce a **new** `khive-storage::secret_scan` module in the existing storage
+crate. Move the canonical pure scalar detector and its coupled escaped-string,
+masking and digest machinery there without a new crate or a database-to-runtime
+dependency. Preserve existing runtime public APIs through adapters/reexports and
+preserve existing scalar detector behavior, constants, masks and digest outputs.
+The runtime retains property-context composition, field attribution, manifest
+capture and eligibility, reserved-property policy, and finalization authority.
+The pure engine may evaluate supplied contextual scalar evidence; it cannot create
+manifest authority or perform storage, authorization or runtime initialization.
+
+Incoming note keys use the same scalar detector on their **exact raw key bytes**.
+`note.key` is diagnostic location metadata, never a string prepended to the key.
+Do not scan a fabricated `key=...` or other trigger wrapper. There is no note-key
+manifest exemption. Safe refusal metadata must not expose the submitted credential
+through display, debug output or a raw path/key echo.
+
+The write paths have these independent obligations:
+
+1. Generic keyed note creation scans before holder lookup or an exact-payload
+   replay can return. A later creation-only check cannot replace this guard.
+2. Atomic note preparation scans the incoming `AtomicNoteOptions.key` before it
+   can persist, including new keyed creation through `stream.batch`. Preserve
+   enclosing atomicity, shape validation, fences and creation-only ordering.
+3. Direct `assign_note_key_if_unset` uses the shared write-only store validator
+   before database access or mutation, including its core/runtime wrappers and
+   default trait path. The actual SQL store must enforce the rule without a
+   configured runtime, injected callback or caller compliance.
+4. Preserve #6276's existing keyed `memory.remember` pre-replay check and tests.
+
+Keep `note_key_is_valid` and `validate_memory_key` shape-only where they serve reads,
+lookups, fences and existing-key selectors. Preserve the 512-byte UTF-8 limit and
+NUL refusal, existing key-conflict behavior, and lawful ordinary keys. Do not
+rewrite or delete stored keys, scan an unrelated lookup as a new assignment, or
+change legacy-key readability. A privileged raw database path does not make an
+application store assignment exempt from this write contract.
+
+### 6. Typed refusal and Rust compatibility
+
+Add a typed `StorageError::SecretDetected` carrying the safe shared `SecretMatch`
+and the storage capability/operation metadata. It is a notes-capability refusal
+and is not retryable. Its display is `write blocked: {matched}`, using only the
+existing safe match representation. For the same scalar and location, direct
+storage and runtime retain the same detector, trigger, masked excerpt and refusal
+text; indexed batch attribution remains intact.
+
+Use a manual `From<StorageError> for RuntimeError` conversion. Map the new secret
+variant to the existing `RuntimeError::SecretDetected`. Wrap every ordinary storage
+variant as before, explicitly preserving the cause annotation:
+
+```rust
+#[error("storage: {0}")]
+Storage(#[source] khive_storage::StorageError),
+```
+
+Removing `#[from]` alone is insufficient: it would lose the derived ordinary
+`Error::source()` chain. Preserve direct construction of the wrapper and verify
+its source independently of its display text.
+
+`StorageError` is public and exhaustive. Adding this variant is a breaking Rust
+API change and is scheduled for **0.21.0**, with a **Breaking (Rust crates)**
+changelog entry and the required downstream exhaustive-match updates. Do not add
+`#[non_exhaustive]` as a workaround or substitute a string-only `InvalidInput`
+refusal. The implementation must preserve public runtime detector imports and
+explain the new shared type's crate location. No wire or stored schema migration
+is introduced by this error variant.
+
+### 7. Acceptance and discriminating controls
+
+Acceptance covers actual property writes and direct storage, not only helper
+outputs or scanner-derived expected values. Retain the existing detector corpus,
+#2756, #6100, escaped-string depth/recovery tests, #6276 and mask-only behavior.
+Use synthetic inputs with independently established outcomes and populated storage
+snapshots where writes are reachable.
+
+1. **Owning context.** Flat and nested credential keys, inherited `secret` to benign
+   `digest`, scalar arrays and arrays of objects refuse the intended candidates.
+   An unrelated sibling path, quoted refusal or array object does not label a
+   benign candidate. Remove owning, inherited and array context separately; use
+   an independent must-admit sibling witness for context leakage.
+2. **Mapped radius.** Pair canonical-origin distances 120 and 121 while the decoded
+   local distance is within 120 in both. First establish that standalone scanning
+   admits the isolated boundary fixture, so another detector cannot hide the
+   mutation. Include nested escapes, surrogate/Unicode origins, recovered later
+   spans, outer credential with benign inner key, and benign outer key with an
+   inner credential. Dropping origin propagation, resetting distance and dropping
+   the inherited label are distinct controls. Mapping/setup failures are not
+   semantic evidence. Include one sorted-sibling pair: a long sibling key that sorts
+   between a credential container key and its nested value moves that value beyond
+   120 canonical bytes, so the existing radius limit is recorded as applying in the
+   canonical key order.
+3. **Every consumer.** Exercise basic property checks and the finalizer's actual
+   property and final-candidate paths with empty and valid test-only nonempty
+   snapshots. Changing only one walker must fail another consumer's assertion.
+   Retain raw key/value fixed-prefix and escaped-value refusals.
+4. **Exact identity.** Check the literal vectors and live builder/runtime parity
+   for roots, empty keys, key `"0"` versus index zero, key/value roles, Unicode,
+   newlines, typed numbers and equivalent wire escapes. Independently omit context,
+   path, role and index binding to demonstrate transplant refusal. Quoted and
+   newline keys cannot create new labels through a constructed wrapper.
+5. **Complete matching.** A valid first match cannot conceal an unmatched later
+   secret, in either traversal order. Multiple views of one atom count once; two
+   independently valid atom identities refuse. An exempt key cannot exempt its
+   descendant. Caller-asserted IDs or hashes cannot authorize a mismatching atom.
+   Do not derive expected results from the implementation's first-match helper.
+6. **Legacy and activation.** Legacy property entries are inert for keys and all
+   string atoms, including unlabelled roots/arrays. A valid mixed document retains
+   unrelated old-scope behavior and does not falsely count a legacy property entry.
+   Preserve other scopes' exact vectors, production-empty enforcement and existing
+   reservation/stamp/audit rollback. No successful record, stamp or exemption event
+   may survive a required refusal.
+7. **Incoming keys.** Exercise direct SQL-store assignment, wrappers, generic
+   create/replay, atomic/new stream keys and the existing memory route. Pin typed
+   refusal, safe location/display/debug output, unchanged complete stored rows and
+   enclosing rollback. Separately bypass the direct-store guard, pre-replay guard
+   and atomic preparation guard; no one route substitutes for another. Lawful
+   high-entropy ordinary keys must not be rejected through fabricated label text.
+   Inventory every in-repo producer of note keys. One key of each generated grammar,
+   including `git.commit:<40-hex commit sha>`, is a must-admit witness through the
+   direct store path and through its runtime route; a grammar the detector refuses
+   is resolved in the same change.
+8. **Compatibility.** Verify read/fence shape behavior and legacy-key access without
+   rewriting data. Verify the new typed conversion and an ordinary non-secret
+   storage error whose `Error::source()` identifies the underlying `StorageError`;
+   display or wrapper-kind assertions alone do not prove that chain. Check all
+   relevant exhaustive matches, crate features and existing runtime imports.
+
+For each required negative control, retain a pristine named positive, a buildable
+production mutation that reaches its own semantic assertion, exact restoration
+and the restored named positive. Compilation, fixture, SQL setup, mapping failures,
+zero selected tests, unrelated panics and timeouts are not semantic reds. Run the
+shared relevant suites and lints on the integrated revision. Record Linux and
+macOS evidence separately; one platform's results do not establish the other's.
+No execution outcome is asserted by this amendment text.
+
+### 8. Sequencing and consequences
+
+Accept this amendment as a separate documentation change before any dependent
+implementation merges. Refresh the implementation base and intersecting changes
+before assigning its exact source scope. Deliver property context and remaining
+key-write enforcement as one coherent implementation bundle with shared validation;
+keep their independent refusal and compatibility obligations visible.
+
+The stronger property identity reduces exemption reuse after harmless context
+edits by design. A single-entry hit still grants no record-wide, path-wide or
+subtree-wide permission. The new storage layer is reusable by direct stores without
+making storage responsible for runtime exemption policy. Existing heuristic
+limits, trust assumptions, nonempty-manifest activation gates and unrelated
+reserved-property or masking work remain explicit and unchanged.

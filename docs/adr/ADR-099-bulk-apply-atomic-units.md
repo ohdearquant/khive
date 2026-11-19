@@ -292,8 +292,10 @@ read verbs are rejected at parse time.**
   seam exists.
 - **`update` and `merge` caveat (verified at source) — applies to BOTH substrates.** Under the
   current handlers, an entity `update` triggers a reindex when name or description change, and a
-  **note** `update` triggers a reindex when note name or content change (`reindex_entity` /
-  `reindex_note` in `crates/khive-runtime/src/curation.rs`); both reindex paths await embedding.
+  **note** `update` triggers a reindex when note name or content change (`reindex_entity` in
+  `crates/khive-runtime/src/curation.rs` / `reindex_note` in
+  `crates/khive-runtime/src/curation/note_reindex.rs`); both reindex paths await embedding
+  under the existing best-effort model contract.
   Property-only updates on either substrate skip reindex entirely (covered by existing
   regression tests). `merge` already performs its vector re-insert **after** its transaction,
   precisely because embedding is async — the handler's own documentation states this. So the
@@ -692,6 +694,12 @@ The reindex stage remains best-effort as D3 already requires. Its failure means 
 index may need repair; it does not mean the source row update failed. Full success, pre-commit
 failure, and rollback envelopes are unchanged. This is a CLI-only additive contract and does not
 change the MCP `request` wire surface.
+
+The opted-in post-commit report retains eligible note model failures with their model and stage
+(embedding, vector validation, vector store, or vector publication), which the atomic CLI
+discloses through `post_commit_reindex` degradation while preserving successful sibling
+truncation warnings, legacy best-effort embedding success, and fail-closed lexical indexing and
+excluded-model cleanup.
 
 ---
 

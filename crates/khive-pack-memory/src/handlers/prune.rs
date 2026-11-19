@@ -10,7 +10,7 @@ use crate::ann;
 use crate::MemoryPack;
 
 use super::common::{
-    DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
+    decode_params, DEFAULT_DECAY_EPISODIC, DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC,
     DEFAULT_SALIENCE_SEMANTIC,
 };
 
@@ -56,7 +56,7 @@ impl MemoryPack {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
-        let p: PruneParams = serde_json::from_value(params).map_err(|e| {
+        let p: PruneParams = decode_params(params).map_err(|e| {
             RuntimeError::InvalidInput(format!("memory.prune: invalid params: {e}"))
         })?;
 
@@ -252,7 +252,7 @@ impl MemoryPack {
 
     pub(crate) async fn handle_vacuum(&self, params: Value) -> Result<Value, RuntimeError> {
         // Validate params — must be empty object or omitted.
-        let _: VacuumParams = serde_json::from_value(params).map_err(|e| {
+        let _: VacuumParams = decode_params(params).map_err(|e| {
             RuntimeError::InvalidInput(format!("memory.vacuum: invalid params: {e}"))
         })?;
 
@@ -361,7 +361,8 @@ mod prune_recall_visibility_tests {
         let ns = Namespace::parse("local").expect("local namespace");
         rt.authorize(ns).expect("authorize local");
 
-        let pack = crate::MemoryPack::new(rt.clone());
+        let pack =
+            crate::MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
         let ann = pack.ann_for_test();
 
         let mut builder = VerbRegistryBuilder::new();
@@ -369,8 +370,9 @@ mod prune_recall_visibility_tests {
         builder.register(pack);
         let registry = builder.build().expect("registry");
 
-        // memory_type=semantic writes to the token's own namespace ("local"),
-        // matching memory.prune's default namespace filter.
+        // This registry has no actor, so the caller is anonymous: a semantic write
+        // stays in the token's own namespace ("local"), which is also
+        // memory.prune's default namespace filter.
         let remember_result = registry
             .dispatch(
                 "memory.remember",
@@ -532,8 +534,8 @@ mod prune_recall_visibility_tests {
 
     /// #533 follow-up: `RecallConfig::default()` fuses via `FusionStrategy::Rrf
     /// { k: 10 }` (`config.rs`) — the shipped default is reached by omitting
-    /// `fusion_strategy` from the recall params entirely (an explicit `"rrf"`
-    /// string selects k=60). This test exercises that exact omitted-param path: seed a
+    /// `fusion_strategy` from the recall params entirely. This test exercises that exact
+    /// omitted-param path: seed a
     /// low-salience note, confirm it is recallable pre-prune via the FTS, vector, and
     /// default (fusion_strategy omitted) legs — proving each leg actually sees the
     /// note, not just vacuously agreeing on absence — then prune and confirm all
@@ -555,7 +557,8 @@ mod prune_recall_visibility_tests {
         let ns = Namespace::parse("local").expect("local namespace");
         rt.authorize(ns).expect("authorize local");
 
-        let pack = crate::MemoryPack::new(rt.clone());
+        let pack =
+            crate::MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
 
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
@@ -669,7 +672,9 @@ mod prune_index_cleanup_tests {
 
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
-        builder.register(crate::MemoryPack::new(rt.clone()));
+        builder.register(crate::MemoryPack::new(
+            crate::test_support::with_receipt_credentials(rt.clone()),
+        ));
         let registry = builder.build().expect("registry");
 
         // One low-salience note to be pruned, one high-salience note that must survive.
@@ -817,7 +822,9 @@ mod prune_effective_salience_tests {
 
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
-        builder.register(crate::MemoryPack::new(rt.clone()));
+        builder.register(crate::MemoryPack::new(
+            crate::test_support::with_receipt_credentials(rt.clone()),
+        ));
         let registry = builder.build().expect("registry");
         (rt, registry)
     }
@@ -1067,13 +1074,10 @@ mod vacuum_write_queue_tests {
         let pool_cfg = khive_db::PoolConfig {
             path: Some(db_path),
             write_queue_enabled: Some(true),
-            ..khive_db::PoolConfig::default()
+            ..khive_db::PoolConfig::for_test()
         };
         let pool = std::sync::Arc::new(khive_db::ConnectionPool::new(pool_cfg).expect("pool"));
-        {
-            let mut writer = pool.writer().expect("writer");
-            khive_db::run_migrations(writer.conn_mut()).expect("migrations");
-        }
+        pool.run_migrations().expect("migrations");
         assert!(
             pool.writer_task_handle().unwrap().is_some(),
             "writer task must be spawned with the flag on for a file-backed pool"

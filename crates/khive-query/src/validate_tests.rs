@@ -181,34 +181,74 @@ fn normalises_relation_alias_in_where() {
 }
 
 #[test]
-fn rejects_zero_hop_range_gql_wide() {
+fn accepts_zero_hop_range_gql_wide() {
     let mut q = gql::parse("MATCH (a)-[:extends*0..3]->(b) RETURN b").unwrap();
-    let err = validate(&mut q).unwrap_err();
-    assert!(
-        matches!(err, QueryError::Unsupported(_)),
-        "expected Unsupported, got {err:?}"
-    );
+    validate(&mut q).unwrap();
+    let edge = q.pattern.edges().next().unwrap();
+    assert_eq!((edge.min_hops, edge.max_hops), (0, 3));
+    assert!(q.pattern.has_variable_length());
 }
 
 #[test]
-fn rejects_zero_hop_range_gql_narrow() {
-    let mut q = gql::parse("MATCH (a)-[:extends*0..1]->(b) RETURN b").unwrap();
-    let err = validate(&mut q).unwrap_err();
-    assert!(
-        matches!(err, QueryError::Unsupported(_)),
-        "expected Unsupported, got {err:?}"
-    );
+fn accepts_zero_hop_range_gql_narrow_and_at_depth_cap() {
+    for max in [0, 1, 10] {
+        let mut q = gql::parse(&format!("MATCH (a)-[:extends*0..{max}]->(b) RETURN b")).unwrap();
+        validate_with_warnings(&mut q).unwrap();
+        let edge = q.pattern.edges().next().unwrap();
+        assert_eq!((edge.min_hops, edge.max_hops), (0, max));
+        assert!(
+            q.pattern.has_variable_length(),
+            "0..{max} needs a zero seed"
+        );
+    }
 }
 
 #[test]
-fn rejects_zero_hop_sparql_explicit_range() {
+fn accepts_zero_hop_sparql_explicit_range() {
     use crate::parsers::sparql;
-    let mut q = sparql::parse("SELECT ?a ?b WHERE { ?a :extends{0,3} ?b . }").unwrap();
-    let err = validate(&mut q).unwrap_err();
-    assert!(
-        matches!(err, QueryError::Unsupported(_)),
-        "expected Unsupported, got {err:?}"
-    );
+    for max in [0, 1, 3] {
+        let mut q = sparql::parse(&format!(
+            "SELECT ?a ?b WHERE {{ ?a :extends{{0,{max}}} ?b . }}"
+        ))
+        .unwrap();
+        validate(&mut q).unwrap();
+        let edge = q.pattern.edges().next().unwrap();
+        assert_eq!((edge.min_hops, edge.max_hops), (0, max));
+        assert!(q.pattern.has_variable_length());
+    }
+}
+
+#[test]
+fn direct_ast_zero_hop_ranges_retain_depth_and_inversion_guards() {
+    let with_range = |min_hops, max_hops| {
+        let mut q = gql::parse("MATCH (a)-[:extends]->(b) RETURN b").unwrap();
+        let crate::ast::PatternElement::Edge(edge) = &mut q.pattern.elements[1] else {
+            panic!("expected parsed edge");
+        };
+        edge.min_hops = min_hops;
+        edge.max_hops = max_hops;
+        q
+    };
+    for (min, max) in [(0, 0), (0, 1), (0, 10), (1, 1)] {
+        let mut q = with_range(min, max);
+        validate(&mut q).unwrap();
+        assert_eq!(q.pattern.has_variable_length(), (min, max) != (1, 1));
+    }
+    let err = validate(&mut with_range(0, 11)).unwrap_err();
+    assert!(matches!(err, QueryError::InvalidInput(_)), "{err:?}");
+    let err = validate(&mut with_range(1, 0)).unwrap_err();
+    assert!(matches!(err, QueryError::Validation(_)), "{err:?}");
+    for (range, inverted) in [("0..11", false), ("1..0", true)] {
+        let mut q = gql::parse(&format!("MATCH (a)-[:extends*{range}]->(b) RETURN b")).unwrap();
+        let err = validate(&mut q).unwrap_err();
+        assert!(
+            matches!(
+                (&err, inverted),
+                (QueryError::Validation(_), true) | (QueryError::InvalidInput(_), false)
+            ),
+            "{range}: {err:?}"
+        );
+    }
 }
 
 #[test]
@@ -380,4 +420,130 @@ fn edge_relation_still_validated() {
         gql::parse("MATCH (a)-[e:extends]->(b) WHERE e.relation = 'not_real' RETURN a").unwrap();
     let err = validate(&mut q).unwrap_err();
     assert!(err.to_string().contains("not_real"), "msg: {err}");
+}
+
+#[test]
+fn not_exists_direct_ast_validates_inner_ranges_and_constraints() {
+    use crate::ast::{PatternElement, WhereExpr};
+    let base =
+        || gql::parse("MATCH (r) WHERE NOT EXISTS { (f)-[:Supports]->(r) } RETURN r.id").unwrap();
+    let mut normalized = base();
+    validate(&mut normalized).unwrap();
+    let WhereExpr::NotExists(pattern) = &normalized.where_clause else {
+        panic!("absence")
+    };
+    assert_eq!(pattern.edges().next().unwrap().relations, ["supports"]);
+    for (min, max) in [(0, 0), (0, 1), (1, 2), (2, 2), (1, 11), (2, 1)] {
+        let mut query = base();
+        let WhereExpr::NotExists(pattern) = &mut query.where_clause else {
+            unreachable!()
+        };
+        let PatternElement::Edge(edge) = &mut pattern.elements[1] else {
+            unreachable!()
+        };
+        edge.min_hops = min;
+        edge.max_hops = max;
+        assert!(validate(&mut query).is_err(), "inner range {min}..{max}");
+    }
+    for source in [
+        "MATCH (r) WHERE NOT EXISTS { (f {namespace: 'foreign'})-[:supports]->(r) } RETURN r",
+        "MATCH (r) WHERE NOT EXISTS { (f)-[:not_a_relation]->(r) } RETURN r",
+        "MATCH (r) WHERE NOT EXISTS { (f)-[:observed_as_selected]->(r) } RETURN r",
+        "MATCH (r) WHERE NOT EXISTS { (f)-[:supports|observed_as_selected]->(r) } RETURN r",
+    ] {
+        let mut query = gql::parse(source).unwrap();
+        assert!(
+            validate(&mut query).is_err(),
+            "must validate the scoped pattern: {source}"
+        );
+    }
+    let mut empty = base();
+    empty.where_clause = WhereExpr::NotExists(crate::ast::MatchPattern { elements: vec![] });
+    assert!(crate::compile(&empty, &crate::CompileOptions::default()).is_err());
+    let mut malformed = base();
+    let WhereExpr::NotExists(pattern) = &mut malformed.where_clause else {
+        unreachable!()
+    };
+    pattern.elements.pop();
+    assert!(crate::compile(&malformed, &crate::CompileOptions::default()).is_err());
+}
+#[test]
+fn mixed_segment_cumulative_maxima_validate_parsed_and_direct_ast() {
+    for (second_max, accepted) in [(6, true), (7, false)] {
+        let text = format!(
+            "MATCH (a)-[:extends*1..4]->(b)-[:implements*1..{second_max}]->(c) RETURN c.id"
+        );
+        let parsed = gql::parse(&text).unwrap();
+        let mut direct =
+            gql::parse("MATCH (a)-[:extends]->(b)-[:implements]->(c) RETURN c.id").unwrap();
+        for (index, max) in [(1, 4), (3, second_max)] {
+            let PatternElement::Edge(edge) = &mut direct.pattern.elements[index] else {
+                unreachable!()
+            };
+            edge.max_hops = max;
+        }
+        for mut query in [parsed, direct] {
+            let result = validate(&mut query);
+            if accepted {
+                result.unwrap();
+                crate::compile(&query, &crate::CompileOptions::default()).unwrap();
+            } else {
+                assert!(
+                    matches!(result, Err(QueryError::InvalidInput(_))),
+                    "{result:?}"
+                );
+                assert!(matches!(
+                    crate::compile(&query, &crate::CompileOptions::default()),
+                    Err(QueryError::InvalidInput(_))
+                ));
+            }
+        }
+    }
+    for source in [
+        "MATCH (a)-[:contains]->(b)-[:extends*1..10]->(c)-[:implements]->(d) RETURN d.id",
+        "MATCH (a)-[:extends*0..0]->(b)-[:implements*1..10]->(c) RETURN c.id",
+        "MATCH (a)-[:extends*0..0]->(b)-[:implements*0..0]->(c) RETURN c.id",
+    ] {
+        let mut query = gql::parse(source).unwrap();
+        validate(&mut query).unwrap();
+        crate::compile(&query, &crate::CompileOptions::default()).unwrap();
+    }
+    let mut outputs = Vec::new();
+    for fixed in [":contains", ":contains*1", ":contains*1..1"] {
+        let mut query = gql::parse(&format!(
+            "MATCH (a)-[{fixed}]->(b)-[:extends*1..10]->(c) RETURN c.id"
+        ))
+        .unwrap();
+        validate(&mut query).unwrap();
+        let edge = query.pattern.edges().next().unwrap();
+        assert_eq!((edge.min_hops, edge.max_hops), (1, 1));
+        let result = crate::compile(&query, &crate::CompileOptions::default()).unwrap();
+        outputs.push((result.sql, format!("{:?}", result.params)));
+    }
+    assert_eq!(outputs[0], outputs[1]);
+    assert_eq!(outputs[0], outputs[2]);
+
+    for (min, max) in [(2, 1), (1, 11)] {
+        let mut query =
+            gql::parse("MATCH (a)-[:extends]->(b)-[:implements]->(c) RETURN c.id").unwrap();
+        let PatternElement::Edge(edge) = &mut query.pattern.elements[1] else {
+            unreachable!()
+        };
+        edge.min_hops = min;
+        edge.max_hops = max;
+        let error = validate(&mut query).unwrap_err();
+        if min > max {
+            assert!(matches!(error, QueryError::Validation(_)), "{error:?}");
+            assert!(error.to_string().contains("min 2 > max 1"));
+        } else {
+            assert!(matches!(error, QueryError::InvalidInput(_)), "{error:?}");
+            assert!(error.to_string().contains("11"));
+        }
+    }
+    let mut comma =
+        gql::parse("MATCH (a)-[:extends*1..2]->(b), (b)-[:implements]->(c) RETURN c.id").unwrap();
+    assert!(matches!(
+        validate(&mut comma),
+        Err(QueryError::Unsupported(_))
+    ));
 }

@@ -18,6 +18,18 @@ pub enum AgentState {
     Terminal,
 }
 
+impl AgentState {
+    /// Canonical snake_case name, as stored and as serialized on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Spawned => "spawned",
+            Self::Running => "running",
+            Self::Suspended => "suspended",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
 /// Why a record reached `Terminal`. Set exactly once, at the transition into `Terminal`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -28,6 +40,19 @@ pub enum TerminalReason {
     Killed,
     Abandoned,
     HostRestart,
+}
+
+impl TerminalReason {
+    /// Canonical snake_case name, as stored and as serialized on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Killed => "killed",
+            Self::Abandoned => "abandoned",
+            Self::HostRestart => "host_restart",
+        }
+    }
 }
 
 /// The runtime-owned agent process record (ADR-142 §1, "Persistent process record").
@@ -50,3 +75,7 @@ pub struct AgentRecord {
     pub state_changed_at: i64,
     pub idempotency_key: Option<String>,
 }
+
+#[cfg(all(test, feature = "serde"))]
+#[path = "agent_tests.rs"]
+mod tests;

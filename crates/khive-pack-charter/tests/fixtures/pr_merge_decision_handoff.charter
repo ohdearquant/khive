@@ -1,0 +1,37 @@
+charter pr_merge_decision_handoff v1
+title "Prepare a pull request for a maintainer's merge decision"
+subject pull_request
+
+roles:
+    checker "checks the pull request and its evidence"
+    maintainer "decides whether the pull request may be merged"
+
+triggers:
+    message.arrived
+    checks.concluded
+    review.posted
+    schedule.fired
+    prompt.received
+
+workflow:
+    phase intake by checker:
+        await message.arrived or checks.concluded or review.posted or schedule.fired or prompt.received
+        goto verify
+
+    phase verify by checker:
+        require pull_request.open hard
+        require checks.required_green(event=pull_request) hard
+        when checks.required_green(event=pull_request) is pass: goto inspect
+        when checks.required_green(event=pull_request) is fail: goto hold
+
+    phase inspect by checker:
+        action review.read_diff by checker
+        require review.verdict_present hard
+        goto ready
+
+    phase ready by checker:
+        require loop.log_written advisory
+        terminate "the verified head is ready for the maintainer's merge decision"
+
+    phase hold by checker:
+        terminate "a required check did not pass for the current pull request head"

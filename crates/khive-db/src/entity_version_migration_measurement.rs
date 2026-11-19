@@ -10,8 +10,9 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
 use super::{
-    attachment_cutover_status, finalize_attachment_cutover, latest_schema_version,
-    read_schema_version, run_migrations, stage_attachment_cutover, AttachmentCutoverStatus,
+    attachment_cutover_status, finalize_attachment_cutover_for_test as finalize_attachment_cutover,
+    latest_schema_version, read_schema_version, run_migrations_for_test as run_migrations,
+    stage_attachment_cutover_for_test as stage_attachment_cutover, AttachmentCutoverStatus,
     ATTACHMENT_CUTOVER_VERSION, MIGRATIONS, MIGRATION_TRACKING_TABLE,
 };
 use crate::stores::blob::try_acquire_database_gc_owner_for_path;

@@ -1,22 +1,24 @@
 //! Secret-gate content-manifest exemption finalizer (ADR-115 Amendment 1).
 //!
-//! This module owns only the execution/outcome slice of the first acceptance
-//! rung: the five typed outcomes, their injectable failure seams, the
-//! store-independent audit-gap sink for a second-order failure-audit
-//! failure, and the atomic-with-rollback transaction that produces them.
-//! The runtime-owned entry-point declaration, the universal reservation
-//! contract, and the manifest-lookup mechanism are separate, independently
-//! owned files under this same module per ADR-115 Amendment 1 and are
-//! not authored here.
-//!
-//! Nothing in this module is wired to a caller yet — that integration is the
-//! runtime-ingress/declaration lane's job. Until it lands, every item here
-//! is reachable only from this module's own tests.
+//! Entity constructors and direct ingest share exact-candidate preparation
+//! and one caller-owned record/stamp/audit transaction. Production manifests
+//! remain empty; nonempty fixtures exist only under cfg(test). Note routes
+//! retain their mechanism harness and reservation-only production behavior.
 #![allow(dead_code)]
 
 #[cfg(test)]
 mod acceptance;
 pub(crate) mod declaration;
+pub(crate) mod entity_admission;
+mod entity_direct;
+#[cfg(test)]
+mod entity_route_tests;
+pub(crate) mod entity_transaction;
+pub use entity_admission::{
+    EntityCandidateContext, EntityCandidateOrigin, EntityCandidatePrepared,
+};
+pub use entity_direct::EntityCandidateAdmission;
+pub use entity_transaction::{EntityCandidateMutation, EntityFinalizationPlan};
 pub(crate) mod faults;
 pub(crate) mod log_sink;
 pub(crate) mod manifest;

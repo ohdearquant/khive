@@ -14,7 +14,7 @@
 //! is present, searchable, and `PRAGMA integrity_check` reports `ok`.
 //!
 //! This mirrors the existing deterministic-interleaving style used for #667
-//! in `khive-runtime/src/daemon.rs::recovery_lock_serializes_two_concurrent_boot_sequences`
+//! in `khive-runtime/src/daemon_tests.rs::recovery_lock_serializes_two_concurrent_boot_sequences`
 //! (real threads + the real lock primitive, not a mocked scheduler), but
 //! here the "critical section" is a real cold-boot migration run plus real
 //! writes instead of a synthetic counter.
@@ -52,7 +52,7 @@ fn file_backed_config(db_path: std::path::PathBuf) -> RuntimeConfig {
 /// Runs its own single-threaded Tokio runtime via `block_on` on a plain OS
 /// thread (`std::thread::spawn`), deliberately mirroring
 /// `recovery_lock_serializes_two_concurrent_boot_sequences` in
-/// `khive-runtime/src/daemon.rs` rather than `tokio::spawn` on a shared test
+/// `khive-runtime/src/daemon_tests.rs` rather than `tokio::spawn` on a shared test
 /// runtime: `acquire_recovery_lock` is a *blocking* `flock` call, and two
 /// such calls racing as tasks on one current-thread test runtime can starve
 /// each other's executor thread — the same self-deadlock class ADR-D3 calls

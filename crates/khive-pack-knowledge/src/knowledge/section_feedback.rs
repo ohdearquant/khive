@@ -1,6 +1,6 @@
 //! Section posterior updates for the knowledge pack.
 
-use khive_brain_core::{FeedbackSignal, SectionPosteriorState, SectionType, DEFAULT_ESS_CAP};
+use khive_brain_core::{FeedbackSignal, SectionPosteriorState, SectionType};
 
 /// Update section posteriors based on explicit per-section feedback signals.
 pub fn on_section_feedback(
@@ -9,23 +9,18 @@ pub fn on_section_feedback(
 ) {
     state.total_events += 1;
     for (section_type, feedback_signal) in signals {
-        if let Some(posterior) = state.posteriors.get_mut(section_type) {
-            match feedback_signal {
-                FeedbackSignal::Useful => posterior.update_success(),
-                FeedbackSignal::NotUseful => posterior.update_failure(),
-                FeedbackSignal::Wrong => posterior.update_failure_weighted(2.0),
-            }
-            if let Some(prior) = state.priors.get(section_type).cloned() {
-                if let Err(e) = posterior.apply_ess_cap(&prior, DEFAULT_ESS_CAP) {
-                    eprintln!(
-                        "[knowledge] apply_ess_cap failed for section {:?}: {e}",
-                        section_type
-                    );
-                }
-            }
+        if let Err(e) = state.apply_section_feedback_entry(section_type, feedback_signal, 1.0) {
+            eprintln!(
+                "[knowledge] apply_ess_cap failed for section {:?}: {e}",
+                section_type
+            );
         }
     }
     if state.exploration_epoch > 0 {
         state.exploration_epoch -= 1;
     }
 }
+
+#[cfg(test)]
+#[path = "section_feedback_tests.rs"]
+mod tests;

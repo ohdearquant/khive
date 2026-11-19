@@ -14,7 +14,7 @@
 //! additively across the workspace, so a `preserve_order` enabled by any
 //! other crate would silently change key order and break these fixtures.
 //! The `serde_json_feature_posture_is_default_keys_serialize_sorted` probe
-//! in `src/codec.rs` pins that posture at test time.
+//! in `src/codec_tests.rs` pins that posture at test time.
 
 use khive_wire_protocol::frame::OperationId;
 use khive_wire_protocol::{
@@ -103,7 +103,8 @@ fn response() {
         "response",
         &Frame::Response {
             id: OperationId::from("op-1"),
-            result: serde_json::json!({"ok": true, "tool": "stats", "result": {"entities": 3}}),
+            result: serde_json::json!({"ok": true, "tool": "stats", "result": {"entities": 3}})
+                .into(),
         },
     );
 }
@@ -213,7 +214,7 @@ fn event() {
             topic: "comm.message_created".to_string(),
             cursor: 43,
             occurred_at: "2026-08-04T11:00:00Z".to_string(),
-            payload: serde_json::json!({"message_id": "m-1"}),
+            payload: serde_json::json!({"message_id": "m-1"}).into(),
         },
     );
 }
@@ -315,7 +316,7 @@ fn frame_kinds_matches_the_frame_enum() {
         },
         Frame::Response {
             id: OperationId::from("op-1"),
-            result: serde_json::json!({}),
+            result: serde_json::json!({}).into(),
         },
         // A connection-terminal code with no id: a scope-consistent
         // pairing the decode-time check accepts (request-terminal codes
@@ -351,7 +352,7 @@ fn frame_kinds_matches_the_frame_enum() {
             topic: "domain.event".to_string(),
             cursor: 0,
             occurred_at: "2026-08-04T11:00:00Z".to_string(),
-            payload: serde_json::json!({}),
+            payload: serde_json::json!({}).into(),
         },
     ];
     assert_eq!(

@@ -2,6 +2,7 @@
 //! The timing fixture explicitly freezes the context inside the handler;
 //! it does not exercise the generated enclosing audit append.
 
+use khive_db::test_hooks::TestHooks;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,8 +19,8 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperati
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-const PROBE: &str = "usage_append_probe";
-const CONTROL: &str = "usage_append_control";
+const PROBE: &str = "usage_append.probe";
+const CONTROL: &str = "usage_append.control";
 
 #[derive(Clone, Copy, Debug)]
 enum AppendMethod {
@@ -103,7 +104,7 @@ impl Lane {
             self.writer
                 .send_top_level(move |connection| {
                     connection
-                        .authorizer(Some(move |context: AuthContext<'_>| {
+                        .test_authorizer(Some(move |context: AuthContext<'_>| {
                             match context.action {
                                 // rusqlite 0.40 reports SQLite COMMIT as Unknown.
                                 AuthAction::Transaction {
@@ -144,7 +145,20 @@ impl Lane {
                 Ok(json!({"id": prime_id}))
             }
             Err(error) => {
-                let state = match (&self.outcome, &error) {
+                assert_eq!(
+                    error.sqlite_write_failure(),
+                    Some(khive_storage::error::SqliteWriteFailure {
+                        stage: khive_storage::error::SqliteWriteStage::Commit,
+                        primary_code: rusqlite::ffi::SQLITE_AUTH,
+                        extended_code: rusqlite::ffi::SQLITE_AUTH,
+                        settlement_unknown: matches!(
+                            self.outcome,
+                            Outcome::Unknown | Outcome::UnknownAfterFreeze
+                        ),
+                    }),
+                    "the real COMMIT refusal must retain native evidence: {error:?}"
+                );
+                let state = match (&self.outcome, error.without_sqlite_write_stage()) {
                     (
                         Outcome::RolledBack,
                         StorageError::WriterTaskRequestFailed {
@@ -156,6 +170,7 @@ impl Lane {
                         Outcome::Unknown | Outcome::UnknownAfterFreeze,
                         StorageError::WriterTaskTerminated {
                             request_state: WriterTaskRequestState::SideEffectsUnknown,
+                            ..
                         },
                     ) => WriterTaskRequestState::SideEffectsUnknown,
                     other => panic!("unexpected real append outcome: {other:?}"),
@@ -165,7 +180,7 @@ impl Lane {
                     self.writer
                         .send_top_level(|connection| {
                             connection
-                                .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                                .test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
                                 .map_err(|error| StorageError::Pool {
                                     operation: "usage_fixture_remove_authorizer".into(),
                                     message: error.to_string(),
@@ -200,7 +215,7 @@ struct AppendProbePack {
 }
 
 impl Pack for AppendProbePack {
-    const NAME: &'static str = "usage-append-fixture";
+    const NAME: &'static str = "usage_append";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[
@@ -316,6 +331,19 @@ impl Fixture {
 fn assert_unknown(entry: &Value) {
     assert_eq!(entry["ok"], false, "{entry}");
     assert_eq!(entry["error"]["code"], "writer_task_terminated", "{entry}");
+    assert_eq!(entry["error"]["stage"], "writer_task_terminated", "{entry}");
+    assert_eq!(
+        entry["error"]["sqlite_write_stage"], "sqlite_commit_failure",
+        "{entry}"
+    );
+    assert_eq!(
+        entry["error"]["sqlite_primary_code"],
+        rusqlite::ffi::SQLITE_AUTH
+    );
+    assert_eq!(
+        entry["error"]["sqlite_extended_code"],
+        rusqlite::ffi::SQLITE_AUTH
+    );
     assert_eq!(
         entry["error"]["request_state"], "side_effects_unknown",
         "{entry}"
@@ -341,7 +369,7 @@ fn assert_success(entry: &Value, method: AppendMethod) {
 async fn unknown_append_omits_partial_usage_in_single_request() {
     for method in [AppendMethod::Single, AppendMethod::Batch] {
         let fixture = Fixture::new(method, Outcome::Unknown);
-        let body = fixture.request("usage_append_probe()").await;
+        let body = fixture.request("usage_append.probe()").await;
         assert_unknown(&body["results"][0]);
         let prime = fixture
             .probe
@@ -365,7 +393,7 @@ async fn unknown_append_omits_usage_without_poisoning_parallel_sibling() {
     for method in [AppendMethod::Single, AppendMethod::Batch] {
         let fixture = Fixture::new(method, Outcome::Unknown);
         let body = fixture
-            .request("[usage_append_probe(), usage_append_control()]")
+            .request("[usage_append.probe(), usage_append.control()]")
             .await;
         assert_unknown(&body["results"][0]);
         assert_success(&body["results"][1], method);
@@ -379,7 +407,7 @@ async fn unknown_append_omits_usage_in_chain_after_measured_success() {
     for method in [AppendMethod::Single, AppendMethod::Batch] {
         let fixture = Fixture::new(method, Outcome::Unknown);
         let body = fixture
-            .request("usage_append_control() | usage_append_probe()")
+            .request("usage_append.control() | usage_append.probe()")
             .await;
         assert_success(&body["results"][0], method);
         assert_unknown(&body["results"][1]);
@@ -390,7 +418,7 @@ async fn unknown_append_omits_usage_in_chain_after_measured_success() {
 async fn unknown_append_after_explicit_freeze_omits_frozen_partial_usage() {
     for method in [AppendMethod::Single, AppendMethod::Batch] {
         let fixture = Fixture::new(method, Outcome::UnknownAfterFreeze);
-        let body = fixture.request("usage_append_probe()").await;
+        let body = fixture.request("usage_append.probe()").await;
         assert_unknown(&body["results"][0]);
         assert_eq!(
             fixture.probe.evidence.lock().unwrap().frozen_before_attempt,
@@ -403,7 +431,7 @@ async fn unknown_append_after_explicit_freeze_omits_frozen_partial_usage() {
 async fn clean_successful_appends_retain_measured_usage() {
     for method in [AppendMethod::Single, AppendMethod::Batch] {
         let fixture = Fixture::new(method, Outcome::Success);
-        let body = fixture.request("usage_append_probe()").await;
+        let body = fixture.request("usage_append.probe()").await;
         assert_success(&body["results"][0], method);
         let attempted = fixture.probe.evidence.lock().unwrap().attempted.clone();
         for id in attempted {
@@ -416,16 +444,26 @@ async fn clean_successful_appends_retain_measured_usage() {
 async fn clean_rolled_back_appends_retain_measured_partial_usage() {
     for method in [AppendMethod::Single, AppendMethod::Batch] {
         let fixture = Fixture::new(method, Outcome::RolledBack);
-        let body = fixture.request("usage_append_probe()").await;
+        let body = fixture.request("usage_append.probe()").await;
         let entry = &body["results"][0];
         assert_eq!(entry["ok"], false, "{entry}");
-        assert_eq!(
-            entry["error"]["code"], "writer_task_request_failed",
-            "{entry}"
-        );
+        assert_eq!(entry["error"]["code"], "sqlite_commit_failure", "{entry}");
         assert_eq!(
             entry["error"]["request_state"], "transaction_rolled_back",
             "{entry}"
+        );
+        assert_eq!(entry["error"]["stage"], "sqlite_commit_failure", "{entry}");
+        assert_eq!(
+            entry["error"]["sqlite_write_stage"], "sqlite_commit_failure",
+            "{entry}"
+        );
+        assert_eq!(
+            entry["error"]["sqlite_primary_code"],
+            rusqlite::ffi::SQLITE_AUTH
+        );
+        assert_eq!(
+            entry["error"]["sqlite_extended_code"],
+            rusqlite::ffi::SQLITE_AUTH
         );
         assert_eq!(entry["error"]["task_terminated"], false, "{entry}");
         assert_eq!(entry["usage"], json!({"event_rows": 1}), "{entry}");

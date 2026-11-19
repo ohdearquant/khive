@@ -214,7 +214,7 @@ fn project_changeset(changeset: &ChangeSet) -> ProjectedNdjson {
             }
             // `update`/`delete`/`merge` are out of scope for commit-time
             // re-validation — see the module-level doc comment.
-            Op::Update(_) | Op::Delete(_) | Op::Merge(_) => {}
+            Op::Update(_) | Op::Delete(_) | Op::Restore(_) | Op::Merge(_) => {}
         }
     }
 
@@ -230,6 +230,7 @@ fn check_no_duplicate_stage_ids(duplicate_ids: &[String]) -> RuleResult {
     let violations: Vec<Violation> = duplicate_ids
         .iter()
         .map(|id| Violation {
+            source: None,
             entity_id: Some(id.clone()),
             entity_name: None,
             entity_kind: None,
@@ -255,6 +256,26 @@ pub(super) fn run_commit_time_rules(
     changeset: &ChangeSet,
     rules_path: &Path,
 ) -> Result<Vec<RuleResult>> {
+    run_commit_time_rules_source(changeset, CommitTimeRules::Path(rules_path))
+}
+
+/// Reuse one immutable rules snapshot for validation and tier classification.
+pub(super) fn run_commit_time_rules_with_rules(
+    changeset: &ChangeSet,
+    rules: &khive_rule_evaluator::Rules,
+) -> Result<Vec<RuleResult>> {
+    run_commit_time_rules_source(changeset, CommitTimeRules::Captured(rules))
+}
+
+enum CommitTimeRules<'a> {
+    Path(&'a Path),
+    Captured(&'a khive_rule_evaluator::Rules),
+}
+
+fn run_commit_time_rules_source(
+    changeset: &ChangeSet,
+    rules: CommitTimeRules<'_>,
+) -> Result<Vec<RuleResult>> {
     let projected = project_changeset(changeset);
 
     let tmp = tempfile::TempDir::new().context("creating projection temp dir")?;
@@ -273,16 +294,24 @@ pub(super) fn run_commit_time_rules(
         validate::check_valid_note_kinds(&notes_path, &taxonomy.note_kinds),
     ];
 
-    if rules_path.exists() {
-        let configurable = validate::configurable_rule_checks_partial_view(
-            &entities_path,
-            &edges_path,
-            &notes_path,
-            rules_path,
-        )
-        .context("evaluating configurable rules")?;
-        results.extend(configurable);
+    let state = khive_rule_evaluator::NdjsonState {
+        entities: &projected.entities,
+        edges: &projected.edges,
+        notes: &projected.notes,
+    };
+    let configurable = match rules {
+        CommitTimeRules::Path(path) if path.exists() => {
+            validate::configurable_rule_checks_partial_view(state, path)
+        }
+        CommitTimeRules::Path(_) => Ok(Vec::new()),
+        CommitTimeRules::Captured(rules) => validate::evaluate_captured_rules(
+            rules,
+            state,
+            khive_rule_evaluator::EvaluationMode::PartialView,
+        ),
     }
+    .context("evaluating configurable rules")?;
+    results.extend(configurable);
 
     Ok(results)
 }

@@ -8,7 +8,7 @@ use core::str::FromStr;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-/// The 9 structural categories that group the 19 canonical edge relations.
+/// The 10 semantic categories that group the 20 canonical edge relations.
 ///
 /// Exposed via [`EdgeRelation::category`] for query planners and UI rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -34,9 +34,11 @@ pub enum EdgeCategory {
     Annotation,
     /// Evidence for/against a claim: `supports`, `refutes`
     Epistemic,
+    /// Current whole or partial ownership: `owns`
+    Ownership,
 }
 
-/// Closed set of 19 canonical edge relations.
+/// Closed set of 20 canonical edge relations.
 ///
 /// No `Default` — every edge requires an explicit relation.
 /// Wire format: snake_case strings (e.g. `"part_of"`, `"introduced_by"`).
@@ -72,11 +74,13 @@ pub enum EdgeRelation {
     // Epistemic
     Supports,
     Refutes,
+    // Ownership
+    Owns,
 }
 
 impl EdgeRelation {
-    /// All 19 canonical relations in ontology-table order.
-    pub const ALL: [Self; 19] = [
+    /// All 20 canonical relations in ontology-table order.
+    pub const ALL: [Self; 20] = [
         Self::Contains,
         Self::PartOf,
         Self::InstanceOf,
@@ -96,9 +100,10 @@ impl EdgeRelation {
         Self::Annotates,
         Self::Supports,
         Self::Refutes,
+        Self::Owns,
     ];
 
-    /// Valid snake_case names for all 19 canonical relations.
+    /// Valid snake_case names for all 20 canonical relations.
     pub const VALID_NAMES: &'static [&'static str] = &[
         "contains",
         "part_of",
@@ -119,11 +124,29 @@ impl EdgeRelation {
         "annotates",
         "supports",
         "refutes",
+        "owns",
     ];
 
     /// `true` for symmetric relations: edge direction has no semantic meaning.
     pub const fn is_symmetric(&self) -> bool {
         matches!(self, Self::CompetesWith | Self::ComposedWith)
+    }
+
+    /// Order the endpoints of an edge so a symmetric relation has one stored form.
+    ///
+    /// For symmetric relations (`competes_with`, `composed_with`) the smaller
+    /// endpoint comes first, so A→B and B→A collapse into a single canonical row.
+    /// Every other relation, and a symmetric pair that is already ordered or has
+    /// equal endpoints, is returned as given.
+    ///
+    /// Generic over `T: Ord` because this crate does not depend on a UUID type;
+    /// for UUIDs the order is the byte order of the id.
+    pub fn canonical_endpoints<T: Ord>(&self, source: T, target: T) -> (T, T) {
+        if self.is_symmetric() && target < source {
+            (target, source)
+        } else {
+            (source, target)
+        }
     }
 
     /// The category this relation belongs to.
@@ -142,6 +165,7 @@ impl EdgeRelation {
             Self::CompetesWith | Self::ComposedWith => EdgeCategory::Lateral,
             Self::Annotates => EdgeCategory::Annotation,
             Self::Supports | Self::Refutes => EdgeCategory::Epistemic,
+            Self::Owns => EdgeCategory::Ownership,
         }
     }
 
@@ -167,6 +191,7 @@ impl EdgeRelation {
             Self::Annotates => "annotates",
             Self::Supports => "supports",
             Self::Refutes => "refutes",
+            Self::Owns => "owns",
         }
     }
 }
@@ -182,7 +207,7 @@ impl FromStr for EdgeRelation {
 
     /// Parse a string into an `EdgeRelation`.
     ///
-    /// Accepts the 19 canonical relation names (case-insensitive, with hyphens
+    /// Accepts the 20 canonical relation names (case-insensitive, with hyphens
     /// normalised to underscores) and also squashed forms that omit the separator
     /// (e.g. `"partof"`, `"derivedfrom"`).  The squashed forms exist for ergonomic
     /// DSL entry; they are **not** stored on the wire, which always uses the
@@ -223,6 +248,7 @@ impl FromStr for EdgeRelation {
             "annotates" => Ok(Self::Annotates),
             "supports" => Ok(Self::Supports),
             "refutes" => Ok(Self::Refutes),
+            "owns" => Ok(Self::Owns),
             _ => Err(crate::error::UnknownVariant::new(
                 "edge_relation",
                 s,
@@ -233,270 +259,5 @@ impl FromStr for EdgeRelation {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use alloc::string::ToString;
-
-    #[test]
-    fn all_has_nineteen_variants() {
-        assert_eq!(EdgeRelation::ALL.len(), 19);
-    }
-
-    #[test]
-    fn all_nine_categories_covered() {
-        let mut cats = alloc::vec::Vec::new();
-        for r in EdgeRelation::ALL {
-            let c = r.category();
-            if !cats.contains(&c) {
-                cats.push(c);
-            }
-        }
-        assert_eq!(cats.len(), 9, "all 9 categories must be represented");
-    }
-
-    #[test]
-    fn display_roundtrip_for_all() {
-        for relation in EdgeRelation::ALL {
-            let s = relation.to_string();
-            let parsed: EdgeRelation = s.parse().expect("display output should re-parse");
-            assert_eq!(parsed, relation);
-        }
-    }
-
-    #[test]
-    fn from_str_case_insensitive() {
-        assert_eq!(
-            "Extends".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::Extends
-        );
-        assert_eq!(
-            "extends".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::Extends
-        );
-        assert_eq!(
-            "EXTENDS".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::Extends
-        );
-    }
-
-    #[test]
-    fn from_str_hyphen_tolerant() {
-        assert_eq!(
-            "part_of".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::PartOf
-        );
-        assert_eq!(
-            "part-of".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::PartOf
-        );
-        assert_eq!(
-            "partof".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::PartOf
-        );
-
-        assert_eq!(
-            "introduced_by".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::IntroducedBy
-        );
-        assert_eq!(
-            "introduced-by".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::IntroducedBy
-        );
-    }
-
-    #[test]
-    fn from_str_unknown_returns_error_with_list() {
-        let err = "related_to".parse::<EdgeRelation>().unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("related_to"),
-            "error should mention the bad input"
-        );
-        assert!(
-            msg.contains("contains"),
-            "error should list valid relations"
-        );
-        assert!(
-            msg.contains("derived_from"),
-            "error should list derived_from"
-        );
-        assert!(msg.contains("precedes"), "error should list precedes");
-        assert!(msg.contains("annotates"), "error should list all 19");
-    }
-
-    #[test]
-    fn edge_relation_bang_rejected() {
-        for bad in ["supports!", "part/of", "depends.on", "competes with"] {
-            let err = bad
-                .parse::<EdgeRelation>()
-                .expect_err("malformed punctuation/whitespace must be rejected");
-            assert_eq!(err.domain, "edge_relation");
-            assert_eq!(err.value, bad);
-        }
-    }
-
-    #[test]
-    fn category_returns_correct_group() {
-        assert_eq!(EdgeRelation::Contains.category(), EdgeCategory::Structure);
-        assert_eq!(EdgeRelation::PartOf.category(), EdgeCategory::Structure);
-        assert_eq!(EdgeRelation::InstanceOf.category(), EdgeCategory::Structure);
-        assert_eq!(EdgeRelation::LinksTo.category(), EdgeCategory::Structure);
-        assert_eq!(EdgeRelation::LocatedIn.category(), EdgeCategory::Structure);
-
-        assert_eq!(EdgeRelation::Extends.category(), EdgeCategory::Derivation);
-        assert_eq!(EdgeRelation::VariantOf.category(), EdgeCategory::Derivation);
-        assert_eq!(
-            EdgeRelation::IntroducedBy.category(),
-            EdgeCategory::Derivation
-        );
-        assert_eq!(
-            EdgeRelation::Supersedes.category(),
-            EdgeCategory::Derivation
-        );
-
-        assert_eq!(EdgeRelation::DependsOn.category(), EdgeCategory::Dependency);
-        assert_eq!(EdgeRelation::Enables.category(), EdgeCategory::Dependency);
-
-        assert_eq!(
-            EdgeRelation::Implements.category(),
-            EdgeCategory::Implementation
-        );
-
-        assert_eq!(
-            EdgeRelation::DerivedFrom.category(),
-            EdgeCategory::Provenance
-        );
-        assert_eq!(EdgeRelation::Precedes.category(), EdgeCategory::Temporal);
-
-        assert_eq!(EdgeRelation::CompetesWith.category(), EdgeCategory::Lateral);
-        assert_eq!(EdgeRelation::ComposedWith.category(), EdgeCategory::Lateral);
-
-        assert_eq!(EdgeRelation::Annotates.category(), EdgeCategory::Annotation);
-    }
-
-    #[test]
-    fn from_str_new_relations() {
-        assert_eq!(
-            "derived_from".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::DerivedFrom
-        );
-        assert_eq!(
-            "derived-from".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::DerivedFrom
-        );
-        assert_eq!(
-            "derivedfrom".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::DerivedFrom
-        );
-        assert_eq!(
-            "precedes".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::Precedes
-        );
-    }
-
-    #[test]
-    fn from_str_links_to() {
-        assert_eq!(
-            "links_to".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::LinksTo
-        );
-        assert_eq!(
-            "links-to".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::LinksTo
-        );
-        assert_eq!(
-            "linksto".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::LinksTo
-        );
-        assert_eq!(EdgeRelation::LinksTo.to_string(), "links_to");
-        assert_eq!(EdgeRelation::LinksTo.category(), EdgeCategory::Structure);
-    }
-
-    #[test]
-    fn from_str_located_in() {
-        assert_eq!(
-            "located_in".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::LocatedIn
-        );
-        assert_eq!(
-            "located-in".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::LocatedIn
-        );
-        assert_eq!(
-            "locatedin".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::LocatedIn
-        );
-        assert_eq!(EdgeRelation::LocatedIn.to_string(), "located_in");
-        assert_eq!(EdgeRelation::LocatedIn.category(), EdgeCategory::Structure);
-    }
-
-    #[test]
-    fn is_symmetric_only_for_lateral_peer_relations() {
-        assert!(EdgeRelation::CompetesWith.is_symmetric());
-        assert!(EdgeRelation::ComposedWith.is_symmetric());
-        assert!(!EdgeRelation::DependsOn.is_symmetric());
-        assert!(!EdgeRelation::DerivedFrom.is_symmetric());
-        assert!(!EdgeRelation::Precedes.is_symmetric());
-        assert!(!EdgeRelation::Extends.is_symmetric());
-        assert!(!EdgeRelation::LinksTo.is_symmetric());
-        assert!(!EdgeRelation::LocatedIn.is_symmetric());
-    }
-
-    #[test]
-    fn from_str_epistemic_relations() {
-        assert_eq!(
-            "supports".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::Supports
-        );
-        assert_eq!(
-            "refutes".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::Refutes
-        );
-        assert_eq!(
-            "Supports".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::Supports
-        );
-        assert_eq!(
-            "REFUTES".parse::<EdgeRelation>().unwrap(),
-            EdgeRelation::Refutes
-        );
-        assert_eq!(EdgeRelation::Supports.category(), EdgeCategory::Epistemic);
-        assert_eq!(EdgeRelation::Refutes.category(), EdgeCategory::Epistemic);
-        assert!(!EdgeRelation::Supports.is_symmetric());
-        assert!(!EdgeRelation::Refutes.is_symmetric());
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn serde_snake_case_roundtrip() {
-        let rel = EdgeRelation::IntroducedBy;
-        let json = serde_json::to_string(&rel).unwrap();
-        assert_eq!(json, "\"introduced_by\"");
-        let parsed: EdgeRelation = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, rel);
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn serde_new_relations_roundtrip() {
-        for rel in [EdgeRelation::DerivedFrom, EdgeRelation::Precedes] {
-            let json = serde_json::to_string(&rel).unwrap();
-            let parsed: EdgeRelation = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed, rel);
-        }
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn serde_epistemic_relations_roundtrip() {
-        let sup_json = serde_json::to_string(&EdgeRelation::Supports).unwrap();
-        assert_eq!(sup_json, "\"supports\"");
-        let sup_parsed: EdgeRelation = serde_json::from_str(&sup_json).unwrap();
-        assert_eq!(sup_parsed, EdgeRelation::Supports);
-
-        let ref_json = serde_json::to_string(&EdgeRelation::Refutes).unwrap();
-        assert_eq!(ref_json, "\"refutes\"");
-        let ref_parsed: EdgeRelation = serde_json::from_str(&ref_json).unwrap();
-        assert_eq!(ref_parsed, EdgeRelation::Refutes);
-    }
-}
+#[path = "edge_tests.rs"]
+mod tests;

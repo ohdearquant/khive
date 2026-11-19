@@ -4,45 +4,48 @@
 
 ## Scope
 
-The KG pack provides 26 verb handlers for the knowledge graph substrate: entity
+The KG pack provides 31 public verb handlers for the knowledge graph substrate: entity
 CRUD, note CRUD, edge creation/traversal, hybrid search, graph queries (GQL),
 entity-anchored graph context (ADR-089), event-sourced proposals (ADR-046),
-caller identity introspection (`whoami`), the secret gate's write-free verdict on a
+grouped event counts (`count`, ADR-022), atomic canonical change-set application (`apply_changeset`,
+ADR-102), caller identity introspection (`whoami`), the secret gate's write-free verdict on a
 note body (`scan`), and writer-contention, graph-edge
 integrity, plus WAL/checkpoint operator diagnostics (`db_diagnostics`,
 ADR-091/ADR-135 — its PASSIVE probe may backfill WAL frames but never changes
 logical state).
+The operator-only `kg.proposal_cleanup` subhandler is a thirty-second handler and is
+not part of the public verb inventory or MCP surface.
 It is the first-party pack shipped with the khive binary.
 
 ## ADR Compliance
 
-| ADR                                                                | What it governs                                                   | Status      |
-| ------------------------------------------------------------------ | ----------------------------------------------------------------- | ----------- |
-| [ADR-001](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)       | 9 entity kinds (8 base + resource per ADR-048)                    | Implemented |
-| [ADR-002](../../../docs/adr/ADR-002-edge-ontology.md)              | 19 edge relations, closed set (17 base incl. `links_to` via ADR-191 and `located_in` via ADR-196 + 2 epistemic via ADR-055) | Implemented |
-| [ADR-007](../../../docs/adr/ADR-007-namespace.md)                  | KG uses shared `local` namespace                                  | Implemented |
-| [ADR-013](../../../docs/adr/ADR-013-note-kind-taxonomy.md)         | 5 base note kinds                                                 | Implemented |
-| [ADR-014](../../../docs/adr/ADR-014-curation-operations.md)        | UUID-only get/update/delete                                       | Implemented |
-| [ADR-017](../../../docs/adr/ADR-017-pack-standard.md)              | Pack trait, vocabulary, edge rules                                | Implemented |
-| [ADR-001](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)       | Alias normalization (paper→document, write-time)                  | Implemented |
-| [ADR-045](../../../docs/adr/ADR-045-verb-response-presentation.md) | ISO-8601 timestamps at handler boundary                           | Implemented |
-| [ADR-046](../../../docs/adr/ADR-046-event-sourced-proposals.md)    | Event-sourced proposals (propose/review/withdraw)                 | Implemented |
-| [ADR-048](../../../docs/adr/ADR-048-knowledge-section-profiles.md) | `resource` entity kind (9th kind)                                 | Implemented |
-| [ADR-089](../../../docs/adr/ADR-089-context-verb.md)               | `context` verb — entity-anchored graph context                    | Implemented |
+| ADR                                                                | What it governs                                                                                                                                                | Status      |
+| ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
+| [ADR-001](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)       | 9 entity kinds (8 base + resource per ADR-048)                                                                                                                 | Implemented |
+| [ADR-002](../../../docs/adr/ADR-002-edge-ontology.md)              | 20 edge relations, closed set (18 non-epistemic base incl. `links_to` via ADR-191, `located_in` via ADR-196, and `owns` via ADR-197 + 2 epistemic via ADR-055) | Implemented |
+| [ADR-007](../../../docs/adr/ADR-007-namespace.md)                  | KG uses shared `local` namespace                                                                                                                               | Implemented |
+| [ADR-013](../../../docs/adr/ADR-013-note-kind-taxonomy.md)         | 5 base note kinds                                                                                                                                              | Implemented |
+| [ADR-014](../../../docs/adr/ADR-014-curation-operations.md)        | UUID-only get/update/delete                                                                                                                                    | Implemented |
+| [ADR-017](../../../docs/adr/ADR-017-pack-standard.md)              | Pack trait, vocabulary, edge rules                                                                                                                             | Implemented |
+| [ADR-001](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)       | Alias normalization (paper→document, write-time)                                                                                                               | Implemented |
+| [ADR-045](../../../docs/adr/ADR-045-verb-response-presentation.md) | ISO-8601 timestamps at handler boundary                                                                                                                        | Implemented |
+| [ADR-046](../../../docs/adr/ADR-046-event-sourced-proposals.md)    | Event-sourced proposals (propose/review/withdraw)                                                                                                              | Implemented |
+| [ADR-048](../../../docs/adr/ADR-048-knowledge-section-profiles.md) | `resource` entity kind (9th kind)                                                                                                                              | Implemented |
+| [ADR-089](../../../docs/adr/ADR-089-context-verb.md)               | `context` verb — entity-anchored graph context                                                                                                                 | Implemented |
 
 ## Primary Modules
 
-| Module                                                            | Purpose                                                  |
-| ----------------------------------------------------------------- | -------------------------------------------------------- |
-| [`src/lib.rs`](../src/lib.rs)                                     | Pack re-exports and crate documentation                  |
-| [`src/pack.rs`](../src/pack.rs)                                   | KgPack struct, Pack trait impl, edge endpoint rules      |
-| [`src/dispatch.rs`](../src/dispatch.rs)                           | PackRuntime impl, inventory self-registration            |
-| [`src/handler_defs.rs`](../src/handler_defs.rs)                   | KG_HANDLERS static table (24 HandlerDef entries)         |
-| [`src/handlers/mod.rs`](../src/handlers/mod.rs)                   | 26 verb handler implementations                          |
-| [`src/vocab.rs`](../src/vocab.rs)                                 | EntityKind (9) and NoteKind (5) enums with alias parsing |
-| [`src/entity_type_registry.rs`](../src/entity_type_registry.rs)   | Validates entity_type against per-kind subtypes          |
-| [`src/apply_worker/mod.rs`](../src/apply_worker/mod.rs)           | Applies approved proposal changesets to KG               |
-| [`src/projection_worker/mod.rs`](../src/projection_worker/mod.rs) | Maintains proposals_open projection table                |
+| Module                                                            | Purpose                                                                      |
+| ----------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| [`src/lib.rs`](../src/lib.rs)                                     | Pack re-exports and crate documentation                                      |
+| [`src/pack.rs`](../src/pack.rs)                                   | KgPack struct, Pack trait impl, edge endpoint rules                          |
+| [`src/dispatch.rs`](../src/dispatch.rs)                           | PackRuntime impl, inventory self-registration                                |
+| [`src/handler_defs.rs`](../src/handler_defs.rs)                   | KG_HANDLERS static table (31 public verbs plus one operator-only subhandler) |
+| [`src/handlers/mod.rs`](../src/handlers/mod.rs)                   | 31 public verb handler implementations                                       |
+| [`src/vocab.rs`](../src/vocab.rs)                                 | EntityKind (9) and NoteKind (5) enums with alias parsing                     |
+| [`src/entity_type_registry.rs`](../src/entity_type_registry.rs)   | Validates entity_type against per-kind subtypes                              |
+| [`src/apply_worker/mod.rs`](../src/apply_worker/mod.rs)           | Applies approved proposal changesets to KG                                   |
+| [`src/projection_worker/mod.rs`](../src/projection_worker/mod.rs) | Maintains proposals_open projection table                                    |
 
 ## Tests
 

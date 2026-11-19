@@ -1,0 +1,31 @@
+charter directive_relay v1
+title "Relay a checked human directive"
+subject session
+
+roles:
+    operator "checks and routes a human directive"
+
+triggers:
+    prompt.received
+    message.arrived
+    schedule.fired
+
+workflow:
+    phase receive by operator:
+        await prompt.received or message.arrived or schedule.fired
+        when message.kind is stop_order: goto stop
+        when message.kind is directive: goto inspect
+        when message.kind is question: goto inspect
+        when message.kind is report: goto inspect
+        when message.kind is other: goto inspect
+
+    phase inspect by operator:
+        action tasks.list_next by operator
+        require memory.recorded advisory
+        goto relay
+
+    phase relay by operator:
+        terminate "delivery to the intended recipient remains pending"
+
+    phase stop by operator:
+        terminate "the received instruction requests work to stop"

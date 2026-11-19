@@ -31,3 +31,51 @@ it retains the existing safety limit and live-view consistency caveat.
 ```text
 request(ops='brain.event_counts(since="2026-09-01T00:00:00Z", until="2026-09-02T00:00:00Z", kind="audit", group_by=["verb","actor"], exhaustive=true)')
 ```
+
+Counts consume the original operator request-read budget
+(`KHIVE_REQUEST_READ_TIMEOUT_SECS`, default 30 seconds, maximum 86400), retaining
+any earlier caller deadline across legacy and events stores and every page of
+an exhaustive count. Scalar/grouped count RPCs and `QueryEvents` pages use that
+original client deadline. This applies to every forwarded `QueryEvents` caller,
+including bounded counts and other event-store page reads. Appends, `GetEvent`
+and `QueryEventPage` retain their 10-second transport timeout. No deadline or
+clock value crosses the socket.
+The daemon stops and settles the read when the caller's budget expires and the
+connection closes, using the existing SQLite interrupt/join path. It does not
+enforce an independent deadline or renew the allowance at receipt.
+
+A client read timeout remains a typed storage error naming the budget, with no
+partial successful aggregate. Count RPC admission failures retain their actual
+wait duration and pool identity; remote `QueryEvents` errors retain their existing
+mapping. Both remain subject to the existing retry classifier.
+The existing hard-cap exception is unchanged: if a worker ignores interruption,
+it can remain unrecovered and retain admission; a timeout alone does not prove
+that its pool recovered. The events protocol is version 6, so clients and daemons
+must agree on that version; version skew is refused without replay or downgrade.
+An older version-6 client still imposes its fixed 10-second page timeout, even
+against an updated daemon. The page deadline change therefore requires updating
+the caller. Page/window/frame caps, admission waits and settlement bounds remain
+independent limits.
+
+## Failed audit classes
+
+Non-success `audit` events (`error` or `denied`) contribute to
+`counts_by_error_class`, a map keyed by the exact known `payload.error_class`
+token. The vocabulary is `policy_refusal`, `gate_refusal`, `invalid_params`,
+`not_found_or_not_addressed`, `deadline_exceeded`, `admission_exhausted`,
+`conflict`, `unsupported`, `configuration`, `storage`, `unavailable`, and
+`internal`. The classification is informational; it does not change retry or
+domain-disposition policy.
+
+Historical rows without that field, malformed values, and unknown future tokens
+contribute only to `unclassified_error_count`. They are not relabeled `internal`,
+and their stored payloads are not changed. Successful audit events and all
+non-audit events contribute to neither field, even if their payload contains an
+`error_class` field.
+
+Both fields are omitted when the fetched rows contain no failed audit event.
+Otherwise the map may be empty and the unclassified count may be zero. If the
+window is truncated, only `counts_by_error_class_page_scoped` and
+`unclassified_error_count_page_scoped` are emitted. They cover the same fetched
+rows and retain the same namespace, actor, kind, time, and request-budget scope
+as the other aggregates; `window_event_total` is not a failed-audit total.

@@ -61,7 +61,7 @@ async fn stream_mcp_default_presentation_keeps_exact_record_and_cursor() -> anyh
     let empty = agent_one(&client, "stream.read(stream=\"unknown\")").await?;
     assert_eq!(
         empty,
-        json!({"entries": [], "head_seq": 0, "next_after": null})
+        json!({"entries": [], "head_seq": 0, "floor_seq": 1, "next_after": null})
     );
     Ok(())
 }

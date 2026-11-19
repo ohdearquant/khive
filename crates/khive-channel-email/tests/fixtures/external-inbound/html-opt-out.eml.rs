@@ -1,0 +1,1 @@
+pub const MIME: &[u8] = b"From: Stranger@Outside.Example\r\nTo: support@example.com\r\nSubject: Recorded external reply\r\nMessage-ID: <html-opt-out@outside.example>\r\nAuthentication-Results: mx.example.com; dmarc=pass header.from=outside.example\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Please remove me.</p><p>Thank you.</p>\r\n";

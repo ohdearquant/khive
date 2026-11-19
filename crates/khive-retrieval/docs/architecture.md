@@ -9,20 +9,23 @@ single retrieval layer with deterministic scoring throughout. Designed to compos
 
 ## Module layout
 
-| Module                 | Purpose                                                                       |
-| ---------------------- | ----------------------------------------------------------------------------- |
-| `src/adapters/`        | `StorageVectorSearch` and `StorageKeywordSearch` (feature `storage-adapters`) |
-| `src/error.rs`         | `RetrievalError` enum and `Result` alias                                      |
-| `src/eval/`            | Precision/recall/nDCG/Jaccard retrieval evaluation metrics                    |
-| `src/hybrid/`          | `HybridSearcher`, `DualIndexRouter`, `HybridConfig`, `Query`                  |
-| `src/metrics/`         | `MetricEvent`, `MetricsSink`, `RecordingSink`, `NoopSink`                     |
-| `src/persist/`         | SQLite persistence for HNSW/BM25 indexes (feature `persist`)                  |
-| `src/policy/`          | `SearchPolicy`, `ClearanceLevel`, `filter_by_policy`                          |
-| `src/query_ir.rs`      | `QueryNode` IR tree; composable, serialisable query plans                     |
-| `src/replay/`          | Temporal replay and drift metrics (feature `persist`)                         |
-| `src/search_config.rs` | Per-call `SearchConfig` for recall/compose search phase                       |
-| `src/timeout.rs`       | `search_with_timeout`, `search_with_cancellation`, `search_with_deadline`     |
-| `src/weights/`         | Per-atom weight loading for replay (feature `persist`)                        |
+| Module                   | Purpose                                                                       |
+| ------------------------ | ----------------------------------------------------------------------------- |
+| `src/adapters/`          | `StorageVectorSearch` and `StorageKeywordSearch` (feature `storage-adapters`) |
+| `src/ann.rs`             | Hidden checkpoint-lock and rotation-watcher helpers (feature `ann`)           |
+| `src/error.rs`           | `RetrievalError` enum and `Result` alias                                      |
+| `src/eval/`              | Precision/recall/nDCG/Jaccard retrieval evaluation metrics                    |
+| `src/hit.rs`             | Search result types: `SearchHit`, `SearchSource`, `HybridSearchOutcome`       |
+| `src/hybrid/`            | `HybridSearcher`, `DualIndexRouter`, `HybridConfig`, `Query`                  |
+| `src/materialization.rs` | Bounded policy-free ranked-prefix materialization and typed drop diagnostics  |
+| `src/metrics/`           | `MetricEvent`, `MetricsSink`, `RecordingSink`, `NoopSink`                     |
+| `src/persist/`           | SQLite persistence for HNSW/BM25 indexes (feature `persist`)                  |
+| `src/policy/`            | `SearchPolicy`, `ClearanceLevel`, `filter_by_policy`                          |
+| `src/query_ir.rs`        | `QueryNode` IR tree; composable, serialisable query plans                     |
+| `src/replay/`            | Historical weights, rank history, and drift metrics (feature `persist`)      |
+| `src/search_config.rs`   | Per-call `SearchConfig` for recall/compose search phase                       |
+| `src/timeout.rs`         | `search_with_timeout`, `search_with_cancellation`, `search_with_deadline`     |
+| `src/weights/`           | Per-atom weight loading for replay (feature `persist`)                        |
 
 ## Tests and benchmarks
 
@@ -55,13 +58,15 @@ is the crate that materialises that composition. The `VectorSearch`, `KeywordSea
 
 ### Feature flag policy (ADR-030)
 
-| Feature            | Default | Notes                                               |
-| ------------------ | ------- | --------------------------------------------------- |
-| `checkpoint`       | off     | HNSW snapshot save/restore; requires `khive-fold`   |
-| `persist`          | off     | SQLite persistence for indexes; requires `rusqlite` |
-| `embed`            | off     | Native `lattice-embed` model implementations        |
-| `storage-adapters` | off     | Bridge `khive-storage` backends to retrieval traits |
-| `policy`           | off     | Gate integration (`khive-gate`); opt-in             |
+| Feature            | Default | Notes                                                                       |
+| ------------------ | ------- | --------------------------------------------------------------------------- |
+| `hnsw`             | off     | Re-export `khive-hnsw` index types                                          |
+| `bm25`             | off     | Re-export `khive-bm25` index types                                          |
+| `checkpoint`       | off     | HNSW snapshot save/restore; implies `hnsw`, requires `khive-fold`           |
+| `persist`          | off     | SQLite persistence for indexes; implies `hnsw`, `bm25`; requires `rusqlite` |
+| `embed`            | off     | Native `lattice-embed` model implementations                                |
+| `storage-adapters` | off     | Bridge `khive-storage` backends to retrieval traits                         |
+| `policy`           | off     | Gate integration (`khive-gate`); opt-in                                     |
 
 The current `default = []` deviates from the ADR-030 table which marks `checkpoint`,
 `persist`, `embed`, and `storage-adapters` as default-on. This deviation is tracked as a
@@ -70,9 +75,10 @@ known gap pending an ADR-030 amendment.
 ### Namespace isolation
 
 Namespace enforcement is the responsibility of the runtime layer (ADR-012). Storage stores
-are ID-only. The retrieval crate provides per-namespace filtering helpers
-(`filter_atoms_by_namespace` in `replay/engine_replay.rs`) for use by callers that operate
-below the runtime trust boundary.
+are ID-only. The historical weight and event readers in `replay/engine_replay.rs` take an
+explicit namespace. The crate has no engine-backed replay or public namespace-filtering
+helper. Its unreachable undeclared-feature integration was removed; supported readers,
+drift metrics and report types remain behind `persist`.
 
 ## Invariants
 

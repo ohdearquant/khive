@@ -11,6 +11,13 @@ replaces Rule 4's TenantGate clause if accepted.
 **Qualified**: 2026-09-18, [memory creation admission](#qualification-memory-creation-admission)
 partially amends Rev 6's generic-memory-create equivalence; routing for
 `memory.remember` and Rules 1–8 are unchanged (#2724 proposed it; accepted 2026-09-18).
+**Qualified**: 2026-11-05, [ADR-021 Delta 3](ADR-021-memory-pack.md#delta-3-an-edge-between-memory-rows-lives-in-its-source-rows-namespace-2026-11-04)
+places an edge between two memory rows in its source row's namespace; Rule 9's qualifications and
+Rule 8 constraints 1 and 4 name it beside `restore`'s ownership comparison. No read gains a check.
+**Qualified**: 2026-11-14, [ADR-021 Delta 4](ADR-021-memory-pack.md#delta-4-every-writer-of-a-supersede-applies-the-old-row-namespace-rule-2026-11-14) extends that placement
+rule to the memory row a `supersedes` write names; Rule 9's qualifications and Rule 8 constraint 1 name it under the same
+comparison. The id still resolves unscoped, and a target that is not a memory row keeps Rule 9 as written. No read
+gains a check.
 **Superseded by**: [ADR-050](ADR-050-kg-token-namespace-contract.md) for the historical
 KG-pack namespace-rebinding clause only; the remainder of this record stays authoritative.
 **ADR chain**: ADR-018 (Gate trait, single dispatch site) | ADR-014 (curation, merge semantics)
@@ -102,6 +109,30 @@ internal note constructors keep their prior behavior. There is no new actor-base
 authorization rule, by-ID namespace check, data migration or change to Rule 8.
 The qualification requires acceptance before its dependent implementation merges.
 
+### Qualification: mailbox-scoped generic message reads
+
+**Status**: shipped behavior (#3763), documentation clarification (#3764).
+
+The namespace-agnostic by-ID rule has a typed qualification for reads of `message` notes and
+direct edge references to them. Generic `get`, `search`, `neighbors` and `context` reads apply the
+calling actor's mailbox view, including when a broad note read encounters a message. Inbound
+copies belong to `to_actor`; outbound copies belong to `from_actor`. A named caller does not
+inherit legacy unattributed local messages. Generic reads have no cross-actor mailbox selector:
+delegated views remain the explicitly authorized comm read surface. This qualification is a
+message view rule, not a namespace partition or a change to other records' by-ID rules.
+
+A message copy outside the view answers as not found to `get`; an edge directly referencing
+such a message is withheld as well, and message annotations are filtered before exposure. Graph
+expansion and search withhold unreadable message records. Knowing a full UUID does not bypass
+the message view. A message-related short-prefix refusal directs the caller to a full UUID and
+`comm.inbox` when uniqueness cannot safely be established. The resolver's bounded ambiguity
+sample, after filtering, is not evidence of the complete candidate population and must not be
+presented as such or used to infer that one remaining message is unique.
+
+The library preconditions, backend-aware origin resolution, separate-read snapshot limits and
+bounded graph continuation behavior are recorded in the
+[generic message-read contract](../../crates/khive-pack-kg/docs/api/message-read-scope.md).
+
 ### Qualification: `neighbors` and `traverse` on an anchor outside the read scope
 
 **Status**: accepted, dated 2026-09-25.
@@ -175,7 +206,10 @@ The following constraints apply:
 
 1. **The shared local substrate is unaffected.** Rules 0 through 7 apply in full to the
    KG, memory, gtd, brain, schedule, and knowledge packs and to any pack that uses the
-   shared SQLite backend. No post-fetch namespace check is added to by-ID ops. The Gate
+   shared SQLite backend. No post-fetch namespace check is added to by-ID ops beyond the two
+   write-effect comparisons named in Rule 9's qualifications (`restore`'s ownership comparison and
+   the memory-edge placement rule of ADR-021 Delta 3, which Delta 4 extends to the row a `supersedes`
+   write names); neither decides access to a record. The Gate
    remains the single enforcement seam for the shared substrate.
 
 2. **A pack with a principal-scoped backend carries its own isolation contract.** That
@@ -193,7 +227,11 @@ The following constraints apply:
    `record.namespace == caller_namespace` checks on by-ID ops of the shared substrate —
    inline namespace equality checks scattered through handlers and stores. Rule 8 is about
    a backend whose isolation is enforced at connection time, not at per-record read time.
-   No by-ID namespace check is added anywhere in the shared substrate layer.
+   No by-ID namespace check is added anywhere in the shared substrate layer, other than those two
+   write-effect comparisons, which compare stored namespaces with each other or with the
+   gate-checked write namespace and never gate a read. Under ADR-021 Delta 4 the placement rule also
+   compares a superseded row's stored namespace with the shared `local` namespace and with the caller's declared
+   `owned_namespaces`; that is still a write-effect comparison and still never gates a read.
 
 5. **The local degenerate case of such a pack is a view-layer scope, not a security
    boundary.** When a principal-scoped pack runs against the shared local SQLite backend
@@ -229,13 +267,25 @@ The schema declares it per parameter. Today twelve parameters across ten verbs c
 `emit(target_id)`. Any parameter added later under the same contract joins the population by
 carrying it, which is why the rule is written against the contract rather than against the names.
 
-Two qualifications, because the declaration governs _resolution_ and not everything that follows
+Qualifications apply because the declaration governs _resolution_ and not everything that follows
 it. `restore` resolves by id unscoped and then compares the resolved record's namespace against
 the caller's, refusing a mismatch, so unscoped resolution is not unscoped effect for that verb —
-read the handler, not only the declaration. And the contract has narrower siblings on other verbs:
+read the handler, not only the declaration. An edge whose source and target are both memory rows
+is qualified the same way ([ADR-021 Delta 3](ADR-021-memory-pack.md#delta-3-an-edge-between-memory-rows-lives-in-its-source-rows-namespace-2026-11-04)):
+`link` resolves both ids unscoped, then compares the source row's stored namespace with the request's
+write namespace and refuses a mismatch, and `restore` of such an edge compares the edge's stored
+namespace with its source row's. Under [ADR-021 Delta 4](ADR-021-memory-pack.md#delta-4-every-writer-of-a-supersede-applies-the-old-row-namespace-rule-2026-11-14), the same comparison also
+covers the memory row a `supersedes` write names, for the writes Delta 4 rule 2 lists: each compares that row's stored
+namespace with the write namespace under the batch old-row rule. The comparison applies only when the named row is a memory row and the relation is `supersedes`;
+the id is still resolved without a namespace check, and every other `link(target_id)` keeps the unscoped contract. These comparisons decide where an edge may be written, never who
+may reach a record; the gate still decides the request. And the contract has narrower siblings on other verbs:
 several parameters declare prefix-scoped-to-primary resolution instead, `neighbors(node_id)` among
 them, where the _prefix_ form resolves within the caller's primary namespace while a full UUID is
 still unchecked. Those are smaller openings rather than exceptions to the rule.
+
+For generic reads, the [message qualification](#qualification-mailbox-scoped-generic-message-reads)
+additionally withholds message copies and direct references outside the caller's mailbox, even
+when the id is a full UUID. This does not add a namespace predicate to by-ID resolution.
 
 **How an id resolves, since Rule 3b's visible set makes the difference load-bearing.** A full UUID is
 used as given. A short prefix on a parameter carrying this contract resolves through an unfiltered
@@ -528,6 +578,10 @@ partitioning. These make the Gate redundant — the exact regression this seam e
 get, update, delete by UUID resolve a globally-unique UUID with no namespace check at any
 layer: not in the store SQL, not in the runtime post-fetch check, not in the pack handler.
 
+For reads, `message` notes and direct edge references carry the
+[mailbox-view qualification](#qualification-mailbox-scoped-generic-message-reads). Other record
+kinds retain their declared by-ID behavior; the qualification concerns the message read view.
+
 Status: SHIPPED in commit 2607e263. Covered by regression tests added in that PR.
 
 Affected functions confirmed clean post-PR-A1 (operations.rs): get_entity,
@@ -642,7 +696,8 @@ What Rev 4 does NOT change:
   NOT widened by `visible_namespaces`: `list(namespace="ns-beta")` returns only `ns-beta`,
   never `ns-beta ∪ local ∪ visible_namespaces`. This preserves the ability to read a single
   named set precisely.
-- By-ID ops (Rule 2). get, update, delete, merge by UUID remain namespace-agnostic.
+- By-ID ops (Rule 2). get, update, delete, merge by UUID remain namespace-agnostic in how they resolve an id;
+  merge also keeps its same-namespace guard (Rule 5).
 - The Gate (Rule 4). Authorization remains a single seam. `visible_namespaces` is a
   configuration convenience, not an authorization mechanism. A TenantGate continues to
   mint the read-visibility set from the authenticated identity, independent of this config

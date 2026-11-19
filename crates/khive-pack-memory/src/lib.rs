@@ -17,6 +17,8 @@ pub mod tunable;
 pub(crate) mod visibility;
 
 #[cfg(test)]
+mod ann_fresh_tail_order_tests;
+#[cfg(test)]
 mod test_support;
 
 pub use pack::MemoryPack;

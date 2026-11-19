@@ -1,6 +1,6 @@
 # ADR-163: Restart-Boundary Event Legibility
 
-- **Status:** Proposed
+- **Status:** withdrawn (2026-10-23). Never implemented; a later need returns as a new proposal against the current code.
 - **Date:** 2026-08-16
 - **Extends:** ADR-162 (answers a question the ownership skeleton raises and does not close; ADR-162 is not replaced)
 - **Depends on:** ADR-142, ADR-162, ADR-022

@@ -120,10 +120,11 @@ async fn forwarding_runtime_uses_one_reader_on_every_store() {
         Some(1),
         "forwarding default must be selected before store construction"
     );
-    let multi =
-        build_registry_for_multi_backend_inner_with_max_readers(config, &khive_cfg, None, readers)
-            .await
-            .expect("forwarding registry");
+    let multi = build_registry_for_multi_backend_inner_with_max_readers(
+        config, &khive_cfg, None, readers, None,
+    )
+    .await
+    .expect("forwarding registry");
     assert_store_readers(&multi, 1);
 }
 
@@ -145,12 +146,28 @@ async fn direct_hosts_keep_default_readers() {
             "direct hosts must retain the default reader policy"
         );
         let multi = build_registry_for_multi_backend_inner_with_max_readers(
-            config, &khive_cfg, None, readers,
+            config, &khive_cfg, None, readers, None,
         )
         .await
         .expect("direct registry");
         assert_store_readers(&multi, khive_db::pool::PoolConfig::default().max_readers);
     }
+}
+
+#[test]
+#[serial]
+#[serial(config_ledger)]
+fn each_boot_records_its_own_forwarding_role() {
+    let _env = FixtureEnv::clear();
+    let args = Args::parse_from(["mcp", "--no-embed"]);
+    mark_mcp_host_role(&args);
+    assert_eq!(is_forwarding_client(), cfg!(unix));
+    std::env::set_var("KHIVE_NO_DAEMON", "1");
+    mark_mcp_host_role(&args);
+    assert!(
+        !is_forwarding_client(),
+        "a daemonless boot after a forwarding one must run the store-owning boot work"
+    );
 }
 
 #[tokio::test]
@@ -195,7 +212,7 @@ async fn memory_runtime_keeps_single_connection_mode() {
     khive_cfg.packs.clear();
     let readers = mcp_max_readers(&args, &config, &khive_cfg.backends, None);
     assert_eq!(readers, None);
-    let runtime = build_single_backend_runtime_with_max_readers(config, &khive_cfg, readers)
+    let runtime = build_single_backend_runtime_with_max_readers(config, &khive_cfg, readers, None)
         .await
         .expect("in-memory runtime");
     assert!(!runtime.backend().is_file_backed());
@@ -224,11 +241,211 @@ async fn mcp_boot_applies_reader_policy_before_opening_single_store() {
         cfg.to_str().unwrap(),
     ]);
     let (server, _) = build_server(&args).await.expect("single-store MCP server");
+    #[cfg(unix)]
+    assert_eq!(
+        server.daemon_spawn_overrides(),
+        (Some(cfg.as_path()), db.to_str()),
+        "single-store MCP boot must retain explicit daemon spawn overrides"
+    );
     let pool = server.pool().expect("file-backed server pool");
     assert_eq!(
         pool.max_readers(),
         1,
         "single-store MCP boot must retain the selected reader count"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+#[serial(config_ledger)]
+async fn mcp_boot_retains_config_for_declared_backends() {
+    let _env = FixtureEnv::clear();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("main.db");
+    let cfg = dir.path().join("config.toml");
+    let config = format!("[runtime]\npacks = ['kg']\n[[backends]]\nname = 'main'\npath = {db:?}\n");
+    std::fs::write(&cfg, config).unwrap();
+    let args = Args::parse_from([
+        "mcp",
+        "--no-embed",
+        "--actor",
+        "reader-pool-test",
+        "--pack",
+        "kg",
+        "--db",
+        db.to_str().unwrap(),
+        "--config",
+        cfg.to_str().unwrap(),
+    ]);
+    let (server, _) = build_server(&args)
+        .await
+        .expect("declared-backend MCP server");
+    assert_eq!(
+        server.daemon_spawn_overrides(),
+        (Some(cfg.as_path()), None),
+        "declared-backend MCP boot must retain the config without a DB override"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_boot_retains_discovered_config_for_declared_backends() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    const CHILD_ROOT: &str = "KHIVE_TEST_DISCOVERED_CONFIG_CHILD_ROOT";
+    const CHILD_TOKEN: &str = "KHIVE_TEST_DISCOVERED_CONFIG_CHILD_TOKEN";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        // LLVM's coverage runtime sets this marker during profile initialization,
+        // and on macOS CoreFoundation sets its text-encoding variable when the
+        // child process starts.
+        let allowed = [
+            "HOME",
+            "TMPDIR",
+            CHILD_ROOT,
+            CHILD_TOKEN,
+            "__LLVM_PROFILE_RT_INIT_ONCE",
+            "__CF_USER_TEXT_ENCODING",
+        ];
+        for (key, _) in std::env::vars_os() {
+            assert!(
+                allowed
+                    .iter()
+                    .any(|name| key.as_os_str() == std::ffi::OsStr::new(*name)),
+                "unexpected environment variable in discovery child: {key:?}"
+            );
+        }
+        let _env = FixtureEnv::clear();
+        let root = std::fs::canonicalize(root).expect("fixture root");
+        // This token guards fixture isolation, not adversarial authentication.
+        let token = std::env::var(CHILD_TOKEN).expect("fixture token");
+        let suffix = token
+            .strip_prefix("khive-child-")
+            .expect("fixture token prefix");
+        assert!(!suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_alphanumeric()));
+        let token_path = root.join(&token);
+        assert_eq!(std::fs::canonicalize(&token_path).unwrap(), token_path);
+        assert!(token_path.is_file());
+        let marker = root.join("owner.marker");
+        assert_eq!(std::fs::canonicalize(&marker).unwrap(), marker);
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), token);
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let home = std::fs::canonicalize(std::env::var_os("HOME").expect("fixture HOME"))
+            .expect("fixture HOME path");
+        let tmp = std::fs::canonicalize(std::env::var_os("TMPDIR").expect("fixture TMPDIR"))
+            .expect("fixture TMPDIR path");
+        assert_eq!(cwd, root.join("cwd"));
+        assert_eq!(home, root.join("home"));
+        assert_eq!(tmp, root.join("tmp"));
+        assert!(!cwd.join("khive.toml").exists());
+        let config_dir = root.join(".khive");
+        assert_eq!(config_dir.canonicalize().unwrap(), config_dir);
+        for path in [&root, &cwd, &home, &tmp, &config_dir] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
+                0,
+                "discovery fixture directory must be private: {}",
+                path.display()
+            );
+        }
+        let db = config_dir.join("khive.db");
+        let cfg = config_dir.join("config.toml");
+        assert_eq!(cfg.canonicalize().unwrap(), cfg);
+        let expected_config =
+            format!("[runtime]\npacks = ['kg']\n[[backends]]\nname = 'main'\npath = {db:?}\n");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), expected_config);
+        match std::fs::symlink_metadata(&db) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => panic!("fixture DB path must not already exist"),
+            Err(error) => panic!("inspect fixture DB path: {error}"),
+        }
+        let args = Args::parse_from([
+            "mcp",
+            "--no-embed",
+            "--actor",
+            "reader-pool-test",
+            "--pack",
+            "kg",
+            "--db",
+            db.to_str().unwrap(),
+        ]);
+        let (server, _) = build_server(&args)
+            .await
+            .expect("discovered declared-backend MCP server");
+        assert_eq!(
+            server.daemon_spawn_overrides(),
+            (Some(cfg.as_path()), None),
+            "declared-backend MCP boot must retain the discovered config"
+        );
+        return;
+    }
+
+    let dir = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cwd = root.join("cwd");
+    let home = root.join("home");
+    let tmp = root.join("tmp");
+    let config_dir = root.join(".khive");
+    for path in [&cwd, &home, &tmp, &config_dir] {
+        std::fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+    }
+    let token_file = tempfile::Builder::new()
+        .prefix("khive-child-")
+        .tempfile_in(&root)
+        .unwrap();
+    let token = token_file.path().file_name().unwrap().to_str().unwrap();
+    std::fs::write(root.join("owner.marker"), token).unwrap();
+    let db = config_dir.join("khive.db");
+    let cfg = config_dir.join("config.toml");
+    let config = format!("[runtime]\npacks = ['kg']\n[[backends]]\nname = 'main'\npath = {db:?}\n");
+    std::fs::write(&cfg, config).unwrap();
+    let function_name =
+        std::any::type_name_of_val(&mcp_boot_retains_discovered_config_for_declared_backends);
+    // Libtest names begin at the module, whereas the function type includes the crate.
+    let (_, test_name) = function_name.split_once("::").expect("qualified test name");
+    let stdout_path = dir.path().join("child.stdout");
+    let stderr_path = dir.path().join("child.stderr");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+        .current_dir(&cwd)
+        .env_clear()
+        .env("HOME", &home)
+        .env("TMPDIR", &tmp)
+        .env(CHILD_ROOT, &root)
+        .env(CHILD_TOKEN, token)
+        .stdout(std::fs::File::create(&stdout_path).unwrap())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .expect("run isolated discovery test");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (status, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (status, false),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("poll isolated discovery test: {error}");
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            // It may exit between the poll and kill; wait still reaps it.
+            let _ = child.kill();
+            break (child.wait().expect("reap timed-out discovery test"), true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let stdout = std::fs::read_to_string(stdout_path).unwrap();
+    let stderr = std::fs::read_to_string(stderr_path).unwrap();
+    assert!(
+        !timed_out
+            && status.success()
+            && stdout.contains("running 1 test")
+            && stdout.contains("1 passed; 0 failed"),
+        "isolated discovery child must run exactly one passing test (timed out: {timed_out})\nstdout: {stdout}\nstderr: {stderr}"
     );
 }
 
@@ -278,10 +495,11 @@ async fn forwarding_runtime_retains_pool_for_local_dispatch_and_save_to() {
     let dir = tempfile::tempdir().unwrap();
     let (args, config, khive_cfg) = fixture(dir.path());
     let readers = mcp_max_readers(&args, &config, &khive_cfg.backends, None);
-    let multi =
-        build_registry_for_multi_backend_inner_with_max_readers(config, &khive_cfg, None, readers)
-            .await
-            .expect("forwarding registry");
+    let multi = build_registry_for_multi_backend_inner_with_max_readers(
+        config, &khive_cfg, None, readers, None,
+    )
+    .await
+    .expect("forwarding registry");
     let pool = multi.main_backend.pool_arc();
     let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
     let sink = dir.path().join("stats.jsonl");

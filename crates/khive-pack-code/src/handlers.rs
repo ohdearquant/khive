@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig, RuntimeError};
 
-use crate::db_target::{resolve_target_db, validate_explicit_db_path};
+use crate::db_target::{configured_production_bases, resolve_target_db, validate_explicit_db_path};
 use crate::manifest::LANGUAGES;
 use crate::source_ingest::{run_code_ingest, CodeSourceIngestOptions};
 use crate::CodePack;
@@ -122,15 +122,36 @@ impl CodePack {
             self.runtime.declared_backend_db_paths(),
         )
         .map_err(RuntimeError::InvalidInput)?;
+        if db.is_none() {
+            let parent = db_path.parent().ok_or_else(|| {
+                RuntimeError::InvalidInput("default code-map target has no parent".into())
+            })?;
+            std::fs::create_dir_all(parent).map_err(|error| {
+                RuntimeError::InvalidInput(format!(
+                    "creating default code-map directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let protected_main = configured_production_bases(
+            runtime_db_path.as_deref(),
+            self.runtime.declared_backend_db_paths(),
+        )
+        .map_err(RuntimeError::InvalidInput)?;
+        let protected_events = protected_main
+            .iter()
+            .map(|path| khive_runtime::events_split::events_db_path_beside(path))
+            .collect();
 
         let config = RuntimeConfig {
             db_path: Some(db_path.clone()),
             packs: vec!["kg".to_string(), "code".to_string()],
             ..RuntimeConfig::no_embeddings()
         };
-        let target_rt = KhiveRuntime::new(config).map_err(|e| {
-            RuntimeError::InvalidInput(format!("opening target db {db_path:?}: {e}"))
-        })?;
+        let target_rt = KhiveRuntime::new_code_map(config, protected_main, protected_events)
+            .map_err(|e| {
+                RuntimeError::InvalidInput(format!("opening target db {db_path:?}: {e}"))
+            })?;
         let token = target_rt
             .authorize(Namespace::local())
             .map_err(|e| RuntimeError::InvalidInput(format!("authorizing target db: {e}")))?;
@@ -158,100 +179,5 @@ impl CodePack {
 }
 
 #[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::{parse_params, parse_tiers, TierSelection};
-
-    #[test]
-    fn tiers_default_to_l1_and_l1_5() {
-        let expected = TierSelection {
-            enable_l1: true,
-            enable_l1_5: true,
-            enable_l2: false,
-        };
-
-        assert_eq!(parse_tiers(None).unwrap(), expected);
-    }
-
-    #[test]
-    fn tiers_accept_an_empty_selection() {
-        let tiers = Vec::new();
-        assert_eq!(
-            parse_tiers(Some(&tiers)).unwrap(),
-            TierSelection {
-                enable_l1: false,
-                enable_l1_5: false,
-                enable_l2: false,
-            }
-        );
-    }
-
-    #[test]
-    fn tiers_accept_each_supported_value() {
-        let cases = [
-            (
-                "l1",
-                TierSelection {
-                    enable_l1: true,
-                    enable_l1_5: false,
-                    enable_l2: false,
-                },
-            ),
-            (
-                "l1.5",
-                TierSelection {
-                    enable_l1: false,
-                    enable_l1_5: true,
-                    enable_l2: false,
-                },
-            ),
-            (
-                "l2",
-                TierSelection {
-                    enable_l1: false,
-                    enable_l1_5: false,
-                    enable_l2: true,
-                },
-            ),
-        ];
-
-        for (tier, expected) in cases {
-            assert_eq!(parse_tiers(Some(&[tier.to_string()])).unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn tiers_deduplicate_entries_and_ignore_input_order() {
-        let tiers = ["l2", "l1.5", "l1", "l2"].map(str::to_string);
-        assert_eq!(
-            parse_tiers(Some(&tiers)).unwrap(),
-            TierSelection {
-                enable_l1: true,
-                enable_l1_5: true,
-                enable_l2: true,
-            }
-        );
-    }
-
-    #[test]
-    fn tiers_reject_a_scalar_value() {
-        let scalar = parse_params(json!({"path": ".", "tiers": "l2"})).unwrap_err();
-        assert!(scalar.to_string().contains("invalid type: string"));
-    }
-
-    #[test]
-    fn tiers_reject_non_string_entries() {
-        let non_string = parse_params(json!({"path": ".", "tiers": ["l1", 2]})).unwrap_err();
-        assert!(non_string.to_string().contains("invalid type: integer"));
-    }
-
-    #[test]
-    fn tiers_reject_unknown_values() {
-        let unknown = parse_tiers(Some(&["L2".to_string()])).unwrap_err();
-        assert_eq!(
-            unknown.to_string(),
-            "invalid input: unknown tier \"L2\"; valid: l1, l1.5, l2"
-        );
-    }
-}
+#[path = "handlers_tests.rs"]
+mod tests;

@@ -24,11 +24,51 @@ use khive_runtime::micros_to_iso;
 
 const PROPOSAL_LIST_CAP: u32 = 500;
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalCleanupParams {
+    older_than: String,
+}
+
+/// Fixed-duration operator input, checked before taking a writer (ADR-046 C4).
+fn proposal_cleanup_cutoff(older_than: &str, now: i64) -> Result<i64, RuntimeError> {
+    let invalid = || {
+        RuntimeError::InvalidInput(
+            "older_than must be a positive ASCII integer followed by s, m, h, or d, within the microsecond timestamp range".into(),
+        )
+    };
+    let bytes = older_than.as_bytes();
+    let (unit, digits) = bytes.split_last().ok_or_else(invalid)?;
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return Err(invalid());
+    }
+    let seconds: i64 = match unit {
+        b's' => 1,
+        b'm' => 60,
+        b'h' => 3_600,
+        b'd' => 86_400,
+        _ => return Err(invalid()),
+    };
+    // ASCII validation above makes the byte boundary a UTF-8 boundary.
+    let amount = older_than[..digits.len()]
+        .parse::<i64>()
+        .map_err(|_| invalid())?;
+    if amount == 0 {
+        return Err(invalid());
+    }
+    let micros = amount
+        .checked_mul(seconds)
+        .and_then(|value| value.checked_mul(1_000_000))
+        .ok_or_else(invalid)?;
+    now.checked_sub(micros).ok_or_else(invalid)
+}
+
 /// Refuse caller-owned stamps before a draft becomes immutable proposal history.
 fn reject_reserved_changeset_properties(changeset: &ProposalChangeset) -> Result<(), RuntimeError> {
     use khive_runtime::secret_gate::reject_reserved_secret_gate_property;
 
     match changeset {
+        ProposalChangeset::Canonical { .. } => Ok(()),
         ProposalChangeset::AddEntity { entity } => {
             reject_reserved_secret_gate_property(entity.properties.as_ref())
         }
@@ -51,6 +91,43 @@ fn reject_reserved_changeset_properties(changeset: &ProposalChangeset) -> Result
 }
 
 impl KgPack {
+    pub(crate) async fn handle_proposal_cleanup(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        self.handle_proposal_cleanup_at(token, params, chrono::Utc::now().timestamp_micros())
+            .await
+    }
+
+    // The supplied clock is private: the public operator accepts only older_than.
+    async fn handle_proposal_cleanup_at(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        now: i64,
+    ) -> Result<Value, RuntimeError> {
+        let p: ProposalCleanupParams = deser(params)?;
+        let cutoff = proposal_cleanup_cutoff(&p.older_than, now)?;
+        let sql = self.runtime.sql();
+        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
+        let archived = writer
+            .execute(
+                SqlStatement::new(
+                    sql!("proposals_archive_resolved"),
+                    vec![
+                        SqlValue::Integer(now),
+                        SqlValue::Text(token.namespace().as_str().to_owned()),
+                        SqlValue::Integer(cutoff),
+                    ],
+                )
+                .labelled("proposals_open.archive_resolved"),
+            )
+            .await
+            .map_err(RuntimeError::Storage)?;
+        Ok(serde_json::json!({"archived": archived}))
+    }
+
     pub(crate) async fn resolve_proposal_uuid(
         &self,
         token: &NamespaceToken,
@@ -75,15 +152,7 @@ impl KgPack {
 
             let ids: Vec<String> = rows
                 .into_iter()
-                .filter_map(|row| {
-                    row.get("proposal_id").and_then(|v| {
-                        if let SqlValue::Text(s) = v {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    })
-                })
+                .filter_map(|row| row.text_or_none("proposal_id").map(str::to_owned))
                 .collect();
 
             return match ids.len() {
@@ -121,6 +190,20 @@ impl KgPack {
             ));
         }
 
+        let expiry = p
+            .expiry
+            .map(|micros| {
+                u64::try_from(micros)
+                    .map(khive_types::Timestamp::from_micros)
+                    .map_err(|_| {
+                        RuntimeError::InvalidInput(
+                            "expiry must be a non-negative integer in microseconds since epoch"
+                                .into(),
+                        )
+                    })
+            })
+            .transpose()?;
+
         // Secret gate: scan all caller-supplied text before constructing/appending events.
         khive_runtime::secret_gate::check_at(&p.title, "proposal", "title")?;
         khive_runtime::secret_gate::check_at(&p.description, "proposal", "description")?;
@@ -152,7 +235,11 @@ impl KgPack {
                     RuntimeError::InvalidInput(format!("invalid changeset: {serde_message}"))
                 }
             })?;
+        crate::canonical_apply::validate_proposal(&changeset, registry)?;
         reject_reserved_changeset_properties(&changeset)?;
+        crate::apply_worker::ProposalApplyWorker::new(self.runtime.clone())
+            .validate_supersede_entity_preconditions(token, &changeset)
+            .await?;
         if has_multi_step_compound(&changeset) {
             return Err(RuntimeError::InvalidInput(
                 "multi-step Compound proposals are not supported until atomic proposal apply is available"
@@ -213,9 +300,7 @@ impl KgPack {
             description: p.description.clone(),
             changeset,
             reviewers: p.reviewers.clone(),
-            expiry: p
-                .expiry
-                .map(|v| khive_types::Timestamp::from_micros(v as u64)),
+            expiry,
             parent_id: validated_parent_id,
         };
 
@@ -293,26 +378,11 @@ impl KgPack {
             .ok_or_else(|| RuntimeError::NotFound(format!("proposal {}", p.id)))?;
 
         let proposer = row
-            .get("proposer")
-            .and_then(|v| {
-                if let SqlValue::Text(s) = v {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            })
+            .text_or_none("proposer")
+            .map(str::to_owned)
             .unwrap_or_default();
 
-        let current_status = row
-            .get("status")
-            .and_then(|v| {
-                if let SqlValue::Text(s) = v {
-                    Some(s.as_str())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or("open");
+        let current_status = row.text_or_none("status").unwrap_or("open");
 
         if matches!(
             current_status,
@@ -335,6 +405,19 @@ impl KgPack {
             khive_runtime::secret_gate::check_at(c, "review", "comment")?;
         }
 
+        let changeset = crate::apply_worker::ProposalApplyWorker::new(self.runtime.clone())
+            .load_changeset(token, proposal_id)
+            .await?;
+        let preimage = match &changeset {
+            ProposalChangeset::Canonical {
+                schema_version,
+                delta,
+            } => crate::canonical_apply::preimage_status(&crate::canonical_apply::decode_delta(
+                delta,
+                Some(*schema_version),
+            )?),
+            _ => khive_types::event::ProposalPreimageStatus::None,
+        };
         let payload = ProposalReviewedPayload {
             proposal_id: khive_types::Id128::from_u128(proposal_id.as_u128()),
             reviewer: actor.clone(),
@@ -355,11 +438,9 @@ impl KgPack {
         event.aggregate_kind = Some("proposal".to_string());
         event.aggregate_id = Some(proposal_id);
 
-        let new_status = match decision {
-            ProposalDecision::Approve => "approved",
-            ProposalDecision::Reject => "rejected",
-            ProposalDecision::Comment => current_status,
-            ProposalDecision::RequestChanges => "changes_requested",
+        let new_status = match crate::projection_worker::review_decision_effect(decision).0 {
+            Some(status) => status,
+            None => current_status,
         };
 
         let decision_changes_state = decision != ProposalDecision::Comment;
@@ -390,6 +471,7 @@ impl KgPack {
             "reviewer": actor,
             "decision": p.decision,
             "status": new_status,
+            "preimage": preimage,
         }))?;
         super::create::add_embedding_truncation_warning(
             &mut response,
@@ -425,14 +507,8 @@ impl KgPack {
             .ok_or_else(|| RuntimeError::NotFound(format!("proposal {}", p.id)))?;
 
         let proposer = row
-            .get("proposer")
-            .and_then(|v| {
-                if let SqlValue::Text(s) = v {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            })
+            .text_or_none("proposer")
+            .map(str::to_owned)
             .unwrap_or_default();
 
         if actor != proposer {
@@ -441,16 +517,7 @@ impl KgPack {
             )));
         }
 
-        let current_status = row
-            .get("status")
-            .and_then(|v| {
-                if let SqlValue::Text(s) = v {
-                    Some(s.as_str())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or("open");
+        let current_status = row.text_or_none("status").unwrap_or("open");
 
         if matches!(current_status, "applied" | "withdrawn" | "applying") {
             return Err(RuntimeError::InvalidInput(format!(
@@ -563,25 +630,11 @@ impl KgPack {
             .into_iter()
             .map(|row| {
                 let get_text = |name: &str| -> String {
-                    row.get(name)
-                        .and_then(|v| {
-                            if let SqlValue::Text(s) = v {
-                                Some(s.clone())
-                            } else {
-                                None
-                            }
-                        })
+                    row.text_or_none(name)
+                        .map(str::to_owned)
                         .unwrap_or_default()
                 };
-                let get_int = |name: &str| -> Option<i64> {
-                    row.get(name).and_then(|v| {
-                        if let SqlValue::Integer(i) = v {
-                            Some(*i)
-                        } else {
-                            None
-                        }
-                    })
-                };
+                let get_int = |name: &str| -> Option<i64> { row.i64_or_none(name) };
                 let ts_or_null = |name: &str| -> Value {
                     match get_int(name) {
                         Some(micros) => Value::String(micros_to_iso(micros)),
@@ -618,3 +671,11 @@ impl KgPack {
 #[cfg(test)]
 #[path = "proposal_reservation_tests.rs"]
 mod reservation_tests;
+
+#[cfg(test)]
+#[path = "proposal_cleanup_tests.rs"]
+mod cleanup_tests;
+
+#[cfg(test)]
+#[path = "proposal_entity_precondition_tests.rs"]
+mod entity_precondition_tests;

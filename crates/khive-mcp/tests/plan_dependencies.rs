@@ -188,7 +188,7 @@ fn assert_adapter_dependencies(method: &syn::ImplItemFn) {
 
 #[test]
 fn mcp_plan_adapters_only_validate_presence_read_catalog_and_plan() {
-    let server = include_str!("../src/server.rs");
+    let server = include_str!("../src/server/bridge.rs");
     for name in ["plan_ops", "plan_response"] {
         assert_adapter_dependencies(&adapter_method(server, "KhiveMcpServer", name));
     }
@@ -204,12 +204,12 @@ fn mcp_plan_adapters_only_validate_presence_read_catalog_and_plan() {
 fn mcp_plan_adapter_guards_reject_effect_calls() {
     for (source, owner, name) in [
         (
-            include_str!("../src/server.rs"),
+            include_str!("../src/server/bridge.rs"),
             "KhiveMcpServer",
             "plan_ops",
         ),
         (
-            include_str!("../src/server.rs"),
+            include_str!("../src/server/bridge.rs"),
             "KhiveMcpServer",
             "plan_response",
         ),

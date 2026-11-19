@@ -7,21 +7,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use khive_runtime::{EmbedderProvider, RuntimeResult};
+use khive_types::fnv1a_64;
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 
 const DIM: usize = 384;
 pub(crate) const MODEL_NAME: &str = "all-minilm-l6-v2";
-
-fn fnv1a_64(data: &[u8]) -> u64 {
-    const BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = BASIS;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(PRIME);
-    }
-    h
-}
 
 /// Feature-hashing embedder: tokenise → per-token (dim, sign) → accumulate →
 /// L2-normalise. See `crates/khive-mcp/docs/design.md` (Bench embedder).

@@ -3,6 +3,11 @@
 mod sql;
 
 #[cfg(test)]
+mod daemon_recall_stack_tests;
+#[cfg(test)]
+#[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
+mod receipt_credentials;
+#[cfg(test)]
 mod test_process;
 
 mod atomic_apply;
@@ -15,13 +20,18 @@ pub mod coordinator;
 pub mod dbpath;
 pub mod engine;
 pub mod entity_type_backfill;
+pub mod events_prune;
 pub mod exec;
 pub mod git_annotation_repair;
+pub mod git_dedup;
 pub mod git_ingest;
+pub mod import_notes;
 pub mod kg;
+pub mod memory_edge_namespace_move;
 pub mod mount;
 pub mod pack_introspect;
 pub mod reindex;
+#[cfg(feature = "repo-showcase")]
 pub mod repo;
 mod supervisor;
 pub mod sync;
@@ -42,13 +52,17 @@ pub mod vector;
 //
 // To add a new first-party pack: (1) add its crate as a `[dependency]` in
 // `kkernel/Cargo.toml`, (2) add a `use` line below referencing any public type
-// — this is the force-link anchor that prevents linker dead-stripping.
+// — this is the force-link anchor that prevents linker dead-stripping. A pack
+// that is an optional feature (agent, telemetry, web, formal, moodboard) takes a
+// `#[cfg(feature = ...)]` on its line, matching its `optional = true` dependency.
 #[doc(hidden)]
 #[allow(unused_imports)]
 mod _pack_links {
+    #[cfg(feature = "pack-agent")]
     use khive_pack_agent::AgentPack as _;
     use khive_pack_blob::BlobPack as _;
     use khive_pack_brain::BrainPack as _;
+    use khive_pack_charter::CharterPack as _;
     use khive_pack_code::CodePack as _;
     use khive_pack_comm::CommPack as _;
     use khive_pack_exec::ExecPack as _;
@@ -63,8 +77,10 @@ mod _pack_links {
     use khive_pack_moodboard::MoodboardPack as _;
     use khive_pack_schedule::SchedulePack as _;
     use khive_pack_session::SessionPack as _;
+    #[cfg(feature = "pack-telemetry")]
     use khive_pack_telemetry::TelemetryPack as _;
     use khive_pack_tool::ToolPack as _;
+    #[cfg(feature = "pack-web")]
     use khive_pack_web::WebPack as _;
     use khive_pack_workspace::WorkspacePack as _;
 }

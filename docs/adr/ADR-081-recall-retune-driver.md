@@ -349,3 +349,174 @@ the section 5 stamp.
   turns one seam read into two-sided bookkeeping.
 - **Keying the clamp by `(target, query_class)`.** Rejected: unboundedly many query
   classes per target would multiply the per-target implicit mass bound away.
+
+## Amendment 1 (2026-10-06): declared recall-event correlation
+
+**Status**: Proposed\
+**Scope**: additive recall/feedback correlation for #1731 and #1757, following the
+#1509 design consolidation. This amendment does not adopt posterior forgetting or
+change the accepted weighting, attribution, clamp, ledger or scorer contracts above.
+The response-side companion is the independently Proposed
+[ADR-021 amendment](ADR-021-memory-pack.md#amendment-declared-recall-event-correlation-2026-10-06).
+
+### Problem and proposed decision
+
+Automatic feedback already retains the query and candidate IDs supplied by its caller.
+Those values cannot distinguish two recalls of the same memories for the same query.
+The existing `RecallExecuted` event receives its UUID in the asynchronous emitter, so
+the returned result objects cannot identify that particular telemetry row.
+
+Add `recall_event_id` to every actual hit object returned by a successful, nonempty
+`memory.recall`. Generate one fresh UUIDv4 per invocation before result projection and
+background handoff. Emit canonical lowercase, dashed UUID text. All hits in that
+invocation carry the same value; a second otherwise identical recall gets a different
+value. Preserve result order, profile stamps, the bare-array shape and existing
+verbose, degraded and truncated `results` envelopes. Diagnostic candidate lists are
+not additional returned hits. Human-oriented presentations may omit metadata; callers
+using this linkage forward the structured result objects.
+
+Carry that UUID through the existing captured serve fields. If the existing
+best-effort `RecallExecuted` append succeeds, its physical `Event.id` MUST equal the
+returned `recall_event_id`. Do not allocate a replacement UUID in the emitter, add a
+second event, or substitute a payload-only identifier. Keep the existing event kind,
+write-token namespace, actor, payload fields, timestamp capture, duration and error
+handling. This requires no new table, migration or event kind.
+
+An empty recall has no selectable hit. Preserve its existing `[]` or empty `results`
+envelope without adding a top-level correlation field. Existing zero-result telemetry
+continues and may use its ordinary, unreturned UUID. Failed calls return no correlation
+identifier; this amendment adds no failure-telemetry promise.
+
+### Best-effort identity and collision behavior
+
+A returned ID declares the identity that successful telemetry would use; it does not
+certify a committed event. Recall remains independent of background task admission,
+timeouts, the presence of the brain pack, ledger dispatch failures, event-store
+acquisition and append failures. Feedback may commit before the recall event, or the
+recall event may never persist. A missing joined row is unknown, not proof that recall
+did not happen or that any write rolled back. Do not synchronously await telemetry,
+synthesize or backfill a missing event, retry indefinitely, or describe this ID as a
+durable receipt.
+
+Choose **refusal** for a duplicate physical event ID, including an identical replay.
+If any event already occupies that ID, the telemetry append must fail without changing
+the existing event or its observation projections. It must not replace, merge or
+silently relabel the row, and must not retry under a newly generated ID. This matches
+the ordinary event-store append's `INSERT` into the `events.id` primary key; the
+idempotent batch API is not the correlation emitter's path. The append failure uses
+the existing best-effort error handling and does not fail the recall response. UUID
+equality alone is therefore insufficient evidence of causal membership, including
+when a row with that ID exists.
+
+### Automatic and direct feedback
+
+`brain.auto_feedback` keeps its existing unique selection by `id` or `full_id`, alias
+counting, target resolution and attribution rules. Read `recall_event_id` from the
+selected object only and forward it to the shared feedback handler as optional
+metadata. There is no top-level automatic-feedback override and no inference from
+query, time, target, rank or current state. Mixed result arrays may contain IDs from
+different invocations; the selected object's value wins. Continue to retain the full
+candidate-ID list and query as declared context without requiring that they describe
+one invocation.
+
+The field has the following input contract:
+
+- Missing or JSON `null` means legacy/no correlation; omit the feedback payload field.
+- A non-null selected value must be a string of exactly 36 characters in dashed
+  `8-4-4-4-12` UUID syntax. Accept hexadecimal case and normalize to lowercase. Refuse
+  prefixes, surrounding whitespace, URNs, non-string values and malformed UUIDs as
+  `InvalidInput`, without echoing the supplied value.
+- Validate before any `FeedbackExplicit` append or posterior mutation. Unselected
+  correlation fields are ignored even if malformed. Defer validation until after
+  selection; deserializing every result's field as `Option<String>` would incorrectly
+  reject malformed values on unselected objects.
+- With no `signal`, do not select a result or validate any correlation. Preserve
+  existing namespace, query, result-shape/profile-field and scorer-pair validation,
+  the exact `no_signal`/`no_results` acknowledgements and ordinary dispatch auditing.
+  No feedback event or posterior fold occurs. A signal with empty results retains its
+  existing target/selection refusal.
+
+`brain.feedback` gains the same additive optional field with the same missing/null and
+syntax rules; the deprecated `brain.emit` alias follows the shared handler. Neither
+requires a recall lookup. Persist the canonical value as `payload.recall_event_id`
+only on newly appended `FeedbackExplicit` rows. The feedback's physical `Event.id`
+and returned `event_id` remain its own independent identity. No acknowledgement-shape
+expansion or historical payload backfill is required.
+
+### Authority, namespaces and scorer separation
+
+Correlation is caller-declared, unverified context. It is not a credential, membership
+proof, attribution source, idempotency key or authorization to fold feedback. Existing
+target, namespace, profile/lifecycle, signal, attribution, scorer-pair and clamp
+checks remain authoritative. A caller may supply a foreign or nonexistent UUID as
+declared metadata; no event lookup grants access or discloses its contents.
+
+Recall telemetry retains its current write-token namespace. Feedback retains its
+independently authorized dispatch namespace, including automatic feedback's exact
+namespace override and direct-token check. Correlation never rehomes an event or
+opens another namespace. Downstream joins must apply event-read authorization
+independently and examine the actual actor, namespace and selected-target fields when
+their analysis requires those properties. Equality of the two IDs does not prove them.
+
+This identifier is separate from `scorer_run_id`, `serve_ledger_id` and each per-target
+serve-ledger row. It must not populate the scorer pair, choose a profile, alter ledger
+grades or deduplicate ordinary feedback. Repeated ordinary feedback carrying one
+correlation may append multiple independently identified events. Existing scorer
+deduplication remains unchanged and never rewrites the correlation on an already
+committed feedback event.
+
+### Alternatives and consequences
+
+- A synchronous event append would make the ID a stronger persistence signal, at the
+  cost of coupling recall success and latency to telemetry storage. This proposal
+  retains the accepted best-effort boundary instead.
+- Returning per-target serve-ledger IDs would address scorer-grade linkage directly,
+  but would couple response construction to asynchronous brain-owned row creation and
+  its per-target identity. It remains distinct from invocation-level event correlation.
+- Inferring the serve from target, query or time cannot distinguish repeated identical
+  recalls. Carrying the ID in the existing result object avoids a separate manual
+  lookup while retaining explicit result selection.
+
+The additive field supports joins when both rows exist, with one repeated UUID string
+per hit. It neither makes missing telemetry complete nor makes caller-supplied context
+trustworthy. No improvement in calibration quality or numeric latency is claimed.
+
+### Acceptance and sequencing
+
+This amendment and its ADR-021 companion require formal acceptance before dependent
+implementation merges. Implementation and acceptance must be repinned to actual
+`main` after #4277 and #4279 land, preserving their recall and brain changes; their
+currently open heads are not a fixed implementation base. The broader #1731/#1757
+tracking scope remains open beyond this correlation decision.
+
+Required evidence uses actual registry/handler/event-store paths:
+
+1. Seed memories and perform two identical recalls. Assert each invocation's returned
+   hits share one canonical ID, the two IDs differ, and a bounded background-task drain
+   yields exactly one physical `RecallExecuted` row per invocation with the matching
+   ID, actor, namespace, query and selected targets. Cover bare arrays, verbose envelopes,
+   nonempty degraded/truncated results, true-empty, degraded-empty and budget-empty
+   responses without adding an ID to an empty envelope.
+2. Judge a result from the second recall and from a mixed-invocation array. The new
+   feedback row must contain exactly the selected correlation, retain the full declared
+   query/candidate context, and have an independent physical ID. Same-object alias
+   equality counts once; duplicate matching objects still refuse.
+3. Cover direct and automatic missing/null legacy inputs, mixed-case normalization,
+   malformed selected refusal with no `FeedbackExplicit` or posterior change,
+   malformed unselected acceptance and no-signal abstention. Retain existing result,
+   profile, namespace, attribution and scorer-pair refusal checks.
+4. Exercise actual task-admission refusal and event-append failure. Recall still returns
+   its ordinary successful shape with a possibly dangling ID. Feedback using that ID
+   may succeed before or without telemetry; no event lookup or backfill is required.
+5. Force an emitter-ID collision with a pre-existing event, including the identical-row
+   case. Assert append refusal, unchanged complete event/projection contents and row
+   counts, no replacement-ID event, and an unaffected successful recall response.
+6. Prove namespace isolation and existing profile/clamp authority with foreign and
+   nonexistent correlation IDs. Repeated ordinary feedback remains repeatable;
+   scorer replay preserves deduplication, ledger grades and the earlier payload.
+
+The corresponding controls must fail if the emitter regenerates the ID, feedback
+selects the first/global correlation, abstention or an unselected value is validated,
+correlation populates the scorer pair or grants namespace/profile authority, or a
+duplicate event overwrites its predecessor. These are acceptance requirements, not
+claims of executed tests; implementation and native/control evidence are pending.

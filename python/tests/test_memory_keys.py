@@ -26,7 +26,7 @@ SUCCESS = {"ok": True, "tool": "memory.remember", "result": RECEIPT}
 KEY_CONFLICT = {
     "kind": "conflict",
     "message": "memory key already held",
-    "details": {"reason": "key_conflict", "key": KEY, "existing_id": MEMORY_ID},
+    "details": {"reason": "idempotency_key_conflict", "key": KEY, "existing_id": MEMORY_ID},
     "domain_disposition": "not_committed",
 }
 

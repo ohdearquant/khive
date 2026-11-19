@@ -1,53 +1,58 @@
 //! Environment-interposing fixtures execute as the sole test in a child.
 
-use std::process::Command;
+use khive_storage::test_support::run_exact_test_in_child;
 
 const CHILD_TEST: &str = "KKERNEL_ISOLATED_TEST";
 
 /// Call before fixture setup or environment changes. Only the exact child
 /// continues; unrelated tests never share its environment or recovery lock.
 pub(crate) fn run_in_child() -> bool {
-    let thread = std::thread::current();
-    let name = thread.name().expect("libtest names its test threads");
-    let arguments = ["--exact", name, "--nocapture", "--test-threads=1"];
-    if std::env::var(CHILD_TEST).ok().as_deref() == Some(name) {
-        assert_eq!(
-            std::env::args().skip(1).collect::<Vec<_>>(),
-            arguments,
-            "isolated child must run exactly its one named test"
-        );
+    run_in_child_with_stack(None)
+}
+
+/// Reserve extra stack only for this isolated child, without changing sibling tests.
+pub(crate) fn run_in_child_with_stack_size(stack_bytes: usize) -> bool {
+    run_in_child_with_stack(Some(stack_bytes))
+}
+
+fn run_in_child_with_stack(stack_bytes: Option<usize>) -> bool {
+    let mut fixture = None;
+    let in_parent = run_exact_test_in_child(CHILD_TEST, false, |command| {
+        let root = tempfile::tempdir().expect("isolated test fixture");
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).expect("private child HOME");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("KHIVE_") {
+                command.env_remove(key);
+            }
+        }
+        command
+            .env("HOME", &home)
+            // Native model initialization must not escape the checked child HOME.
+            .env_remove("LATTICE_MODEL_CACHE")
+            .env("KHIVE_TEST_HARNESS", "1")
+            .env("KHIVE_VOLUME_LOCK_DIR", root.path().join("volume-locks"))
+            .env("KHIVE_LOCK", root.path().join("khived.recovery.lock"))
+            .env(
+                "KHIVE_RECOVERER_LOCK",
+                root.path().join("khived.recoverer.lock"),
+            )
+            .env("KHIVE_PID", root.path().join("khived.pid"))
+            .env("KHIVE_SOCKET", root.path().join("khived.sock"));
+        if let Some(stack_bytes) = stack_bytes {
+            command.env("RUST_MIN_STACK", stack_bytes.to_string());
+        }
+        // The fixture must outlive the child that runs inside the call.
+        fixture = Some(root);
+    });
+    if !in_parent {
         return false;
     }
-
-    let root = tempfile::tempdir().expect("isolated test fixture");
-    let home = root.path().join("home");
-    std::fs::create_dir(&home).expect("private child HOME");
-    let mut command = Command::new(std::env::current_exe().expect("current test executable"));
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("KHIVE_") {
-            command.env_remove(key);
-        }
-    }
-    let output = command
-        .args(arguments)
-        .env(CHILD_TEST, name)
-        .env("HOME", &home)
-        // Native model initialization must not escape the checked child HOME.
-        .env_remove("LATTICE_MODEL_CACHE")
-        .env("KHIVE_TEST_HARNESS", "1")
-        .env("KHIVE_LOCK", root.path().join("khived.recovery.lock"))
-        .output()
-        .expect("spawn isolated test");
+    let root = fixture.expect("the parent created the isolated fixture");
+    let thread = std::thread::current();
+    let name = thread.name().expect("libtest names its test threads");
     assert!(
-        output.status.success()
-            && String::from_utf8_lossy(&output.stdout)
-                .contains("test result: ok. 1 passed; 0 failed;"),
-        "isolated test must execute exactly one passing case:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        std::fs::read_dir(&home)
+        std::fs::read_dir(root.path().join("home"))
             .expect("read child HOME")
             .next()
             .is_none(),
@@ -58,6 +63,21 @@ pub(crate) fn run_in_child() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn requested_stack_size_is_child_local() {
+        let original_stack = std::env::var_os("RUST_MIN_STACK");
+        const STACK_BYTES: usize = 4 * 1024 * 1024;
+        if super::run_in_child_with_stack_size(STACK_BYTES) {
+            assert_eq!(std::env::var_os("RUST_MIN_STACK"), original_stack);
+            return;
+        }
+        assert_eq!(
+            std::env::var("RUST_MIN_STACK").ok(),
+            Some(STACK_BYTES.to_string()),
+            "isolated child must receive its requested stack reservation"
+        );
+    }
+
     #[test]
     fn environment_changes_stay_in_the_child() {
         let original_home = std::env::var_os("HOME");
@@ -98,6 +118,39 @@ mod tests {
         );
         let _guard = khive_runtime::daemon::acquire_recovery_lock().expect("private recovery lock");
         assert!(lock.is_file(), "recovery lock must use the fixture path");
+        assert!(
+            std::fs::read_dir(&home).unwrap().next().is_none(),
+            "acquiring the private lock must not create default HOME paths"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rendezvous_paths_share_the_private_fixture() {
+        if super::run_in_child() {
+            return;
+        }
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let root = home.parent().unwrap();
+        for key in [
+            "KHIVE_LOCK",
+            "KHIVE_RECOVERER_LOCK",
+            "KHIVE_PID",
+            "KHIVE_SOCKET",
+        ] {
+            let path = std::path::PathBuf::from(std::env::var_os(key).expect("private path"));
+            assert_eq!(
+                path.parent(),
+                Some(root),
+                "{key} must use the private fixture"
+            );
+            assert!(!path.starts_with(&home), "{key} must stay outside HOME");
+        }
+        let marker = khive_runtime::daemon::supervisor_marker_path();
+        assert_eq!(marker.parent(), Some(root));
+        assert!(!marker.starts_with(&home));
+        let _guard = khive_runtime::daemon::acquire_recovery_lock().expect("private recovery lock");
+        assert!(std::fs::read_dir(&home).unwrap().next().is_none());
     }
 
     #[test]

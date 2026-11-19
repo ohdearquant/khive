@@ -4,83 +4,37 @@
 //! `scheduled_event` notes. Trigger evaluation is NOT performed by the pack —
 //! the pack only stores intent. See `docs/design.md` for execution modes.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::embedding_warning::add_embedding_truncation_warning;
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::note::{
     FilterOp, Note, NoteFilter, NoteInstantSeekAfter, PropertyFilter, SortDir,
 };
-use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
+use khive_storage::types::{PageRequest, SqlValue};
 use khive_storage::Event;
 use khive_types::{EventKind, SubstrateKind};
 
 use crate::{CREATOR_PROVENANCE_MARKER_V1, CREATOR_PROVENANCE_VERB};
 
 #[cfg(test)]
-mod activation_seam {
-    use std::sync::Arc;
-    use tokio::sync::Barrier;
+#[path = "handlers_activation_seam.rs"]
+mod activation_seam;
 
-    tokio::task_local! {
-        pub(super) static AFTER_CREATE: (Arc<Barrier>, Arc<Barrier>);
-    }
+#[cfg(test)]
+#[path = "handlers_cancel_seam.rs"]
+mod cancel_seam;
 
-    pub(super) async fn pause_after_create() {
-        if let Ok((arrived, resume)) = AFTER_CREATE.try_with(Clone::clone) {
-            tokio::time::timeout(std::time::Duration::from_secs(10), arrived.wait())
-                .await
-                .expect("public verb did not reach post-create seam");
-            resume.wait().await;
-        }
-    }
-}
+#[cfg(test)]
+#[path = "handlers_cancel_tests.rs"]
+mod cancel_tests;
 
 fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
-}
-
-fn add_embedding_truncation_warning(
-    response: &mut Value,
-    report: &khive_runtime::retrieval::EmbeddingTruncationReport,
-) {
-    if !report.any_truncated() {
-        return;
-    }
-    if let Some(object) = response.as_object_mut() {
-        object.insert(
-            "warnings".to_string(),
-            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
-        );
-    }
-}
-
-/// Resolve a raw id string to a full UUID.
-///
-/// Accepts a 36-char hyphenated UUID or an 8+ hex-char short prefix.
-/// The prefix is resolved via `runtime.resolve_prefix` (namespace-scoped).
-async fn resolve_id(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
-    raw: &str,
-    verb: &str,
-) -> Result<Uuid, RuntimeError> {
-    if let Ok(uuid) = raw.parse::<Uuid>() {
-        return Ok(uuid);
-    }
-    if raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
-        return match runtime.resolve_prefix(token, raw).await? {
-            Some(uuid) => Ok(uuid),
-            None => Err(RuntimeError::InvalidInput(format!(
-                "{verb}: no record matches prefix: {raw:?}"
-            ))),
-        };
-    }
-    Err(RuntimeError::InvalidInput(format!(
-        "{verb}: invalid id {raw:?}; expected full UUID or 8-char hex prefix"
-    )))
 }
 
 fn note_to_event_json(note: &Note) -> Value {
@@ -96,16 +50,14 @@ fn note_to_event_json(note: &Note) -> Value {
     })
 }
 
-fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params)
-        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
-}
+use khive_runtime::deser_params as deser;
 
 /// Validates `at` is an RFC 3339 timestamp lying in the future; returns the
 /// parsed instant. See `docs/api/replay-validation.md#validate_at` for accepted
 /// formats and rationale.
 fn validate_at(verb: &str, at: &str) -> Result<DateTime<Utc>, RuntimeError> {
     let parsed = at.parse::<DateTime<Utc>>().map_err(|_| {
+        let at = mask_for_redaction_surface(RedactionSurface::GateProbe, at);
         RuntimeError::InvalidInput(format!(
             "{verb}.at: must be an RFC 3339 timestamp (e.g. \"2027-01-01T00:00:00Z\"), got {at:?}"
         ))
@@ -297,6 +249,23 @@ mod create_refusal_tests;
 #[path = "resource_alias_drift_tests.rs"]
 mod resource_alias_drift_tests;
 
+/// Mirror KG create's raw singleton alias-shape check before kind reconciliation.
+fn optional_create_kind_alias_for_replay<'a>(
+    args: &'a std::collections::BTreeMap<String, khive_request::ArgValue>,
+    field: &str,
+) -> Result<Option<&'a str>, RuntimeError> {
+    match args.get(field).and_then(khive_request::ArgValue::as_value) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.trim().is_empty() => Err(RuntimeError::InvalidInput(
+            format!("create: `{field}` must not be empty"),
+        )),
+        Some(Value::String(value)) => Ok(Some(value.as_str())),
+        Some(value) => Err(RuntimeError::InvalidInput(format!(
+            "create: `{field}` must be a string or null; got {value}"
+        ))),
+    }
+}
+
 /// Rejects scheduled actions known to fail a handler's *conditional*
 /// required param even though `describe_verb` marks none of the
 /// alternatives `required:true` (issue #461) — hard-codes the `create`
@@ -339,15 +308,8 @@ fn validate_conditional_requirements(
         .and_then(khive_request::ArgValue::as_value)
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let entity_kind_arg = args
-        .get("entity_kind")
-        .and_then(khive_request::ArgValue::as_value)
-        .and_then(Value::as_str);
-    let note_kind_arg = args
-        .get("note_kind")
-        .and_then(khive_request::ArgValue::as_value)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty());
+    let entity_kind_arg = optional_create_kind_alias_for_replay(args, "entity_kind")?;
+    let note_kind_arg = optional_create_kind_alias_for_replay(args, "note_kind")?;
 
     match classify_create_kind(kind_str, registry)? {
         CreateKindClass::Entity { specific } => {
@@ -488,8 +450,9 @@ fn classify_create_kind(
         });
     }
     Err(RuntimeError::InvalidInput(format!(
-        "schedule.action: verb \"create\" with kind={raw:?} always fails at replay (unknown \
+        "schedule.action: verb \"create\" with kind={:?} always fails at replay (unknown \
          kind; valid: entity | note | edge | event | proposal | {} | {})",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, raw),
         registry.all_entity_kinds().join(" | "),
         registry.all_note_kinds().join(" | "),
     )))
@@ -515,7 +478,8 @@ fn canonical_entity_kind_for_replay(
     let mut all: Vec<&'static str> = registry.all_entity_kinds();
     all.sort_unstable();
     Err(RuntimeError::InvalidInput(format!(
-        "unknown entity_kind {raw:?}; valid: {}",
+        "unknown entity_kind {:?}; valid: {}",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, raw),
         all.join(" | ")
     )))
 }
@@ -534,7 +498,8 @@ fn canonical_note_kind_for_replay(
     let mut all: Vec<&'static str> = registry.all_note_kinds();
     all.sort_unstable();
     Err(RuntimeError::InvalidInput(format!(
-        "unknown note_kind {raw:?}; valid: {}",
+        "unknown note_kind {:?}; valid: {}",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, raw),
         all.join(" | ")
     )))
 }
@@ -779,6 +744,10 @@ pub(crate) struct RemindParams {
     pub at: String,
     #[serde(default)]
     pub repeat: Option<String>,
+    #[serde(default)]
+    pub misfire_policy: Option<String>,
+    #[serde(default)]
+    pub max_lateness: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -788,6 +757,10 @@ pub(crate) struct ScheduleParams {
     pub at: String,
     #[serde(default)]
     pub repeat: Option<String>,
+    #[serde(default)]
+    pub misfire_policy: Option<String>,
+    #[serde(default)]
+    pub max_lateness: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -799,6 +772,10 @@ pub(crate) struct AgendaParams {
     pub to: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
+    #[serde(default)]
+    pub after: Option<String>,
+    #[serde(default)]
+    pub after_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -823,6 +800,7 @@ pub(crate) async fn handle_remind(
         ));
     }
 
+    crate::misfire::parse_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?;
     let p: RemindParams = deser(params)?;
     if p.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -856,6 +834,12 @@ pub(crate) async fn handle_remind(
         "cancelled_at": null,
     });
     store_monthly_anchor(&mut properties, p.repeat.as_deref(), &trigger_at_original);
+    if let Some(policy) = p.misfire_policy.as_deref() {
+        properties["misfire_policy"] = json!(policy);
+    }
+    if let Some(max_lateness) = p.max_lateness {
+        properties["max_lateness"] = json!(max_lateness);
+    }
 
     // The report-returning variant keeps a truncated embedding input from
     // failing the call after the note is committed: the staged event must
@@ -895,6 +879,7 @@ pub(crate) async fn handle_schedule(
     registry: &VerbRegistry,
     params: Value,
 ) -> Result<Value, RuntimeError> {
+    crate::misfire::parse_misfire_policy(&params).map_err(RuntimeError::InvalidInput)?;
     let p: ScheduleParams = deser(params)?;
     if p.action.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -939,6 +924,12 @@ pub(crate) async fn handle_schedule(
         "cancelled_at": null,
     });
     store_monthly_anchor(&mut properties, p.repeat.as_deref(), &trigger_at_original);
+    if let Some(policy) = p.misfire_policy.as_deref() {
+        properties["misfire_policy"] = json!(policy);
+    }
+    if let Some(max_lateness) = p.max_lateness {
+        properties["max_lateness"] = json!(max_lateness);
+    }
 
     // See `handle_remind`: activation must follow a committed note even when
     // its embedding input was truncated.
@@ -997,6 +988,7 @@ pub(crate) async fn handle_agenda(
     let from_instant: Option<DateTime<Utc>> = match p.from {
         Some(ref s) => {
             let ts = s.parse::<DateTime<Utc>>().map_err(|_| {
+                let s = mask_for_redaction_surface(RedactionSurface::GateProbe, s);
                 RuntimeError::InvalidInput(format!(
                     "agenda.from: must be an RFC 3339 timestamp (e.g. \"2027-01-01T00:00:00Z\"), \
                      got {s:?}"
@@ -1009,6 +1001,7 @@ pub(crate) async fn handle_agenda(
     let to_instant: Option<DateTime<Utc>> = match p.to {
         Some(ref s) => {
             let ts = s.parse::<DateTime<Utc>>().map_err(|_| {
+                let s = mask_for_redaction_surface(RedactionSurface::GateProbe, s);
                 RuntimeError::InvalidInput(format!(
                     "agenda.to: must be an RFC 3339 timestamp (e.g. \"2027-01-01T00:00:00Z\"), \
                      got {s:?}"
@@ -1019,10 +1012,33 @@ pub(crate) async fn handle_agenda(
         None => None,
     };
 
-    // The exact SQL predicate and sort parse stored RFC 3339 text into a UTC
-    // key. Chrono accepts four-digit date prefixes and offsets under one day,
-    // so widened local-date bounds can use the existing raw trigger index.
-    // The exact predicate remains authoritative at each inclusive boundary.
+    let after_instant = match (&p.after, &p.after_id) {
+        (None, None) => None,
+        (Some(value), Some(id)) => {
+            value.parse::<DateTime<Utc>>().map_err(|_| {
+                let value = mask_for_redaction_surface(RedactionSurface::GateProbe, value);
+                RuntimeError::InvalidInput(format!(
+                    "agenda.after: must be an RFC 3339 timestamp; got {value:?}"
+                ))
+            })?;
+            let id = Uuid::parse_str(id).map_err(|_| {
+                let id = mask_for_redaction_surface(RedactionSurface::GateProbe, id);
+                RuntimeError::InvalidInput(format!("agenda.after_id: must be a UUID; got {id:?}"))
+            })?;
+            Some(NoteInstantSeekAfter {
+                value: value.clone(),
+                id,
+            })
+        }
+        _ => {
+            return Err(RuntimeError::InvalidInput(
+                "agenda: `after` and `after_id` must be supplied together".into(),
+            ));
+        }
+    };
+
+    // Accepted timestamps can have unpadded components or signed years, so
+    // raw-text date bounds can exclude rows that match the exact UTC window.
     let store = runtime.notes(token)?;
     let namespace = token.namespace().as_str();
     let mut property_filters = vec![
@@ -1038,16 +1054,6 @@ pub(crate) async fn handle_agenda(
         },
     ];
     if let Some(from) = from_instant {
-        if let Some(local_start) = from.checked_sub_signed(Duration::days(1)) {
-            let date = local_start.format("%Y-%m-%d").to_string();
-            if date.len() == 10 && date.as_bytes()[0].is_ascii_digit() {
-                property_filters.push(PropertyFilter {
-                    json_path: "$.trigger_at".to_string(),
-                    op: FilterOp::Gte,
-                    value: SqlValue::Text(date),
-                });
-            }
-        }
         property_filters.push(PropertyFilter {
             json_path: "$.trigger_at".to_string(),
             op: FilterOp::Rfc3339Gte,
@@ -1055,16 +1061,6 @@ pub(crate) async fn handle_agenda(
         });
     }
     if let Some(to) = to_instant {
-        if let Some(local_end_exclusive) = to.checked_add_signed(Duration::days(2)) {
-            let date = local_end_exclusive.format("%Y-%m-%d").to_string();
-            if date.len() == 10 && date.as_bytes()[0].is_ascii_digit() {
-                property_filters.push(PropertyFilter {
-                    json_path: "$.trigger_at".to_string(),
-                    op: FilterOp::Lt,
-                    value: SqlValue::Text(date),
-                });
-            }
-        }
         property_filters.push(PropertyFilter {
             json_path: "$.trigger_at".to_string(),
             op: FilterOp::Rfc3339Lte,
@@ -1076,11 +1072,14 @@ pub(crate) async fn handle_agenda(
         property_filters,
         order_by: Some(("$.trigger_at".to_string(), SortDir::Asc)),
         order_by_instant: true,
+        after_instant,
         ..Default::default()
-    };
+    }
+    .with_default_note_status(khive_storage::note::NoteStatusSelector::Active);
 
     const PAGE_SIZE: u32 = 64;
     let mut events = Vec::with_capacity(limit as usize);
+    let mut next = Value::Null;
     while events.len() < limit as usize {
         let page_limit = PAGE_SIZE.min(limit - events.len() as u32);
         let page = store
@@ -1107,6 +1106,7 @@ pub(crate) async fn handle_agenda(
                 value: value.to_string(),
                 id: last.id,
             });
+            next = json!({ "after": value, "after_id": last.id });
         }
         events.extend(page.items.iter().map(note_to_event_json));
         if page_len < page_limit {
@@ -1115,7 +1115,7 @@ pub(crate) async fn handle_agenda(
     }
     let count = events.len();
 
-    Ok(json!({ "events": events, "count": count }))
+    Ok(json!({ "events": events, "count": count, "next": next }))
 }
 
 /// `cancel` — cancel a scheduled event.
@@ -1125,16 +1125,18 @@ pub(crate) async fn handle_cancel(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: CancelParams = deser(params)?;
-    let id = resolve_id(runtime, token, &p.id, "cancel").await?;
+    let id = runtime
+        .resolve_uuid_or_prefix_for_verb(token, &p.id, "cancel")
+        .await?;
 
     let store = runtime.notes(token)?;
-    let note = store
+    let mut note = store
         .get_note(id)
         .await
         .map_err(|e| RuntimeError::Internal(format!("cancel: get_note: {e}")))?
         .ok_or_else(|| RuntimeError::NotFound(format!("cancel: event {id} not found")))?;
 
-    if note.namespace != token.namespace().as_str() {
+    if note.namespace != token.namespace().as_str() || note.deleted_at.is_some() {
         return Err(RuntimeError::NotFound(format!(
             "cancel: event {id} not found"
         )));
@@ -1150,7 +1152,7 @@ pub(crate) async fn handle_cancel(
     // Mutable string-key indexing on a non-object value panics in serde_json;
     // reject corrupt notes here with a clear error instead (SCH-AUD-001).
     let raw_props = note.properties.clone().unwrap_or_else(|| json!({}));
-    let props = match raw_props {
+    let mut props = match raw_props {
         Value::Object(_) => raw_props,
         ref other => {
             let type_name = match other {
@@ -1183,19 +1185,35 @@ pub(crate) async fn handle_cancel(
     }
 
     let cancelled_at = Utc::now().to_rfc3339();
-    // Persist the transition with a conditional (CAS) update on
-    // (id, namespace, kind, current status) instead of a full-row
-    // `upsert_note`/`INSERT OR REPLACE`. This closes the race where a
-    // pending-events dispatch fires the event (writing status="fired" and
-    // fired_at) between our read above and the write below: the CAS only
-    // succeeds if the row is still "pending" at write time, so a concurrent
-    // fire can never be clobbered by a stale cancel (issue #462).
-    let updated =
-        cancel_pending_event(runtime, token.namespace().as_str(), id, &cancelled_at).await?;
+    props["status"] = json!("cancelled");
+    props["cancelled_at"] = json!(cancelled_at);
+    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&props))?;
+
+    let expected_updated_at = note.updated_at;
+    let expected_deleted_at = note.deleted_at;
+    let minimum = expected_updated_at.checked_add(1).ok_or_else(|| {
+        RuntimeError::Internal(format!(
+            "cancel: event {id} revision cannot advance past i64::MAX"
+        ))
+    })?;
+    note.updated_at = Utc::now().timestamp_micros().max(minimum);
+    note.properties = Some(props);
+
+    #[cfg(test)]
+    cancel_seam::pause_after_read().await;
+
+    // Preserve every other field from the validated snapshot. The shared
+    // revision and deletion guards refuse a concurrent edit, fire, cancel,
+    // or deletion instead of replacing that newer state with this snapshot.
+    let updated = store
+        .replace_note_if_unchanged(note, expected_updated_at, expected_deleted_at)
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("cancel: conditional replace: {e}")))?;
     if !updated {
-        return Err(RuntimeError::InvalidInput(format!(
-            "cancel: event {id} is no longer pending; it was cancelled or fired concurrently"
-        )));
+        return Err(khive_types::KhiveError::conflict(format!(
+            "cancel: event {id} changed after it was read; retry with fresh state"
+        ))
+        .into());
     }
 
     let note = store
@@ -1212,94 +1230,6 @@ pub(crate) async fn handle_cancel(
         "cancelled_at": cancelled_at,
         "properties": props,
     }))
-}
-
-/// Conditionally transition a `scheduled_event` note from `pending` to
-/// `cancelled`, returning `true` iff the transition was applied.
-///
-/// Uses a `json_set`-on-`properties` UPDATE gated by pending status and the
-/// exact raw properties snapshot that passed the reservation check. A
-/// concurrent fire (or a second cancel) affects zero rows rather than
-/// overwriting the newer state.
-async fn cancel_pending_event(
-    runtime: &KhiveRuntime,
-    namespace: &str,
-    id: Uuid,
-    cancelled_at: &str,
-) -> Result<bool, RuntimeError> {
-    let updated_at = Utc::now().timestamp_micros();
-    let mut writer = runtime
-        .sql()
-        .writer()
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("cancel: open SQL writer: {e}")))?;
-
-    let snapshot = writer
-        .query_scalar(SqlStatement {
-            sql: "SELECT properties FROM notes \
-                  WHERE id = ?1 \
-                    AND namespace = ?2 \
-                    AND kind = 'scheduled_event' \
-                    AND deleted_at IS NULL \
-                    AND json_extract(properties, '$.status') = 'pending'"
-                .into(),
-            params: vec![
-                SqlValue::Text(id.to_string()),
-                SqlValue::Text(namespace.to_string()),
-            ],
-            label: Some("schedule_cancel_snapshot".into()),
-        })
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("cancel: read properties: {e}")))?;
-    let raw_properties = match snapshot {
-        None => return Ok(false),
-        Some(SqlValue::Text(raw)) => raw,
-        Some(other) => {
-            return Err(RuntimeError::InvalidInput(format!(
-                "cancel: event {id} has malformed properties ({other:?}); cannot mutate"
-            )));
-        }
-    };
-    let mut final_properties: Value = serde_json::from_str(&raw_properties).map_err(|e| {
-        RuntimeError::InvalidInput(format!(
-            "cancel: event {id} has malformed properties ({e}); cannot mutate"
-        ))
-    })?;
-    if !final_properties.is_object() {
-        return Err(RuntimeError::InvalidInput(format!(
-            "cancel: event {id} has malformed properties (expected JSON object); cannot mutate"
-        )));
-    }
-    final_properties["status"] = json!("cancelled");
-    final_properties["cancelled_at"] = json!(cancelled_at);
-    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&final_properties))?;
-
-    let rows = writer
-        .execute(SqlStatement {
-            sql: "UPDATE notes \
-                  SET properties = json_set(COALESCE(properties, '{}'), \
-                      '$.status', 'cancelled', '$.cancelled_at', ?1), \
-                      updated_at = ?2 \
-                  WHERE id = ?3 \
-                    AND namespace = ?4 \
-                    AND kind = 'scheduled_event' \
-                    AND deleted_at IS NULL \
-                    AND json_extract(properties, '$.status') = 'pending' \
-                    AND properties = ?5"
-                .to_string(),
-            params: vec![
-                SqlValue::Text(cancelled_at.to_string()),
-                SqlValue::Integer(updated_at),
-                SqlValue::Text(id.to_string()),
-                SqlValue::Text(namespace.to_string()),
-                SqlValue::Text(raw_properties),
-            ],
-            label: Some("schedule_cancel_pending".into()),
-        })
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("cancel: conditional update: {e}")))?;
-
-    Ok(rows == 1)
 }
 
 #[cfg(test)]
@@ -1439,5 +1369,63 @@ mod reservation_tests {
         let after = store.get_note(id).await.expect("read row").expect("row");
         assert_eq!(after.properties, Some(planted), "row changed");
         assert_eq!(after.updated_at, before.updated_at, "revision changed");
+    }
+}
+
+#[cfg(test)]
+mod archive_visibility_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn agenda_excludes_archived_pending_notes_before_instant_order_and_limit() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let runtime = KhiveRuntime::memory().unwrap();
+            let token = runtime
+                .authorize(khive_runtime::Namespace::local())
+                .unwrap();
+            let mut expected = None;
+            for (status, trigger) in [
+                ("archived", "2099-01-01T00:00:00Z"),
+                ("active", "2099-01-02T00:00:00Z"),
+            ] {
+                let mut note = Note::new(
+                    "local",
+                    "scheduled_event",
+                    format!("{status} pending event"),
+                );
+                note.status = status.into();
+                note.properties = Some(json!({"status": "pending", "trigger_at": trigger}));
+                if status == "active" {
+                    expected = Some(note.id.to_string());
+                }
+                runtime
+                    .notes(&token)
+                    .unwrap()
+                    .upsert_note(note)
+                    .await
+                    .unwrap();
+            }
+            let result = handle_agenda(
+                &runtime,
+                &token,
+                json!({
+                    "limit": 1, "from": "2098-01-01T00:00:00Z", "to": "2100-01-01T00:00:00Z",
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["count"], 1);
+            assert_eq!(
+                result["events"][0]["full_id"],
+                expected.unwrap(),
+                "agenda must omit archived pending events before its limit"
+            );
+            assert_eq!(
+                result["events"][0]["properties"]["status"], "pending",
+                "workflow state remains unchanged"
+            );
+        })
+        .await
+        .expect("bounded actual schedule agenda regression");
     }
 }

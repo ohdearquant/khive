@@ -7,6 +7,7 @@
 //! across all read paths, making a split impractical without duplicating the
 //! deserialization logic.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,8 +17,8 @@ use khive_storage::error::StorageError;
 #[cfg(test)]
 use khive_storage::error::WriterTaskRequestState;
 use khive_storage::event::{
-    Event, EventAppendDisposition, EventFilter, EventObservation, IdempotentEventBatchResult,
-    ObservationRole, ReferentKind,
+    Event, EventAppendDisposition, EventFilter, EventGroupBy, EventObservation,
+    IdempotentEventBatchResult, ObservationRole, ReferentKind,
 };
 use khive_storage::types::{BatchWriteSummary, Page, PageRequest, SqlStatement, SqlValue};
 use khive_storage::EventStore;
@@ -25,16 +26,14 @@ use khive_storage::SqlWriter;
 use khive_storage::StorageCapability;
 use khive_types::{EventKind, EventOutcome, SubstrateKind};
 
-use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 use crate::writer_task::WriterTaskHandle;
 
+#[path = "event_cursor.rs"]
+mod cursor;
+
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Events, op, e)
-}
-
-fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
-    e.into_storage_error(StorageCapability::Events, op)
 }
 
 // Preserve the existing error-classification fixtures at their original seam.
@@ -49,6 +48,8 @@ pub struct SqlEventStore {
     is_file_backed: bool,
     namespace: String,
     writer_task: Option<WriterTaskHandle>,
+    #[cfg(test)]
+    lose_next_fallback_reply: std::sync::atomic::AtomicBool,
 }
 
 impl SqlEventStore {
@@ -69,13 +70,27 @@ impl SqlEventStore {
             is_file_backed,
             namespace: namespace.into(),
             writer_task,
+            #[cfg(test)]
+            lose_next_fallback_reply: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    fn open_standalone_writer(&self) -> Result<rusqlite::Connection, StorageError> {
-        self.pool
-            .open_standalone_writer()
-            .map_err(|e| map_sqlite_err(e, "open_event_writer"))
+    #[cfg(test)]
+    fn after_fallback_write_for_test<T>(
+        &self,
+        result: Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        // Lose only the reply: the real fallback transaction already committed.
+        if result.is_ok()
+            && self
+                .lose_next_fallback_reply
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StorageError::writer_task_terminated(
+                WriterTaskRequestState::SideEffectsUnknown,
+            ));
+        }
+        result
     }
 
     fn current_writer_task(
@@ -105,41 +120,42 @@ impl SqlEventStore {
     {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
-                .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .send_bounded_at(move |conn| f(conn).map_err(|e| map_err(e, op)), op)
                 .await;
         }
 
         self.pool
             .record_direct_route(crate::timeout_sink::Site::DirectRouteEventGeneralWrite);
-        if self.is_file_backed {
-            let conn = self.open_standalone_writer()?;
-            let db = crate::timeout_sink::db_label(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                f(&conn).map_err(|e| {
-                    crate::timeout_sink::maybe_emit_busy(
+        // Atomic SQL units release an in-memory connection between statements;
+        // share their unit budget so this transaction cannot overlap one.
+        let unit_slot = if self.is_file_backed {
+            None
+        } else {
+            Some(crate::sql_bridge::acquire_in_memory_write_unit(&self.pool, op).await?)
+        };
+        let pool = Arc::clone(&self.pool);
+        let db = crate::timeout_sink::db_label(&pool);
+        let is_file_backed = self.is_file_backed;
+        tokio::task::spawn_blocking(move || {
+            // Cancellation of the caller must not release the slot before this job ends.
+            let _unit_slot = unit_slot;
+            let result =
+                pool.execute_direct_transaction(StorageCapability::Events, op, move |conn| {
+                    f(conn).map_err(|error| map_err(error, op))
+                });
+            if is_file_backed {
+                if let Err(error) = &result {
+                    crate::timeout_sink::maybe_emit_busy_storage_error(
                         &db,
                         crate::timeout_sink::Site::StandaloneEvent,
-                        &e,
+                        error,
                     );
-                    map_err(e, op)
-                })
-            })
-            .await
-            .map_err(|e| StorageError::driver(StorageCapability::Events, op, e))?
-        } else {
-            // Atomic SQL units release the connection guard between statements;
-            // share their unit budget so this transaction cannot overlap one.
-            let unit_slot = crate::sql_bridge::acquire_in_memory_write_unit(&self.pool, op).await?;
-            let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                // Cancellation of the caller must not release the slot before this job ends.
-                let _unit_slot = unit_slot;
-                let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn()).map_err(|e| map_err(e, op))
-            })
-            .await
-            .map_err(|e| StorageError::driver(StorageCapability::Events, op, e))?
-        }
+                }
+            }
+            result
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Events, op, e))?
     }
 
     async fn with_reader<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
@@ -629,7 +645,9 @@ fn profile_state_version_to_sql(event: &Event) -> Result<Option<i64>, rusqlite::
 /// intentionally not a prepare-time edge query: a guarded edge write that
 /// commits immediately before the delete must be represented in the warning
 /// payload before the subsequent cascade statement removes it. Relations
-/// with no matching incident edge insert no event.
+/// with no matching incident edge insert no event. Incident edges are found
+/// in every namespace through the graph store's namespace walk, so each
+/// statement seeks per namespace instead of reading every edge.
 pub fn hard_delete_lineage_warning_statements(
     namespace: &str,
     actor: &str,
@@ -650,7 +668,8 @@ pub fn hard_delete_lineage_warning_statements(
     WARNINGS
         .into_iter()
         .map(|(relation, warning)| SqlStatement {
-            sql: "INSERT INTO events \
+            sql: format!(
+                "INSERT INTO events \
                   (id, namespace, verb, substrate, actor, kind, outcome, payload, \
                    payload_schema_version, profile_state_version, duration_us, target_id, \
                    session_id, aggregate_kind, aggregate_id, created_at, op_index, ref_resolution) \
@@ -669,14 +688,22 @@ pub fn hard_delete_lineage_warning_statements(
                              'deleted_at', incident.deleted_at)) \
                          ), \
                          1, NULL, 0, ?8, NULL, NULL, NULL, ?10, ?11, ?12 \
-                  FROM ( \
-                    SELECT id, namespace, source_id, target_id, deleted_at \
-                    FROM graph_edges \
-                    WHERE (source_id = ?8 OR target_id = ?8) AND relation = ?9 \
+                  FROM ( {cte} \
+                    SELECT e.id AS id, e.namespace AS namespace, e.source_id AS source_id, \
+                           e.target_id AS target_id, e.deleted_at AS deleted_at \
+                    FROM edge_ns CROSS JOIN graph_edges AS e \
+                      ON e.namespace = edge_ns.namespace AND e.source_id = ?8 AND e.relation = ?9 \
+                    UNION ALL \
+                    SELECT e.id AS id, e.namespace AS namespace, e.source_id AS source_id, \
+                           e.target_id AS target_id, e.deleted_at AS deleted_at \
+                    FROM edge_ns CROSS JOIN graph_edges AS e \
+                      ON e.namespace = edge_ns.namespace AND e.target_id = ?8 AND e.relation = ?9 \
+                    WHERE e.source_id <> ?8 \
                     ORDER BY namespace, id \
                   ) AS incident \
-                  HAVING count(*) > 0"
-                .into(),
+                  HAVING count(*) > 0",
+                cte = super::graph::EDGE_NAMESPACES_CTE
+            ),
             params: vec![
                 SqlValue::Text(Uuid::new_v4().to_string()),
                 SqlValue::Text(namespace.to_string()),
@@ -706,9 +733,9 @@ pub fn hard_delete_lineage_warning_statements(
 /// `BEGIN`/`COMMIT`/`ROLLBACK` of its own.
 ///
 /// This exists alongside `insert_event_with_observations` (the raw
-/// `rusqlite::Connection` path `SqlEventStore::append_event` uses, which
-/// opens its own `BEGIN IMMEDIATE`/`COMMIT` for the ordinary
-/// caller-owns-nothing case) rather than replacing it: the two run on
+/// `rusqlite::Connection` path `SqlEventStore::append_event` uses, whose
+/// caller now owns an admitted transaction for the ordinary case) rather
+/// than replacing it: the two run on
 /// different connection abstractions — a standalone `rusqlite::Connection`
 /// vs. a `Box<dyn SqlWriter>` — so they cannot share one function body. Both
 /// build on [`event_insert_statements`] for the actual insert shape.
@@ -1097,7 +1124,19 @@ fn build_event_filter_sql(
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
     params.push(Box::new(default_namespace.to_string()));
-    conditions.push(format!("namespace = ?{}", params.len()));
+    // An ID-filtered read is bounded by the caller's IDs. Without
+    // sqlite_stat1 the planner otherwise lets the namespace equality drive
+    // through the index that also serves `ORDER BY created_at DESC, id DESC`,
+    // and walks every row of the namespace whenever fewer than `LIMIT` of
+    // the IDs exist, which is the normal case for the split store's probe of a
+    // new audit batch. Unary `+` keeps the namespace term as a filter only, so
+    // the primary key drives.
+    let namespace_term = if filter.ids.is_empty() {
+        "namespace"
+    } else {
+        "+namespace"
+    };
+    conditions.push(format!("{namespace_term} = ?{}", params.len()));
 
     push_in_clause(
         &mut conditions,
@@ -1128,6 +1167,17 @@ fn build_event_filter_sql(
         &mut params,
         "actor",
         filter.actors.iter().cloned(),
+    );
+
+    if let Some(outcome) = filter.outcome {
+        params.push(Box::new(outcome.name().to_string()));
+        conditions.push(format!("outcome = ?{}", params.len()));
+    }
+    super::append_json_equalities(
+        &mut conditions,
+        &mut params,
+        "payload",
+        &filter.payload_equalities,
     );
 
     if let Some(after) = filter.after {
@@ -1168,6 +1218,15 @@ fn build_event_filter_sql(
 
     let clause = format!(" WHERE {}", conditions.join(" AND "));
     Ok((clause, params))
+}
+
+fn query_events_sql(where_clause: &str, limit_idx: usize, offset_idx: usize) -> String {
+    format!(
+        "SELECT id, namespace, verb, substrate, actor, kind, outcome, payload, \
+                payload_schema_version, profile_state_version, duration_us, target_id, \
+                session_id, aggregate_kind, aggregate_id, created_at, op_index, ref_resolution \
+         FROM events{where_clause} ORDER BY created_at DESC, id DESC LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+    )
 }
 
 fn push_in_clause<I>(
@@ -1282,33 +1341,25 @@ impl EventStore for SqlEventStore {
         // only after the usage snapshot is frozen, so it never counts itself.
         if let Some(writer_task) = self.current_writer_task("append_event")? {
             let result = writer_task
-                .send_bounded(move |conn| {
-                    insert_event_with_observations(conn, &event)
-                        .map_err(|e| map_err(e, "append_event"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        insert_event_with_observations(conn, &event)
+                            .map_err(|e| map_err(e, "append_event"))
+                    },
+                    "append_event",
+                )
                 .await;
             khive_storage::usage::account_event_write(result.as_ref().map(|()| 1));
             return result;
         }
 
-        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
-        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
-        let origin = self.pool.origin();
         let result = self
             .with_writer("append_event", move |conn| {
-                conn.execute_batch("BEGIN IMMEDIATE")?;
-                let _tx_handle = khive_storage::tx_registry::register_scoped(
-                    Some("event_append".to_string()),
-                    origin,
-                );
-                if let Err(e) = insert_event_with_observations(conn, &event) {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return Err(e);
-                }
-                conn.execute_batch("COMMIT")?;
-                Ok(())
+                insert_event_with_observations(conn, &event)
             })
             .await;
+        #[cfg(test)]
+        let result = self.after_fallback_write_for_test(result);
         khive_storage::usage::account_event_write(result.as_ref().map(|()| 1));
         result
     }
@@ -1323,10 +1374,13 @@ impl EventStore for SqlEventStore {
         // and issues the ROLLBACK on `Err`.
         if let Some(writer_task) = self.current_writer_task("append_events")? {
             let result = writer_task
-                .send_bounded(move |conn| {
-                    batch_append_events_dml(conn, &events, attempted)
-                        .map_err(|e| map_err(e, "append_events"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        batch_append_events_dml(conn, &events, attempted)
+                            .map_err(|e| map_err(e, "append_events"))
+                    },
+                    "append_events",
+                )
                 .await;
             khive_storage::usage::account_event_write(
                 result.as_ref().map(|summary| summary.affected),
@@ -1334,35 +1388,18 @@ impl EventStore for SqlEventStore {
             return result;
         }
 
-        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
-        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
-        let origin = self.pool.origin();
         let result = self
             .with_writer("append_events", move |conn| {
-                conn.execute_batch("BEGIN IMMEDIATE")?;
-                let _tx_handle = khive_storage::tx_registry::register_scoped(
-                    Some("event_append_batch".to_string()),
-                    origin,
-                );
-
-                let summary = match batch_append_events_dml(conn, &events, attempted) {
-                    Ok(summary) => summary,
-                    Err(e) => {
-                        let _ = conn.execute_batch("ROLLBACK");
-                        return Err(e);
-                    }
-                };
-
-                conn.execute_batch("COMMIT")?;
-                Ok(summary)
+                batch_append_events_dml(conn, &events, attempted)
             })
             .await;
+        #[cfg(test)]
+        let result = self.after_fallback_write_for_test(result);
         khive_storage::usage::account_event_write(result.as_ref().map(|summary| summary.affected));
         result
     }
 
     async fn get_event(&self, id: Uuid) -> Result<Option<Event>, StorageError> {
-        let namespace = self.namespace.clone();
         let id_str = id.to_string();
 
         self.with_reader("get_event", move |conn| {
@@ -1370,9 +1407,9 @@ impl EventStore for SqlEventStore {
                 "SELECT id, namespace, verb, substrate, actor, kind, outcome, payload, \
                         payload_schema_version, profile_state_version, duration_us, target_id, \
                         session_id, aggregate_kind, aggregate_id, created_at, op_index, ref_resolution \
-                 FROM events WHERE namespace = ?1 AND id = ?2",
+                 FROM events WHERE id = ?1",
             )?;
-            let mut rows = stmt.query(rusqlite::params![namespace, id_str])?;
+            let mut rows = stmt.query(rusqlite::params![id_str])?;
             match rows.next()? {
                 Some(row) => Ok(Some(read_event(row)?)),
                 None => Ok(None),
@@ -1386,6 +1423,11 @@ impl EventStore for SqlEventStore {
         filter: EventFilter,
         page: PageRequest,
     ) -> Result<Page<Event>, StorageError> {
+        super::validate_json_equality_paths(
+            &filter.payload_equalities,
+            StorageCapability::Events,
+            "query_events",
+        )?;
         let namespace = self.namespace.clone();
         let limit_i64 = i64::from(page.limit);
         let offset_i64 = i64::try_from(page.offset).map_err(|_| StorageError::InvalidInput {
@@ -1416,13 +1458,7 @@ impl EventStore for SqlEventStore {
             let limit_idx = all_params.len() - 1;
             let offset_idx = all_params.len();
 
-            let data_sql = format!(
-                "SELECT id, namespace, verb, substrate, actor, kind, outcome, payload, \
-                        payload_schema_version, profile_state_version, duration_us, target_id, \
-                        session_id, aggregate_kind, aggregate_id, created_at, op_index, ref_resolution \
-                 FROM events{} ORDER BY created_at DESC, id DESC LIMIT ?{} OFFSET ?{}",
-                where_clause, limit_idx, offset_idx,
-            );
+            let data_sql = query_events_sql(&where_clause, limit_idx, offset_idx);
 
             let mut stmt = conn.prepare(&data_sql)?;
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -1439,7 +1475,19 @@ impl EventStore for SqlEventStore {
         .await
     }
 
+    async fn query_event_page(
+        &self,
+        query: khive_storage::event::EventPageQuery,
+    ) -> Result<khive_storage::event::EventPageWindow, StorageError> {
+        cursor::query_event_page(self, query).await
+    }
+
     async fn count_events(&self, filter: EventFilter) -> Result<u64, StorageError> {
+        super::validate_json_equality_paths(
+            &filter.payload_equalities,
+            StorageCapability::Events,
+            "count_events",
+        )?;
         let namespace = self.namespace.clone();
 
         self.with_reader("count_events", move |conn| {
@@ -1450,6 +1498,35 @@ impl EventStore for SqlEventStore {
                 params.iter().map(|p| p.as_ref()).collect();
             let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
             Ok(count as u64)
+        })
+        .await
+    }
+
+    async fn count_events_grouped(
+        &self,
+        filter: EventFilter,
+        group_by: EventGroupBy,
+    ) -> Result<BTreeMap<String, u64>, StorageError> {
+        super::validate_json_equality_paths(
+            &filter.payload_equalities,
+            StorageCapability::Events,
+            "count_events_grouped",
+        )?;
+        let namespace = self.namespace.clone();
+        self.with_reader("count_events_grouped", move |conn| {
+            let (where_clause, params) = build_event_filter_sql(conn, &namespace, &filter)?;
+            // The identifier comes only from the closed enum; every filter value
+            // (including the namespace) is still bound by the shared builder.
+            let column = group_by.column();
+            let sql =
+                format!("SELECT {column}, COUNT(*) FROM events{where_clause} GROUP BY {column}");
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?;
+            rows.collect()
         })
         .await
     }
@@ -1466,31 +1543,18 @@ impl EventStore for SqlEventStore {
     ) -> Result<IdempotentEventBatchResult, StorageError> {
         if let Some(writer_task) = self.current_writer_task("append_events_idempotent")? {
             return writer_task
-                .send_bounded(move |conn| {
-                    idempotent_batch_dml(conn, &events)
-                        .map_err(|e| map_err(e, "append_events_idempotent"))
-                })
+                .send_bounded_at(
+                    move |conn| {
+                        idempotent_batch_dml(conn, &events)
+                            .map_err(|e| map_err(e, "append_events_idempotent"))
+                    },
+                    "append_events_idempotent",
+                )
                 .await;
         }
 
-        let origin = self.pool.origin();
         self.with_writer("append_events_idempotent", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("event_append_idempotent".to_string()),
-                origin,
-            );
-
-            let result = match idempotent_batch_dml(conn, &events) {
-                Ok(result) => result,
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return Err(e);
-                }
-            };
-
-            conn.execute_batch("COMMIT")?;
-            Ok(result)
+            idempotent_batch_dml(conn, &events)
         })
         .await
     }
@@ -1505,11 +1569,56 @@ impl EventStore for SqlEventStore {
 // =============================================================================
 
 const EVENTS_DDL: &str = include_str!("../../sql/events-ddl.sql");
+const OPERATION_ATTRIBUTION_COLUMNS: &str =
+    include_str!("../../sql/036-events-operation-attribution.sql");
 
 pub(crate) fn ensure_events_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(EVENTS_DDL)
+    conn.execute_batch(EVENTS_DDL)?;
+    ensure_operation_attribution_columns(conn)
+}
+
+/// Add `op_index` and `ref_resolution` to an `events` table created before
+/// they existed. `CREATE TABLE IF NOT EXISTS` leaves such a table unchanged,
+/// and a standalone events database has no migration chain to run V36, so
+/// every insert naming the two columns would fail. V36 calls this too, which
+/// keeps it valid on a table the store DDL has already upgraded. Both columns
+/// are added in one transaction (the caller's, if one is open).
+pub(crate) fn ensure_operation_attribution_columns(
+    conn: &rusqlite::Connection,
+) -> Result<(), rusqlite::Error> {
+    match (
+        has_column(conn, "events", "op_index")?,
+        has_column(conn, "events", "ref_resolution")?,
+    ) {
+        (true, true) => Ok(()),
+        (false, false) if conn.is_autocommit() => {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(OPERATION_ATTRIBUTION_COLUMNS)?;
+            tx.commit()
+        }
+        (false, false) => conn.execute_batch(OPERATION_ATTRIBUTION_COLUMNS),
+        (op_index, ref_resolution) => Err(rusqlite::Error::ToSqlConversionFailure(
+            format!(
+                "events table has only one operation attribution column \
+                 (op_index={op_index}, ref_resolution={ref_resolution}); refusing to guess"
+            )
+            .into(),
+        )),
+    }
 }
 
 #[cfg(test)]
 #[path = "event_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "event_busy_tests.rs"]
+mod direct_busy_tests;
+
+#[cfg(test)]
+#[path = "event_fallback_usage_tests.rs"]
+mod fallback_usage_tests;
+
+#[cfg(test)]
+#[path = "event_plan_tests.rs"]
+mod plan_tests;

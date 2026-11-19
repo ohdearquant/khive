@@ -8,6 +8,7 @@ use std::{borrow::Cow, str::FromStr, sync::OnceLock};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::{
     micros_to_iso, ContentMergeStrategy, EntityDedupMergePolicy, KhiveRuntime, NamespaceToken,
     PackByIdResolver, QueryResult, RuntimeError, VerbRegistry,
@@ -27,6 +28,33 @@ pub(crate) use super::params::{
     QueryParams, RestoreParams, ReviewParams, SearchParams, StatsParams, TraverseParams,
     UpdateParams, WhoamiParams, WithdrawParams, HARD_CAP,
 };
+
+pub(super) struct DoublingWindowIter {
+    next: Option<u32>,
+    cap: u32,
+}
+
+impl DoublingWindowIter {
+    pub(super) fn new(first: u32, cap: u32) -> Self {
+        Self {
+            next: Some(first.min(cap)),
+            cap,
+        }
+    }
+
+    pub(super) fn advance(&mut self, current: u32, minimum: u32, double: bool) {
+        let doubled = if double { current.saturating_mul(2) } else { 0 };
+        self.next = Some(minimum.max(doubled).clamp(1, self.cap));
+    }
+}
+
+impl Iterator for DoublingWindowIter {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next.take()
+    }
+}
 
 // ---- Kind canonicalization ----
 
@@ -570,6 +598,13 @@ async fn resolve_name_async(
     }
 }
 
+/// The answer for a prefix that no record the caller may read carries. A
+/// resolver that withholds a candidate answers with this same error, so a
+/// withheld record and a missing one read alike.
+pub(crate) fn prefix_not_found(prefix: &str) -> RuntimeError {
+    RuntimeError::InvalidInput(format!("no record matches prefix: {prefix:?}"))
+}
+
 pub(crate) async fn resolve_uuid_async(
     s: &str,
     runtime: &KhiveRuntime,
@@ -581,11 +616,7 @@ pub(crate) async fn resolve_uuid_async(
     if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
         match runtime.resolve_prefix(token, s).await {
             Ok(Some(uuid)) => return Ok(uuid),
-            Ok(None) => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "no record matches prefix: {s:?}"
-                )))
-            }
+            Ok(None) => return Err(prefix_not_found(s)),
             Err(e) => return Err(e),
         }
     }
@@ -607,21 +638,7 @@ pub async fn resolve_uuid_unfiltered(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
 ) -> Result<Uuid, RuntimeError> {
-    if let Ok(uuid) = Uuid::from_str(s) {
-        return Ok(uuid);
-    }
-    if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-        match runtime.resolve_prefix_unfiltered(s).await {
-            Ok(Some(uuid)) => return Ok(uuid),
-            Ok(None) => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "no record matches prefix: {s:?}"
-                )))
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    resolve_name_async(s, runtime, token).await
+    resolve_uuid_unfiltered_with_deleted(s, runtime, token, false).await
 }
 
 /// Same as [`resolve_uuid_unfiltered`], but the prefix-resolution branch also matches
@@ -636,11 +653,25 @@ pub async fn resolve_uuid_unfiltered_including_deleted(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
 ) -> Result<Uuid, RuntimeError> {
+    resolve_uuid_unfiltered_with_deleted(s, runtime, token, true).await
+}
+
+async fn resolve_uuid_unfiltered_with_deleted(
+    s: &str,
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    include_deleted: bool,
+) -> Result<Uuid, RuntimeError> {
     if let Ok(uuid) = Uuid::from_str(s) {
         return Ok(uuid);
     }
     if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-        match runtime.resolve_prefix_unfiltered_including_deleted(s).await {
+        let resolved = if include_deleted {
+            runtime.resolve_prefix_unfiltered_including_deleted(s).await
+        } else {
+            runtime.resolve_prefix_unfiltered(s).await
+        };
+        match resolved {
             Ok(Some(uuid)) => return Ok(uuid),
             Ok(None) => {
                 return Err(RuntimeError::InvalidInput(format!(
@@ -799,7 +830,7 @@ pub(crate) fn parse_relation(s: &str) -> Result<EdgeRelation, RuntimeError> {
 
 pub(crate) fn validate_weight(weight: Option<f64>) -> Result<f64, RuntimeError> {
     let w = weight.unwrap_or(1.0);
-    if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+    if !khive_types::validate_edge_weight(w) {
         return Err(RuntimeError::InvalidInput(format!(
             "edge weight must be a finite number in [0.0, 1.0], got {w}"
         )));
@@ -978,9 +1009,13 @@ pub(crate) fn parse_event_outcome(raw: &str) -> Result<EventOutcome, RuntimeErro
         "success" => Ok(EventOutcome::Success),
         "denied" => Ok(EventOutcome::Denied),
         "error" => Ok(EventOutcome::Error),
-        _ => Err(RuntimeError::InvalidInput(format!(
-            "unknown outcome {raw:?}; valid: success | denied | error"
-        ))),
+        _ => Err(RuntimeError::InvalidInput(
+            mask_for_redaction_surface(
+                RedactionSurface::GateProbe,
+                &format!("unknown outcome {raw:?}; valid: success | denied | error"),
+            )
+            .into_owned(),
+        )),
     }
 }
 
@@ -989,24 +1024,41 @@ pub(crate) fn parse_event_substrate(raw: &str) -> Result<SubstrateKind, RuntimeE
         .to_ascii_lowercase()
         .parse::<SubstrateKind>()
         .map_err(|_| {
-            RuntimeError::InvalidInput(format!(
-                "unknown substrate {raw:?}; valid: note | entity | event"
-            ))
+            RuntimeError::InvalidInput(
+                mask_for_redaction_surface(
+                    RedactionSurface::GateProbe,
+                    &format!("unknown substrate {raw:?}; valid: note | entity | event"),
+                )
+                .into_owned(),
+            )
         })
 }
 
 pub(crate) fn parse_event_kind(raw: &str) -> Result<EventKind, RuntimeError> {
-    raw.parse::<EventKind>()
-        .map_err(|e| RuntimeError::InvalidInput(format!("unknown event_kind {raw:?}: {e}")))
+    raw.parse::<EventKind>().map_err(|e| {
+        RuntimeError::InvalidInput(
+            mask_for_redaction_surface(
+                RedactionSurface::GateProbe,
+                &format!("unknown event_kind {raw:?}: {e}"),
+            )
+            .into_owned(),
+        )
+    })
 }
 
 fn parse_exact_event_filter_id(field: &str, raw: &str) -> Result<Uuid, RuntimeError> {
     Uuid::from_str(raw).map_err(|error| {
-        RuntimeError::InvalidInput(format!(
-            "list: {field} must contain a full UUID because a short-prefix resolution can miss \
-             or be ambiguous, while an event filter must identify the exact stable record; \
-             got {raw:?}: {error}"
-        ))
+        RuntimeError::InvalidInput(
+            mask_for_redaction_surface(
+                RedactionSurface::GateProbe,
+                &format!(
+                "list: {field} must contain a full UUID because a short-prefix resolution can miss \
+                 or be ambiguous, while an event filter must identify the exact stable record; \
+                 got {raw:?}: {error}"
+            ),
+            )
+            .into_owned(),
+        )
     })
 }
 
@@ -1088,10 +1140,7 @@ pub(crate) fn to_json<T: serde::Serialize>(v: &T) -> Result<Value, RuntimeError>
     serde_json::to_value(v).map_err(|e| RuntimeError::Internal(format!("serialize: {e}")))
 }
 
-pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params)
-        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
-}
+pub(crate) use khive_runtime::deser_params as deser;
 
 /// Convert `created_at`/`updated_at`/`deleted_at`/`expires_at` fields on a JSON entity
 /// object from epoch-micros integers to ISO-8601 strings, in place. Fields that are
@@ -1372,132 +1421,12 @@ pub(crate) fn require_object_param(value: Option<&Value>, param: &str) -> Result
 }
 
 #[cfg(test)]
-mod param_contract_tests {
-    use super::*;
-
-    #[test]
-    fn an_object_parameter_refuses_every_non_object_and_names_what_it_got() {
-        // The shape that was accepted and persisted.
-        let err = require_object_param(Some(&json!("not-an-object")), "properties")
-            .expect_err("a string is not an object");
-        let message = err.to_string();
-        assert!(message.contains("properties"), "{message}");
-        assert!(message.contains("string"), "names what arrived: {message}");
-
-        // An array is the near miss a caller is most likely to send next, so it
-        // must be refused by type rather than by a map-specific probe.
-        assert!(require_object_param(Some(&json!([1, 2])), "properties").is_err());
-        let err = require_object_param(Some(&json!(7)), "properties")
-            .expect_err("a number is not an object");
-        assert_eq!(
-            err.to_string(),
-            "invalid input: properties must be an object; got number"
-        );
-        assert!(require_object_param(Some(&json!(true)), "properties").is_err());
-    }
-
-    #[test]
-    fn absent_and_explicit_null_are_not_type_errors() {
-        // Absent means unchanged and null is how the update path clears a field;
-        // an implementation that refuses anything that is not an object breaks both.
-        require_object_param(None, "properties").expect("absent is allowed");
-        require_object_param(Some(&Value::Null), "properties").expect("null is allowed");
-        require_object_param(Some(&json!({"a": 1})), "properties").expect("an object is allowed");
-    }
-}
+#[path = "common_param_contract_tests.rs"]
+mod param_contract_tests;
 
 #[cfg(test)]
-mod note_projection_tests {
-    use super::*;
-
-    fn note(value: serde_json::Value) -> serde_json::Map<String, Value> {
-        remap_note_status(value)
-            .as_object()
-            .expect("projection returns an object for an object input")
-            .clone()
-    }
-
-    #[test]
-    fn projection_reports_the_tags_the_filter_matches_on() {
-        // Stored shape: notes have no tags column, so the tags a caller passed live
-        // under `properties.tags`, which is also the path the tag filter extracts.
-        let out = note(json!({
-            "kind": "observation",
-            "content": "body",
-            "properties": {"tags": ["fleet-incident", "merge-safety"]},
-        }));
-        assert_eq!(
-            out.get("tags"),
-            Some(&json!(["fleet-incident", "merge-safety"])),
-            "a note must report the tags it is findable by"
-        );
-
-        // A non-array value is left where it is: promoting it would hand callers a
-        // `tags` field they still have to type-check.
-        let out = note(json!({
-            "kind": "observation",
-            "content": "body",
-            "properties": {"tags": "fleet-incident,merge-safety"},
-        }));
-        assert_eq!(out.get("tags"), None, "only an array is lifted");
-
-        // An explicit top-level value wins over the stored one, so a substrate that
-        // does carry its own tags column is never overwritten by this projection.
-        let out = note(json!({
-            "kind": "observation",
-            "content": "body",
-            "tags": ["explicit"],
-            "properties": {"tags": ["stored"]},
-        }));
-        assert_eq!(out.get("tags"), Some(&json!(["explicit"])));
-    }
-
-    #[test]
-    fn projection_labels_a_nameless_note_from_its_first_content_line() {
-        // A name is optional and nothing defaults it, so this is the common shape.
-        let out = note(json!({
-            "kind": "observation",
-            "name": Value::Null,
-            "content": "\n  A review status in a mutable flag is a side effect.\nSecond line.",
-        }));
-        assert_eq!(
-            out.get("display_name"),
-            Some(&json!(
-                "A review status in a mutable flag is a side effect."
-            )),
-            "the label is the first non-empty line, trimmed"
-        );
-        assert_eq!(
-            out.get("name"),
-            Some(&Value::Null),
-            "the stored name is untouched: the projection labels, it does not title"
-        );
-
-        // With a name, the label is that name. An implementation that always derives
-        // from content fails here.
-        let out = note(json!({"kind": "observation", "name": "Real title", "content": "body"}));
-        assert_eq!(out.get("display_name"), Some(&json!("Real title")));
-
-        // A whitespace-only name is as blank as a null one. An implementation testing
-        // only for null fails here.
-        let out = note(json!({"kind": "observation", "name": "   ", "content": "derived"}));
-        assert_eq!(out.get("display_name"), Some(&json!("derived")));
-
-        // Whitespace-only content yields no label rather than an empty one.
-        let out = note(json!({"kind": "observation", "name": Value::Null, "content": "   \n\n"}));
-        assert_eq!(out.get("display_name"), None);
-
-        // A long first line is capped and marked, so a listing column stays readable.
-        let long = "x".repeat(DERIVED_LABEL_MAX_CHARS + 10);
-        let out = note(json!({"kind": "observation", "name": Value::Null, "content": long}));
-        let label = out
-            .get("display_name")
-            .and_then(Value::as_str)
-            .expect("a long line still yields a label");
-        assert_eq!(label.chars().count(), DERIVED_LABEL_MAX_CHARS + 1);
-        assert!(label.ends_with('\u{2026}'), "got {label}");
-    }
-}
+#[path = "common_note_projection_tests.rs"]
+mod note_projection_tests;
 
 #[cfg(test)]
 #[path = "common/bulk_kind_tests.rs"]

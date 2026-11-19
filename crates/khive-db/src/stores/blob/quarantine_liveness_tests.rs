@@ -1,4 +1,8 @@
-use super::{blob_gc_unowned_attachment_predicate, FsBlobStore};
+use super::{
+    blob_gc_unowned_attachment_predicate, blob_root_key, claim_blob_gc_batch,
+    parse_blob_gc_claim_rows, release_blob_gc_batch, FsBlobStore,
+};
+use crate::StorageBackend;
 use khive_storage::BlobStore;
 use rusqlite::{params, Connection};
 
@@ -161,4 +165,156 @@ async fn quarantine_liveness_predicate_keeps_quarantined_blob_live() {
         vec![orphan.to_string()],
         "only the independent orphan may be selected after quarantine migration"
     );
+}
+
+#[tokio::test]
+async fn quarantine_ownership_reaches_the_actual_gc_batch_claim_and_dry_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path().join("blobs"), 0).unwrap();
+    let canonical = store.put(b"canonical owner".to_vec()).await.unwrap();
+    let quarantined = store.put(b"quarantine owner".to_vec()).await.unwrap();
+    let orphan = store.put(b"real orphan".to_vec()).await.unwrap();
+    let grace = store.put(b"grace orphan".to_vec()).await.unwrap();
+    let backend = StorageBackend::memory().expect("isolated batch database");
+    backend
+        .prepare_core_schema()
+        .expect("actual complete core schema");
+    let owner = "33333333-3333-4333-8333-333333333333";
+    let quarantine_owner = "44444444-4444-4444-8444-444444444444";
+    let role = "quarantine-original\u{85}";
+    {
+        let writer = backend.pool().writer().unwrap();
+        writer.conn().execute(
+            "INSERT INTO attachments (record_uuid, substrate, role, content_ref, media_type, size_bytes, created_at) VALUES (?1, 'note', 'message-attachment:0', ?2, NULL, 15, 1)",
+            params![owner, canonical.as_str()],
+        ).unwrap();
+        writer.conn().execute(
+            "INSERT INTO attachment_quarantine (record_uuid, substrate, role, content_ref, media_type, size_bytes, created_at, reason) VALUES (?1, 'note', ?2, ?3, NULL, 16, 2, 'invalid_role')",
+            params![quarantine_owner, role, quarantined.as_str()],
+        ).unwrap();
+    }
+    let snapshot = || {
+        let writer = backend.pool().writer().unwrap();
+        let canonical_row: (String, String, String) = writer
+            .conn()
+            .query_row(
+                "SELECT record_uuid, role, content_ref FROM attachments",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let quarantine_row: (String, String, String, String) = writer
+            .conn()
+            .query_row(
+                "SELECT record_uuid, role, content_ref, reason FROM attachment_quarantine",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        (canonical_row, quarantine_row)
+    };
+    let before = snapshot();
+    assert_eq!(
+        before.0,
+        (
+            owner.to_string(),
+            "message-attachment:0".into(),
+            canonical.to_string()
+        )
+    );
+    assert_eq!(
+        before.1,
+        (
+            quarantine_owner.to_string(),
+            role.into(),
+            quarantined.to_string(),
+            "invalid_role".into()
+        )
+    );
+    let sql = backend.sql();
+    let root_key = blob_root_key(store.root());
+    let candidates = vec![
+        (quarantined.clone(), false),
+        (orphan.clone(), false),
+        (canonical.clone(), false),
+        (grace.clone(), true),
+    ];
+    // Exercise the internal claim seam without weakening public sweep admission.
+    let dry_run = claim_blob_gc_batch(sql.as_ref(), root_key.clone(), &candidates, true)
+        .await
+        .expect("actual quarantine-aware dry run");
+    assert_eq!(
+        dry_run.would_delete, 1,
+        "only the independent orphan is eligible"
+    );
+    assert_eq!(dry_run.grace_period_skipped, 1);
+    assert!(dry_run.claimed_rows.is_empty());
+    let claims: i64 = backend
+        .pool()
+        .writer()
+        .unwrap()
+        .conn()
+        .query_row("SELECT COUNT(*) FROM blob_gc_claims", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(claims, 0, "dry run writes no claims");
+    assert_eq!(snapshot(), before);
+
+    let claimed = claim_blob_gc_batch(sql.as_ref(), root_key.clone(), &candidates, false)
+        .await
+        .expect("actual quarantine-aware claim");
+    assert_eq!(claimed.would_delete, 1);
+    assert_eq!(claimed.grace_period_skipped, 1);
+    assert_eq!(
+        parse_blob_gc_claim_rows(claimed.claimed_rows).unwrap(),
+        vec![orphan]
+    );
+    assert_eq!(snapshot(), before, "claiming preserves both owners exactly");
+    for (reference, bytes) in [
+        (&canonical, b"canonical owner".as_slice()),
+        (&quarantined, b"quarantine owner".as_slice()),
+        (&grace, b"grace orphan".as_slice()),
+    ] {
+        assert_eq!(
+            store.get_bounded_verified(reference, 64).await.unwrap(),
+            bytes
+        );
+    }
+    release_blob_gc_batch(sql.as_ref(), root_key.clone())
+        .await
+        .unwrap();
+    {
+        let writer = backend.pool().writer().unwrap();
+        assert_eq!(
+            writer
+                .conn()
+                .execute(
+                    "DELETE FROM attachment_quarantine WHERE record_uuid = ?1",
+                    [quarantine_owner],
+                )
+                .unwrap(),
+            1
+        );
+    }
+    let released = claim_blob_gc_batch(
+        sql.as_ref(),
+        root_key.clone(),
+        &[(quarantined.clone(), false)],
+        false,
+    )
+    .await
+    .expect("detached quarantine ownership becomes claimable");
+    assert_eq!(released.would_delete, 1);
+    assert_eq!(
+        parse_blob_gc_claim_rows(released.claimed_rows).unwrap(),
+        vec![quarantined]
+    );
+    release_blob_gc_batch(sql.as_ref(), root_key).await.unwrap();
+    let claims: i64 = backend
+        .pool()
+        .writer()
+        .unwrap()
+        .conn()
+        .query_row("SELECT COUNT(*) FROM blob_gc_claims", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(claims, 0);
 }

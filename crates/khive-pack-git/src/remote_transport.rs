@@ -6,10 +6,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine;
+use khive_runtime::bounded_read::read_to_end_bounded_async;
 use serde_json::{json, Value};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::process::Command;
 use zeroize::Zeroizing;
+
+use crate::git_env;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteError {
@@ -61,19 +64,8 @@ pub struct GhTransport {
 
 fn isolated(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
-    command.env_clear();
-    if let Some(path) = std::env::var_os("PATH") {
-        command.env("PATH", path);
-    }
+    git_env::apply_shared_env(command.as_std_mut());
     command
-        .env("LC_ALL", "C")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_ATTR_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_NO_LAZY_FETCH", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -81,23 +73,20 @@ fn isolated(program: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
+/// Settings only the remote transport carries, passed after `git_env::SHARED_SETTINGS`.
+const TRANSPORT_SETTINGS: &[&str] = &[
+    "protocol.https.allow=always",
+    "http.sslVerify=true",
+    "http.followRedirects=false",
+    "http.extraHeader=",
+    "push.followTags=false",
+    "push.recurseSubmodules=no",
+];
+
 fn git_command(program: &Path, repo: &Path, token: Option<&str>) -> Command {
     let mut command = isolated(program.as_os_str());
-    for setting in [
-        "core.hooksPath=/dev/null",
-        "core.fsmonitor=false",
-        "commit.gpgsign=false",
-        "credential.helper=",
-        "core.sshCommand=/usr/bin/false",
-        "protocol.allow=never",
-        "protocol.https.allow=always",
-        "http.sslVerify=true",
-        "http.followRedirects=false",
-        "http.extraHeader=",
-        "push.followTags=false",
-        "push.recurseSubmodules=no",
-    ] {
-        command.args(["-c", setting]);
+    for setting in git_env::SHARED_SETTINGS.iter().chain(TRANSPORT_SETTINGS) {
+        command.arg("-c").arg(setting);
     }
     if let Some(token) = token {
         let clear = Zeroizing::new(format!("x-access-token:{token}"));
@@ -112,13 +101,10 @@ fn git_command(program: &Path, repo: &Path, token: Option<&str>) -> Command {
     command
 }
 
-async fn bounded(mut pipe: impl AsyncRead + Unpin, limit: u64) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    (&mut pipe).take(limit + 1).read_to_end(&mut bytes).await?;
-    if bytes.len() as u64 > limit {
-        return Err(std::io::Error::other("remote output exceeded limit"));
-    }
-    Ok(bytes)
+async fn bounded(pipe: impl AsyncRead + Unpin, limit: u64) -> std::io::Result<Vec<u8>> {
+    read_to_end_bounded_async(pipe, limit)
+        .await?
+        .ok_or_else(|| std::io::Error::other("remote output exceeded limit"))
 }
 
 async fn run(
@@ -437,155 +423,5 @@ fn redact(value: Value, token: &str) -> Value {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn graphql_review_read_binds_variables_and_rejects_partial_errors() {
-        if crate::test_process::run_in_child() {
-            return;
-        }
-
-        use std::os::unix::fs::PermissionsExt;
-        let _lock = crate::cache::ENV_MUTEX.lock().await;
-        struct RestorePath(Option<std::ffi::OsString>);
-        impl Drop for RestorePath {
-            fn drop(&mut self) {
-                if let Some(path) = &self.0 {
-                    std::env::set_var("PATH", path);
-                } else {
-                    std::env::remove_var("PATH");
-                }
-            }
-        }
-        let _restore = RestorePath(std::env::var_os("PATH"));
-        let dir = tempfile::tempdir().unwrap();
-        let quoted = |name: &str| {
-            format!(
-                "'{}'",
-                dir.path()
-                    .join(name)
-                    .display()
-                    .to_string()
-                    .replace('\'', "'\\''")
-            )
-        };
-        std::fs::write(dir.path().join("gh"), format!(
-            "#!/bin/sh\n[ \"$GH_TOKEN\" = 'fixture-secret' ] || exit 91\n/bin/cat > {}\nprintf '%s\\n' \"$@\" > {}\n/bin/cat {}\n",
-            quoted("request"), quoted("argv"), quoted("response"),
-        )).unwrap();
-        std::fs::set_permissions(
-            dir.path().join("gh"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-        // Keep real tools available inside this isolated case while shadowing gh.
-        let shimmed = match std::env::var_os("PATH") {
-            Some(prior) => {
-                let mut paths = vec![dir.path().to_path_buf()];
-                paths.extend(std::env::split_paths(&prior));
-                std::env::join_paths(paths).unwrap()
-            }
-            None => dir.path().as_os_str().to_os_string(),
-        };
-        std::env::set_var("PATH", shimmed);
-        assert!(
-            std::process::Command::new("git")
-                .arg("--version")
-                .output()
-                .is_ok_and(|out| out.status.success()),
-            "this isolated case must leave real git resolvable alongside its gh shim"
-        );
-        let pr = json!({"headRefOid":"a".repeat(40),"reviewDecision":"APPROVED"});
-        let data = json!({"data":{"repository":{"pullRequest":pr}}});
-        for (response, expected) in [
-            (format!("HTTP/2.0 200 OK\n\n{data}"), Ok(pr.clone())),
-            (
-                format!(
-                    "HTTP/2.0 200 OK\n\n{}",
-                    json!({"data":data["data"],"errors":[{"message":"denied fixture-secret"}]})
-                ),
-                Err(RemoteError::InvalidResponse),
-            ),
-            (
-                "HTTP/2.0 200 OK\n\n{\"data\":{\"repository\":null}}".into(),
-                Err(RemoteError::InvalidResponse),
-            ),
-            (
-                "HTTP/2.0 503 Unavailable\n\n{}".into(),
-                Err(RemoteError::Unavailable),
-            ),
-        ] {
-            std::fs::write(dir.path().join("response"), response).unwrap();
-            let actual = GhTransport::new("git".into())
-                .review_decision("fixture-secret", "owner/project", 42)
-                .await;
-            assert_eq!(actual, expected);
-            assert!(!format!("{actual:?}").contains("fixture-secret"));
-            let request: Value =
-                serde_json::from_slice(&std::fs::read(dir.path().join("request")).unwrap())
-                    .unwrap();
-            assert_eq!(
-                request["variables"],
-                json!({"owner":"owner","name":"project","number":42})
-            );
-            let query = request["query"].as_str().unwrap();
-            assert!(query.starts_with("query("));
-            assert!(query.contains("headRefOid reviewDecision"));
-            assert!(!request.to_string().contains("fixture-secret"));
-            let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
-            assert!(argv.contains("--method\nPOST\n"));
-            assert!(argv.ends_with("--input\n-\ngraphql\n"));
-            assert!(!argv.contains("fixture-secret"));
-        }
-    }
-
-    #[test]
-    fn api_redacts_json_escaped_credentials_in_keys_and_values() {
-        let response = b"HTTP/2.0 200 OK\r\n\r\n{\"s\\u0065cret\": [\"prefix secret suffix\", {\"nested\": \"s\\u0065cret\"}]}";
-        let value = parse_api_response(true, response.to_vec(), "secret", true).unwrap();
-        assert_eq!(
-            value,
-            json!({"[redacted]": ["prefix [redacted] suffix", {"nested":"[redacted]"}]})
-        );
-        assert!(!value.to_string().contains("secret"));
-    }
-
-    #[test]
-    fn api_ambiguous_effect_replies_are_unknown_and_explicit_refusals_are_not() {
-        for response in [
-            b"HTTP/2.0 503 Unavailable\n\n{}".as_slice(),
-            b"HTTP/2.0 200 OK\n\nnot-json",
-            b"no response headers",
-        ] {
-            assert_eq!(
-                parse_api_response(true, response.to_vec(), "secret", true),
-                Err(RemoteError::Unknown)
-            );
-        }
-        assert_eq!(
-            parse_api_response(
-                false,
-                b"HTTP/2.0 409 Conflict\n\n{}".to_vec(),
-                "secret",
-                true
-            ),
-            Err(RemoteError::Refused)
-        );
-        assert_eq!(
-            parse_api_response(false, b"HTTP/2.0 200 OK\n\n{}".to_vec(), "secret", true),
-            Err(RemoteError::Unknown)
-        );
-        assert_eq!(
-            parse_api_response(
-                true,
-                b"HTTP/2.0 200 OK\n\nnot-json".to_vec(),
-                "secret",
-                false
-            ),
-            Err(RemoteError::InvalidResponse)
-        );
-    }
-}
+#[path = "remote_transport_tests.rs"]
+mod tests;

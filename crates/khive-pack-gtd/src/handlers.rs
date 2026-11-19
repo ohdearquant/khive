@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::note_write::NoteWriteOptions;
+use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
 use khive_runtime::time_anchor::anchor_date_to_earliest_instant;
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, Resolved, RuntimeError};
 use khive_storage::note::{FilterOp, NoteFilter, NoteTagMode, PropertyFilter};
@@ -33,12 +34,13 @@ use crate::schema::{
 use crate::GtdPack;
 
 fn idempotency_conflict(key: &str, existing_id: Uuid) -> RuntimeError {
+    let key = mask_for_redaction_surface(RedactionSurface::GateProbe, key);
     KhiveError::conflict(format!(
         "idempotency_key_conflict: key {key:?} already exists; stored content differs (existing task {existing_id})"
     ))
     .with_details(Details::new_owned([
         ("reason", "idempotency_key_conflict".into()),
-        ("key", key.to_owned()),
+        ("key", key.into_owned()),
         ("existing_id", existing_id.to_string()),
     ]))
     .into()
@@ -74,7 +76,7 @@ pub async fn ensure_audit_schema(runtime: &KhiveRuntime) {
     // `INSERT ... namespace` doesn't silently fail on legacy schemas.
     let rows = match w
         .query_all(SqlStatement {
-            sql: "PRAGMA table_info(gtd_lifecycle_audit)".into(),
+            sql: khive_runtime::sql!("task-lifecycle-audit-table-info").into(),
             params: vec![],
             label: Some("gtd_audit_schema_info".into()),
         })
@@ -93,7 +95,7 @@ pub async fn ensure_audit_schema(runtime: &KhiveRuntime) {
 
     if !has_namespace {
         if let Err(e) = w
-            .execute_script("ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespace TEXT".into())
+            .execute_script(khive_runtime::sql!("task-lifecycle-audit-add-namespace").into())
             .await
         {
             tracing::warn!(
@@ -137,10 +139,7 @@ pub async fn write_audit_record_with_status(
 ) -> bool {
     let now = Utc::now().timestamp_micros();
     let stmt = SqlStatement {
-        sql: "INSERT INTO gtd_lifecycle_audit \
-              (note_id, from_state, to_state, note, at, namespace) \
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-            .into(),
+        sql: khive_runtime::sql!("task-lifecycle-audit-insert").into(),
         params: vec![
             SqlValue::Text(note_id.as_hyphenated().to_string()),
             SqlValue::Text(from.to_string()),
@@ -255,6 +254,8 @@ pub struct CompleteParams {
     status: Option<String>,
     #[serde(default)]
     ignore_dependencies: bool,
+    #[serde(default)]
+    duplicate_of: Option<String>,
 }
 
 /// Validates the target terminal status for `complete()`.
@@ -264,7 +265,8 @@ fn complete_target_status(status: Option<&str>) -> Result<&'static str, RuntimeE
         None | Some("done") => Ok("done"),
         Some("cancelled") => Ok("cancelled"),
         Some(other) => Err(RuntimeError::InvalidInput(format!(
-            "complete: status must be \"done\" or \"cancelled\"; got {other:?}"
+            "complete: status must be \"done\" or \"cancelled\"; got {:?}",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, other)
         ))),
     }
 }
@@ -288,6 +290,8 @@ struct TasksParams {
     limit: Option<u32>,
     #[serde(default)]
     offset: Option<u32>,
+    #[serde(default)]
+    duplicate_of: Option<String>,
 }
 
 /// ADR-099 B3: `pub` for the same reason as `CompleteParams` above —
@@ -301,14 +305,16 @@ pub struct TransitionParams {
     note: Option<String>,
     #[serde(default)]
     ignore_dependencies: bool,
+    #[serde(default)]
+    duplicate_of: Option<String>,
 }
+
+#[path = "duplicate.rs"]
+pub mod duplicate;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params)
-        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
-}
+use khive_runtime::deser_params as deser;
 
 /// #2679: merge the shared `khive_storage::types::LimitReport`
 /// (`requested_limit`, `effective_limit`, `limit_clamped = requested >
@@ -331,6 +337,31 @@ fn insert_limit_report(response: &mut Value, requested: u32, effective: u32) {
 
 fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
+}
+
+/// Rename an accepted parameter-name alias to its canonical name.
+///
+/// Callers repeatedly send the sibling verb's spelling (`gtd.transition(to=)`,
+/// `gtd.assign(content=)`, `gtd.complete(note=)`). The rename runs before the
+/// strict parameter struct is deserialized, so the struct keeps refusing every
+/// other unknown field exactly as before and its field list stays the schema.
+/// Supplying both spellings is refused even when the values agree, so a call has
+/// one reading; an explicit `null` counts as supplied. A non-object payload is
+/// left for the struct's own refusal.
+fn fold_alias(params: &mut Value, canonical: &str, alias: &str) -> Result<(), RuntimeError> {
+    let Some(map) = params.as_object_mut() else {
+        return Ok(());
+    };
+    if map.contains_key(canonical) && map.contains_key(alias) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "`{alias}` is an alias for `{canonical}`; supply only one of the two, \
+             even when the values agree"
+        )));
+    }
+    if let Some(value) = map.remove(alias) {
+        map.insert(canonical.to_string(), value);
+    }
+    Ok(())
 }
 
 /// Resolve a task-create reference as a full UUID or 8+ hex prefix.
@@ -356,7 +387,8 @@ pub async fn resolve_uuid(
         };
     }
     Err(RuntimeError::InvalidInput(format!(
-        "invalid UUID (expected full UUID or 8+ hex prefix): {s:?}"
+        "invalid UUID (expected full UUID or 8+ hex prefix): {:?}",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, s)
     )))
 }
 
@@ -376,7 +408,8 @@ async fn resolve_lifecycle_uuid(s: &str, runtime: &KhiveRuntime) -> Result<Uuid,
         };
     }
     Err(RuntimeError::InvalidInput(format!(
-        "invalid UUID (expected full UUID or 8+ hex prefix): {s:?}"
+        "invalid UUID (expected full UUID or 8+ hex prefix): {:?}",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, s)
     )))
 }
 
@@ -396,7 +429,8 @@ pub(crate) async fn resolve_context_entity_id(
         RuntimeError::InvalidInput(format!(
             "context_entity_id must be a full UUID because a short prefix would require a \
              primary-namespace resolution and this field stores an explicit stable entity \
-             reference; got {raw:?}"
+             reference; got {:?}",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, raw)
         ))
     })?;
 
@@ -425,12 +459,12 @@ pub(crate) async fn resolve_context_entity_id(
 /// Property filters that select this value must use `FilterOp::TextEqOrNonText`
 /// (not plain `Eq`) so their SQL predicate mirrors [`task_status`]'s exact
 /// `CASE` semantics for absent, JSON-null, and non-text legacy values.
-const DEFAULT_STATUS: &str = "inbox";
+pub(crate) const DEFAULT_STATUS: &str = "inbox";
 
-/// Priority a task is treated as when the `priority` property is missing/empty.
-/// An explicit default-priority filter uses `FilterOp::EqOrMissing` so legacy
-/// rows without the property remain visible.
-const DEFAULT_PRIORITY: &str = "p2";
+/// Priority projected when the `priority` property is missing or non-text.
+/// An explicit default-priority filter uses `FilterOp::TextEqOrNonText` to
+/// match that fallback; empty and unknown strings retain their stored values.
+pub(crate) const DEFAULT_PRIORITY: &str = "p2";
 
 /// Status used internally on a task. Defaults to "inbox" when missing or non-string.
 fn task_status(props: Option<&Value>) -> String {
@@ -459,6 +493,7 @@ fn lifecycle_write_conflict(
     note_id: Uuid,
     expected_status: &str,
     actual_status: &str,
+    duplicate_of: Option<Uuid>,
 ) -> RuntimeError {
     if is_terminal(actual_status) {
         RuntimeError::InvalidInput(format!(
@@ -470,6 +505,16 @@ fn lifecycle_write_conflict(
             "{operation}: task {} changed from expected state {expected_status:?} to \
              {actual_status:?}; retry with fresh state",
             short_id(note_id)
+        ))
+    } else if let Some(partner) = duplicate_of {
+        // The partner guard shares the write's predicate, so a zero-row write with the
+        // source still in its decided state may mean the partner is gone instead.
+        RuntimeError::InvalidInput(format!(
+            "{operation}: nothing was written; task {} changed after the lifecycle decision \
+             while remaining in state {actual_status:?}, or duplicate partner {} is no longer \
+             a live task; retry with fresh state",
+            short_id(note_id),
+            short_id(partner)
         ))
     } else {
         RuntimeError::InvalidInput(format!(
@@ -587,260 +632,14 @@ pub(crate) fn parse_due(value: &str, tz: Tz) -> Result<String, RuntimeError> {
             });
     }
     Err(RuntimeError::InvalidInput(format!(
-        "due must be ISO-8601 (e.g., 2026-06-01T00:00:00Z or 2026-06-01); got {value:?}"
+        "due must be ISO-8601 (e.g., 2026-06-01T00:00:00Z or 2026-06-01); got {:?}",
+        mask_for_redaction_surface(RedactionSurface::GateProbe, value)
     )))
 }
 
 #[cfg(test)]
-mod parse_due_tests {
-    use super::*;
-    use chrono::TimeZone;
-
-    // America/New_York (used for the west-of-UTC and general DST coverage in
-    // tests/assign.rs) never transitions at local midnight, so it cannot
-    // exercise LocalResult::None or ::Ambiguous — a "DST test" against it
-    // passes without touching the rule ADR-169 D1 actually specifies. The
-    // zones and dates below are ADR-169's own worked table (measured against
-    // the IANA database) of zones that DO transition at 00:00.
-
-    #[test]
-    fn date_only_due_resolves_to_first_instant_when_local_midnight_does_not_exist_havana() {
-        let tz: Tz = "America/Havana".parse().expect("known IANA zone");
-        let result = parse_due("2021-03-14", tz).expect(
-            "a gap date must resolve to the first instant of that date, not error (ADR-169 D1)",
-        );
-        let parsed = DateTime::parse_from_rfc3339(&result).unwrap();
-        assert_eq!(
-            parsed.date_naive(),
-            chrono::NaiveDate::from_ymd_opt(2021, 3, 14).unwrap(),
-            "got {result}"
-        );
-        assert!(
-            parsed.time() > chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
-            "local midnight does not exist on this date, so the resolved instant must be \
-             strictly after 00:00 — proving the gap was bridged forward, not unwrapped to UTC; \
-             got {result}"
-        );
-    }
-
-    #[test]
-    fn date_only_due_resolves_to_first_instant_when_local_midnight_does_not_exist_santiago() {
-        let tz: Tz = "America/Santiago".parse().expect("known IANA zone");
-        let result = parse_due("2021-09-05", tz).expect(
-            "a gap date must resolve to the first instant of that date, not error (ADR-169 D1)",
-        );
-        let parsed = DateTime::parse_from_rfc3339(&result).unwrap();
-        assert_eq!(
-            parsed.date_naive(),
-            chrono::NaiveDate::from_ymd_opt(2021, 9, 5).unwrap(),
-            "got {result}"
-        );
-        assert!(
-            parsed.time() > chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
-            "got {result}"
-        );
-    }
-
-    // The two tests above assert only that the resolved time is after 00:00.
-    // That is too weak to separate "the first instant on this date" from "some
-    // instant on this date": both zones' gaps begin exactly at local midnight,
-    // so a projection under the previous offset and a true least-instant search
-    // agree there and either implementation passes. The test below uses a zone
-    // whose gap begins BEFORE midnight, where the two rules give different
-    // answers, and asserts the least-instant property itself.
-    #[test]
-    fn date_only_due_resolves_to_the_least_instant_when_the_gap_begins_before_midnight_toronto() {
-        let tz: Tz = "America/Toronto".parse().expect("known IANA zone");
-        // On 1919-03-31 the clock jumped from 23:30 on the previous date to
-        // 00:30, so local midnight never occurred and the first instant of the
-        // date is 00:30 -04:00 = 04:30Z. Reading the previous day's offset
-        // (-05:00) and projecting midnight forward gives 05:00Z instead, which
-        // is on the right date and thirty minutes late.
-        let result = parse_due("1919-03-31", tz)
-            .expect("a gap date must resolve to the first instant of that date (ADR-169 D1)");
-        let parsed = DateTime::parse_from_rfc3339(&result).unwrap();
-
-        assert_eq!(
-            parsed.to_utc(),
-            chrono::NaiveDate::from_ymd_opt(1919, 3, 31)
-                .unwrap()
-                .and_hms_opt(4, 30, 0)
-                .unwrap()
-                .and_utc(),
-            "must be the FIRST instant of the date (04:30Z), not the instant local midnight \
-             would have had under the previous offset (05:00Z); got {result}"
-        );
-
-        // The least-instant property, asserted directly rather than by
-        // comparing against a constant: one second earlier must already be a
-        // different local date. This is what fails for the projected answer,
-        // since 04:59:59Z is still 1919-03-31 locally.
-        let one_second_earlier = parsed.to_utc() - chrono::Duration::seconds(1);
-        assert_ne!(
-            tz.from_utc_datetime(&one_second_earlier.naive_utc())
-                .date_naive(),
-            chrono::NaiveDate::from_ymd_opt(1919, 3, 31).unwrap(),
-            "the instant one second before the resolved one must belong to a different local \
-             date, or the resolved instant was not the least one; got {result}"
-        );
-    }
-
-    #[test]
-    fn date_only_due_picks_the_earlier_instant_when_local_midnight_occurs_twice_havana() {
-        let tz: Tz = "America/Havana".parse().expect("known IANA zone");
-        let date = chrono::NaiveDate::from_ymd_opt(2020, 11, 1).unwrap();
-        let midnight = date.and_hms_opt(0, 0, 0).unwrap();
-        // Derived directly from chrono_tz, independent of parse_due, so this
-        // is a cross-check against the library's own contract rather than a
-        // restatement of parse_due's internals.
-        let (earliest, latest) = match tz.from_local_datetime(&midnight) {
-            chrono::LocalResult::Ambiguous(a, b) => (a, b),
-            other => panic!(
-                "2020-11-01 in America/Havana must be ambiguous per ADR-169's worked table; \
-                 got {other:?}"
-            ),
-        };
-        assert!(
-            earliest < latest,
-            "sanity: chrono's `earliest` must be chronologically first"
-        );
-
-        let result =
-            parse_due("2020-11-01", tz).expect("an ambiguous date must resolve, not error");
-        let parsed = DateTime::parse_from_rfc3339(&result).unwrap();
-        assert_eq!(
-            parsed, earliest,
-            "parse_due must pick the earlier of the two midnight instants (ADR-169 D1); got {result}"
-        );
-    }
-
-    // Pacific/Apia jumped from UTC-11 to UTC+13 on 2011-12-30, skipping that
-    // calendar date entirely in local time — not a sub-day gap but a
-    // whole-day one, which ADR-169 D1's worked examples do not name. No
-    // instant anywhere maps to this date in this zone, so parse_due errors
-    // rather than silently resolving to a neighboring date under a
-    // mislabeled due-date.
-    #[test]
-    fn date_only_due_in_a_skipped_local_day_is_rejected() {
-        let tz: Tz = "Pacific/Apia".parse().expect("known IANA zone");
-        let err = parse_due("2011-12-30", tz).expect_err("2011-12-30 never existed in Apia");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("2011-12-30"),
-            "error must name the unparseable due date; got: {msg}"
-        );
-    }
-
-    /// `%Y` accepts chrono's full signed year range, so a caller can name the
-    /// minimum date, whose ±48h anchor window runs off the end of
-    /// `NaiveDateTime`. chrono's `-` PANICS there, and the input arrives
-    /// through a public verb, so that was reachable availability denial.
-    ///
-    /// The right outcome is not a rejection. In a zone east of UTC the minimum
-    /// date has no representable local midnight, but later local times on it
-    /// do exist, so the date HAS a least representable instant and the
-    /// least-instant contract can be honoured. Assert that instant, which also
-    /// keeps this a panic regression test: bare arithmetic here still aborts.
-    #[test]
-    fn the_minimum_date_resolves_to_its_least_representable_instant_east_of_utc() {
-        let tz: Tz = "Pacific/Apia".parse().expect("known IANA zone");
-        let out = parse_due("-262143-01-01", tz)
-            .expect("the minimum date has representable instants in a positive-offset zone");
-        assert!(
-            out.starts_with("-262143-01-01T12:33:04"),
-            "must be the least representable instant carrying that local date, which is \
-             chrono's minimum instant seen through Apia's +12:33:04 offset; got: {out}"
-        );
-    }
-
-    /// The returned instant is not merely valid, it is chrono's minimum. That
-    /// is what makes it the LEAST instant carrying the date: the usual
-    /// one-second-earlier check cannot be written here, because one second
-    /// earlier does not exist.
-    #[test]
-    fn the_minimum_date_anchors_exactly_at_the_minimum_instant_east_of_utc() {
-        let tz: Tz = "Pacific/Apia".parse().expect("known IANA zone");
-        let resolved = super::anchor_date_to_earliest_instant(chrono::NaiveDate::MIN, tz)
-            .expect("the minimum date has representable instants east of UTC");
-        assert_eq!(
-            resolved.naive_utc(),
-            chrono::NaiveDateTime::MIN,
-            "no representable instant precedes this one, so it is the least"
-        );
-    }
-
-    /// The same boundary from the other side, and it takes a DIFFERENT path.
-    /// Zone names mislead here: `America/Adak` reads as west of UTC but its
-    /// earliest LMT is +12:13:22, because it crossed the date line. Zones that
-    /// are genuinely negative at the minimum instant have a representable
-    /// local midnight (UTC = midnight + |offset|), so they resolve through the
-    /// direct branch and never reach the lower-bound short-circuit. Offsets
-    /// measured at `NaiveDateTime::MIN`: New York -4:56:02, Los Angeles
-    /// -7:52:58, Honolulu -10:31:26.
-    #[test]
-    fn the_minimum_date_resolves_in_genuinely_negative_offset_zones() {
-        for name in [
-            "America/New_York",
-            "America/Los_Angeles",
-            "Pacific/Honolulu",
-        ] {
-            let tz: Tz = name.parse().expect("known IANA zone");
-            let out = parse_due("-262143-01-01", tz)
-                .unwrap_or_else(|e| panic!("{name}: minimum date must resolve, got {e}"));
-            assert!(
-                out.starts_with("-262143-01-01T00:00:00"),
-                "{name}: a representable local midnight anchors the date directly; got: {out}"
-            );
-        }
-    }
-
-    /// The guard this replaced asked "is the +/-48h window representable" of
-    /// EVERY date, but only the skipped-midnight branch searches that window.
-    /// So it rejected the extremes of the representable range even where local
-    /// midnight resolves directly to a single instant.
-    ///
-    /// Both ends, and zones on both sides of UTC: the offset's SIGN decides
-    /// which end is at risk, so a single-zone test would confirm one direction
-    /// and infer the other. `Pacific/Apia` is east of UTC, `America/Adak` west.
-    #[test]
-    fn the_extremes_of_the_representable_range_resolve_when_local_midnight_exists() {
-        for name in ["UTC", "Pacific/Apia", "Pacific/Midway", "America/Adak"] {
-            let tz: Tz = name.parse().expect("known IANA zone");
-            let out = parse_due("+262142-12-31", tz)
-                .unwrap_or_else(|e| panic!("{name}: the maximum date must resolve, got {e}"));
-            assert!(
-                out.starts_with("+262142-12-31T00:00:00"),
-                "{name}: the maximum date anchors to its own local midnight; got: {out}"
-            );
-        }
-
-        // The minimum date takes the SEARCHING branch in zones east of UTC:
-        // converting its local midnight to UTC would run off the end of the
-        // range, and chrono-tz reports that as no valid local time. That case
-        // is asserted above, where it resolves to the least representable
-        // instant. The case here is UTC, where local midnight exists, so the
-        // direct branch must still succeed at the bottom of the range.
-        let utc: Tz = "UTC".parse().expect("known IANA zone");
-        let out = parse_due("-262143-01-01", utc)
-            .expect("the minimum date must resolve in UTC, where its midnight exists");
-        assert!(
-            out.starts_with("-262143-01-01T00:00:00"),
-            "the minimum date anchors to its own local midnight in UTC; got: {out}"
-        );
-    }
-
-    /// The must-not-fire half. Without it the assertion above could pass
-    /// against a resolver that rejected every date.
-    #[test]
-    fn an_ordinary_date_still_resolves() {
-        let tz: Tz = "Pacific/Apia".parse().expect("known IANA zone");
-        let out = parse_due("2026-08-23", tz).expect("an ordinary date must still resolve");
-        assert!(
-            out.starts_with("2026-08-23T00:00:00"),
-            "ordinary dates keep anchoring to local midnight; got: {out}"
-        );
-    }
-}
+#[path = "handlers_parse_due_tests.rs"]
+mod parse_due_tests;
 
 fn ts_to_rfc(micros: i64) -> String {
     micros_to_iso(micros)
@@ -877,7 +676,8 @@ async fn fetch_all_matching_tasks(
         property_filters,
         namespaces,
         ..Default::default()
-    };
+    }
+    .with_default_note_status(khive_storage::note::NoteStatusSelector::Active);
     let store = runtime.notes(token)?;
 
     let notes = store
@@ -955,6 +755,7 @@ async fn atomic_gtd_transition(
     target: &str,
     new_props: &serde_json::Value,
     updated_at: i64,
+    duplicate_of: Option<Uuid>,
 ) -> Result<u64, RuntimeError> {
     // The conditional UPDATE runs as a single SQLite statement, which is atomic
     // on its own — no explicit transaction is needed because the decision
@@ -966,8 +767,14 @@ async fn atomic_gtd_transition(
     // semantic status, or soft-deleted the row by the time the predicate is
     // evaluated, it fails with rows_affected = 0. The caller distinguishes
     // that loser path from the pre-load errors returned by `load_task`.
-    let statement =
-        gtd_transition_statement(snapshot, expected_current, target, new_props, updated_at)?;
+    let statement = duplicate::transition_statement(
+        snapshot,
+        expected_current,
+        target,
+        new_props,
+        updated_at,
+        duplicate_of,
+    )?;
     let sql = runtime.sql();
     let mut writer = sql
         .writer()
@@ -1011,17 +818,7 @@ pub fn gtd_transition_statement(
     let props_str = serde_json::to_string(new_props)
         .map_err(|e| RuntimeError::Internal(format!("serialize props: {e}")))?;
     Ok(SqlStatement {
-        sql: "UPDATE notes SET properties = ?1, updated_at = ?2 \
-              WHERE id = ?3 \
-              AND updated_at = ?4 \
-              AND deleted_at IS ?5 \
-              AND ?2 > updated_at \
-              AND CASE \
-                    WHEN json_type(properties, '$.status') = 'text' \
-                    THEN json_extract(properties, '$.status') \
-                    ELSE 'inbox' \
-                  END = ?6"
-            .to_string(),
+        sql: khive_runtime::sql!("task-transition-update").to_string(),
         params: vec![
             SqlValue::Text(props_str),
             SqlValue::Integer(updated_at),
@@ -1058,17 +855,7 @@ pub fn gtd_noop_assertion_statement(
         )));
     }
     Ok(SqlStatement {
-        sql: "SELECT 1 FROM notes \
-              WHERE id = ?1 \
-              AND updated_at = ?2 \
-              AND deleted_at IS ?3 \
-              AND CASE \
-                    WHEN json_type(properties, '$.status') = 'text' \
-                    THEN json_extract(properties, '$.status') \
-                    ELSE 'inbox' \
-                  END = ?4 \
-              AND version = ?5"
-            .to_string(),
+        sql: khive_runtime::sql!("task-noop-assertion").to_string(),
         params: vec![
             SqlValue::Text(snapshot.id.as_hyphenated().to_string()),
             SqlValue::Integer(snapshot.updated_at),
@@ -1134,8 +921,9 @@ pub async fn prepare_transition(
     let target = normalize_status(raw_status);
     if !is_valid_status(target) {
         return Err(RuntimeError::InvalidInput(format!(
-            "invalid status {raw_status:?} — valid: inbox, next, waiting, someday, active, done, cancelled \
-             (aliases: in_progress, todo, blocked, later, finished)"
+            "invalid status {:?} — valid: inbox, next, waiting, someday, active, done, cancelled \
+             (aliases: in_progress, todo, blocked, later, finished)",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, raw_status)
         )));
     }
     if let Some(n) = note_arg {
@@ -1346,8 +1134,9 @@ impl GtdPack {
     pub(crate) async fn handle_assign(
         &self,
         token: &NamespaceToken,
-        params: Value,
+        mut params: Value,
     ) -> Result<Value, RuntimeError> {
+        fold_alias(&mut params, "description", "content")?;
         let p: AssignParams = deser(params)?;
 
         // #625/#626: `gtd.assign` and the generic `create(kind="note",
@@ -1584,8 +1373,9 @@ impl GtdPack {
     pub(crate) async fn handle_complete(
         &self,
         token: &NamespaceToken,
-        params: Value,
+        mut params: Value,
     ) -> Result<Value, RuntimeError> {
+        fold_alias(&mut params, "result", "note")?;
         let p: CompleteParams = deser(params)?;
 
         // Decide step (ADR-099 B3 r6 second pass): validates the target
@@ -1593,7 +1383,7 @@ impl GtdPack {
         // the terminal/lifecycle guards, and computes the patched
         // `properties` value — the SAME function the ADR-099 `--atomic`
         // `gtd.complete` prepare path in `kkernel` calls.
-        let decision = prepare_complete(
+        let (decision, duplicate_of) = duplicate::prepare_complete(
             self.runtime(),
             token,
             &p.id,
@@ -1602,6 +1392,7 @@ impl GtdPack {
             DependencyOptions {
                 ignore_dependencies: p.ignore_dependencies,
             },
+            p.duplicate_of.as_deref(),
         )
         .await?;
         let CompleteDecision {
@@ -1618,9 +1409,16 @@ impl GtdPack {
         // may leave status unchanged while changing description/content or
         // other task properties; replacing its property document would lose
         // that write and can break the task-body mirror invariant.
-        let rows_affected =
-            atomic_gtd_transition(self.runtime(), &note, &current, target, &props, updated_at)
-                .await?;
+        let rows_affected = atomic_gtd_transition(
+            self.runtime(),
+            &note,
+            &current,
+            target,
+            &props,
+            updated_at,
+            duplicate_of,
+        )
+        .await?;
 
         if rows_affected == 0 {
             // Re-read status for a precise conflict class. The snapshot guard
@@ -1632,6 +1430,7 @@ impl GtdPack {
                 note.id,
                 &current,
                 &actual_now,
+                duplicate_of,
             ));
         }
 
@@ -1665,24 +1464,24 @@ impl GtdPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: TasksParams = deser(params)?;
-        // #744 → #2679: see the identical rationale in `handle_next` above — the
-        // bare-array shape stays byte-identical when unclamped; wrapping happens
-        // only when `requested_limit > limit` fires below (checked at every
-        // return site, including the `filter_excluded` object wrap further
-        // down, which already switches shape for an unrelated reason).
         let requested_limit = p.limit.unwrap_or(50);
         let limit = requested_limit.clamp(1, 200);
         let limit_clamped = requested_limit > limit;
         let offset = p.offset.unwrap_or(0);
 
         // Normalize status filter once.
-        let status_filter: Option<String> = match p.status.as_deref() {
+        let status_filter: Option<String> = match p
+            .status
+            .as_deref()
+            .or_else(|| p.duplicate_of.as_ref().map(|_| "cancelled"))
+        {
             None => None,
             Some(s) => {
                 let normalized = normalize_status(s);
                 if !is_valid_status(normalized) {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "invalid status {s:?} — valid: {}",
+                        "invalid status {:?} — valid: {}",
+                        mask_for_redaction_surface(RedactionSurface::GateProbe, s),
                         crate::schema::TASK_STATUSES.join(", ")
                     )));
                 }
@@ -1692,7 +1491,8 @@ impl GtdPack {
         if let Some(ref pri) = p.priority {
             if !is_valid_priority(pri) {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "invalid priority {pri:?} — valid: p0, p1, p2, p3"
+                    "invalid priority {:?} — valid: p0, p1, p2, p3",
+                    mask_for_redaction_surface(RedactionSurface::GateProbe, pri)
                 )));
             }
         }
@@ -1752,6 +1552,14 @@ impl GtdPack {
                 value: SqlValue::Null,
             },
         }];
+        if let Some(raw) = p.duplicate_of.as_deref() {
+            let id = resolve_lifecycle_uuid(raw, self.runtime()).await?;
+            property_filters.push(PropertyFilter {
+                json_path: "$.duplicate_of".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text(id.to_string()),
+            });
+        }
         if let Some(want) = p.assignee.as_deref() {
             property_filters.push(PropertyFilter {
                 json_path: "$.assignee".to_string(),
@@ -1760,18 +1568,15 @@ impl GtdPack {
             });
         }
         if let Some(want) = p.priority.as_deref() {
-            // Priorities are always stored lowercase (`task_create`/
-            // `prepare_transition` normalize via `to_ascii_lowercase`), so an
-            // exact-match SQL predicate on the lowercased input reproduces
-            // the prior `eq_ignore_ascii_case` behavior. A legacy task with no
-            // stored `priority` renders as `p2` (`priority_rank`,
-            // `render_task`), so `priority="p2"` must also match the missing
-            // case via `EqOrMissing` — plain `Eq` never matches SQL NULL.
+            // Canonical priorities are stored lowercase, so normalize the input.
+            // `render_task` defaults missing and non-text priorities to `p2`;
+            // match that fallback in SQL before pagination. Other stored strings
+            // retain exact matching rather than being treated as `p2`.
             let want = want.to_ascii_lowercase();
             property_filters.push(PropertyFilter {
                 json_path: "$.priority".to_string(),
                 op: if want == DEFAULT_PRIORITY {
-                    FilterOp::EqOrMissing
+                    FilterOp::TextEqOrNonText
                 } else {
                     FilterOp::Eq
                 },
@@ -1803,21 +1608,26 @@ impl GtdPack {
             tags: p.tags.unwrap_or_default(),
             tag_mode: p.tag_mode.unwrap_or_default(),
             ..Default::default()
-        };
-        let page = self
+        }
+        .with_default_note_status(khive_storage::note::NoteStatusSelector::Active);
+        let mut page = self
             .runtime()
             .notes(token)?
             .query_notes_filtered_count_free(
                 token.namespace().as_str(),
                 &filter,
                 PageRequest {
-                    limit,
+                    limit: limit + 1,
                     offset: offset.into(),
                 },
             )
             .await
             .map_err(|e| RuntimeError::Internal(format!("query_notes_filtered: {e}")))?;
 
+        let has_more = page.items.len() > limit as usize;
+        // The lookahead only witnesses continuation; it is not part of the
+        // caller's page and must not incur dependency diagnostics.
+        page.items.truncate(limit as usize);
         let diagnostics =
             crate::dependency::diagnose_tasks(self.runtime(), token, &page.items).await?;
         let result: Vec<Value> = page
@@ -1874,9 +1684,14 @@ impl GtdPack {
                 return Ok(response);
             }
         }
-        if limit_clamped {
+        if limit_clamped || has_more {
             let mut response = json!({ "tasks": result });
-            insert_limit_report(&mut response, requested_limit, limit);
+            if has_more {
+                response["has_more"] = json!(true);
+            }
+            if limit_clamped {
+                insert_limit_report(&mut response, requested_limit, limit);
+            }
             Ok(response)
         } else {
             Ok(Value::Array(result))
@@ -1886,8 +1701,9 @@ impl GtdPack {
     pub(crate) async fn handle_transition(
         &self,
         token: &NamespaceToken,
-        params: Value,
+        mut params: Value,
     ) -> Result<Value, RuntimeError> {
+        fold_alias(&mut params, "status", "to")?;
         let p: TransitionParams = deser(params)?;
 
         // Decide step (ADR-099 B3 r6 second pass): normalizes/validates the
@@ -1895,7 +1711,7 @@ impl GtdPack {
         // and either returns the idempotent no-op case or the fully computed
         // patch — the SAME function the ADR-099 `--atomic` `gtd.transition`
         // prepare path in `kkernel` calls.
-        let decision = prepare_transition(
+        let (decision, duplicate_of) = duplicate::prepare_transition(
             self.runtime(),
             token,
             &p.id,
@@ -1904,6 +1720,7 @@ impl GtdPack {
             DependencyOptions {
                 ignore_dependencies: p.ignore_dependencies,
             },
+            p.duplicate_of.as_deref(),
         )
         .await?;
 
@@ -1913,6 +1730,7 @@ impl GtdPack {
                 current,
                 target,
             } => {
+                duplicate::assert_noop(self.runtime(), &note, &current, duplicate_of).await?;
                 // Same-status is a read assertion, not a lifecycle event, so
                 // nothing is persisted. The explanation is returned under
                 // `reason`: it is not the caller's note, and returning it under
@@ -1950,6 +1768,7 @@ impl GtdPack {
                     &target,
                     &props,
                     updated_at,
+                    duplicate_of,
                 )
                 .await?;
 
@@ -1960,6 +1779,7 @@ impl GtdPack {
                         note.id,
                         &current,
                         &actual_now,
+                        duplicate_of,
                     ));
                 }
 
@@ -2004,205 +1824,69 @@ impl GtdPack {
 }
 
 #[cfg(test)]
-mod lifecycle_snapshot_tests {
+#[path = "handlers_lifecycle_snapshot_tests.rs"]
+mod lifecycle_snapshot_tests;
+
+#[cfg(test)]
+mod archive_visibility_tests {
     use super::*;
 
-    #[test]
-    fn lifecycle_revision_strictly_advances_a_future_snapshot() {
-        let future_snapshot = Utc::now()
-            .timestamp_micros()
-            .checked_add(86_400_000_000)
-            .expect("one-day future timestamp is representable");
-        assert_eq!(
-            next_lifecycle_updated_at(future_snapshot).expect("advance lifecycle revision"),
-            future_snapshot + 1
-        );
-    }
-
-    async fn seeded_task() -> (KhiveRuntime, NamespaceToken, khive_storage::note::Note) {
-        let runtime = KhiveRuntime::memory().expect("memory runtime");
-        let token = runtime
-            .authorize(khive_runtime::Namespace::local())
-            .expect("authorize local");
-        let mut task =
-            khive_storage::note::Note::new("local", "task", "canonical-lifecycle-test-task");
-        task.name = Some("canonical-lifecycle-test-task".to_string());
-        task.properties = Some(json!({"status": "inbox", "priority": "p2"}));
-        runtime
-            .notes(&token)
-            .expect("note store")
-            .upsert_note(task.clone())
-            .await
-            .expect("seed task");
-        (runtime, token, task)
-    }
-
-    async fn install_concurrent_mirrored_update(
-        runtime: &KhiveRuntime,
-        token: &NamespaceToken,
-        snapshot: &khive_storage::note::Note,
-    ) -> i64 {
-        // This is the canonical generic-note CAS seam after the task hook has
-        // synchronized the two body spellings. It starts from the very same
-        // snapshot as the lifecycle decision, then commits first.
-        let (concurrent, _) = runtime
-            .update_note_from_snapshot_with_embedding_report(
-                token,
-                snapshot.clone(),
-                khive_runtime::NotePatch::new(
-                    None,
-                    Some("concurrent mirrored body".to_string()),
-                    None,
-                    None,
-                    Some(json!({"description": "concurrent mirrored body"})),
-                ),
-            )
-            .await
-            .expect("commit concurrent canonical update");
-        concurrent.updated_at
-    }
-
-    async fn assert_concurrent_update_survived(
-        runtime: &KhiveRuntime,
-        token: &NamespaceToken,
-        task_id: Uuid,
-        concurrent_revision: i64,
-    ) {
-        let persisted = runtime
-            .notes(token)
-            .expect("note store")
-            .get_note(task_id)
-            .await
-            .expect("read task")
-            .expect("task exists");
-        assert_eq!(persisted.updated_at, concurrent_revision);
-        assert_eq!(persisted.content, "concurrent mirrored body");
-        assert_eq!(
-            persisted
-                .properties
-                .as_ref()
-                .and_then(|properties| properties.get("description"))
-                .and_then(Value::as_str),
-            Some("concurrent mirrored body")
-        );
-        assert_eq!(task_status(persisted.properties.as_ref()), "inbox");
-    }
-
     #[tokio::test]
-    async fn canonical_transition_refuses_stale_decision_snapshot() {
-        let (runtime, token, task) = seeded_task().await;
-        let decision = prepare_transition(
-            &runtime,
-            &token,
-            &task.id.as_hyphenated().to_string(),
-            "next",
-            None,
-            DependencyOptions::default(),
-        )
-        .await
-        .expect("prepare transition");
-        let TransitionDecision::Write {
-            note: snapshot,
-            current,
-            target,
-            props,
-            updated_at,
-            ..
-        } = decision
-        else {
-            panic!("inbox -> next must be a write decision");
-        };
-        assert!(updated_at > snapshot.updated_at);
-
-        let concurrent_revision =
-            install_concurrent_mirrored_update(&runtime, &token, &snapshot).await;
-        let affected =
-            atomic_gtd_transition(&runtime, &snapshot, &current, &target, &props, updated_at)
+    async fn tasks_and_next_preserve_workflow_filters_but_exclude_archived_notes() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let runtime = KhiveRuntime::memory().unwrap();
+            let token = runtime
+                .authorize(khive_runtime::Namespace::local())
+                .unwrap();
+            let mut builder = khive_runtime::VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(GtdPack::new(runtime.clone()));
+            let registry = builder.build().expect("actual GTD schema and hooks");
+            runtime.install_edge_rules(registry.all_edge_rules());
+            let mut expected = None;
+            for (status, priority, timestamp) in [("archived", "p0", 20), ("active", "p2", 10)] {
+                let mut note =
+                    khive_storage::note::Note::new("local", "task", format!("{status} task"));
+                note.status = status.into();
+                note.created_at = timestamp;
+                note.updated_at = timestamp;
+                note.properties =
+                    Some(json!({"status": "next", "priority": priority, "depends_on": []}));
+                if status == "active" {
+                    expected = Some(note.id);
+                }
+                runtime
+                    .notes(&token)
+                    .unwrap()
+                    .upsert_note(note)
+                    .await
+                    .unwrap();
+            }
+            let expected = expected.unwrap().to_string();
+            let pack = GtdPack::new(runtime);
+            let next = pack.handle_next(&token, json!({"limit": 1})).await.unwrap();
+            let next = next.as_array().unwrap();
+            assert_eq!(next.len(), 1);
+            assert_eq!(
+                next[0]["full_id"], expected,
+                "next must not prioritize an archived actionable task"
+            );
+            let tasks = pack
+                .handle_tasks(&token, json!({"status": "next", "limit": 1}))
                 .await
-                .expect("execute guarded transition");
-        assert_eq!(affected, 0, "stale transition snapshot must lose its CAS");
-        assert_concurrent_update_survived(&runtime, &token, task.id, concurrent_revision).await;
-    }
-
-    #[tokio::test]
-    async fn canonical_transition_guard_closes_soft_delete_without_revision_change() {
-        let (runtime, token, task) = seeded_task().await;
-        let decision = prepare_transition(
-            &runtime,
-            &token,
-            &task.id.as_hyphenated().to_string(),
-            "next",
-            None,
-            DependencyOptions::default(),
-        )
+                .unwrap();
+            let tasks = tasks.as_array().unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(
+                tasks[0]["full_id"], expected,
+                "tasks must apply active note status before pagination"
+            );
+            assert_eq!(
+                tasks[0]["status"], "next",
+                "workflow status remains distinct"
+            );
+        })
         .await
-        .expect("prepare transition");
-        let TransitionDecision::Write {
-            note: snapshot,
-            current,
-            target,
-            props,
-            updated_at,
-            ..
-        } = decision
-        else {
-            panic!("inbox -> next must be a write decision");
-        };
-
-        assert!(runtime
-            .notes(&token)
-            .expect("note store")
-            .delete_note(task.id, khive_storage::DeleteMode::Soft)
-            .await
-            .expect("soft delete task"));
-        let tombstone = runtime
-            .notes(&token)
-            .expect("note store")
-            .get_note_including_deleted(task.id)
-            .await
-            .expect("read tombstone")
-            .expect("tombstone exists");
-        assert_eq!(
-            tombstone.updated_at, snapshot.updated_at,
-            "legacy soft delete deliberately demonstrates why deletion marker is a separate guard"
-        );
-        assert!(tombstone.deleted_at.is_some());
-
-        let affected =
-            atomic_gtd_transition(&runtime, &snapshot, &current, &target, &props, updated_at)
-                .await
-                .expect("execute guarded transition");
-        assert_eq!(affected, 0, "soft-deleted snapshot must lose its CAS");
-    }
-
-    #[tokio::test]
-    async fn canonical_complete_refuses_stale_decision_snapshot() {
-        let (runtime, token, task) = seeded_task().await;
-        let decision = prepare_complete(
-            &runtime,
-            &token,
-            &task.id.as_hyphenated().to_string(),
-            None,
-            Some("shipped"),
-            DependencyOptions::default(),
-        )
-        .await
-        .expect("prepare complete");
-        assert!(decision.updated_at > decision.note.updated_at);
-
-        let concurrent_revision =
-            install_concurrent_mirrored_update(&runtime, &token, &decision.note).await;
-        let affected = atomic_gtd_transition(
-            &runtime,
-            &decision.note,
-            &decision.current,
-            decision.target,
-            &decision.props,
-            decision.updated_at,
-        )
-        .await
-        .expect("execute guarded complete");
-        assert_eq!(affected, 0, "stale complete snapshot must lose its CAS");
-        assert_concurrent_update_survived(&runtime, &token, task.id, concurrent_revision).await;
+        .expect("bounded actual GTD ordinary-query regression");
     }
 }

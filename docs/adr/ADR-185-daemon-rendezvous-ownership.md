@@ -450,3 +450,126 @@ The proposed implementation is in `crates/kkernel/src/supervisor.rs`
 `crates/khive-runtime/src/daemon.rs` (claim echo and daemon self-shutdown).
 The process-level acceptance tests are in
 `crates/kkernel/tests/supervisor_lifecycle.rs`.
+
+## Amendment 4 (2026-10-05): implicit markers belong to one socket
+
+An implicit global marker made a private socket inherit the default supervisor's
+startup wait and ownership lock. The declaration and all its consumers must
+instead select the same marker for the rendezvous they operate on (#4214).
+
+1. A nonempty `KHIVE_SUPERVISOR_MARKER` remains the first choice; empty is unset.
+   Without it, the resolved default socket keeps `~/.khive/khived.supervisor`,
+   including an explicit `KHIVE_SOCKET` with that exact default pathname spelling.
+   A nondefault socket appends `.supervisor-marker` to its complete pathname.
+   This preserves distinct extensions and keeps an extensionless private socket
+   named `~/.khive/khived` distinct from the default marker.
+2. Launcher publication/release, client admission, daemon claim checks and the
+   local installer use the same rule. Comparison is by pathname spelling, without
+   filesystem canonicalization. The installer derives its default socket once
+   with the same separator join as the runtime, including a trailing slash in
+   HOME, and uses it for both the socket fallback and the default comparison.
+3. Marker contents and the prior bounded wait, UUID claim, ownership, cleanup,
+   handover and lock protocols are unchanged. An unrelated marker does not delay
+   a private client; the marker for its own socket retains the existing bounded
+   suppression and degraded-bootstrap behavior.
+
+Existing default and explicit-marker deployments retain their files. An older
+private supervisor using the implicit global marker needs a controlled stop and
+upgrade: release the old marker only with its exact label and an explicit old-path
+override, then restart the upgraded participants. Never infer ownership of or
+automatically remove a global marker. An agreed explicit marker path supports a
+mixed-version private deployment during upgrade.
+
+Acceptance covers a private client's real bootstrap while the default marker
+exists, continued default-socket suppression, distinct private marker/lock paths,
+and launcher publication/release that leaves another socket's marker untouched.
+Mocked installer controls cover the same selection and explicit-override rules,
+plus trailing-slash HOME with unset, empty and explicitly default socket values.
+
+## Amendment 5 (2026-10-13): client recovery acts on one rendezvous, never signals a supervised daemon, and the daemon records how it exited
+
+**Status**: Accepted (2026-10-13)
+
+### Context
+
+Client lifecycle recovery (the path a client takes when the socket refuses: the supervisor-marker wait,
+the unmanaged grace, then kill and spawn) resolved its three paths independently. `socket_path()` came
+from `KHIVE_SOCKET`, `pid_path()` from `KHIVE_PID`, and the supervisor marker from the socket
+(Amendment 4). The daemon refuses to boot when exactly one of the two overrides is set (#2656), but no
+client applied the same rule. A client with `KHIVE_SOCKET` set to a private path and `KHIVE_PID` unset
+probed the private socket (absent), read the private socket's marker (absent, so no claim), read the
+default PID file (naming the supervised daemon, alive) and sent that daemon SIGTERM. The daemon exited
+cleanly after its drain, and its exit lines were logged at a level the daemon's default log filter
+drops, so nothing on the host said which process had stopped it.
+
+Amendment 1's degraded bootstrap lets a client start a daemon once the supervisor's bounded wait has
+passed. Nothing in this record forbade that client from signalling a live daemon on the claimed
+rendezvous first.
+
+### Decisions
+
+1. **One rendezvous.** Client lifecycle recovery runs only when the socket and the PID file belong to
+   one rendezvous: both overridden, or neither. When exactly one of `KHIVE_SOCKET` / `KHIVE_PID` is set,
+   a request whose socket does not answer is refused before any marker read, PID read, signal or spawn,
+   with reason `rendezvous_split` and `domain_disposition` `not_committed`. The error data names the
+   variable that is set, the one that is not, and both resolved paths. Forwarding to a socket that
+   answers is unchanged. The predicate is the one the daemon's boot refusal uses (`rendezvous_split()`
+   in khive-runtime), so client and daemon cannot disagree about what counts as set.
+2. **A client never signals a supervised daemon.** Before a client signals the process its PID file
+   names, it reads the marker for the same rendezvous. When a marker is present, readable or not, the
+   client does not signal: it returns `supervised_daemon_unresponsive` (`not_committed`), naming the
+   PID-file pid, the marker's job and pid, and the marker path. Degraded bootstrap still starts a daemon
+   when no live daemon holds the rendezvous; it no longer replaces one. A supervisor in a crash loop is
+   unaffected, because its daemon is dead and there is nothing to signal.
+3. **Exit record.** The daemon keeps `<pid file>.exit` in the PID file's directory with the PID file's
+   ownership rules. Right after it claims the PID file it writes `running pid=<p> started=<rfc3339>`;
+   when shutdown begins it writes `exited pid=<p> reason=<signal SIGTERM|signal SIGINT|idle|error>
+   sender_pid=<n|unknown> at=<rfc3339>`. The sender is the pid the kernel reports for the first SIGTERM
+   or SIGINT (an `SA_SIGINFO` action registered through `signal-hook-registry`, beside the handlers the
+   runtime's signal streams already use); `unknown` when the signal came from the kernel or the action
+   could not be registered. Every write goes to a temporary file in the same directory, is synced, and
+   is renamed over the record, so a reader sees the previous line or the new one and never a partial
+   one. Only the process the PID file names writes the record, and each write first checks that the PID
+   file still names it, so a replacement daemon's record is never overwritten. The `exited` line is
+   written before the drain, so a second signal that ends a blocked drain still leaves the first one on
+   record. At boot the daemon logs the previous record at WARN on the `khive.boot` target:
+   `previous exit: <line>`, or `previous incarnation pid=<p> recorded no exit (killed or crashed)` when
+   the record still says running. The shutdown line (`khived exiting`, with pid, reason and sender) is
+   logged at WARN on the same target.
+4. **Descriptor limit at boot.** Every boot logs the effective `RLIMIT_NOFILE`, soft and hard, at WARN on
+   `khive.boot`.
+
+### Consequences
+
+- A client configured with `KHIVE_SOCKET` alone forwards unchanged while its socket answers, and is
+  refused with `rendezvous_split` when recovery would be needed. Deployments that move the socket set
+  both `KHIVE_SOCKET` and `KHIVE_PID`.
+- A stale marker left after a supervisor is removed blocks recovery of a live, unresponsive daemon on
+  that rendezvous until the marker is removed; the refusal names the file.
+- Between the PID-file claim and the `running` write there is a window in which the PID file names the
+  new process and the record still holds the previous incarnation's line. A reader that sees the two
+  disagree is observing a boot in progress.
+- `signal-hook-registry` becomes a direct dependency of khive-runtime on Unix; it was already in the
+  dependency graph through tokio.
+
+### Acceptance
+
+Each mutation below was stated before it ran and turned exactly the named tests red.
+
+- `rendezvous_recovery_tests::socket_override_alone_refuses_recovery_and_leaves_the_default_daemon_alive`
+  and `pid_override_alone_refuses_recovery`: refused with `rendezvous_split`, the daemon named by the
+  PID file alive, no signal, no spawn. Control `paired_private_rendezvous_still_recovers`: the same live
+  process behind a paired rendezvous is signalled and a daemon is launched. Mutation: split check
+  removed.
+- `a_claimed_rendezvous_daemon_is_never_signalled`, `an_unreadable_marker_still_protects_the_daemon`,
+  and through the forward path `degraded_bootstrap_refuses_to_replace_a_live_supervised_daemon`: refused
+  with `supervised_daemon_unresponsive`, process alive, no SIGTERM. Control
+  `an_unclaimed_rendezvous_daemon_is_still_signalled`: without a marker the existing recovery signals
+  and replaces it. Mutation: marker guard removed.
+- `exit_records::the_exit_record_names_the_signal_and_its_sender_and_the_next_boot_reports_it`: a daemon
+  process stopped by a known sender records `reason=signal SIGTERM` and that sender's pid; the next boot
+  logs it; after a SIGKILL the boot after logs `recorded no exit`; a boot under a 256-descriptor soft
+  limit logs `nofile_soft=256`. Mutations: sender capture never registered, exit line not written on a
+  signal, descriptor line removed.
+- `only_the_pid_file_owner_writes_the_record_and_each_write_is_whole`: whole lines, no temporary file
+  left, and no write once the PID file names another process. Mutation: ownership check removed.

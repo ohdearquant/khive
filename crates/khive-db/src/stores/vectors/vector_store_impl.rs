@@ -1,0 +1,1175 @@
+//! sqlite-vec implementation of the storage capability trait.
+
+use super::{
+    async_trait, batch_insert_vectors_dml, bind_params, current_failpoint,
+    delete_vector_provenance, delete_vector_statement, delete_vector_subjects_dml,
+    log_vector_deletes, map_err, non_finite_index, non_finite_vector_error, orphan_sweep_dml,
+    provenance_read_sql, provenance_sidecar_exists, replace_vector_row_dml, sqlite_cosine_score,
+    vec_upsert_atomic_dml, BatchWriteSummary, ContentRef, DateTime, HashSet, IndexRebuildScope,
+    OnceLock, OptionalExtension, OrphanSweepConfig, OrphanSweepResult, SqliteVecStore,
+    StorageCapability, StorageError, StorageResult, SubstrateKind, Utc, Uuid, VectorIndexKind,
+    VectorProvenance, VectorRecord, VectorRowRef, VectorSearchHit, VectorSearchRequest,
+    VectorStore, VectorStoreCapabilities, VectorStoreInfo,
+};
+use khive_storage::{
+    decode_f32_native, encode_f32_native, VectorScanEntry, VectorScanPage, VectorScanRequest,
+};
+
+/// sqlite-vec's ceiling on `k` in a vec0 KNN query (`SQLITE_VEC_VEC0_K_MAX`).
+const VEC0_K_MAX: usize = 4096;
+
+// One sanitized trace per search-kernel invocation, including early errors.
+// `not_completed` includes interruption and other errors; it does not infer a
+// cause from a low-level SQLite error.
+struct TieSearchTrace {
+    knn_attempts: u32,
+    tie_widenings: u32,
+    scalar_fallback: &'static str,
+    outcome: &'static str,
+}
+
+impl Drop for TieSearchTrace {
+    fn drop(&mut self) {
+        tracing::trace!(
+            target: "khive_db::stores::vectors::tie_widening",
+            knn_attempts = self.knn_attempts,
+            tie_widenings = self.tie_widenings,
+            scalar_fallback = self.scalar_fallback,
+            outcome = self.outcome,
+            "sqlite vector search kernel finished"
+        );
+    }
+}
+
+impl SqliteVecStore {
+    /// Prepare the existing single-query kernel without acquiring a reader.
+    fn prepare_search(
+        &self,
+        request: VectorSearchRequest,
+    ) -> StorageResult<
+        impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<Vec<VectorSearchHit>> + Send + 'static,
+    > {
+        if request.filter.as_ref().is_some_and(|f| !f.is_empty()) {
+            return Err(StorageError::Unsupported {
+                capability: StorageCapability::Vectors,
+                operation: "vec_search".into(),
+                message: "use search_with_filter for filtered queries".into(),
+            });
+        }
+        if request.query_vectors.len() != 1 {
+            return Err(StorageError::Unsupported {
+                capability: StorageCapability::Vectors,
+                operation: "vec_search".into(),
+                message: "sqlite-vec supports exactly one query vector per search".into(),
+            });
+        }
+        let query_embedding = request.query_vectors[0].clone();
+
+        let table = self.table_name.clone();
+        let dims = self.dimensions;
+        // Use request.namespace if present; fall back to self.namespace.
+        let namespace = request
+            .namespace
+            .clone()
+            .unwrap_or_else(|| self.namespace.clone());
+        // Runtime entity retrieval excludes pack-owned atom vectors before KNN.
+        // Ordinary VectorStore searches retain their existing population.
+        let exclude_knowledge_atoms = request.kind == Some(SubstrateKind::Entity)
+            && request
+                .backend_hints
+                .as_ref()
+                .and_then(|hints| hints.get("exclude_knowledge_atoms"))
+                .is_some_and(|hint| hint.as_bool() == Some(true));
+        let kind_filter = request.kind.map(|k| k.to_string());
+        // Use the request's embedding_model filter, or fall back to this store's model.
+        let effective_model = request
+            .embedding_model
+            .clone()
+            .unwrap_or_else(|| self.embedding_model.clone());
+
+        if query_embedding.len() == dims {
+            if let Some(idx) = non_finite_index(&query_embedding) {
+                return Err(non_finite_vector_error(
+                    "vec_search",
+                    idx,
+                    query_embedding[idx],
+                ));
+            }
+        }
+
+        Ok(move |conn: &rusqlite::Connection| {
+            let mut trace = TieSearchTrace {
+                knn_attempts: 0,
+                tie_widenings: 0,
+                scalar_fallback: "none",
+                outcome: "not_completed",
+            };
+            if query_embedding.len() != dims {
+                return Err(rusqlite::Error::InvalidParameterCount(
+                    query_embedding.len(),
+                    dims,
+                ));
+            }
+
+            // MATCH applies namespace, model and kind inside sqlite-vec before its
+            // top-k, but orders by distance alone, so rows tied at the top_k
+            // boundary would be cut in table order. The query widens k until the
+            // last row returned is strictly farther than the boundary row, or the
+            // eligible rows run out, and the cut below orders ties by subject ID.
+            // A k past sqlite-vec's limit uses the scalar distance over every
+            // eligible row instead.
+            let kind_clause = if kind_filter.is_some() {
+                "AND kind = ?5"
+            } else {
+                ""
+            };
+            // `field` is non-null vec0 metadata; NOT_EQUALS is applied by
+            // sqlite-vec during KNN, rather than after its bounded window.
+            let entity_field_clause = if exclude_knowledge_atoms {
+                "AND field != 'knowledge.atom'"
+            } else {
+                ""
+            };
+            let match_sql = format!(
+                "SELECT subject_id, distance \
+                 FROM {t} \
+                 WHERE embedding MATCH ?1 \
+                   AND namespace = ?3 \
+                   AND embedding_model = ?4 \
+                   {kind_clause} \
+                   {entity_field_clause} \
+                 ORDER BY distance \
+                 LIMIT ?2",
+                t = table,
+                kind_clause = kind_clause,
+                entity_field_clause = entity_field_clause
+            );
+            let exact_sql = format!(
+                "SELECT subject_id, vec_distance_cosine(embedding, ?1) AS exact_distance \
+                 FROM {t} \
+                 WHERE namespace = ?3 \
+                   AND embedding_model = ?4 \
+                   {kind_clause} \
+                   {entity_field_clause} \
+                 ORDER BY exact_distance, subject_id \
+                 LIMIT ?2",
+                t = table,
+                kind_clause = kind_clause,
+                entity_field_clause = entity_field_clause
+            );
+
+            let query_blob = encode_f32_native(&query_embedding);
+            let query_rows = |sql: &str, limit: usize| -> rusqlite::Result<Vec<(String, f64)>> {
+                let mut stmt = conn.prepare(sql)?;
+                let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+                let read_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(String, f64)> {
+                    Ok((row.get(0)?, row.get(1)?))
+                };
+                if let Some(ref kind_str) = kind_filter {
+                    stmt.query_map(
+                        rusqlite::params![
+                            query_blob,
+                            limit,
+                            &namespace,
+                            &effective_model,
+                            kind_str
+                        ],
+                        read_row,
+                    )?
+                    .collect()
+                } else {
+                    stmt.query_map(
+                        rusqlite::params![query_blob, limit, &namespace, &effective_model],
+                        read_row,
+                    )?
+                    .collect()
+                }
+            };
+
+            let top_k = request.top_k as usize;
+            let mut k = top_k.saturating_add(1);
+            let mut rows = loop {
+                if k > VEC0_K_MAX {
+                    trace.scalar_fallback = if trace.knn_attempts == 0 {
+                        "direct_over_limit"
+                    } else {
+                        "tie_exhausted_limit"
+                    };
+                    break query_rows(&exact_sql, top_k)?;
+                }
+                trace.knn_attempts += 1;
+                let rows = query_rows(&match_sql, k)?;
+                if top_k == 0 || rows.len() < k || rows[k - 1].1 > rows[top_k - 1].1 {
+                    break rows;
+                }
+                trace.tie_widenings += 1;
+                k = if k == VEC0_K_MAX {
+                    VEC0_K_MAX + 1
+                } else {
+                    k.saturating_mul(2).min(VEC0_K_MAX)
+                };
+            };
+            rows.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            rows.truncate(top_k);
+
+            let mut hits = Vec::new();
+            for (rank_idx, (id_str, distance)) in rows.into_iter().enumerate() {
+                let subject_id = Uuid::parse_str(&id_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+
+                hits.push(VectorSearchHit {
+                    subject_id,
+                    score: sqlite_cosine_score(distance)?,
+                    rank: (rank_idx + 1) as u32,
+                });
+            }
+
+            trace.outcome = "completed";
+            Ok(hits)
+        })
+    }
+}
+
+#[async_trait]
+impl VectorStore for SqliteVecStore {
+    async fn score_candidates(
+        &self,
+        query_embedding: &[f32],
+        candidate_ids: &[Uuid],
+        kind: Option<SubstrateKind>,
+    ) -> StorageResult<Vec<VectorSearchHit>> {
+        let mut unique_ids = candidate_ids.to_vec();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+        self.score_candidates_with_kind(query_embedding, &unique_ids, kind)
+            .await
+    }
+
+    async fn insert(
+        &self,
+        subject_id: Uuid,
+        kind: SubstrateKind,
+        namespace: &str,
+        field: &str,
+        vectors: Vec<Vec<f32>>,
+    ) -> Result<(), StorageError> {
+        self.insert_one(
+            subject_id,
+            kind,
+            namespace,
+            field,
+            vectors,
+            true,
+            "vec_insert",
+            "vec_insert_atomic",
+        )
+        .await
+    }
+
+    async fn insert_exact_only(
+        &self,
+        subject_id: Uuid,
+        kind: SubstrateKind,
+        namespace: &str,
+        field: &str,
+        vectors: Vec<Vec<f32>>,
+    ) -> Result<(), StorageError> {
+        self.insert_one(
+            subject_id,
+            kind,
+            namespace,
+            field,
+            vectors,
+            false,
+            "vec_insert_exact_only",
+            "vec_insert_exact_only_atomic",
+        )
+        .await
+    }
+
+    async fn insert_batch(
+        &self,
+        records: Vec<VectorRecord>,
+    ) -> Result<BatchWriteSummary, StorageError> {
+        let table = self.table_name.clone();
+        let dims = self.dimensions;
+        let attempted = records.len() as u64;
+        let store_embedding_model = self.embedding_model.clone();
+
+        // Capture the failpoint Arc (if any) from the thread-local on the
+        // calling thread before handing the closure to spawn_blocking — both
+        // the WriterTask path and the legacy path eventually run the closure
+        // on a different thread than the one that reads the thread-local.
+        let failpoint_flag = current_failpoint();
+
+        // ADR-067 Component A: when the write queue is enabled, route
+        // through the pool-wide WriterTask. DML-only closure (the per-record
+        // `SAVEPOINT vec_batch_record` is preserved unchanged — only the
+        // OUTER BEGIN IMMEDIATE/COMMIT is removed, since the WriterTask's
+        // run loop owns the enclosing transaction).
+        if let Some(writer_task) = self.current_writer_task("vec_insert_batch")? {
+            let table2 = table.clone();
+            let store_embedding_model2 = store_embedding_model.clone();
+            return writer_task
+                .send_bounded_at(
+                    move |conn| {
+                        batch_insert_vectors_dml(
+                            conn,
+                            &table2,
+                            dims,
+                            &store_embedding_model2,
+                            &records,
+                            attempted,
+                            failpoint_flag,
+                        )
+                        .map_err(|e| map_err(e, "vec_insert_batch"))
+                    },
+                    "vec_insert_batch",
+                )
+                .await;
+        }
+
+        // The direct pooled fallback opens and admits one transaction before
+        // this DML body, then settles it after the complete batch.
+        self.with_writer("vec_insert_batch", move |conn| {
+            batch_insert_vectors_dml(
+                conn,
+                &table,
+                dims,
+                &store_embedding_model,
+                &records,
+                attempted,
+                failpoint_flag,
+            )
+        })
+        .await
+    }
+
+    async fn provenance(&self, subject_id: Uuid) -> Result<Option<VectorProvenance>, StorageError> {
+        let table = self.table_name.clone();
+        let model_key = self.model_key.clone();
+        let namespace = self.namespace.clone();
+        self.with_reader("vec_provenance", move |conn| {
+            let has_sidecar = provenance_sidecar_exists(conn)?;
+            let sql = provenance_read_sql(&table, has_sidecar);
+            let subject_id = subject_id.to_string();
+            let with_sidecar: [&dyn rusqlite::ToSql; 3] = [&model_key, &subject_id, &namespace];
+            let without_sidecar: [&dyn rusqlite::ToSql; 2] = [&subject_id, &namespace];
+            let params: &[&dyn rusqlite::ToSql] = if has_sidecar {
+                &with_sidecar
+            } else {
+                &without_sidecar
+            };
+            conn.query_row(&sql, params, |row| {
+                let embedding_model = row.get(0)?;
+                let field = row.get(1)?;
+                let live_embedding: Vec<u8> = row.get(2)?;
+                let stored_digest: Option<String> = row.get(3)?;
+                let live_digest = blake3::hash(&live_embedding).to_hex().to_string();
+                if stored_digest.as_deref() != Some(live_digest.as_str()) {
+                    return Ok(VectorProvenance {
+                        embedding_model,
+                        field,
+                        text_fingerprint: None,
+                        updated_at: None,
+                    });
+                }
+                let fingerprint: Option<String> = row.get(4)?;
+                let text_fingerprint = fingerprint
+                    .map(|raw| {
+                        ContentRef::from_hex(raw).map_err(|message| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Text,
+                                Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    message,
+                                )),
+                            )
+                        })
+                    })
+                    .transpose()?;
+                let timestamp: Option<String> = row.get(5)?;
+                let updated_at = timestamp
+                    .map(|raw| {
+                        DateTime::parse_from_rfc3339(&raw)
+                            .map(|value| value.with_timezone(&Utc))
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    5,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })
+                    })
+                    .transpose()?;
+                Ok(VectorProvenance {
+                    embedding_model,
+                    field,
+                    text_fingerprint,
+                    updated_at,
+                })
+            })
+            .optional()
+        })
+        .await
+    }
+
+    async fn update(
+        &self,
+        subject_id: Uuid,
+        kind: SubstrateKind,
+        namespace: &str,
+        field: &str,
+        vectors: Vec<Vec<f32>>,
+    ) -> Result<(), StorageError> {
+        if vectors.len() != 1 {
+            return Err(StorageError::Unsupported {
+                capability: StorageCapability::Vectors,
+                operation: "vec_update".into(),
+                message: "sqlite-vec supports exactly one vector per record".into(),
+            });
+        }
+        let embedding = vectors.into_iter().next().expect("len checked");
+
+        let table = self.table_name.clone();
+        let dims = self.dimensions;
+        let namespace = namespace.to_string();
+        let field = field.to_string();
+        let kind_str = kind.to_string();
+        let embedding_model = self.embedding_model.clone();
+
+        if embedding.len() == dims {
+            if let Some(idx) = non_finite_index(&embedding) {
+                return Err(non_finite_vector_error("vec_update", idx, embedding[idx]));
+            }
+        }
+
+        // Capture the failpoint Arc (if any) from the thread-local on the
+        // calling thread before handing the closure to spawn_blocking.
+        let failpoint_flag = current_failpoint();
+
+        // ADR-067 Component A (Fork C slice 2): when the write queue is
+        // enabled, route through the pool-wide WriterTask. DML-only
+        // closure — atomicity is provided by `vec_upsert_atomic_dml`'s
+        // named SAVEPOINT rather than `conn.unchecked_transaction()`,
+        // which would attempt a nested `BEGIN` and fail under the
+        // WriterTask's already-open transaction.
+        if let Some(writer_task) = self.current_writer_task("vec_update")? {
+            let table2 = table.clone();
+            let namespace2 = namespace.clone();
+            let field2 = field.clone();
+            let kind_str2 = kind_str.clone();
+            let embedding_model2 = embedding_model.clone();
+            let embedding2 = embedding.clone();
+            return writer_task
+                .send_bounded_at(
+                    move |conn| {
+                        vec_upsert_atomic_dml(
+                            conn,
+                            &table2,
+                            dims,
+                            subject_id,
+                            &kind_str2,
+                            &namespace2,
+                            &field2,
+                            &embedding_model2,
+                            &embedding2,
+                            "vec_update_atomic",
+                            true,
+                            failpoint_flag,
+                        )
+                        .map_err(|e| map_err(e, "vec_update"))
+                    },
+                    "vec_update",
+                )
+                .await;
+        }
+
+        // The direct pooled fallback owns the admitted transaction. The
+        // DELETE+INSERT body is shared with the WriterTask/batch paths (#546).
+        self.with_writer("vec_update", move |conn| {
+            replace_vector_row_dml(
+                conn,
+                &table,
+                dims,
+                VectorRowRef {
+                    subject_id,
+                    namespace: &namespace,
+                    kind: &kind_str,
+                    field: &field,
+                    embedding_model: &embedding_model,
+                    embedding: &embedding,
+                    text_fingerprint: None,
+                    updated_at: None,
+                },
+                true,
+                failpoint_flag,
+            )
+        })
+        .await
+    }
+
+    async fn delete(&self, subject_id: Uuid) -> Result<bool, StorageError> {
+        let statement = delete_vector_statement(&self.table_name, subject_id, &self.namespace);
+        let table = self.table_name.clone();
+        let namespace = self.namespace.clone();
+
+        self.with_writer("vec_delete", move |conn| {
+            conn.execute_batch("SAVEPOINT vec_delete_log")?;
+            let result = (|| {
+                log_vector_deletes(
+                    conn,
+                    &table,
+                    "subject_id = ?1 AND namespace = ?2",
+                    &[&subject_id.to_string(), &namespace],
+                )?;
+                let mut stmt = conn.prepare(&statement.sql)?;
+                bind_params(&mut stmt, &statement.params)?;
+                let deleted = stmt.raw_execute()? > 0;
+                if deleted {
+                    delete_vector_provenance(conn, &table, &[subject_id.to_string()])?;
+                }
+                Ok(deleted)
+            })();
+            match result {
+                Ok(v) => {
+                    conn.execute_batch("RELEASE SAVEPOINT vec_delete_log")?;
+                    Ok(v)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT vec_delete_log");
+                    let _ = conn.execute_batch("RELEASE SAVEPOINT vec_delete_log");
+                    Err(e)
+                }
+            }
+        })
+        .await
+    }
+
+    async fn count(&self) -> Result<u64, StorageError> {
+        let table = self.table_name.clone();
+        let namespace = self.namespace.clone();
+
+        self.with_reader("vec_count", move |conn| {
+            let sql = format!("SELECT COUNT(*) FROM {} WHERE namespace = ?1", table);
+            let count: i64 =
+                conn.query_row(&sql, rusqlite::params![&namespace], |row| row.get(0))?;
+            Ok(count as u64)
+        })
+        .await
+    }
+
+    async fn search(
+        &self,
+        request: VectorSearchRequest,
+    ) -> Result<Vec<VectorSearchHit>, StorageError> {
+        self.with_reader("vec_search", self.prepare_search(request)?)
+            .await
+    }
+
+    async fn search_batch(
+        &self,
+        requests: &[VectorSearchRequest],
+    ) -> StorageResult<Vec<StorageResult<Vec<VectorSearchHit>>>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let queries = requests
+            .iter()
+            .cloned()
+            .map(|request| self.prepare_search(request))
+            .collect::<Vec<_>>();
+        #[cfg(all(test, feature = "vectors"))]
+        let after_slot = super::search_batch_tests::current_after_slot_gate();
+
+        let results = super::super::run_stateful_pooled_store_read(
+            std::sync::Arc::clone(&self.pool),
+            StorageCapability::Vectors,
+            "vec_search_batch",
+            move |conn| {
+                let transaction = rusqlite::Transaction::new_unchecked(
+                    conn,
+                    rusqlite::TransactionBehavior::Deferred,
+                )
+                .map_err(|error| map_err(error, "vec_search_batch"))?;
+                let mut results = Vec::with_capacity(queries.len());
+                for query in queries {
+                    results.push(match query {
+                        Ok(query) => {
+                            query(&transaction).map_err(|error| map_err(error, "vec_search"))
+                        }
+                        Err(error) => Err(error),
+                    });
+                    #[cfg(all(test, feature = "vectors"))]
+                    if let Some(gate) = &after_slot {
+                        gate.after_slot(&transaction);
+                    }
+                }
+                transaction
+                    .commit()
+                    .map_err(|error| map_err(error, "vec_search_batch"))?;
+                Ok(results)
+            },
+        )
+        .await?;
+        Ok(results)
+    }
+
+    async fn info(&self) -> Result<VectorStoreInfo, StorageError> {
+        let count = self.count().await?;
+
+        Ok(VectorStoreInfo {
+            model_name: self.model_key.clone(),
+            dimensions: self.dimensions,
+            index_kind: VectorIndexKind::SqliteVec,
+            entry_count: count,
+            needs_rebuild: false,
+            last_rebuild_at: None,
+        })
+    }
+
+    async fn rebuild(&self, _scope: IndexRebuildScope) -> Result<VectorStoreInfo, StorageError> {
+        // sqlite-vec uses brute-force search — no index to rebuild.
+        self.info().await
+    }
+
+    async fn delete_subjects(&self, ids: &[Uuid]) -> Result<u64, StorageError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let table = self.table_name.clone();
+        let id_strings: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+
+        // The WriterTask owns one BEGIN IMMEDIATE/COMMIT/ROLLBACK around each
+        // request. Submit the complete chunk loop as one DML-only request so a
+        // failure in any chunk makes the task roll back the complete input.
+        if let Some(writer_task) = self.current_writer_task("vec_delete_subjects")? {
+            let table_for_error = table.clone();
+            return writer_task
+                .send_bounded_at(
+                    move |conn| {
+                        delete_vector_subjects_dml(conn, &table, &id_strings)
+                            .map_err(|e| map_err(e, "vec_delete_subjects"))
+                    },
+                    "vec_delete_subjects",
+                )
+                .await
+                .map_err(|e| {
+                    tracing::warn!(target: "khive_db::stores::vectors", error = %e, table = %table_for_error, "delete_subjects failed");
+                    e
+                });
+        }
+
+        // The direct pooled path owns an admitted transaction around all
+        // chunks and verifies rollback/autocommit before returning the writer.
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteVecDeleteSubjects);
+        let table_for_error = table.clone();
+        self.with_writer_unmanaged("vec_delete_subjects", move |conn| {
+            delete_vector_subjects_dml(conn, &table, &id_strings)
+        })
+        .await
+        .map_err(|e| {
+            tracing::warn!(target: "khive_db::stores::vectors", error = %e, table = %table_for_error, "delete_subjects failed");
+            e
+        })
+    }
+
+    async fn batch_exists(
+        &self,
+        ids: &[Uuid],
+        namespace: &str,
+    ) -> Result<HashSet<Uuid>, StorageError> {
+        if ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let table = self.table_name.clone();
+        let namespace = namespace.to_string();
+        let model = self.embedding_model.clone();
+        let id_strings: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+
+        self.with_reader("vec_batch_exists", move |conn| {
+            let mut found = HashSet::new();
+            // vec0's primary-key IN constraint otherwise selects a full scan.
+            let sql = format!(
+                "SELECT subject_id FROM {table} WHERE namespace = ?1 \
+                 AND embedding_model = ?2 AND subject_id = ?3"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+
+            for id in id_strings {
+                let id_str: Option<String> = stmt
+                    .query_row(rusqlite::params![&namespace, &model, &id], |row| row.get(0))
+                    .optional()?;
+                if let Some(id_str) = id_str {
+                    if let Ok(uuid) = Uuid::parse_str(&id_str) {
+                        found.insert(uuid);
+                    }
+                }
+            }
+
+            Ok(found)
+        })
+        .await
+    }
+
+    async fn get_vectors(
+        &self,
+        ids: &[Uuid],
+        namespace: &str,
+        field: &str,
+    ) -> StorageResult<std::collections::HashMap<Uuid, Vec<f32>>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let table = self.table_name.clone();
+        let namespace = namespace.to_owned();
+        let field = field.to_owned();
+        let model = self.embedding_model.clone();
+        let dims = self.dimensions;
+        let ids = ids.to_vec();
+
+        self.with_reader("vec_get_vectors", move |conn| {
+            // The vec0 subject_id primary key constrains each lookup before
+            // metadata filtering, so the work is bounded by ids.len().
+            let sql = format!(
+                "SELECT embedding FROM {table} WHERE subject_id = ?1 \
+                 AND namespace = ?2 AND field = ?3 AND embedding_model = ?4"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut found = std::collections::HashMap::with_capacity(ids.len());
+            for id in ids {
+                let blob: Option<Vec<u8>> = stmt
+                    .query_row(
+                        rusqlite::params![id.to_string(), &namespace, &field, &model],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(blob) = blob {
+                    if blob.len() != dims * std::mem::size_of::<f32>() {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "stored vector has {} bytes, expected {}",
+                                    blob.len(),
+                                    dims * std::mem::size_of::<f32>()
+                                ),
+                            )),
+                        ));
+                    }
+                    // vec0 exposes its native f32 ABI; keep the dimension check above.
+                    let vector = decode_f32_native(&blob).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            Box::new(error),
+                        )
+                    })?;
+                    found.insert(id, vector);
+                }
+            }
+            Ok(found)
+        })
+        .await
+    }
+
+    async fn scan_vectors(&self, request: VectorScanRequest) -> StorageResult<VectorScanPage> {
+        let table = self.table_name.clone();
+        let dims = self.dimensions;
+        let kind = request.kind.map(|kind| kind.to_string());
+        let after = request.after.map(|id| id.to_string());
+        let probe_limit = i64::from(request.limit.get()) + 1;
+
+        self.with_reader("vec_scan_vectors", move |conn| {
+            let invalid_blob = |message: String| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Blob,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        message,
+                    )),
+                )
+            };
+            let expected_bytes = dims
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| {
+                    invalid_blob("stored vector dimensions overflow the byte length".into())
+                })?;
+            // Only the constructor-validated model table is interpolated. No
+            // MATCH: SQLite filters and orders the raw scan before its limit.
+            let sql = format!(
+                "SELECT subject_id, embedding FROM {table} \
+                 WHERE namespace = ?1 AND embedding_model = ?2 AND field = ?3 \
+                   AND (?4 IS NULL OR kind = ?4) \
+                   AND (?5 IS NULL OR subject_id COLLATE BINARY > ?5) \
+                 ORDER BY subject_id COLLATE BINARY ASC LIMIT ?6"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(rusqlite::params![
+                &request.namespace,
+                &request.embedding_model,
+                &request.field,
+                &kind,
+                &after,
+                probe_limit,
+            ])?;
+            let mut items = Vec::new();
+            while let Some(row) = rows.next()? {
+                let spelling: String = row.get(0)?;
+                let subject_id = Uuid::parse_str(&spelling).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                // A normalized cursor must have the same ordering as stored
+                // text, so refuse noncanonical persisted spellings.
+                if subject_id.to_string() != spelling {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "stored vector subject_id is not canonical",
+                        )),
+                    ));
+                }
+                let blob: Vec<u8> = row.get(1)?;
+                if blob.len() != expected_bytes {
+                    return Err(invalid_blob(format!(
+                        "stored vector has {} bytes, expected {expected_bytes}",
+                        blob.len(),
+                    )));
+                }
+                let vector = decode_f32_native(&blob).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Blob,
+                        Box::new(error),
+                    )
+                })?;
+                items.push(VectorScanEntry {
+                    subject_id,
+                    vectors: vec![vector],
+                });
+            }
+            let next_after = if items.len() as u64 > u64::from(request.limit.get()) {
+                items.pop();
+                items.last().map(|item| item.subject_id)
+            } else {
+                None
+            };
+            Ok(VectorScanPage { items, next_after })
+        })
+        .await
+    }
+
+    async fn orphan_sweep(&self, config: &OrphanSweepConfig) -> StorageResult<OrphanSweepResult> {
+        let table = self.table_name.clone();
+
+        // Serialize filter lists as JSON arrays for json_each() usage inside SQL.
+        // An empty list becomes None, which binds as NULL; the IS NULL guard then
+        // short-circuits to true, passing all rows through (= no filtering).
+        let ns_json: Option<String> = if config.namespaces.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&config.namespaces).ok()
+        };
+
+        let kind_json: Option<String> = if config.substrate_kinds.is_empty() {
+            None
+        } else {
+            let strs: Vec<String> = config
+                .substrate_kinds
+                .iter()
+                .map(|k| k.to_string())
+                .collect();
+            serde_json::to_string(&strs).ok()
+        };
+
+        // None = all rows eligible; Some(ids) = only those IDs may be swept.
+        let allow_json: Option<String> = config.subject_id_allowlist.as_ref().map(|ids| {
+            let strs: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+            serde_json::to_string(&strs).unwrap_or_default()
+        });
+
+        let max_delete = config.max_delete as i64;
+        let dry_run = config.dry_run;
+
+        // ADR-067 Amendment 1: when the write queue is enabled, route through
+        // the pool-wide WriterTask. DML-only closure — `run_writer_task`'s
+        // drain loop already owns the enclosing `BEGIN IMMEDIATE`/`COMMIT`/
+        // `ROLLBACK` for this request, so the closure must not open or commit
+        // its own transaction; issuing `Transaction::new_unchecked`'s `BEGIN
+        // IMMEDIATE` here would violate SQLite's nested-transaction rule and
+        // fail with `SQLITE_ERROR: cannot start a transaction within a
+        // transaction` (ADR-067 lines 271-276).
+        if let Some(writer_task) = self.current_writer_task("orphan_sweep")? {
+            let table2 = table.clone();
+            let ns_json2 = ns_json.clone();
+            let kind_json2 = kind_json.clone();
+            let allow_json2 = allow_json.clone();
+            return writer_task
+                .send_bounded_at(
+                    move |conn| {
+                        orphan_sweep_dml(
+                            conn,
+                            &table2,
+                            ns_json2.as_deref(),
+                            kind_json2.as_deref(),
+                            allow_json2.as_deref(),
+                            max_delete,
+                            dry_run,
+                        )
+                        .map_err(|e| map_err(e, "orphan_sweep"))
+                    },
+                    "orphan_sweep",
+                )
+                .await;
+        }
+
+        // The direct pooled fallback owns the admitted transaction around
+        // this DML body and verifies rollback/autocommit on every outcome.
+        self.pool
+            .record_direct_route(crate::timeout_sink::Site::DirectRouteOrphanSweep);
+        self.with_writer_unmanaged("orphan_sweep", move |conn| {
+            orphan_sweep_dml(
+                conn,
+                &table,
+                ns_json.as_deref(),
+                kind_json.as_deref(),
+                allow_json.as_deref(),
+                max_delete,
+                dry_run,
+            )
+        })
+        .await
+    }
+
+    fn capabilities(&self) -> &'static VectorStoreCapabilities {
+        static SQLITE_VEC_CAPABILITIES: OnceLock<VectorStoreCapabilities> = OnceLock::new();
+        SQLITE_VEC_CAPABILITIES.get_or_init(|| VectorStoreCapabilities {
+            supports_filter: false,
+            supports_batch_search: true,
+            supports_quantization: false,
+            supports_update: false,
+            supports_orphan_sweep: true,
+            supports_vector_read: true,
+            // sqlite-vec uses subject_id as PRIMARY KEY — only one vector per
+            // subject per namespace is stored. Callers must use a single canonical
+            // field (e.g. "content") and are not permitted to store both
+            // "entity.title" and "entity.body" as separate vectors in one table.
+            supports_multi_field: false,
+            // sqlite-vec 0.1.9 rejects dimensions > SQLITE_VEC_VEC0_MAX_DIMENSIONS (8192).
+            // Reporting 8192 lets callers know that 4097–8192 dimensional models are
+            // supported. The previous value of 4096 was the K_MAX (neighbors per query)
+            // constant, not the dimension limit.
+            max_dimensions: Some(8192),
+            index_kinds: vec![VectorIndexKind::SqliteVec],
+        })
+    }
+}
+
+#[cfg(all(test, feature = "vectors"))]
+mod tie_widening_trace_tests {
+    use super::*;
+    use crate::pool::{ConnectionPool, PoolConfig};
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::{layer::Context, layer::SubscriberExt, Layer};
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    struct Captured {
+        knn_attempts: u64,
+        tie_widenings: u64,
+        scalar_fallback: String,
+        outcome: String,
+    }
+
+    impl Visit for Captured {
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            match field.name() {
+                "knn_attempts" => self.knn_attempts = value,
+                "tie_widenings" => self.tie_widenings = value,
+                _ => {}
+            }
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            match field.name() {
+                "scalar_fallback" => self.scalar_fallback = value.to_owned(),
+                "outcome" => self.outcome = value.to_owned(),
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+    }
+
+    struct Capture(Arc<Mutex<Vec<Captured>>>);
+
+    impl<S: Subscriber> Layer<S> for Capture {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            if event.metadata().target() == "khive_db::stores::vectors::tie_widening" {
+                let names: std::collections::BTreeSet<_> = event
+                    .metadata()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name())
+                    .collect();
+                assert_eq!(
+                    names,
+                    std::collections::BTreeSet::from([
+                        "knn_attempts",
+                        "message",
+                        "outcome",
+                        "scalar_fallback",
+                        "tie_widenings",
+                    ])
+                );
+                let mut fields = Captured::default();
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields);
+            }
+        }
+    }
+
+    fn request(top_k: u32) -> VectorSearchRequest {
+        VectorSearchRequest {
+            query_vectors: vec![vec![1.0, 0.0, 0.0]],
+            top_k,
+            namespace: None,
+            kind: Some(SubstrateKind::Note),
+            embedding_model: None,
+            filter: None,
+            backend_hints: None,
+        }
+    }
+
+    #[test]
+    fn actual_search_kernel_emits_sanitized_completion_and_error_traces() {
+        crate::extension::ensure_extensions_loaded();
+        let dir = tempfile::tempdir().expect("synthetic vector directory");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join("trace.db")),
+                write_queue_enabled: Some(false),
+                volume_lock_dir: Some(dir.path().join("locks")),
+                ..PoolConfig::for_test()
+            })
+            .expect("synthetic vector pool"),
+        );
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            true,
+            "trace".into(),
+            "trace-model".into(),
+            3,
+            "local".into(),
+        )
+        .expect("synthetic vector store");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&captured)));
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        pool.writer()
+            .unwrap()
+            .autocommit(|conn| {
+                conn.execute_batch(
+                    "CREATE VIRTUAL TABLE vec_trace USING vec0(\
+                     subject_id TEXT PRIMARY KEY, namespace TEXT NOT NULL, kind TEXT NOT NULL, \
+                     field TEXT NOT NULL, embedding_model TEXT NOT NULL, \
+                     embedding float[3] distance_metric=cosine)",
+                )?;
+                // The empty population is a positive one-attempt baseline.
+                assert!(store.prepare_search(request(1)).unwrap()(conn)?.is_empty());
+                conn.execute_batch("BEGIN")?;
+                let vector = encode_f32_native(&[1.0, 0.0, 0.0]);
+                let mut stmt = conn.prepare(
+                    "INSERT INTO vec_trace(subject_id, namespace, kind, field, embedding_model, embedding) \
+                     VALUES (?1, 'local', 'note', 'note.content', 'trace-model', ?2)",
+                )?;
+                for id in (1..=4096_u128).rev() {
+                    stmt.execute(rusqlite::params![Uuid::from_u128(id).to_string(), &vector])?;
+                }
+                drop(stmt);
+                conn.execute_batch("COMMIT")?;
+
+                // A whole equal-distance cohort forces all k stages through the cap.
+                let query = store.prepare_search(request(1)).unwrap();
+                let hits = query(conn)?;
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].subject_id, Uuid::from_u128(1));
+
+                // An oversized request takes the direct scalar route, not tie widening.
+                let query = store.prepare_search(request(4096)).unwrap();
+                assert_eq!(query(conn)?.len(), 4096);
+
+                // No SQL attempt starts on a dimension error, and the original
+                // error remains observable to the caller.
+                let mut invalid = request(1);
+                invalid.query_vectors = vec![vec![1.0, 0.0]];
+                let query = store.prepare_search(invalid).unwrap();
+                assert!(matches!(
+                    query(conn),
+                    Err(rusqlite::Error::InvalidParameterCount(2, 3))
+                ));
+
+                // A SQL failure counts the attempt but propagates the original
+                // error; the trace reports no diagnostic or error text.
+                conn.execute_batch("DROP TABLE vec_trace")?;
+                let query = store.prepare_search(request(1)).unwrap();
+                assert!(query(conn).is_err());
+                Ok(())
+            })
+            .expect("synthetic query fixture");
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![
+                Captured {
+                    knn_attempts: 1,
+                    tie_widenings: 0,
+                    scalar_fallback: "none".into(),
+                    outcome: "completed".into(),
+                },
+                Captured {
+                    knn_attempts: 12,
+                    tie_widenings: 12,
+                    scalar_fallback: "tie_exhausted_limit".into(),
+                    outcome: "completed".into(),
+                },
+                Captured {
+                    knn_attempts: 0,
+                    tie_widenings: 0,
+                    scalar_fallback: "direct_over_limit".into(),
+                    outcome: "completed".into(),
+                },
+                Captured {
+                    knn_attempts: 0,
+                    tie_widenings: 0,
+                    scalar_fallback: "none".into(),
+                    outcome: "not_completed".into(),
+                },
+                Captured {
+                    knn_attempts: 1,
+                    tie_widenings: 0,
+                    scalar_fallback: "none".into(),
+                    outcome: "not_completed".into(),
+                },
+            ]
+        );
+    }
+}

@@ -43,10 +43,10 @@ let analyzer = StandardAnalyzer::with_tokenizer(IdentifierTokenizer::default())
 
 ## Script detection
 
-`is_cjk_char`, `contains_cjk`, and `is_meaningful_query` (a `ScriptProfile`-based
-heuristic for rejecting queries that are too short or punctuation-only to search
-on) live in the `lang` module for callers that need to branch on script before
-choosing an analyzer.
+`is_cjk_char` and `contains_cjk` classify supported CJK blocks. `is_meaningful_text_query`
+rejects empty or symbol-only input, a single ASCII letter, and dominant-character repetition.
+These helpers and `ScriptProfile` live in `lang`. The deprecated `is_meaningful_query` name
+delegates to the unchanged text policy for one release.
 
 ## Where this sits
 

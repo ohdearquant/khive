@@ -333,7 +333,35 @@ request(ops="comm.send(to=\"email:prof.sheng@example.edu\", subject=\"Draft read
 
 ### How outbound delivery works
 
-`comm.send` itself only writes the note; it does not talk to SMTP directly.
+`comm.send` and `comm.reply` do not talk to SMTP directly. The serving host
+resolves one recipient policy at boot, independently of connector startup or
+credentials, and shares it with admission and the outbox. A configured denied
+recipient is refused before a fresh message is written. Nonempty trimmed
+`KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` entries take precedence; otherwise,
+including when that variable holds only blanks and separators, the first
+configured maintainer address is the fallback. Entries and requested
+recipients use the same normalization: display names are removed and the
+addr-spec has its ASCII letters lowercased; every other character compares
+exactly. Stored recipient spelling is unchanged.
+A refusal names the requested recipient in that normalized form, or as
+requested when it does not parse as an address.
+Invalid or unreadable configured policy prevents startup, as does a set but
+empty policy with no fallback recipient. A `KHIVE_EMAIL_MAINTAINER_ADDRESS`
+that is set is read the way the email connector reads it at start: comma
+separated, trimmed, empty values dropped, every remaining value must parse and
+at least one must remain. A value that fails prevents startup even beside a
+valid explicit list. An unset maintainer beside a valid explicit list is
+configured: allowed recipients are admitted and their messages stay pending
+while the connector cannot start, and the start-up warning names the missing
+value. With neither policy variable set, messages can
+still queue for later delivery, without a new backlog age cutoff.
+
+An exact keyed retry returns the original committed pair even if policy has
+since changed to deny a fresh send. It does not reset delivery state or request
+retransmission. A fresh denied keyed request claims no key; if another request
+commits after its final no-holder observation, a later retry can retrieve that
+receipt.
+
 A background outbox loop polls every 5 seconds for undelivered outbound
 notes. A note is eligible only when it has no terminal `delivery` value and
 its optional RFC 3339 `next_attempt_at` deadline is due:
@@ -342,10 +370,12 @@ its optional RFC 3339 `next_attempt_at` deadline is due:
 list(namespace=<ingest_namespace>, kind="message", direction="outbound", delivered=false, limit=200)
 ```
 
-For each note returned, the loop keeps only those where `to_actor` starts
-with `email:` and the note is not already delivered, then checks the
-recipient against the allowlist (`KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS`, or the
-channel's maintainer address if that variable is unset). Passing notes are
+Delivery requires a configured policy; starting it with absent policy returns
+a permanent component error without sending or restarting. The loop selects
+eligible email rows and defensively checks each recipient
+against the same policy, including messages queued by an earlier process.
+Stored Message-ID verification precedes recipient classification, so an
+unverifiable ID remains a visible hold. Passing notes are
 sent over SMTP, using the note's `subject`, `content`, and any
 `thread_id`/`in_reply_to_message_id`/`references_chain` properties to set the
 RFC 822 `Message-ID`, `In-Reply-To`, and `References` headers so replies group
@@ -379,6 +409,36 @@ Every channel poller must supply both `Channel::kind()` and `Channel::slug()`;
 kind alone cannot distinguish two accounts using the same adapter. Duplicate
 `external_id` values are ignored, making re-delivery idempotent.
 
+#### Inbound disposition order
+
+Each polled message is disposed in a fixed order (ADR-200 §7). Steps that keep
+the behaviour described above are unchanged:
+
+1. A message that is malformed or over the byte cap is quarantined.
+2. A subject carrying a verified mailto unsubscribe token is a machine record,
+   not mail: the token's recipient key is added to the suppression list
+   (`source = mailto_token`) and the message is neither delivered to an actor
+   nor quarantined. The poll cursor advancing past its UID is how the poller
+   marks it processed, so it is not polled again. A second copy of the same
+   unsubscribe neither fails nor duplicates. This runs before domain
+   authentication, because the token is the authority.
+3. Domain authentication failing is quarantined as before.
+4. A `From:` that is the maintainer is attributed and routed as before.
+5. While external inbound is disabled (neither `KHIVE_EMAIL_EXTERNAL_SENDERS`
+   nor `KHIVE_EMAIL_EXTERNAL_INBOUND=enabled` is set), any other authenticated
+   sender is quarantined `off-allowlist`.
+6. With external inbound enabled, an `inbound` suppression entry matching the
+   authenticated sender's address or its exact domain (no subdomain match) is
+   quarantined `blocked`.
+7. Otherwise screening decides between delivery to the routed actor, withheld
+   delivery and quarantine (see the email channel's external inbound
+   documentation).
+
+The `inbound` suppression entries are read from the same comm store the
+`comm.suppression_add` / `comm.suppression_list` / `comm.suppression_remove`
+verbs write, so an operator or the channel itself can add one without a
+restart.
+
 ### Configuration
 
 `EmailChannelConfig::from_env` reads configuration exclusively from
@@ -396,8 +456,10 @@ Required:
 - `KHIVE_EMAIL_AUTHSERV_ID` (the trust anchor for validating inbound
   `Authentication-Results` headers; the reserved value
   `!topmost-no-authserv-id` selects trust of the topmost header when the
-  receiving boundary emits no `authserv-id` at all, as with Exchange Online's
-  internal-hop stamp)
+  receiving boundary emits no `authserv-id` at all; `!topmost:<authserv-id>`
+  also trusts only the topmost header, accepting either no `authserv-id` or the
+  given one, for a boundary such as Exchange Online that stamps
+  `mx.microsoft.com` on its own header for some senders and nothing for others)
 
 Auth mode (choose one):
 
@@ -426,7 +488,64 @@ Optional, with defaults:
   uncorrelated email messages. Set it to `local` only to retain the previous
   shared inbox routing.)
 - `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` (comma-separated outbound allowlist;
-  falls back to the maintainer address when unset)
+  falls back to the maintainer address when unset or when it holds only
+  blanks and separators)
+
+External recipients (any address outside the outbound allowlist) are disabled
+until `KHIVE_EMAIL_EXTERNAL_SENDERS` is set. All of the variables below are
+read only when it is set; while it is unset the channel behaves exactly as it
+did before, and the values are ignored entirely.
+
+- `KHIVE_EMAIL_EXTERNAL_SENDERS` (comma-separated actor ids allowed to send to
+  external recipients)
+- `KHIVE_EMAIL_EXTERNAL_DAILY_CAP` (positive integer; bounds fresh external
+  admissions across all actors in any trailing 24 hours)
+- `KHIVE_EMAIL_UNSUBSCRIBE_RK_KEY` (hex key material, at least 32 bytes; the
+  recipient-key secret. The recipient key is `HMAC-SHA256` of the normalized
+  address under this key, rendered as 64 lowercase hex characters)
+- `KHIVE_EMAIL_UNSUBSCRIBE_TOKEN_KEYS` (comma-separated `id:key` pairs; `id`
+  is a decimal integer 0-255, no duplicate ids, and `key` is hex key material
+  of at least 32 bytes. The highest id mints new unsubscribe tokens; every
+  retired id keeps verifying so an older link keeps working)
+- `KHIVE_EMAIL_EXTERNAL_FOOTER_FILE` (path to the default footer for external
+  messages without an exact `traffic:list` tag. It must exist, be readable and
+  contain the placeholder `{unsubscribe}`, which the channel replaces with the
+  mailto opt-out instruction. Admission using this footer is refused while it is
+  unset, unreadable or missing the placeholder; policy-recipient messages are
+  unaffected)
+- `KHIVE_EMAIL_LIST_FOOTER_FILE` (a separate footer for external messages tagged
+  `traffic:list`, with the same placeholder requirement. An unavailable list
+  footer refuses admission and causes permanent delivery failure before SMTP; it
+  never falls back to the default footer. Both footer files are read at startup
+  when external senders are configured, and delivery chooses from the outbound
+  row's stored tags)
+- `KHIVE_EMAIL_SUPPRESSION_MIRROR_URL` (optional; an `https://` URL that
+  answers the complete set of one-click opt-outs as
+  `{"as_of": "<RFC 3339>", "count": N, "recipient_keys": [...]}`. When set,
+  the outbox reads it at most once per delivery cycle, before any external
+  message goes to SMTP, and adds every missing key to the local suppression
+  list as a `one_click` entry; nothing is written back. A failed read keeps
+  every external message of that cycle pending, never failed. A cycle also
+  reads it when the last successful read is at least half the maximum age old,
+  so an idle deployment stays admissible)
+- `KHIVE_EMAIL_SUPPRESSION_MIRROR_TOKEN` (required with the URL; sent as a
+  bearer credential. Secret)
+- `KHIVE_EMAIL_SUPPRESSION_MIRROR_MAX_AGE_SECS` (required with the URL;
+  positive integer. External admission, which does no network I/O, is refused
+  with `suppression mirror stale` while the last successful read is older than
+  this; policy-recipient messages are unaffected. Either of these two variables
+  without the URL is a configuration error)
+
+Mail from outside senders can be received without enabling external sending:
+`KHIVE_EMAIL_EXTERNAL_INBOUND=enabled` admits authenticated non-maintainer mail
+as external inbound (sender `email:<address>`, `origin=external`,
+`trust=untrusted`, routed by verified thread owner, then
+`KHIVE_EMAIL_INBOUND_ROUTES`, then `KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR`) while
+`KHIVE_EMAIL_EXTERNAL_SENDERS` stays unset, so a send to an address outside the
+outbound allowlist is still refused. Start-up fails if
+`KHIVE_EMAIL_EXTERNAL_INBOUND_ACTOR` is unset or empty while external inbound
+is enabled, and any value of `KHIVE_EMAIL_EXTERNAL_INBOUND` other than
+`enabled` or empty is a configuration error.
 
 An anonymous `local` caller cannot read the delegated `channel:email` mailbox;
 the mailbox gate denies that read with `mailbox_read_not_granted`. To grant a
