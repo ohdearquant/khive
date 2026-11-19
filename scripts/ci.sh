@@ -521,6 +521,8 @@ phase_deno_tests() {
 phase_smoke_tests() {
     echo "=== Smoke Test ==="
     scope_skips kkernel && return 0
+    python3 "$SCRIPT_DIR/tests/test_generate_taxonomy.py"
+    python3 "$SCRIPT_DIR/generate-taxonomy.py" --kkernel "$(kkernel_binary_path)" --check
     python3 "$SCRIPT_DIR/../tests/test_documented_verb_counts.py"
     python3 "$SCRIPT_DIR/../tests/smoke_test.py"
     python3 "$SCRIPT_DIR/../tests/smoke_brain.py"
