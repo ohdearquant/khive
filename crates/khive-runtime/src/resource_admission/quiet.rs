@@ -83,8 +83,11 @@ pub async fn wait_until_not_quiet() {
         tokio::select! {
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline.monotonic)) => {},
             result = changed.changed() => {
-                // The process singleton retains the sender for its lifetime.
-                result.expect("quiet state sender remains alive");
+                // The process singleton retains the sender for its lifetime; a
+                // closed channel can bring no renewal, so the wait ends.
+                if result.is_err() {
+                    return;
+                }
             }
         }
     }
