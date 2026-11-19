@@ -215,10 +215,10 @@ class OpOutcome:
         self.error = error
 
 
-def _timed_call(proc, verb, args) -> OpOutcome:
+def _timed_call(proc, verb, args, request_id=None) -> OpOutcome:
     t0 = time.perf_counter_ns()
     try:
-        bpd._call_verb(proc, verb, args)
+        bpd._call_verb(proc, verb, args, request_id=request_id)
         elapsed_us = (time.perf_counter_ns() - t0) // 1000
         return OpOutcome(verb, True, elapsed_us)
     except Exception as exc:
@@ -226,21 +226,24 @@ def _timed_call(proc, verb, args) -> OpOutcome:
         return OpOutcome(verb, False, elapsed_us, str(exc))
 
 
-def _op_recall(proc, tenant, i):
-    return _timed_call(proc, "memory.recall", {"query": random.choice(_RECALL_PHRASES), "limit": 5})
+def _op_recall(proc, tenant, i, request_id=None):
+    return _timed_call(proc, "memory.recall", {"query": random.choice(_RECALL_PHRASES), "limit": 5},
+                       request_id)
 
 
-def _op_knowledge_search(proc, tenant, i):
-    return _timed_call(proc, "knowledge.search", {"query": random.choice(_RECALL_PHRASES), "limit": 5})
+def _op_knowledge_search(proc, tenant, i, request_id=None):
+    return _timed_call(proc, "knowledge.search", {"query": random.choice(_RECALL_PHRASES), "limit": 5},
+                       request_id)
 
 
-def _op_knowledge_compose(proc, tenant, i):
+def _op_knowledge_compose(proc, tenant, i, request_id=None):
     return _timed_call(
-        proc, "knowledge.compose", {"query": random.choice(_COMPOSE_PHRASES), "max_tokens": 1500}
+        proc, "knowledge.compose", {"query": random.choice(_COMPOSE_PHRASES), "max_tokens": 1500},
+        request_id,
     )
 
 
-def _op_remember(proc, tenant, i):
+def _op_remember(proc, tenant, i, request_id=None):
     return _timed_call(
         proc,
         "memory.remember",
@@ -250,10 +253,11 @@ def _op_remember(proc, tenant, i):
             "salience": 0.3,
             "decay_factor": 0.02,
         },
+        request_id,
     )
 
 
-def _op_create_entity(proc, tenant, i):
+def _op_create_entity(proc, tenant, i, request_id=None):
     return _timed_call(
         proc,
         "create",
@@ -263,6 +267,7 @@ def _op_create_entity(proc, tenant, i):
             "name": f"loadharness-concept-tenant{tenant}-{i}-{uuid.uuid4().hex[:8]}",
             "description": "load-harness synthetic concept for concurrency probing",
         },
+        request_id,
     )
 
 
@@ -411,21 +416,40 @@ def _run_worker(binary, tenant, idx, base_env, log_level, tmpdir, ops_per_worker
     return result
 
 
-def _execute_arrival(worker, fn, sequence, clock):
+# An arrival's request id is (run prefix << REQUEST_ID_SEQUENCE_BITS) | sequence, so ids are unique within a run
+# and two runs with different random prefixes never share one. The server's per-attempt writer rows carry the id.
+REQUEST_ID_SEQUENCE_BITS = 20
+
+
+def new_request_id_prefix(rng=random):
+    return rng.randrange(1, 1 << 32)
+
+
+def arrival_request_id(prefix, sequence):
+    if prefix is None:
+        return None
+    if not 0 <= sequence < (1 << REQUEST_ID_SEQUENCE_BITS):
+        raise ValueError(f"arrival sequence {sequence} does not fit {REQUEST_ID_SEQUENCE_BITS} bits")
+    return (prefix << REQUEST_ID_SEQUENCE_BITS) | sequence
+
+
+def _execute_arrival(worker, fn, sequence, clock, request_id=None):
     proc, result = worker
     started = clock()
     try:
-        outcome = fn(proc, result.tenant, sequence)
+        outcome = fn(proc, result.tenant, sequence, request_id=request_id)
     except Exception as exc:
         outcome = OpOutcome(_OP_NAMES[fn], False, (clock() - started) * 1_000_000, repr(exc))
     return outcome, started, clock()
 
 
 def _drive_open_loop(workers, pool, rate, operations, drain_timeout, *,
-                     pick_op=_pick_op, clock=time.monotonic, sleep=time.sleep):
+                     pick_op=_pick_op, clock=time.monotonic, sleep=time.sleep, request_id_prefix=None):
     if (not math.isfinite(rate) or rate <= 0 or operations < 0
             or not math.isfinite(drain_timeout) or drain_timeout < 0):
         raise ValueError("arrival rate must be finite and positive; operation count and drain timeout nonnegative")
+    if request_id_prefix is not None and operations > (1 << REQUEST_ID_SEQUENCE_BITS):
+        raise ValueError(f"at most {1 << REQUEST_ID_SEQUENCE_BITS} arrivals carry request ids in one run")
     started = clock()
     offered_duration = operations / rate
     records = []
@@ -452,7 +476,8 @@ def _drive_open_loop(workers, pool, rate, operations, drain_timeout, *,
         sleep(max(0.0, scheduled - clock()))
         reap()
         fn = pick_op()
-        record = dict(sequence=sequence, op=_OP_NAMES[fn], scheduled_s=scheduled - started,
+        request_id = arrival_request_id(request_id_prefix, sequence)
+        record = dict(sequence=sequence, request_id=request_id, op=_OP_NAMES[fn], scheduled_s=scheduled - started,
                       offered_s=clock() - started, started_s=None, finished_s=None,
                       tenant=None, worker=None, latency_us=None, state="outstanding", error=None)
         records.append(record)
@@ -463,7 +488,7 @@ def _drive_open_loop(workers, pool, rate, operations, drain_timeout, *,
         slot = idle.pop(0)
         record.update(tenant=workers[slot][1].tenant, worker=workers[slot][1].idx)
         try:
-            future = pool.submit(_execute_arrival, workers[slot], fn, sequence, clock)
+            future = pool.submit(_execute_arrival, workers[slot], fn, sequence, clock, request_id)
             pending[future] = (slot, record)
         except Exception as exc:
             idle.append(slot)
@@ -496,6 +521,7 @@ def _drive_open_loop(workers, pool, rate, operations, drain_timeout, *,
         }
     return {
         "mode": "open-loop", "configured_rate_per_s": rate,
+        "request_id_prefix": request_id_prefix, "request_id_sequence_bits": REQUEST_ID_SEQUENCE_BITS,
         "status": "drain_timeout" if counts["outstanding"] else "drained",
         "max_in_flight": len(workers), "overflow_policy": "refuse immediately; no client queue",
         "counts": counts, "classes": by_class, "records": records,
@@ -552,7 +578,8 @@ def _run_open_workers(binary, jobs, base_env, log_level, tmpdir, proc_registry,
         setup_deadline = time.monotonic() + worker_timeout
         for future in futures:
             workers.append(future.result(timeout=max(0.0, setup_deadline - time.monotonic())))
-        arrival = _drive_open_loop(workers, pool, rate, operations, worker_timeout)
+        arrival = _drive_open_loop(workers, pool, rate, operations, worker_timeout,
+                                   request_id_prefix=new_request_id_prefix())
         if arrival["counts"]["outstanding"]:
             # Kill pipes before joining threads so a wedged MCP read can finish.
             outstanding = {(row["tenant"], row["worker"]) for row in arrival["records"]

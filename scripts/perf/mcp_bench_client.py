@@ -123,9 +123,17 @@ def recv(proc):
     return json.loads(line)
 
 
-def call_request(proc, ops_string):
-    """Send one `request(ops=ops_string)` `tools/call` and return the decoded body."""
-    send(proc, "tools/call", {"name": "request", "arguments": {"ops": ops_string}})
+def call_request(proc, ops_string, request_id=None):
+    """Send one `request(ops=ops_string)` `tools/call` and return the decoded body.
+
+    `request_id`, when given, rides in the tool arguments; the front end
+    forwards it on the daemon frame, so the server's per-attempt writer rows
+    carry the same id and join back to this call.
+    """
+    arguments = {"ops": ops_string}
+    if request_id is not None:
+        arguments["request_id"] = request_id
+    send(proc, "tools/call", {"name": "request", "arguments": arguments})
     resp = recv(proc)
     if "error" in resp:
         raise RuntimeError(f"MCP RPC error: {resp['error']}")
@@ -139,10 +147,10 @@ def call_request(proc, ops_string):
     return json.loads(text) if text else None
 
 
-def call_verb(proc, verb, args):
+def call_verb(proc, verb, args, request_id=None):
     """Call a single verb through `request` and return its unwrapped result."""
     ops = json.dumps([{"tool": verb, "args": args}])
-    body = call_request(proc, ops)
+    body = call_request(proc, ops, request_id=request_id)
     if body is None:
         raise RuntimeError(f"Empty response for verb {verb}")
     results = body.get("results") or []

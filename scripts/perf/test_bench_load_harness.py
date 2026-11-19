@@ -81,12 +81,14 @@ class ImmediatePool:
 
 
 class OpenLoopArrivalTests(unittest.TestCase):
-    def drive(self, delays, operations, workers=1, drain_timeout=1.0, failures=()):
+    def drive(self, delays, operations, workers=1, drain_timeout=1.0, failures=(), request_id_prefix=None):
         clock = VirtualClock()
         pool = SlowServicePool(clock, delays)
         connections = [(None, harness.WorkerResult(0, idx)) for idx in range(workers)]
+        self.served_request_ids = []
 
-        def service(proc, tenant, sequence):
+        def service(proc, tenant, sequence, request_id=None):
+            self.served_request_ids.append((sequence, request_id))
             return harness.OpOutcome("memory.recall", sequence not in failures, 40,
                                      "fake service failure" if sequence in failures else None)
 
@@ -94,8 +96,31 @@ class OpenLoopArrivalTests(unittest.TestCase):
             report = harness._drive_open_loop(
                 connections, pool, 10.0, operations, drain_timeout,
                 pick_op=lambda: service, clock=clock, sleep=clock.sleep,
+                request_id_prefix=request_id_prefix,
             )
         return report
+
+    def test_each_arrival_carries_its_run_unique_request_id_to_the_service(self):
+        report = self.drive([0.01] * 3, 3, request_id_prefix=0xABC)
+        expected = [(0xABC << 20) | sequence for sequence in range(3)]
+        self.assertEqual([row["request_id"] for row in report["records"]], expected)
+        self.assertEqual(self.served_request_ids, list(zip(range(3), expected)))
+        self.assertEqual(report["request_id_prefix"], 0xABC)
+
+    def test_refused_arrival_keeps_its_request_id_and_no_prefix_means_no_ids(self):
+        refused = self.drive([0.4] * 2, 2, request_id_prefix=7)
+        self.assertEqual([row["state"] for row in refused["records"]], ["completed", "refused"])
+        self.assertEqual(refused["records"][1]["request_id"], (7 << 20) | 1)
+        plain = self.drive([0.01], 1)
+        self.assertIsNone(plain["records"][0]["request_id"])
+        self.assertEqual(self.served_request_ids, [(0, None)])
+
+    def test_request_id_sequence_must_fit_its_bits(self):
+        self.assertEqual(harness.arrival_request_id(1, (1 << 20) - 1), (1 << 21) - 1)
+        with self.assertRaisesRegex(ValueError, "does not fit"):
+            harness.arrival_request_id(1, 1 << 20)
+        with self.assertRaisesRegex(ValueError, "carry request ids"):
+            harness._drive_open_loop([], None, 1.0, (1 << 20) + 1, 0, request_id_prefix=1)
 
     def test_slow_completions_do_not_move_arrivals(self):
         report = self.drive([0.4] * 4, 4)
@@ -145,7 +170,9 @@ class OpenLoopLifecycleTests(unittest.TestCase):
             events.append("attribution")
             return {"status": "consistent", "attributed_actor": "tenant_0"}
 
-        def drive(workers, selected_pool, rate, operations, timeout):
+        def drive(workers, selected_pool, rate, operations, timeout, request_id_prefix=None):
+            self.assertIsInstance(request_id_prefix, int)
+            self.assertTrue(0 < request_id_prefix < (1 << 32))
             self.assertEqual(events, ["handshake", "attribution", "handshake"])
             self.assertIs(selected_pool, pool)
             self.assertEqual(len(workers), 2)
