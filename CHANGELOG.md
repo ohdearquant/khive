@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `KHIVE_WRITER_ATTEMPT_LOG=1` makes the writer sink write one `writer_attempt` row for every
+  completed writer-task attempt: the stage intervals, queue depth, labels, `rows_changed`, the
+  outcome, a per-process `attempt_seq` and the caller's `request_id`, which the daemon now scopes
+  around dispatch (`khive_storage::scope_request_correlation`). Off by default; these rows skip
+  the per-row fsync. The sink's `startup` row also carries the linked SQLite version, source id
+  and compile options (#6767).
 - `comm.read(id=..., mark=false)` fetches one inbound message without marking it read. The
   message's properties, `updated_at` and unread membership are left as stored, and the response
   reports the stored read state. `mark=false` is accepted only with `id`; `mark` defaults to true,
