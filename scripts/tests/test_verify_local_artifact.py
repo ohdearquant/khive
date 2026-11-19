@@ -48,6 +48,44 @@ def write_build_receipt(
     )
 
 
+def daemon_stand_in(directory: Path, seconds: int) -> list[str]:
+    """Make `directory` holding a `kkernel` stand-in; return argv running it `seconds`.
+
+    Runs the stand-in once as a probe and may re-point it, since the recipe stops
+    only a process named like the installed binary. Raises naming the probe if not.
+    """
+    # A symlink to `sleep` keeps the name wherever `sleep` runs under another
+    # name (BSD, GNU). A multicall `sleep` (uutils) refuses, and there the
+    # symlink points at this interpreter. That fallback cannot serve macOS: a
+    # framework Python re-executes itself, so `ps -o comm=` reports `Python`.
+    directory.mkdir()
+    stand_in = directory / "kkernel"
+    sleep_bin = shutil.which("sleep")
+    if sleep_bin is None:
+        raise AssertionError("no sleep binary on PATH")
+    stand_in.symlink_to(sleep_bin)
+    try:
+        probe = subprocess.run(
+            [str(stand_in), "0"], capture_output=True, text=True, timeout=10
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError(
+            f"the probe `kkernel 0` (a symlink to `sleep`) ran past {exc.timeout}s"
+        ) from exc
+    if probe.returncode == 0:
+        return [str(stand_in), str(seconds)]
+    reason = (
+        f"`sleep` refused to run as kkernel (rc {probe.returncode}): "
+        f"{probe.stderr.strip()}"
+    )
+    if sys.platform == "darwin":
+        raise AssertionError(reason)
+    print(f"{reason}; the stand-in runs this interpreter", file=sys.stderr)
+    stand_in.unlink()
+    stand_in.symlink_to(sys.executable)
+    return [str(stand_in), "-c", f"import time; time.sleep({seconds})"]
+
+
 FAKE_ARTIFACT = r"""#!/usr/bin/env python3
 import json
 import os
@@ -1101,26 +1139,7 @@ class MakefileGateContractTests(unittest.TestCase):
             daemon: subprocess.Popen[bytes] | None = None
             reaper: threading.Thread | None = None
             if live_daemon:
-                # The recipe stops only a process whose executable name is the
-                # installed binary's, so the stand-in runs as `kkernel`. A symlink
-                # to `sleep` does that wherever `sleep` runs under another name
-                # (BSD, GNU). A multicall coreutils `sleep` (uutils) refuses to,
-                # so there the symlink points at this interpreter instead. Not
-                # everywhere: a macOS framework Python re-executes itself, and
-                # `ps -o comm=` then reports `Python`, not `kkernel`.
-                stand_in = root / "outgoing" / "kkernel"
-                stand_in.parent.mkdir()
-                sleep_bin = shutil.which("sleep")
-                self.assertIsNotNone(sleep_bin, "no sleep binary on PATH")
-                stand_in.symlink_to(sleep_bin)
-                probe = subprocess.run([str(stand_in), "0"], capture_output=True)
-                if probe.returncode == 0:
-                    argv = [str(stand_in), "300"]
-                else:
-                    stand_in.unlink()
-                    stand_in.symlink_to(sys.executable)
-                    argv = [str(stand_in), "-c", "import time; time.sleep(300)"]
-                daemon = subprocess.Popen(argv)
+                daemon = subprocess.Popen(daemon_stand_in(root / "outgoing", 300))
                 self.addCleanup(daemon.kill)
                 # Reap it the moment it exits: the recipe polls `ps -p`, which
                 # still lists an unreaped child, and would escalate to SIGKILL.
