@@ -371,7 +371,7 @@ pub async fn measure(n: usize, arm: Arm, m: usize, offered_hz: f64, explicit_war
             "fresh_tail_returned_rows": "UNMEASURED",
             "route_evidence": "positive public ANN provenance and empty baseline tail; updated target has ANN provenance and final body marker; actual observed replay SQL starts after writes",
             "visibility_scope": "public ANN-tagged target visibility, including eligible fresh-tail candidates; not proof that background replay completed",
-            "delete_semantics": if matches!(arm, Arm::ComposedVectorDelete) { "informational two-commit vector+atom deletion; no atomicity claim" } else if matches!(arm, Arm::VerbDelete) { "actual knowledge.delete_atoms soft-deletes atom only; no vector delete tail" } else { "knowledge.index after a content rewrite; vector commit acknowledged before visibility interval" },
+            "delete_semantics": if matches!(arm, Arm::ComposedVectorDelete) { "informational two-commit vector+atom deletion; no atomicity claim" } else if matches!(arm, Arm::VerbDelete) { "actual knowledge.delete_atoms soft-deletes the atom and deletes its atom-field vectors; one vector delete tail" } else { "knowledge.index after a content rewrite; vector commit acknowledged before visibility interval" },
         }),
     ] {
         let Value::Object(fields) = section else {

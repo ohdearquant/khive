@@ -457,7 +457,7 @@ pub fn vector_purge_statements(
     field: Option<&str>,
     label_prefix: &str,
 ) -> Result<Vec<SqlStatement>, khive_storage::StorageError> {
-    let mut statements = Vec::with_capacity(tables.len() * 3);
+    let mut statements = Vec::with_capacity(tables.len() * (2 * subject_ids.len() + 1));
     if subject_ids.is_empty() {
         return Ok(statements);
     }
@@ -472,7 +472,7 @@ pub fn vector_purge_statements(
         }
         // The legacy all-field caller supplies one subject, preserving labels
         // and the original all-field and provenance behavior.
-        if field.is_none() {
+        let Some(field) = field else {
             for subject_id in subject_ids {
                 statements.push(
                     log_vector_row_delete_statement(
@@ -503,31 +503,35 @@ pub fn vector_purge_statements(
                 );
             }
             continue;
-        }
-        let field = field.expect("field checked above");
+        };
         let model_key = &table[4..];
         let quoted = format!("main.\"{}\"", table.replace('"', "\"\""));
         let ids = (3..subject_ids.len() + 3)
             .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
             .join(",");
-        let mut params = vec![
-            SqlValue::Text(namespace.to_owned()),
-            SqlValue::Text(field.to_owned()),
-        ];
-        params.extend(subject_ids.iter().map(|id| SqlValue::Text(id.to_string())));
-        statements.push(SqlStatement {
-            sql: format!("INSERT INTO main.ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
-                 SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
-                 FROM {quoted} WHERE namespace = ?1 AND field = ?2 AND subject_id IN ({ids})"),
-            params: params.clone(),
-            label: Some(format!("{label_prefix}-log-delete-vec-{table}")),
-        });
-        statements.push(SqlStatement {
-            sql: format!("DELETE FROM {quoted} WHERE namespace = ?1 AND field = ?2 AND subject_id IN ({ids})"),
-            params,
-            label: Some(format!("{label_prefix}-purge-vec-{table}")),
-        });
+        // vec0 plans a point lookup only for `subject_id = ?`; IN is a full scan.
+        for subject_id in subject_ids {
+            let params = vec![
+                SqlValue::Text(namespace.to_owned()),
+                SqlValue::Text(field.to_owned()),
+                SqlValue::Text(subject_id.to_string()),
+            ];
+            statements.push(SqlStatement {
+                sql: format!("INSERT INTO main.ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
+                     SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
+                     FROM {quoted} WHERE subject_id = ?3 AND namespace = ?1 AND field = ?2"),
+                params: params.clone(),
+                label: Some(format!("{label_prefix}-log-delete-vec-{table}")),
+            });
+            statements.push(SqlStatement {
+                sql: format!(
+                    "DELETE FROM {quoted} WHERE subject_id = ?3 AND namespace = ?1 AND field = ?2"
+                ),
+                params,
+                label: Some(format!("{label_prefix}-purge-vec-{table}")),
+            });
+        }
         let mut provenance_params = vec![
             SqlValue::Text(model_key.to_owned()),
             SqlValue::Text(namespace.to_owned()),

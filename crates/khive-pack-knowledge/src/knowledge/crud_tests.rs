@@ -562,8 +562,8 @@ async fn atomic_real_batch_failure_rolls_back_requested_rows() {
     assert_eq!(atomic_rows(&runtime).await.as_array().unwrap().len(), 2);
 }
 
-// These are synthetic in-memory fixtures. Their setup and positive baseline
-// must pass on the owner host before either mutation control is interpreted.
+// An in-memory runtime with one live atom, two vec0 tables holding its vectors
+// under different fields, and one unrelated vector.
 async fn delete_purge_fixture() -> (KhiveRuntime, khive_runtime::NamespaceToken, String) {
     let (runtime, token) = atomic_runtime();
     super::KnowledgeHandlers::upsert_atoms_with_sql(
@@ -604,6 +604,51 @@ async fn delete_purge_fixture() -> (KhiveRuntime, khive_runtime::NamespaceToken,
     )).await.expect("seed unrelated vector");
     drop(writer);
     (runtime, token, id)
+}
+
+#[tokio::test]
+async fn atom_vector_purge_reads_each_vec0_row_by_its_key() {
+    let (runtime, _token, id) = delete_purge_fixture().await;
+    let ids = [id, "00000000-0000-4000-8000-000000000001".to_string()];
+    let statements = khive_runtime::atomic_prepare::vector_purge_statements(
+        &["vec_fixture_a".into()],
+        "local",
+        &ids,
+        Some("knowledge.atom"),
+        "plan",
+    )
+    .expect("purge statements");
+    let mut reader = runtime.sql().reader().await.expect("plan reader");
+    let mut checked = 0;
+    for statement in statements
+        .into_iter()
+        .filter(|s| !s.sql.contains("vector_provenance"))
+    {
+        let plan = reader
+            .query_all(khive_storage::SqlStatement::new(
+                format!("EXPLAIN QUERY PLAN {}", statement.sql),
+                statement.params,
+            ))
+            .await
+            .expect("explain purge statement");
+        let details: Vec<String> = plan
+            .iter()
+            .filter_map(|row| row.text("detail").ok().map(str::to_owned))
+            .collect();
+        // sqlite-vec names its primary-key point plan idxStr '2!...'; '1' is a full scan.
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("VIRTUAL TABLE INDEX ")
+                    && detail
+                        .rsplit_once(':')
+                        .is_some_and(|(_, index)| index.starts_with("2!"))),
+            "{}: {details:?}",
+            statement.sql
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 4, "a log and a delete per id");
 }
 
 async fn purge_count(runtime: &KhiveRuntime, query: &str, id: &str) -> i64 {

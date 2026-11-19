@@ -5075,19 +5075,27 @@ fn vector_purge_statement_count_scales_with_chunks_and_tables() {
             .expect("valid vector table names")
         })
         .collect();
-    assert!(per_chunk
-        .iter()
-        .all(|statements| statements.len() == tables.len() * 3));
-    assert_eq!(per_chunk.iter().map(Vec::len).sum::<usize>(), 5 * 4 * 3);
-    for statements in per_chunk {
-        for triple in statements.chunks_exact(3) {
-            assert!(triple[0].sql.starts_with("INSERT INTO main.ann_write_log"));
-            assert!(triple[1].sql.starts_with("DELETE FROM main.\"vec_"));
-            assert!(triple[2]
+    for (chunk, statements) in ids.chunks(128).zip(&per_chunk) {
+        assert_eq!(statements.len(), tables.len() * (2 * chunk.len() + 1));
+        for block in statements.chunks_exact(2 * chunk.len() + 1) {
+            let (pairs, provenance) = block.split_at(2 * chunk.len());
+            for pair in pairs.chunks_exact(2) {
+                assert!(pair[0].sql.starts_with("INSERT INTO main.ann_write_log"));
+                assert!(pair[1].sql.starts_with("DELETE FROM main.\"vec_"));
+                // vec0 plans a point lookup only for equality on subject_id.
+                assert!(pair
+                    .iter()
+                    .all(|s| s.sql.contains("WHERE subject_id = ?3") && !s.sql.contains(" IN (")));
+            }
+            assert!(provenance[0]
                 .sql
                 .starts_with("DELETE FROM main.vector_provenance"));
         }
     }
+    assert_eq!(
+        per_chunk.iter().map(Vec::len).sum::<usize>(),
+        4 * (2 * 520 + 5)
+    );
 }
 
 #[test]
