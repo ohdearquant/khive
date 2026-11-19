@@ -1102,15 +1102,25 @@ class MakefileGateContractTests(unittest.TestCase):
             reaper: threading.Thread | None = None
             if live_daemon:
                 # The recipe stops only a process whose executable name is the
-                # installed binary's, so the stand-in runs as `kkernel`: a symlink
-                # to this interpreter, since a multicall coreutils `sleep` (uutils)
-                # refuses to run under a name that is not its own.
+                # installed binary's, so the stand-in runs as `kkernel`. A symlink
+                # to `sleep` does that wherever `sleep` runs under another name
+                # (BSD, GNU). A multicall coreutils `sleep` (uutils) refuses to,
+                # so there the symlink points at this interpreter instead. Not
+                # everywhere: a macOS framework Python re-executes itself, and
+                # `ps -o comm=` then reports `Python`, not `kkernel`.
                 stand_in = root / "outgoing" / "kkernel"
                 stand_in.parent.mkdir()
-                stand_in.symlink_to(sys.executable)
-                daemon = subprocess.Popen(
-                    [str(stand_in), "-c", "import time; time.sleep(300)"]
-                )
+                sleep_bin = shutil.which("sleep")
+                self.assertIsNotNone(sleep_bin, "no sleep binary on PATH")
+                stand_in.symlink_to(sleep_bin)
+                probe = subprocess.run([str(stand_in), "0"], capture_output=True)
+                if probe.returncode == 0:
+                    argv = [str(stand_in), "300"]
+                else:
+                    stand_in.unlink()
+                    stand_in.symlink_to(sys.executable)
+                    argv = [str(stand_in), "-c", "import time; time.sleep(300)"]
+                daemon = subprocess.Popen(argv)
                 self.addCleanup(daemon.kill)
                 # Reap it the moment it exits: the recipe polls `ps -p`, which
                 # still lists an unreaped child, and would escalate to SIGKILL.
