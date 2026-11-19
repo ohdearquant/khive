@@ -263,8 +263,9 @@ def burst_drain(records, deadline_s):
     MISSES when that time is over `deadline_s`, or when any of its arrivals was refused, failed or never finished:
     a refused arrival finishes at once, so leaving it out of the drain time alone would read an overload as fast.
     A burst DRAINS LATE when its completed arrivals finished past the deadline or an arrival it did not refuse never
-    completed, whatever its refusals; `drain_missed` counts those bursts. A burst that missed only through refused
-    arrivals is counted in `refused_only`: what caused those refusals is not measured here.
+    completed (a failed arrival counts here), whatever its refusals; `drain_missed` counts those bursts. A burst
+    that missed only through refused arrivals is counted in `refused_only`: what caused those refusals is not
+    measured here.
     Returns None when no record belongs to a burst.
     """
     bursts = {}
