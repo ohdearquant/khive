@@ -39,9 +39,12 @@ pub fn request_quiet(ttl_secs: u64) -> Result<DateTime<Utc>, RuntimeError> {
             "comm.quiet: ttl_secs must be an integer from 1 through 300".into(),
         ));
     }
+    // Wall clock first: the reported UTC deadline never lands after the
+    // instant the monotonic wait ends.
+    let utc = Utc::now() + chrono::Duration::seconds(ttl_secs as i64);
     let next = Deadline {
         monotonic: Instant::now() + Duration::from_secs(ttl_secs),
-        utc: Utc::now() + chrono::Duration::seconds(ttl_secs as i64),
+        utc,
     };
     let state = state();
     let mut current = super::lock(&state.deadline);
