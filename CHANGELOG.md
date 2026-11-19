@@ -113,10 +113,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - In `khive_retrieval`, the exhaustive `FuseStrategy` enum gains `WeightedRrf`, `VectorOnly`,
   `KeywordOnly` and `Custom`, `QueryNode` gains `Collect`, and `ExecutorError` gains
   `MissingVectorPreparer`, `StrategyValidation`, `RerankResolution`, `Metadata` and `Rerank`.
-  Downstream exhaustive matches must handle them. `WeightedRrf` is declared before `Union` and
-  `Collect` before `Filter`, so casting `FuseStrategy::Union`, `QueryNode::Filter`, `Rerank` or
-  `Empty` to an integer gives a value one higher than before. `ExecutorOutcome` gains a public
-  `plan` field, the candidate tree the executor consumed, which a struct literal must set (#6737).
+  Downstream exhaustive matches must handle them. `ExecutorOutcome` gains a public `plan` field,
+  the candidate tree the executor consumed, which a struct literal must set (#6737).
 
 - The exhaustive `khive_storage::StorageError` enum gains `WriteOutcomeUnknown` (COMMIT was
   issued and the reply was lost; side effects unknown, not retryable), `WriterOwnerUnavailable`
