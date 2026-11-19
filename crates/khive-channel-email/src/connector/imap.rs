@@ -411,16 +411,17 @@ impl LiveImap {
                 continue;
             }
 
+            let Some(&rfc822_size) = plan.body_sizes.get(&uid.get()) else {
+                return Err(ChannelError::Transport(format!(
+                    "IMAP size plan has no RFC822.SIZE for UID {}; page rejected",
+                    uid.get()
+                )));
+            };
             let remaining = self.max_page_bytes - page_bytes;
             let allowed = self.max_message_bytes.min(remaining);
             let body_query = format!("BODY.PEEK[]<0.{}>", allowed + 1);
             let uid_str = uid.get().to_string();
-            let body_timeout = body_fetch_timeout(
-                *plan
-                    .body_sizes
-                    .get(&uid.get())
-                    .expect("body UID has a validated RFC822.SIZE"),
-            );
+            let body_timeout = body_fetch_timeout(rfc822_size);
             let (body, body_len) = tokio::time::timeout(body_timeout, async {
                 let mut stream = session
                     .uid_fetch(&uid_str, &body_query)
