@@ -66,6 +66,36 @@ def summarize(values):
     }
 
 
+def fixed_variable_cost(rows):
+    """Least-squares split of writer service time into a fixed part and a part per changed row.
+
+    Fits service_micros = fixed + per_row * rows_changed over the attempts given. Rows without `rows_changed` are
+    left out and counted. With fewer than two distinct row counts there is no slope to fit, and the fit says so
+    instead of inventing one.
+    """
+    points = [(int(r["rows_changed"]), service_micros(r)) for r in rows if r.get("rows_changed") is not None]
+    out = {"n": len(points), "without_rows_changed": len(rows) - len(points)}
+    xs = {x for x, _ in points}
+    if len(xs) < 2:
+        out["fit"] = None
+        out["reason"] = f"{len(xs)} distinct rows_changed value(s); a slope needs two"
+        return out
+    n = len(points)
+    mx = sum(x for x, _ in points) / n
+    my = sum(y for _, y in points) / n
+    sxx = sum((x - mx) ** 2 for x, _ in points)
+    sxy = sum((x - mx) * (y - my) for x, y in points)
+    syy = sum((y - my) ** 2 for _, y in points)
+    slope = sxy / sxx
+    out["fit"] = {
+        "fixed_micros": my - slope * mx,
+        "per_row_micros": slope,
+        "r2": (sxy * sxy) / (sxx * syy) if syy else None,
+        "rows_changed_range": [min(xs), max(xs)],
+    }
+    return out
+
+
 def parse_sink_lines(lines):
     """Split one sink file's lines into segments, each opened by a `startup` row.
 
@@ -177,6 +207,7 @@ def join_point(arrivals, attempts, window_s, *, prefix, sequence_bits, window=No
             "joined_fraction": entry["joined"] / entry["completed"] if entry["completed"] else None,
             "attempts_per_request": summarize(entry["per_request"]),
             "service_micros": summarize([service_micros(r) for r in rows]),
+            "fixed_variable_cost": fixed_variable_cost(rows),
             "queue_wait_micros": summarize([int(r.get("queue_wait_micros") or 0) for r in rows]),
             "error_rate": sum(r.get("outcome") == "error" for r in rows) / len(rows) if rows else None,
         }

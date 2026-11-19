@@ -91,6 +91,23 @@ class JoinTests(unittest.TestCase):
         self.assertAlmostEqual(out["utilization"], 6 * 150 / 2_000_000)
 
 
+class CostSplitTests(unittest.TestCase):
+    def test_service_splits_into_fixed_and_per_row_parts(self):
+        rows = [dict(attempt(i, body=100 + 5 * k), rows_changed=k) for i, k in enumerate([1, 2, 3, 3], start=1)]
+        rows.append(attempt(9))
+        out = war.fixed_variable_cost(rows)
+        self.assertEqual((out["n"], out["without_rows_changed"]), (4, 1))
+        self.assertAlmostEqual(out["fit"]["fixed_micros"], 150)
+        self.assertAlmostEqual(out["fit"]["per_row_micros"], 5)
+        self.assertAlmostEqual(out["fit"]["r2"], 1.0)
+        self.assertEqual(out["fit"]["rows_changed_range"], [1, 3])
+
+    def test_one_row_count_has_no_slope(self):
+        out = war.fixed_variable_cost([dict(attempt(1), rows_changed=1), dict(attempt(2), rows_changed=1)])
+        self.assertIsNone(out["fit"])
+        self.assertIn("1 distinct rows_changed value", out["reason"])
+
+
 class VerdictTests(unittest.TestCase):
     def report(self, sink_lines, records=None, **limits):
         records = records if records is not None else [arrival(0, "create")]
