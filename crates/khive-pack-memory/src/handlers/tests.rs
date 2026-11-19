@@ -1225,6 +1225,36 @@ fn recall_help_states_the_server_side_caps_it_enforces() {
 }
 
 #[test]
+fn recall_help_states_the_scaled_entity_term_and_its_breakdown_fields() {
+    use khive_types::Pack;
+
+    let recall_def = <crate::MemoryPack as Pack>::HANDLERS
+        .iter()
+        .find(|h| h.name == "memory.recall")
+        .expect("memory.recall HandlerDef exists");
+    let param = |name: &str| {
+        recall_def
+            .params
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("memory.recall advertises {name}"))
+            .description
+    };
+    let min_score = param("min_score");
+    assert!(
+        min_score.contains("1 + (t0 - 1) * n / (n + 16)"),
+        "min_score help must state the evidence-scaled entity term: {min_score}"
+    );
+    let breakdown = param("include_breakdown");
+    for field in ["`entity_posterior_mean`", "`entity_evidence_mass`"] {
+        assert!(
+            breakdown.contains(field),
+            "include_breakdown help must list {field}: {breakdown}"
+        );
+    }
+}
+
+#[test]
 fn recall_params_distinguish_missing_session_fields_from_explicit_null() {
     let missing: RecallParams = serde_json::from_value(serde_json::json!({"query": "x"}))
         .expect("missing session controls are optional");

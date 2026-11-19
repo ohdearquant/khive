@@ -232,6 +232,7 @@ impl KhiveMcpServer {
             pool: None,
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
+            catalog_verbosity: crate::args::CatalogVerbosity::Full,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
             #[cfg(unix)]
             events_readiness: Arc::new(std::sync::OnceLock::new()),
@@ -276,6 +277,12 @@ impl KhiveMcpServer {
     /// `khive.toml`. Per-request `format` fields override this at dispatch time.
     pub fn with_default_output_format(mut self, fmt: OutputFormat) -> Self {
         self.default_output_format = fmt;
+        self
+    }
+
+    /// Select the advertised verb catalog detail without changing dispatch or full help.
+    pub fn with_catalog_verbosity(mut self, verbosity: crate::args::CatalogVerbosity) -> Self {
+        self.catalog_verbosity = verbosity;
         self
     }
 

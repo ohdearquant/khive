@@ -31,12 +31,15 @@ fn runtime_routing_refuses_strict_fallbacks_and_attributes_only_enabled_queue_de
             for (operation, _) in operations {
                 let result = pool.writer_task_for_runtime_write(operation);
                 if strict && enabled {
-                    assert!(matches!(result, Err(StorageError::WriterTaskNoRuntime)));
+                    assert!(matches!(result,
+                        Err(StorageError::WriterOwnerUnavailable { ref source, .. })
+                        if matches!(source.as_ref(), StorageError::WriterTaskNoRuntime)
+                    ));
                 } else if strict {
                     assert!(matches!(
                         result,
-                        Err(StorageError::Pool { operation: name, .. })
-                            if name == operation.operation()
+                        Err(StorageError::WriterOwnerUnavailable { operation: name, ref source })
+                            if name == operation.operation() && matches!(source.as_ref(), StorageError::Pool { .. })
                     ));
                 } else {
                     assert!(result.unwrap().is_none());

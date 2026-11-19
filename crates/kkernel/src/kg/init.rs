@@ -717,6 +717,9 @@ mod tests {
 
     #[test]
     fn init_schema_supports_public_remote_pin_update_and_preserves_result_on_rerun() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
         const OLD_COMMIT: &str = "1111111111111111111111111111111111111111";
         const ARCHIVE_PIN: &str =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

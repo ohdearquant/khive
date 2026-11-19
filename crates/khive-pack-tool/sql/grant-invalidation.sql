@@ -1,4 +1,5 @@
-CREATE TRIGGER IF NOT EXISTS tool_grants_invalidate_on_registry_insert
+DROP TRIGGER IF EXISTS tool_grants_invalidate_on_registry_insert;
+CREATE TRIGGER tool_grants_invalidate_on_registry_insert
 AFTER INSERT ON entities
 WHEN NEW.deleted_at IS NULL
     AND NEW.kind = 'project'
@@ -18,8 +19,8 @@ BEGIN
             OR tool = '*'
             OR (
                 substr(CAST(tool AS BLOB), -1) = X'2A'
-                AND substr(CAST(NEW.name AS BLOB), 1, length(CAST(tool AS BLOB)) - 1)
-                    = substr(CAST(tool AS BLOB), 1, length(CAST(tool AS BLOB)) - 1)
+                AND substr(CAST(lower(NEW.name) AS BLOB), 1, length(CAST(tool AS BLOB)) - 1)
+                    = substr(CAST(lower(tool) AS BLOB), 1, length(CAST(tool AS BLOB)) - 1)
             )
         );
 END;
@@ -46,8 +47,8 @@ WITH first_known_registry AS (
             OR grants.tool = '*'
             OR (
                 substr(CAST(grants.tool AS BLOB), -1) = X'2A'
-                AND substr(CAST(registry.name AS BLOB), 1, length(CAST(grants.tool AS BLOB)) - 1)
-                    = substr(CAST(grants.tool AS BLOB), 1, length(CAST(grants.tool AS BLOB)) - 1)
+                AND substr(CAST(lower(registry.name) AS BLOB), 1, length(CAST(grants.tool AS BLOB)) - 1)
+                    = substr(CAST(lower(grants.tool) AS BLOB), 1, length(CAST(grants.tool AS BLOB)) - 1)
             )
         )
     WHERE grants.status = 'granted'

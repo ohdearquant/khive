@@ -39,8 +39,8 @@ pub enum ConfigError {
     #[error("mount configuration: {reason}")]
     InvalidMountConfig { reason: String },
 
-    #[error("channel.node: {reason}")]
-    InvalidNodeConfig { reason: String },
+    #[error("channel configuration: {reason}")]
+    InvalidChannelConfig { reason: String },
 
     #[error("config file I/O: {0}")]
     Io(#[from] std::io::Error),
@@ -1469,10 +1469,10 @@ pub struct KhiveConfig {
     #[serde(skip)]
     pub visibility_receipts: Option<crate::credentials::VisibilityReceiptConfig>,
 
-    /// `[channel]` section. A `[channel.node]` table is accepted so an existing
-    /// config file keeps loading; its contents are not interpreted.
+    /// Opaque `[channel.*]` values. Registered components validate their own
+    /// values at activation; unregistered values remain stored without effect.
     #[serde(default)]
-    pub channel: crate::node_config::ChannelSectionConfig,
+    pub channel: crate::channel_section::ChannelSectionConfig,
 
     #[serde(default)]
     pub mounts: Vec<crate::mount_config::MountConfig>,

@@ -105,6 +105,111 @@ inventory::collect!(DaemonComponentRegistration);
 
 type ComponentFactory = Arc<dyn Fn(HostContext) -> ComponentFuture + Send + Sync + 'static>;
 
+type ResidentFactory =
+    Arc<dyn Fn(HostContext, Arc<khive_channel::ChannelRegistry>) -> ComponentFuture + Send + Sync>;
+
+/// One caller-owned resident, supervised beside the host's channel loops.
+///
+/// Register through [`crate::serve::ServeRegistrations`] before serving. The
+/// factory receives the same immutable channel registry as the builtin loops,
+/// and is called again after an eligible retryable failure. Capture component
+/// state in the factory; observe the context's cancellation token when stopping.
+/// Only persistent daemon boots start these residents.
+#[derive(Clone)]
+pub struct ResidentComponentRegistration {
+    pub name: &'static str,
+    pub restart: RestartClass,
+    pub max_restarts: u32,
+    pub backoff_initial_ms: u64,
+    pub backoff_max_ms: u64,
+    pub shutdown_timeout_ms: u64,
+    start: ResidentFactory,
+}
+
+impl ResidentComponentRegistration {
+    /// Use the host's normal retry and shutdown defaults for a captured factory.
+    pub fn new(
+        name: &'static str,
+        start: impl Fn(HostContext, Arc<khive_channel::ChannelRegistry>) -> ComponentFuture
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self {
+            name,
+            restart: RestartClass::OnFailure,
+            max_restarts: 5,
+            backoff_initial_ms: 1_000,
+            backoff_max_ms: 60_000,
+            shutdown_timeout_ms: 5_000,
+            start: Arc::new(start),
+        }
+    }
+
+    fn bind(&self, channels: Arc<khive_channel::ChannelRegistry>) -> ComponentRegistration {
+        let start = self.start.clone();
+        ComponentRegistration {
+            name: self.name,
+            restart: self.restart,
+            max_restarts: self.max_restarts,
+            backoff_initial_ms: self.backoff_initial_ms,
+            backoff_max_ms: self.backoff_max_ms,
+            shutdown_timeout_ms: self.shutdown_timeout_ms,
+            start: Arc::new(move |context| start(context, channels.clone())),
+        }
+    }
+}
+
+/// Refuse name collisions before any loop or supervisor starts. Existing linked
+/// registrations retain their own behavior; caller registrations cannot obscure
+/// their health rows or those of a host-owned component.
+pub(crate) fn validate_resident_components(
+    residents: &[ResidentComponentRegistration],
+) -> anyhow::Result<()> {
+    let mut names: std::collections::HashSet<&str> =
+        inventory::iter::<DaemonComponentRegistration>()
+            .map(|registration| registration.name)
+            .collect();
+    names.extend([
+        SCHEDULE_COMPONENT_NAME,
+        BLOB_UPLOAD_COMPONENT_NAME,
+        "email-outbound",
+        "telegram-outbound",
+    ]);
+    for resident in residents {
+        if resident.name.is_empty()
+            || resident
+                .name
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+        {
+            anyhow::bail!(
+                "resident component name must be nonempty without whitespace or control characters"
+            );
+        }
+        if !names.insert(resident.name) {
+            anyhow::bail!("duplicate resident component name {:?}", resident.name);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn start_resident_components(
+    residents: &[ResidentComponentRegistration],
+    channels: Arc<khive_channel::ChannelRegistry>,
+    server: &KhiveMcpServer,
+) -> usize {
+    start_component_registrations(
+        residents
+            .iter()
+            .map(|resident| resident.bind(channels.clone()))
+            .collect(),
+        server,
+        khive_runtime::daemon_shutdown_token(),
+        component_health().clone(),
+    )
+}
+
 #[derive(Clone)]
 struct ComponentRegistration {
     name: &'static str,
@@ -693,3 +798,112 @@ mod outbox_tests;
 #[cfg(test)]
 #[path = "components_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod resident_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn registration(name: &'static str) -> ResidentComponentRegistration {
+        ResidentComponentRegistration::new(name, |_, _| Box::pin(async { Ok(()) }))
+    }
+
+    #[test]
+    fn resident_names_cannot_replace_host_or_caller_health_rows() {
+        for name in [
+            "",
+            "two words",
+            "schedule-tick",
+            "blob-upload-sweep",
+            "email-outbound",
+            "telegram-outbound",
+        ] {
+            assert!(
+                validate_resident_components(&[registration(name)]).is_err(),
+                "invalid or reserved resident name must be refused: {name:?}"
+            );
+        }
+        assert!(validate_resident_components(&[
+            registration("stand-in"),
+            registration("stand-in")
+        ])
+        .is_err());
+        validate_resident_components(&[registration("stand-in"), registration("other")]).unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn captured_resident_restarts_with_the_same_registry_and_joins_on_cancel() {
+        let runtime = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".into()],
+            brain_profile: None,
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .expect("resident runtime");
+        let server = KhiveMcpServer::new(runtime).expect("resident server");
+        let channels = Arc::new(khive_channel::ChannelRegistry::new());
+        let expected = channels.clone();
+        let starts = Arc::new(AtomicU32::new(0));
+        let completed = Arc::new(AtomicU32::new(0));
+        let starts_in_factory = starts.clone();
+        let completed_in_factory = completed.clone();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut resident =
+            ResidentComponentRegistration::new("captured-resident", move |ctx, actual| {
+                let attempt = starts_in_factory.fetch_add(1, Ordering::SeqCst);
+                let completion = completed_in_factory.clone();
+                started_tx
+                    .send(Arc::ptr_eq(&actual, &expected))
+                    .expect("started receiver");
+                Box::pin(async move {
+                    if attempt == 0 {
+                        return Err(ComponentError::Retryable("one transient failure".into()));
+                    }
+                    ctx.heartbeat();
+                    ctx.cancellation().cancelled().await;
+                    completion.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+        resident.max_restarts = 1;
+        resident.backoff_initial_ms = 1;
+        resident.backoff_max_ms = 1;
+        let cancellation = CancellationToken::new();
+        let health = HealthReporter::default();
+        let supervisor = tokio::spawn(supervise(
+            resident.bind(channels),
+            server,
+            cancellation.clone(),
+            health.clone(),
+        ));
+        for _ in 0..2 {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+                    .await
+                    .expect("resident start"),
+                Some(true),
+                "every resident attempt must receive the host's exact shared registry"
+            );
+        }
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(2), supervisor)
+            .await
+            .expect("supervisor joins")
+            .expect("supervisor succeeds");
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            2,
+            "retry budget must reuse the captured factory"
+        );
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            1,
+            "cancellation must join the resident's cooperative cleanup"
+        );
+        let status = health.status("captured-resident").expect("resident health");
+        assert_eq!(status.state, ComponentState::Stopped);
+        assert_eq!(status.restart_count, 1);
+        assert!(status.last_heartbeat.is_some());
+    }
+}

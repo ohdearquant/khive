@@ -1648,8 +1648,9 @@ async fn run_receipt_reports_first_registration_when_name_is_taken() {
     let f = fixture();
     let first = f.register_sh("occupied", "allow").await;
     assert_eq!(first["created"], true);
-    let second = f
-        .call(
+    // A different source under a taken name is refused and changes nothing (ADR-180 Amendment 10).
+    let refused = f
+        .call_err(
             "tool.register",
             json!({
                 "name": "occupied", "kind": "tool", "source": "exec:/bin/echo",
@@ -1657,9 +1658,10 @@ async fn run_receipt_reports_first_registration_when_name_is_taken() {
             }),
         )
         .await;
-    assert_eq!(second["created"], false);
-    assert_eq!(second["tool"]["full_id"], first["tool"]["full_id"]);
-    assert_eq!(second["tool"]["source"], "exec:/bin/sh");
+    assert!(
+        refused.contains("cannot change source on an existing registration"),
+        "{refused}"
+    );
     let tree = f.tree(&[]).await;
     let out = f
         .call(

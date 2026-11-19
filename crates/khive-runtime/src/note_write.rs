@@ -1251,6 +1251,8 @@ impl KhiveRuntime {
             };
         };
 
+        crate::secret_gate::check_at(key, "note", "key")?;
+
         // Keyed singleton create (ADR-172 Amendment 6): staged.
         //
         // Properties are derived exactly once, here, before either holder

@@ -206,8 +206,11 @@ jobs:
                 echo "crates/$crate/Cargo.toml"
               done > "$diff_file"
             fi
-          elif ! git diff --name-only "$BASE_SHA...$HEAD_SHA" > "$diff_file"; then
-            echo "::warning::git diff failed for $BASE_SHA...$HEAD_SHA; treating as all-components (fail closed)"
+          # The checkout is the pull request merge commit: its first parent is the base branch as merged,
+          # so this is the pull request's own change. The event's base SHA is the base when the event fired,
+          # and a head that merged a newer main read every crate main had changed since as changed here.
+          elif ! git diff --name-only HEAD^1 HEAD > "$diff_file"; then
+            echo "::warning::git diff failed for HEAD^1..HEAD; treating as all-components (fail closed)"
             all_components=true
           fi
 

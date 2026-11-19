@@ -12,10 +12,7 @@ async fn test_help_true_returns_schema_for_kg_create() {
 
     // Shape checks.
     assert_eq!(result["verb"], "create", "envelope must name the verb");
-    assert_eq!(
-        result["pack"], "helptest",
-        "envelope must name the owning pack"
-    );
+    assert_eq!(result["pack"], "kg", "envelope must name the owning pack");
     assert!(
         result["description"].as_str().is_some(),
         "description must be a string"
