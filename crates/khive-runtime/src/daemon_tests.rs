@@ -426,7 +426,6 @@ impl DaemonDispatch for MockDispatch {
 
 fn base_request_frame(config_id: &str) -> DaemonRequestFrame {
     DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
         ops: String::new(),
         namespace: "local".to_string(),
         config_id: config_id.to_string(),
