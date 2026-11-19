@@ -618,15 +618,16 @@ async fn atom_vector_purge_reads_each_vec0_row_by_its_key() {
         "plan",
     )
     .expect("purge statements");
-    let mut reader = runtime.sql().reader().await.expect("plan reader");
+    // The purge holds writes, which a pooled reader refuses even under EXPLAIN.
+    let mut writer = runtime.sql().writer().await.expect("plan writer");
     let mut checked = 0;
     for statement in statements
         .into_iter()
         .filter(|s| !s.sql.contains("vector_provenance"))
     {
-        let plan = reader
-            .query_all(khive_storage::SqlStatement::new(
-                format!("EXPLAIN QUERY PLAN {}", statement.sql),
+        let plan = writer
+            .explain(khive_storage::SqlStatement::new(
+                statement.sql.clone(),
                 statement.params,
             ))
             .await
