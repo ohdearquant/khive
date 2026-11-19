@@ -95,6 +95,7 @@ fn remote_identity_reader_refuses_malformed_explicit_metadata() {
         serde_json::json!({"content_hash": hash, "coverage": null}),
         serde_json::json!({"content_hash": hash, "coverage": {"entities": true, "edges": true}}),
         serde_json::json!({"content_hash": hash, "coverage": {"entities": true, "edges": true, "notes": "false"}}),
+        serde_json::json!({"content_hash": hash, "coverage": {"entities": true, "edges": true, "notes": false, "tasks": true}}),
     ] {
         std::fs::write(
             cache.join("meta.json"),

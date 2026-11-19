@@ -98,6 +98,7 @@ impl std::fmt::Display for SnapshotId {
 /// v1 covers entities and edges only. Notes are excluded until note packs
 /// define versioned export, import, privacy/redaction, and merge semantics.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotCoverage {
     pub entities: bool,
     pub edges: bool,
