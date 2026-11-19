@@ -10,6 +10,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 import f7_sweep as sweep
+import writer_attempt_report as war
 
 BITS = 20
 PREFIX = 7
@@ -104,18 +105,25 @@ class BurstTests(unittest.TestCase):
             summary, rc = sweep.execute(runs, pathlib.Path(tmp), args(burst_deadline_ms=100.0), spawn=fake,
                                         emit=lines.append)
         self.assertEqual(rc, 0)
-        self.assertIn("bursts=1 missed=1 refused=0 drain_p99_ms=500.0 deadline_ms=100", lines[2])
-        self.assertEqual(lines[-1], "burst-drain knee at deadline 100 ms: size 40 "
-                                    "(first size with a burst missed and no arrival refused)")
+        self.assertIn("bursts=1 missed=1 drain_missed=1 refused_only=0 refused_arrivals=0 drain_p99_ms=500.0 deadline_ms=100", lines[2])
+        self.assertEqual(lines[-1], "burst-drain knee at deadline 100 ms: size 40 (first size with a burst that drained late)")
 
-    def test_refused_bursts_are_named_apart_from_the_knee(self):
-        drain = lambda missed, refused: {"missed": missed, "refused": refused, "drain_missed": missed and not refused}
-        line_ = sweep.knee_line([(10, drain(0, 0)), (40, drain(1, 3)), (80, drain(1, 0))], 0.1)
-        self.assertEqual(line_, "burst-drain knee at deadline 100 ms: size 80 (first size with a burst missed and no "
-                                "arrival refused); client pool refused burst arrivals from size 40 "
-                                "(a capacity reading, not a drain one)")
-        only_refused = sweep.knee_line([(10, drain(0, 0)), (40, drain(1, 2))], 0.1)
-        self.assertTrue(only_refused.startswith("burst-drain knee at deadline 100 ms: none up to size 40; client pool"))
+    def test_a_size_with_refusals_and_a_late_drain_is_the_knee(self):
+        records = [{"burst": 1, "state": "completed", "scheduled_s": 1.0, "finished_s": 1.5} for _ in range(39)]
+        records.append({"burst": 1, "state": "refused", "scheduled_s": 1.0, "finished_s": 1.0})
+        refused_and_late = war.burst_drain(records, 0.1)
+        fast = war.burst_drain([{"burst": 1, "state": "completed", "scheduled_s": 1.0, "finished_s": 1.01}], 0.1)
+        self.assertEqual(sweep.knee_line([(10, fast), (40, refused_and_late)], 0.1),
+                         "burst-drain knee at deadline 100 ms: size 40 (first size with a burst that drained late)")
+
+    def test_refusal_only_bursts_are_named_apart(self):
+        records = [{"burst": 1, "state": "completed", "scheduled_s": 1.0, "finished_s": 1.01},
+                   {"burst": 1, "state": "refused", "scheduled_s": 1.0, "finished_s": 1.0}]
+        refusal_only = war.burst_drain(records, 0.1)
+        self.assertEqual((refusal_only["drain_missed"], refusal_only["refused_only"]), (0, 1))
+        self.assertEqual(sweep.knee_line([(10, refusal_only), (40, refusal_only)], 0.1),
+                         "burst-drain knee at deadline 100 ms: none up to size 40; "
+                         "bursts missed only through refused arrivals at size 10, 40")
 
     def test_burst_sizes_at_or_over_the_worker_pool_are_refused(self):
         base = ["--out", "/x/o", "--rate-per-worker", "1", "--burst-deadline-ms", "100", "--paired-workers", "50"]

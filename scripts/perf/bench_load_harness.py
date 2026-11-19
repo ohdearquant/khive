@@ -279,7 +279,7 @@ def _op_create_entity(proc, tenant, i, request_id=None):
 # The writer sink reports drops only in its heartbeat (default every 5 minutes). A kept sink directory shortens it and
 # the run waits two heartbeats after the last arrival, so the drop counter covers every row the run enqueued.
 SINK_HEARTBEAT_MS = 1000
-SINK_SETTLE_S = 3.0
+SINK_SETTLE_S = 2 * SINK_HEARTBEAT_MS / 1000 + 1.0
 
 # The F7 transaction shapes (ADR-135 F7, #6743), one verb each. Every one is a write.
 BULK_INGEST_MEMBERS = 100

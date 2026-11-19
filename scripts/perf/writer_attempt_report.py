@@ -262,7 +262,9 @@ def burst_drain(records, deadline_s):
     A burst's drain time runs from its scheduled instant to the last finish among its completed arrivals. A burst
     MISSES when that time is over `deadline_s`, or when any of its arrivals was refused, failed or never finished:
     a refused arrival finishes at once, so leaving it out of the drain time alone would read an overload as fast.
-    A refusal is the client's worker pool, not the writer, so `drain_missed` counts only misses with no refusal.
+    A burst DRAINS LATE when its completed arrivals finished past the deadline or an arrival it did not refuse never
+    completed, whatever its refusals; `drain_missed` counts those bursts. A burst that missed only through refused
+    arrivals is counted in `refused_only`: what caused those refusals is not measured here.
     Returns None when no record belongs to a burst.
     """
     bursts = {}
@@ -280,16 +282,18 @@ def burst_drain(records, deadline_s):
         finished = [row["finished_s"] for row in rows if row.get("state") == "completed"]
         drain = max(finished) - rows[0]["scheduled_s"] if finished else None
         unfinished = len(rows) - states["completed"]
+        late = (drain is not None and drain > deadline_s) or unfinished > states["refused"]
         per_burst.append({"burst": burst_id, "size": len(rows), "completed": states["completed"],
                           "refused": states["refused"], "unfinished": unfinished, "drain_s": drain,
-                          "missed": bool(unfinished) or drain is None or drain > deadline_s})
+                          "missed": bool(unfinished) or drain is None or drain > deadline_s, "drain_late": late})
     return {
         "deadline_s": deadline_s,
         "bursts": len(per_burst),
         "sizes": sorted({b["size"] for b in per_burst}),
         "missed": sum(b["missed"] for b in per_burst),
         "refused": sum(b["refused"] for b in per_burst),
-        "drain_missed": sum(b["missed"] and not b["refused"] for b in per_burst),
+        "drain_missed": sum(b["drain_late"] for b in per_burst),
+        "refused_only": sum(b["missed"] and not b["drain_late"] for b in per_burst),
         "drain_s": summarize([b["drain_s"] for b in per_burst if b["drain_s"] is not None]),
         "per_burst": per_burst,
     }

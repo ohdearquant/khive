@@ -11,8 +11,10 @@ The run order is fixed before the first run and written to plan.json in the outp
      latency is pooled per arm over the rounds, and the cost line states on minus off at p50 and p99 per op class.
   4. Burst points, when --burst-sizes is given: one run per size at --paired-workers, attempt log on, with that many
      extra arrivals at one instant every --burst-every seconds on top of the steady rate. Each run states how many
-     bursts missed the --burst-deadline-ms drain deadline (late, or any arrival refused, failed or unfinished), and
-     the knee line names the smallest size with a missed burst. Bursts add arrivals to a run of fixed length, so a
+     bursts missed the --burst-deadline-ms drain deadline (late, or any arrival refused, failed or unfinished) and how
+     many drained late (completed arrivals past the deadline, or an arrival that was not refused never completing,
+     whatever the refusals). The knee line names the smallest size with a burst that drained late, and names apart
+     the sizes whose bursts missed only through refused arrivals. Bursts add arrivals to a run of fixed length, so a
      burst run offers fewer seconds than a sweep run at the same rate.
 
 Each run gets its own directory under --out with the harness report (harness.json), the harness log and the sink
@@ -124,21 +126,22 @@ def run_line(run, reading):
 
 def burst_text(drain):
     p99 = drain["drain_s"].get("p99")
-    return (f"; bursts={drain['bursts']} missed={drain['missed']} refused={drain['refused']} "
+    return (f"; bursts={drain['bursts']} missed={drain['missed']} drain_missed={drain['drain_missed']} "
+            f"refused_only={drain['refused_only']} refused_arrivals={drain['refused']} "
             f"drain_p99_ms={'none' if p99 is None else round(p99 * 1000, 3)} deadline_ms={drain['deadline_s'] * 1000:g}")
 
 
 def knee_line(burst_points, deadline_s):
-    """The smallest size with a burst missed with no refusal, or the largest size tried when none missed. Sizes whose
-    bursts had arrivals refused by the client's worker pool are named apart: they measure the pool, not the writer."""
+    """The smallest size with a burst that drained late, whatever its refusals, or the largest size tried when none
+    did. Sizes with a burst that missed only through refused arrivals are named apart."""
     missed = sorted(size for size, drain in burst_points if drain["drain_missed"])
-    refused = sorted(size for size, drain in burst_points if drain["refused"])
+    refused = sorted(size for size, drain in burst_points if drain["refused_only"])
     tried = sorted(size for size, _ in burst_points)
     head = f"burst-drain knee at deadline {deadline_s * 1000:g} ms: "
-    line = head + (f"size {missed[0]} (first size with a burst missed and no arrival refused)" if missed
+    line = head + (f"size {missed[0]} (first size with a burst that drained late)" if missed
                    else f"none up to size {tried[-1]}")
     if refused:
-        line += f"; client pool refused burst arrivals from size {refused[0]} (a capacity reading, not a drain one)"
+        line += f"; bursts missed only through refused arrivals at size {', '.join(map(str, refused))}"
     return line
 
 
