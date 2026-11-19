@@ -16,6 +16,11 @@ Loss accounting, per sink file (one file per process and sink directory, sequenc
 A segment whose gaps exceed its drop counter is inconsistent and makes the run BROKEN. A point whose loss_upper is
 over the loss limit (default 1 percent) is VOID: rows and alarm rows share one bounded channel, so loss is likeliest
 exactly at the load where the measurement matters, and a void point is re-run, never read.
+
+Utilization counts only the rows whose `ts_utc` falls inside the run's wall-clock measurement window
+(`window_utc` in the arrival report, from arrival zero to the end of the drain). Setup writes before arrival zero
+(bootstrap, fixtures) share the sink file and would otherwise inflate it; they stay counted as
+`outside_window_attempts`.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ import math
 import pathlib
 import re
 import sys
+from datetime import datetime
 
 ATTEMPT_KIND = "writer_attempt"
 DROP_MESSAGE = re.compile(r"^sink drops since last summary: (\d+)$")
@@ -113,12 +119,23 @@ def service_micros(row):
     return sum(int(row.get(key) or 0) for key in SERVICE_KEYS)
 
 
-def join_point(arrivals, attempts, window_s, *, prefix, sequence_bits):
+def parse_utc(text):
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        raise ReportError(f"timestamp {text!r} is not an RFC 3339 UTC time") from None
+    if moment.tzinfo is None:
+        raise ReportError(f"timestamp {text!r} carries no UTC offset")
+    return moment
+
+
+def join_point(arrivals, attempts, window_s, *, prefix, sequence_bits, window=None):
     """Join one point's arrivals to its writer_attempt rows by request id.
 
     `attempts` are every writer_attempt row of the point's sink segments. Rows whose request id carries this run's
     prefix are joined to arrivals; rows with no id (setup, background work, writes spawned without the request
-    context) and rows with another prefix are counted, never dropped from the totals.
+    context) and rows with another prefix are counted, never dropped from the totals. With `window` (a pair of
+    aware datetimes), utilization and the overall queue wait read only the rows whose `ts_utc` lies inside it.
     """
     if window_s <= 0:
         raise ReportError("the measurement window must be positive")
@@ -163,15 +180,21 @@ def join_point(arrivals, attempts, window_s, *, prefix, sequence_bits):
             "queue_wait_micros": summarize([int(r.get("queue_wait_micros") or 0) for r in rows]),
             "error_rate": sum(r.get("outcome") == "error" for r in rows) / len(rows) if rows else None,
         }
-    all_service = sum(service_micros(r) for r in attempts)
+    if window is None:
+        in_window = attempts
+    else:
+        start, end = window
+        in_window = [r for r in attempts if start <= parse_utc(r.get("ts_utc")) <= end]
+    all_service = sum(service_micros(r) for r in in_window)
     return {
         "classes": report_classes,
         "attempts": len(attempts),
         "unscoped_attempts": unscoped,
         "foreign_attempts": foreign,
         "orphan_attempts": orphan,
+        "outside_window_attempts": len(attempts) - len(in_window),
         "utilization": all_service / (window_s * 1_000_000),
-        "queue_wait_micros": summarize([int(r.get("queue_wait_micros") or 0) for r in attempts]),
+        "queue_wait_micros": summarize([int(r.get("queue_wait_micros") or 0) for r in in_window]),
     }
 
 
@@ -202,6 +225,10 @@ def build_point_report(arrival_report, sink_lines_by_file, *, loss_limit=0.01, u
     bits = arrival_report.get("request_id_sequence_bits")
     if prefix is None or bits is None:
         raise ReportError("the arrival report carries no request id prefix; its rows cannot be joined")
+    window_utc = arrival_report.get("window_utc") or {}
+    if not window_utc.get("start") or not window_utc.get("end"):
+        raise ReportError("the arrival report carries no wall-clock window; setup writes cannot be separated")
+    window = (parse_utc(window_utc["start"]), parse_utc(window_utc["end"]))
     if not sink_lines_by_file:
         raise ReportError("no sink file was read")
     segments = []
@@ -217,7 +244,7 @@ def build_point_report(arrival_report, sink_lines_by_file, *, loss_limit=0.01, u
     if not attempts:
         raise ReportError("the sink holds no writer_attempt rows; was KHIVE_WRITER_ATTEMPT_LOG set on the daemon?")
     joined = join_point(arrival_report["records"], attempts, arrival_report["observed_duration_s"],
-                        prefix=prefix, sequence_bits=bits)
+                        prefix=prefix, sequence_bits=bits, window=window)
     verdict, reason = point_verdict(total, joined, loss_limit=loss_limit, util_limit=util_limit,
                                     queue_p99_limit_micros=queue_p99_limit_micros)
     return {

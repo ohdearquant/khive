@@ -170,7 +170,9 @@ class OpenLoopLifecycleTests(unittest.TestCase):
             events.append("attribution")
             return {"status": "consistent", "attributed_actor": "tenant_0"}
 
-        def drive(workers, selected_pool, rate, operations, timeout, request_id_prefix=None):
+        def drive(workers, selected_pool, rate, operations, timeout, request_id_prefix=None, pick_op=None, menu=None):
+            self.assertIs(menu, harness._OP_MENU)
+            self.assertEqual(len([pick_op() for _ in range(operations)]), operations)
             self.assertIsInstance(request_id_prefix, int)
             self.assertTrue(0 < request_id_prefix < (1 << 32))
             self.assertEqual(events, ["handshake", "attribution", "handshake"])
@@ -240,6 +242,127 @@ class OpenLoopLifecycleTests(unittest.TestCase):
         blocked.kill.assert_called_once()
         self.assertEqual(order, ["kill", "join"])
         self.assertEqual(registry, {(0, 0): failed, (0, 1): blocked})
+
+
+class NamedMixTests(unittest.TestCase):
+    def test_mix_names_its_classes_write_set_and_wall_clock_window(self):
+        clock = VirtualClock()
+        pool = SlowServicePool(clock, [0.01] * 4)
+        connections = [(None, harness.WorkerResult(0, 0))]
+        menu = harness.MIXES["f7"]
+        plan = [harness._op_audit_append, harness._op_bulk_ingest, harness._op_audit_append, harness._op_comm_send]
+        calls = []
+
+        def served(fn):
+            def service(proc, tenant, sequence, request_id=None):
+                calls.append(harness._OP_NAMES[fn])
+                return harness.OpOutcome(harness._OP_NAMES[fn], True, 40)
+            return service
+
+        fakes = {fn: served(fn) for fn, _ in menu}
+        with patch.dict(harness._OP_NAMES, {fakes[fn]: harness._OP_NAMES[fn] for fn in fakes}):
+            report = harness._drive_open_loop(
+                connections, pool, 10.0, 4, 1.0, pick_op=iter([fakes[fn] for fn in plan]).__next__,
+                clock=clock, sleep=clock.sleep, menu=menu, wall_clock=lambda: 1_763_424_000.25 + clock(),
+            )
+        self.assertEqual(calls, ["stream.append", "stream.batch", "stream.append", "comm.send"])
+        self.assertEqual(sorted(report["classes"]),
+                         ["comm.mark_read", "comm.send", "stream.append", "stream.batch", "update"])
+        self.assertEqual(report["classes"]["stream.append"]["submitted"], 2)
+        self.assertAlmostEqual(report["classes"]["update"]["configured_offered_rate_per_s"], 2.0)
+        self.assertEqual(report["write_workload"]["classes"],
+                         ["stream.append", "comm.mark_read", "update", "comm.send", "stream.batch"])
+        self.assertEqual(report["write_workload"]["bulk_ingest_members"], harness.BULK_INGEST_MEMBERS)
+        self.assertEqual(report["window_utc"]["start"], "2025-11-18T00:00:00.250Z")
+        self.assertEqual(report["window_utc"]["end"], "2025-11-18T00:00:00.650Z")
+
+    def test_plan_draws_one_op_per_arrival_from_the_menu(self):
+        plan = harness.plan_arrivals(harness.MIXES["read-receipt"], 5)
+        self.assertEqual(plan, [harness._op_read_receipt] * 5)
+        self.assertEqual(harness.plan_arrivals(harness.MIXES["f7"], 0), [])
+
+    def test_mix_without_arrival_rate_is_refused(self):
+        argv = ["bench_load_harness.py", "--mix", "comm-send"]
+        with patch.object(harness.sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit):
+                harness.main()
+        self.assertIn("needs --arrival-rate", err.getvalue())
+
+
+class FixtureTests(unittest.TestCase):
+    def fake_server(self, inbox_ids, page=2):
+        calls = []
+
+        def call(proc, verb, args, request_id=None):
+            calls.append((proc, verb, args))
+            if verb == "create":
+                return {"id": f"entity-{proc}"}
+            if verb == "comm.send":
+                return {"id": "outbound"}
+            if verb == "comm.inbox":
+                offset = args["offset"]
+                chunk = inbox_ids[offset:offset + page]
+                more = offset + page < len(inbox_ids)
+                return {"messages": [{"id": i} for i in chunk], "has_more": more,
+                        "next_offset": offset + page if more else None}
+            if verb == "comm.mark_read":
+                return {"marked_count": 1 if args["ids"][0] != "bad" else 0}
+            raise AssertionError(verb)
+        return calls, call
+
+    def test_first_worker_fills_the_tenant_pool_and_siblings_share_it(self):
+        calls, call = self.fake_server(["m1", "m2", "m3"])
+        pool = harness.deque()
+        planned = {"update": 2, "comm.mark_read": 3}
+        with patch.object(harness.bpd, "_call_verb", side_effect=call):
+            first = harness._prepare_fixtures("w0", 4, 0, planned, pool)
+            second = harness._prepare_fixtures("w1", 4, 1, planned, pool)
+        sends = [args for _, verb, args in calls if verb == "comm.send"]
+        self.assertEqual(len(sends), 3)
+        self.assertTrue(all(a["to"] == "tenant_4_actor" and a["self_send"] for a in sends))
+        self.assertEqual([proc for proc, verb, _ in calls if verb == "comm.inbox"], ["w0", "w0"])
+        self.assertEqual(list(pool), ["m1", "m2", "m3"])
+        self.assertIs(first["receipts"], second["receipts"])
+        self.assertEqual((first["entity_id"], second["entity_id"]), ("entity-w0", "entity-w1"))
+
+    def test_inbox_count_unlike_the_plan_stops_setup(self):
+        _, call = self.fake_server(["m1"])
+        with patch.object(harness.bpd, "_call_verb", side_effect=call):
+            with self.assertRaisesRegex(RuntimeError, "sent 2 messages to tenant 0, its inbox lists 1 unread"):
+                harness._prepare_fixtures("w0", 0, 0, {"comm.mark_read": 2}, harness.deque())
+
+    def test_no_fixture_shape_means_no_fixture_call(self):
+        calls, call = self.fake_server([])
+        with patch.object(harness.bpd, "_call_verb", side_effect=call):
+            self.assertEqual(harness._prepare_fixtures("w0", 0, 0, {"stream.append": 9}, harness.deque()), {})
+        self.assertEqual(calls, [])
+
+    def test_receipt_marks_each_message_once_and_reports_exhaustion_and_misses(self):
+        calls, call = self.fake_server([])
+        fixtures = {"receipts": harness.deque(["m1", "bad"])}
+        with patch.object(harness.bpd, "_call_verb", side_effect=call):
+            first = harness._op_read_receipt("w0", 0, 0, fixtures=fixtures)
+            missed = harness._op_read_receipt("w0", 0, 1, fixtures=fixtures)
+            empty = harness._op_read_receipt("w0", 0, 2, fixtures=fixtures)
+        self.assertEqual([args["ids"] for _, _, args in calls], [["m1"], ["bad"]])
+        self.assertTrue(first.ok)
+        self.assertFalse(missed.ok)
+        self.assertIn("unexpected result", missed.error)
+        self.assertEqual((empty.ok, empty.error), (False, "read-receipt fixture pool exhausted"))
+
+    def test_arrival_hands_fixtures_only_to_a_worker_that_has_them(self):
+        seen = []
+
+        def op(proc, tenant, sequence, request_id=None, **kwargs):
+            seen.append(kwargs)
+            return harness.OpOutcome("update", True, 1)
+
+        plain, fitted = harness.WorkerResult(0, 0), harness.WorkerResult(0, 1)
+        fitted.fixtures = {"entity_id": "e"}
+        clock = VirtualClock()
+        harness._execute_arrival((None, plain), op, 0, clock, request_id=5)
+        harness._execute_arrival((None, fitted), op, 1, clock, request_id=6)
+        self.assertEqual(seen, [{}, {"fixtures": {"entity_id": "e"}}])
 
 
 # Fixed synthetic values, with the complete legacy report shape and field order.
@@ -348,7 +471,7 @@ class AuditSuccessRowsLoadPreflightTests(unittest.TestCase):
         def oracle(*args):
             events.append("oracle")
             return {"oracle": "PENDING", "detail": "fixture"}
-        def worker(*args):
+        def worker(*args, **kwargs):
             events.append("worker")
             worker_envs.append(dict(args[2] if arrival_rate else args[3]))
             raise RuntimeError("worker boundary")

@@ -17,8 +17,12 @@ def rid(sequence):
     return (PREFIX << BITS) | sequence
 
 
-def attempt(seq, request_id=None, outcome="ok", acquire=10, body=100, commit=40, queue=5):
-    row = {"kind": "writer_attempt", "attempt_seq": seq, "outcome": outcome,
+WINDOW_START = "2026-11-18T00:00:00.000Z"
+INSIDE = "2026-11-18T00:00:00.500Z"
+
+
+def attempt(seq, request_id=None, outcome="ok", acquire=10, body=100, commit=40, queue=5, ts=INSIDE):
+    row = {"kind": "writer_attempt", "ts_utc": ts, "attempt_seq": seq, "outcome": outcome,
            "transaction_acquire_micros": acquire, "body_micros": body, "commit_micros": commit,
            "queue_wait_micros": queue}
     if request_id is not None:
@@ -38,8 +42,10 @@ def arrival(sequence, op, state="completed", latency_us=1000):
 
 
 def arrival_report(records, window_s=1.0):
+    end = f"2026-11-18T00:00:{window_s:06.3f}Z"
     return {"request_id_prefix": PREFIX, "request_id_sequence_bits": BITS, "records": records,
-            "observed_duration_s": window_s, "configured_rate_per_s": 10.0}
+            "observed_duration_s": window_s, "configured_rate_per_s": 10.0,
+            "window_utc": {"start": WINDOW_START, "end": end}}
 
 
 class SinkLossTests(unittest.TestCase):
@@ -109,9 +115,27 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(out["verdict"], "OUTSIDE")
         self.assertIn("queue wait p99", out["verdict_reason"])
 
+    def test_setup_rows_before_arrival_zero_are_kept_out_of_utilization(self):
+        setup = attempt(1, body=900_000, ts="2026-11-17T23:59:59.000Z")
+        sink = [line(STARTUP), line(setup), line(attempt(2, rid(0)))]
+        out = self.report(sink)
+        self.assertEqual(out["verdict"], "WITHIN")
+        self.assertEqual((out["attempts"], out["outside_window_attempts"], out["unscoped_attempts"]), (2, 1, 1))
+        self.assertAlmostEqual(out["utilization"], 150 / 1_000_000)
+        self.assertEqual(out["queue_wait_micros"]["n"], 1)
+
+    def test_missing_window_or_untimed_row_is_broken(self):
+        records = arrival_report([arrival(0, "create")])
+        del records["window_utc"]
+        with self.assertRaisesRegex(war.ReportError, "no wall-clock window"):
+            war.build_point_report(records, {"f": [line(STARTUP), line(attempt(1, rid(0)))]})
+        with self.assertRaisesRegex(war.ReportError, "not an RFC 3339 UTC time"):
+            self.report([line(STARTUP), line(attempt(1, rid(0), ts=None))])
+
     def test_missing_prefix_or_rows_is_broken(self):
         with self.assertRaisesRegex(war.ReportError, "no request id prefix"):
-            war.build_point_report({"records": [], "observed_duration_s": 1.0}, {"f": [line(STARTUP)]})
+            war.build_point_report({"records": [], "observed_duration_s": 1.0, "window_utc": {"start": WINDOW_START, "end": INSIDE}},
+                                   {"f": [line(STARTUP)]})
         with self.assertRaisesRegex(war.ReportError, "no writer_attempt rows"):
             self.report([line(STARTUP)])
         with self.assertRaisesRegex(war.ReportError, "no sink file"):
