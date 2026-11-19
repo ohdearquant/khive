@@ -610,7 +610,8 @@ fn validate_create_bulk_items(
         .map_err(|e| {
             RuntimeError::InvalidInput(format!(
                 "schedule.action: verb \"create\": malformed `items` — could not parse bulk \
-             entries: {e}"
+             entries: {}",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &e.to_string())
             ))
         })?;
     if entries.len() > 1000 {

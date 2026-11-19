@@ -255,3 +255,35 @@ async fn schedule_create_alias_type_refusals_mask_credentials_without_writes() {
         }
     }
 }
+
+#[tokio::test]
+async fn schedule_create_malformed_items_refusal_masks_credentials() {
+    use khive_runtime::RuntimeError;
+    use serde_json::json;
+
+    let (registry, _runtime) = build_registry();
+    let secret = format!("sk-proj-{}", "A".repeat(80));
+    for (items, masked) in [
+        ("\"ordinary\"".to_owned(), false),
+        (format!("\"{secret}\""), true),
+    ] {
+        let error = registry
+            .dispatch(
+                "schedule.schedule",
+                json!({"action": format!("create(items={items})"), "at": "2099-06-01T10:00:00Z"}),
+            )
+            .await
+            .expect_err("non-array items must refuse before scheduling");
+        let RuntimeError::InvalidInput(message) = error else {
+            panic!("wrong schedule refusal kind: {error:?}");
+        };
+        assert!(
+            message.starts_with(
+                "schedule.action: verb \"create\": malformed `items` — could not parse bulk entries: "
+            ),
+            "{message}"
+        );
+        assert!(!message.contains(&secret), "refusal exposed a credential");
+        assert_eq!(message.contains("***MASKED***"), masked, "{message}");
+    }
+}
