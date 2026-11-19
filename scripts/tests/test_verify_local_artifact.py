@@ -1110,7 +1110,11 @@ class MakefileGateContractTests(unittest.TestCase):
                 stand_in = root / "outgoing" / "kkernel"
                 stand_in.parent.mkdir()
                 stand_in.symlink_to(sleep_bin)
-                daemon = subprocess.Popen([str(stand_in), "300"])
+                # A multicall coreutils `sleep` (uutils) refuses an argv[0] that
+                # is not its own name. Linux `ps -o comm=` reports the executed
+                # file's name whatever argv[0] says; macOS reports argv[0].
+                argv0 = "sleep" if sys.platform.startswith("linux") else str(stand_in)
+                daemon = subprocess.Popen([argv0, "300"], executable=str(stand_in))
                 self.addCleanup(daemon.kill)
                 # Reap it the moment it exits: the recipe polls `ps -p`, which
                 # still lists an unreaped child, and would escalate to SIGKILL.
