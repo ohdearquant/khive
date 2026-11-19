@@ -9,9 +9,72 @@ mod outbox_parity_tests {
     use serde_json::{json, Value};
     use std::sync::Mutex;
 
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn capture(&self) -> tracing::subscriber::DefaultGuard {
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_env_filter("warn")
+                    .with_writer(self.clone())
+                    .with_ansi(false)
+                    .without_time()
+                    .finish(),
+            )
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+
+        fn assert_delivered(&self, id: uuid::Uuid, kind: &str, attempt_count: u64) {
+            let text = self.text();
+            let delivered: Vec<_> = text
+                .lines()
+                .filter(|line| line.contains("outbox loop: delivered"))
+                .collect();
+            assert_eq!(delivered.len(), 1, "{text}");
+            let line = delivered[0];
+            assert!(line.contains(&format!("note_id={id}")), "{text}");
+            assert!(line.contains(&format!("channel={kind:?}")), "{text}");
+            assert!(
+                line.contains(&format!("attempt_count={attempt_count}")),
+                "{text}"
+            );
+            if kind == "email" {
+                assert!(line.contains(&format!("<{id}@example.com>")), "{text}");
+            } else {
+                assert!(line.contains("message_id=None"), "{text}");
+            }
+            assert!(!text.contains("recipient@example.com"), "{text}");
+            assert!(!text.contains("recipient="), "{text}");
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
     #[derive(Clone, Copy)]
     pub(super) enum Outcome {
         Success,
+        SuccessWithTerminalState,
         Transient,
         RateLimited,
         Permanent,
@@ -60,9 +123,27 @@ mod outbox_parity_tests {
                 .lock()
                 .unwrap()
                 .push(serde_json::to_value(envelope).unwrap());
-            match *self.outcome.lock().unwrap() {
-                Outcome::Success => Ok(()),
-                Outcome::Transient => Err(ChannelError::Transport("temporary pressure".into())),
+            let outcome = *self.outcome.lock().unwrap();
+            if matches!(outcome, Outcome::SuccessWithTerminalState) {
+                let (runtime, id) = self.watch.lock().unwrap().clone().unwrap();
+                let token = runtime.authorize(Namespace::local()).unwrap();
+                // Simulate another writer winning a terminal outcome after send,
+                // before the loop attempts to persist delivered_at.
+                runtime
+                    .mark_outbound_message_failed(
+                        &token,
+                        id,
+                        Utc::now().to_rfc3339(),
+                        "concurrent terminal outcome".into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            match outcome {
+                Outcome::Success | Outcome::SuccessWithTerminalState => Ok(()),
+                Outcome::Transient => Err(ChannelError::Transport(
+                    "temporary pressure for recipient@example.com".into(),
+                )),
                 Outcome::RateLimited => Err(ChannelError::RateLimited {
                     message: "Telegram asks us to wait".into(),
                     retry_after: std::time::Duration::from_secs(2),
@@ -197,6 +278,8 @@ mod outbox_parity_tests {
         for kind in ["email", "telegram"] {
             let (runtime, token) = fixture();
             let id = seed(&runtime, &token, kind, None).await;
+            let log = CapturedLog::default();
+            let _capture = log.capture();
             let channel = RecordingChannel::new(kind, "sender@example.com", Outcome::Success);
             *channel.watch.lock().unwrap() = Some((runtime.clone(), id));
             cycle(&runtime, &channel).await.unwrap();
@@ -223,6 +306,7 @@ mod outbox_parity_tests {
             }
             cycle(&runtime, &channel).await.unwrap();
             assert_eq!(channel.sent.lock().unwrap().len(), 1);
+            log.assert_delivered(id, kind, 1);
         }
     }
 
@@ -231,6 +315,8 @@ mod outbox_parity_tests {
         for kind in ["email", "telegram"] {
             let (runtime, token) = fixture();
             let id = seed(&runtime, &token, kind, None).await;
+            let log = CapturedLog::default();
+            let _capture = log.capture();
             let channel = RecordingChannel::new(kind, "sender@example.com", Outcome::Transient);
             cycle(&runtime, &channel).await.unwrap();
             let p = props(&runtime, &token, id).await;
@@ -239,6 +325,12 @@ mod outbox_parity_tests {
             assert!(p.get("delivery").is_none());
             cycle(&runtime, &channel).await.unwrap();
             assert_eq!(channel.sent.lock().unwrap().len(), 1);
+            let failed = log.text();
+            assert!(failed.contains("send failure recorded"), "{failed}");
+            assert!(failed.contains(&format!("note_id={id}")), "{failed}");
+            assert!(failed.contains("attempt_count=1"), "{failed}");
+            assert!(!failed.contains("outbox loop: delivered"), "{failed}");
+            assert!(!failed.contains("recipient@example.com"), "{failed}");
             let mut note = runtime
                 .notes(&token)
                 .unwrap()
@@ -260,6 +352,35 @@ mod outbox_parity_tests {
                 vec![expected(kind, id), expected(kind, id)]
             );
             assert_eq!(props(&runtime, &token, id).await["delivery"], "delivered");
+            cycle(&runtime, &channel).await.unwrap();
+            assert_eq!(channel.sent.lock().unwrap().len(), 2);
+            log.assert_delivered(id, kind, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_delivery_mark_does_not_log_success() {
+        for kind in ["email", "telegram"] {
+            let (runtime, token) = fixture();
+            let id = seed(&runtime, &token, kind, None).await;
+            let channel = RecordingChannel::new(
+                kind,
+                "sender@example.com",
+                Outcome::SuccessWithTerminalState,
+            );
+            *channel.watch.lock().unwrap() = Some((runtime.clone(), id));
+            let log = CapturedLog::default();
+            let _capture = log.capture();
+            cycle(&runtime, &channel).await.unwrap();
+            assert_eq!(channel.sent.lock().unwrap().len(), 1);
+            let p = props(&runtime, &token, id).await;
+            assert_eq!(p["delivery"], "failed");
+            assert!(p.get("delivered_at").is_none());
+            let text = log.text();
+            assert!(text.contains("failed to set delivered_at"), "{text}");
+            assert!(text.contains(&format!("note_id={id}")), "{text}");
+            assert!(!text.contains("outbox loop: delivered"), "{text}");
+            assert!(!text.contains("recipient@example.com"), "{text}");
         }
     }
 
