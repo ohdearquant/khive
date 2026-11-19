@@ -3,6 +3,8 @@
 import contextlib
 import io
 import json
+import os
+import tempfile
 import unittest
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -461,7 +463,7 @@ class ClosedLoopCompatibilityTests(unittest.TestCase):
 
 
 class AuditSuccessRowsLoadPreflightTests(unittest.TestCase):
-    def run_to_worker_boundary(self, arrival_rate=None, refuse=False):
+    def run_to_worker_boundary(self, arrival_rate=None, refuse=False, extra_argv=()):
         events, worker_envs, process = [], [], Mock()
         def preflight(proc):
             self.assertIs(proc, process)
@@ -479,10 +481,12 @@ class AuditSuccessRowsLoadPreflightTests(unittest.TestCase):
                 "--tenants", "1", "--ops-per-worker", "1"]
         if arrival_rate:
             argv.extend(["--arrival-rate", str(arrival_rate)])
+        argv.extend(extra_argv)
         output = io.StringIO()
         with contextlib.ExitStack() as stack:
             stack.enter_context(contextlib.redirect_stdout(output))
-            stack.enter_context(patch.dict(harness.os.environ, {"KHIVE_AUDIT_SUCCESS_ROWS": "reduced"}))
+            stack.enter_context(patch.dict(harness.os.environ, {"KHIVE_AUDIT_SUCCESS_ROWS": "reduced",
+                                                                "KHIVE_WRITER_ATTEMPT_LOG": "1"}))
             patches = [patch.object(harness.sys, "argv", argv),
                        patch.object(harness, "_resolve_binary", return_value="fixture-binary"),
                        patch.object(harness.tempfile, "mkdtemp", return_value="/fixture"),
@@ -528,6 +532,24 @@ class AuditSuccessRowsLoadPreflightTests(unittest.TestCase):
                 self.assertEqual(bootstrap_env["KHIVE_AUDIT_SUCCESS_ROWS"], "all")
                 self.assertEqual(len(worker_envs), 1)
                 self.assertEqual(worker_envs[0]["KHIVE_AUDIT_SUCCESS_ROWS"], "all")
+
+    def test_attempt_log_reaches_the_daemon_only_when_asked_and_lands_in_the_sink_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sink = os.path.join(tmp, "sink")
+            _, off_env, _ = self.run_to_worker_boundary(10, extra_argv=["--sink-dir", sink])
+            self.assertNotIn("KHIVE_WRITER_ATTEMPT_LOG", off_env)
+            self.assertEqual(off_env["KHIVE_WRITER_TIMEOUT_SINK_DIR"], os.path.realpath(sink))
+            self.assertTrue(os.path.isdir(sink))
+            _, on_env, worker_envs = self.run_to_worker_boundary(10, extra_argv=["--sink-dir", sink, "--writer-attempt-log"])
+            self.assertEqual(on_env["KHIVE_WRITER_ATTEMPT_LOG"], "1")
+            self.assertEqual(worker_envs[0]["KHIVE_WRITER_ATTEMPT_LOG"], "1")
+
+    def test_attempt_log_without_sink_dir_is_refused(self):
+        argv = ["bench_load_harness.py", "--arrival-rate", "10", "--writer-attempt-log"]
+        with patch.object(harness.sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit):
+                harness.main()
+        self.assertIn("needs --sink-dir", err.getvalue())
 
 
 if __name__ == "__main__":

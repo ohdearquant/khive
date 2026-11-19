@@ -789,6 +789,11 @@ def main() -> int:
     ap.add_argument("--mix", choices=sorted(MIXES), default="read-heavy",
                     help="named op mix; every mix but read-heavy needs --arrival-rate (fixtures are sized to the "
                          "open-loop plan)")
+    ap.add_argument("--sink-dir", default=None,
+                    help="directory for the daemon's writer sink files (KHIVE_WRITER_TIMEOUT_SINK_DIR); kept after the run")
+    ap.add_argument("--writer-attempt-log", action="store_true",
+                    help="set KHIVE_WRITER_ATTEMPT_LOG=1 on the daemon: one writer_attempt row per writer attempt; needs "
+                         "--sink-dir. Without it the variable is removed from the spawned environment")
     ap.add_argument("--log-level", default="warn")
     ap.add_argument(
         "--packs",
@@ -810,6 +815,8 @@ def main() -> int:
         or not math.isfinite(args.worker_timeout) or args.worker_timeout <= 0
     ):
         ap.error("open-loop rate, workers, tenants and timeout must be finite/positive; ops-per-worker nonnegative")
+    if args.writer_attempt_log and not args.sink_dir:
+        ap.error("--writer-attempt-log needs --sink-dir, so the attempt rows land where the report reads them")
     if args.mix != "read-heavy" and args.arrival_rate is None:
         ap.error(f"--mix {args.mix} needs --arrival-rate: its fixtures are sized to the open-loop arrival plan")
 
@@ -860,6 +867,12 @@ def main() -> int:
     base_env["KHIVE_WRITE_QUEUE"] = "1"
     base_env["KHIVE_CONFIG"] = scratch_config_path
     base_env.pop("KHIVE_NO_DAEMON", None)
+    base_env.pop("KHIVE_WRITER_ATTEMPT_LOG", None)
+    if args.sink_dir:
+        pathlib.Path(args.sink_dir).mkdir(parents=True, exist_ok=True)
+        base_env["KHIVE_WRITER_TIMEOUT_SINK_DIR"] = str(pathlib.Path(args.sink_dir).resolve())
+    if args.writer_attempt_log:
+        base_env["KHIVE_WRITER_ATTEMPT_LOG"] = "1"
 
     report: dict = {
         "meta": {
@@ -942,6 +955,8 @@ def main() -> int:
                 menu=MIXES[args.mix],
             )
             report["arrival"]["mix"] = args.mix
+            report["arrival"]["writer_attempt_log"] = args.writer_attempt_log
+            report["arrival"]["sink_dir"] = base_env.get("KHIVE_WRITER_TIMEOUT_SINK_DIR")
         else:
             with ThreadPoolExecutor(max_workers=args.workers) as pool:
                 futures = {
