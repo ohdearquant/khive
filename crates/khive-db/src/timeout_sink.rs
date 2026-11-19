@@ -184,11 +184,6 @@ const WRITER_ATTEMPT_LOG_ENV: &str = "KHIVE_WRITER_ATTEMPT_LOG";
 /// Row kind of a per-attempt record.
 pub(crate) const WRITER_ATTEMPT_KIND: &str = "writer_attempt";
 
-/// Sequence of `writer_attempt` rows this process has offered to the sink.
-/// Taken before the enqueue, so a row dropped on a full channel still uses
-/// its number and leaves a gap a reader can count.
-static WRITER_ATTEMPT_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// Resolve the per-attempt mode: on when [`WRITER_ATTEMPT_LOG_ENV`] parses to
 /// a non-zero integer.
 pub(crate) fn writer_attempt_log_enabled() -> bool {
@@ -423,6 +418,12 @@ struct SinkHandle {
     /// (caller side) and there on a write/open failure (writer-thread side)
     /// — one counter, reported via `sink_error_summary`.
     dropped: Arc<AtomicU64>,
+    /// Sequence of `writer_attempt` rows offered to this sink, counted from 1
+    /// after the `startup` row its writer thread writes. Taken once the row
+    /// is routed here and before the enqueue, so a gap in one file's sequence
+    /// is a row this sink was handed and did not write: a full channel or a
+    /// failed write, both also counted in `dropped`.
+    attempt_seq: AtomicU64,
 }
 
 #[cfg(test)]
@@ -848,8 +849,10 @@ fn write_event(sink: &mut AppendSink<File>, dropped: &AtomicU64, event: QueuedEv
     if sink.write_line(&line) {
         // A per-attempt row is one of many per second under load and is
         // measurement, not an alarm: it is appended without the fsync the
-        // failure-shaped rows pay. A crash can lose the tail, which the
-        // sequence gap then shows.
+        // failure-shaped rows pay. The write is unbuffered, so a process
+        // crash loses only rows still queued in the channel; an OS crash or
+        // power loss can also drop written rows not yet synced. Neither
+        // leaves a later row in this file to show the gap.
         if event.kind != WRITER_ATTEMPT_KIND {
             sink.sync();
         }
@@ -1450,16 +1453,16 @@ pub(crate) struct WriterAttempt {
 /// Record a `writer_attempt` row for one completed writer-task attempt, in
 /// per-attempt mode. Same non-blocking enqueue as every other row: a full
 /// channel drops the row and counts it, and the sequence number it already
-/// took leaves a gap.
+/// took leaves a gap. An attempt with no sink route takes no number.
 pub(crate) fn emit_writer_attempt(
     db: &str,
     stages: &crate::writer_task::WriterStageObservation,
     attempt: WriterAttempt,
 ) {
-    let attempt_seq = WRITER_ATTEMPT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
     let Some(handle) = lifecycle::route(db) else {
         return;
     };
+    let attempt_seq = handle.attempt_seq.fetch_add(1, Ordering::Relaxed) + 1;
     let event = QueuedEvent {
         ts_utc: now_rfc3339(),
         kind: WRITER_ATTEMPT_KIND,

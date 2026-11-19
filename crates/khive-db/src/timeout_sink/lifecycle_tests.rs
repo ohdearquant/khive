@@ -223,6 +223,7 @@ async fn cancelled_close_resumes_join_after_file_release_and_refuses_reopen() {
     let handle = Arc::new(SinkHandle {
         sender,
         dropped: Arc::new(AtomicU64::new(0)),
+        attempt_seq: AtomicU64::new(0),
     });
     let entry = Arc::new(Entry {
         directory: directory.clone(),
