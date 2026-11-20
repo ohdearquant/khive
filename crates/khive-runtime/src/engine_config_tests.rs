@@ -2951,3 +2951,107 @@ fn a_malformed_cwd_config_beside_a_database_anchored_tier_names_no_file_in_use()
     assert_eq!(in_use, None);
     assert!(text.contains("(in use: none)"), "{text}");
 }
+
+#[test]
+fn knowledge_import_roots_parse_closed_and_absolute() {
+    let parsed: KhiveConfig =
+        toml::from_str("[knowledge]\nimport_roots = [\"/srv/atlas\"]\n").unwrap();
+    assert_eq!(
+        parsed.knowledge.import_roots,
+        vec![PathBuf::from("/srv/atlas")]
+    );
+    parsed.validate().expect("an absolute root validates");
+    assert!(KhiveConfig::default().knowledge.import_roots.is_empty());
+
+    let unknown = toml::from_str::<KhiveConfig>("[knowledge]\nimport_root = [\"/srv\"]\n");
+    assert!(unknown.is_err(), "a misspelled key fails to parse");
+
+    let relative: KhiveConfig =
+        toml::from_str("[knowledge]\nimport_roots = [\"atlas\"]\n").unwrap();
+    let error = relative.validate().expect_err("a relative root is refused");
+    assert!(
+        error.to_string().contains("knowledge.import_roots"),
+        "{error}"
+    );
+}
+
+#[test]
+fn git_digest_sources_parse_closed_and_checked() {
+    let parsed: KhiveConfig = toml::from_str(
+        "[git_digest]\nlocal_roots = [\"/srv/repos\"]\nremotes = [\"https://example.com/org/a\"]\n",
+    )
+    .unwrap();
+    parsed
+        .validate()
+        .expect("absolute roots and https remotes validate");
+    assert_eq!(
+        parsed.git_digest.local_roots,
+        vec![PathBuf::from("/srv/repos")]
+    );
+    assert!(KhiveConfig::default().git_digest == GitDigestSectionConfig::default());
+
+    assert!(toml::from_str::<KhiveConfig>("[git_digest]\nroots = []\n").is_err());
+
+    let relative: KhiveConfig =
+        toml::from_str("[git_digest]\nlocal_roots = [\"repos\"]\n").unwrap();
+    let error = relative.validate().expect_err("a relative root is refused");
+    assert!(
+        error.to_string().contains("git_digest.local_roots"),
+        "{error}"
+    );
+
+    let ssh: KhiveConfig =
+        toml::from_str("[git_digest]\nremotes = [\"ssh://example.com/a\"]\n").unwrap();
+    let error = ssh.validate().expect_err("a non-https remote is refused");
+    assert!(
+        error.to_string().contains("git_digest.remotes")
+            && error.to_string().contains("is not an https:// URL"),
+        "{error}"
+    );
+
+    for broad in [
+        "https://github.com/ohdearquant",
+        "https://github.com/ohdearquant/",
+        "https://github.com",
+        "https://github.com/ohdearquant/*",
+        "https://github.com/*/khive",
+        "https://github.com//khive",
+        "https://github.com/ohdearquant/khive?all",
+    ] {
+        let parsed: KhiveConfig =
+            toml::from_str(&format!("[git_digest]\nremotes = [{broad:?}]\n")).unwrap();
+        let error = parsed
+            .validate()
+            .expect_err("an entry naming more or less than one repository is refused");
+        assert!(
+            error.to_string().contains("does not name one repository"),
+            "{broad}: {error}"
+        );
+    }
+    for exact in [
+        "https://github.com/ohdearquant/khive",
+        "https://github.com/ohdearquant/khive.git",
+        "https://github.com/ohdearquant/khive/",
+        "https://gitlab.example/group/subgroup/repo",
+    ] {
+        let parsed: KhiveConfig =
+            toml::from_str(&format!("[git_digest]\nremotes = [{exact:?}]\n")).unwrap();
+        parsed
+            .validate()
+            .unwrap_or_else(|error| panic!("{exact} names one repository: {error}"));
+    }
+}
+
+#[test]
+fn code_ingest_roots_parse_closed_and_absolute() {
+    let parsed: KhiveConfig = toml::from_str("[code_ingest]\nroots = [\"/srv/code\"]\n").unwrap();
+    parsed.validate().expect("absolute roots validate");
+    assert_eq!(parsed.code_ingest.roots, vec![PathBuf::from("/srv/code")]);
+    assert!(KhiveConfig::default().code_ingest == CodeIngestSectionConfig::default());
+
+    assert!(toml::from_str::<KhiveConfig>("[code_ingest]\nimport_roots = []\n").is_err());
+
+    let relative: KhiveConfig = toml::from_str("[code_ingest]\nroots = [\"code\"]\n").unwrap();
+    let error = relative.validate().expect_err("a relative root is refused");
+    assert!(error.to_string().contains("code_ingest.roots"), "{error}");
+}
