@@ -154,6 +154,10 @@ pub use startup::{
     MultiBackendRegistry, DB_OVERRIDE_CONFLICT_CODE,
 };
 
+#[cfg(test)]
+#[path = "serve/embed_pipeline_tests.rs"]
+mod embed_pipeline_tests;
+
 #[cfg(all(test, unix))]
 #[path = "serve/demand_startup_tests.rs"]
 mod demand_startup_tests;
