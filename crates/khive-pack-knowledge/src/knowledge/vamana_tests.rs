@@ -3807,3 +3807,126 @@ fn reverse_map_for_missing_and_empty_subjects_keep_map_contract() {
         "empty request resets the prior per-call count"
     );
 }
+
+fn quiet_vamana_child() -> bool {
+    let mut fixture = None;
+    khive_storage::test_support::run_exact_test_in_child(
+        "KHIVE_QUIET_VAMANA_CHILD",
+        false,
+        |command| {
+            let mut builder = tempfile::Builder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                builder.permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            let directory = builder.tempdir().unwrap();
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("KHIVE_") {
+                    command.env_remove(key);
+                }
+            }
+            command
+                .env("HOME", directory.path())
+                .env("KHIVE_TEST_HARNESS", "1");
+            fixture = Some(directory);
+        },
+    )
+}
+
+#[tokio::test]
+async fn quiet_defers_actual_snapshot_warm_and_preserves_loaded_vectors() {
+    if quiet_vamana_child() {
+        return;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let directory = TempDir::new().unwrap();
+        let rt = file_rt_with_embedder(directory.path().join("quiet.db"));
+        let token = rt.authorize(Namespace::local()).unwrap();
+        seed_warm_corpus(&rt, &token, 4).await;
+        let seed = new_shared();
+        ensure_ann_for_model(&rt, &token, &seed, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        let expected_ids = seed.indexes.read().await.get(&key).unwrap().id_map.clone();
+        assert_eq!(expected_ids.len(), 4);
+        // Exercise filesystem snapshot discovery, without relying on legacy rows.
+        rt.sql()
+            .writer()
+            .await
+            .unwrap()
+            .execute(SqlStatement {
+                sql: "DROP TABLE IF EXISTS retrieval_snapshots".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        let fresh = new_shared();
+        khive_runtime::resource_admission::request_quiet(1).unwrap();
+        warm_known_snapshots(&rt, &fresh).await;
+        assert_eq!(khive_runtime::resource_admission::quiet_until(), None);
+        let indexes = fresh.indexes.read().await;
+        let actual = &indexes
+            .get(&key)
+            .expect("real persisted index is loaded")
+            .id_map;
+        assert_eq!(actual, &expected_ids);
+        drop(indexes);
+        let mut query = vec![0.0; WARM_DIMS];
+        query[0] = 1.0;
+        let hits = search_loaded(&fresh, &key, &query, 4)
+            .await
+            .expect("loaded ANN serves");
+        assert_eq!(
+            hits.iter().map(|(id, _)| *id).collect::<HashSet<_>>(),
+            expected_ids.iter().copied().collect::<HashSet<_>>()
+        );
+        assert!(matches!(
+            warm_states_guard(&fresh.warm_states).get(&key),
+            Some(AnnWarmState::Ready { .. })
+        ));
+    })
+    .await
+    .expect("snapshot warm quiet fixture exceeded real-time budget");
+}
+
+#[tokio::test]
+async fn quiet_detached_warm_shutdown_is_retryable_without_loading() {
+    if quiet_vamana_child() {
+        return;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let directory = TempDir::new().unwrap();
+        let rt = file_rt_with_embedder(directory.path().join("shutdown.db"));
+        let token = rt.authorize(Namespace::local()).unwrap();
+        seed_warm_corpus(&rt, &token, 4).await;
+        let ann = new_shared();
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        khive_runtime::resource_admission::request_quiet(300).unwrap();
+        ensure_ann_background(&rt, &token, &ann);
+        assert!(is_warming_not_loaded(&ann, &key));
+        let attempt = ann.next_warm_attempt_id.load(Ordering::Relaxed);
+        ensure_ann_background(&rt, &token, &ann);
+        assert_eq!(ann.next_warm_attempt_id.load(Ordering::Relaxed), attempt);
+        assert!(ann.indexes.read().await.is_empty());
+        khive_runtime::daemon_shutdown_token().cancel();
+        while is_warming_not_loaded(&ann, &key) {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            khive_runtime::resource_admission::quiet_until().is_some(),
+            "shutdown does not wait for expiry"
+        );
+        assert!(ann.indexes.read().await.is_empty());
+        assert!(matches!(
+            warm_states_guard(&ann.warm_states).get(&key),
+            Some(AnnWarmState::Failed {
+                error: AnnWarmFailure::Interrupted,
+                ..
+            })
+        ));
+        drop(begin_warm(&ann, key).expect("cancellation releases the attempt for retry"));
+    })
+    .await
+    .expect("detached warm quiet fixture exceeded real-time budget");
+}

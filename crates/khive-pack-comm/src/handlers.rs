@@ -1,6 +1,6 @@
 //! Verb handler implementations for the comm pack.
 //!
-//! All fifteen public comm verbs store or query comm state.
+//! Sixteen public comm verbs query or change communication and process-control state.
 //! Message-specific metadata lives
 //! in the `properties` JSON column; `content` is the message body.
 
@@ -51,6 +51,7 @@ mod outbox_scan;
 mod parameter_aliases;
 mod probe_cursor;
 mod quarantine_heartbeat;
+mod quiet;
 mod read_marking;
 mod reply;
 mod suppression;
@@ -66,6 +67,7 @@ pub(crate) use thread::handle_thread;
 use health::channel_stalled;
 pub(crate) use health::handle_health;
 pub use outbox_scan::{record_outbox_scan, OutboxScan, OutboxScanOutcome};
+pub(crate) use quiet::handle_quiet;
 
 #[cfg(test)]
 use inbox::wait_for_inbox_response;

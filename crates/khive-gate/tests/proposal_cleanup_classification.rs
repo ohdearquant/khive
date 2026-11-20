@@ -72,6 +72,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("comm.ingest", OperationAccess::Write),
     ("comm.mark_read", OperationAccess::Write),
     ("comm.probe", OperationAccess::Read),
+    ("comm.quiet", OperationAccess::Write),
     ("comm.read", OperationAccess::Write),
     ("comm.reply", OperationAccess::Write),
     ("comm.send", OperationAccess::Write),
@@ -225,7 +226,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
 
 #[test]
 fn proposal_cleanup_revision_preserves_every_existing_classification() {
-    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v26");
+    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v27");
     assert_eq!(CLASSIFIED_OPERATIONS, EXPECTED);
     for &(name, access) in EXPECTED {
         assert_eq!(classify_operation(name), Some(access), "{name}");
