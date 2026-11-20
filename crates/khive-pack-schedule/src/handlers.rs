@@ -261,7 +261,8 @@ fn optional_create_kind_alias_for_replay<'a>(
         )),
         Some(Value::String(value)) => Ok(Some(value.as_str())),
         Some(value) => Err(RuntimeError::InvalidInput(format!(
-            "create: `{field}` must be a string or null; got {value}"
+            "create: `{field}` must be a string or null; got {}",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, &value.to_string())
         ))),
     }
 }
@@ -609,7 +610,8 @@ fn validate_create_bulk_items(
         .map_err(|e| {
             RuntimeError::InvalidInput(format!(
                 "schedule.action: verb \"create\": malformed `items` — could not parse bulk \
-             entries: {e}"
+             entries: {}",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &e.to_string())
             ))
         })?;
     if entries.len() > 1000 {
