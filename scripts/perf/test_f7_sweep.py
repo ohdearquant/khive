@@ -48,7 +48,11 @@ class FakeHarness:
         if "--burst-size" in argv:
             for row in records[2:]:
                 row.update(burst=1, scheduled_s=1.0, finished_s=1.0 + self.burst_finish.get(name, 0.01))
-        report = {"smoke_result": smoke, "smoke_errors": [], "arrival": {
+        errors = [f"tenant=0 worker={i}: {sweep.DRAIN_TIMEOUT_CRASH}"
+                  for i, state in enumerate(states) if state == "outstanding"]
+        if name in self.failing:
+            errors.append("tenant=0 worker=0: daemon exited with code 137")
+        report = {"smoke_result": smoke, "smoke_errors": errors, "arrival": {
             "request_id_prefix": PREFIX, "request_id_sequence_bits": BITS, "records": records,
             "observed_duration_s": 1.0, "counts": {"submitted": 4, **counts},
             "sink_heartbeat_ms": 1000, "sink_settle_s": 3.0,
@@ -228,6 +232,24 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("[sweep-100] BROKEN: sweep-100: the harness exited 1 with smoke_result=FAIL", lines[-1])
         self.assertEqual(summary["runs"][-1]["verdict"], "BROKEN")
+
+    def test_a_harness_that_failed_otherwise_beside_a_drain_timeout_is_broken(self):
+        states = ["completed", "completed", "completed", "outstanding"]
+        summary, rc, lines, _ = self.run_plan(FakeHarness(states={"sweep-100": states}, failing={"sweep-100"}))
+        self.assertEqual(rc, 2)
+        self.assertIn("for a reason other than a drain timeout alone", lines[-1])
+        self.assertIn("daemon exited with code 137", lines[-1])
+        self.assertEqual(summary["runs"][-1]["verdict"], "BROKEN")
+
+    def test_a_drain_timeout_with_no_error_named_is_broken(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = pathlib.Path(tmp)
+            report = {"smoke_result": "FAIL", "smoke_errors": [], "arrival": {
+                "records": [{"state": "outstanding"}], "counts": {"submitted": 1, "outstanding": 1}}}
+            (run_dir / "harness.json").write_text(json.dumps(report))
+            with self.assertRaisesRegex(war.ReportError, "other than a drain timeout"):
+                sweep.read_run({"name": "x", "attempt_log": False}, run_dir, loss_limit=0.01, util_limit=0.7,
+                               queue_p99_limit_micros=None, harness_rc=1)
 
     def test_a_pair_from_two_rounds_is_refused(self):
         runs = sweep.plan_runs([100], aa=False, paired_workers=100, paired_rounds=2)

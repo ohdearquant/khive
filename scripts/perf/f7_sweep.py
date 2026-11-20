@@ -96,20 +96,33 @@ def attempt_rows(sink):
     return sum(len(segment["attempts"]) for lines in sink.values() for segment in war.parse_sink_lines(lines))
 
 
+# bench_load_harness.DRAIN_TIMEOUT_CRASH; a test compares the two.
+DRAIN_TIMEOUT_CRASH = "open-loop drain exceeded --worker-timeout"
+
+
+def drain_timeout_only(harness, harness_rc):
+    """True when the harness failed only because arrivals were outstanding at its drain timeout."""
+    errors = harness.get("smoke_errors") or []
+    outstanding = (harness.get("arrival") or {}).get("counts", {}).get("outstanding")
+    return (bool(outstanding) and harness_rc in (0, 1) and bool(errors)
+            and all(str(error).endswith(f": {DRAIN_TIMEOUT_CRASH}") for error in errors))
+
+
 def read_run(run, run_dir, *, loss_limit, util_limit, queue_p99_limit_micros, burst_deadline_s=None, harness_rc=0):
     """One run's reading: the point report for a log-on run, client latency and a row count for a log-off run.
 
-    A harness that failed for any reason but arrivals left outstanding at its drain timeout supports no reading. A
-    drain timeout is a reading: the point says how many arrivals never finished."""
+    A harness that failed for any reason but arrivals left outstanding at its drain timeout supports no reading,
+    including a run where that timeout came with another error. A drain timeout alone is a reading: the point says
+    how many arrivals never finished."""
     harness = json.loads((run_dir / "harness.json").read_text())
     arrival = harness.get("arrival") or {}
     if not arrival.get("records"):
         raise war.ReportError(f"{run['name']}: the harness report holds no arrival records "
                               f"(smoke_result={harness.get('smoke_result')}, errors={harness.get('smoke_errors')})")
-    if (harness_rc != 0 or harness.get("smoke_result") != "PASS") and not arrival.get("counts", {}).get("outstanding"):
+    if (harness_rc != 0 or harness.get("smoke_result") != "PASS") and not drain_timeout_only(harness, harness_rc):
         raise war.ReportError(f"{run['name']}: the harness exited {harness_rc} with "
-                              f"smoke_result={harness.get('smoke_result')} and no arrival outstanding "
-                              f"(errors={harness.get('smoke_errors')})")
+                              f"smoke_result={harness.get('smoke_result')} for a reason other than a drain timeout "
+                              f"alone (errors={harness.get('smoke_errors')})")
     sink = read_sink(run_dir / "sink")
     if not run["attempt_log"]:
         rows = attempt_rows(sink)

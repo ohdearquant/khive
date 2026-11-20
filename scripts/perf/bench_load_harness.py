@@ -287,6 +287,10 @@ ATTEMPT_LOG_ENV = "KHIVE_WRITER_ATTEMPT_LOG"
 SINK_DIR_ENV = "KHIVE_WRITER_TIMEOUT_SINK_DIR"
 SINK_HEARTBEAT_ENV = "KHIVE_WRITER_TIMEOUT_SINK_HEARTBEAT_MS"
 
+# The error a worker carries when its arrivals were still outstanding at the drain timeout. f7_sweep.py reads a
+# failed run as a reading only when every error is this one; a test compares the two.
+DRAIN_TIMEOUT_CRASH = "open-loop drain exceeded --worker-timeout"
+
 # The F7 transaction shapes (ADR-135 F7, #6743), one verb each. Every one is a write.
 BULK_INGEST_MEMBERS = 100
 
@@ -765,7 +769,7 @@ def _run_open_workers(binary, jobs, base_env, log_level, tmpdir, proc_registry,
                            if row["state"] == "outstanding"}
             for _, result in workers:
                 if (result.tenant, result.idx) in outstanding:
-                    result.crashed = "open-loop drain exceeded --worker-timeout"
+                    result.crashed = DRAIN_TIMEOUT_CRASH
         return [result for _, result in workers], arrival
     finally:
         stop.set()

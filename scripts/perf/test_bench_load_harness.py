@@ -588,6 +588,10 @@ class AuditSuccessRowsLoadPreflightTests(unittest.TestCase):
             self.assertEqual(on_env["KHIVE_WRITER_ATTEMPT_LOG"], "1")
             self.assertEqual(worker_envs[0]["KHIVE_WRITER_ATTEMPT_LOG"], "1")
 
+    def test_the_sweep_reads_the_drain_timeout_error_the_harness_writes(self):
+        from scripts.perf import f7_sweep
+        self.assertEqual(f7_sweep.DRAIN_TIMEOUT_CRASH, harness.DRAIN_TIMEOUT_CRASH)
+
     def test_daemon_env_names_match_the_constants_the_sink_reads(self):
         source = pathlib.Path(__file__).resolve().parents[2] / "crates/khive-db/src/timeout_sink.rs"
         consts = dict(re.findall(r'^const (\w+): &str = "([^"]+)";', source.read_text(), re.MULTILINE))
