@@ -216,6 +216,13 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(summary["runs"][0]["verdict"], "OUTSIDE")
         self.assertIn("(1 of 4 arrivals failed)", lines[0])
 
+    def test_a_pair_round_with_unfinished_arrivals_leaves_both_arms(self):
+        states = ["completed", "completed", "completed", "outstanding"]
+        summary, rc, lines, _ = self.run_plan(FakeHarness(states={"pair-2-off": states}))
+        self.assertEqual(rc, 0)
+        self.assertIn("[pair-2] pair-2-off had failed or outstanding arrivals; the round leaves both arms", lines)
+        self.assertEqual(summary["paired_cost"]["rounds"], 1)
+
     def test_a_harness_that_failed_with_nothing_outstanding_is_broken(self):
         summary, rc, lines, _ = self.run_plan(FakeHarness(failing={"sweep-100"}))
         self.assertEqual(rc, 2)

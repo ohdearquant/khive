@@ -22,7 +22,8 @@ directory the daemon wrote (sink/), which is kept. Every attempt-log run prints 
 sequence gaps, drop counter and loss bound, then its point verdict (writer_attempt_report.py). A run whose loss bound
 is over --loss-limit is VOID and runs again, up to --void-retries more times; the void runs stay on the record. In the
 paired arm the whole round runs again, off and on in the same order, so the two stay adjacent, and a round still VOID
-after its retries is dropped from both arms. A run with the attempt log off must leave no writer_attempt row in its
+after its retries is dropped from both arms, as is a round in which either run had failed or outstanding arrivals,
+so the cost line pools clean rounds only. A run with the attempt log off must leave no writer_attempt row in its
 sink: one there means the variable reached a daemon it should not have, and the paired arm is BROKEN.
 
 Every run, both paired arms included, shortens the sink heartbeat and waits for it to settle before teardown
@@ -122,6 +123,11 @@ def read_run(run, run_dir, *, loss_limit, util_limit, queue_p99_limit_micros, bu
     return {"verdict": point["verdict"], "arrival": arrival, "point": point}
 
 
+def unfinished(arrival):
+    counts = arrival.get("counts") or {}
+    return counts.get("failed", 0) + counts.get("outstanding", 0)
+
+
 def run_line(run, reading):
     head = f"[{run['name']}] workers={run['workers']}"
     if reading["verdict"] == "OFF":
@@ -198,7 +204,8 @@ def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
     """Run the plan in order and return (record, rc). `spawn` runs one harness argv; it is replaced in tests.
 
     A paired round is its two runs, off and on, adjacent in time. When either is VOID the whole round runs again in
-    the same order, so the partners stay adjacent; a round still VOID after --void-retries leaves both arms."""
+    the same order, so the partners stay adjacent; a round still VOID after --void-retries leaves both arms, and so
+    does a round in which either run had failed or outstanding arrivals, so the cost line pools clean rounds only."""
     record, pairs, bursts, seen, rc = [], {"off": [], "on": []}, [], [], 0
     deadline_s = None if args.burst_deadline_ms is None else args.burst_deadline_ms / 1000
     i = 0
@@ -228,6 +235,11 @@ def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
             emit(f"[{label}] still VOID after {args.void_retries} retries; no reading at this {what}"
                  + ("; the round leaves both arms" if what == "round" else ""))
             rc = 1
+            continue
+        unclean = [run["name"] for run, reading in zip(group, readings)
+                   if run["role"] == "pair" and unfinished(reading["arrival"])]
+        if unclean:
+            emit(f"[{label}] {', '.join(unclean)} had failed or outstanding arrivals; the round leaves both arms")
             continue
         for run, reading in zip(group, readings):
             if run["role"] == "pair":
