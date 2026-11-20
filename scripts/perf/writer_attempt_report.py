@@ -265,7 +265,7 @@ def burst_drain(records, deadline_s):
     A burst DRAINS LATE when its completed arrivals finished past the deadline or an arrival it did not refuse never
     completed (a failed arrival counts here), whatever its refusals; `drain_missed` counts those bursts. A burst
     that missed only through refused arrivals is counted in `refused_only`: what caused those refusals is not
-    measured here.
+    measured here. `missed`, `drain_missed` and `refused_only` count bursts; `refused_arrivals` counts arrivals.
     Returns None when no record belongs to a burst.
     """
     bursts = {}
@@ -292,7 +292,7 @@ def burst_drain(records, deadline_s):
         "bursts": len(per_burst),
         "sizes": sorted({b["size"] for b in per_burst}),
         "missed": sum(b["missed"] for b in per_burst),
-        "refused": sum(b["refused"] for b in per_burst),
+        "refused_arrivals": sum(b["refused"] for b in per_burst),
         "drain_missed": sum(b["drain_late"] for b in per_burst),
         "refused_only": sum(b["missed"] and not b["drain_late"] for b in per_burst),
         "drain_s": summarize([b["drain_s"] for b in per_burst if b["drain_s"] is not None]),

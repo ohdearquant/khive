@@ -282,6 +282,11 @@ def _op_create_entity(proc, tenant, i, request_id=None):
 SINK_HEARTBEAT_MS = 1000
 SINK_SETTLE_S = 2 * SINK_HEARTBEAT_MS / 1000 + 1.0
 
+# The daemon reads these names in crates/khive-db/src/timeout_sink.rs; a test compares them with that file.
+ATTEMPT_LOG_ENV = "KHIVE_WRITER_ATTEMPT_LOG"
+SINK_DIR_ENV = "KHIVE_WRITER_TIMEOUT_SINK_DIR"
+SINK_HEARTBEAT_ENV = "KHIVE_WRITER_TIMEOUT_SINK_HEARTBEAT_MS"
+
 # The F7 transaction shapes (ADR-135 F7, #6743), one verb each. Every one is a write.
 BULK_INGEST_MEMBERS = 100
 
@@ -915,13 +920,13 @@ def main() -> int:
     base_env["KHIVE_WRITE_QUEUE"] = "1"
     base_env["KHIVE_CONFIG"] = scratch_config_path
     base_env.pop("KHIVE_NO_DAEMON", None)
-    base_env.pop("KHIVE_WRITER_ATTEMPT_LOG", None)
+    base_env.pop(ATTEMPT_LOG_ENV, None)
     if args.sink_dir:
         pathlib.Path(args.sink_dir).mkdir(parents=True, exist_ok=True)
-        base_env["KHIVE_WRITER_TIMEOUT_SINK_DIR"] = str(pathlib.Path(args.sink_dir).resolve())
-        base_env["KHIVE_WRITER_TIMEOUT_SINK_HEARTBEAT_MS"] = str(SINK_HEARTBEAT_MS)
+        base_env[SINK_DIR_ENV] = str(pathlib.Path(args.sink_dir).resolve())
+        base_env[SINK_HEARTBEAT_ENV] = str(SINK_HEARTBEAT_MS)
     if args.writer_attempt_log:
-        base_env["KHIVE_WRITER_ATTEMPT_LOG"] = "1"
+        base_env[ATTEMPT_LOG_ENV] = "1"
 
     report: dict = {
         "meta": {
@@ -1009,7 +1014,7 @@ def main() -> int:
                 report["arrival"]["burst"] = {"size": args.burst_size, "every_s": args.burst_every}
             report["arrival"]["mix"] = args.mix
             report["arrival"]["writer_attempt_log"] = args.writer_attempt_log
-            report["arrival"]["sink_dir"] = base_env.get("KHIVE_WRITER_TIMEOUT_SINK_DIR")
+            report["arrival"]["sink_dir"] = base_env.get(SINK_DIR_ENV)
             if args.sink_dir:
                 time.sleep(SINK_SETTLE_S)
                 report["arrival"]["sink_heartbeat_ms"] = SINK_HEARTBEAT_MS

@@ -4,6 +4,8 @@ import contextlib
 import io
 import json
 import os
+import pathlib
+import re
 import tempfile
 import unittest
 import threading
@@ -388,7 +390,9 @@ class FixtureTests(unittest.TestCase):
         harness._execute_arrival((None, fitted), op, 1, clock, request_id=6)
         self.assertEqual(seen, [{}, {"fixtures": {"entity_id": "e"}}])
 
-    def test_every_f7_shape_runs_on_a_worker_that_holds_fixtures(self):
+    def test_every_registered_op_runs_on_a_worker_that_holds_fixtures(self):
+        mixed = {fn for menu in harness.MIXES.values() for fn, _ in menu}
+        self.assertLessEqual(mixed, set(harness._OP_NAMES), "an op in a mix has no registered name")
         verbs = []
 
         def call(proc, verb, args, request_id=None):
@@ -399,7 +403,7 @@ class FixtureTests(unittest.TestCase):
         fitted.fixtures = {"entity_id": "e", "receipts": harness.deque(["m%d" % i for i in range(9)])}
         clock = VirtualClock()
         with patch.object(harness.bpd, "_call_verb", side_effect=call):
-            for fn in harness._F7_SHAPES:
+            for fn in harness._OP_NAMES:
                 before = len(verbs)
                 outcome, _, _ = harness._execute_arrival((None, fitted), fn, 0, clock, request_id=1)
                 self.assertNotIn("unexpected keyword", outcome.error or "", fn.__name__)
@@ -583,6 +587,13 @@ class AuditSuccessRowsLoadPreflightTests(unittest.TestCase):
             _, on_env, worker_envs = self.run_to_worker_boundary(10, extra_argv=["--sink-dir", sink, "--writer-attempt-log"])
             self.assertEqual(on_env["KHIVE_WRITER_ATTEMPT_LOG"], "1")
             self.assertEqual(worker_envs[0]["KHIVE_WRITER_ATTEMPT_LOG"], "1")
+
+    def test_daemon_env_names_match_the_constants_the_sink_reads(self):
+        source = pathlib.Path(__file__).resolve().parents[2] / "crates/khive-db/src/timeout_sink.rs"
+        consts = dict(re.findall(r'^const (\w+): &str = "([^"]+)";', source.read_text(), re.MULTILINE))
+        self.assertEqual((harness.ATTEMPT_LOG_ENV, harness.SINK_DIR_ENV, harness.SINK_HEARTBEAT_ENV),
+                         (consts.get("WRITER_ATTEMPT_LOG_ENV"), consts.get("SINK_DIR_OVERRIDE_ENV"),
+                          consts.get("HEARTBEAT_MS_OVERRIDE_ENV")))
 
     def test_attempt_log_without_sink_dir_is_refused(self):
         argv = ["bench_load_harness.py", "--arrival-rate", "10", "--writer-attempt-log"]

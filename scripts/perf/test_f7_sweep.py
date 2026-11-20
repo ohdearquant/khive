@@ -106,8 +106,10 @@ class BurstTests(unittest.TestCase):
             summary, rc = sweep.execute(runs, pathlib.Path(tmp), args(burst_deadline_ms=100.0), spawn=fake,
                                         emit=lines.append)
         self.assertEqual(rc, 0)
-        self.assertIn("bursts=1 missed=1 drain_missed=1 refused_only=0 refused_arrivals=0 drain_p99_ms=500.0 deadline_ms=100", lines[2])
-        self.assertEqual(lines[-1], "burst-drain knee at deadline 100 ms: size 40 (first size with a burst that drained late)")
+        self.assertIn("bursts=1 missed=1 drain_missed=1 refused_only=0 refused_arrivals=0 "
+                      "drain_p99_ms=500.0 deadline_ms=100", lines[2])
+        self.assertEqual(lines[-1],
+                         "burst-drain knee at deadline 100 ms: size 40 (first size with a burst that drained late)")
 
     def test_a_size_with_refusals_and_a_late_drain_is_the_knee(self):
         records = [{"burst": 1, "state": "completed", "scheduled_s": 1.0, "finished_s": 1.5} for _ in range(39)]
@@ -180,7 +182,7 @@ class ExecuteTests(unittest.TestCase):
         self.assertIn("[sweep-100] still VOID after 1 retries; no reading at this point", lines)
 
     def test_a_void_pair_run_runs_its_whole_round_again_in_order(self):
-        summary, rc, lines, names = self.run_plan(FakeHarness(drops={"pair-1-on": 1}))
+        summary, rc, _, _ = self.run_plan(FakeHarness(drops={"pair-1-on": 1}))
         self.assertEqual(rc, 0)
         paired = [r["name"] for r in summary["runs"] if r["role"] == "pair"]
         self.assertEqual(paired, ["pair-1-off", "pair-1-on", "pair-1-off-retry1", "pair-1-on-retry1",
