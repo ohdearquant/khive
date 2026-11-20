@@ -167,6 +167,14 @@ struct WriteTelemetry {
     queue_depth_at_entry: usize,
     slow_write_threshold: Option<Duration>,
     labels: SubmitLabels,
+    /// Per-attempt mode (`timeout_sink::writer_attempt_log_enabled`) of the
+    /// handle this request was submitted through.
+    attempt_log: bool,
+    top_level: bool,
+    /// The caller's request id, read from the submitting task's request
+    /// context at submit time, so a per-attempt row joins to the caller's
+    /// own record of the request. `None` for writes no request scoped.
+    request_id: Option<u64>,
 }
 
 impl WriteTelemetry {
@@ -176,6 +184,8 @@ impl WriteTelemetry {
         queue_depth_at_entry: usize,
         slow_write_threshold: Option<Duration>,
         labels: SubmitLabels,
+        attempt_log: bool,
+        top_level: bool,
     ) -> Self {
         Self {
             #[cfg(test)]
@@ -186,6 +196,9 @@ impl WriteTelemetry {
             queue_depth_at_entry,
             slow_write_threshold,
             labels,
+            attempt_log,
+            top_level,
+            request_id: khive_storage::current_request_correlation(),
         }
     }
 
@@ -212,21 +225,25 @@ impl WriteTelemetry {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish(
         self,
         queue_wait: Duration,
         transaction_acquire: Duration,
         body: Duration,
         commit: Duration,
+        succeeded: bool,
+        rows_changed: u64,
     ) {
         let total = self.submitted_at.elapsed();
         let slow = self
             .slow_write_threshold
             .is_some_and(|threshold| total >= threshold);
         // Labels are resolved only for a write that crossed the slow
-        // threshold, so a fast write never turns a site name into an
-        // allocation; its observation carries no labels.
-        let (labels, labels_truncated) = if slow {
+        // threshold, or for every write in per-attempt mode, so outside that
+        // mode a fast write never turns a site name into an allocation; its
+        // observation carries no labels.
+        let (labels, labels_truncated) = if slow || self.attempt_log {
             self.resolve_labels()
         } else {
             (Vec::new(), None)
@@ -249,6 +266,18 @@ impl WriteTelemetry {
 
         if slow {
             crate::timeout_sink::emit_slow_write(&self.db, &observation);
+        }
+        if self.attempt_log {
+            crate::timeout_sink::emit_writer_attempt(
+                &self.db,
+                &observation,
+                crate::timeout_sink::WriterAttempt {
+                    request_id: self.request_id,
+                    succeeded,
+                    rows_changed,
+                    top_level: self.top_level,
+                },
+            );
         }
     }
 }
@@ -756,6 +785,7 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
         } = *self;
         #[cfg(any(test, feature = "test-support"))]
         let reply_probe = crate::test_hooks::begin_commit_reply_request(conn);
+        let changes_before = conn.total_changes();
         let profiled = execute_wrapped_transaction_profiled(
             conn,
             "writer_task_commit",
@@ -766,6 +796,8 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
             #[cfg(test)]
             telemetry.test_clock.as_deref(),
         );
+        let rows_changed = conn.total_changes().saturating_sub(changes_before);
+        let succeeded = profiled.result.is_ok();
         *receipt.completed() = Some(profiled.result);
         if let Some(Err(error)) = receipt.completed().as_ref() {
             crate::timeout_sink::maybe_emit_sqlite_full(&telemetry.db, error);
@@ -780,6 +812,8 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
             transaction_acquire,
             profiled.body,
             profiled.commit,
+            succeeded,
+            rows_changed,
         );
         // The receiver may already be gone (caller dropped its future) —
         // that is not this task's problem to report.
@@ -806,11 +840,13 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
             admission,
             ..
         } = *self;
+        let changes_before = conn.total_changes();
         let body_started = Instant::now();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             op(conn).map_err(crate::error::statement_failure)
         }));
         let body = body_started.elapsed();
+        let rows_changed = conn.total_changes().saturating_sub(changes_before);
         let (result, terminal_state, open_transaction) = match outcome {
             Ok(outcome) if conn.is_autocommit() => (outcome, None, false),
             Ok(outcome) => {
@@ -830,9 +866,17 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
                 (Err(writer_task_terminated(state)), Some(state), false)
             }
         };
+        let succeeded = result.is_ok();
         *receipt.completed() = Some(result);
         let telemetry_db = telemetry.db.clone();
-        telemetry.finish(queue_wait, Duration::ZERO, body, Duration::ZERO);
+        telemetry.finish(
+            queue_wait,
+            Duration::ZERO,
+            body,
+            Duration::ZERO,
+            succeeded,
+            rows_changed,
+        );
         if open_transaction {
             tracing::error!(
                 "writer task: top-level request returned with an open transaction; request \
@@ -866,6 +910,8 @@ impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {
             transaction_acquire,
             Duration::ZERO,
             Duration::ZERO,
+            false,
+            0,
         );
         reply_with_admission(reply, admission, &receipt, false);
     }
@@ -994,6 +1040,9 @@ pub struct WriterTaskHandle {
     /// and tests get a deterministic value by setting the override before
     /// spawning their own writer task.
     slow_write_threshold: Option<std::time::Duration>,
+    /// Per-attempt mode (`timeout_sink::writer_attempt_log_enabled`),
+    /// resolved once at spawn like the slow-write bound.
+    attempt_log: bool,
     /// Default enqueue-capacity deadline for [`Self::send_bounded`] /
     /// [`Self::send_top_level_bounded`], captured from
     /// `PoolConfig::write_admission_deadline_ms` at [`spawn`] (ADR-131
@@ -1095,6 +1144,8 @@ impl WriterTaskHandle {
             self.queue_depth(),
             self.slow_write_threshold,
             labels,
+            self.attempt_log,
+            top_level,
         );
         let mut request = Box::new(WriteRequest {
             op: Box::new(op),
@@ -1390,6 +1441,7 @@ pub(crate) fn spawn_with_connection(
         backend_key,
         db,
         slow_write_threshold: crate::timeout_sink::slow_write_threshold(),
+        attempt_log: crate::timeout_sink::writer_attempt_log_enabled(),
         enqueue_timeout: std::time::Duration::from_millis(
             pool.config().write_admission_deadline_ms,
         ),

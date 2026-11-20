@@ -11,6 +11,7 @@ async fn full_channel_applies_backpressure_not_immediate_error() {
         strict_routing: false,
         db: "test".to_string(),
         slow_write_threshold: None,
+        attempt_log: false,
         enqueue_timeout: Duration::from_secs(5),
         admission_metrics: WriterAdmissionMetrics::new(),
     };
@@ -53,6 +54,7 @@ async fn send_with_timeout_maps_full_channel_to_write_queue_full() {
         strict_routing: false,
         db: "test".to_string(),
         slow_write_threshold: None,
+        attempt_log: false,
         enqueue_timeout: Duration::from_secs(5),
         admission_metrics: WriterAdmissionMetrics::new(),
     };

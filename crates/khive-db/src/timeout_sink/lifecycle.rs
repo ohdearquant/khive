@@ -208,7 +208,11 @@ fn init_in(
             state: Mutex::new(State {
                 pools: 0,
                 writers: 0,
-                handle: Some(Arc::new(SinkHandle { sender, dropped })),
+                handle: Some(Arc::new(SinkHandle {
+                    sender,
+                    dropped,
+                    attempt_seq: AtomicU64::new(0),
+                })),
                 join: Some(join),
                 result: None,
             }),
