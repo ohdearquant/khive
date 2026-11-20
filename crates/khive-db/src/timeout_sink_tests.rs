@@ -160,6 +160,7 @@ fn slow_write_line_carries_elapsed_and_depth_and_omits_inapplicable_fields() {
         }),
         None,
         None,
+        None,
     );
     let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(parsed["kind"], "slow_write");
@@ -225,6 +226,7 @@ fn enqueue_drops_and_counts_on_full_channel() {
         queue_depth: None,
         writer_stages: None,
         labels: None,
+        attempt: None,
     };
 
     enqueue(&sender, &dropped, make_event());
@@ -407,6 +409,7 @@ fn concurrent_enqueue_then_single_threaded_drain_produces_intact_lines() {
                     queue_depth: None,
                     writer_stages: None,
                     labels: None,
+                    attempt: None,
                 };
                 enqueue(&sender, &dropped, event);
             })
@@ -433,6 +436,7 @@ fn concurrent_enqueue_then_single_threaded_drain_produces_intact_lines() {
             event.queue_depth,
             event.writer_stages,
             event.labels,
+            event.attempt,
             None,
             None,
         );
@@ -508,4 +512,72 @@ fn sqlite_full_escalation_has_its_own_event_kind() {
         rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY), None);
     assert!(!is_sqlite_full(&busy));
     assert!(is_busy_or_locked(&busy));
+}
+
+/// `attempt_seq` belongs to the sink a row is routed to: each sink directory's
+/// file counts its own `writer_attempt` rows from 1, and an attempt for a
+/// database with no sink route takes no number from any of them. A gap in one
+/// file's sequence is then a row that sink was handed and did not write.
+#[test]
+fn writer_attempt_sequence_is_per_sink_and_unrouted_attempts_take_none() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let db_a = format!("attempt-seq-a-{}", uuid::Uuid::new_v4());
+    let db_b = format!("attempt-seq-b-{}", uuid::Uuid::new_v4());
+    let db_unrouted = format!("attempt-seq-unrouted-{}", uuid::Uuid::new_v4());
+    let _registration_a = lifecycle::init(dir_a.path().to_path_buf(), &db_a)
+        .expect("sink a registers")
+        .expect("sink a spawns its writer");
+    let _registration_b = lifecycle::init(dir_b.path().to_path_buf(), &db_b)
+        .expect("sink b registers")
+        .expect("sink b spawns its writer");
+
+    let stages = crate::writer_task::WriterStageObservation {
+        queue_wait_micros: 1,
+        transaction_acquire_micros: 1,
+        body_micros: 1,
+        commit_micros: 1,
+        total_micros: 4,
+        queue_depth_at_entry: 0,
+        observed_at_unix_ms: 0,
+        labels: Vec::new(),
+        labels_truncated: None,
+    };
+    let attempt = || WriterAttempt {
+        request_id: None,
+        succeeded: true,
+        rows_changed: 1,
+        top_level: false,
+    };
+    for db in [&db_a, &db_unrouted, &db_b, &db_unrouted, &db_a, &db_b] {
+        emit_writer_attempt(db, &stages, attempt());
+    }
+
+    let sequence = |dir: &Path, db: &str| -> Vec<u64> {
+        let path = dir.join(ndjson_file_name());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let seqs: Vec<u64> = std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|row| row["kind"] == WRITER_ATTEMPT_KIND && row["db"] == db)
+                .filter_map(|row| row["attempt_seq"].as_u64())
+                .collect();
+            if seqs.len() >= 2 || std::time::Instant::now() >= deadline {
+                return seqs;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    assert_eq!(
+        sequence(dir_a.path(), &db_a),
+        vec![1, 2],
+        "sink a must number its own rows 1, 2"
+    );
+    assert_eq!(
+        sequence(dir_b.path(), &db_b),
+        vec![1, 2],
+        "sink b must number its own rows 1, 2"
+    );
 }

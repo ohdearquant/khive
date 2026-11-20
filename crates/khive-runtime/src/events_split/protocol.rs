@@ -172,17 +172,40 @@ pub enum EventsResponse {
 
 /// Whether a writer-state error belongs to one failed request on a still-live
 /// seam or to a permanently retired writer task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WireWriterTaskFailure {
     RequestFailed {
         request_state: WireWriterTaskState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<WireWriterFailureEvidence>,
     },
     TaskTerminated {
         request_state: WireWriterTaskState,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sqlite_full_codes: Option<(i32, i32)>,
     },
+}
+
+/// Additive evidence keeps the legacy request-failed envelope readable by old peers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireWriterFailureEvidence {
+    WriteOutcomeUnknown,
+    OwnerUnavailable {
+        operation: String,
+        cause: WireWriterOwnerCause,
+    },
+    RouteViolation {
+        operation: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireWriterOwnerCause {
+    Pool { operation: String, message: String },
+    NoRuntime,
 }
 
 /// Wire mirror of [`khive_storage::WriterTaskRequestState`]. A separate type

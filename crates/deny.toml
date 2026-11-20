@@ -42,6 +42,12 @@ ignore = [
     # `transport-streamable-http-client-*` feature is enabled.
     { id = "RUSTSEC-2026-0457", reason = "OAuth client metadata fetch; the rmcp auth feature is not enabled" },
     { id = "RUSTSEC-2026-0462", reason = "Streamable HTTP client body buffering; no transport-streamable-http-client feature is enabled" },
+    # chrono and chrono-tz are marked unmaintained with no fixed release. Both are
+    # direct dependencies across the workspace; the move to a maintained crate is
+    # tracked in #6754. Remove both entries when no workspace crate depends on
+    # either directly.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained with no fixed release; replacement tracked in #6754" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz is unmaintained with no fixed release; replacement tracked in #6754" },
 ]
 
 [licenses]

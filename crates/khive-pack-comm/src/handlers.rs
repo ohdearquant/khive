@@ -138,7 +138,7 @@ pub(crate) async fn handle_send_with_route(
     params: Value,
     route: Option<&dyn crate::node_route::NodeSendRoute>,
 ) -> Result<Value, RuntimeError> {
-    let p: SendParams = deser(params)?;
+    let p: SendParams = deser(params.clone())?;
     // Classify the recipient exactly as written, before anything can read or write. A node
     // address with no route installed is refused as disabled here and never falls through to the
     // local actor-label path; a padded node address is refused rather than trimmed.
@@ -181,7 +181,8 @@ pub(crate) async fn handle_send_with_route(
              worktree-scoped `.khive/config.toml`, so they are not addressable as distinct \
              principals until each is configured with its own actor identity. If this send is \
              genuinely a note to yourself, resend with `self_send=true`."
-        )));
+        ))
+        .before_requested_write());
     }
 
     // #200: unattributed callers stamp from_actor="local", corrupting reply-thread
@@ -194,6 +195,13 @@ pub(crate) async fn handle_send_with_route(
              reply-thread routing in multi-actor deployments. \
              Set [actor] id in khive.toml to fix (issue #200)."
         );
+    }
+
+    if let Some(channel_route) = runtime.config().channel_send_routes.resolve(&p.to)? {
+        if let Some(key) = p.idempotency_key.as_deref() {
+            khive_runtime::keyed_memory::validate_memory_key(key)?;
+        }
+        return channel_route.send(runtime, token, params).await;
     }
 
     let sent_at = Utc::now().to_rfc3339();
@@ -356,13 +364,19 @@ pub(crate) async fn handle_transport_status(
 /// See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_inbox
 pub const MAX_INBOX_WAIT_MS: u64 = 30_000;
 
-/// `read` — retrieve an inbound message and mark it as read.
+/// `read` — retrieve inbound messages, marking them unless a single fetch opts out.
 pub(crate) async fn handle_read(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
+    let supplied_ids = params.get("ids").is_some();
     let p: ReadParams = deser(params)?;
+    if !p.mark && supplied_ids {
+        return Err(RuntimeError::InvalidInput(
+            "read: mark=false requires a single `id`; `ids` is not supported".into(),
+        ));
+    }
     let include_body = p.body;
     match (p.id, p.ids) {
         (Some(_), Some(_)) => Err(RuntimeError::InvalidInput(
@@ -378,7 +392,23 @@ pub(crate) async fn handle_read(
             } else {
                 None
             };
-            let result = mark_read_target(runtime, token, id, note).await?;
+            let result = if p.mark {
+                mark_read_target(runtime, token, id, note).await?
+            } else {
+                let read = note
+                    .properties
+                    .as_ref()
+                    .and_then(|properties| properties.get("read"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                json!({
+                    "id": short_id(id),
+                    "full_id": id.as_hyphenated().to_string(),
+                    "status": "success",
+                    "read": read,
+                    "properties": note.properties,
+                })
+            };
             Ok(read_result_with_body(result, message))
         }
         (None, Some(raw_ids)) => {

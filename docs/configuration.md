@@ -295,6 +295,32 @@ file) is the entry point for every MCP client. When your config declares
 declared `main` backend or is the explicit `:memory:` escape hatch. The config
 file is authoritative for backend paths.
 
+### Verb catalog verbosity
+
+MCP clients discover khive's verbs in the `request` tool description. The default
+`full` mode includes the complete catalog descriptions. To request shorter
+summaries for one client, add the option to that client's command arguments:
+
+```sh
+kkernel mcp --catalog-verbosity compact
+```
+
+Compact mode keeps every enabled callable verb, including mounted verbs, in
+sorted order. Each row retains its contributing packs and a `verb(help=true)`
+pointer. A contribution shows the first nonempty description line with normalized
+whitespace, up to 160 Unicode scalar values including any shortening ellipsis.
+A header identifies these summaries and explains how to obtain full help.
+`verb(help=true)` returns complete help, including argument definitions; `verbs`
+keeps its complete descriptions.
+
+Omit the option or pass `--catalog-verbosity full` to retain the original full
+request-tool description. This is a choice for the individual MCP server
+instance; it does not change the loaded packs, dispatch, daemon identity or
+forwarding. There is no corresponding environment variable or TOML setting.
+Rust callers can use
+`server.with_catalog_verbosity(khive_mcp::args::CatalogVerbosity::Compact)`;
+existing server constructors default to `Full`.
+
 ### Claude Code (`.mcp.json` or `.claude/settings.json`)
 
 ```json
@@ -527,12 +553,36 @@ cover yet.
 
 ---
 
-## `[channel.node]` — accepted and not interpreted
+## `[channel.*]` — component configuration
 
-The node channel is not part of this release. A `[channel.node]` table left in
-an existing configuration file still loads and is accepted as it stands: its
-contents are not read or checked, and it changes nothing about how the daemon
-runs. Any other key under `[channel]` is still rejected when the file loads.
+Every value under `[channel]` is retained without interpretation. A host registers
+component validators before constructing its pack registry; each validator receives
+the value under its exact component name, or its absence. The component decides
+whether a table is required and validates its own fields before activation.
+
+An unregistered name remains stored but has no effect: its presence does not start
+a component, install a channel, or add a send route. Nested values and scalar values
+are preserved unchanged. Registering two validators under the same name is refused
+instead of replacing the first registration.
+
+Library hosts use `ServeRegistrations::register_config_validator` and
+`run_with_registrations` to validate components before runtime construction, even
+when comm is not loaded. The same callbacks remain installed for pack activation;
+checks must be pure and idempotent because validation may run more than once.
+
+Hosts install custom address policies with `ServeRegistrations::register_send_route`.
+Each route receives the authorized runtime, namespace token, and original validated
+send parameters. The route owns persistence, replay handling, and transport submission;
+the core returns its result without adding a message or falling back to another route.
+Built-in transport and local actor address kinds cannot be overridden.
+
+On Unix, a host carrying validators or send routes must run as the daemon or select local
+dispatch with `KHIVE_NO_DAEMON=1`, whatever its transport: requests from a non-daemon host are
+forwarded to the daemon, and callbacks cannot be forwarded to another process. The prebuilt
+`serve_server_with_registrations` API refuses bundles containing validators or send routes. A host
+that configures `RuntimeConfig` before constructing its server can pass only its
+channels and residents to that prebuilt entrypoint; the same local-dispatch rule applies when
+that server's runtime carries validators or send routes.
 
 ---
 

@@ -6,75 +6,75 @@
 struct ErrorInjectPack;
 
 impl khive_types::Pack for ErrorInjectPack {
-    const NAME: &'static str = "error-inject";
+    const NAME: &'static str = "error_inject";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[
         HandlerDef {
-            name: "always_fail",
+            name: "error_inject.always_fail",
             description: "always returns a KhiveError::unavailable with code + details",
             visibility: Visibility::Verb,
             category: VerbCategory::Assertive,
             params: &[],
         },
         HandlerDef {
-            name: "writer_pool_timeout",
+            name: "error_inject.writer_pool_timeout",
             description: "returns a typed writer pool timeout through a storage wrapper",
             visibility: Visibility::Verb,
             category: VerbCategory::Assertive,
             params: &[],
         },
         HandlerDef {
-            name: "write_queue_full",
+            name: "error_inject.write_queue_full",
             description: "returns a typed write-queue saturation error",
             visibility: Visibility::Verb,
             category: VerbCategory::Assertive,
             params: &[],
         },
         HandlerDef {
-            name: "writer_task_busy",
+            name: "error_inject.writer_task_busy",
             description: "returns a typed writer-task BEGIN contention error",
             visibility: Visibility::Verb,
             category: VerbCategory::Assertive,
             params: &[],
         },
         HandlerDef {
-            name: "writer_task_rolled_back",
+            name: "error_inject.writer_task_rolled_back",
             description: "returns an ordinary writer request error after proven rollback",
             visibility: Visibility::Verb,
             category: VerbCategory::Assertive,
             params: &[],
         },
         HandlerDef {
-            name: "writer_task_side_effects_unknown",
+            name: "error_inject.writer_task_side_effects_unknown",
             description: "returns a terminal writer error with ambiguous side effects",
             visibility: Visibility::Verb,
             category: VerbCategory::Assertive,
             params: &[],
         },
         HandlerDef {
-            name: "storage_admission_timeout",
+            name: "error_inject.storage_admission_timeout",
             description: "returns a typed storage-admission timeout error",
             visibility: Visibility::Verb,
             category: VerbCategory::Assertive,
             params: &[],
         },
         HandlerDef {
-            name: "storage_admission_timeout_with_pool",
+            name: "error_inject.storage_admission_timeout_with_pool",
             description: "returns a storage-admission timeout naming its pool",
             visibility: Visibility::Verb,
             category: VerbCategory::Assertive,
             params: &[],
         },
         HandlerDef {
-            name: "read_tx_age_evicted",
+            name: "error_inject.read_tx_age_evicted",
             description: "returns a typed cached-reader read-transaction age eviction error",
             visibility: Visibility::Verb,
             category: VerbCategory::Assertive,
             params: &[],
         },
         HandlerDef {
-            name: "read_tx_age_eviction_cleanup_failed",
+            name: "error_inject.read_tx_age_eviction_cleanup_failed",
             description: "returns a typed cached-reader read-transaction age eviction error \
                 whose cleanup rollback was denied or failed",
             visibility: Visibility::Verb,
@@ -87,7 +87,7 @@ impl khive_types::Pack for ErrorInjectPack {
 #[async_trait]
 impl PackRuntime for ErrorInjectPack {
     fn name(&self) -> &str {
-        "error-inject"
+        "error_inject"
     }
 
     fn note_kinds(&self) -> &'static [&'static str] {
@@ -109,7 +109,7 @@ impl PackRuntime for ErrorInjectPack {
         _registry: &VerbRegistry,
         _token: &NamespaceToken,
     ) -> Result<serde_json::Value, RuntimeError> {
-        if verb == "writer_pool_timeout" {
+        if verb == "error_inject.writer_pool_timeout" {
             let storage = khive_storage::StorageError::driver(
                 khive_storage::StorageCapability::Notes,
                 "append_note",
@@ -119,17 +119,17 @@ impl PackRuntime for ErrorInjectPack {
             );
             return Err(RuntimeError::Storage(storage));
         }
-        if verb == "write_queue_full" {
+        if verb == "error_inject.write_queue_full" {
             return Err(RuntimeError::Storage(
                 khive_storage::StorageError::WriteQueueFull { timeout_ms: 175 },
             ));
         }
-        if verb == "writer_task_busy" {
+        if verb == "error_inject.writer_task_busy" {
             return Err(RuntimeError::Storage(
                 khive_storage::StorageError::WriterTaskBusy { timeout_ms: 175 },
             ));
         }
-        if verb == "writer_task_rolled_back" {
+        if verb == "error_inject.writer_task_rolled_back" {
             return Err(RuntimeError::Storage(
                 khive_storage::StorageError::WriterTaskRequestFailed {
                     request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
@@ -140,14 +140,14 @@ impl PackRuntime for ErrorInjectPack {
                 },
             ));
         }
-        if verb == "writer_task_side_effects_unknown" {
+        if verb == "error_inject.writer_task_side_effects_unknown" {
             return Err(RuntimeError::Storage(
                 khive_storage::StorageError::writer_task_terminated(
                     khive_storage::WriterTaskRequestState::SideEffectsUnknown,
                 ),
             ));
         }
-        if verb == "storage_admission_timeout" {
+        if verb == "error_inject.storage_admission_timeout" {
             return Err(RuntimeError::Storage(
                 khive_storage::StorageError::AdmissionTimeout {
                     operation: "sql_bridge.writer_handle".into(),
@@ -156,7 +156,7 @@ impl PackRuntime for ErrorInjectPack {
                 },
             ));
         }
-        if verb == "storage_admission_timeout_with_pool" {
+        if verb == "error_inject.storage_admission_timeout_with_pool" {
             return Err(RuntimeError::Storage(
                 khive_storage::StorageError::AdmissionTimeout {
                     operation: "sql_bridge.reader_operation".into(),
@@ -165,7 +165,7 @@ impl PackRuntime for ErrorInjectPack {
                 },
             ));
         }
-        if verb == "read_tx_age_evicted" {
+        if verb == "error_inject.read_tx_age_evicted" {
             return Err(RuntimeError::Storage(
                 khive_storage::StorageError::ReadTransactionAgeEvicted {
                     operation: "sql_bridge.cached_reader".into(),
@@ -173,7 +173,7 @@ impl PackRuntime for ErrorInjectPack {
                 },
             ));
         }
-        if verb == "read_tx_age_eviction_cleanup_failed" {
+        if verb == "error_inject.read_tx_age_eviction_cleanup_failed" {
             return Err(RuntimeError::Storage(
                 khive_storage::StorageError::ReadTransactionAgeEvictionCleanupFailed {
                     operation: "sql_bridge.cached_reader".into(),
@@ -231,7 +231,7 @@ async fn runtime_khive_error_serializes_as_structured_object() -> anyhow::Result
     let result = call(
         &client,
         "request",
-        serde_json::json!({"ops": "always_fail()"}),
+        serde_json::json!({"ops": "error_inject.always_fail()"}),
     )
     .await?;
     let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
@@ -295,7 +295,7 @@ async fn writer_pool_timeout_survives_storage_runtime_and_mcp_wire() -> anyhow::
     let result = call(
         &client,
         "request",
-        serde_json::json!({"ops": "writer_pool_timeout()"}),
+        serde_json::json!({"ops": "error_inject.writer_pool_timeout()"}),
     )
     .await?;
     let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
@@ -334,7 +334,7 @@ async fn write_queue_full_survives_storage_runtime_and_mcp_wire() -> anyhow::Res
     let result = call(
         &client,
         "request",
-        serde_json::json!({"ops": "write_queue_full()"}),
+        serde_json::json!({"ops": "error_inject.write_queue_full()"}),
     )
     .await?;
     let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;

@@ -1,6 +1,11 @@
-use super::*;
+use super::page::{event_page_json, MAX_RESPONSE_BYTES};
+use super::parsing::event_actor_read_scope;
+use crate::EventReadPageResult;
+use crate::{micros_to_iso, NamespaceToken, RuntimeError};
+use khive_types::EventKind;
+use serde_json::{json, Value};
 
-use khive_runtime::{KhiveConfig, KhiveRuntime, Namespace, RuntimeConfig};
+use crate::{KhiveConfig, KhiveRuntime, Namespace, RuntimeConfig};
 use khive_storage::event::Event;
 use khive_types::SubstrateKind;
 use uuid::Uuid;
@@ -9,12 +14,12 @@ fn fixture(
     actor: Option<&str>,
     visible: &[&str],
     fleet_readers: &[&str],
-) -> (BrainPack, KhiveRuntime, NamespaceToken) {
+) -> (KhiveRuntime, NamespaceToken) {
     let mut config = KhiveConfig::default();
     config.actor.id = actor.map(str::to_owned);
     config.actor.visible_namespaces = Some(visible.iter().map(|s| s.to_string()).collect());
     config.brain.fleet_readers = fleet_readers.iter().map(|s| s.to_string()).collect();
-    let runtime = KhiveRuntime::new(khive_runtime::runtime_config_from_khive_config(
+    let runtime = KhiveRuntime::new(crate::runtime_config_from_khive_config(
         &config,
         RuntimeConfig {
             db_path: None,
@@ -28,7 +33,7 @@ fn fixture(
     let token = runtime
         .authorize_with_visibility(Namespace::local(), runtime.visible_namespaces().to_vec())
         .unwrap();
-    (BrainPack::new(runtime.clone()), runtime, token)
+    (runtime, token)
 }
 
 async fn seed(runtime: &KhiveRuntime, namespace: &str, actor: &str, at: i64) -> Uuid {
@@ -79,13 +84,13 @@ fn invalid_message(error: RuntimeError) -> String {
 
 #[tokio::test]
 async fn page_stitches_stored_rows_and_matches_quiescent_alias_counts() {
-    let (pack, runtime, token) = fixture(Some("caller"), &[], &[]);
+    let (runtime, token) = fixture(Some("caller"), &[], &[]);
     let first = seed(&runtime, "local", "caller", 1_000_001).await;
     let second = seed(&runtime, "local", "actor:caller", 1_000_002).await;
     seed(&runtime, "local", "other", 1_000_003).await;
     let request = params();
-    let page = pack
-        .handle_event_page(&token, request.clone())
+    let page = runtime
+        .read_event_page_response(&token, request.clone())
         .await
         .unwrap();
     assert_eq!(ids(&page), vec![first]);
@@ -99,14 +104,17 @@ async fn page_stitches_stored_rows_and_matches_quiescent_alias_counts() {
     let mut next = request.clone();
     next["after"] = page["next_after"].clone();
     next["limit"] = json!(1000);
-    let tail = pack.handle_event_page(&token, next).await.unwrap();
+    let tail = runtime
+        .read_event_page_response(&token, next)
+        .await
+        .unwrap();
     assert_eq!(ids(&tail), vec![second]);
     assert_eq!(tail["has_more"], false);
     assert!(tail["next_after"].is_null());
     assert_eq!(tail["until"], page["until"]);
 
-    let counts = pack
-        .handle_event_counts(&token, request_without_page_args())
+    let counts = runtime
+        .read_event_counts(&token, request_without_page_args())
         .await
         .unwrap();
     assert_eq!(counts["truncated"], false);
@@ -126,7 +134,7 @@ fn request_without_page_args() -> Value {
 
 #[tokio::test]
 async fn namespace_exclusions_are_applied_before_page_peek() {
-    let (pack, runtime, token) = fixture(Some("caller"), &["visible"], &[]);
+    let (runtime, token) = fixture(Some("caller"), &["visible"], &[]);
     for at in 1_000_000..1_000_010 {
         seed(&runtime, "local", "caller", at).await;
     }
@@ -136,27 +144,33 @@ async fn namespace_exclusions_are_applied_before_page_peek() {
     let mut request = params();
     request["namespaces"] = json!(["local", "visible", "hidden"]);
     request["exclude_namespaces"] = json!(["local"]);
-    let page = pack
-        .handle_event_page(&token, request.clone())
+    let page = runtime
+        .read_event_page_response(&token, request.clone())
         .await
         .unwrap();
     assert_eq!(ids(&page), vec![first]);
     assert_eq!(page["scope"]["namespaces"], json!(["visible"]));
     assert_eq!(page["has_more"], true);
     request["after"] = page["next_after"].clone();
-    let tail = pack.handle_event_page(&token, request).await.unwrap();
+    let tail = runtime
+        .read_event_page_response(&token, request)
+        .await
+        .unwrap();
     assert_eq!(ids(&tail), vec![second]);
     assert_eq!(tail["has_more"], false);
 }
 
 #[tokio::test]
 async fn invisible_and_empty_namespace_selections_return_same_empty_page() {
-    let (pack, runtime, token) = fixture(Some("caller"), &[], &[]);
+    let (runtime, token) = fixture(Some("caller"), &[], &[]);
     seed(&runtime, "hidden", "caller", 1_000_001).await;
     for selection in [json!([]), json!(["hidden"]), json!(["absent"])] {
         let mut request = params();
         request["namespaces"] = selection;
-        let page = pack.handle_event_page(&token, request).await.unwrap();
+        let page = runtime
+            .read_event_page_response(&token, request)
+            .await
+            .unwrap();
         assert_eq!(page["count"], 0);
         assert_eq!(page["has_more"], false);
         assert_eq!(page["scope"]["namespaces"], json!([]));
@@ -166,12 +180,12 @@ async fn invisible_and_empty_namespace_selections_return_same_empty_page() {
 
 #[tokio::test]
 async fn serving_fleet_allowlist_controls_all_actors_without_widening_namespaces() {
-    let (unlisted, _, _) = fixture(Some("serving"), &[], &[]);
-    let (_, _, caller) = fixture(Some("caller"), &["visible"], &["caller"]);
+    let (unlisted, _) = fixture(Some("serving"), &[], &[]);
+    let (_, caller) = fixture(Some("caller"), &["visible"], &["caller"]);
     let mut request = params();
     request["all_actors"] = json!(true);
     let error = unlisted
-        .handle_event_page(&caller, request.clone())
+        .read_event_page_response(&caller, request.clone())
         .await
         .unwrap_err();
     assert_eq!(
@@ -179,10 +193,13 @@ async fn serving_fleet_allowlist_controls_all_actors_without_widening_namespaces
         "actor \"caller\" is not a configured fleet reader"
     );
 
-    let (listed, runtime, _) = fixture(Some("serving"), &[], &["caller"]);
+    let (runtime, _) = fixture(Some("serving"), &[], &["caller"]);
     let own = seed(&runtime, "local", "foreign", 1_000_001).await;
     seed(&runtime, "visible", "foreign", 1_000_002).await;
-    let page = listed.handle_event_page(&caller, request).await.unwrap();
+    let page = runtime
+        .read_event_page_response(&caller, request)
+        .await
+        .unwrap();
     assert_eq!(ids(&page), vec![own]);
     assert_eq!(page["scope"]["namespaces"], json!(["local"]));
     assert_eq!(page["has_more"], false);
@@ -190,7 +207,7 @@ async fn serving_fleet_allowlist_controls_all_actors_without_widening_namespaces
 
 #[tokio::test]
 async fn actor_refusals_precede_missing_time_or_invalid_kind() {
-    let (pack, _, token) = fixture(Some("caller"), &[], &[]);
+    let (runtime, token) = fixture(Some("caller"), &[], &[]);
     let cases = [
         (
             json!({"actor": "foreign", "kind": "invalid"}),
@@ -202,30 +219,39 @@ async fn actor_refusals_precede_missing_time_or_invalid_kind() {
         ),
     ];
     for (request, expected) in cases {
-        let error = pack
-            .handle_event_page(&token, request.clone())
+        let error = runtime
+            .read_event_page_response(&token, request.clone())
             .await
             .unwrap_err();
         assert_eq!(invalid_message(error), expected);
-        let old_error = pack.handle_event_counts(&token, request).await.unwrap_err();
+        let old_error = runtime
+            .read_event_counts(&token, request)
+            .await
+            .unwrap_err();
         assert_eq!(invalid_message(old_error), expected);
     }
-    let missing = pack.handle_event_page(&token, json!({})).await.unwrap_err();
+    let missing = runtime
+        .read_event_page_response(&token, json!({}))
+        .await
+        .unwrap_err();
     assert!(invalid_message(missing).starts_with("missing `since`:"));
 }
 
 #[tokio::test]
 async fn prefixed_and_anonymous_callers_keep_count_actor_aliases() {
     for actor in [Some("actor:caller"), None] {
-        let (pack, runtime, token) = fixture(actor, &[], &[]);
+        let (runtime, token) = fixture(actor, &[], &[]);
         let scope = event_actor_read_scope(&runtime, &token, None, false).unwrap();
         assert_eq!(scope.actors.len(), 1);
         let expected = seed(&runtime, "local", &scope.actors[0], 1_000_001).await;
         seed(&runtime, "local", "caller", 1_000_002).await;
-        let page = pack.handle_event_page(&token, params()).await.unwrap();
+        let page = runtime
+            .read_event_page_response(&token, params())
+            .await
+            .unwrap();
         assert_eq!(ids(&page), vec![expected]);
-        let counts = pack
-            .handle_event_counts(&token, request_without_page_args())
+        let counts = runtime
+            .read_event_counts(&token, request_without_page_args())
             .await
             .unwrap();
         assert_eq!(counts["window_event_total"], 1);
@@ -234,32 +260,47 @@ async fn prefixed_and_anonymous_callers_keep_count_actor_aliases() {
 
 #[tokio::test]
 async fn page_limits_and_cursor_scope_mismatches_refuse() {
-    let (pack, runtime, token) = fixture(Some("caller"), &[], &[]);
+    let (runtime, token) = fixture(Some("caller"), &[], &[]);
     seed(&runtime, "local", "caller", 1_000_001).await;
     seed(&runtime, "local", "caller", 1_000_002).await;
     for limit in [0, 1001] {
         let mut request = params();
         request["limit"] = json!(limit);
-        assert!(pack.handle_event_page(&token, request).await.is_err());
+        assert!(runtime
+            .read_event_page_response(&token, request)
+            .await
+            .is_err());
     }
-    let page = pack.handle_event_page(&token, params()).await.unwrap();
+    let page = runtime
+        .read_event_page_response(&token, params())
+        .await
+        .unwrap();
     let mut request = params();
     request["after"] = page["next_after"].clone();
     request["actor"] = json!("actor:caller");
-    assert!(pack.handle_event_page(&token, request).await.is_err());
+    assert!(runtime
+        .read_event_page_response(&token, request)
+        .await
+        .is_err());
     let mut request = params();
     request["after"] = json!("invalid-cursor-sentinel");
-    let error = pack.handle_event_page(&token, request).await.unwrap_err();
+    let error = runtime
+        .read_event_page_response(&token, request)
+        .await
+        .unwrap_err();
     assert!(!error.to_string().contains("invalid-cursor-sentinel"));
 }
 
 #[tokio::test]
 async fn duplicate_kind_selectors_do_not_duplicate_events() {
-    let (pack, runtime, token) = fixture(Some("caller"), &[], &[]);
+    let (runtime, token) = fixture(Some("caller"), &[], &[]);
     let expected = seed(&runtime, "local", "caller", 1_000_001).await;
     let mut request = params();
     request["kinds"] = json!(["search_executed", "search_executed"]);
-    let page = pack.handle_event_page(&token, request).await.unwrap();
+    let page = runtime
+        .read_event_page_response(&token, request)
+        .await
+        .unwrap();
     assert_eq!(ids(&page), vec![expected]);
     assert_eq!(page["has_more"], false);
 }

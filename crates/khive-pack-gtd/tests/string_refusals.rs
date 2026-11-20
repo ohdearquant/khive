@@ -5,6 +5,7 @@ use khive_pack_kg::KgPack;
 use khive_runtime::{
     KhiveRuntime, Namespace, RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
 };
+use khive_storage::{Note, SqlStatement, SqlValue};
 use khive_types::ErrorKind;
 use serde_json::{json, Value};
 
@@ -20,6 +21,10 @@ const STATUSES: [&str; 7] = [
 ];
 
 fn fixture() -> VerbRegistry {
+    fixture_with_runtime().1
+}
+
+fn fixture_with_runtime() -> (KhiveRuntime, VerbRegistry) {
     let runtime = KhiveRuntime::new(RuntimeConfig {
         db_path: None,
         default_namespace: Namespace::local(),
@@ -58,7 +63,7 @@ fn fixture() -> VerbRegistry {
     let registry = builder.build().expect("KG and GTD registry");
     registry.apply_schema_plans(runtime.backend());
     runtime.install_edge_rules(registry.all_edge_rules());
-    registry
+    (runtime, registry)
 }
 
 fn refused_strings() -> Vec<(String, String, bool)> {
@@ -89,6 +94,41 @@ async fn get(registry: &VerbRegistry, id: &Value) -> Value {
         .dispatch("get", json!({"id": id}))
         .await
         .expect("get actual stored task")
+}
+
+async fn stored_note(runtime: &KhiveRuntime, id: &Value) -> Note {
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    runtime
+        .notes(&token)
+        .unwrap()
+        .get_note(id.as_str().unwrap().parse().unwrap())
+        .await
+        .unwrap()
+        .expect("actual stored task")
+}
+
+async fn task_domain_state(runtime: &KhiveRuntime) -> Vec<(String, String)> {
+    let mut reader = runtime.sql().reader().await.unwrap();
+    let mut result = Vec::new();
+    for table in [
+        "notes",
+        "graph_edges",
+        "fts_notes",
+        "ann_write_log",
+        "note_streams",
+        "gtd_lifecycle_audit",
+    ] {
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: format!("SELECT * FROM {table} ORDER BY rowid"),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        result.push((table.to_owned(), format!("{rows:?}")));
+    }
+    result
 }
 
 // Default gtd.tasks lists only open tasks, so enumerate every canonical status.
@@ -207,16 +247,53 @@ async fn dependency_update_refusal_masks_invalid_uuid_strings_without_task_mutat
 
 #[tokio::test]
 async fn assign_key_conflict_masks_message_and_details_without_task_mutation() {
-    let registry = fixture();
+    let (runtime, registry) = fixture_with_runtime();
     assign(&registry, json!({"title": "unrelated retained task"})).await;
     for (index, (raw, shown, secret)) in refused_strings().into_iter().enumerate() {
         let args = json!({"title": format!("keyed original task {index}"), "idempotency_key": raw.clone()});
-        // Opaque-key acceptance is an actual first write and exact retry,
-        // not a fabricated conflict or a scanner-refused setup.
-        let first = assign(&registry, args.clone()).await;
+        let first = if secret {
+            let first = assign(
+                &registry,
+                json!({"title": format!("keyed original task {index}")}),
+            )
+            .await;
+            let mut expected = stored_note(&runtime, &first["full_id"]).await;
+            assert_eq!(expected.key, None);
+            // Legacy rows remain readable; application writes must not seed a credential key.
+            let changed = runtime
+                .sql()
+                .writer()
+                .await
+                .unwrap()
+                .execute(SqlStatement {
+                    sql: "UPDATE notes SET key = ?1 WHERE id = ?2 AND namespace = 'local' AND kind = 'task' AND key IS NULL".into(),
+                    params: vec![
+                        SqlValue::Text(raw.clone()),
+                        SqlValue::Text(expected.id.to_string()),
+                    ],
+                    label: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(changed, 1, "seed exactly one historical task key");
+            expected.key = Some(raw.clone());
+            expected.version += 1;
+            assert_eq!(stored_note(&runtime, &first["full_id"]).await, expected);
+            first
+        } else {
+            assign(&registry, args.clone()).await
+        };
+        let stored_before = stored_note(&runtime, &first["full_id"]).await;
+        let domain_before = task_domain_state(&runtime).await;
         let replay = assign(&registry, args).await;
         assert_eq!(replay["full_id"], first["full_id"]);
         assert_eq!(replay["replayed"], true);
+        assert_eq!(
+            stored_note(&runtime, &first["full_id"]).await,
+            stored_before,
+            "replay preserves every stored task field, including its legacy key"
+        );
+        assert_eq!(task_domain_state(&runtime).await, domain_before);
         let before = task_state(&registry).await;
         let error = registry
             .dispatch(
@@ -264,7 +341,63 @@ async fn assign_key_conflict_masks_message_and_details_without_task_mutation() {
             before,
             "conflict must preserve the real keyed note and every other task"
         );
+        assert_eq!(
+            stored_note(&runtime, &first["full_id"]).await,
+            stored_before
+        );
+        assert_eq!(task_domain_state(&runtime).await, domain_before);
     }
+}
+
+#[tokio::test]
+async fn assign_new_credential_key_refuses_without_task_or_index_mutation() {
+    let (runtime, registry) = fixture_with_runtime();
+    let blocker = assign(&registry, json!({"title": "retained blocker"})).await;
+    assign(
+        &registry,
+        json!({"title": "retained dependent", "depends_on": [blocker["full_id"]]}),
+    )
+    .await;
+    let edges = runtime
+        .sql()
+        .reader()
+        .await
+        .unwrap()
+        .query_all(SqlStatement {
+            sql: "SELECT * FROM graph_edges".into(),
+            params: vec![],
+            label: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(edges.len(), 1, "retain a real task dependency edge");
+    let before = task_state(&registry).await;
+    let domain_before = task_domain_state(&runtime).await;
+    let raw = format!("sk-proj-{}", "A".repeat(80));
+    let result = registry
+        .dispatch(
+            "gtd.assign",
+            json!({"title": "new credential-key task", "idempotency_key": raw.clone(),
+                "depends_on": [blocker["full_id"]]}),
+        )
+        .await;
+    assert!(
+        matches!(&result, Err(error)
+            if matches!(error.refusal_source(), RuntimeError::SecretDetected(matched)
+                if matched.detector == "openai-api-key"
+                    && matched.trigger.is_none()
+                    && matched.location.as_deref() == Some("note.key"))),
+        "a new credential key must reach the typed note.key write refusal: {result:?}"
+    );
+    let error = result.unwrap_err();
+    assert!(!error.to_string().contains(&raw));
+    assert!(!format!("{error:?}").contains(&raw));
+    assert_eq!(task_state(&registry).await, before);
+    assert_eq!(
+        task_domain_state(&runtime).await,
+        domain_before,
+        "key refusal must preserve complete task, edge, index, stream and lifecycle rows"
+    );
 }
 
 #[tokio::test]

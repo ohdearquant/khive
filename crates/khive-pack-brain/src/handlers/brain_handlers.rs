@@ -153,114 +153,17 @@ impl BrainPack {
         token: &NamespaceToken,
         params: Value,
     ) -> Result<Value, RuntimeError> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct EventsParams {
-            limit: Option<u32>,
-        }
-        let p: EventsParams = parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
-
-        let limit = p.limit.unwrap_or(20).min(100);
-        let ns = token.namespace().as_str().to_string();
-
-        let store = self.runtime.events(token)?;
-        let filter = EventFilter {
-            verbs: vec![
-                "recall".into(),
-                "search".into(),
-                "brain.feedback".into(),
-                "brain.emit".into(), // retained for backward-compat queries
-                "get".into(),
-                "remember".into(),
-            ],
-            ..EventFilter::default()
-        };
-        let _ = ns;
-        let page = store
-            .query_events(filter, PageRequest { offset: 0, limit })
-            .await
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-
-        let events: Vec<Value> = page
-            .items
-            .iter()
-            .map(|e| {
-                json!({
-                    "id": e.id.to_string(),
-                    "verb": e.verb,
-                    "outcome": e.outcome,
-                    "target_id": e.target_id.map(|t| t.to_string()),
-                    "duration_us": e.duration_us,
-                    "created_at": micros_to_iso(e.created_at),
-                    "payload": e.payload,
-                })
-            })
-            .collect();
-
-        Ok(json!({
-            "count": events.len(),
-            "events": events,
-        }))
+        self.runtime.read_brain_events(token, params).await
     }
 
     // ── brain.event_counts ──────────────────────────────────────────────────
-    //
-    // ADR-103 Stage 1 (#724 Ask A): a windowed, per-actor, per-kind, per-verb
-    // read verb over the event plane, additionally surfacing `work_class`
-    // (ADR-103-resource-attribution-model.md:303) via `counts_by_work_class`.
-    // `work_class` is read from `payload.work_class` first — the shape the
-    // three Phase* events (`PhaseStarted`/`PhaseCompleted`/`PhaseCancelled`,
-    // `khive_storage::telemetry`) use today — falling back to
-    // `payload.resource.work_class` for the not-yet-emitted future shape
-    // where a generic audit row carries a `resource` sub-object (ADR-103
-    // Stage 1's "resource payload enrichment", still open). Events with
-    // neither path present are simply not counted in the split.
-    // `cost_unit` (ADR-103 Amendment 1, `payload.resource.cost_unit`,
-    // stamped on every successful verb dispatch since PR #927 via
-    // `khive_runtime::cost_unit::resource_payload`) sums into
-    // `total_cost_unit` and `cost_unit_by_verb`, both omitted rather than
-    // zero-filled when no event in the window carries it. Amendment 1's
-    // "absence has exactly two meanings" rule means a missing
-    // `resource.cost_unit` is either a pre-Amendment-1 event or an
-    // errored/denied dispatch — this verb does not distinguish the two, it
-    // simply excludes the event from the sum, matching the `work_class`
-    // split's existing exclusion convention.
-    //
-    // Named `brain.event_counts` rather than the literal
-    // `brain.events(...)` shape sketched on the issue — that name is already
-    // taken by the `Visibility::Subhandler` debug-listing verb above, which an
-    // MCP-boundary test (`subhandler_verbs_are_blocked_at_mcp_boundary`)
-    // requires to stay internal-only, and which several existing tests depend
-    // on for its `{count, events}` shape. Reusing the name would either break
-    // that invariant or overload one verb with two incompatible response
-    // shapes; a second, public verb name keeps both surfaces intact.
 
-    /// Per-part row cap for the default bounded `brain.event_counts` view.
-    /// A kind-filtered call folds at most this many events; an unfiltered call
-    /// independently admits up to this many audit and this many non-audit events,
-    /// for up to twice this cap in one call. Truncation is checked per part.
-    /// Storage-side Kind grouping counts `window_event_total` independently of
-    /// the admitted rows folded into profile, cross and cost aggregates.
-    pub(super) const MAX_WINDOW_EVENTS: u32 = 50_000;
-    pub(super) const EXHAUSTIVE_PAGE_SIZE: u32 = 10_000;
-    pub(super) const MAX_EXHAUSTIVE_EVENTS: u64 = 40 * Self::MAX_WINDOW_EVENTS as u64;
-
-    /// Issue #14: when the window's aggregation ran over a bounded page
-    /// rather than the full window (`truncated`), a bare scalar total next
-    /// to complete-looking `counts_by_*` maps reads as authoritative even
-    /// though it is only a page-scoped estimate. Storage-side admission totals
-    /// do not make the admitted-row aggregates complete: when truncated, the misleading key is
-    /// never emitted; the same page-scoped value is returned under an
-    /// explicitly incomplete name instead. A missing `total` gets noticed;
-    /// a `total` that is wrong by an order of magnitude does not.
-    /// `window_event_total` (the true count) and `truncated` (the marker)
-    /// are unaffected -- this only renames the page-scoped scalar's own key.
-    pub(crate) fn truncatable_total_key(base_key: &str, truncated: bool) -> String {
-        if truncated {
-            format!("{base_key}_page_scoped")
-        } else {
-            base_key.to_string()
-        }
+    pub(crate) async fn handle_event_counts(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
+        self.runtime.read_event_counts(token, params).await
     }
 
     pub(super) fn check_read_actor(
@@ -273,176 +176,6 @@ impl BrainPack {
             )));
         }
         Ok(())
-    }
-
-    pub(crate) async fn handle_event_counts(
-        &self,
-        token: &NamespaceToken,
-        params: Value,
-    ) -> Result<Value, RuntimeError> {
-        let allowance = khive_storage::request_read_timeout_from_env();
-        let deadline = khive_storage::effective_request_read_deadline(
-            khive_storage::RequestReadDeadline::after(allowance),
-        );
-        khive_storage::scope_request_read_deadline_at(deadline, async {
-            let operation = format!(
-                "brain.event_counts (operator read budget {}s; earlier caller deadline retained)",
-                allowance.as_secs()
-            );
-            if khive_storage::request_read_is_cancelled() {
-                return Err(RuntimeError::Storage(
-                    khive_storage::StorageError::Timeout {
-                        operation: operation.into(),
-                    },
-                ));
-            }
-            let result = self.handle_event_counts_in_read_scope(token, params).await;
-            if result.is_ok() && khive_storage::request_read_is_cancelled() {
-                return Err(RuntimeError::Storage(
-                    khive_storage::StorageError::Timeout {
-                        operation: operation.into(),
-                    },
-                ));
-            }
-            result
-        })
-        .await
-    }
-
-    pub(super) async fn handle_event_counts_in_read_scope(
-        &self,
-        token: &NamespaceToken,
-        params: Value,
-    ) -> Result<Value, RuntimeError> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct EventCountsParams {
-            actor: Option<String>,
-            all_actors: Option<bool>,
-            kind: Option<String>,
-            group_by: Option<crate::event_counts_grouping::EventCountGroupBy>,
-            // `Option`, not a required `String`: a bare-missing `since` must go through
-            // the same named-field-plus-example-format error as a malformed one, not
-            // serde's generic "missing field `since`" message.
-            since: Option<String>,
-            until: Option<String>,
-            // #21: opt into full-window aggregation (paginates through every
-            // matching event instead of a single bounded page) so a coverage
-            // panel gets non-sampled per-verb/kind/actor counts in one call,
-            // without stitching sampled windows client-side. The window is a
-            // best-effort live view, not a snapshot (see the walk's docs). Default false — the
-            // bounded page is cheaper and sufficient for most callers.
-            exhaustive: Option<bool>,
-        }
-        let p: EventCountsParams =
-            parse_handler_params(params).map_err(RuntimeError::InvalidInput)?;
-
-        let actor_scope = event_actor_read_scope(
-            &self.runtime,
-            token,
-            p.actor.as_deref(),
-            p.all_actors.unwrap_or(false),
-        )?;
-
-        let since_raw = p.since.as_deref().ok_or_else(|| {
-            RuntimeError::InvalidInput(
-                "missing `since`: required ISO-8601/RFC-3339 datetime; expected e.g. \
-                 \"2026-07-01T00:00:00Z\""
-                    .to_string(),
-            )
-        })?;
-        let display_tz = self.runtime.config().display_timezone;
-        let since_us = parse_rfc3339_micros("since", since_raw, false, display_tz)?;
-        let until_us = match p.until.as_deref() {
-            Some(u) => parse_rfc3339_micros("until", u, true, display_tz)?,
-            None => Utc::now().timestamp_micros(),
-        };
-
-        let kind_filter = match p.kind.as_deref() {
-            Some(k) => Some(
-                k.parse::<khive_types::EventKind>()
-                    .map_err(|e| RuntimeError::InvalidInput(format!("invalid `kind`: {e}")))?,
-            ),
-            None => None,
-        };
-
-        // The event plane is read through a store scoped to exactly one
-        // namespace (`Runtime::events` opens `token.namespace()` and the SQL
-        // pins `namespace = ?`), so a visibility set does not widen this
-        // window the way it widens a note read. Name the namespace the answer
-        // covers, and name the others this caller may ask for by passing
-        // `namespace=`, so an undercount is legible from the result itself.
-        let scope_namespace = token.namespace().as_str().to_string();
-        let mut scope_other: Vec<String> = token
-            .visible_namespace_strs()
-            .iter()
-            .map(|n| n.to_string())
-            .filter(|n| n != &scope_namespace)
-            .collect();
-        scope_other.sort();
-        scope_other.dedup();
-
-        let store = self.runtime.events(token)?;
-        let base_filter = EventFilter {
-            actors: actor_scope.actors,
-            kinds: kind_filter.into_iter().collect(),
-            // Half-open window [since, until): `EventFilter.after` is a strict
-            // `created_at > after`, so subtracting one microsecond from `since`
-            // makes the boundary itself inclusive; `before` is already a strict
-            // `created_at < before`, which is exactly the exclusive `until` we want.
-            after: Some(since_us - 1),
-            before: Some(until_us),
-            ..EventFilter::default()
-        };
-
-        let exhaustive = p.exhaustive.unwrap_or(false);
-        let mut counts =
-            EventCountsAccumulator::new(actor_scope.default_caller.as_deref(), p.group_by);
-        let (total, window_event_total, truncated) = if exhaustive {
-            fold_event_counts_window_exhaustive(
-                store.as_ref(),
-                &base_filter,
-                Self::EXHAUSTIVE_PAGE_SIZE,
-                Self::MAX_EXHAUSTIVE_EVENTS,
-                &mut counts,
-            )
-            .await?
-        } else {
-            let (items, window_event_total, truncated) = fetch_event_counts_window(
-                store.as_ref(),
-                &base_filter,
-                p.kind.is_none(),
-                Self::MAX_WINDOW_EVENTS,
-            )
-            .await?;
-            for event in &items {
-                counts.observe(event);
-            }
-            (items.len() as u64, window_event_total, truncated)
-        };
-
-        let mut result = json!({
-            "since": micros_to_iso(since_us),
-            "until": micros_to_iso(until_us),
-            "actor": p.actor,
-            "kind": p.kind,
-            "truncated": truncated,
-            "window_event_total": window_event_total,
-            "exhaustive": exhaustive,
-            // The scope the answer was computed under, stated rather than
-            // implied. `namespace` is the single namespace this window covers;
-            // `other_namespaces` are the ones this caller may read by asking
-            // for them explicitly, and whose rows are absent here. A caller can
-            // therefore tell a real zero from an out-of-scope population, and
-            // knows what to pass to reach the rest.
-            "scope": {
-                "namespace": scope_namespace,
-                "other_namespaces": scope_other,
-            },
-        });
-        result[Self::truncatable_total_key("total", truncated)] = json!(total);
-        counts.add_to_result(&mut result, truncated);
-        Ok(result)
     }
 
     // ── brain.profiles ────────────────────────────────────────────────────
@@ -502,7 +235,11 @@ impl BrainPack {
 
     // ── brain.profile ─────────────────────────────────────────────────────
 
-    pub(crate) async fn handle_profile(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_profile(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         // Accept both `profile_id` (canonical) and `id` (legacy alias).
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -523,6 +260,50 @@ impl BrainPack {
             .materialized_profile(&profile_id)
             .ok_or_else(|| RuntimeError::NotFound(format!("profile {:?}", profile_id)))?;
         let record = &record;
+
+        let resolving_bindings: Vec<Value> = state
+            .bindings
+            .iter()
+            .filter(|binding| {
+                let namespace = token.namespace().as_str();
+                if binding.profile_id != profile_id
+                    || (binding.actor != "*"
+                        && Self::check_read_actor(token, &binding.actor).is_err())
+                    || (binding.namespace != "*" && binding.namespace != namespace)
+                {
+                    return false;
+                }
+                // Anonymous consumers are a real context for wildcard actors.
+                // Named actors only add more-specific candidates, so querying
+                // the current named caller alone could hide a usable wildcard.
+                let actor = (binding.actor != "*").then_some(binding.actor.as_str());
+                [
+                    ConsumerKind::Recall,
+                    ConsumerKind::KnowledgeCompose,
+                    ConsumerKind::Rerank,
+                ]
+                .into_iter()
+                .filter(|kind| {
+                    binding.consumer_kind == "*" || binding.consumer_kind == kind.as_str()
+                })
+                .any(|kind| {
+                    state
+                        .resolve_with_match(actor, Some(namespace), kind.as_str())
+                        .is_some_and(|(resolved, _, matched_binding)| {
+                            matched_binding && resolved.id == profile_id
+                        })
+                })
+            })
+            .map(|binding| {
+                json!({
+                    "actor": binding.actor,
+                    "namespace": binding.namespace,
+                    "consumer_kind": binding.consumer_kind,
+                })
+            })
+            .collect();
+        let serving_through_visible_binding_while_inactive =
+            record.lifecycle == ProfileLifecycle::Inactive && !resolving_bindings.is_empty();
 
         // Build per-section posterior summary for the response.
         let section_summary = if let Some(ss) = state.section_states.get(&profile_id) {
@@ -572,6 +353,8 @@ impl BrainPack {
             "consumer_kind": record.consumer_kind,
             "state_class": record.state_class,
             "lifecycle": record.lifecycle,
+            "resolving_bindings": resolving_bindings,
+            "serving_through_visible_binding_while_inactive": serving_through_visible_binding_while_inactive,
             "total_events": record.total_events,
             "exploration_epoch": record.exploration_epoch,
             "created_at": record.created_at,
@@ -2205,8 +1988,12 @@ mod local_factor_tests {
             state.profiles.insert(record.id.clone(), record);
         }
 
+        let token = pack
+            .runtime
+            .authorize(Namespace::local())
+            .expect("local token");
         let profile = pack
-            .handle_profile(json!({ "profile_id": "bare-profile" }))
+            .handle_profile(&token, json!({ "profile_id": "bare-profile" }))
             .await
             .expect("brain.profile");
 
