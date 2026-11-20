@@ -90,6 +90,11 @@ Revision `domain-effects-v26` classifies `tool.unregister` as `Write`: it
 soft-deletes a tool registration, retires matching local policies and revokes
 matching local grants. Idempotent retirement remains subject to write admission.
 
+Revision `domain-effects-v27` classifies `comm.quiet` as `Write`: it changes the
+process-wide quiet deadline controlling background work. Its state is in memory,
+but caller-requested control changes require write permission. Ordinary dispatch
+audit retention and failure handling still apply.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -156,6 +161,7 @@ matching local grants. Idempotent retirement remains subject to write admission.
 | `comm.ingest`                     | Write  | Subhandler | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L379)                              |
 | `comm.mark_read`                  | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L271)                              |
 | `comm.probe`                      | Read   | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L609)                              |
+| `comm.quiet`                      | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs)                                   |
 | `comm.read`                       | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L249)                              |
 | `comm.reply`                      | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L300)                              |
 | `comm.send`                       | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L47)                               |

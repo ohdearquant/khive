@@ -12,6 +12,8 @@ use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 mod priority;
+mod quiet;
+pub use quiet::{quiet_until, request_quiet, wait_until_not_quiet, MAX_QUIET_TTL_SECS};
 #[cfg(test)]
 mod tests;
 
@@ -694,7 +696,16 @@ impl BackgroundDomainHandle {
             let mut guard = guard;
             let execution_hold = job.clone();
             let outcome = match start_decision(&job.lease.cancel) {
-                Ok(()) => make(job).await,
+                Ok(()) => {
+                    // Wait before entering a producer: it may acquire an ANN/model
+                    // guard that foreground work also needs. Cancellation and
+                    // posture refusal retain their normal start precedence.
+                    let _ = job.run_body(wait_until_not_quiet()).await;
+                    match start_decision(&job.lease.cancel) {
+                        Ok(()) => make(job).await,
+                        Err(outcome) => refusal(outcome),
+                    }
+                }
                 Err(outcome) => refusal(outcome),
             };
             guard.finished = true;

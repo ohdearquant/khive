@@ -8,6 +8,12 @@ pub(super) async fn run_warm_attempt(
     model: &str,
     permit: AnnWarmPermit,
 ) {
+    let shutdown = khive_runtime::daemon_shutdown_token();
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return,
+        _ = khive_runtime::resource_admission::wait_until_not_quiet() => {},
+    }
     let outcome = ensure_ann_for_model(rt, token, ann, model).await;
     finish_warm(permit, outcome).await;
 }
