@@ -394,6 +394,7 @@ can still return `entity_type: null`. This fallback is specific to `list`, not
 | `entity_kind`                | string                   | no       | Filter when `kind="entity"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `entity_type`                | string                   | no       | Filter by type field when `kind="entity"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `note_kind`                  | string                   | no       | Filter when `kind="note"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `exclude_superseded`         | bool                     | no       | Default false; memory lists only. Exclude targets of visible live incoming `supersedes` edges before pagination.                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `tags`                       | array\<string\>          | no       | Case-insensitive OR-match over entity tags or note `properties.tags`; valid for `kind="entity"` and `kind="note"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `source_id` / `target_id`    | uuid                     | no       | Edge endpoint filters, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `relations`                  | array\<string\>          | no       | Edge relation filter, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
@@ -412,6 +413,33 @@ can still return `entity_type: null`. This fallback is specific to `list`, not
 ```
 request(ops="list(kind=\"entity\", entity_kind=\"concept\", limit=20)")
 ```
+
+`exclude_superseded=true` is valid only for `kind="memory"` or
+`kind="note", note_kind="memory"`. It removes a memory with a live incoming
+`supersedes` edge in any namespace visible to the request, using the memory
+backend. The successor need not match the list's filters or page. A soft-deleted
+successor still suppresses through its live edge; restoring that successor does
+not change suppression. Removing the edge lifts its effect. Hidden edges,
+outgoing edges, other relations and soft-deleted edges do not trigger the filter.
+This is a graph-only view, without recall's additional legacy
+`properties.supersedes` interpretation or ranking. It changes no stored rows,
+status, `get` results or default lists, and exposes no successor identities or
+new hidden-edge count. Omission or false retains existing behavior; supplying
+the option on another kind is refused, even when false. Null and non-booleans
+are refused.
+
+This filter runs before matching-row offset, limit, lookahead and continuation
+selection in ordinary, insertion-cursor and keyed pagination. Keyed listing
+keeps its primary-namespace note scope while checking edges in the request's
+full visible namespace set. Each call scans at most 10,000 raw rows in batches
+of at most 200. A capped scan reports `scan_incomplete: true` and `has_more: true`,
+including an empty page; insertion and keyed cursors return the last permitted
+scanned boundary. Continue with that cursor and unchanged filters. An incomplete
+offset page is not proof of exhaustion and cannot guarantee forward progress,
+because it rescans from the beginning; use a cursor walk beyond the scan ceiling.
+No full-page, total-count or cross-page/edge-read snapshot guarantee is implied.
+Cancellation and graph-read failures refuse the operation rather than returning
+an unfiltered or apparently complete page.
 
 `parse_content=true` replaces only a note's returned `content` field with its JSON value:
 objects, arrays, numbers, booleans, strings, and null are supported. Omission or false preserves
