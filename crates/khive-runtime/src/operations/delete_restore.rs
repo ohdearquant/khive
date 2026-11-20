@@ -1555,6 +1555,112 @@ pub(super) mod memory_edge_namespace_restore_tests {
         assert!(after_restore.deleted_at.is_none());
     }
 
+    /// Store a `supersedes` tombstone from `source_id` to `target_id` in
+    /// `namespace`, as a row written before the supersede target rule existed.
+    async fn supersedes_tombstone(
+        runtime: &KhiveRuntime,
+        token: &crate::NamespaceToken,
+        source_id: Uuid,
+        target_id: Uuid,
+        namespace: &str,
+    ) -> Uuid {
+        let edge = runtime
+            .link(
+                token,
+                source_id,
+                target_id,
+                EdgeRelation::Annotates,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        let edge_id = Uuid::from(edge.id);
+        let statement = SqlStatement {
+            sql: "UPDATE graph_edges SET relation='supersedes' WHERE id=?1 AND namespace=?2".into(),
+            params: vec![
+                SqlValue::Text(edge_id.to_string()),
+                SqlValue::Text(namespace.into()),
+            ],
+            label: Some("test-prepare-supersedes-tombstone".into()),
+        };
+        assert_eq!(execute_private_write(runtime, statement).await, 1);
+        assert_eq!(
+            prepare_tombstone(runtime, edge_id, namespace, namespace).await,
+            1
+        );
+        edge_id
+    }
+
+    #[tokio::test]
+    async fn restore_edge_refuses_supersedes_tombstone_onto_foreign_memory_target() {
+        let (runtime, _dir) = fixture();
+        let local_token = runtime
+            .authorize_with_visibility(Namespace::local(), vec![Namespace::parse("other").unwrap()])
+            .unwrap();
+        let other_token = runtime
+            .authorize(Namespace::parse("other").unwrap())
+            .unwrap();
+        let source = Note::new("local", "memory", "supersede restore source");
+        let source_id = source.id;
+        let own_target = Note::new("local", "memory", "supersede restore own target");
+        let own_target_id = own_target.id;
+        let foreign_target = Note::new("other", "memory", "supersede restore foreign target");
+        let foreign_target_id = foreign_target.id;
+        for note in [source, own_target] {
+            runtime
+                .notes(&local_token)
+                .unwrap()
+                .upsert_note(note)
+                .await
+                .unwrap();
+        }
+        runtime
+            .notes(&other_token)
+            .unwrap()
+            .upsert_note(foreign_target)
+            .await
+            .unwrap();
+
+        // Control: a supersedes tombstone onto the caller's own memory restores.
+        let own_edge =
+            supersedes_tombstone(&runtime, &local_token, source_id, own_target_id, "local").await;
+        match runtime.restore_edge(&local_token, own_edge).await {
+            Ok(Some((restored, true))) => {
+                assert_eq!(restored.relation, EdgeRelation::Supersedes);
+                assert!(restored.deleted_at.is_none());
+            }
+            _ => panic!("a supersedes tombstone onto an own-namespace memory should restore"),
+        }
+
+        let foreign_edge = supersedes_tombstone(
+            &runtime,
+            &local_token,
+            source_id,
+            foreign_target_id,
+            "local",
+        )
+        .await;
+        match runtime.restore_edge(&local_token, foreign_edge).await {
+            Err(RuntimeError::InvalidInput(message)) => assert_eq!(
+                message,
+                "restore: the memory row a supersedes edge names is in namespace other; a \
+                 supersede may name only a memory row in the stored edge namespace local, in the \
+                 shared namespace local, or in a namespace the caller owns, as memory.apply_batch \
+                 requires"
+            ),
+            Ok(Some((_, true))) => panic!("restore_supersedes_foreign_target_admitted"),
+            _ => panic!("fixture did not reach the supersede target refusal"),
+        }
+        let after_refusal = runtime
+            .get_edge_including_deleted(&local_token, foreign_edge)
+            .await
+            .unwrap()
+            .expect("refused restore must preserve the tombstone row");
+        assert_eq!(after_refusal.relation, EdgeRelation::Supersedes);
+        assert!(after_refusal.deleted_at.is_some());
+    }
+
     #[tokio::test]
     async fn restore_refusal_hides_unreadable_memory_source_namespace() {
         let (runtime, _dir) = fixture();
