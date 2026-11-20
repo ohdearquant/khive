@@ -220,6 +220,27 @@ class OpenLoopLifecycleTests(unittest.TestCase):
             proc.wait.assert_called_once_with(timeout=5)
         self.assertEqual(pool.shutdowns, [{"wait": False, "cancel_futures": True}, {"wait": True, "cancel_futures": True}])
 
+    def test_an_exited_worker_with_outstanding_arrivals_is_not_a_drain_timeout(self):
+        registry = {}
+        alive, exited = Mock(), Mock()
+        alive.poll.return_value = None
+        exited.poll.return_value = 1
+
+        def drive(*args, **kwargs):
+            records = [{"tenant": 0, "worker": 0, "state": "outstanding"},
+                       {"tenant": 0, "worker": 1, "state": "outstanding"}]
+            return {"counts": {"outstanding": 2}, "records": records}
+
+        with patch.object(harness, "ThreadPoolExecutor", return_value=ImmediatePool()), \
+                patch.object(harness, "_spawn_worker_proc", side_effect=[alive, exited]), \
+                patch.object(harness.bpd, "_handshake"), \
+                patch.object(harness, "_attribution_probe", return_value={}), \
+                patch.object(harness, "_drive_open_loop", side_effect=drive):
+            results, _ = harness._run_open_workers("fake", [(0, 0), (0, 1)], {}, "warn", "/fake", registry, 4, 10.0, 1.0)
+        crashed = {result.idx: result.crashed for result in results}
+        self.assertEqual(crashed[0], harness.DRAIN_TIMEOUT_CRASH)
+        self.assertEqual(crashed[1], "worker process exited (1) with arrivals outstanding")
+
     def test_setup_failure_kills_registered_process_before_pool_join(self):
         failed, blocked = Mock(), Mock()
         failed.poll.return_value = 0

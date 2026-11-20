@@ -287,8 +287,10 @@ ATTEMPT_LOG_ENV = "KHIVE_WRITER_ATTEMPT_LOG"
 SINK_DIR_ENV = "KHIVE_WRITER_TIMEOUT_SINK_DIR"
 SINK_HEARTBEAT_ENV = "KHIVE_WRITER_TIMEOUT_SINK_HEARTBEAT_MS"
 
-# The error a worker carries when its arrivals were still outstanding at the drain timeout. f7_sweep.py reads a
-# failed run as a reading only when every error is this one; a test compares the two.
+# The error a worker carries when its arrivals were still outstanding at the drain timeout and its process was still
+# running. A worker whose process had exited carries a different error. Only the worker process is read: a worker
+# alive but wedged on a daemon that died behind it still carries this one. f7_sweep.py reads a failed run as a
+# reading only when every error is this one; a test compares the two.
 DRAIN_TIMEOUT_CRASH = "open-loop drain exceeded --worker-timeout"
 
 # The F7 transaction shapes (ADR-135 F7, #6743), one verb each. Every one is a write.
@@ -769,7 +771,11 @@ def _run_open_workers(binary, jobs, base_env, log_level, tmpdir, proc_registry,
                            if row["state"] == "outstanding"}
             for _, result in workers:
                 if (result.tenant, result.idx) in outstanding:
-                    result.crashed = DRAIN_TIMEOUT_CRASH
+                    # Liveness is read before teardown kills anything, so an exit here happened during the run.
+                    proc = proc_registry.get((result.tenant, result.idx))
+                    code = proc.poll() if proc is not None else "unread"
+                    result.crashed = (DRAIN_TIMEOUT_CRASH if code is None else
+                                      f"worker process exited ({code}) with arrivals outstanding")
         return [result for _, result in workers], arrival
     finally:
         stop.set()

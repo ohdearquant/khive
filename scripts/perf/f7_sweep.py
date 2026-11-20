@@ -101,7 +101,11 @@ DRAIN_TIMEOUT_CRASH = "open-loop drain exceeded --worker-timeout"
 
 
 def drain_timeout_only(harness, harness_rc):
-    """True when the harness failed only because arrivals were outstanding at its drain timeout."""
+    """True when the harness failed only because arrivals were outstanding at its drain timeout.
+
+    The harness writes the drain-timeout error only for a worker whose process was still running at the timeout; an
+    exited worker process carries another error and the run reads BROKEN. A worker process alive but wedged on a
+    daemon that died behind it is not told apart from an overloaded one."""
     errors = harness.get("smoke_errors") or []
     outstanding = (harness.get("arrival") or {}).get("counts", {}).get("outstanding")
     return (bool(outstanding) and harness_rc in (0, 1) and bool(errors)
