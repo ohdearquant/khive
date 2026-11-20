@@ -313,6 +313,7 @@ async fn strict_stopped_owner_refuses_before_queue_acceptance() {
         backend_key: None,
         db: "strict stopped".into(),
         slow_write_threshold: None,
+        attempt_log: false,
         enqueue_timeout: Duration::from_secs(1),
         admission_metrics: WriterAdmissionMetrics::new(),
         strict_routing: true,

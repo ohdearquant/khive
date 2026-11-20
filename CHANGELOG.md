@@ -7,8 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-18
+
 ### Added
 
+- `KHIVE_WRITER_ATTEMPT_LOG=1` makes the writer sink write one `writer_attempt` row for every
+  completed writer-task attempt: the stage intervals, queue depth, labels, `rows_changed`, the
+  outcome, a per-process `attempt_seq` and the caller's `request_id`, which the daemon now scopes
+  around dispatch (`khive_storage::scope_request_correlation`). Off by default; these rows skip
+  the per-row fsync. The sink's `startup` row also carries the linked SQLite version, source id
+  and compile options (#6767).
+- `comm.read(id=..., mark=false)` fetches one inbound message without marking it read. The
+  message's properties, `updated_at` and unread membership are left as stored, and the response
+  reports the stored read state. `mark=false` is accepted only with `id`; `mark` defaults to true,
+  so existing reads keep marking (#6722).
+- New crate `khive-subject`: the ADR-069 subject contract (`OntologySpec`), a Lean declaration
+  JSONL scanner (`LeanJsonlScanner`) and a formal extractor (`FormalExtractor`) that turns
+  declarations into a typed graph operation plan. It starts no server and writes no
+  database (#6744).
 - `KhiveRuntime::read_brain_events` exposes the existing namespace-scoped recent brain-event
   reader to embedding hosts (#4554).
 - `KhiveRuntime::read_event_counts` and `read_event_page_response` expose the existing event count and
@@ -34,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `memory.recall` scales the per-entity posterior term toward neutral by the evidence its posterior
+  holds: the term is `1 + (t0 - 1) * n / (n + 16)`, where `t0` is the previous multiplier and `n`
+  the posterior's observation mass beyond its prior. An entity with little feedback moves a score
+  less than before; with no posterior the term is 1, and the [0.85, 1.15] bounds are unchanged.
+  The recall score breakdown gains `entity_evidence_mass` beside `entity_posterior_mean` (#6764).
 - `memory.recall_candidates` returns the executed collection `plan` beside its existing raw
   arrays; recall ranking, hydration and scoring are unchanged (#6737).
 - GQL query-text LIMIT applies after SKIP on each page. Existing terminal-page and sentinel
@@ -44,10 +65,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is kept and passed to the component registered under that name; a table with no registered
   component, including a misspelt name, is kept with no error (#6739).
 
+### Fixed
+
+- Property strings are checked with their owning credential labels, including inherited labels
+  through nested objects and arrays. Context-bound manifest identities prevent a property
+  exemption from being reused after its context, path or role changes (#6562).
+- Note-key creation, replay admission and direct assignment use the shared secret detector on
+  the raw key. Existing keys remain readable, and read/fence selectors retain their shape-only
+  validation (#6273).
+- A write whose reply is lost after COMMIT reports `write_outcome_unknown` with
+  `request_state: side_effects_unknown`; a loss before COMMIT stays `writer_task_terminated`. With
+  `write_routing_strict`, a missing or stopped writer owner fails as `writer_owner_unavailable`
+  and a write that bypasses the owner fails as `writer_route_violation`, both before any work
+  runs (#6740).
+- `exec` keeps the child's process group anchored until cleanup: the group is signalled only while
+  its leader is unreaped, so a process-group id the system has reused is never signalled (#6718).
+- Forwarded event pages keep the caller's original read deadline instead of a fixed 10-second
+  transport timeout, so an exhaustive `brain.event_counts` across many pages completes within its
+  own budget (#6528).
+
+### Security
+
+- The email channel's SMTP client, `lettre`, is updated to 0.11.24 for RUSTSEC-2026-0560 through
+  RUSTSEC-2026-0565: a STARTTLS response injection, missing dot-stuffing after a bare LF or CR,
+  quoted local-part misdelivery, a panic on a CR or LF in a display name, a panic on a
+  whitespace-only EHLO reply, and unbounded reply buffering (#6768).
+
 ### Breaking (Rust crates)
 
-- Scheduled for 0.21.0: the exhaustive `khive_storage::StorageError` enum gains
-  `SecretDetected` for credential-shaped note keys. Downstream exhaustive matches must handle
+- The exhaustive `khive_storage::StorageError` enum gains `SecretDetected` for credential-shaped
+  note keys (#6728). Downstream exhaustive matches must handle
   the new variant. The shared detector and `SecretMatch` live in
   `khive_storage::secret_scan`; existing `khive_runtime::secret_gate` imports remain available.
   Conversion to `RuntimeError` preserves typed secret refusals and the source chain of ordinary
@@ -63,29 +110,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validates the plan before the empty-namespace early return, so a caller with no namespaces
   and an invalid plan gets an error where it used to get an empty outcome (#6737).
 
+- In `khive_retrieval`, the exhaustive `FuseStrategy` enum gains `WeightedRrf`, `VectorOnly`,
+  `KeywordOnly` and `Custom`, `QueryNode` gains `Collect`, and `ExecutorError` gains
+  `MissingVectorPreparer`, `StrategyValidation`, `RerankResolution`, `Metadata` and `Rerank`.
+  Downstream exhaustive matches must handle them. `ExecutorOutcome` gains a public `plan` field,
+  the candidate tree the executor consumed, which a struct literal must set (#6737).
+
 - The exhaustive `khive_storage::StorageError` enum gains `WriteOutcomeUnknown` (COMMIT was
   issued and the reply was lost; side effects unknown, not retryable), `WriterOwnerUnavailable`
   (strict routing found no writer owner; not started) and `WriterRouteViolation` (strict routing
   refused a write that bypassed the owner; not started). Downstream exhaustive matches must
   handle all three (#6740).
 
+- The exhaustive `khive_db::SqliteError` enum gains `WriterRouteViolation`.
+  `khive_runtime`'s `WireWriterTaskFailure` no longer derives `Copy`, and its `RequestFailed`
+  variant gains an `evidence` field. With the `test-support` feature, the
+  `khive_db::test_hooks::TestHooks` trait gains the required method
+  `test_suppress_commit_reply_after_update` (#6740).
+
 - `khive_runtime::node_config` is renamed `channel_section`; `ChannelSectionConfig` holds opaque
   per-component values (`get`, `iter`) in place of the `node` field, and
   `ConfigError::InvalidNodeConfig` becomes `InvalidChannelConfig` (#6739).
 
-### Fixed
+- `khive_runtime::RuntimeConfig` gains the public fields `channel`, `channel_config_validators` and
+  `channel_send_routes`; a struct literal must set them or take them from
+  `RuntimeConfig::default()`. `khive-mcp` no longer has a `khive-channel` feature: the channel
+  crate is always linked, and `channel-email` and `channel-telegram` no longer name it (#6739).
 
-- Property strings are checked with their owning credential labels, including inherited labels
-  through nested objects and arrays. Context-bound manifest identities prevent a property
-  exemption from being reused after its context, path or role changes (#6562).
-- Note-key creation, replay admission and direct assignment use the shared secret detector on
-  the raw key. Existing keys remain readable, and read/fence selectors retain their shape-only
-  validation (#6273).
-- A write whose reply is lost after COMMIT reports `write_outcome_unknown` with
-  `request_state: side_effects_unknown`; a loss before COMMIT stays `writer_task_terminated`. With
-  `write_routing_strict`, a missing or stopped writer owner fails as `writer_owner_unavailable`
-  and a write that bypasses the owner fails as `writer_route_violation`, both before any work
-  runs (#6740).
+- `khive_pack_memory::config::ScoreBreakdown` gains the public field `entity_evidence_mass`; a
+  struct literal must set it (#6764).
 
 ## [0.20.0] - 2026-11-16
 

@@ -377,6 +377,7 @@ pub struct RequestReadContext {
     cancellations: Arc<[tokio::sync::watch::Receiver<bool>]>,
     deadline: Option<RequestReadDeadline>,
     store_acquisition_operation: Option<&'static str>,
+    correlation_id: Option<u64>,
 }
 
 impl RequestReadContext {
@@ -520,6 +521,30 @@ where
         None => deadline,
     });
     REQUEST_READ_CONTEXT.scope(context, future).await
+}
+
+/// Scope `future` to the caller-supplied request id, so a backend that records
+/// per-request work (a writer attempt row) can be joined to the caller's own
+/// record of that request. `None` leaves an outer id in place. Children spawned
+/// through [`inherit_request_read_context`] carry the id with the rest of the
+/// context.
+pub async fn scope_request_correlation<F>(request_id: Option<u64>, future: F) -> F::Output
+where
+    F: Future,
+{
+    let mut context = capture_request_read_context();
+    if request_id.is_some() {
+        context.correlation_id = request_id;
+    }
+    REQUEST_READ_CONTEXT.scope(context, future).await
+}
+
+/// The request id scoped by [`scope_request_correlation`] on this task, if any.
+pub fn current_request_correlation() -> Option<u64> {
+    REQUEST_READ_CONTEXT
+        .try_with(|context| context.correlation_id)
+        .ok()
+        .flatten()
 }
 
 /// Capture the current request read context for a spawned child future.

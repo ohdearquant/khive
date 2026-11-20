@@ -33,6 +33,10 @@ on:
       - "scripts/perf/test_mcp_bench_client.py"
       - "scripts/perf/bench_load_harness.py"
       - "scripts/perf/test_bench_load_harness.py"
+      - "scripts/perf/writer_attempt_report.py"
+      - "scripts/perf/test_writer_attempt_report.py"
+      - "scripts/perf/f7_sweep.py"
+      - "scripts/perf/test_f7_sweep.py"
       - ".github/workflows/bench-pipeline.yml"
   push:
     branches: ["main", "integration/**"]
@@ -55,6 +59,10 @@ on:
       - "scripts/perf/test_mcp_bench_client.py"
       - "scripts/perf/bench_load_harness.py"
       - "scripts/perf/test_bench_load_harness.py"
+      - "scripts/perf/writer_attempt_report.py"
+      - "scripts/perf/test_writer_attempt_report.py"
+      - "scripts/perf/f7_sweep.py"
+      - "scripts/perf/test_f7_sweep.py"
       - ".github/workflows/bench-pipeline.yml"
 
 # A new push to a pull request cancels that pull request's run in progress. Other events keep
@@ -134,6 +142,8 @@ jobs:
           python3 -m unittest discover -s scripts/perf -p 'test_bench_pipeline_daemon.py' -v
           python3 -m unittest discover -s scripts/perf -p 'test_mcp_bench_client.py' -v
           python3 -m unittest discover -s scripts/perf -p 'test_bench_load_harness.py' -v
+          python3 -m unittest discover -s scripts/perf -p 'test_writer_attempt_report.py' -v
+          python3 -m unittest discover -s scripts/perf -p 'test_f7_sweep.py' -v
 
       - name: Run pipeline regression gate
         working-directory: .
