@@ -102,6 +102,16 @@ class StdioMcpTransportTests(unittest.TestCase):
         out = mbc.call_verb(proc, "stats", {})
         self.assertEqual(out, {"entities": 5})
 
+    def test_call_request_carries_request_id_only_when_given(self):
+        body = {"results": [{"ok": True, "result": {}}]}
+        line = {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": json.dumps(body)}]}}
+        proc = _FakeProc([line, line])
+        mbc.call_request(proc, "stats()", request_id=770_003)
+        mbc.call_verb(proc, "stats", {})
+        sent = proc.written_requests()
+        self.assertEqual(sent[0]["params"]["arguments"], {"ops": "stats()", "request_id": 770_003})
+        self.assertNotIn("request_id", sent[1]["params"]["arguments"])
+
     def test_call_verb_raises_on_failed_op(self):
         body = {"results": [{"ok": False, "error": "invalid kind"}]}
         proc = _FakeProc([
