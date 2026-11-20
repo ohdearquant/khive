@@ -130,7 +130,7 @@ class BurstDrainTests(unittest.TestCase):
         self.assertTrue(by_id[3]["missed"])
         self.assertEqual((by_id[3]["refused"], by_id[3]["unfinished"]), (1, 1))
         self.assertIsNone(by_id[4]["drain_s"])
-        self.assertEqual((out["bursts"], out["missed"], out["refused"], out["sizes"]), (4, 3, 1, [1, 2]))
+        self.assertEqual((out["bursts"], out["missed"], out["refused_arrivals"], out["sizes"]), (4, 3, 1, [1, 2]))
         # Burst 2 drained late, burst 4 never completed; burst 3 missed only through its refused arrival.
         self.assertEqual([by_id[i]["drain_late"] for i in (1, 2, 3, 4)], [False, True, False, True])
         self.assertEqual((out["drain_missed"], out["refused_only"]), (2, 1))
@@ -139,7 +139,7 @@ class BurstDrainTests(unittest.TestCase):
     def test_a_late_drain_counts_whatever_the_refusals(self):
         records = [self.row(1, finished=1.5) for _ in range(39)] + [self.row(1, state="refused", finished=1.0)]
         out = war.burst_drain(records, 0.1)
-        self.assertEqual((out["missed"], out["refused"], out["drain_missed"], out["refused_only"]), (1, 1, 1, 0))
+        self.assertEqual((out["missed"], out["refused_arrivals"], out["drain_missed"], out["refused_only"]), (1, 1, 1, 0))
 
     def test_no_burst_rows_is_no_reading_and_a_burst_without_a_deadline_is_broken(self):
         self.assertIsNone(war.burst_drain([self.row(None)], None))

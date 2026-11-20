@@ -235,11 +235,18 @@ def join_point(arrivals, attempts, window_s, *, prefix, sequence_bits, window=No
     }
 
 
-def point_verdict(loss, joined, *, loss_limit, util_limit, queue_p99_limit_micros):
-    """VOID when loss may exceed the limit; otherwise WITHIN or OUTSIDE the stated envelope."""
+def point_verdict(loss, joined, *, loss_limit, util_limit, queue_p99_limit_micros, counts=None):
+    """VOID when loss may exceed the limit; otherwise WITHIN or OUTSIDE the stated envelope.
+
+    An arrival that failed or was still outstanding at the drain timeout puts the point OUTSIDE: the client did not
+    get every answer it asked for, whatever the writer's numbers say about the answers it did get."""
     if loss["loss_upper"] > loss_limit:
         return "VOID", f"loss upper bound {loss['loss_upper']:.4f} over {loss_limit}"
     reasons = []
+    counts = counts or {}
+    for state, words in (("outstanding", "outstanding at the drain timeout"), ("failed", "failed")):
+        if counts.get(state):
+            reasons.append(f"{counts[state]} of {counts.get('submitted')} arrivals {words}")
     if joined["utilization"] >= util_limit:
         reasons.append(f"utilization {joined['utilization']:.3f} >= {util_limit}")
     p99 = joined["queue_wait_micros"].get("p99")
@@ -265,7 +272,7 @@ def burst_drain(records, deadline_s):
     A burst DRAINS LATE when its completed arrivals finished past the deadline or an arrival it did not refuse never
     completed (a failed arrival counts here), whatever its refusals; `drain_missed` counts those bursts. A burst
     that missed only through refused arrivals is counted in `refused_only`: what caused those refusals is not
-    measured here.
+    measured here. `missed`, `drain_missed` and `refused_only` count bursts; `refused_arrivals` counts arrivals.
     Returns None when no record belongs to a burst.
     """
     bursts = {}
@@ -292,7 +299,7 @@ def burst_drain(records, deadline_s):
         "bursts": len(per_burst),
         "sizes": sorted({b["size"] for b in per_burst}),
         "missed": sum(b["missed"] for b in per_burst),
-        "refused": sum(b["refused"] for b in per_burst),
+        "refused_arrivals": sum(b["refused"] for b in per_burst),
         "drain_missed": sum(b["drain_late"] for b in per_burst),
         "refused_only": sum(b["missed"] and not b["drain_late"] for b in per_burst),
         "drain_s": summarize([b["drain_s"] for b in per_burst if b["drain_s"] is not None]),
@@ -332,7 +339,8 @@ def build_point_report(arrival_report, sink_lines_by_file, *, loss_limit=0.01, u
     joined = join_point(arrival_report["records"], attempts, arrival_report["observed_duration_s"],
                         prefix=prefix, sequence_bits=bits, window=window)
     verdict, reason = point_verdict(total, joined, loss_limit=loss_limit, util_limit=util_limit,
-                                    queue_p99_limit_micros=queue_p99_limit_micros)
+                                    queue_p99_limit_micros=queue_p99_limit_micros,
+                                    counts=arrival_report.get("counts"))
     return {
         "configured_rate_per_s": arrival_report.get("configured_rate_per_s"),
         "sqlite": sink_identity(segments),

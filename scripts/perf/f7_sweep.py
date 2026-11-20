@@ -20,12 +20,19 @@ The run order is fixed before the first run and written to plan.json in the outp
 Each run gets its own directory under --out with the harness report (harness.json), the harness log and the sink
 directory the daemon wrote (sink/), which is kept. Every attempt-log run prints the attempts expected, rows written,
 sequence gaps, drop counter and loss bound, then its point verdict (writer_attempt_report.py). A run whose loss bound
-is over --loss-limit is VOID and runs again, up to --void-retries more times; the void runs stay on the record. A run
-with the attempt log off must leave no writer_attempt row in its sink: one there means the variable reached a daemon
-it should not have, and the paired arm is BROKEN.
+is over --loss-limit is VOID and runs again, up to --void-retries more times; the void runs stay on the record. In the
+paired arm the whole round runs again, off and on in the same order, so the two stay adjacent, and a round still VOID
+after its retries is dropped from both arms, as is a round in which either run had failed or outstanding arrivals,
+so the cost line pools clean rounds only. A run with the attempt log off must leave no writer_attempt row in its
+sink: one there means the variable reached a daemon it should not have, and the paired arm is BROKEN.
+
+Every run, both paired arms included, shortens the sink heartbeat and waits for it to settle before teardown
+(bench_load_harness.py SINK_HEARTBEAT_MS and SINK_SETTLE_S), which a default daemon does not do. The closing lines
+state the heartbeat and settle the runs recorded.
 
 The script reports; it never asserts an envelope. Exit 0 when every point has a reading, 1 when a point is still
-VOID after its retries, 2 when an input could not support a reading (BROKEN).
+VOID after its retries or no paired round was clean enough to pool, 2 when an input could not support a reading
+(BROKEN). A line before the cost line says how many paired rounds left both arms for failed or outstanding arrivals.
 """
 
 from __future__ import annotations
@@ -90,13 +97,43 @@ def attempt_rows(sink):
     return sum(len(segment["attempts"]) for lines in sink.values() for segment in war.parse_sink_lines(lines))
 
 
-def read_run(run, run_dir, *, loss_limit, util_limit, queue_p99_limit_micros, burst_deadline_s=None):
-    """One run's reading: the point report for a log-on run, client latency and a row count for a log-off run."""
-    harness = json.loads((run_dir / "harness.json").read_text())
+# bench_load_harness.DRAIN_TIMEOUT_CRASH; a test compares the two.
+DRAIN_TIMEOUT_CRASH = "open-loop drain exceeded --worker-timeout"
+
+
+def drain_timeout_only(harness, harness_rc):
+    """True when the harness failed only because arrivals were outstanding at its drain timeout.
+
+    The harness writes the drain-timeout error only for a worker whose process was still running at the timeout; an
+    exited worker process carries another error and the run reads BROKEN. A worker process alive but wedged on a
+    daemon that died behind it is not told apart from an overloaded one."""
+    errors = harness.get("smoke_errors") or []
+    outstanding = (harness.get("arrival") or {}).get("counts", {}).get("outstanding")
+    return (bool(outstanding) and harness_rc in (0, 1) and bool(errors)
+            and all(str(error).endswith(f": {DRAIN_TIMEOUT_CRASH}") for error in errors))
+
+
+def read_run(run, run_dir, *, loss_limit, util_limit, queue_p99_limit_micros, burst_deadline_s=None, harness_rc=0):
+    """One run's reading: the point report for a log-on run, client latency and a row count for a log-off run.
+
+    A harness that failed for any reason but arrivals left outstanding at its drain timeout supports no reading,
+    including a run where that timeout came with another error. A drain timeout alone is a reading: the point says
+    how many arrivals never finished."""
+    try:
+        harness = json.loads((run_dir / "harness.json").read_text())
+    except (OSError, ValueError) as exc:
+        raise war.ReportError(f"{run['name']}: the harness exited {harness_rc} and left no readable report "
+                              f"({type(exc).__name__}: {exc}); its output is in harness.log") from exc
+    if not isinstance(harness, dict):
+        raise war.ReportError(f"{run['name']}: the harness report is a {type(harness).__name__}, not an object")
     arrival = harness.get("arrival") or {}
     if not arrival.get("records"):
         raise war.ReportError(f"{run['name']}: the harness report holds no arrival records "
                               f"(smoke_result={harness.get('smoke_result')}, errors={harness.get('smoke_errors')})")
+    if (harness_rc != 0 or harness.get("smoke_result") != "PASS") and not drain_timeout_only(harness, harness_rc):
+        raise war.ReportError(f"{run['name']}: the harness exited {harness_rc} with "
+                              f"smoke_result={harness.get('smoke_result')} for a reason other than a drain timeout "
+                              f"alone (errors={harness.get('smoke_errors')})")
     sink = read_sink(run_dir / "sink")
     if not run["attempt_log"]:
         rows = attempt_rows(sink)
@@ -110,11 +147,17 @@ def read_run(run, run_dir, *, loss_limit, util_limit, queue_p99_limit_micros, bu
     return {"verdict": point["verdict"], "arrival": arrival, "point": point}
 
 
+def unfinished(arrival):
+    counts = arrival.get("counts") or {}
+    return counts.get("failed", 0) + counts.get("outstanding", 0)
+
+
 def run_line(run, reading):
     head = f"[{run['name']}] workers={run['workers']}"
     if reading["verdict"] == "OFF":
         counts = reading["arrival"].get("counts", {})
-        return f"{head} attempt log off; arrivals {counts.get('submitted')} completed {counts.get('completed')}"
+        return (f"{head} attempt log off; arrivals {counts.get('submitted')} completed {counts.get('completed')} "
+                f"failed {counts.get('failed', 0)} outstanding {counts.get('outstanding', 0)}")
     point = reading["point"]
     loss = point["loss"]
     return (f"{head} attempts expected={loss['expected']} written={loss['written']} gaps={loss['gaps']} "
@@ -127,7 +170,7 @@ def run_line(run, reading):
 def burst_text(drain):
     p99 = drain["drain_s"].get("p99")
     return (f"; bursts={drain['bursts']} missed={drain['missed']} drain_missed={drain['drain_missed']} "
-            f"refused_only={drain['refused_only']} refused_arrivals={drain['refused']} "
+            f"refused_only={drain['refused_only']} refused_arrivals={drain['refused_arrivals']} "
             f"drain_p99_ms={'none' if p99 is None else round(p99 * 1000, 3)} deadline_ms={drain['deadline_s'] * 1000:g}")
 
 
@@ -145,6 +188,17 @@ def knee_line(burst_points, deadline_s):
     return line
 
 
+def sink_line(conditions):
+    """The sink heartbeat and settle every run used; a default daemon heartbeats every 5 minutes."""
+    if len(conditions) == 1:
+        hb, settle = conditions[0]
+        if hb is None or settle is None:
+            return "sink heartbeat and settle not recorded by the harness"
+        return f"sink heartbeat {hb} ms and settle {settle} s on every run, both paired arms included"
+    parts = [f"heartbeat {hb} ms settle {st} s" for hb, st in conditions]
+    return "sink conditions differ between runs: " + "; ".join(parts)
+
+
 def cost_line(cost):
     parts = []
     for op, entry in cost["classes"].items():
@@ -153,43 +207,84 @@ def cost_line(cost):
     return f"attempt-log cost, on minus off, pooled over {cost['rounds']} rounds: " + "; ".join(parts)
 
 
+def run_once(run, name, out, args, spawn, deadline_s):
+    """One harness run under `name`: (record entry, reading or None when the inputs could not support a reading)."""
+    run_dir = out / name
+    run_dir.mkdir(parents=True, exist_ok=False)
+    argv = harness_argv(run, run_dir, args)
+    with open(run_dir / "harness.log", "wb") as log:
+        harness_rc = spawn(argv, stdout=log, stderr=subprocess.STDOUT).returncode
+    entry = {**run, "name": name, "dir": str(run_dir), "harness_rc": harness_rc}
+    try:
+        reading = read_run(dict(run, name=name), run_dir, loss_limit=args.loss_limit, util_limit=args.util_limit,
+                           queue_p99_limit_micros=args.queue_p99_limit_micros, burst_deadline_s=deadline_s,
+                           harness_rc=harness_rc)
+    except war.ReportError as exc:
+        return {**entry, "verdict": "BROKEN", "reason": str(exc)}, exc
+    return {**entry, "verdict": reading["verdict"], "point": reading.get("point")}, reading
+
+
 def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
-    """Run the plan in order and return (record, rc). `spawn` runs one harness argv; it is replaced in tests."""
-    record, pairs, bursts, rc = [], {"off": [], "on": []}, [], 0
+    """Run the plan in order and return (record, rc). `spawn` runs one harness argv; it is replaced in tests.
+
+    A paired round is its two runs, off and on, adjacent in time. When either is VOID the whole round runs again in
+    the same order, so the partners stay adjacent; a round still VOID after --void-retries leaves both arms, and so
+    does a round in which either run had failed or outstanding arrivals, so the cost line pools clean rounds only."""
+    record, pairs, bursts, seen, rc = [], {"off": [], "on": []}, [], [], 0
+    rounds = {"planned": 0, "unclean": 0}
     deadline_s = None if args.burst_deadline_ms is None else args.burst_deadline_ms / 1000
-    for run in runs:
-        tries = 0
-        while True:
-            name = run["name"] if tries == 0 else f"{run['name']}-retry{tries}"
-            run_dir = out / name
-            run_dir.mkdir(parents=True, exist_ok=False)
-            argv = harness_argv(run, run_dir, args)
-            with open(run_dir / "harness.log", "wb") as log:
-                harness_rc = spawn(argv, stdout=log, stderr=subprocess.STDOUT).returncode
-            try:
-                reading = read_run(dict(run, name=name), run_dir, loss_limit=args.loss_limit,
-                                   util_limit=args.util_limit, queue_p99_limit_micros=args.queue_p99_limit_micros,
-                                   burst_deadline_s=deadline_s)
-            except war.ReportError as exc:
-                emit(f"[{name}] BROKEN: {exc}")
-                record.append({**run, "name": name, "dir": str(run_dir), "harness_rc": harness_rc,
-                               "verdict": "BROKEN", "reason": str(exc)})
-                return {"runs": record, "paired_cost": None}, 2
-            emit(run_line(dict(run, name=name), reading))
-            record.append({**run, "name": name, "dir": str(run_dir), "harness_rc": harness_rc,
-                           "verdict": reading["verdict"], "point": reading.get("point")})
-            if reading["verdict"] != "VOID":
+    i = 0
+    while i < len(runs):
+        group = runs[i:i + 2] if runs[i]["role"] == "pair" else runs[i:i + 1]
+        i += len(group)
+        if group[0]["role"] == "pair" and (len(group) != 2 or group[0].get("round") != group[1].get("round")
+                                           or group[0]["attempt_log"] == group[1]["attempt_log"]):
+            raise ValueError(f"paired runs must come as one off and one on run of the same round: {group}")
+        label = f"pair-{group[0]['round']}" if group[0]["role"] == "pair" else group[0]["name"]
+        if group[0]["role"] == "pair":
+            rounds["planned"] += 1
+        for tries in range(args.void_retries + 1):
+            readings = []
+            for run in group:
+                name = run["name"] if tries == 0 else f"{run['name']}-retry{tries}"
+                entry, reading = run_once(run, name, out, args, spawn, deadline_s)
+                record.append(entry)
+                if isinstance(reading, war.ReportError):
+                    emit(f"[{name}] BROKEN: {reading}")
+                    return {"runs": record, "paired_cost": None}, 2
+                emit(run_line(dict(run, name=name), reading))
+                readings.append(reading)
+                seen.append(reading)
+            if all(r["verdict"] != "VOID" for r in readings):
                 break
-            tries += 1
-            if tries > args.void_retries:
-                emit(f"[{run['name']}] still VOID after {args.void_retries} retries; no reading at this point")
-                rc = 1
-                break
-        if run["role"] == "pair" and reading["verdict"] != "VOID":
-            pairs["on" if run["attempt_log"] else "off"].append(reading["arrival"])
-        if run["role"] == "burst" and reading["verdict"] != "VOID":
-            bursts.append((run["burst_size"], reading["point"]["burst_drain"]))
+        else:
+            what = "round" if group[0]["role"] == "pair" else "point"
+            emit(f"[{label}] still VOID after {args.void_retries} retries; no reading at this {what}"
+                 + ("; the round leaves both arms" if what == "round" else ""))
+            rc = 1
+            continue
+        unclean = [run["name"] for run, reading in zip(group, readings)
+                   if run["role"] == "pair" and unfinished(reading["arrival"])]
+        if unclean:
+            emit(f"[{label}] {', '.join(unclean)} had failed or outstanding arrivals; the round leaves both arms")
+            rounds["unclean"] += 1
+            continue
+        for run, reading in zip(group, readings):
+            if run["role"] == "pair":
+                pairs["on" if run["attempt_log"] else "off"].append(reading["arrival"])
+            if run["role"] == "burst":
+                bursts.append((run["burst_size"], reading["point"]["burst_drain"]))
+    sink = sorted({(r["arrival"].get("sink_heartbeat_ms"), r["arrival"].get("sink_settle_s")) for r in seen},
+                  key=repr)
+    if sink:
+        emit(sink_line(sink))
+    if rounds["unclean"]:
+        emit(f"paired arm: {rounds['unclean']} of {rounds['planned']} rounds left both arms for failed or "
+             f"outstanding arrivals; the cost line covers the clean rounds only")
     cost = None
+    if rounds["planned"] and not (pairs["off"] or pairs["on"]):
+        emit(f"paired arm: none of {rounds['planned']} rounds was clean; no cost line")
+        rc = max(rc, 1)
     if pairs["off"] or pairs["on"]:
         try:
             cost = war.paired_latency_cost(pairs["off"], pairs["on"])
@@ -199,7 +294,7 @@ def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
             rc = 2
     if bursts:
         emit(knee_line(bursts, deadline_s))
-    return {"runs": record, "paired_cost": cost}, rc
+    return {"runs": record, "paired_cost": cost, "sink_conditions": sink, "paired_rounds": rounds}, rc
 
 
 def parse_args(argv=None):
@@ -230,8 +325,9 @@ def parse_args(argv=None):
                              or args.burst_every <= 0 or not (args.burst_deadline_ms or 0) > 0):
         ap.error("--burst-sizes needs positive sizes, a positive --burst-every and a positive --burst-deadline-ms")
     if args.burst_sizes and max(args.burst_sizes) >= args.paired_workers:
-        ap.error("--burst-sizes must stay below --paired-workers: a burst larger than the worker pool is refused by "
-                 "the client, which measures the pool rather than the writer")
+        ap.error("--burst-sizes must stay below --paired-workers: a burst at or over the worker pool is refused by "
+                 "the client whatever the writer does. A smaller burst can still meet refusals while steady arrivals "
+                 "hold workers, so each run counts them per burst and the knee line names those sizes apart")
     args.queue_p99_limit_micros = None if args.queue_p99_limit_ms is None else args.queue_p99_limit_ms * 1000
     if not math.isfinite(args.rate_per_worker) or args.rate_per_worker <= 0 or args.seconds <= 0:
         ap.error("--rate-per-worker and --seconds must be positive")

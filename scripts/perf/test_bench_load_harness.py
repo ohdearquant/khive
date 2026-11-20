@@ -4,6 +4,8 @@ import contextlib
 import io
 import json
 import os
+import pathlib
+import re
 import tempfile
 import unittest
 import threading
@@ -218,6 +220,27 @@ class OpenLoopLifecycleTests(unittest.TestCase):
             proc.wait.assert_called_once_with(timeout=5)
         self.assertEqual(pool.shutdowns, [{"wait": False, "cancel_futures": True}, {"wait": True, "cancel_futures": True}])
 
+    def test_an_exited_worker_with_outstanding_arrivals_is_not_a_drain_timeout(self):
+        registry = {}
+        alive, exited = Mock(), Mock()
+        alive.poll.return_value = None
+        exited.poll.return_value = 1
+
+        def drive(*args, **kwargs):
+            records = [{"tenant": 0, "worker": 0, "state": "outstanding"},
+                       {"tenant": 0, "worker": 1, "state": "outstanding"}]
+            return {"counts": {"outstanding": 2}, "records": records}
+
+        with patch.object(harness, "ThreadPoolExecutor", return_value=ImmediatePool()), \
+                patch.object(harness, "_spawn_worker_proc", side_effect=[alive, exited]), \
+                patch.object(harness.bpd, "_handshake"), \
+                patch.object(harness, "_attribution_probe", return_value={}), \
+                patch.object(harness, "_drive_open_loop", side_effect=drive):
+            results, _ = harness._run_open_workers("fake", [(0, 0), (0, 1)], {}, "warn", "/fake", registry, 4, 10.0, 1.0)
+        crashed = {result.idx: result.crashed for result in results}
+        self.assertEqual(crashed[0], harness.DRAIN_TIMEOUT_CRASH)
+        self.assertEqual(crashed[1], "worker process exited (1) with arrivals outstanding")
+
     def test_setup_failure_kills_registered_process_before_pool_join(self):
         failed, blocked = Mock(), Mock()
         failed.poll.return_value = 0
@@ -388,7 +411,9 @@ class FixtureTests(unittest.TestCase):
         harness._execute_arrival((None, fitted), op, 1, clock, request_id=6)
         self.assertEqual(seen, [{}, {"fixtures": {"entity_id": "e"}}])
 
-    def test_every_f7_shape_runs_on_a_worker_that_holds_fixtures(self):
+    def test_every_registered_op_runs_on_a_worker_that_holds_fixtures(self):
+        mixed = {fn for menu in harness.MIXES.values() for fn, _ in menu}
+        self.assertLessEqual(mixed, set(harness._OP_NAMES), "an op in a mix has no registered name")
         verbs = []
 
         def call(proc, verb, args, request_id=None):
@@ -399,7 +424,7 @@ class FixtureTests(unittest.TestCase):
         fitted.fixtures = {"entity_id": "e", "receipts": harness.deque(["m%d" % i for i in range(9)])}
         clock = VirtualClock()
         with patch.object(harness.bpd, "_call_verb", side_effect=call):
-            for fn in harness._F7_SHAPES:
+            for fn in harness._OP_NAMES:
                 before = len(verbs)
                 outcome, _, _ = harness._execute_arrival((None, fitted), fn, 0, clock, request_id=1)
                 self.assertNotIn("unexpected keyword", outcome.error or "", fn.__name__)
@@ -583,6 +608,17 @@ class AuditSuccessRowsLoadPreflightTests(unittest.TestCase):
             _, on_env, worker_envs = self.run_to_worker_boundary(10, extra_argv=["--sink-dir", sink, "--writer-attempt-log"])
             self.assertEqual(on_env["KHIVE_WRITER_ATTEMPT_LOG"], "1")
             self.assertEqual(worker_envs[0]["KHIVE_WRITER_ATTEMPT_LOG"], "1")
+
+    def test_the_sweep_reads_the_drain_timeout_error_the_harness_writes(self):
+        from scripts.perf import f7_sweep
+        self.assertEqual(f7_sweep.DRAIN_TIMEOUT_CRASH, harness.DRAIN_TIMEOUT_CRASH)
+
+    def test_daemon_env_names_match_the_constants_the_sink_reads(self):
+        source = pathlib.Path(__file__).resolve().parents[2] / "crates/khive-db/src/timeout_sink.rs"
+        consts = dict(re.findall(r'^const (\w+): &str = "([^"]+)";', source.read_text(), re.MULTILINE))
+        self.assertEqual((harness.ATTEMPT_LOG_ENV, harness.SINK_DIR_ENV, harness.SINK_HEARTBEAT_ENV),
+                         (consts.get("WRITER_ATTEMPT_LOG_ENV"), consts.get("SINK_DIR_OVERRIDE_ENV"),
+                          consts.get("HEARTBEAT_MS_OVERRIDE_ENV")))
 
     def test_attempt_log_without_sink_dir_is_refused(self):
         argv = ["bench_load_harness.py", "--arrival-rate", "10", "--writer-attempt-log"]
