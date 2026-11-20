@@ -2853,6 +2853,7 @@ dependencies = [
  "async-trait",
  "globset",
  "inventory",
+ "khive-db",
  "khive-fs",
  "khive-pack-git",
  "khive-pack-gtd",
