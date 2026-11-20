@@ -14,7 +14,7 @@ use crate::handlers;
 use crate::inbox_signal::InboxSignal;
 use crate::vocab::{COMM_HANDLERS, COMM_SCHEMA_PLAN_STMTS};
 
-/// Communication pack providing fifteen public `comm.*` verbs.
+/// Communication pack providing sixteen public `comm.*` verbs.
 ///
 /// Stores and queries `message` notes in the standard notes table; message
 /// metadata lives in the `properties` JSON column.
@@ -182,9 +182,10 @@ impl CommPack {
         None
     }
 
-    /// This pack has no configuration of its own to refuse, so every configuration is accepted.
-    fn validate_node_config(&self) -> Result<(), RuntimeError> {
-        Ok(())
+    /// Component validation shares the runtime bound to this pack instance.
+    fn validate_channel_config(&self) -> Result<(), RuntimeError> {
+        let config = self.runtime.config();
+        config.channel_config_validators.validate(&config.channel)
     }
 }
 
@@ -414,7 +415,7 @@ impl PackRuntime for CommPack {
         self.node_host_state()
     }
     fn validate_config(&self) -> Result<(), RuntimeError> {
-        self.validate_node_config()
+        self.validate_channel_config()
     }
     fn note_property_policies(&self) -> &'static [NotePropertyPolicySpec] {
         <Self as Pack>::NOTE_PROPERTY_POLICIES
@@ -506,6 +507,7 @@ impl PackRuntime for CommPack {
             }
             "comm.heartbeat" => handlers::handle_heartbeat(self.runtime(), token, params).await,
             "comm.health" => handlers::handle_health(self.runtime(), token, params).await,
+            "comm.quiet" => handlers::handle_quiet(params),
             "comm.probe" => handlers::handle_probe(self.runtime(), token, params).await,
             "comm.cursor_get" => handlers::handle_cursor_get(self.runtime(), params).await,
             "comm.cursor_commit" => handlers::handle_cursor_commit(self.runtime(), params).await,
@@ -523,3 +525,149 @@ mod help_tests;
 #[cfg(test)]
 #[path = "pack_message_identity_tests.rs"]
 mod message_identity_tests;
+
+#[cfg(test)]
+mod channel_config_tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use khive_runtime::channel_section::ChannelConfigValidator;
+    use khive_runtime::{
+        runtime_config_from_khive_config, KhiveConfig, KhiveRuntime, PackRegistry, RuntimeConfig,
+        RuntimeError, VerbRegistryBuilder,
+    };
+    use khive_types::Pack;
+
+    fn pack_names() -> Vec<String> {
+        vec![
+            <khive_pack_kg::KgPack as Pack>::NAME.into(),
+            <super::CommPack as Pack>::NAME.into(),
+        ]
+    }
+
+    fn runtime(value: i64, validator: Option<ChannelConfigValidator>) -> KhiveRuntime {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!("[channel]\nstand_in = {value}\nunknown = 'retained without activation'\n"),
+        )
+        .unwrap();
+        let loaded = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+        let mut config = RuntimeConfig {
+            db_path: None,
+            brain_profile: None,
+            packs: pack_names(),
+            ..RuntimeConfig::no_embeddings()
+        };
+        if let Some(validator) = validator {
+            config
+                .channel_config_validators
+                .register("stand_in", validator)
+                .unwrap();
+        }
+        KhiveRuntime::new(runtime_config_from_khive_config(&loaded, config)).unwrap()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn automatic_comm_pack_validates_its_exact_config_before_activation() {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observed = observations.clone();
+        let runtime = runtime(
+            41,
+            Some(Arc::new(move |value| {
+                observed.lock().unwrap().push(value.cloned());
+                Ok(())
+            })),
+        );
+        let mut builder = VerbRegistryBuilder::new();
+        PackRegistry::register_packs(&pack_names(), runtime.clone(), &mut builder).unwrap();
+        assert!(
+            observations.lock().unwrap().is_empty(),
+            "registration must not activate components"
+        );
+        let _registry = builder
+            .build()
+            .expect("registered component config is valid");
+        assert_eq!(
+            *observations.lock().unwrap(),
+            vec![Some(toml::Value::Integer(41))],
+            "automatic comm factory must validate the exact opaque component value"
+        );
+        assert_eq!(
+            runtime
+                .config()
+                .channel
+                .get("unknown")
+                .and_then(toml::Value::as_str),
+            Some("retained without activation")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn automatic_comm_pack_refuses_registered_invalid_config_but_keeps_unknown_values() {
+        let unregistered = runtime(7, None);
+        let mut builder = VerbRegistryBuilder::new();
+        PackRegistry::register_packs(&pack_names(), unregistered, &mut builder).unwrap();
+        let _registry = builder
+            .build()
+            .expect("unregistered raw scalar remains inert");
+
+        let invalid = runtime(
+            7,
+            Some(Arc::new(|value| {
+                assert_eq!(value, Some(&toml::Value::Integer(7)));
+                Err(RuntimeError::InvalidInput(
+                    "stand_in requires a table".into(),
+                ))
+            })),
+        );
+        let mut builder = VerbRegistryBuilder::new();
+        PackRegistry::register_packs(&pack_names(), invalid, &mut builder).unwrap();
+        let result = builder.build();
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(ref message)) if message == "stand_in requires a table"),
+            "automatic comm activation must preserve the component's typed refusal"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn automatic_multi_backend_comm_uses_the_selected_runtime_validator() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let default_calls = calls.clone();
+        let default_runtime = runtime(
+            11,
+            Some(Arc::new(move |_| {
+                default_calls.lock().unwrap().push("default");
+                Err(RuntimeError::InvalidInput("wrong runtime selected".into()))
+            })),
+        );
+        let selected_calls = calls.clone();
+        let selected_runtime = runtime(
+            29,
+            Some(Arc::new(move |value| {
+                assert_eq!(value, Some(&toml::Value::Integer(29)));
+                selected_calls.lock().unwrap().push("comm");
+                Ok(())
+            })),
+        );
+        let runtimes = HashMap::from([("comm".into(), selected_runtime)]);
+        let mut builder = VerbRegistryBuilder::new();
+        PackRegistry::register_packs_with_runtimes(
+            &pack_names(),
+            &runtimes,
+            &default_runtime,
+            &mut builder,
+        )
+        .unwrap();
+        let _registry = builder.build().expect("selected comm runtime is valid");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["comm"],
+            "multi-backend comm activation must use its selected runtime, not the default"
+        );
+    }
+}

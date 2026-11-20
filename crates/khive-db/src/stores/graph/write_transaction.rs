@@ -38,7 +38,7 @@ where
 
 pub(super) fn run_graph_mutation_transaction<R, F>(
     pool: &ConnectionPool,
-    conn: &rusqlite::Connection,
+    conn: &mut crate::ProgressConn,
     pooled: bool,
     operation: F,
 ) -> StorageResult<R>

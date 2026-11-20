@@ -92,7 +92,11 @@ async fn submit_delta(args: &ApplyArgs, delta: &str) -> Result<String> {
         packs: (!args.packs.is_empty()).then(|| args.packs.clone()),
         brain_profile: None,
     })?;
-    enforce_strict_actor_mode(config.actor_id.as_deref(), &config.packs)?;
+    enforce_strict_actor_mode(
+        config.actor_id.as_deref(),
+        &config.packs,
+        config.require_attributed_actor,
+    )?;
     let discovery_anchor = config_discovery_db_anchor(args.db.as_deref());
     let loaded = KhiveConfig::load_with_home_fallback_and_source(
         args.config.as_deref(),

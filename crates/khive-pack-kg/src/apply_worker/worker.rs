@@ -108,6 +108,37 @@ impl ProposalApplyWorker {
         }
     }
 
+    /// Validate entity identity before proposal admission or supersession preparation.
+    pub(crate) async fn validate_supersede_entity_preconditions(
+        &self,
+        token: &NamespaceToken,
+        changeset: &ProposalChangeset,
+    ) -> Result<(), RuntimeError> {
+        let mut pending = vec![changeset];
+        while let Some(step) = pending.pop() {
+            match step {
+                ProposalChangeset::SupersedeEntity { old, new } => {
+                    for id in [old, new] {
+                        let id = Uuid::from_u128(id.to_u128());
+                        match self.runtime.get_entity(token, id).await {
+                            Ok(_) => {}
+                            Err(RuntimeError::NotFound(detail)) => {
+                                return Err(RuntimeError::NotFound(format!(
+                                    "{id} does not name a live entity: {detail}"
+                                )));
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                // Stack order preserves the submitted order, including nested steps.
+                ProposalChangeset::Compound { steps } => pending.extend(steps.iter().rev()),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Check approval threshold; apply changeset if met. Failures known to be
     /// pre-commit emit `ProposalApplied { Failed }`; post-commit failures leave
     /// the proposal in `applying` for reconciliation and are never replayed.
@@ -531,6 +562,7 @@ impl ProposalApplyWorker {
                     target,
                     relation,
                     weight,
+                    metadata,
                 } => {
                     let source_id = Uuid::from_u128(source.to_u128());
                     let target_id = Uuid::from_u128(target.to_u128());
@@ -540,6 +572,7 @@ impl ProposalApplyWorker {
                         "target_id": target_id,
                         "relation": relation.as_str(),
                         "weight": weight.map(f64::from),
+                        "metadata": metadata,
                     });
                     let plan = prepare_op(&self.runtime, token, "link", &args).await?;
                     let (source_id, target_id) = match &plan {
@@ -589,6 +622,8 @@ impl ProposalApplyWorker {
                     })
                 }
                 ProposalChangeset::SupersedeEntity { old, new } => {
+                    self.validate_supersede_entity_preconditions(token, changeset)
+                        .await?;
                     let old_id = Uuid::from_u128(old.to_u128());
                     let new_id = Uuid::from_u128(new.to_u128());
                     let args = serde_json::json!({

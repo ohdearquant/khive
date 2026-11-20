@@ -15,6 +15,20 @@ use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 pub(crate) static SEARCH_PARAMS: &[ParamDef] = &[
     ParamDef {
+        name: "created_after",
+        param_type: "string",
+        required: false,
+        description: "Inclusive RFC 3339 lower bound on entity/note created_at (at most 9 fractional-second digits). Metadata filter before the final limit over returned candidates: limit × 50, capped at 500 per backend. Can underfill; does not scan the full time range or use the larger property/tag pushdown window.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "created_before",
+        param_type: "string",
+        required: false,
+        description: "Inclusive RFC 3339 upper bound on entity/note created_at (at most 9 fractional-second digits). Must not precede created_after. Omitted/null bounds are unrestricted; compared as instants before ordering and the final limit within the returned candidate window.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
         name: "kind",
         param_type: "string",
         required: true,
@@ -458,6 +472,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
             ParamDef { name: "updated_after", param_type: "string", required: false, description: "Notes only: inclusive RFC 3339 updated_at lower bound; without key_prefix it includes keyed and unkeyed notes.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "tag_mode", param_type: "string", required: false, description: "Notes only: any (default) or all requested tags, ASCII case-insensitive, applied before pagination. Empty tags impose no constraint.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "note_status", param_type: "string", required: false, description: "Notes only: active (default), archived, or any, selecting the note status before pagination. Omitted/null selects active. Any includes every stored note status while soft-deleted rows stay excluded. Separate from scheduled-event workflow status.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "exclude_superseded", param_type: "boolean", required: false, description: "Memory notes only (kind=memory or kind=note with note_kind=memory). Default false; null and non-booleans are invalid. True excludes targets of live incoming supersedes edges in the request's visible namespaces before offset and page selection, even if the superseding note is soft-deleted or outside the requested filters. Does not interpret legacy properties.supersedes or alter stored status. Scans at most 10,000 rows in batches of at most 200; a capped scan reports scan_incomplete and has_more=true, not exhaustion. Cursor pages can resume from next_after; capped offset pages may not advance, so use cursors to continue beyond the scan ceiling.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "status", param_type: "string", required: false, description: "For scheduled_event notes only (kind=scheduled_event or kind=note with note_kind=scheduled_event): exact property status, applied before pagination. Valid: provisioning, pending, firing, fired, cancelled, missed, failed. Omitted/null imposes no constraint. Proposal lists retain their separate proposal-status filter; other kinds reject this parameter.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "created_by_actor", param_type: "string", required: false, description: "Scheduled_event notes only: exact, case-sensitive, non-blank creator display metadata, applied before pagination. May name any creator; never an authorization check or verified attribution. No implicit self-filter or wildcard. Omitted/null imposes no constraint; other kinds reject this parameter.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
@@ -1423,7 +1438,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                     add_note — {kind: \"add_note\", note: {kind: <note-kind>, content: <string>, name?: <string>, properties?: <object>}}; \
                     merge_entities — {kind: \"merge_entities\", into: <full UUID>, from: <full UUID>}; \
                     supersede_entity — {kind: \"supersede_entity\", old: <full UUID>, new: <full UUID>}; \
-                    compound — {kind: \"compound\", steps: [<changeset>, ...]}.",
+                    compound — {kind: \"compound\", steps: [<changeset>]}: one step only for now; a compound with more than one step, at any depth, is refused until multi-step compounds apply atomically.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

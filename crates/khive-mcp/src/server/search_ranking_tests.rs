@@ -27,9 +27,8 @@ mod search_ranking_tests {
         ) -> Result<CoordSearchResult, RuntimeError> {
             // Ranking rows in this fake are observations and have no mailbox
             // routing. Concrete message scenarios cover the scoped service.
-            Ok(self
-                .fan_out_search(request, token.gate_namespace(), extra_visible)
-                .await)
+            self.fan_out_search(request, token.gate_namespace(), extra_visible)
+                .await
         }
 
         async fn fan_out_note_search_scoped_with_count(
@@ -73,7 +72,7 @@ mod search_ranking_tests {
             request: &ValidatedSearchRequest,
             _namespace: &Namespace,
             _extra_visible: &[Namespace],
-        ) -> CoordSearchResult {
+        ) -> Result<CoordSearchResult, RuntimeError> {
             // Deliberately leave filtering to the MCP boundary under test.
             let id = Uuid::from_u128(1);
             let score = DeterministicScore::from_raw(1_i64 << 31);
@@ -127,7 +126,7 @@ mod search_ranking_tests {
                     vector_error: None,
                 });
             }
-            CoordSearchResult {
+            Ok(CoordSearchResult {
                 entity_hits,
                 note_hits,
                 per_backend,
@@ -141,7 +140,7 @@ mod search_ranking_tests {
                 note_updated_at: [(id, 2_000_000)].into_iter().collect(),
                 note_versions: [(id, 1)].into_iter().collect(),
                 note_names: [(id, Some("stored name".into()))].into_iter().collect(),
-            }
+            })
         }
         fn is_single_backend(&self) -> bool {
             false

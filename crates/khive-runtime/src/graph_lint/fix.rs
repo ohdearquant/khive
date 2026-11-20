@@ -463,13 +463,7 @@ fn unknown(error: &StorageError) -> bool {
     {
         return true;
     }
-    match error.without_sqlite_write_stage() {
-        StorageError::WriterTaskRequestFailed { request_state, .. }
-        | StorageError::WriterTaskTerminated { request_state, .. } => {
-            *request_state == khive_storage::WriterTaskRequestState::SideEffectsUnknown
-        }
-        _ => false,
-    }
+    error.writer_request_state() == Some(khive_storage::WriterTaskRequestState::SideEffectsUnknown)
 }
 fn failure(
     source: RuntimeError,
@@ -499,4 +493,43 @@ fn action_access(owner: &KhiveRuntime) -> std::sync::Arc<dyn khive_storage::SqlA
 #[cfg(test)]
 tokio::task_local! {
     pub(super) static TEST_ACTION_ACCESS: std::sync::Arc<dyn khive_storage::SqlAccess>;
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+
+    #[test]
+    fn commit_reply_loss_is_unknown_but_known_outer_finality_wins() {
+        let lost = || StorageError::WriteOutcomeUnknown {
+            source: Box::new(std::io::Error::other("lost COMMIT reply")),
+        };
+        assert!(
+            unknown(&lost()),
+            "graph fix must not claim failed after COMMIT reply loss"
+        );
+        assert!(unknown(&lost().with_sqlite_write_failure(
+            khive_storage::error::SqliteWriteFailure {
+                stage: khive_storage::error::SqliteWriteStage::Commit,
+                primary_code: 10,
+                extended_code: 1034,
+                settlement_unknown: false,
+            }
+        )));
+        for state in [
+            khive_storage::WriterTaskRequestState::NotStarted,
+            khive_storage::WriterTaskRequestState::TransactionRolledBack,
+        ] {
+            assert!(
+                !unknown(&StorageError::WriterTaskRequestFailed {
+                    request_state: state,
+                    source: Box::new(lost()),
+                }),
+                "inner uncertainty must not override known outer finality"
+            );
+        }
+        assert!(!unknown(&StorageError::WriterRouteViolation {
+            operation: "lint fix".into()
+        }));
+    }
 }

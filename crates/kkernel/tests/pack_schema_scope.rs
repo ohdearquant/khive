@@ -1,3 +1,4 @@
+use khive_db::test_hooks::TestHooks;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
@@ -12,7 +13,7 @@ use sha2::{Digest, Sha256};
 const CORE_TABLES: [&str; 4] = ["notes", "entities", "graph_edges", "events"];
 // ADR-017 (2026-09-12) mentions tool invalidation; #4137 tracks this shipped exception.
 const TOOL_INVALIDATION_SHA256: &str =
-    "c025d184512b437533e641e2e1c4427f585bd23aae23bd9359e76d3720f6b01e";
+    "0b03222ad9d5d0d7a707d5ae130282c53a6f7d16124e9b523f9c89c6168debe9";
 const TOOL_INVALIDATION_TRIGGER: &str = "tool_grants_invalidate_on_registry_insert";
 
 struct Declared {
@@ -85,6 +86,12 @@ fn refused_action(action: AuthAction<'_>, tool_batch: bool) -> Option<String> {
             } if trigger_name == TOOL_INVALIDATION_TRIGGER && table_name == "entities" => {
                 return None
             }
+            AuthAction::DropTrigger {
+                trigger_name,
+                table_name,
+            } if trigger_name == TOOL_INVALIDATION_TRIGGER && table_name == "entities" => {
+                return None
+            }
             AuthAction::Read {
                 table_name: "entities",
                 ..
@@ -146,7 +153,7 @@ fn quoted(identifier: &str) -> String {
 }
 
 fn scope_connection(migrated: bool) -> Connection {
-    let mut conn = Connection::open_in_memory().unwrap();
+    let mut conn = khive_db::test_hooks::registered(Connection::open_in_memory().unwrap());
     if migrated {
         khive_db::run_migrations(&mut conn).unwrap();
         let indexes: Vec<(String, String)> = conn
@@ -178,7 +185,7 @@ fn inspect_sql(conn: &Connection, pack: &str, sql: &str, prepare_only: bool) -> 
     let refused = Arc::new(Mutex::new(None));
     let recorded = Arc::clone(&refused);
     let mut created_indexes = BTreeSet::new();
-    conn.authorizer(Some(move |context: AuthContext<'_>| {
+    conn.test_authorizer(Some(move |context: AuthContext<'_>| {
         match context.action {
             AuthAction::CreateIndex { index_name, .. }
             | AuthAction::CreateTempIndex { index_name, .. } => {
@@ -204,7 +211,7 @@ fn inspect_sql(conn: &Connection, pack: &str, sql: &str, prepare_only: bool) -> 
     } else {
         conn.execute_batch(sql)
     };
-    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+    conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
         .map_err(|e| e.to_string())?;
     if let Some(reason) = refused.lock().unwrap().take() {
         let exception = if pack == "tool" {
@@ -621,6 +628,12 @@ fn tool_invalidation_exception_4137_is_byte_pinned_and_pack_scoped() {
     };
     assert!(refused_action(create, true).is_none());
     assert!(refused_action(create, false).is_some());
+    let drop = AuthAction::DropTrigger {
+        trigger_name: TOOL_INVALIDATION_TRIGGER,
+        table_name: "entities",
+    };
+    assert!(refused_action(drop, true).is_none());
+    assert!(refused_action(drop, false).is_some());
     for action in [
         AuthAction::CreateIndex {
             index_name: "forbidden",
@@ -633,6 +646,14 @@ fn tool_invalidation_exception_4137_is_byte_pinned_and_pack_scoped() {
         AuthAction::CreateTrigger {
             trigger_name: "another",
             table_name: "entities",
+        },
+        AuthAction::DropTrigger {
+            trigger_name: "another",
+            table_name: "entities",
+        },
+        AuthAction::DropTrigger {
+            trigger_name: TOOL_INVALIDATION_TRIGGER,
+            table_name: "notes",
         },
         AuthAction::Read {
             table_name: "notes",
@@ -647,6 +668,39 @@ fn tool_invalidation_exception_4137_is_byte_pinned_and_pack_scoped() {
             refused_action(action, true).is_some(),
             "exception must not permit {action:?}"
         );
+    }
+}
+
+#[test]
+fn tool_schema_scope_accepts_installed_trigger_replay() {
+    let tool = declared::<khive_pack_tool::ToolPack>();
+    let plan = tool.plan.unwrap();
+    let conn = scope_connection(true);
+    check_plan(&conn, tool.name, plan.statements, tool.columns, false).unwrap();
+    let body: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1 AND tbl_name='entities'",
+            [TOOL_INVALIDATION_TRIGGER],
+            |row| row.get(0),
+        )
+        .unwrap();
+    check_plan(&conn, tool.name, plan.statements, tool.columns, false).unwrap();
+    let replayed: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1 AND tbl_name='entities'",
+            [TOOL_INVALIDATION_TRIGGER],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(replayed, body);
+    let sql = include_str!("../../khive-pack-tool/sql/grant-invalidation.sql");
+    for (pack, statement) in [
+        ("other", sql.to_owned()),
+        ("tool", format!("{sql}\n-- changed")),
+    ] {
+        let error = check_statement(&conn, pack, &statement).unwrap_err();
+        assert!(error.contains("DropTrigger"), "{error}");
+        assert!(error.contains("core table entities"), "{error}");
     }
 }
 

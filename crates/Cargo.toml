@@ -34,6 +34,7 @@ members = [
     "khive-pack-comm",
     "khive-pack-schedule",
     "khive-pack-formal",
+    "khive-subject",
     "khive-pack-code",
     "khive-pack-web",
     "khive-pack-telemetry",
@@ -67,7 +68,7 @@ exclude = ["khive-merge"]
 # keep this exclusion from members.
 
 [workspace.package]
-version = "0.18.0"
+version = "0.21.0"
 edition = "2021"
 # The locked libsqlite3-sys build script uses `cfg_select!`, which Rust 1.93 rejects as
 # unstable; the workspace MSRV is the CI toolchain, 1.95.
@@ -94,7 +95,7 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1-rustl
 async-imap = "0.9"
 async-native-tls = "0.5"
 mail-parser = "0.9"
-rusqlite = { version = "0.40" }
+rusqlite = { version = "0.41.1" }
 anyhow = "1.0.103"
 thiserror = "2.0"
 zstd = "0.14.3"

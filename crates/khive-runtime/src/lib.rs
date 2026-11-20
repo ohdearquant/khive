@@ -16,6 +16,11 @@ pub mod atomic_message;
 pub mod atomic_plan;
 pub mod atomic_prepare;
 pub mod atomic_runner;
+pub mod attachment_cutover;
+pub use attachment_cutover::{
+    coordinate_attachment_cutover, coordinate_empty_secondary_attachment_cutover,
+    legacy_preference_model_count, require_secondary_attachment_empty,
+};
 pub mod audit_batch;
 pub mod audit_error;
 pub mod backend_handle;
@@ -51,6 +56,7 @@ mod error_projection;
 mod event_actor_scope;
 mod event_cursor_walk;
 mod event_page;
+mod event_plane_read;
 mod event_store_guard;
 pub mod events_split;
 mod fence_identity;
@@ -59,7 +65,13 @@ pub mod fusion;
 pub mod graph_traversal;
 pub mod hooks;
 mod index_repair;
+#[cfg(feature = "native-rerank")]
+pub mod native_reranker;
 pub use index_repair::IndexRepairReport;
+pub mod channel_section;
+#[cfg(test)]
+mod channel_section_tests;
+pub mod channel_send;
 pub mod graph_lint;
 pub mod input_schema;
 pub mod keyed_memory;
@@ -69,9 +81,6 @@ pub mod keyed_message;
 mod kg_read;
 mod live_until;
 mod mailbox_view;
-pub mod node_config;
-#[cfg(test)]
-mod node_config_tests;
 mod note_create;
 mod note_index;
 mod note_read;
@@ -169,9 +178,9 @@ pub use embedding::{EmbeddingModelRecord, EmbeddingModelStatus};
 pub use embedding_reranker::{EmbeddingCosineReranker, EmbeddingRerankHit};
 pub use engine_config::{
     config_from_env, resolve_wal_ceiling, BackendConfig, BackendKind, BlobConfig,
-    BrainSectionConfig, CodeMapConfig, ConfigError, EngineConfig, GateSectionConfig,
-    GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig, ResolvedWalCeiling,
-    StorageSectionConfig,
+    BrainSectionConfig, CodeIngestSectionConfig, CodeMapConfig, ConfigError, EngineConfig,
+    GateSectionConfig, GitDigestSectionConfig, GitWriteEntryConfig, GitWriteSectionConfig,
+    KhiveConfig, KnowledgeSectionConfig, PackConfig, ResolvedWalCeiling, StorageSectionConfig,
 };
 pub use error::{
     fts_text_leg_or_err, AdmissionFailureContext, AuditObligationFailure, AuditObligationReason,
@@ -192,6 +201,9 @@ pub use event_cursor_walk::{visit_events_cursor_walk, EventCursorWalkError};
 pub use event_page::{
     page_budget_exceeded_error, row_exceeds_budget_error, EventReadPageRequest, EventReadPageResult,
 };
+#[cfg(any(test, feature = "test-internals"))]
+#[doc(hidden)]
+pub use event_plane_read::test_support_exports as event_plane_read_test_support;
 pub use event_store_guard::EventAttribution;
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
@@ -211,6 +223,8 @@ pub use khive_storage::types::TraversalOptions;
 pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};
 pub use khive_types::namespace::Namespace;
 pub use mailbox_view::MailboxView;
+#[cfg(feature = "native-rerank")]
+pub use native_reranker::RuntimeRerankDocumentResolver;
 pub use note_create::{effective_create_tags, EffectiveCreateTags};
 pub use objectives::{
     AmplifiedDecayAwareSalienceObjective, DecayAwareSalienceObjective, GraphProximityObjective,
@@ -255,9 +269,10 @@ pub use resource::{cpu_delta_us, process_resource_usage, ProcessResourceUsage};
 pub use retrieval::{HybridSearchOutcome, RankScoreKind, SearchHit, SearchSignals, SearchSource};
 pub use runtime::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
-    parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
-    BackendId, EntityTypeValidatorFn, KhiveRuntime, NamedVectorIdentity, NamespaceToken,
-    NoteMutationHookFn, NoteWriteValidatorFn, OpenedDiagnosticBackend, RuntimeConfig,
+    parse_pack_list, resolve_db_anchor, resolve_project_actor_id,
+    resolve_project_requires_attributed_actor, runtime_config_from_khive_config, BackendId,
+    EntityTypeValidatorFn, KhiveRuntime, NamedVectorIdentity, NamespaceToken, NoteMutationHookFn,
+    NoteWriteValidatorFn, OpenedDiagnosticBackend, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
 pub use secret_gate_finalizer::{

@@ -18,6 +18,7 @@ pub(crate) fn open_external_writer_fixture(
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_URI,
     )?;
+    let conn = crate::pool::register_test_hooks(conn)?;
     pool.configure_standalone_connection(&conn)?;
     Ok(conn)
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_hooks::TestHooks;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 fn pool(path: &Path, locks: &Path) -> ConnectionPool {
@@ -86,7 +87,7 @@ fn public_pooled_transaction_samples_after_begin_and_finalizes_below_floor() {
         let sampled = Arc::clone(&available);
         let observed = Arc::clone(&samples);
         pool.set_test_write_admission(100, move |_| {
-            let contender = Connection::open(&path).unwrap();
+            let contender = crate::test_hooks::registered(Connection::open(&path).unwrap());
             contender.busy_timeout(Duration::ZERO).unwrap();
             let error = contender.execute_batch("BEGIN IMMEDIATE").unwrap_err();
             assert!(crate::timeout_sink::is_busy_or_locked(&error));
@@ -239,7 +240,7 @@ fn pooled_transaction_unwind_keeps_registry_and_lease_until_native_rollback() {
             .unwrap()
             .transaction(|conn| -> Result<(), SqliteError> {
                 conn.execute_batch("INSERT INTO pooled_owner_probe VALUES(1)")?;
-                conn.authorizer(Some(move |context: AuthContext<'_>| {
+                conn.test_authorizer(Some(move |context: AuthContext<'_>| {
                     if matches!(
                         context.action,
                         AuthAction::Transaction {
@@ -277,7 +278,7 @@ fn pooled_transaction_unwind_keeps_registry_and_lease_until_native_rollback() {
     pool.writer()
         .unwrap()
         .transaction(|conn| {
-            conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+            conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
             conn.execute_batch("INSERT INTO pooled_owner_probe VALUES(2)")?;
             Ok(())
         })
@@ -309,7 +310,7 @@ fn public_autocommit_failed_script_preserves_native_error_after_rollback() {
         let rollbacks = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&rollbacks);
         let body = move |conn: &Connection| -> Result<(), SqliteError> {
-            conn.authorizer(Some(move |context: AuthContext<'_>| {
+            conn.test_authorizer(Some(move |context: AuthContext<'_>| {
                 if matches!(
                     context.action,
                     AuthAction::Transaction {
@@ -367,7 +368,7 @@ fn public_autocommit_failed_script_preserves_native_error_after_rollback() {
             .expect("the failed script released its owner and volume lease")
             .autocommit(|conn| {
                 assert!(conn.is_autocommit());
-                conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+                conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
                 conn.execute_batch("INSERT INTO pooled_owner_probe VALUES(2)")?;
                 Ok(())
             })

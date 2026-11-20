@@ -358,6 +358,14 @@ pub struct RuntimeConfig {
 
     pub mounts: Vec<crate::mount_config::MountConfig>,
 
+    /// Opaque values retained from `[channel.*]` without interpretation.
+    pub channel: crate::channel_section::ChannelSectionConfig,
+    /// Host-supplied validators installed before pack registry construction.
+    pub channel_config_validators: crate::channel_section::ChannelConfigValidators,
+    /// Trusted host routes for custom communication address kinds. These
+    /// process-local callbacks must be installed in the dispatching host.
+    pub channel_send_routes: crate::channel_send::ChannelSendRoutes,
+
     /// Path to the SQLite database file. `None` = in-memory (tests).
     ///
     /// Production boot passes this value to the async khive-mcp/kkernel host
@@ -482,6 +490,11 @@ pub struct RuntimeConfig {
     /// `ActorRef::anonymous()` and inbox is scoped to party-line messages —
     /// those addressed to `"local"` or carrying no `to_actor` stamp.
     pub actor_id: Option<String>,
+    /// Strict attributed-actor mode requested by configuration: `[actor]
+    /// require_attributed = true` in the database-anchored or the project
+    /// config. The `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` environment flag is read
+    /// separately by the enforcing seam; either one turns the refusal on.
+    pub require_attributed_actor: bool,
     /// Resolved `[brain]` policy from the serving process's configuration.
     pub brain: crate::engine_config::BrainSectionConfig,
     /// Resolved `[git_write]` policy allowlist (ADR-108 Amendment), populated
@@ -494,6 +507,12 @@ pub struct RuntimeConfig {
     /// Effective `[blob]` file-transfer opt-in, resolved with the exact environment
     /// opt-in during construction and retained by the blob pack.
     pub blob: crate::engine_config::BlobSectionConfig,
+    /// `[knowledge]` policy: the directories `knowledge.import` may read.
+    pub knowledge: crate::engine_config::KnowledgeSectionConfig,
+    /// `[git_digest]` policy: the sources `git.digest` may read.
+    pub git_digest: crate::engine_config::GitDigestSectionConfig,
+    /// `[code_ingest]` policy: the directories `code.ingest` may use.
+    pub code_ingest: crate::engine_config::CodeIngestSectionConfig,
     /// Resolved `[exec]` sandbox section (ADR-181), threaded through like
     /// `git_write` so the exec pack reads an already-resolved config.
     pub exec: crate::engine_config::ExecSectionConfig,
@@ -641,6 +660,7 @@ impl Default for RuntimeConfig {
             owned_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id,
+            require_attributed_actor: false,
             brain: crate::engine_config::BrainSectionConfig::default(),
             git_write: crate::engine_config::GitWriteSectionConfig::default(),
             blob: crate::engine_config::BlobSectionConfig {
@@ -648,9 +668,15 @@ impl Default for RuntimeConfig {
                     .map(|value| value == "1")
                     .unwrap_or(false),
             },
+            knowledge: crate::engine_config::KnowledgeSectionConfig::default(),
+            git_digest: crate::engine_config::GitDigestSectionConfig::default(),
+            code_ingest: crate::engine_config::CodeIngestSectionConfig::default(),
             exec: crate::engine_config::ExecSectionConfig::default(),
             telemetry: crate::telemetry_config::TelemetryConfig::default(),
             mounts: Vec::new(),
+            channel: crate::channel_section::ChannelSectionConfig::default(),
+            channel_config_validators: crate::channel_section::ChannelConfigValidators::default(),
+            channel_send_routes: crate::channel_send::ChannelSendRoutes::default(),
             display_timezone: resolve_default_display_timezone(),
             events_split: None,
             web: crate::engine_config::WebSectionConfig::default(),
@@ -985,6 +1011,20 @@ pub fn resolve_project_actor_id(
         .filter(|s| !s.trim().is_empty()))
 }
 
+/// Read `[actor].require_attributed` from the explicit config, or with none from
+/// every existing discovery tier (the one anchored at `db_path` included), ORed.
+///
+/// The database-anchored load already carries the key into
+/// [`RuntimeConfig::require_attributed_actor`]; callers OR the two, so a request
+/// for strict mode in any file holds and a higher-precedence file without the key
+/// cannot shadow one that sets it. `Ok(false)` when no file sets it.
+pub fn resolve_project_requires_attributed_actor(
+    config_path: Option<&std::path::Path>,
+    db_path: Option<&std::path::Path>,
+) -> Result<bool, crate::engine_config::ConfigError> {
+    crate::engine_config::KhiveConfig::require_attributed_in_any_tier(config_path, db_path)
+}
+
 // ---- Embedding model helpers ----
 
 /// Sanitize an embedding model name into a valid SQL table suffix.
@@ -1074,6 +1114,7 @@ pub fn runtime_config_from_khive_config(
     // `local`); it only widens the read visible-set below.
     let default_namespace = base.default_namespace.clone();
     let mounts = khive_cfg.mounts.clone();
+    let channel = khive_cfg.channel.clone();
     let credentials = khive_cfg.credentials.clone();
     let visibility_receipts = khive_cfg.visibility_receipts.clone();
     let code_map_root = khive_cfg.code_map_root.clone();
@@ -1178,6 +1219,8 @@ pub fn runtime_config_from_khive_config(
         .clone()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| base.actor_id.clone());
+    let require_attributed_actor =
+        khive_cfg.actor.require_attributed || base.require_attributed_actor;
 
     let gate = khive_cfg
         .gate
@@ -1197,6 +1240,9 @@ pub fn runtime_config_from_khive_config(
     let blob = crate::engine_config::BlobSectionConfig {
         file_transfers: khive_cfg.blob.file_transfers || base.blob.file_transfers,
     };
+    let knowledge = khive_cfg.knowledge.clone();
+    let git_digest = khive_cfg.git_digest.clone();
+    let code_ingest = khive_cfg.code_ingest.clone();
     let exec = khive_cfg.exec.clone();
     let telemetry = khive_cfg.telemetry.clone();
     let web = khive_cfg.web.clone();
@@ -1234,13 +1280,18 @@ pub fn runtime_config_from_khive_config(
             owned_namespaces,
             allowed_outbound_namespaces,
             actor_id,
+            require_attributed_actor,
             gate,
             brain,
             git_write,
             blob,
+            knowledge,
+            git_digest,
+            code_ingest,
             exec,
             telemetry,
             mounts,
+            channel,
             code_map_root,
             code_maps,
             code_map_protected_database_paths,
@@ -1275,13 +1326,18 @@ pub fn runtime_config_from_khive_config(
         owned_namespaces,
         allowed_outbound_namespaces,
         actor_id,
+        require_attributed_actor,
         gate,
         brain,
         git_write,
         blob,
+        knowledge,
+        git_digest,
+        code_ingest,
         exec,
         telemetry,
         mounts,
+        channel,
         code_map_root,
         code_maps,
         code_map_protected_database_paths,

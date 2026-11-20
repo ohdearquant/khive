@@ -1,3 +1,4 @@
+use khive_db::test_hooks::TestHooks;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,10 +29,24 @@ struct Fixture {
 
 impl Fixture {
     fn new(route: Route) -> Self {
+        Self::with_initial_note(route, None)
+    }
+
+    fn with_initial_note(route: Route, initial_note: Option<&Note>) -> Self {
         let dir = (!matches!(route, Route::Memory)).then(|| tempfile::tempdir().unwrap());
+        let path = dir.as_ref().map(|dir| dir.path().join("notes.db"));
+        if let Some(path) = &path {
+            let connection = rusqlite::Connection::open(path).unwrap();
+            connection
+                .execute_batch(include_str!("../sql/notes-ddl.sql"))
+                .unwrap();
+            if let Some(note) = initial_note {
+                Self::insert_on(&connection, note).unwrap();
+            }
+        }
         let pool = Arc::new(
             ConnectionPool::new(PoolConfig {
-                path: dir.as_ref().map(|dir| dir.path().join("notes.db")),
+                path,
                 write_queue_enabled: Some(matches!(route, Route::Queued)),
                 write_routing_strict: matches!(route, Route::StrictWithoutQueue),
                 checkout_timeout: Duration::from_millis(100),
@@ -40,10 +55,18 @@ impl Fixture {
             })
             .unwrap(),
         );
-        pool.writer()
-            .unwrap()
-            .autocommit(|conn| Ok(conn.execute_batch(include_str!("../sql/notes-ddl.sql"))?))
-            .unwrap();
+        if dir.is_none() {
+            pool.writer()
+                .unwrap()
+                .autocommit(|conn| {
+                    conn.execute_batch(include_str!("../sql/notes-ddl.sql"))?;
+                    if let Some(note) = initial_note {
+                        Self::insert_on(conn, note)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
         let store = SqlNoteStore::new(Arc::clone(&pool), dir.is_some());
         Self {
             pool,
@@ -53,51 +76,58 @@ impl Fixture {
     }
 
     fn insert(&self, note: &Note) {
-        let (due_key, due_source) = note_due_key_values(&note.properties);
         self.pool
             .writer()
             .unwrap()
-            .autocommit(|conn| {
-                Ok(conn.execute(
-                    "INSERT INTO notes \
+            .autocommit(|conn| Ok(Self::insert_on(conn, note)?))
+            .unwrap();
+    }
+
+    fn insert_on(conn: &rusqlite::Connection, note: &Note) -> rusqlite::Result<usize> {
+        let (due_key, due_source) = note_due_key_values(&note.properties);
+        conn.execute(
+            "INSERT INTO notes \
              (id, namespace, kind, status, name, content, salience, decay_factor, \
               expires_at, properties, created_at, updated_at, deleted_at, key, \
               strict_due_key, due_source) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-                    rusqlite::params![
-                        note.id.to_string(),
-                        note.namespace,
-                        note.kind,
-                        note.status,
-                        note.name,
-                        note.content,
-                        note.salience,
-                        note.decay_factor,
-                        note.expires_at,
-                        note.properties.as_ref().map(Value::to_string),
-                        note.created_at,
-                        note.updated_at,
-                        note.deleted_at,
-                        note.key,
-                        due_key,
-                        due_source,
-                    ],
-                )?)
-            })
-            .unwrap();
+            rusqlite::params![
+                note.id.to_string(),
+                note.namespace,
+                note.kind,
+                note.status,
+                note.name,
+                note.content,
+                note.salience,
+                note.decay_factor,
+                note.expires_at,
+                note.properties.as_ref().map(Value::to_string),
+                note.created_at,
+                note.updated_at,
+                note.deleted_at,
+                note.key,
+                due_key,
+                due_source,
+            ],
+        )
     }
 
     fn snapshot(&self, id: Uuid) -> Vec<rusqlite::types::Value> {
-        self.pool
-            .writer()
-            .unwrap()
-            .autocommit(|conn| {
-                let mut statement = conn.prepare("SELECT rowid, * FROM notes WHERE id = ?1")?;
-                let columns = statement.column_count();
-                Ok(statement.query_row([id.to_string()], |row| {
-                    (0..columns).map(|index| row.get(index)).collect()
-                })?)
-            })
+        let reader = self.pool.reader().unwrap();
+        let columns: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('notes')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let columns = usize::try_from(columns).expect("notes column count must fit usize");
+        reader
+            .query_row(
+                "SELECT rowid, * FROM notes WHERE id = ?1",
+                [id.to_string()],
+                |row| (0..=columns).map(|index| row.get(index)).collect(),
+            )
             .unwrap()
     }
 
@@ -514,9 +544,8 @@ async fn retry_deadline_projections_follow_only_writes_to_next_attempt_at() {
 
 #[tokio::test]
 async fn invalid_patch_is_rejected_before_writer_admission() {
-    let fixture = Fixture::new(Route::StrictWithoutQueue);
     let note = note(Some(json!({})));
-    fixture.insert(&note);
+    let fixture = Fixture::with_initial_note(Route::StrictWithoutQueue, Some(&note));
     let before = fixture.snapshot(note.id);
     let mut invalid = Vec::new();
     let mut empty = patch();
@@ -568,9 +597,18 @@ async fn invalid_patch_is_rejected_before_writer_admission() {
     }
     let error = fixture.patch(note.id, &patch()).await.unwrap_err();
     assert!(
-        matches!(error, StorageError::Pool { ref operation, ref message } if operation == "writer" && message.contains("strict")),
+        matches!(&error, StorageError::WriterOwnerUnavailable { operation, source }
+            if operation == "writer"
+                && matches!(source.as_ref(), StorageError::Pool { operation, message }
+                    if operation == "writer" && message == "strict write routing requires a live writer owner")),
         "{error:?}"
     );
+    assert!(error.is_retryable(), "{error:?}");
+    assert_eq!(
+        error.writer_request_state(),
+        Some(WriterTaskRequestState::NotStarted)
+    );
+    assert!(!error.is_write_outcome_unknown(), "{error:?}");
     assert_eq!(fixture.snapshot(note.id), before);
 }
 
@@ -719,7 +757,7 @@ async fn queued_terminal_unknown_outcome_is_not_wrapped_or_retried() {
     handle
         .send_top_level(|connection| {
             connection
-                .authorizer(Some(deny_finalization))
+                .test_authorizer(Some(deny_finalization))
                 .map_err(|error| {
                     StorageError::driver(
                         StorageCapability::Sql,

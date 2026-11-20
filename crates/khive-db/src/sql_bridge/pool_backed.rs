@@ -21,7 +21,7 @@ where
     T: Send + 'static,
     F: FnOnce(
             &crate::read_cancellation::InterruptibleReadScope,
-            &rusqlite::Connection,
+            &crate::ProgressConn,
         ) -> khive_storage::types::StorageResult<T>
         + Send
         + 'static,
@@ -67,7 +67,7 @@ where
     T: Send + 'static,
     F: FnOnce(
             &crate::read_cancellation::InterruptibleReadScope,
-            &rusqlite::Connection,
+            &crate::ProgressConn,
             bool,
         ) -> khive_storage::types::StorageResult<T>
         + Send
@@ -77,20 +77,20 @@ where
         StorageCapability::Sql,
         operation,
         move |scope| {
-            let guard = pool.try_writer().map_err(|error: SqliteError| {
+            let mut guard = pool.try_writer().map_err(|error: SqliteError| {
                 error.into_storage_error(StorageCapability::Sql, operation)
             })?;
             if requires_admission {
-                let unit = guard
+                let mut unit = guard
                     .admit_autocommit()
                     .map_err(|error| error.into_storage_error(StorageCapability::Sql, operation))?;
-                let result = scope.with_pooled_write_unit(&pool, &unit, |conn| {
+                let result = scope.with_pooled_write_unit(&pool, &mut unit, |conn| {
                     query(scope, conn, conn.is_autocommit())
                 });
-                return settle_pooled_call(&unit, operation, result)
+                return settle_pooled_call(&mut unit, operation, result)
                     .inspect_err(|error| pool.record_direct_writer_error(error));
             }
-            scope.with_pooled_writer(&pool, &guard, |conn| {
+            scope.with_pooled_writer(&pool, &mut guard, |conn| {
                 let interruptible = conn.is_autocommit();
                 query(scope, conn, interruptible)
             })
@@ -167,7 +167,7 @@ where
     T: Send + 'static,
     F: FnOnce(
             &crate::read_cancellation::InterruptibleReadScope,
-            &rusqlite::Connection,
+            &crate::ProgressConn,
             bool,
             bool,
         ) -> khive_storage::types::StorageResult<T>
@@ -214,7 +214,7 @@ where
     T: Send + 'static,
     F: FnOnce(
             &crate::read_cancellation::InterruptibleReadScope,
-            &rusqlite::Connection,
+            &crate::ProgressConn,
             bool,
             bool,
         ) -> khive_storage::types::StorageResult<T>
@@ -546,7 +546,7 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
         }
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
-            let guard = pool.autocommit_write_unit().map_err(|e: SqliteError| {
+            let mut guard = pool.autocommit_write_unit().map_err(|e: SqliteError| {
                 StorageError::driver(StorageCapability::Sql, "pool_writer.execute", e)
             })?;
             let result = (|| {
@@ -559,7 +559,7 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
                     .map_err(|e| map_write_err(e, "pool_writer.execute"))?;
                 Ok(rows as u64)
             })();
-            settle_pooled_call(&guard, "pool_writer.execute", result)
+            settle_pooled_call(&mut guard, "pool_writer.execute", result)
                 .inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await
@@ -577,7 +577,7 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let mut tx_handle = None;
-            let guard = pool.writer().map_err(|e: SqliteError| {
+            let mut guard = pool.writer().map_err(|e: SqliteError| {
                 StorageError::driver(StorageCapability::Sql, "pool_writer.execute_batch", e)
             })?;
             let result = (|| {
@@ -591,6 +591,7 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
                     )
                 })?;
                 if let Err(refused) = pool.write_admission().check() {
+                    drop(prepared);
                     guard
                         .rollback_or_retire("pooled batch capacity admission")
                         .map_err(|error| {
@@ -657,14 +658,14 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
         // refused before the pooled writer is released.
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
-            let guard = pool.autocommit_write_unit().map_err(|e: SqliteError| {
+            let mut guard = pool.autocommit_write_unit().map_err(|e: SqliteError| {
                 StorageError::driver(StorageCapability::Sql, "pool_writer.execute_script", e)
             })?;
             let result = guard
                 .conn()
                 .execute_batch(&script)
                 .map_err(|e| map_write_err(e, "pool_writer.execute_script"));
-            settle_pooled_call(&guard, "pool_writer.execute_script", result)
+            settle_pooled_call(&mut guard, "pool_writer.execute_script", result)
                 .inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await

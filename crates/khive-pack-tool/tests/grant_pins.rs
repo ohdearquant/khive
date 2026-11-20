@@ -412,25 +412,142 @@ async fn bootstrap_marks_legacy_null_pins_without_binding_them() {
 }
 
 #[tokio::test]
-async fn re_registration_keeps_the_approved_object_and_definition() {
-    let f = Fixture::new();
-    let first = f.register("same").await;
-    let id = f.request("same").await;
-    let grant = f.grant(&id).await;
-    let again = f.call("tool.register", json!({"name":"same", "source":"mcp:changed", "side_effect":"read", "trust":"external", "schema":{"type":"object", "required":["changed"]}, "capabilities":["new capability"]})).await;
-    assert_eq!(again["created"], false);
-    assert_eq!(again["tool"]["full_id"], first["full_id"]);
-    let described = f.call("tool.describe", json!({"tool":"same"})).await;
-    assert!(described["tool"]["capabilities"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|capability| capability["name"] == "new capability"));
-    assert_eq!(f.check("same").await["source"], "grant");
-    assert_eq!(
-        f.row(&id).await["definition_digest"],
-        grant["definition_digest"]
-    );
+async fn re_registration_updates_definition_and_invalidates_only_mismatched_grants() {
+    for (field, value) in [
+        ("side_effect", json!("egress")),
+        ("trust", json!("external")),
+        ("schema", json!({"type":"object", "required":["changed"]})),
+    ] {
+        let f = Fixture::new();
+        let first = f.register("same").await;
+        let original = f.entity(&first["full_id"]).await;
+        let id = f.request("same").await;
+        let grant = f.grant(&id).await;
+        f.call(
+            "tool.policy",
+            json!({"actor":"agent:requester", "tool":"same", "decision":"deny"}),
+        )
+        .await;
+
+        let metadata = f.call("tool.register", json!({"name":"same", "description":"corrected description", "kind":"tool", "tags":["new tag"], "capabilities":["new capability"]})).await;
+        assert_eq!(metadata["updated"], true);
+        assert_eq!(f.check("same").await["source"], "grant");
+        assert_eq!(
+            RegistryPin::from_entity(&f.entity(&first["full_id"]).await)
+                .unwrap()
+                .definition_digest(),
+            grant["definition_digest"].as_str().unwrap()
+        );
+        let described = f.call("tool.describe", json!({"tool":"same"})).await;
+        assert!(described["tool"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability["name"] == "new capability"));
+
+        let frozen = f.entity(&first["full_id"]).await;
+        let token = f.rt.authorize(Namespace::local()).unwrap();
+        let events = f.rt.events(&token).unwrap();
+        let filter = khive_storage::EventFilter {
+            target_id: Some(frozen.id),
+            kinds: vec![khive_types::EventKind::ToolRegistrationChanged],
+            ..Default::default()
+        };
+        let count = events.count_events(filter.clone()).await.unwrap();
+        assert_eq!(count, 0);
+        for fields in [
+            json!({"source":"mcp:changed"}),
+            json!({"kind":"skill"}),
+            json!({"source":"exec:/fixture/other", "kind":"plugin"}),
+        ] {
+            let mut params = fields;
+            params["name"] = json!("same");
+            params["capabilities"] = json!(["must-not-link"]);
+            let error = f
+                .registry
+                .dispatch("tool.register", params)
+                .await
+                .expect_err("source and kind cannot retarget an existing grant");
+            assert!(matches!(error, RuntimeError::InvalidInput(_)), "{error}");
+            assert!(error.to_string().contains("new name"), "{error}");
+            assert_eq!(
+                serde_json::to_value(f.entity(&first["full_id"]).await).unwrap(),
+                serde_json::to_value(&frozen).unwrap()
+            );
+            assert_eq!(f.row(&id).await, grant);
+            assert_eq!(f.check("same").await["grant_id"], id);
+            assert_eq!(
+                f.call("tool.describe", json!({"tool":"same"})).await["tool"]["capabilities"],
+                described["tool"]["capabilities"]
+            );
+            assert_eq!(events.count_events(filter.clone()).await.unwrap(), count);
+        }
+
+        let mut patch = json!({"name":"same"});
+        patch[field] = value.clone();
+        let again = f.call("tool.register", patch).await;
+        assert_eq!(again["created"], false);
+        assert_eq!(again["updated"], true);
+        assert_eq!(again["unchanged"], false);
+        assert_eq!(again["tool"]["full_id"], first["full_id"]);
+        let current = f.entity(&first["full_id"]).await;
+        assert_eq!(current.properties.as_ref().unwrap()[field], value);
+        assert_ne!(
+            RegistryPin::from_entity(&current)
+                .unwrap()
+                .definition_digest(),
+            grant["definition_digest"].as_str().unwrap()
+        );
+        assert_eq!(f.check("same").await["source"], "policy");
+        assert_eq!(f.check("same").await["decision"], "deny");
+        assert_eq!(
+            f.row(&id).await,
+            grant,
+            "the original grant is not rewritten"
+        );
+
+        let replacement_id = f.request("same").await;
+        let replacement = f.grant(&replacement_id).await;
+        assert_eq!(
+            replacement["definition_digest"],
+            RegistryPin::from_entity(&current)
+                .unwrap()
+                .definition_digest()
+        );
+        assert_eq!(f.check("same").await["grant_id"], replacement_id);
+        let mut restore = json!({"name":"same"});
+        restore[field] = original.properties.as_ref().unwrap()[field].clone();
+        if matches!(field, "side_effect" | "trust") {
+            let before = f.entity(&first["full_id"]).await;
+            let token = f.rt.authorize(Namespace::local()).unwrap();
+            let events = f.rt.events(&token).unwrap();
+            let filter = khive_storage::EventFilter {
+                target_id: Some(before.id),
+                kinds: vec![khive_types::EventKind::ToolRegistrationChanged],
+                ..Default::default()
+            };
+            let count = events.count_events(filter.clone()).await.unwrap();
+            let error = f
+                .registry
+                .dispatch("tool.register", restore)
+                .await
+                .expect_err("restoring a looser side effect or more trusted origin refuses");
+            assert!(matches!(error, RuntimeError::InvalidInput(_)), "{error}");
+            assert!(error.to_string().contains(field), "{error}");
+            assert_eq!(
+                serde_json::to_value(f.entity(&first["full_id"]).await).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+            assert_eq!(events.count_events(filter).await.unwrap(), count);
+            assert_eq!(f.check("same").await["grant_id"], replacement_id);
+            assert_ne!(f.check("same").await["grant_id"], id);
+        } else {
+            f.call("tool.register", restore).await;
+            assert_eq!(f.check("same").await["grant_id"], id);
+        }
+        assert_eq!(f.row(&id).await, grant);
+        assert_eq!(f.row(&replacement_id).await, replacement);
+    }
 }
 
 #[tokio::test]
@@ -553,12 +670,14 @@ async fn register_and_ingest_keep_same_named_tools_and_links_in_their_own_namesp
             .call_for(
                 &b,
                 "tool.register",
-                json!({"name":"same-tool", "source":"mcp:changed", "capabilities":["b second capability"]}),
+                json!({"name":"same-tool", "description":"updated b description", "schema":{"type":"object"}, "capabilities":["b second capability"]}),
             )
             .await;
         assert_eq!(again_b["created"], false);
         assert_eq!(again_b["tool"]["full_id"], registered_b["tool"]["full_id"]);
         assert_eq!(again_b["tool"]["source"], "mcp:b");
+        assert_eq!(again_b["tool"]["description"], "updated b description");
+        assert_eq!(again_b["updated"], true);
         let tool_b = f
             .call_for(
                 &a,
@@ -567,6 +686,7 @@ async fn register_and_ingest_keep_same_named_tools_and_links_in_their_own_namesp
             )
             .await["tool"]
             .clone();
+        assert_eq!(tool_b["schema"], json!({"type":"object"}));
         let capabilities_b = tool_b["capabilities"].as_array().unwrap();
         assert_eq!(capabilities_b.len(), 2);
         for name in ["b capability", "b second capability"] {
@@ -904,7 +1024,7 @@ async fn an_active_grant_survives_five_hundred_newer_rows() {
 }
 
 #[tokio::test]
-async fn grant_matching_keeps_literal_case_sensitive_byte_prefixes() {
+async fn grant_matching_folds_tool_names_and_keeps_actor_bytes() {
     let f = Fixture::new();
     f.write(
         "INSERT INTO tool_grants (id, namespace, actor, tool, status, requested_at) \
@@ -933,6 +1053,9 @@ async fn grant_matching_keeps_literal_case_sensitive_byte_prefixes() {
         ("nul\0exact", "nul\0other", false),
     ] {
         for column in ["actor", "tool"] {
+            let matches = matches
+                || (column == "tool"
+                    && matches!((pattern, value), ("Exact", "exact") | ("Pre*", "prefix")));
             f.write(
                 &format!(
                     "UPDATE tool_grants SET actor='*', tool='*', {column}=?1 WHERE id='pattern'"
@@ -1024,3 +1147,487 @@ async fn equal_request_times_keep_the_existing_grant_selection() {
 
 #[path = "grant_pins/strict_decode.rs"]
 mod strict_decode;
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn tool_grant_matches_registry_name_folding() {
+    for (requested_name, stored_name) in [("ExecShell", "execshell"), ("execshell", "ExecShell")] {
+        let f = Fixture::new();
+        let id = f.request(requested_name).await;
+        let requested = f.row(&id).await;
+        assert_eq!(requested["status"], "requested");
+        assert_eq!(requested["tool"], requested_name);
+        assert!(requested["registry_id"].is_null());
+        let tool = f.register(stored_name).await;
+        assert_eq!(f.row(&id).await, requested);
+        let granted = f.grant(&id).await;
+        let entity = f.entity(&tool["full_id"]).await;
+        let pin = RegistryPin::from_entity(&entity).unwrap();
+        assert_eq!(entity.name, stored_name);
+        assert_eq!(granted["tool"], requested_name);
+        assert_eq!(granted["registry_id"], tool["full_id"]);
+        assert_eq!(granted["definition_digest"], pin.definition_digest());
+        assert_ne!(granted["decided_by"], granted["actor"]);
+        for reference in [
+            stored_name,
+            requested_name,
+            tool["full_id"].as_str().unwrap(),
+        ] {
+            let checked = f.check(reference).await;
+            assert_eq!(checked["registered"], true);
+            assert_eq!(checked["decision"], "allow");
+            assert_eq!(checked["source"], "grant");
+            assert_eq!(checked["grant_id"], id);
+        }
+        let mut reader = f.rt.sql().reader().await.unwrap();
+        for (actor, expected) in [("agent:requester", true), ("Agent:requester", false)] {
+            assert_eq!(
+                khive_pack_tool::policy::grant_is_active_on(
+                    reader.as_mut(),
+                    "local",
+                    &id,
+                    actor,
+                    stored_name,
+                    khive_pack_tool::policy::now_micros(),
+                    Some(&pin),
+                )
+                .await
+                .unwrap(),
+                expected
+            );
+        }
+        drop(reader);
+        assert_eq!(f.row(&id).await, granted);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn folded_prefix_grants_end_at_first_matching_registration() {
+    for approve_before_registration in [true, false] {
+        for (pattern, name, future_name) in [
+            ("SHELL*", "ShellOne", "shellTwo"),
+            ("NUL\0PRE*", "Nul\0Prefix", "nul\0preOther"),
+        ] {
+            let f = Fixture::new();
+            let id = f.request(pattern).await;
+            let requested = f.row(&id).await;
+            assert_eq!(requested["tool"], pattern);
+            if approve_before_registration {
+                let granted = f.grant(&id).await;
+                assert!(granted["invalidated_by_registry_id"].is_null());
+                assert_eq!(f.check(future_name).await["source"], "grant");
+            }
+            let tool = f.register(name).await;
+            let created_at = f.entity(&tool["full_id"]).await.created_at;
+            if !approve_before_registration {
+                assert_eq!(f.row(&id).await, requested);
+                f.grant(&id).await;
+            }
+            let invalidated = f.row(&id).await;
+            assert_eq!(invalidated["status"], "granted");
+            assert!(invalidated["registry_id"].is_null());
+            assert!(invalidated["definition_digest"].is_null());
+            assert_eq!(invalidated["invalidated_by_registry_id"], tool["full_id"]);
+            assert_eq!(
+                invalidated["invalidated_at"],
+                khive_runtime::micros_to_iso(created_at)
+            );
+            assert_eq!(f.check(future_name).await["source"], "default");
+            let later = f.register(&format!("{name}Later")).await;
+            assert_ne!(later["full_id"], tool["full_id"]);
+            assert_eq!(f.row(&id).await, invalidated);
+        }
+    }
+}
+
+const LEGACY_REGISTRY_INSERT_TRIGGER: &str = r#"
+CREATE TRIGGER tool_grants_invalidate_on_registry_insert
+AFTER INSERT ON entities
+WHEN NEW.deleted_at IS NULL
+    AND NEW.kind = 'project'
+    AND EXISTS (SELECT 1 FROM json_each(NEW.tags) WHERE lower(value) = 'tool-registry')
+BEGIN
+    UPDATE tool_grants
+    SET invalidated_by_registry_id = NEW.id,
+        invalidated_at = NEW.created_at
+    WHERE namespace = NEW.namespace
+        AND status = 'granted'
+        AND registry_id IS NULL
+        AND definition_digest IS NULL
+        AND invalidated_by_registry_id IS NULL
+        AND invalidated_at IS NULL
+        AND (
+            CAST(lower(tool) AS BLOB) = CAST(lower(NEW.name) AS BLOB)
+            OR tool = '*'
+            OR (
+                substr(CAST(tool AS BLOB), -1) = X'2A'
+                AND substr(CAST(NEW.name AS BLOB), 1, length(CAST(tool AS BLOB)) - 1)
+                    = substr(CAST(tool AS BLOB), 1, length(CAST(tool AS BLOB)) - 1)
+            )
+        );
+END;
+"#;
+
+async fn folded_schema_rows(
+    backend: &khive_db::StorageBackend,
+    sql: &str,
+) -> Vec<khive_storage::SqlRow> {
+    backend
+        .sql()
+        .reader()
+        .await
+        .unwrap()
+        .query_all(SqlStatement {
+            sql: sql.into(),
+            params: vec![],
+            label: None,
+        })
+        .await
+        .unwrap()
+}
+
+async fn folded_schema_write(backend: &khive_db::StorageBackend, sql: &str, params: Vec<SqlValue>) {
+    assert_eq!(
+        backend
+            .sql()
+            .writer()
+            .await
+            .unwrap()
+            .execute(SqlStatement {
+                sql: sql.into(),
+                params,
+                label: None,
+            })
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn registry_trigger_upgrade_replaces_legacy_body_and_preserves_grant_evidence() {
+    use khive_pack_tool::vocab::{TOOL_SCHEMA_COLUMN_ADDITIONS, TOOL_SCHEMA_PLAN_STMTS};
+    let db = khive_db::StorageBackend::memory().unwrap();
+    db.apply_pack_ddl_statements(&[
+        "CREATE TABLE entities (id TEXT PRIMARY KEY, namespace TEXT, kind TEXT, tags TEXT, name TEXT, created_at INTEGER, deleted_at INTEGER)",
+    ]).unwrap();
+    db.apply_pack_ddl_statements_with_columns(
+        &TOOL_SCHEMA_PLAN_STMTS,
+        &TOOL_SCHEMA_COLUMN_ADDITIONS,
+    )
+    .unwrap();
+    db.apply_pack_ddl_statements(&[
+        "DROP TRIGGER tool_grants_invalidate_on_registry_insert",
+        LEGACY_REGISTRY_INSERT_TRIGGER,
+    ])
+    .unwrap();
+    let trigger_query = "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='tool_grants_invalidate_on_registry_insert'";
+    let legacy = folded_schema_rows(&db, trigger_query).await;
+    assert_eq!(legacy.len(), 1);
+    assert_eq!(
+        legacy[0].text("sql").unwrap(),
+        LEGACY_REGISTRY_INSERT_TRIGGER.trim().trim_end_matches(';')
+    );
+
+    // Registrations precede these historical grant rows, so their evidence
+    // is supplied by the upgrade rather than the insertion trigger.
+    for (id, ns, name, at, kind, tags, deleted_at) in [
+        (
+            "alpha-z",
+            "local",
+            "AlphaOne",
+            200,
+            "project",
+            "[\"tool-registry\"]",
+            None,
+        ),
+        (
+            "alpha-b",
+            "local",
+            "alphaLater",
+            100,
+            "project",
+            "[\"tool-registry\"]",
+            None,
+        ),
+        (
+            "alpha-a",
+            "local",
+            "AlphaFirst",
+            100,
+            "project",
+            "[\"tool-registry\"]",
+            None,
+        ),
+        (
+            "nul",
+            "local",
+            "Nul\0Prefix",
+            120,
+            "project",
+            "[\"tool-registry\"]",
+            None,
+        ),
+        (
+            "star-prefix",
+            "local",
+            "StarOther",
+            50,
+            "project",
+            "[\"tool-registry\"]",
+            None,
+        ),
+        (
+            "star-exact",
+            "local",
+            "star*",
+            300,
+            "project",
+            "[\"tool-registry\"]",
+            None,
+        ),
+        (
+            "gone",
+            "local",
+            "GoneOne",
+            1,
+            "project",
+            "[\"tool-registry\"]",
+            Some(2),
+        ),
+        (
+            "kind",
+            "local",
+            "KindOne",
+            2,
+            "concept",
+            "[\"tool-registry\"]",
+            None,
+        ),
+        ("tag", "local", "TagOne", 3, "project", "[]", None),
+        (
+            "foreign",
+            "other",
+            "ForeignOne",
+            4,
+            "project",
+            "[\"tool-registry\"]",
+            None,
+        ),
+    ] {
+        folded_schema_write(&db, "INSERT INTO entities (id,namespace,name,created_at,kind,tags,deleted_at) VALUES (?1,?2,?3,?4,?5,?6,?7)", vec![
+            SqlValue::Text(id.into()), SqlValue::Text(ns.into()), SqlValue::Text(name.into()), SqlValue::Integer(at),
+            SqlValue::Text(kind.into()), SqlValue::Text(tags.into()), SqlValue::from_opt_i64(deleted_at),
+        ]).await;
+    }
+    for (id, tool, status, registry_id, digest, evidence, evidence_at) in [
+        ("prefix", "ALPHA*", "granted", None, None, None, None),
+        ("nul", "NUL\0PRE*", "granted", None, None, None, None),
+        ("exact", "ALPHAONE", "granted", None, None, None, None),
+        ("star-exact", "STAR*", "granted", None, None, None, None),
+        ("global", "*", "granted", None, None, None, None),
+        ("unrelated", "OTHER*", "granted", None, None, None, None),
+        ("foreign", "FOREIGN*", "granted", None, None, None, None),
+        ("deleted", "GONE*", "granted", None, None, None, None),
+        ("wrong-kind", "KIND*", "granted", None, None, None, None),
+        ("wrong-tag", "TAG*", "granted", None, None, None, None),
+        (
+            "pinned",
+            "ALPHA*",
+            "granted",
+            Some("alpha-z"),
+            Some("digest"),
+            None,
+            None,
+        ),
+        (
+            "registry-only",
+            "ALPHA*",
+            "granted",
+            Some("alpha-z"),
+            None,
+            None,
+            None,
+        ),
+        (
+            "digest-only",
+            "ALPHA*",
+            "granted",
+            None,
+            Some("digest"),
+            None,
+            None,
+        ),
+        ("requested", "ALPHA*", "requested", None, None, None, None),
+        ("denied", "ALPHA*", "denied", None, None, None, None),
+        ("revoked", "ALPHA*", "revoked", None, None, None, None),
+        (
+            "evidence",
+            "ALPHA*",
+            "granted",
+            None,
+            None,
+            Some("original"),
+            Some(10),
+        ),
+        (
+            "evidence-id",
+            "ALPHA*",
+            "granted",
+            None,
+            None,
+            Some("original"),
+            None,
+        ),
+        (
+            "evidence-time",
+            "ALPHA*",
+            "granted",
+            None,
+            None,
+            None,
+            Some(10),
+        ),
+    ] {
+        folded_schema_write(&db, "INSERT INTO tool_grants (id,namespace,actor,tool,status,requested_at,registry_id,definition_digest,invalidated_by_registry_id,invalidated_at) VALUES (?1,'local','agent:upgrade',?2,?3,400,?4,?5,?6,?7)", vec![
+            SqlValue::Text(id.into()), SqlValue::Text(tool.into()), SqlValue::Text(status.into()),
+            SqlValue::from_opt_text(registry_id), SqlValue::from_opt_text(digest),
+            SqlValue::from_opt_text(evidence), SqlValue::from_opt_i64(evidence_at),
+        ]).await;
+    }
+    folded_schema_write(&db, "INSERT INTO tool_policy (id,namespace,actor,tool,decision,created_at,updated_at,history) VALUES ('policy','local','agent:upgrade','ALPHA*','deny',10,10,'[]')", vec![]).await;
+    let grants_query = "SELECT * FROM tool_grants ORDER BY id";
+    let entities = folded_schema_rows(&db, "SELECT * FROM entities ORDER BY id").await;
+    let policies = folded_schema_rows(&db, "SELECT * FROM tool_policy ORDER BY id").await;
+    let before = folded_schema_rows(&db, grants_query).await;
+    assert_eq!(before.len(), 19);
+
+    let mut failing_plan = TOOL_SCHEMA_PLAN_STMTS.to_vec();
+    failing_plan.push("CREATE INDEX upgrade_missing ON nonexistent_table(id)");
+    let error = db
+        .apply_pack_ddl_statements_with_columns(&failing_plan, &TOOL_SCHEMA_COLUMN_ADDITIONS)
+        .unwrap_err();
+    assert!(error.to_string().contains("nonexistent_table"), "{error}");
+    assert_eq!(
+        serde_json::to_value(folded_schema_rows(&db, trigger_query).await).unwrap(),
+        serde_json::to_value(&legacy).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(folded_schema_rows(&db, grants_query).await).unwrap(),
+        serde_json::to_value(&before).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(folded_schema_rows(&db, "SELECT * FROM entities ORDER BY id").await)
+            .unwrap(),
+        serde_json::to_value(&entities).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(
+            folded_schema_rows(&db, "SELECT * FROM tool_policy ORDER BY id").await
+        )
+        .unwrap(),
+        serde_json::to_value(&policies).unwrap()
+    );
+
+    db.apply_pack_ddl_statements_with_columns(
+        &TOOL_SCHEMA_PLAN_STMTS,
+        &TOOL_SCHEMA_COLUMN_ADDITIONS,
+    )
+    .unwrap();
+    let upgraded = folded_schema_rows(&db, trigger_query).await;
+    assert!(upgraded[0]
+        .text("sql")
+        .unwrap()
+        .contains("substr(CAST(lower(NEW.name) AS BLOB)"));
+    assert!(upgraded[0]
+        .text("sql")
+        .unwrap()
+        .contains("= substr(CAST(lower(tool) AS BLOB)"));
+    let expected_trigger = include_str!("../sql/grant-invalidation.sql")
+        .split_once("CREATE TRIGGER ")
+        .unwrap()
+        .1
+        .split_once("END;")
+        .unwrap()
+        .0;
+    assert_eq!(
+        upgraded[0].text("sql").unwrap(),
+        format!("CREATE TRIGGER {expected_trigger}END")
+    );
+    assert_ne!(
+        upgraded[0].text("sql").unwrap(),
+        legacy[0].text("sql").unwrap()
+    );
+    let mut expected = before.clone();
+    for (id, registry_id, at) in [
+        ("prefix", "alpha-a", 100),
+        ("nul", "nul", 120),
+        ("exact", "alpha-z", 200),
+        ("star-exact", "star-exact", 300),
+        ("global", "star-prefix", 50),
+    ] {
+        let row = expected
+            .iter_mut()
+            .find(|row| row.text("id").unwrap() == id)
+            .unwrap();
+        for column in &mut row.columns {
+            match column.name.as_str() {
+                "invalidated_by_registry_id" => column.value = SqlValue::Text(registry_id.into()),
+                "invalidated_at" => column.value = SqlValue::Integer(at),
+                _ => {}
+            }
+        }
+    }
+    let after = folded_schema_rows(&db, grants_query).await;
+    assert_eq!(
+        serde_json::to_value(&after).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(folded_schema_rows(&db, "SELECT * FROM entities ORDER BY id").await)
+            .unwrap(),
+        serde_json::to_value(&entities).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(
+            folded_schema_rows(&db, "SELECT * FROM tool_policy ORDER BY id").await
+        )
+        .unwrap(),
+        serde_json::to_value(&policies).unwrap()
+    );
+    db.apply_pack_ddl_statements_with_columns(
+        &TOOL_SCHEMA_PLAN_STMTS,
+        &TOOL_SCHEMA_COLUMN_ADDITIONS,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(folded_schema_rows(&db, grants_query).await).unwrap(),
+        serde_json::to_value(after).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(folded_schema_rows(&db, trigger_query).await).unwrap(),
+        serde_json::to_value(upgraded).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(folded_schema_rows(&db, "SELECT * FROM entities ORDER BY id").await)
+            .unwrap(),
+        serde_json::to_value(entities).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(
+            folded_schema_rows(&db, "SELECT * FROM tool_policy ORDER BY id").await
+        )
+        .unwrap(),
+        serde_json::to_value(policies).unwrap()
+    );
+
+    folded_schema_write(&db, "INSERT INTO tool_grants (id,namespace,actor,tool,status,requested_at) VALUES ('later','local','agent:upgrade','LATER*','granted',500)", vec![]).await;
+    folded_schema_write(&db, "INSERT INTO entities (id,namespace,kind,tags,name,created_at) VALUES ('later-registry','local','project','[\"tool-registry\"]','LaterOne',600)", vec![]).await;
+    let later = folded_schema_rows(&db, "SELECT * FROM tool_grants WHERE id='later'").await;
+    assert_eq!(
+        later[0].text("invalidated_by_registry_id").unwrap(),
+        "later-registry"
+    );
+    assert_eq!(later[0].i64("invalidated_at").unwrap(), 600);
+}

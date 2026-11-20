@@ -1,5 +1,6 @@
 use super::*;
 use crate::pool::PoolConfig;
+use crate::test_hooks::TestHooks;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
 use serial_test::serial;
 
@@ -300,7 +301,8 @@ async fn begin_failure_reply_waits_for_writer_tx_deregistration() {
     let handle = spawn(&pool, 8).expect("writer task spawn");
     // An independent SQLite writer does not hold khive's cooperative
     // volume lease, so this reaches the intended BEGIN-busy branch.
-    let lock_holder = rusqlite::Connection::open(&path).expect("external writer");
+    let lock_holder =
+        crate::test_hooks::registered(rusqlite::Connection::open(&path).expect("external writer"));
     lock_holder
         .execute_batch("BEGIN IMMEDIATE")
         .expect("hold database write lock");
@@ -377,7 +379,7 @@ async fn begin_immediate_failure_replies_error_without_running_op() {
 
     let handle = spawn(&pool, 8).expect("writer task should spawn on a file-backed pool");
 
-    let lock_holder = rusqlite::Connection::open(&path).unwrap();
+    let lock_holder = crate::test_hooks::registered(rusqlite::Connection::open(&path).unwrap());
     lock_holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let op_ran = Arc::new(AtomicBool::new(false));
@@ -485,7 +487,7 @@ async fn transient_begin_contention_clears_within_budget_and_op_runs_once() {
     // A second khive writer would contend on the cooperative volume lease
     // before SQLite. This fixture needs an independent SQLite writer so it
     // exercises the intended BEGIN busy-handler path.
-    let lock_holder = Connection::open(&path).unwrap();
+    let lock_holder = crate::test_hooks::registered(Connection::open(&path).unwrap());
     lock_holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let op_runs = Arc::new(AtomicUsize::new(0));
@@ -751,7 +753,7 @@ async fn commit_failure_with_successful_rollback_reports_finality_once_and_conti
                     operation: "test_commit_error_insert".into(),
                     message: e.to_string(),
                 })?;
-            conn.authorizer(Some(deny_commit))
+            conn.test_authorizer(Some(deny_commit))
                 .map_err(|e| StorageError::Pool {
                     operation: "test_install_authorizer".into(),
                     message: e.to_string(),
@@ -788,7 +790,7 @@ async fn commit_failure_with_successful_rollback_reports_finality_once_and_conti
 
     let affected = handle
         .send(|conn| {
-            conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
                 .map_err(|e| StorageError::Pool {
                     operation: "test_remove_authorizer".into(),
                     message: e.to_string(),
@@ -823,7 +825,8 @@ async fn commit_failure_with_successful_rollback_reports_finality_once_and_conti
 
 #[test]
 fn top_level_request_returning_with_open_transaction_reports_side_effects_unknown() {
-    let conn = Connection::open_in_memory().expect("in-memory connection");
+    let conn =
+        crate::test_hooks::registered(Connection::open_in_memory().expect("in-memory connection"));
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         .unwrap();
     let (reply_tx, mut reply_rx) = oneshot::channel();
@@ -841,10 +844,20 @@ fn top_level_request_returning_with_open_transaction_reports_side_effects_unknow
                 })
         }),
         reply: reply_tx,
+        receipt: Arc::new(ReplyReceipt::default()),
         top_level: true,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
-        telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
+        lease_class: Default::default(),
+        telemetry: WriteTelemetry::new(
+            None,
+            "test".to_string(),
+            0,
+            None,
+            SubmitLabels::None,
+            false,
+            false,
+        ),
         admission: None,
     };
 
@@ -869,7 +882,8 @@ fn top_level_request_returning_with_open_transaction_reports_side_effects_unknow
 
 #[test]
 fn commit_failure_with_failed_rollback_reports_side_effects_unknown() {
-    let conn = Connection::open_in_memory().expect("in-memory connection");
+    let conn =
+        crate::test_hooks::registered(Connection::open_in_memory().expect("in-memory connection"));
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
         .unwrap();
     let executions = Arc::new(AtomicUsize::new(0));
@@ -884,7 +898,7 @@ fn commit_failure_with_failed_rollback_reports_side_effects_unknown() {
                     operation: "test_insert_before_commit_failure".into(),
                     message: e.to_string(),
                 })?;
-            conn.authorizer(Some(deny_commit_and_rollback))
+            conn.test_authorizer(Some(deny_commit_and_rollback))
                 .map_err(|e| StorageError::Pool {
                     operation: "test_install_authorizer".into(),
                     message: e.to_string(),
@@ -892,10 +906,20 @@ fn commit_failure_with_failed_rollback_reports_side_effects_unknown() {
             Ok(affected)
         }),
         reply: reply_tx,
+        receipt: Arc::new(ReplyReceipt::default()),
         top_level: false,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
-        telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
+        lease_class: Default::default(),
+        telemetry: WriteTelemetry::new(
+            None,
+            "test".to_string(),
+            0,
+            None,
+            SubmitLabels::None,
+            false,
+            false,
+        ),
         admission: None,
     };
 
@@ -956,7 +980,7 @@ async fn poisoned_connection_retires_before_queued_top_level_request() {
                             operation: "test_active_insert".into(),
                             message: e.to_string(),
                         })?;
-                    conn.authorizer(Some(deny_commit_and_rollback))
+                    conn.test_authorizer(Some(deny_commit_and_rollback))
                         .map_err(|e| StorageError::Pool {
                             operation: "test_install_authorizer".into(),
                             message: e.to_string(),
@@ -1031,7 +1055,8 @@ async fn poisoned_connection_retires_before_queued_top_level_request() {
 
 #[test]
 fn operation_failure_with_failed_rollback_reports_side_effects_unknown() {
-    let conn = Connection::open_in_memory().expect("in-memory connection");
+    let conn =
+        crate::test_hooks::registered(Connection::open_in_memory().expect("in-memory connection"));
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
         .unwrap();
     let executions = Arc::new(AtomicUsize::new(0));
@@ -1040,7 +1065,7 @@ fn operation_failure_with_failed_rollback_reports_side_effects_unknown() {
     let request = WriteRequest {
         op: Box::new(move |conn| -> Result<(), StorageError> {
             executions_in_op.fetch_add(1, Ordering::SeqCst);
-            conn.authorizer(Some(deny_rollback))
+            conn.test_authorizer(Some(deny_rollback))
                 .map_err(|e| StorageError::Pool {
                     operation: "test_install_authorizer".into(),
                     message: e.to_string(),
@@ -1050,10 +1075,20 @@ fn operation_failure_with_failed_rollback_reports_side_effects_unknown() {
             ))
         }),
         reply: reply_tx,
+        receipt: Arc::new(ReplyReceipt::default()),
         top_level: false,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
-        telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
+        lease_class: Default::default(),
+        telemetry: WriteTelemetry::new(
+            None,
+            "test".to_string(),
+            0,
+            None,
+            SubmitLabels::None,
+            false,
+            false,
+        ),
         admission: None,
     };
 
@@ -1081,7 +1116,8 @@ fn operation_failure_with_failed_rollback_reports_side_effects_unknown() {
 
 #[test]
 fn wrapped_panic_with_failed_rollback_reports_side_effects_unknown() {
-    let conn = Connection::open_in_memory().expect("in-memory connection");
+    let conn =
+        crate::test_hooks::registered(Connection::open_in_memory().expect("in-memory connection"));
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
         .unwrap();
     let (reply_tx, mut reply_rx) = oneshot::channel();
@@ -1099,10 +1135,20 @@ fn wrapped_panic_with_failed_rollback_reports_side_effects_unknown() {
             panic!("intentional panic after illicit commit");
         }),
         reply: reply_tx,
+        receipt: Arc::new(ReplyReceipt::default()),
         top_level: false,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
-        telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
+        lease_class: Default::default(),
+        telemetry: WriteTelemetry::new(
+            None,
+            "test".to_string(),
+            0,
+            None,
+            SubmitLabels::None,
+            false,
+            false,
+        ),
         admission: None,
     };
 
@@ -1377,8 +1423,10 @@ async fn closed_receiver_rejects_all_send_surfaces_as_not_started() {
         backend_key: None,
         db: "test".to_string(),
         slow_write_threshold: None,
+        attempt_log: false,
         enqueue_timeout: Duration::from_secs(5),
         admission_metrics: WriterAdmissionMetrics::new(),
+        strict_routing: false,
     };
     let send_result = handle.send(|_conn| Ok::<(), StorageError>(())).await;
     assert_writer_task_terminal_state(send_result, WriterTaskRequestState::NotStarted);
@@ -1405,8 +1453,10 @@ async fn accepted_request_lost_reply_is_side_effects_unknown() {
         backend_key: None,
         db: "test".to_string(),
         slow_write_threshold: None,
+        attempt_log: false,
         enqueue_timeout: Duration::from_secs(5),
         admission_metrics: WriterAdmissionMetrics::new(),
+        strict_routing: false,
     };
     let request_ran = Arc::new(AtomicBool::new(false));
     let request_ran_in_op = Arc::clone(&request_ran);
@@ -1472,7 +1522,7 @@ impl TestWriterStageClock for ControlledWriterClock {
 
 #[test]
 fn writer_stage_sample_attributes_body_and_commit_at_boundaries() {
-    let conn = Connection::open_in_memory().unwrap();
+    let conn = crate::test_hooks::registered(Connection::open_in_memory().unwrap());
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -1483,8 +1533,15 @@ fn writer_stage_sample_attributes_body_and_commit_at_boundaries() {
         micros: std::sync::atomic::AtomicU64::new(0),
     });
     let body_clock = Arc::clone(&clock);
-    let mut telemetry =
-        WriteTelemetry::new(key.clone(), "test".into(), 0, None, SubmitLabels::None);
+    let mut telemetry = WriteTelemetry::new(
+        key.clone(),
+        "test".into(),
+        0,
+        None,
+        SubmitLabels::None,
+        false,
+        false,
+    );
     telemetry.test_clock = Some(clock);
     let (reply_tx, mut reply_rx) = oneshot::channel();
     let request = WriteRequest {
@@ -1497,9 +1554,11 @@ fn writer_stage_sample_attributes_body_and_commit_at_boundaries() {
                 })
         }),
         reply: reply_tx,
+        receipt: Arc::new(ReplyReceipt::default()),
         top_level: false,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
+        lease_class: Default::default(),
         telemetry,
         admission: None,
     };
@@ -1532,7 +1591,7 @@ fn writer_stage_sample_attributes_body_and_commit_at_boundaries() {
 
 #[test]
 fn wrapped_transaction_synthetic_commit_and_rollback() {
-    let conn = Connection::open_in_memory().unwrap();
+    let conn = crate::test_hooks::registered(Connection::open_in_memory().unwrap());
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE")
         .unwrap();
     let (result, terminal) = execute_wrapped_transaction(&conn, "test_commit", |conn| {
@@ -1715,7 +1774,7 @@ async fn writer_task_failure_counters_are_acquisition_site_exact() {
 
         let active_result = handle
             .send(|conn| -> Result<(), StorageError> {
-                conn.authorizer(Some(deny_rollback))
+                conn.test_authorizer(Some(deny_rollback))
                     .map_err(|e| StorageError::Pool {
                         operation: "test_install_authorizer".into(),
                         message: e.to_string(),
@@ -1753,3 +1812,98 @@ async fn writer_task_failure_counters_are_acquisition_site_exact() {
 
 #[path = "writer_task_admission_metrics_tests.rs"]
 mod admission_metrics_tests;
+
+// The lease class of the issuing future reaches the writer thread that takes
+// the volume lease: work scoped as migration on the caller is recorded as
+// migration on the writer task, and unscoped work keeps the site's class.
+#[tokio::test]
+#[serial(tx_registry)]
+async fn writer_task_applies_the_issuers_lease_class_on_the_writer_thread() {
+    use crate::disk_guard::{effective_class, LeaseClass, WriteClassContext};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("writer_task_lease_class.db");
+    let pool = file_pool(&path);
+    let handle = spawn(&pool, 8).expect("writer task should spawn on a file-backed pool");
+
+    let scoped = WriteClassContext::migration()
+        .scope_future(handle.send(|_conn| Ok(effective_class(LeaseClass::WriterTask))))
+        .await
+        .expect("scoped op should succeed");
+    assert_eq!(scoped, LeaseClass::Migration);
+
+    let unscoped = handle
+        .send(|_conn| Ok(effective_class(LeaseClass::WriterTask)))
+        .await
+        .expect("unscoped op should succeed");
+    assert_eq!(unscoped, LeaseClass::WriterTask);
+}
+
+/// Holds of at least half a second recorded under `class` so far; see
+/// `pool_identity_admission_tests::long_holds`.
+fn long_holds(class: crate::disk_guard::LeaseClass) -> u64 {
+    let holds = crate::disk_guard::lease_hold_snapshot().expect("lease holds available");
+    let (_, histogram) = holds
+        .iter()
+        .find(|(recorded, _)| *recorded == class)
+        .expect("every class is reported");
+    histogram.buckets[11..].iter().sum::<u64>() + histogram.overflow_count
+}
+
+/// Waits up to five seconds for `long_holds(class)` to reach `at_least` and
+/// returns the last reading. The writer thread sends the reply before it
+/// releases the volume lease, and the hold is recorded at release, so the
+/// awaiting caller can read the histogram before the hold lands.
+async fn long_holds_reaching(class: crate::disk_guard::LeaseClass, at_least: u64) -> u64 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let now = long_holds(class);
+        if now >= at_least || std::time::Instant::now() >= deadline {
+            return now;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+// Every queue entry point records the writer thread's lease under the class
+// the issuer was scoped to, and an unscoped request under the writer task's.
+#[tokio::test]
+#[serial(tx_registry)]
+async fn every_queue_entry_point_records_the_lease_under_the_issuers_class() {
+    use crate::disk_guard::{LeaseClass, WriteClassContext};
+
+    let dir = tempfile::tempdir().unwrap();
+    let pool = file_pool(&dir.path().join("writer_task_lease_report.db"));
+    let handle = spawn(&pool, 8).expect("writer task should spawn on a file-backed pool");
+    let hold = |_conn: &rusqlite::Connection| {
+        std::thread::sleep(Duration::from_millis(600));
+        Ok::<(), StorageError>(())
+    };
+
+    let migration = WriteClassContext::migration();
+    let before = long_holds(LeaseClass::Migration);
+    migration.scope_future(handle.send(hold)).await.unwrap();
+    migration
+        .scope_future(handle.send_bounded(hold))
+        .await
+        .unwrap();
+    migration
+        .scope_future(handle.send_top_level(hold))
+        .await
+        .unwrap();
+    migration
+        .scope_future(handle.send_at(hold, "lease_report_test"))
+        .await
+        .unwrap();
+    assert!(
+        long_holds_reaching(LeaseClass::Migration, before + 4).await >= before + 4,
+        "four 600 ms holds queued under a migration context are recorded as migration"
+    );
+
+    let before = long_holds(LeaseClass::WriterTask);
+    handle.send(hold).await.unwrap();
+    assert!(
+        long_holds_reaching(LeaseClass::WriterTask, before + 1).await > before,
+        "an unscoped request keeps the writer task's class"
+    );
+}

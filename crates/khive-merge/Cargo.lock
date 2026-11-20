@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "khive-changeset"
-version = "0.18.0"
+version = "0.21.0"
 dependencies = [
  "khive-types",
  "serde",
@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "khive-channel"
-version = "0.18.0"
+version = "0.21.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -772,7 +772,7 @@ dependencies = [
 
 [[package]]
 name = "khive-db"
-version = "0.18.0"
+version = "0.21.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fold"
-version = "0.18.0"
+version = "0.21.0"
 dependencies = [
  "chrono",
  "khive-score",
@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fs"
-version = "0.18.0"
+version = "0.21.0"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "khive-fusion"
-version = "0.18.0"
+version = "0.21.0"
 dependencies = [
  "khive-score",
  "serde",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "khive-gate"
-version = "0.18.0"
+version = "0.21.0"
 dependencies = [
  "chrono",
  "khive-types",
@@ -844,7 +844,7 @@ dependencies = [
 
 [[package]]
 name = "khive-merge"
-version = "0.18.0"
+version = "0.21.0"
 dependencies = [
  "chrono",
  "khive-runtime",
@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "khive-query"
-version = "0.18.0"
+version = "0.21.0"
 dependencies = [
  "khive-types",
  "thiserror",
@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "khive-retrieval"
-version = "0.18.0"
+version = "0.21.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -887,7 +887,7 @@ dependencies = [
 
 [[package]]
 name = "khive-runtime"
-version = "0.18.0"
+version = "0.21.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "khive-score"
-version = "0.18.0"
+version = "0.21.0"
 dependencies = [
  "khive-types",
  "serde",
@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "khive-storage"
-version = "0.18.0"
+version = "0.21.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -952,12 +952,13 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "unicode-general-category",
  "uuid",
 ]
 
 [[package]]
 name = "khive-types"
-version = "0.18.0"
+version = "0.21.0"
 dependencies = [
  "blake3",
  "serde",
@@ -1195,9 +1196,9 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.1"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6c19a05435c21ac299d71b6a9c13db3e3f47c520517d58990a462a1397a61db"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -1489,9 +1490,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.40.1"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11438310b19e3109b6446c33d1ed5e889428cf2e278407bc7896bc4aaea43323"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags",
  "fallible-iterator",

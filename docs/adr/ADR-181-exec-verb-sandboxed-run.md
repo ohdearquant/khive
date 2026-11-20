@@ -956,9 +956,12 @@ accepted by its driven arms, never by its text.
    it is not. Per-destination egress is later work and is not decided here.
 
    Re-registering an existing name keeps the stored row unchanged (ADR-180 test
-   `re_registration_keeps_the_approved_object_and_definition`), so a `network` passed on a
+   `re_registration_updates_definition_and_invalidates_only_mismatched_grants`), so a `network` passed on a
    re-registration does not reach the row. `tool.describe`, `tool.list` and the register response
    report the stored `network`, so the caller sees what is stored rather than what was asked.
+
+   ADR-180 Amendment 10 rewrites the existing-name behavior of `tool.register`: supplied fields
+   correct the row, and a source or kind change on any existing row, this one included, is refused.
 
    Which registrations may carry `network` is the hosting deployment's registration policy, not
    exec's. exec enforces the declaration a row carries; it does not decide eligibility, and nothing
@@ -1356,6 +1359,8 @@ item 8).
 
    An upgraded executable is a new registration under a new name, granted again. Re-registering an existing name never
    changes the stored row (item 2).
+   ADR-180 Amendment 10 rewrites this for `tool.register`: other supplied fields correct the row, and a source
+   or kind change on any existing row, this one included, is refused.
 
 2. **Re-registration refuses a conflicting network declaration.** `tool.register` on a name that already has a row
    validates a passed `network` or `executable_digest` as it would for a new row. When a passed value differs from the
@@ -1366,7 +1371,7 @@ item 8).
    `claim_entity_if_absent` returns the winner with `created` false after checking only its identity
    (`handlers.rs:463-478`, `khive-runtime/src/operations/entity_create.rs:103-135`). It runs before any capability link
    is written. This replaces Amendment 13 Decision item 1's statement that a re-registration's `network` silently does
-   not reach the row. ADR-180's `re_registration_keeps_the_approved_object_and_definition` passes neither property and is
+   not reach the row. ADR-180's `re_registration_updates_definition_and_invalidates_only_mismatched_grants` passes neither property and is
    unaffected.
 
 3. **The host setting is named, typed and bound to measured builds.** The setting is the `[exec.network]` table of the

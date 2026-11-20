@@ -2713,3 +2713,345 @@ fn code_map_values_of_the_wrong_type_fail_configuration_load() {
         assert!(error.contains(key), "{error}");
     }
 }
+
+fn write_config(root: &std::path::Path, rel: &str, body: &str) {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, body).unwrap();
+}
+
+#[test]
+fn require_attributed_in_a_home_config_holds_beside_a_project_khive_toml_without_it() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        "khive.toml",
+        "[actor]\nid = \"lambda:project\"\n",
+    );
+    write_config(
+        home_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nrequire_attributed = true\n",
+    );
+    let first = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()), None)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !first.actor.require_attributed,
+        "the first-found file lacks the key"
+    );
+    let any =
+        KhiveConfig::require_attributed_in_tiers(project_dir.path(), Some(home_dir.path()), None);
+    assert!(any.unwrap(), "the home file's key is not shadowed");
+}
+
+#[test]
+fn require_attributed_in_a_home_config_holds_beside_a_project_dot_khive_config_without_it() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nid = \"lambda:project\"\n",
+    );
+    write_config(
+        home_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nrequire_attributed = true\n",
+    );
+    let any =
+        KhiveConfig::require_attributed_in_tiers(project_dir.path(), Some(home_dir.path()), None);
+    assert!(any.unwrap());
+}
+
+#[test]
+fn require_attributed_is_off_when_no_tier_sets_it() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        "khive.toml",
+        "[actor]\nid = \"lambda:project\"\n",
+    );
+    write_config(
+        home_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nid = \"lambda:home\"\n",
+    );
+    let any =
+        KhiveConfig::require_attributed_in_tiers(project_dir.path(), Some(home_dir.path()), None);
+    assert!(!any.unwrap());
+}
+
+#[test]
+fn an_explicit_config_is_the_only_file_read_for_require_attributed() {
+    let dir = tempfile::tempdir().unwrap();
+    write_config(
+        dir.path(),
+        "explicit.toml",
+        "[actor]\nid = \"lambda:explicit\"\n",
+    );
+    let explicit = dir.path().join("explicit.toml");
+    assert!(!KhiveConfig::require_attributed_in_any_tier(Some(&explicit), None).unwrap());
+    write_config(
+        dir.path(),
+        "strict.toml",
+        "[actor]\nrequire_attributed = true\n",
+    );
+    let strict = dir.path().join("strict.toml");
+    assert!(KhiveConfig::require_attributed_in_any_tier(Some(&strict), None).unwrap());
+}
+
+#[test]
+fn require_attributed_in_a_database_anchored_config_holds_beside_a_cwd_khive_toml_without_it() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let db_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        "khive.toml",
+        "[actor]\nid = \"lambda:project\"\n",
+    );
+    write_config(
+        db_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nrequire_attributed = true\n",
+    );
+    let db = db_dir.path().join(".khive/khive.db");
+    let first = KhiveConfig::load_with_roots(project_dir.path(), None, Some(&db))
+        .unwrap()
+        .unwrap();
+    assert!(
+        !first.actor.require_attributed,
+        "the cwd khive.toml shadows the database-anchored file"
+    );
+    let any = KhiveConfig::require_attributed_in_tiers(project_dir.path(), None, Some(&db));
+    assert!(
+        any.unwrap(),
+        "the database-anchored file's key is not shadowed"
+    );
+}
+
+/// The refusal a shadowed tier's load failure produces, with its display text.
+fn shadowed_tier_refusal(result: Result<bool, ConfigError>) -> (PathBuf, Option<PathBuf>, String) {
+    match result {
+        Err(error @ ConfigError::ShadowedTier { .. }) => {
+            let text = error.to_string();
+            let ConfigError::ShadowedTier { path, in_use, .. } = error else {
+                unreachable!()
+            };
+            (path, in_use, text)
+        }
+        other => panic!("expected a shadowed-tier refusal, got {other:?}"),
+    }
+}
+
+fn canonical(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap()
+}
+
+#[test]
+fn a_malformed_shadowed_tier_is_refused_naming_the_file_and_the_file_in_use() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        "khive.toml",
+        "[actor]\nid = \"agent:proj\"\n",
+    );
+    write_config(home_dir.path(), ".khive/config.toml", "[actor\n");
+    let shadowed = canonical(&home_dir.path().join(".khive/config.toml"));
+    let used = canonical(&project_dir.path().join("khive.toml"));
+    let (path, in_use, text) = shadowed_tier_refusal(KhiveConfig::require_attributed_in_tiers(
+        project_dir.path(),
+        Some(home_dir.path()),
+        None,
+    ));
+    assert_eq!(path, shadowed);
+    assert_eq!(in_use.as_deref(), Some(used.as_path()));
+    assert_eq!(
+        text.split(": TOML parse error").next().unwrap(),
+        format!(
+            "config file {} is not the file in use (in use: {}); it was read only to look for \
+             `[actor] require_attributed`, which could not be read from it: config TOML parse \
+             error in {}",
+            shadowed.display(),
+            used.display(),
+            shadowed.display()
+        ),
+        "{text}"
+    );
+    assert!(text.contains("invalid table header"), "{text}");
+}
+
+#[test]
+fn a_shadowed_tier_with_an_unknown_key_is_refused_naming_the_key() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        "khive.toml",
+        "[actor]\nid = \"agent:proj\"\n",
+    );
+    write_config(
+        home_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nid = \"agent:home\"\nrequire_attributes = true\n",
+    );
+    let (path, in_use, text) = shadowed_tier_refusal(KhiveConfig::require_attributed_in_tiers(
+        project_dir.path(),
+        Some(home_dir.path()),
+        None,
+    ));
+    assert_eq!(path, canonical(&home_dir.path().join(".khive/config.toml")));
+    assert_eq!(
+        in_use,
+        Some(canonical(&project_dir.path().join("khive.toml")))
+    );
+    assert!(
+        text.contains("was read only to look for `[actor] require_attributed`"),
+        "{text}"
+    );
+    assert!(text.contains("require_attributes"), "{text}");
+}
+
+#[test]
+fn a_malformed_file_in_use_keeps_its_own_parse_error() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(project_dir.path(), "khive.toml", "[actor\n");
+    write_config(
+        home_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nid = \"agent:home\"\n",
+    );
+    let result =
+        KhiveConfig::require_attributed_in_tiers(project_dir.path(), Some(home_dir.path()), None);
+    assert!(
+        matches!(&result, Err(ConfigError::Parse { path, .. }) if path.ends_with("khive.toml")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_malformed_cwd_config_beside_a_database_anchored_tier_names_no_file_in_use() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let db_dir = tempfile::tempdir().unwrap();
+    write_config(project_dir.path(), ".khive/config.toml", "[actor\n");
+    let db = db_dir.path().join(".khive/khive.db");
+    let (path, in_use, text) = shadowed_tier_refusal(KhiveConfig::require_attributed_in_tiers(
+        project_dir.path(),
+        None,
+        Some(&db),
+    ));
+    assert_eq!(
+        path,
+        canonical(&project_dir.path().join(".khive/config.toml"))
+    );
+    assert_eq!(in_use, None);
+    assert!(text.contains("(in use: none)"), "{text}");
+}
+
+#[test]
+fn knowledge_import_roots_parse_closed_and_absolute() {
+    let parsed: KhiveConfig =
+        toml::from_str("[knowledge]\nimport_roots = [\"/srv/atlas\"]\n").unwrap();
+    assert_eq!(
+        parsed.knowledge.import_roots,
+        vec![PathBuf::from("/srv/atlas")]
+    );
+    parsed.validate().expect("an absolute root validates");
+    assert!(KhiveConfig::default().knowledge.import_roots.is_empty());
+
+    let unknown = toml::from_str::<KhiveConfig>("[knowledge]\nimport_root = [\"/srv\"]\n");
+    assert!(unknown.is_err(), "a misspelled key fails to parse");
+
+    let relative: KhiveConfig =
+        toml::from_str("[knowledge]\nimport_roots = [\"atlas\"]\n").unwrap();
+    let error = relative.validate().expect_err("a relative root is refused");
+    assert!(
+        error.to_string().contains("knowledge.import_roots"),
+        "{error}"
+    );
+}
+
+#[test]
+fn git_digest_sources_parse_closed_and_checked() {
+    let parsed: KhiveConfig = toml::from_str(
+        "[git_digest]\nlocal_roots = [\"/srv/repos\"]\nremotes = [\"https://example.com/org/a\"]\n",
+    )
+    .unwrap();
+    parsed
+        .validate()
+        .expect("absolute roots and https remotes validate");
+    assert_eq!(
+        parsed.git_digest.local_roots,
+        vec![PathBuf::from("/srv/repos")]
+    );
+    assert!(KhiveConfig::default().git_digest == GitDigestSectionConfig::default());
+
+    assert!(toml::from_str::<KhiveConfig>("[git_digest]\nroots = []\n").is_err());
+
+    let relative: KhiveConfig =
+        toml::from_str("[git_digest]\nlocal_roots = [\"repos\"]\n").unwrap();
+    let error = relative.validate().expect_err("a relative root is refused");
+    assert!(
+        error.to_string().contains("git_digest.local_roots"),
+        "{error}"
+    );
+
+    let ssh: KhiveConfig =
+        toml::from_str("[git_digest]\nremotes = [\"ssh://example.com/a\"]\n").unwrap();
+    let error = ssh.validate().expect_err("a non-https remote is refused");
+    assert!(
+        error.to_string().contains("git_digest.remotes")
+            && error.to_string().contains("is not an https:// URL"),
+        "{error}"
+    );
+
+    for broad in [
+        "https://github.com/ohdearquant",
+        "https://github.com/ohdearquant/",
+        "https://github.com",
+        "https://github.com/ohdearquant/*",
+        "https://github.com/*/khive",
+        "https://github.com//khive",
+        "https://github.com/ohdearquant/khive?all",
+    ] {
+        let parsed: KhiveConfig =
+            toml::from_str(&format!("[git_digest]\nremotes = [{broad:?}]\n")).unwrap();
+        let error = parsed
+            .validate()
+            .expect_err("an entry naming more or less than one repository is refused");
+        assert!(
+            error.to_string().contains("does not name one repository"),
+            "{broad}: {error}"
+        );
+    }
+    for exact in [
+        "https://github.com/ohdearquant/khive",
+        "https://github.com/ohdearquant/khive.git",
+        "https://github.com/ohdearquant/khive/",
+        "https://gitlab.example/group/subgroup/repo",
+    ] {
+        let parsed: KhiveConfig =
+            toml::from_str(&format!("[git_digest]\nremotes = [{exact:?}]\n")).unwrap();
+        parsed
+            .validate()
+            .unwrap_or_else(|error| panic!("{exact} names one repository: {error}"));
+    }
+}
+
+#[test]
+fn code_ingest_roots_parse_closed_and_absolute() {
+    let parsed: KhiveConfig = toml::from_str("[code_ingest]\nroots = [\"/srv/code\"]\n").unwrap();
+    parsed.validate().expect("absolute roots validate");
+    assert_eq!(parsed.code_ingest.roots, vec![PathBuf::from("/srv/code")]);
+    assert!(KhiveConfig::default().code_ingest == CodeIngestSectionConfig::default());
+
+    assert!(toml::from_str::<KhiveConfig>("[code_ingest]\nimport_roots = []\n").is_err());
+
+    let relative: KhiveConfig = toml::from_str("[code_ingest]\nroots = [\"code\"]\n").unwrap();
+    let error = relative.validate().expect_err("a relative root is refused");
+    assert!(error.to_string().contains("code_ingest.roots"), "{error}");
+}

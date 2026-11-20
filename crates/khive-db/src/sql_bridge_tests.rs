@@ -1,5 +1,6 @@
 use super::*;
 use crate::pool::PoolConfig;
+use crate::test_hooks::TestHooks;
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{SqlAccess as _, SqlReader as _};
 
@@ -76,21 +77,18 @@ fn blocking_non_interrupting_progress_gate(
     let notify_on_drop = NotifyOnDrop(Arc::clone(&completed));
     let blocked_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let callback_blocked_once = Arc::clone(&blocked_once);
-    conn.progress_handler(
-        1_000,
-        Some(move || {
-            let _keep_until_connection_drop = &notify_on_drop;
-            if !callback_blocked_once.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                callback_entered.notify_one();
-                callback_release.wait();
-                // The gate deliberately stalls but never asks SQLite to
-                // abort. It proves completion-preserving SQLite work ignores
-                // request-read cancellation and finishes normally.
-                return false;
-            }
-            false
-        }),
-    )
+    conn.test_progress_handler(Some(move || {
+        let _keep_until_connection_drop = &notify_on_drop;
+        if !callback_blocked_once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            callback_entered.notify_one();
+            callback_release.wait();
+            // The gate deliberately stalls but never asks SQLite to
+            // abort. It proves completion-preserving SQLite work ignores
+            // request-read cancellation and finishes normally.
+            return false;
+        }
+        false
+    }))
     .unwrap();
     (entered, release, completed)
 }
@@ -959,10 +957,10 @@ async fn raw_pooled_writer_retires_cleanup_failure_during_unwind() {
             StorageCapability::Sql,
             "raw_writer_unwind_cleanup",
             move |scope| {
-                let guard = worker_pool.try_writer().map_err(|error| {
+                let mut guard = worker_pool.try_writer().map_err(|error| {
                     StorageError::driver(StorageCapability::Sql, "raw_writer_unwind_cleanup", error)
                 })?;
-                scope.with_pooled_writer(&worker_pool, &guard, |conn| {
+                scope.with_pooled_writer(&worker_pool, &mut guard, |conn| {
                     scope.run(conn, || -> khive_storage::types::StorageResult<()> {
                         panic!("injected raw writer panic after progress registration")
                     })
@@ -983,7 +981,7 @@ async fn raw_pooled_writer_retires_cleanup_failure_during_unwind() {
 
 #[test]
 fn query_row_converts_only_the_first_matching_row() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
     let statement = SqlStatement {
         sql: "WITH RECURSIVE rows(value) AS (\
                   SELECT 0 UNION ALL SELECT value + 1 FROM rows WHERE value < 99\
@@ -1051,7 +1049,7 @@ fn integer_consumer_statement() -> SqlStatement {
 
 #[test]
 fn query_consume_orders_rows_and_stops_conversion_at_consumer_failure() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
     let statement = integer_consumer_statement();
     ROW_CONVERSIONS.with(|count| count.set(0));
     let consumer = query_execution::execute_prepared_query_consume(
@@ -1459,7 +1457,7 @@ async fn query_consume_observes_cancellation_after_a_consumer_visit() {
 
 #[test]
 fn query_page_bounds_owned_rows_before_full_materialization() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
     let statement = SqlStatement {
         sql: "WITH RECURSIVE rows(value) AS (\
                   SELECT 0 UNION ALL SELECT value + 1 FROM rows WHERE value < 99\
@@ -1488,7 +1486,7 @@ fn query_page_bounds_owned_rows_before_full_materialization() {
 
 #[test]
 fn query_page_zero_limit_converts_no_rows_but_still_validates_sql() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
     let statement = SqlStatement {
         sql: "WITH RECURSIVE rows(value) AS (\
                   SELECT 0 UNION ALL SELECT value + 1 FROM rows WHERE value < 99\
@@ -1533,7 +1531,7 @@ fn query_page_zero_limit_converts_no_rows_but_still_validates_sql() {
 
 #[test]
 fn cached_writer_prepare_preserves_the_single_statement_boundary() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
     assert!(matches!(
         prepare_cached_sql_statement(&conn, "SELECT 1; SELECT 2"),
         Err(rusqlite::Error::MultipleStatement)
@@ -1571,7 +1569,7 @@ async fn queue_backed_execute_reuses_the_persistent_connection_statement_cache()
     let hook_count = Arc::clone(&prepare_count);
     writer_task
         .send_top_level(move |conn| {
-            conn.authorizer(Some(move |context: AuthContext<'_>| {
+            conn.test_authorizer(Some(move |context: AuthContext<'_>| {
                 if matches!(
                     context.action,
                     AuthAction::Insert { table_name } if table_name == "writer_cache_test"
@@ -1608,7 +1606,7 @@ async fn queue_backed_execute_reuses_the_persistent_connection_statement_cache()
     );
     writer_task
         .send_top_level(|conn| {
-            conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
                 .map_err(|error| map_rusqlite_err(error, "test.remove_authorizer"))
         })
         .await
@@ -1620,7 +1618,7 @@ fn inline_execute_batch_prepares_each_statement_once() {
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
     conn.execute_batch(
         "CREATE TABLE single_prepare_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
     )
@@ -1666,7 +1664,7 @@ fn inline_execute_batch_prepares_each_statement_once() {
 
 #[test]
 fn inline_execute_batch_preserves_schema_dependencies_between_statements() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
     let mut writer = InlineWriter {
         event_rows: None,
         conn: &conn as *const rusqlite::Connection,
@@ -2011,7 +2009,7 @@ async fn pooled_raw_sql_read_counts_busy_handler_timeouts() {
     assert!(matches!(value, Some(SqlValue::Integer(0))), "{value:?}");
     assert_eq!(pool.reader_acquisition_snapshot().busy_timeouts, 0);
 
-    let holder = rusqlite::Connection::open(&path).unwrap();
+    let holder = crate::test_hooks::registered(rusqlite::Connection::open(&path).unwrap());
     holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
     let refused = reader.query_scalar(count()).await.unwrap_err();
     assert!(
@@ -2230,11 +2228,11 @@ async fn failed_cached_reader_begin_does_not_register_a_transaction() {
     };
     let pool = Arc::new(ConnectionPool::new(config).unwrap());
     let origin_view = database_tx_view(&pool);
-    let conn = open_standalone_reader(&pool).unwrap();
+    let mut conn = open_standalone_reader(&pool).unwrap();
     conn.authorizer(Some(deny_begin)).unwrap();
     let mut reader = SqliteReader {
         handle: Some(StandaloneHandle {
-            conn,
+            conn: crate::ProgressConn::new(conn).unwrap(),
             _retained_slot: None,
             read_transaction_slot: None,
         }),
@@ -2286,7 +2284,7 @@ async fn failed_cached_reader_rollback_deregisters_only_when_connection_is_disca
     let conn = open_standalone_reader(&pool).unwrap();
     let mut reader = SqliteReader {
         handle: Some(StandaloneHandle {
-            conn,
+            conn: crate::ProgressConn::new(conn).unwrap(),
             _retained_slot: None,
             read_transaction_slot: None,
         }),
@@ -2309,7 +2307,7 @@ async fn failed_cached_reader_rollback_deregisters_only_when_connection_is_disca
         .as_ref()
         .expect("reader must retain its connection")
         .conn
-        .authorizer(Some(deny_rollback))
+        .test_authorizer(Some(deny_rollback))
         .unwrap();
 
     let rollback = reader
@@ -2650,7 +2648,7 @@ async fn expired_cached_reader_transaction_rollback_denial_discards_connection_a
     let conn = open_standalone_reader(&pool).unwrap();
     let mut reader = SqliteReader {
         handle: Some(StandaloneHandle {
-            conn,
+            conn: crate::ProgressConn::new(conn).unwrap(),
             _retained_slot: None,
             read_transaction_slot: None,
         }),
@@ -2684,7 +2682,7 @@ async fn expired_cached_reader_transaction_rollback_denial_discards_connection_a
         .as_ref()
         .expect("reader must retain its connection")
         .conn
-        .authorizer(Some(deny_rollback))
+        .test_authorizer(Some(deny_rollback))
         .unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(40)).await;
@@ -3226,7 +3224,7 @@ async fn cached_reader_restores_autocommit_before_releasing_its_operation_permit
     );
     let mut reader = SqliteReader {
         handle: Some(StandaloneHandle {
-            conn,
+            conn: crate::ProgressConn::new(conn).unwrap(),
             _retained_slot: None,
             read_transaction_slot: None,
         }),
@@ -3554,7 +3552,7 @@ async fn abandoned_writer_read_interrupts_and_releases_writer_handle() {
         observe_direct_errors: true,
         event_rows: None,
         handle: Some(StandaloneHandle {
-            conn,
+            conn: crate::ProgressConn::new(conn).unwrap(),
             _retained_slot: Some(handle_slot),
             read_transaction_slot: None,
         }),
@@ -3622,7 +3620,7 @@ async fn request_cancellation_never_interrupts_admitted_execute_batch() {
         observe_direct_errors: true,
         event_rows: None,
         handle: Some(StandaloneHandle {
-            conn,
+            conn: crate::ProgressConn::new(conn).unwrap(),
             _retained_slot: Some(handle_slot),
             read_transaction_slot: None,
         }),
@@ -3716,7 +3714,7 @@ async fn request_cancellation_never_interrupts_dml_returning_via_sql_reader() {
         observe_direct_errors: true,
         event_rows: None,
         handle: Some(StandaloneHandle {
-            conn,
+            conn: crate::ProgressConn::new(conn).unwrap(),
             _retained_slot: Some(handle_slot),
             read_transaction_slot: None,
         }),
@@ -3809,7 +3807,7 @@ async fn cancelled_call_invalidates_handle_reuse_fails_loud() {
         observe_direct_errors: true,
         event_rows: None,
         handle: Some(StandaloneHandle {
-            conn,
+            conn: crate::ProgressConn::new(conn).unwrap(),
             _retained_slot: Some(handle_slot),
             read_transaction_slot: None,
         }),
@@ -4286,7 +4284,7 @@ fn cached_read_transaction_control_classification_matrix() {
 
 #[test]
 fn sqlite_accepts_utf8_bom_before_transaction_control() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
     conn.execute_batch("CREATE TABLE bom_transaction_test (id INTEGER)")
         .unwrap();
     conn.execute_batch("\u{feff}BEGIN IMMEDIATE").unwrap();
@@ -4450,13 +4448,13 @@ async fn failed_rollback_poisons_handle_reuse_fails_loud() {
     )
     .await
     .unwrap();
-    let conn = open_external_writer_fixture(&pool).unwrap();
+    let mut conn = open_external_writer_fixture(&pool).unwrap();
     conn.authorizer(Some(deny_rollback)).unwrap();
     let mut writer = SqliteWriter {
         observe_direct_errors: true,
         event_rows: None,
         handle: Some(StandaloneHandle {
-            conn,
+            conn: crate::ProgressConn::new(conn).unwrap(),
             _retained_slot: Some(handle_slot),
             read_transaction_slot: None,
         }),
@@ -4568,7 +4566,7 @@ async fn non_transient_begin_failure_poisons_handle() {
         observe_direct_errors: true,
         event_rows: None,
         handle: Some(StandaloneHandle {
-            conn,
+            conn: crate::ProgressConn::new(conn).unwrap(),
             _retained_slot: Some(handle_slot),
             read_transaction_slot: None,
         }),
@@ -4679,7 +4677,7 @@ async fn busy_begin_failure_restores_handle_reusable() {
         observe_direct_errors: true,
         event_rows: None,
         handle: Some(StandaloneHandle {
-            conn,
+            conn: crate::ProgressConn::new(conn).unwrap(),
             _retained_slot: Some(handle_slot),
             read_transaction_slot: None,
         }),
@@ -4975,7 +4973,7 @@ async fn in_memory_atomic_unit_terminal_fault_retires_writer() {
                 .unwrap();
             guard
                 .conn()
-                .authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
+                .test_authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
                     AuthAction::Transaction {
                         operation: TransactionOperation::Rollback,
                     } if deny_rollback => Authorization::Deny,

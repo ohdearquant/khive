@@ -311,11 +311,11 @@ mod embedder_registry_tests {
     }
 
     impl Pack for EmbedderInitPack {
-        const NAME: &'static str = "embedder-init-test";
+        const NAME: &'static str = "embedder_init";
         const NOTE_KINDS: &'static [&'static str] = &[];
         const ENTITY_KINDS: &'static [&'static str] = &["concept"];
         const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
-            name: "initialize_embedder",
+            name: "embedder_init.initialize_embedder",
             description: "initialize the test embedder",
             visibility: Visibility::Verb,
             category: VerbCategory::Commissive,
@@ -480,15 +480,12 @@ mod embedder_registry_tests {
 
         registry
             .dispatch_with_identity(
-                "initialize_embedder",
+                "embedder_init.initialize_embedder",
                 serde_json::json!({"namespace": tenant.as_str()}),
                 Some(RequestIdentity {
-                    owned_namespaces: Vec::new(),
                     namespace: tenant.as_str().to_string(),
                     actor_id: Some("request-actor".to_string()),
-                    visible_namespaces: vec![],
-                    process_ref: None,
-                    request_id: None,
+                    ..Default::default()
                 }),
             )
             .await

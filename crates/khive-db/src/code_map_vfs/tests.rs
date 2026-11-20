@@ -886,10 +886,7 @@ fn migration_failure_names_a_recorded_refusal_once() {
         matches!(&unrelated, SqliteError::InvalidData(message) if message == "unrelated"),
         "{unrelated}"
     );
-    let failed = || SqliteError::Migration {
-        version: 5,
-        error: "unable to open database file".into(),
-    };
+    let failed = || SqliteError::migration_message(5, "unable to open database file");
     assert_eq!(
         super::with_refusal(failed(), &name).to_string(),
         "migration v5 failed: unable to open database file; code-map VFS refused the Journal \
@@ -968,10 +965,7 @@ fn migration_failure_for_another_cause_leaves_the_refusal() {
     let guard = Arc::new(CodeMapHandleGuard::new(target, Mode::Rollback, vec![]).unwrap());
     let name = vfs::register(Arc::clone(&guard)).unwrap();
     guard.record_refusal("unrelated refusal".into());
-    let failed = SqliteError::Migration {
-        version: 5,
-        error: "near \"x\": syntax error".into(),
-    };
+    let failed = SqliteError::migration_message(5, "near \"x\": syntax error");
     assert_eq!(
         super::with_refusal(failed, &name).to_string(),
         "migration v5 failed: near \"x\": syntax error"

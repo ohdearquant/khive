@@ -1,5 +1,6 @@
 //! Public cached-writer admission and settlement witnesses.
 
+use crate::test_hooks::TestHooks;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -29,26 +30,28 @@ struct Probe {
 }
 
 fn pool(root: &Path, queued: bool) -> (Arc<ConnectionPool>, Probe) {
-    let mut pool = ConnectionPool::new(PoolConfig {
-        path: Some(root.join("writer-query.db")),
-        volume_lock_dir: Some(root.join("volume-locks")),
-        write_queue_enabled: Some(queued),
-        write_routing_strict: queued,
-        max_readers: 2,
-        ..PoolConfig::for_test()
-    })
-    .unwrap();
-    pool.standalone_transaction(|conn| {
-        conn.execute_batch(
-            "CREATE TABLE writable_query_rows (id INTEGER PRIMARY KEY, value INTEGER NOT NULL);
+    let path = root.join("writer-query.db");
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE writable_query_rows (id INTEGER PRIMARY KEY, value INTEGER NOT NULL);
              INSERT INTO writable_query_rows VALUES (1, 10);
              CREATE TABLE writable_query_effects (operation TEXT NOT NULL);
              CREATE TRIGGER writable_query_insert AFTER INSERT ON writable_query_rows
              BEGIN INSERT INTO writable_query_effects VALUES ('insert'); END;
              CREATE TRIGGER writable_query_update AFTER UPDATE ON writable_query_rows
              BEGIN INSERT INTO writable_query_effects VALUES ('update'); END;",
-        )?;
-        Ok(())
+            )
+            .unwrap();
+    }
+    let mut pool = ConnectionPool::new(PoolConfig {
+        path: Some(path),
+        volume_lock_dir: Some(root.join("volume-locks")),
+        write_queue_enabled: Some(queued),
+        write_routing_strict: queued,
+        max_readers: 2,
+        ..PoolConfig::for_test()
     })
     .unwrap();
     let probe = Probe {
@@ -338,7 +341,7 @@ pub(super) fn configure_test_connection(
     }
     if hooks.deny_rollback {
         let terminal = hooks.terminal;
-        conn.authorizer(Some(move |context: AuthContext<'_>| match context.action {
+        conn.test_authorizer(Some(move |context: AuthContext<'_>| match context.action {
             AuthAction::Transaction {
                 operation: TransactionOperation::Rollback,
             } => {
@@ -807,7 +810,7 @@ async fn cached_unsettled_script_reports_unknown_poisons_pool_and_releases_lease
         let _lease = identity
             .acquire(WATCHDOG, Some(&root.path().join("volume-locks")))
             .unwrap();
-        let conn = rusqlite::Connection::open(path).unwrap();
+        let conn = crate::test_hooks::registered(rusqlite::Connection::open(path).unwrap());
         conn.busy_timeout(Duration::ZERO).unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         assert_eq!(

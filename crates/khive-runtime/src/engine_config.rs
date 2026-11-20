@@ -18,7 +18,7 @@ mod backend_disk_guard;
 
 #[path = "engine_config_embed_batch.rs"]
 mod embed_batch;
-pub use embed_batch::EmbedSectionConfig;
+pub use embed_batch::{EmbedSectionConfig, EntityEmbeddingFields, LegacyEmbedDevice};
 
 #[path = "engine_config_peers.rs"]
 mod peers;
@@ -39,8 +39,8 @@ pub enum ConfigError {
     #[error("mount configuration: {reason}")]
     InvalidMountConfig { reason: String },
 
-    #[error("channel.node: {reason}")]
-    InvalidNodeConfig { reason: String },
+    #[error("channel configuration: {reason}")]
+    InvalidChannelConfig { reason: String },
 
     #[error("config file I/O: {0}")]
     Io(#[from] std::io::Error),
@@ -259,6 +259,23 @@ pub enum ConfigError {
         #[source]
         source: Box<ConfigError>,
     },
+
+    /// A discovery-tier file the loader does not use failed to load while it
+    /// was read only for `[actor] require_attributed`, which is ORed across
+    /// every tier. Still a refusal: the key could not be read from the file.
+    #[error(
+        "config file {} is not the file in use (in use: {}); it was read only to look for \
+         `[actor] require_attributed`, which could not be read from it: {source}",
+        path.display(),
+        in_use.as_deref().map_or_else(|| "none".to_string(), |used| used.display().to_string())
+    )]
+    ShadowedTier {
+        path: PathBuf,
+        /// The discovery-tier file the loader uses, if any exists.
+        in_use: Option<PathBuf>,
+        #[source]
+        source: Box<ConfigError>,
+    },
 }
 
 impl ConfigError {
@@ -293,6 +310,7 @@ impl ConfigError {
 /// id = "lambda:alice"                          # attribution identity (required)
 /// display_name = "example actor"   # human label (optional)
 /// visible_namespaces = ["lambda:khive", "local"]  # widens default read scope (ADR-007 Rev 4 Rule 3b)
+/// require_attributed = true                       # refuse comm without an actor (optional)
 /// ```
 ///
 /// `visible_namespaces` is consumed by OSS dispatch to widen the DEFAULT
@@ -363,6 +381,21 @@ pub struct ActorConfig {
     /// into an owned namespace and widens no read.
     #[serde(default)]
     pub owned_namespaces: Vec<String>,
+
+    /// Strict attributed-actor mode while the `comm` pack is loaded, exactly as
+    /// `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1`; either one turns it on and neither can
+    /// turn the other off. An actor is unattributed when it is absent, empty or
+    /// `local`. A server refuses to start and `kkernel exec` refuses to run when
+    /// its own actor is unattributed, and a daemon refuses each request whose
+    /// frame carries an unattributed actor, before anything dispatches.
+    /// Every other key comes from the first config file found; this one is ORed
+    /// across the database-anchored file and every existing discovery tier (cwd
+    /// `khive.toml`, cwd `.khive/config.toml`, `~/.khive/config.toml`), so a
+    /// project file without it cannot shadow a home file that sets it. An
+    /// explicit `--config`/`KHIVE_CONFIG` file is hermetic and is the only one
+    /// read. Valid without `id`. Defaults to `false`.
+    #[serde(default)]
+    pub require_attributed: bool,
 }
 
 /// Built-in caller-enrollment policy configured by `[gate]`.
@@ -659,6 +692,79 @@ pub struct BlobSectionConfig {
     /// Permit server-local file transfers. Absent means disabled.
     #[serde(default)]
     pub file_transfers: bool,
+}
+
+/// `[knowledge]` pack policy.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeSectionConfig {
+    /// Absolute directories `knowledge.import` may read from. A requested path is
+    /// resolved, symlinks included, before it is compared against the resolved
+    /// roots. Absent or empty refuses every import path.
+    #[serde(default)]
+    pub import_roots: Vec<std::path::PathBuf>,
+}
+
+/// Whether an `https://` remote entry names exactly one repository: a host and at
+/// least an owner and a repository segment, with no empty segment, wildcard, query or
+/// fragment. An entry matches only the repository it names, so an owner-level entry
+/// would admit nothing and a pattern would read as wider than it is; both are refused.
+fn names_one_repository(remote: &str) -> bool {
+    let Some(rest) = remote.strip_prefix("https://") else {
+        return false;
+    };
+    if rest.contains(['*', '?', '#', '[', ']']) {
+        return false;
+    }
+    let rest = rest.trim_end_matches('/');
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let mut segments = rest.split('/');
+    let host = segments.next().unwrap_or("");
+    let path: Vec<&str> = segments.collect();
+    !host.is_empty() && path.len() >= 2 && path.iter().all(|segment| !segment.is_empty())
+}
+
+/// `[git_digest]` policy: the sources `git.digest` may read. Absent or empty
+/// lists refuse every source of that kind.
+///
+/// ```toml
+/// [git_digest]
+/// local_roots = ["/srv/repos"]
+/// remotes = ["https://github.com/example/repo"]
+/// ```
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitDigestSectionConfig {
+    /// Absolute directories a local source may resolve under, symlinks included.
+    #[serde(default)]
+    pub local_roots: Vec<std::path::PathBuf>,
+    /// `https://` repositories a remote source may name, compared after the
+    /// trailing `/` and `.git` are removed and the host is lowercased.
+    #[serde(default)]
+    pub remotes: Vec<String>,
+}
+
+/// `[code_ingest]` policy: the directories `code.ingest` may read and write a
+/// map database under. Absent or empty refuses every path.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodeIngestSectionConfig {
+    /// Absolute directories; a source path and an explicit `db` must resolve,
+    /// symlinks included, under one of them.
+    #[serde(default)]
+    pub roots: Vec<std::path::PathBuf>,
+}
+
+impl KnowledgeSectionConfig {
+    /// The configured roots that resolve to existing directories, resolved. A root
+    /// that does not resolve admits nothing.
+    pub fn resolved_import_roots(&self) -> Vec<std::path::PathBuf> {
+        self.import_roots
+            .iter()
+            .filter_map(|root| std::fs::canonicalize(root).ok())
+            .filter(|root| root.is_dir())
+            .collect()
+    }
 }
 
 /// `[storage]` section in `khive.toml`. Holds storage-layer config not
@@ -1404,7 +1510,7 @@ where
 /// - `[actor]`: default namespace / identity (OSS actor model)
 /// - `[gate]`: built-in caller enrollment
 /// - `[schema]`: explicit import unknown-entity-kind admission
-/// - `[embed].batch_size`: explicit reindex batch size
+/// - `[embed]`: validated policy, explicit reindex batch size and legacy diagnostics
 /// - `[runtime]`: runtime knobs (pack selection, brain profile, output format)
 /// - `[brain]`: actor read policy
 /// - `[telemetry]`: stream and channel carrier policy
@@ -1413,9 +1519,12 @@ where
 /// - `code_map_root` and `[[code_maps]]`: registered code maps (ADR-139)
 /// - `[display]`: rendering timezone (ADR-169)
 /// - `[blob]`: server-local file-transfer opt-in
+/// - `[knowledge]`: directories `knowledge.import` may read
+/// - `[git_digest]`: sources `git.digest` may read
+/// - `[code_ingest]`: directories `code.ingest` may read and write under
 ///
 /// Unknown top-level keys are silently ignored by serde for forward
-/// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, and `[telemetry]` tables are closed
+/// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, `[knowledge]`, `[git_digest]`, `[code_ingest]` and `[telemetry]` tables are closed
 /// with `deny_unknown_fields` so a misspelled policy key always fails startup.
 /// `[storage]`, `[[backends]]` entries and `[exec]` are also closed so unknown
 /// destination keys cannot be silently dropped, as are `[web]` and `[[mounts]]` entries.
@@ -1425,7 +1534,7 @@ pub struct KhiveConfig {
     #[serde(default)]
     pub schema: SchemaSectionConfig,
 
-    /// Explicit reindex batch size; automatic embedding settings remain separate.
+    /// Validated declarations; automatic and field-selection execution is host-owned.
     #[serde(default, deserialize_with = "embed_batch::deserialize_table")]
     pub embed: EmbedSectionConfig,
 
@@ -1436,10 +1545,10 @@ pub struct KhiveConfig {
     #[serde(skip)]
     pub visibility_receipts: Option<crate::credentials::VisibilityReceiptConfig>,
 
-    /// `[channel]` section. A `[channel.node]` table is accepted so an existing
-    /// config file keeps loading; its contents are not interpreted.
+    /// Opaque `[channel.*]` values. Registered components validate their own
+    /// values at activation; unregistered values remain stored without effect.
     #[serde(default)]
-    pub channel: crate::node_config::ChannelSectionConfig,
+    pub channel: crate::channel_section::ChannelSectionConfig,
 
     #[serde(default)]
     pub mounts: Vec<crate::mount_config::MountConfig>,
@@ -1518,6 +1627,18 @@ pub struct KhiveConfig {
     /// Server-local file-transfer opt-in. Other blob verbs are unaffected.
     #[serde(default)]
     pub blob: BlobSectionConfig,
+
+    /// Knowledge-pack policy: the directories `knowledge.import` may read.
+    #[serde(default)]
+    pub knowledge: KnowledgeSectionConfig,
+
+    /// The local roots and remote repositories `git.digest` may read.
+    #[serde(default)]
+    pub git_digest: GitDigestSectionConfig,
+
+    /// The directories `code.ingest` may read and write a map database under.
+    #[serde(default)]
+    pub code_ingest: CodeIngestSectionConfig,
 
     /// Storage-layer config not covered by `[[backends]]` (ADR-111
     /// Amendment 2: `[storage.blob]`'s `fs`/`s3` selector).
@@ -1679,6 +1800,11 @@ impl KhiveConfig {
         let (embed, unknown_embed_keys) = embed_batch::parse(&raw, &document, &diagnostic_path)?;
         let engines_declared = peers::normalize_engine_input(&mut document, &diagnostic_path)
             .map_err(|error| error.in_file(&diagnostic_path))?;
+        // Keep the validated original-order embed parse. Detached TOML tables
+        // can reorder unknown keys into the reserved datetime-marker position.
+        if let Some(table) = document.as_table_mut() {
+            table.remove("embed");
+        }
         let mut cfg: KhiveConfig = document.try_into().map_err(|source| ConfigError::Parse {
             path: diagnostic_path.clone(),
             source,
@@ -1827,6 +1953,63 @@ impl KhiveConfig {
         Ok(None)
     }
 
+    /// Whether `[actor].require_attributed` is set in the explicit file, or with
+    /// none, in any existing discovery tier, the database-anchored one included.
+    /// A file that fails to load is an error, never a silent `false`.
+    pub fn require_attributed_in_any_tier(
+        path: Option<&Path>,
+        db_path: Option<&Path>,
+    ) -> Result<bool, ConfigError> {
+        if let Some(p) = path {
+            if !p.exists() {
+                return Err(ConfigError::ExplicitConfigMissing {
+                    path: p.to_path_buf(),
+                });
+            }
+            return Ok(Self::load(Some(p))?.is_some_and(|cfg| cfg.actor.require_attributed));
+        }
+        let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let home_root = std::env::var_os("HOME").map(PathBuf::from);
+        Self::require_attributed_in_tiers(&project_root, home_root.as_deref(), db_path)
+    }
+
+    /// Every file the loader's tiers 2-4 may read (`load_with_roots_and_source`), plus the
+    /// cwd `.khive/config.toml`, which tier 3 reads when no database path is given.
+    pub(crate) fn require_attributed_in_tiers(
+        project_root: &Path,
+        home_root: Option<&Path>,
+        db_path: Option<&Path>,
+    ) -> Result<bool, ConfigError> {
+        let mut files = vec![
+            project_root.join("khive.toml"),
+            Self::project_config_anchor_dir(db_path, project_root).join("config.toml"),
+            project_root.join(".khive/config.toml"),
+        ];
+        let home_file = home_root.map(|home| home.join(".khive/config.toml"));
+        // The file `load_with_roots_and_source` reads: the first existing of tiers 2-4.
+        let in_use = [Some(&files[0]), Some(&files[1]), home_file.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|file| file.exists())
+            .cloned();
+        files.extend(home_file);
+        files.dedup();
+        for file in files.iter().filter(|file| file.exists()) {
+            let loaded = Self::load(Some(file)).map_err(|source| match &in_use {
+                Some(used) if used == file => source,
+                _ => ConfigError::ShadowedTier {
+                    path: Self::diagnostic_config_path(file),
+                    in_use: in_use.as_deref().map(Self::diagnostic_config_path),
+                    source: Box::new(source),
+                },
+            })?;
+            if loaded.is_some_and(|cfg| cfg.actor.require_attributed) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn diagnostic_config_path(path: &Path) -> PathBuf {
         std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     }
@@ -1887,6 +2070,65 @@ impl KhiveConfig {
         #[cfg(not(feature = "blob-s3"))]
         if matches!(&self.storage.blob, Some(BlobConfig::S3 { .. })) {
             return Err(ConfigError::BlobS3FeatureDisabled);
+        }
+
+        if let Some(root) = self
+            .knowledge
+            .import_roots
+            .iter()
+            .find(|root| !root.is_absolute())
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "knowledge.import_roots".to_owned(),
+                reason: format!("{root:?} is not an absolute path"),
+            });
+        }
+        if let Some(root) = self
+            .git_digest
+            .local_roots
+            .iter()
+            .find(|root| !root.is_absolute())
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "git_digest.local_roots".to_owned(),
+                reason: format!("{root:?} is not an absolute path"),
+            });
+        }
+        if let Some(root) = self
+            .code_ingest
+            .roots
+            .iter()
+            .find(|root| !root.is_absolute())
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "code_ingest.roots".to_owned(),
+                reason: format!("{root:?} is not an absolute path"),
+            });
+        }
+        if let Some(remote) = self
+            .git_digest
+            .remotes
+            .iter()
+            .find(|remote| !remote.starts_with("https://"))
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "git_digest.remotes".to_owned(),
+                reason: format!("{remote:?} is not an https:// URL"),
+            });
+        }
+        if let Some(remote) = self
+            .git_digest
+            .remotes
+            .iter()
+            .find(|remote| !names_one_repository(remote))
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "git_digest.remotes".to_owned(),
+                reason: format!(
+                    "{remote:?} does not name one repository: an entry is a full https://host/owner/repo URL, \
+                     never an owner, a host or a pattern"
+                ),
+            });
         }
 
         let warm = self

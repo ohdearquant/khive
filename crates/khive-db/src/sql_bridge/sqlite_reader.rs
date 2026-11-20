@@ -45,7 +45,7 @@ pub(super) struct CachedReadTransaction {
 }
 
 pub(super) struct StandaloneHandle {
-    pub(super) conn: rusqlite::Connection,
+    pub(super) conn: crate::ProgressConn,
     /// Present only for a standalone read-write handle, whose one-permit
     /// connection budget remains handle-scoped. Read-only connections exist
     /// only for explicit deferred transactions and retain reader admission in
@@ -101,6 +101,8 @@ pub(super) async fn open_explicit_read_transaction_handle(
     )
     .await??;
     drop(open_slot);
+    let conn = crate::ProgressConn::new(conn)
+        .map_err(|error| super::map_rusqlite_err(error, "sql_bridge.reader_open"))?;
     Ok(StandaloneHandle {
         conn,
         _retained_slot: None,
@@ -187,7 +189,7 @@ where
     R: Send + 'static,
     F: FnOnce(
             &crate::read_cancellation::InterruptibleReadScope,
-            &rusqlite::Connection,
+            &crate::ProgressConn,
             bool,
             bool,
         ) -> khive_storage::types::StorageResult<R>
