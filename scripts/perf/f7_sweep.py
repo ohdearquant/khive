@@ -20,9 +20,14 @@ The run order is fixed before the first run and written to plan.json in the outp
 Each run gets its own directory under --out with the harness report (harness.json), the harness log and the sink
 directory the daemon wrote (sink/), which is kept. Every attempt-log run prints the attempts expected, rows written,
 sequence gaps, drop counter and loss bound, then its point verdict (writer_attempt_report.py). A run whose loss bound
-is over --loss-limit is VOID and runs again, up to --void-retries more times; the void runs stay on the record. A run
-with the attempt log off must leave no writer_attempt row in its sink: one there means the variable reached a daemon
-it should not have, and the paired arm is BROKEN.
+is over --loss-limit is VOID and runs again, up to --void-retries more times; the void runs stay on the record. In the
+paired arm the whole round runs again, off and on in the same order, so the two stay adjacent, and a round still VOID
+after its retries is dropped from both arms. A run with the attempt log off must leave no writer_attempt row in its
+sink: one there means the variable reached a daemon it should not have, and the paired arm is BROKEN.
+
+Every run, both paired arms included, shortens the sink heartbeat and waits for it to settle before teardown
+(bench_load_harness.py SINK_HEARTBEAT_MS and SINK_SETTLE_S), which a default daemon does not do. The closing lines
+state the heartbeat and settle the runs recorded.
 
 The script reports; it never asserts an envelope. Exit 0 when every point has a reading, 1 when a point is still
 VOID after its retries, 2 when an input could not support a reading (BROKEN).
@@ -145,6 +150,16 @@ def knee_line(burst_points, deadline_s):
     return line
 
 
+def sink_line(conditions):
+    """The sink heartbeat and settle every run used; a default daemon heartbeats every 5 minutes."""
+    if len(conditions) == 1:
+        hb, settle = conditions[0]
+        if hb is None or settle is None:
+            return "sink heartbeat and settle not recorded by the harness"
+        return f"sink heartbeat {hb} ms and settle {settle} s on every run, both paired arms included"
+    return "sink conditions differ between runs: " + "; ".join(f"heartbeat {hb} ms settle {st} s" for hb, st in conditions)
+
+
 def cost_line(cost):
     parts = []
     for op, entry in cost["classes"].items():
@@ -153,42 +168,63 @@ def cost_line(cost):
     return f"attempt-log cost, on minus off, pooled over {cost['rounds']} rounds: " + "; ".join(parts)
 
 
+def run_once(run, name, out, args, spawn, deadline_s):
+    """One harness run under `name`: (record entry, reading or None when the inputs could not support a reading)."""
+    run_dir = out / name
+    run_dir.mkdir(parents=True, exist_ok=False)
+    argv = harness_argv(run, run_dir, args)
+    with open(run_dir / "harness.log", "wb") as log:
+        harness_rc = spawn(argv, stdout=log, stderr=subprocess.STDOUT).returncode
+    entry = {**run, "name": name, "dir": str(run_dir), "harness_rc": harness_rc}
+    try:
+        reading = read_run(dict(run, name=name), run_dir, loss_limit=args.loss_limit, util_limit=args.util_limit,
+                           queue_p99_limit_micros=args.queue_p99_limit_micros, burst_deadline_s=deadline_s)
+    except war.ReportError as exc:
+        return {**entry, "verdict": "BROKEN", "reason": str(exc)}, exc
+    return {**entry, "verdict": reading["verdict"], "point": reading.get("point")}, reading
+
+
 def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
-    """Run the plan in order and return (record, rc). `spawn` runs one harness argv; it is replaced in tests."""
-    record, pairs, bursts, rc = [], {"off": [], "on": []}, [], 0
+    """Run the plan in order and return (record, rc). `spawn` runs one harness argv; it is replaced in tests.
+
+    A paired round is its two runs, off and on, adjacent in time. When either is VOID the whole round runs again in
+    the same order, so the partners stay adjacent; a round still VOID after --void-retries leaves both arms."""
+    record, pairs, bursts, seen, rc = [], {"off": [], "on": []}, [], [], 0
     deadline_s = None if args.burst_deadline_ms is None else args.burst_deadline_ms / 1000
-    for run in runs:
-        tries = 0
-        while True:
-            name = run["name"] if tries == 0 else f"{run['name']}-retry{tries}"
-            run_dir = out / name
-            run_dir.mkdir(parents=True, exist_ok=False)
-            argv = harness_argv(run, run_dir, args)
-            with open(run_dir / "harness.log", "wb") as log:
-                harness_rc = spawn(argv, stdout=log, stderr=subprocess.STDOUT).returncode
-            try:
-                reading = read_run(dict(run, name=name), run_dir, loss_limit=args.loss_limit,
-                                   util_limit=args.util_limit, queue_p99_limit_micros=args.queue_p99_limit_micros,
-                                   burst_deadline_s=deadline_s)
-            except war.ReportError as exc:
-                emit(f"[{name}] BROKEN: {exc}")
-                record.append({**run, "name": name, "dir": str(run_dir), "harness_rc": harness_rc,
-                               "verdict": "BROKEN", "reason": str(exc)})
-                return {"runs": record, "paired_cost": None}, 2
-            emit(run_line(dict(run, name=name), reading))
-            record.append({**run, "name": name, "dir": str(run_dir), "harness_rc": harness_rc,
-                           "verdict": reading["verdict"], "point": reading.get("point")})
-            if reading["verdict"] != "VOID":
+    i = 0
+    while i < len(runs):
+        group = runs[i:i + 2] if runs[i]["role"] == "pair" else runs[i:i + 1]
+        i += len(group)
+        label = f"pair-{group[0]['round']}" if group[0]["role"] == "pair" else group[0]["name"]
+        for tries in range(args.void_retries + 1):
+            readings = []
+            for run in group:
+                name = run["name"] if tries == 0 else f"{run['name']}-retry{tries}"
+                entry, reading = run_once(run, name, out, args, spawn, deadline_s)
+                record.append(entry)
+                if isinstance(reading, war.ReportError):
+                    emit(f"[{name}] BROKEN: {reading}")
+                    return {"runs": record, "paired_cost": None}, 2
+                emit(run_line(dict(run, name=name), reading))
+                readings.append(reading)
+                seen.append(reading)
+            if all(r["verdict"] != "VOID" for r in readings):
                 break
-            tries += 1
-            if tries > args.void_retries:
-                emit(f"[{run['name']}] still VOID after {args.void_retries} retries; no reading at this point")
-                rc = 1
-                break
-        if run["role"] == "pair" and reading["verdict"] != "VOID":
-            pairs["on" if run["attempt_log"] else "off"].append(reading["arrival"])
-        if run["role"] == "burst" and reading["verdict"] != "VOID":
-            bursts.append((run["burst_size"], reading["point"]["burst_drain"]))
+        else:
+            what = "round" if group[0]["role"] == "pair" else "point"
+            emit(f"[{label}] still VOID after {args.void_retries} retries; no reading at this {what}"
+                 + ("; the round leaves both arms" if what == "round" else ""))
+            rc = 1
+            continue
+        for run, reading in zip(group, readings):
+            if run["role"] == "pair":
+                pairs["on" if run["attempt_log"] else "off"].append(reading["arrival"])
+            if run["role"] == "burst":
+                bursts.append((run["burst_size"], reading["point"]["burst_drain"]))
+    sink = sorted({(r["arrival"].get("sink_heartbeat_ms"), r["arrival"].get("sink_settle_s")) for r in seen},
+                  key=repr)
+    if sink:
+        emit(sink_line(sink))
     cost = None
     if pairs["off"] or pairs["on"]:
         try:
@@ -199,7 +235,7 @@ def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
             rc = 2
     if bursts:
         emit(knee_line(bursts, deadline_s))
-    return {"runs": record, "paired_cost": cost}, rc
+    return {"runs": record, "paired_cost": cost, "sink_conditions": sink}, rc
 
 
 def parse_args(argv=None):

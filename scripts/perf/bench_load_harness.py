@@ -277,7 +277,8 @@ def _op_create_entity(proc, tenant, i, request_id=None):
 
 
 # The writer sink reports drops only in its heartbeat (default every 5 minutes). A kept sink directory shortens it and
-# the run waits two heartbeats after the last arrival, so the drop counter covers every row the run enqueued.
+# the run waits two heartbeats after the last arrival, so the drop counter covers every row the run enqueued. The
+# extra second covers the daemon's shutdown after the last heartbeat, which the heartbeat period does not bound.
 SINK_HEARTBEAT_MS = 1000
 SINK_SETTLE_S = 2 * SINK_HEARTBEAT_MS / 1000 + 1.0
 
@@ -1012,6 +1013,7 @@ def main() -> int:
             if args.sink_dir:
                 time.sleep(SINK_SETTLE_S)
                 report["arrival"]["sink_heartbeat_ms"] = SINK_HEARTBEAT_MS
+                report["arrival"]["sink_settle_s"] = SINK_SETTLE_S
                 report["arrival"]["sink_settled_at"] = _utc_text(time.time())
         else:
             with ThreadPoolExecutor(max_workers=args.workers) as pool:

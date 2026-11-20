@@ -47,6 +47,7 @@ class FakeHarness:
         report = {"smoke_result": "PASS", "arrival": {
             "request_id_prefix": PREFIX, "request_id_sequence_bits": BITS, "records": records,
             "observed_duration_s": 1.0, "counts": {"submitted": 4, "completed": 4},
+            "sink_heartbeat_ms": 1000, "sink_settle_s": 3.0,
             "window_utc": {"start": "2026-11-18T00:00:00.000Z", "end": "2026-11-18T00:00:01.000Z"}}}
         (run_dir / "harness.json").write_text(json.dumps(report))
         sink = run_dir / "sink"
@@ -163,6 +164,8 @@ class ExecuteTests(unittest.TestCase):
         self.assertTrue(lines[1].startswith("[pair-1-off] workers=100 attempt log off"))
         self.assertTrue(lines[-1].startswith("attempt-log cost, on minus off, pooled over 2 rounds: stream.append"))
         self.assertEqual(summary["paired_cost"]["classes"]["stream.append"]["off"]["n"], 8)
+        self.assertEqual(lines[-2], "sink heartbeat 1000 ms and settle 3.0 s on every run, both paired arms included")
+        self.assertEqual(summary["sink_conditions"], [(1000, 3.0)])
 
     def test_void_point_runs_again_and_keeps_the_void_run_on_record(self):
         summary, rc, lines, names = self.run_plan(FakeHarness(drops={"sweep-100": 1}))
@@ -175,6 +178,24 @@ class ExecuteTests(unittest.TestCase):
         _, rc, lines, _ = self.run_plan(fake)
         self.assertEqual(rc, 1)
         self.assertIn("[sweep-100] still VOID after 1 retries; no reading at this point", lines)
+
+    def test_a_void_pair_run_runs_its_whole_round_again_in_order(self):
+        summary, rc, lines, names = self.run_plan(FakeHarness(drops={"pair-1-on": 1}))
+        self.assertEqual(rc, 0)
+        paired = [r["name"] for r in summary["runs"] if r["role"] == "pair"]
+        self.assertEqual(paired, ["pair-1-off", "pair-1-on", "pair-1-off-retry1", "pair-1-on-retry1",
+                                  "pair-2-on", "pair-2-off"])
+        self.assertEqual(summary["paired_cost"]["rounds"], 2)
+        self.assertEqual(summary["paired_cost"]["classes"]["stream.append"]["off"]["n"], 8)
+        self.assertEqual(summary["paired_cost"]["classes"]["stream.append"]["on"]["n"], 8)
+
+    def test_a_round_still_void_after_retries_leaves_both_arms(self):
+        summary, rc, lines, _ = self.run_plan(FakeHarness(drops={"pair-1-on": 1, "pair-1-on-retry1": 1}))
+        self.assertEqual(rc, 1)
+        self.assertIn("[pair-1] still VOID after 1 retries; no reading at this round; the round leaves both arms",
+                      lines)
+        self.assertEqual(summary["paired_cost"]["rounds"], 1)
+        self.assertEqual(summary["paired_cost"]["classes"]["stream.append"]["off"]["n"], 4)
 
     def test_attempt_rows_in_a_log_off_run_break_the_paired_arm(self):
         summary, rc, lines, _ = self.run_plan(FakeHarness(stray_rows={"pair-1-off"}))
