@@ -562,6 +562,7 @@ impl ProposalApplyWorker {
                     target,
                     relation,
                     weight,
+                    metadata,
                 } => {
                     let source_id = Uuid::from_u128(source.to_u128());
                     let target_id = Uuid::from_u128(target.to_u128());
@@ -571,6 +572,7 @@ impl ProposalApplyWorker {
                         "target_id": target_id,
                         "relation": relation.as_str(),
                         "weight": weight.map(f64::from),
+                        "metadata": metadata,
                     });
                     let plan = prepare_op(&self.runtime, token, "link", &args).await?;
                     let (source_id, target_id) = match &plan {

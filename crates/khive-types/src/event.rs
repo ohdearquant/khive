@@ -780,11 +780,14 @@ pub enum ProposalChangeset {
         patch: ProposalEntityPatch,
     },
     /// Add a typed edge. `weight` must be finite and in `[0.0, 1.0]` if present.
+    /// Metadata uses the same apply-time validation as `link`.
     AddEdge {
         source: Id128,
         target: Id128,
         relation: crate::EdgeRelation,
         weight: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
     },
     /// Add a note (entity-annotating or stand-alone).
     AddNote {
@@ -868,6 +871,7 @@ impl<'de> serde::Deserialize<'de> for ProposalChangeset {
                 target: Id128,
                 relation: crate::EdgeRelation,
                 weight: Option<f32>,
+                metadata: Option<serde_json::Value>,
             },
             AddNote {
                 note: NoteDraft,
@@ -895,11 +899,13 @@ impl<'de> serde::Deserialize<'de> for ProposalChangeset {
                 target,
                 relation,
                 weight,
+                metadata,
             } => Self::AddEdge {
                 source,
                 target,
                 relation,
                 weight,
+                metadata,
             },
             ProposalChangesetRaw::AddNote { note } => Self::AddNote { note },
             ProposalChangesetRaw::MergeEntities { into, from } => {
