@@ -20,6 +20,9 @@ impl Fixture {
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
             brain_profile: None,
+            knowledge: khive_runtime::KnowledgeSectionConfig {
+                import_roots: vec![std::env::temp_dir()],
+            },
             ..RuntimeConfig::no_embeddings()
         })
         .expect("private memory runtime");

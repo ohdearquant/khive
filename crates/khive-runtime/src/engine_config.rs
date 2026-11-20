@@ -694,6 +694,79 @@ pub struct BlobSectionConfig {
     pub file_transfers: bool,
 }
 
+/// `[knowledge]` pack policy.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeSectionConfig {
+    /// Absolute directories `knowledge.import` may read from. A requested path is
+    /// resolved, symlinks included, before it is compared against the resolved
+    /// roots. Absent or empty refuses every import path.
+    #[serde(default)]
+    pub import_roots: Vec<std::path::PathBuf>,
+}
+
+/// Whether an `https://` remote entry names exactly one repository: a host and at
+/// least an owner and a repository segment, with no empty segment, wildcard, query or
+/// fragment. An entry matches only the repository it names, so an owner-level entry
+/// would admit nothing and a pattern would read as wider than it is; both are refused.
+fn names_one_repository(remote: &str) -> bool {
+    let Some(rest) = remote.strip_prefix("https://") else {
+        return false;
+    };
+    if rest.contains(['*', '?', '#', '[', ']']) {
+        return false;
+    }
+    let rest = rest.trim_end_matches('/');
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let mut segments = rest.split('/');
+    let host = segments.next().unwrap_or("");
+    let path: Vec<&str> = segments.collect();
+    !host.is_empty() && path.len() >= 2 && path.iter().all(|segment| !segment.is_empty())
+}
+
+/// `[git_digest]` policy: the sources `git.digest` may read. Absent or empty
+/// lists refuse every source of that kind.
+///
+/// ```toml
+/// [git_digest]
+/// local_roots = ["/srv/repos"]
+/// remotes = ["https://github.com/example/repo"]
+/// ```
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitDigestSectionConfig {
+    /// Absolute directories a local source may resolve under, symlinks included.
+    #[serde(default)]
+    pub local_roots: Vec<std::path::PathBuf>,
+    /// `https://` repositories a remote source may name, compared after the
+    /// trailing `/` and `.git` are removed and the host is lowercased.
+    #[serde(default)]
+    pub remotes: Vec<String>,
+}
+
+/// `[code_ingest]` policy: the directories `code.ingest` may read and write a
+/// map database under. Absent or empty refuses every path.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodeIngestSectionConfig {
+    /// Absolute directories; a source path and an explicit `db` must resolve,
+    /// symlinks included, under one of them.
+    #[serde(default)]
+    pub roots: Vec<std::path::PathBuf>,
+}
+
+impl KnowledgeSectionConfig {
+    /// The configured roots that resolve to existing directories, resolved. A root
+    /// that does not resolve admits nothing.
+    pub fn resolved_import_roots(&self) -> Vec<std::path::PathBuf> {
+        self.import_roots
+            .iter()
+            .filter_map(|root| std::fs::canonicalize(root).ok())
+            .filter(|root| root.is_dir())
+            .collect()
+    }
+}
+
 /// `[storage]` section in `khive.toml`. Holds storage-layer config not
 /// already covered by `[[backends]]` (ADR-028). Unknown fields are rejected
 /// so an unsupported database selector cannot silently select the default store.
@@ -1446,9 +1519,12 @@ where
 /// - `code_map_root` and `[[code_maps]]`: registered code maps (ADR-139)
 /// - `[display]`: rendering timezone (ADR-169)
 /// - `[blob]`: server-local file-transfer opt-in
+/// - `[knowledge]`: directories `knowledge.import` may read
+/// - `[git_digest]`: sources `git.digest` may read
+/// - `[code_ingest]`: directories `code.ingest` may read and write under
 ///
 /// Unknown top-level keys are silently ignored by serde for forward
-/// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, and `[telemetry]` tables are closed
+/// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, `[knowledge]`, `[git_digest]`, `[code_ingest]` and `[telemetry]` tables are closed
 /// with `deny_unknown_fields` so a misspelled policy key always fails startup.
 /// `[storage]`, `[[backends]]` entries and `[exec]` are also closed so unknown
 /// destination keys cannot be silently dropped, as are `[web]` and `[[mounts]]` entries.
@@ -1551,6 +1627,18 @@ pub struct KhiveConfig {
     /// Server-local file-transfer opt-in. Other blob verbs are unaffected.
     #[serde(default)]
     pub blob: BlobSectionConfig,
+
+    /// Knowledge-pack policy: the directories `knowledge.import` may read.
+    #[serde(default)]
+    pub knowledge: KnowledgeSectionConfig,
+
+    /// The local roots and remote repositories `git.digest` may read.
+    #[serde(default)]
+    pub git_digest: GitDigestSectionConfig,
+
+    /// The directories `code.ingest` may read and write a map database under.
+    #[serde(default)]
+    pub code_ingest: CodeIngestSectionConfig,
 
     /// Storage-layer config not covered by `[[backends]]` (ADR-111
     /// Amendment 2: `[storage.blob]`'s `fs`/`s3` selector).
@@ -1977,6 +2065,65 @@ impl KhiveConfig {
         #[cfg(not(feature = "blob-s3"))]
         if matches!(&self.storage.blob, Some(BlobConfig::S3 { .. })) {
             return Err(ConfigError::BlobS3FeatureDisabled);
+        }
+
+        if let Some(root) = self
+            .knowledge
+            .import_roots
+            .iter()
+            .find(|root| !root.is_absolute())
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "knowledge.import_roots".to_owned(),
+                reason: format!("{root:?} is not an absolute path"),
+            });
+        }
+        if let Some(root) = self
+            .git_digest
+            .local_roots
+            .iter()
+            .find(|root| !root.is_absolute())
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "git_digest.local_roots".to_owned(),
+                reason: format!("{root:?} is not an absolute path"),
+            });
+        }
+        if let Some(root) = self
+            .code_ingest
+            .roots
+            .iter()
+            .find(|root| !root.is_absolute())
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "code_ingest.roots".to_owned(),
+                reason: format!("{root:?} is not an absolute path"),
+            });
+        }
+        if let Some(remote) = self
+            .git_digest
+            .remotes
+            .iter()
+            .find(|remote| !remote.starts_with("https://"))
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "git_digest.remotes".to_owned(),
+                reason: format!("{remote:?} is not an https:// URL"),
+            });
+        }
+        if let Some(remote) = self
+            .git_digest
+            .remotes
+            .iter()
+            .find(|remote| !names_one_repository(remote))
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "git_digest.remotes".to_owned(),
+                reason: format!(
+                    "{remote:?} does not name one repository: an entry is a full https://host/owner/repo URL, \
+                     never an owner, a host or a pattern"
+                ),
+            });
         }
 
         let warm = self
