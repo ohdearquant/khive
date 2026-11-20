@@ -1058,8 +1058,8 @@ hiding their targets.
 leaves edges out.
 
 The endpoint/count qualification of rule 2, its consequences and known limit below,
-and the memory-list option in the 2026-11-13 amendment are **Proposed**, pending contract
-acceptance. The accepted placement rule and the earlier proposed refusal-text change
+and the memory-list option in the 2026-11-13 amendment are **Accepted** 2026-11-20. The accepted placement rule
+and the earlier proposed refusal-text change
 retain their existing status.
 
 **Problem.** Two writers put the same kind of edge in different namespaces (#6380). `memory.apply_batch` writes the
@@ -1401,8 +1401,8 @@ run is what lists it.
 
 ### Amendment: opt-in structural memory-list filtering (2026-11-13)
 
-**Status**: Proposed, pending contract acceptance. Implements the list-filter alternative in #6547 and qualifies
-Delta 3 rule 2's endpoint/completeness description above. No code merge precedes that acceptance.
+**Status**: Accepted 2026-11-20 (Proposed 2026-11-13), implemented by #6568. Implements the list-filter alternative in
+#6547 and qualifies Delta 3 rule 2's endpoint/completeness description above.
 
 **Decision.** `list(kind="memory", exclude_superseded=true)` and
 `list(kind="note", note_kind="memory", exclude_superseded=true)` omit a memory with a live incoming `supersedes`
@@ -1443,4 +1443,5 @@ row eligible for both list and recall again. These use actual records, links and
 candidates and unchanged stored-row checks. Additional regressions cover default/false and get preservation,
 incoming-relation scope, namespace visibility, the memory backend, filtering before pagination across more than
 one batch, insertion/keyed/offset continuation at the scan ceiling, strict scope/type refusals, cancellation,
-graph-read failures and presentation metadata. These are required tests, not a claim that native validation has run.
+graph-read failures and presentation metadata. These tests are part of the change that implements this amendment and
+ran in its CI.
