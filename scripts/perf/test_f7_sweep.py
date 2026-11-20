@@ -226,6 +226,17 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("[pair-2] pair-2-off had failed or outstanding arrivals; the round leaves both arms", lines)
         self.assertEqual(summary["paired_cost"]["rounds"], 1)
+        self.assertIn("paired arm: 1 of 2 rounds left both arms for failed or outstanding arrivals; the cost line "
+                      "covers the clean rounds only", lines)
+        self.assertEqual(summary["paired_rounds"], {"planned": 2, "unclean": 1})
+
+    def test_no_clean_paired_round_is_no_reading(self):
+        states = ["completed", "completed", "completed", "outstanding"]
+        summary, rc, lines, _ = self.run_plan(FakeHarness(states={"pair-1-on": states, "pair-2-off": states}))
+        self.assertEqual(rc, 1)
+        self.assertIn("paired arm: none of 2 rounds was clean; no cost line", lines)
+        self.assertIsNone(summary["paired_cost"])
+        self.assertFalse(any(line.startswith("attempt-log cost") for line in lines))
 
     def test_a_harness_that_failed_with_nothing_outstanding_is_broken(self):
         summary, rc, lines, _ = self.run_plan(FakeHarness(failing={"sweep-100"}))

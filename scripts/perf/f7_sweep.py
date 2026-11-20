@@ -31,7 +31,8 @@ Every run, both paired arms included, shortens the sink heartbeat and waits for 
 state the heartbeat and settle the runs recorded.
 
 The script reports; it never asserts an envelope. Exit 0 when every point has a reading, 1 when a point is still
-VOID after its retries, 2 when an input could not support a reading (BROKEN).
+VOID after its retries or no paired round was clean enough to pool, 2 when an input could not support a reading
+(BROKEN). A line before the cost line says how many paired rounds left both arms for failed or outstanding arrivals.
 """
 
 from __future__ import annotations
@@ -224,6 +225,7 @@ def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
     the same order, so the partners stay adjacent; a round still VOID after --void-retries leaves both arms, and so
     does a round in which either run had failed or outstanding arrivals, so the cost line pools clean rounds only."""
     record, pairs, bursts, seen, rc = [], {"off": [], "on": []}, [], [], 0
+    rounds = {"planned": 0, "unclean": 0}
     deadline_s = None if args.burst_deadline_ms is None else args.burst_deadline_ms / 1000
     i = 0
     while i < len(runs):
@@ -233,6 +235,8 @@ def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
                                            or group[0]["attempt_log"] == group[1]["attempt_log"]):
             raise ValueError(f"paired runs must come as one off and one on run of the same round: {group}")
         label = f"pair-{group[0]['round']}" if group[0]["role"] == "pair" else group[0]["name"]
+        if group[0]["role"] == "pair":
+            rounds["planned"] += 1
         for tries in range(args.void_retries + 1):
             readings = []
             for run in group:
@@ -257,6 +261,7 @@ def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
                    if run["role"] == "pair" and unfinished(reading["arrival"])]
         if unclean:
             emit(f"[{label}] {', '.join(unclean)} had failed or outstanding arrivals; the round leaves both arms")
+            rounds["unclean"] += 1
             continue
         for run, reading in zip(group, readings):
             if run["role"] == "pair":
@@ -267,7 +272,13 @@ def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
                   key=repr)
     if sink:
         emit(sink_line(sink))
+    if rounds["unclean"]:
+        emit(f"paired arm: {rounds['unclean']} of {rounds['planned']} rounds left both arms for failed or "
+             f"outstanding arrivals; the cost line covers the clean rounds only")
     cost = None
+    if rounds["planned"] and not (pairs["off"] or pairs["on"]):
+        emit(f"paired arm: none of {rounds['planned']} rounds was clean; no cost line")
+        rc = max(rc, 1)
     if pairs["off"] or pairs["on"]:
         try:
             cost = war.paired_latency_cost(pairs["off"], pairs["on"])
@@ -277,7 +288,7 @@ def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
             rc = 2
     if bursts:
         emit(knee_line(bursts, deadline_s))
-    return {"runs": record, "paired_cost": cost, "sink_conditions": sink}, rc
+    return {"runs": record, "paired_cost": cost, "sink_conditions": sink, "paired_rounds": rounds}, rc
 
 
 def parse_args(argv=None):
