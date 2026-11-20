@@ -95,13 +95,20 @@ def attempt_rows(sink):
     return sum(len(segment["attempts"]) for lines in sink.values() for segment in war.parse_sink_lines(lines))
 
 
-def read_run(run, run_dir, *, loss_limit, util_limit, queue_p99_limit_micros, burst_deadline_s=None):
-    """One run's reading: the point report for a log-on run, client latency and a row count for a log-off run."""
+def read_run(run, run_dir, *, loss_limit, util_limit, queue_p99_limit_micros, burst_deadline_s=None, harness_rc=0):
+    """One run's reading: the point report for a log-on run, client latency and a row count for a log-off run.
+
+    A harness that failed for any reason but arrivals left outstanding at its drain timeout supports no reading. A
+    drain timeout is a reading: the point says how many arrivals never finished."""
     harness = json.loads((run_dir / "harness.json").read_text())
     arrival = harness.get("arrival") or {}
     if not arrival.get("records"):
         raise war.ReportError(f"{run['name']}: the harness report holds no arrival records "
                               f"(smoke_result={harness.get('smoke_result')}, errors={harness.get('smoke_errors')})")
+    if (harness_rc != 0 or harness.get("smoke_result") != "PASS") and not arrival.get("counts", {}).get("outstanding"):
+        raise war.ReportError(f"{run['name']}: the harness exited {harness_rc} with "
+                              f"smoke_result={harness.get('smoke_result')} and no arrival outstanding "
+                              f"(errors={harness.get('smoke_errors')})")
     sink = read_sink(run_dir / "sink")
     if not run["attempt_log"]:
         rows = attempt_rows(sink)
@@ -119,7 +126,8 @@ def run_line(run, reading):
     head = f"[{run['name']}] workers={run['workers']}"
     if reading["verdict"] == "OFF":
         counts = reading["arrival"].get("counts", {})
-        return f"{head} attempt log off; arrivals {counts.get('submitted')} completed {counts.get('completed')}"
+        return (f"{head} attempt log off; arrivals {counts.get('submitted')} completed {counts.get('completed')} "
+                f"failed {counts.get('failed', 0)} outstanding {counts.get('outstanding', 0)}")
     point = reading["point"]
     loss = point["loss"]
     return (f"{head} attempts expected={loss['expected']} written={loss['written']} gaps={loss['gaps']} "
@@ -179,7 +187,8 @@ def run_once(run, name, out, args, spawn, deadline_s):
     entry = {**run, "name": name, "dir": str(run_dir), "harness_rc": harness_rc}
     try:
         reading = read_run(dict(run, name=name), run_dir, loss_limit=args.loss_limit, util_limit=args.util_limit,
-                           queue_p99_limit_micros=args.queue_p99_limit_micros, burst_deadline_s=deadline_s)
+                           queue_p99_limit_micros=args.queue_p99_limit_micros, burst_deadline_s=deadline_s,
+                           harness_rc=harness_rc)
     except war.ReportError as exc:
         return {**entry, "verdict": "BROKEN", "reason": str(exc)}, exc
     return {**entry, "verdict": reading["verdict"], "point": reading.get("point")}, reading
@@ -196,6 +205,9 @@ def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
     while i < len(runs):
         group = runs[i:i + 2] if runs[i]["role"] == "pair" else runs[i:i + 1]
         i += len(group)
+        if group[0]["role"] == "pair" and (len(group) != 2 or group[0].get("round") != group[1].get("round")
+                                           or group[0]["attempt_log"] == group[1]["attempt_log"]):
+            raise ValueError(f"paired runs must come as one off and one on run of the same round: {group}")
         label = f"pair-{group[0]['round']}" if group[0]["role"] == "pair" else group[0]["name"]
         for tries in range(args.void_retries + 1):
             readings = []

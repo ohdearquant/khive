@@ -28,9 +28,10 @@ def args(**overrides):
 class FakeHarness:
     """Writes what one harness run would: the report and the daemon's sink file. `drops` per run name."""
 
-    def __init__(self, drops=(), stray_rows=(), latency=None, burst_finish=None):
+    def __init__(self, drops=(), stray_rows=(), latency=None, burst_finish=None, states=None, failing=()):
         self.drops, self.stray_rows, self.latency = dict(drops), set(stray_rows), latency or {}
         self.burst_finish = burst_finish or {}
+        self.states, self.failing = states or {}, set(failing)
         self.argvs = []
 
     def __call__(self, argv, stdout=None, stderr=None):
@@ -39,14 +40,17 @@ class FakeHarness:
         name = run_dir.name
         log_on = "--writer-attempt-log" in argv
         lat = self.latency.get(name, 100)
-        records = [{"sequence": i, "request_id": (PREFIX << BITS) | i, "op": "stream.append", "state": "completed",
+        states = self.states.get(name, ["completed"] * 4)
+        records = [{"sequence": i, "request_id": (PREFIX << BITS) | i, "op": "stream.append", "state": states[i],
                     "latency_us": lat + i, "burst": None} for i in range(4)]
+        counts = {state: states.count(state) for state in ("completed", "failed", "refused", "outstanding")}
+        smoke = "FAIL" if counts["outstanding"] or name in self.failing else "PASS"
         if "--burst-size" in argv:
             for row in records[2:]:
                 row.update(burst=1, scheduled_s=1.0, finished_s=1.0 + self.burst_finish.get(name, 0.01))
-        report = {"smoke_result": "PASS", "arrival": {
+        report = {"smoke_result": smoke, "smoke_errors": [], "arrival": {
             "request_id_prefix": PREFIX, "request_id_sequence_bits": BITS, "records": records,
-            "observed_duration_s": 1.0, "counts": {"submitted": 4, "completed": 4},
+            "observed_duration_s": 1.0, "counts": {"submitted": 4, **counts},
             "sink_heartbeat_ms": 1000, "sink_settle_s": 3.0,
             "window_utc": {"start": "2026-11-18T00:00:00.000Z", "end": "2026-11-18T00:00:01.000Z"}}}
         (run_dir / "harness.json").write_text(json.dumps(report))
@@ -62,7 +66,7 @@ class FakeHarness:
         if self.drops.get(name):
             lines.append({"kind": "sink_error_summary", "error": f"sink drops since last summary: {self.drops[name]}"})
         (sink / "writer_timeouts.1.ndjson").write_text("\n".join(json.dumps(x) for x in lines) + "\n")
-        return types.SimpleNamespace(returncode=0)
+        return types.SimpleNamespace(returncode=0 if smoke == "PASS" else 1)
 
 
 class PlanTests(unittest.TestCase):
@@ -198,6 +202,31 @@ class ExecuteTests(unittest.TestCase):
                       lines)
         self.assertEqual(summary["paired_cost"]["rounds"], 1)
         self.assertEqual(summary["paired_cost"]["classes"]["stream.append"]["off"]["n"], 4)
+
+    def test_a_drain_timeout_is_a_reading_outside_the_envelope(self):
+        states = ["completed", "completed", "outstanding", "outstanding"]
+        summary, rc, lines, _ = self.run_plan(FakeHarness(states={"sweep-100": states}))
+        self.assertEqual(rc, 0)
+        self.assertEqual(summary["runs"][0]["verdict"], "OUTSIDE")
+        self.assertIn("(2 of 4 arrivals outstanding at the drain timeout)", lines[0])
+
+    def test_failed_arrivals_put_the_point_outside(self):
+        states = ["completed", "failed", "completed", "completed"]
+        summary, _, lines, _ = self.run_plan(FakeHarness(states={"sweep-100": states}))
+        self.assertEqual(summary["runs"][0]["verdict"], "OUTSIDE")
+        self.assertIn("(1 of 4 arrivals failed)", lines[0])
+
+    def test_a_harness_that_failed_with_nothing_outstanding_is_broken(self):
+        summary, rc, lines, _ = self.run_plan(FakeHarness(failing={"sweep-100"}))
+        self.assertEqual(rc, 2)
+        self.assertIn("[sweep-100] BROKEN: sweep-100: the harness exited 1 with smoke_result=FAIL", lines[-1])
+        self.assertEqual(summary["runs"][-1]["verdict"], "BROKEN")
+
+    def test_a_pair_from_two_rounds_is_refused(self):
+        runs = sweep.plan_runs([100], aa=False, paired_workers=100, paired_rounds=2)
+        runs = runs[:1] + [runs[2], runs[3], runs[1], runs[4]]
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(ValueError, "same round"):
+            sweep.execute(runs, pathlib.Path(tmp), args(), spawn=FakeHarness(), emit=lambda _: None)
 
     def test_attempt_rows_in_a_log_off_run_break_the_paired_arm(self):
         summary, rc, lines, _ = self.run_plan(FakeHarness(stray_rows={"pair-1-off"}))
