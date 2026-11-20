@@ -119,7 +119,13 @@ def read_run(run, run_dir, *, loss_limit, util_limit, queue_p99_limit_micros, bu
     A harness that failed for any reason but arrivals left outstanding at its drain timeout supports no reading,
     including a run where that timeout came with another error. A drain timeout alone is a reading: the point says
     how many arrivals never finished."""
-    harness = json.loads((run_dir / "harness.json").read_text())
+    try:
+        harness = json.loads((run_dir / "harness.json").read_text())
+    except (OSError, ValueError) as exc:
+        raise war.ReportError(f"{run['name']}: the harness exited {harness_rc} and left no readable report "
+                              f"({type(exc).__name__}: {exc}); its output is in harness.log") from exc
+    if not isinstance(harness, dict):
+        raise war.ReportError(f"{run['name']}: the harness report is a {type(harness).__name__}, not an object")
     arrival = harness.get("arrival") or {}
     if not arrival.get("records"):
         raise war.ReportError(f"{run['name']}: the harness report holds no arrival records "

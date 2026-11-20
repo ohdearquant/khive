@@ -262,6 +262,21 @@ class ExecuteTests(unittest.TestCase):
                 sweep.read_run({"name": "x", "attempt_log": False}, run_dir, loss_limit=0.01, util_limit=0.7,
                                queue_p99_limit_micros=None, harness_rc=1)
 
+    def test_a_harness_that_wrote_no_report_is_broken(self):
+        summary, rc, lines, _ = self.run_plan(lambda argv, stdout=None, stderr=None: types.SimpleNamespace(returncode=2))
+        self.assertEqual(rc, 2)
+        self.assertIn("[sweep-100] BROKEN: sweep-100: the harness exited 2 and left no readable report "
+                      "(FileNotFoundError", lines[-1])
+        self.assertEqual(summary["runs"][-1]["verdict"], "BROKEN")
+
+    def test_a_harness_report_that_is_not_an_object_is_broken(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = pathlib.Path(tmp)
+            (run_dir / "harness.json").write_text("[]")
+            with self.assertRaisesRegex(war.ReportError, "the harness report is a list, not an object"):
+                sweep.read_run({"name": "x", "attempt_log": False}, run_dir, loss_limit=0.01, util_limit=0.7,
+                               queue_p99_limit_micros=None)
+
     def test_a_pair_from_two_rounds_is_refused(self):
         runs = sweep.plan_runs([100], aa=False, paired_workers=100, paired_rounds=2)
         runs = runs[:1] + [runs[2], runs[3], runs[1], runs[4]]
