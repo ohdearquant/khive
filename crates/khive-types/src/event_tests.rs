@@ -239,6 +239,57 @@ fn proposal_changeset_rejects_invalid_edge_weight() {
 
 #[cfg(feature = "serde")]
 #[test]
+fn proposal_changeset_edge_metadata_preserves_wire_intent_and_legacy_shape() {
+    let legacy = serde_json::json!({
+        "kind": "add_edge",
+        "source": "7426afd6-0234-4701-9045-83dfd39166e6",
+        "target": "abcdef01-2345-6789-abcd-ef0123456789",
+        "relation": "extends",
+        "weight": 0.25
+    });
+    let decoded: ProposalChangeset = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(matches!(
+        &decoded,
+        ProposalChangeset::AddEdge { metadata: None, .. }
+    ));
+    assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+
+    let mut explicit_null = legacy.clone();
+    explicit_null["metadata"] = serde_json::Value::Null;
+    let decoded: ProposalChangeset = serde_json::from_value(explicit_null).unwrap();
+    assert!(matches!(
+        &decoded,
+        ProposalChangeset::AddEdge { metadata: None, .. }
+    ));
+    assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+
+    // Shape and governed-key validation belongs to the link write boundary;
+    // decoding must retain even a draft that will be refused when applied.
+    for metadata in [
+        serde_json::json!({"optional": false, "context": {"steps": [1, true, null], "label": "evidence"}}),
+        serde_json::json!({}),
+        serde_json::json!({"dependency_kind": "not-a-kind"}),
+        serde_json::json!(["not an object"]),
+        serde_json::json!(42),
+        serde_json::json!(false),
+        serde_json::json!("not an object"),
+    ] {
+        let mut raw = legacy.clone();
+        raw["metadata"] = metadata.clone();
+        let decoded: ProposalChangeset = serde_json::from_value(raw.clone()).unwrap();
+        let ProposalChangeset::AddEdge {
+            metadata: stored, ..
+        } = &decoded
+        else {
+            panic!("expected AddEdge");
+        };
+        assert_eq!(stored.as_ref(), Some(&metadata));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), raw);
+    }
+}
+
+#[cfg(feature = "serde")]
+#[test]
 fn proposal_changeset_accepts_null_edge_weight() {
     let uuid = "7426afd6-0234-4701-9045-83dfd39166e6";
     let uuid2 = "abcdef01-2345-6789-abcd-ef0123456789";
