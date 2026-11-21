@@ -9,7 +9,9 @@ use serde_json::Value;
 use crate::error::{AuditObligationFailure, DispatchError, RuntimeError};
 use crate::runtime::NamespaceToken;
 
-use super::audit::{enrich_search_success, enrich_stream_truncate_success, stamp_error_class};
+use super::audit::{
+    enrich_search_success, enrich_stream_truncate_success, stamp_client_cwd, stamp_error_class,
+};
 use super::request_identity::edge_endpoint_table;
 #[cfg(doc)]
 use super::IdResolutionMode;
@@ -432,7 +434,7 @@ impl VerbRegistry {
                         if let Value::Object(ref mut map) = payload {
                             map.insert("resource".to_string(), resource);
                         }
-                        Event::new(
+                        let mut event = Event::new(
                             gate_req.namespace.as_str(),
                             gate_req.verb.as_str(),
                             EventKind::Audit,
@@ -443,7 +445,9 @@ impl VerbRegistry {
                         .with_target(edge_id)
                         .with_payload(payload)
                         .with_payload_schema_version(2)
-                        .with_duration_us(duration_us)
+                        .with_duration_us(duration_us);
+                        stamp_client_cwd(&mut event, gate_req);
+                        event
                     }
                     None => build_audit_storage_event(
                         gate_req,
@@ -1077,7 +1081,7 @@ impl VerbRegistry {
                                         if let Value::Object(ref mut map) = payload {
                                             map.insert("resource".to_string(), resource);
                                         }
-                                        let storage_event = Event::new(
+                                        let mut storage_event = Event::new(
                                             gate_req.namespace.as_str(),
                                             gate_req.verb.as_str(),
                                             EventKind::Audit,
@@ -1092,6 +1096,7 @@ impl VerbRegistry {
                                         .with_payload(payload)
                                         .with_payload_schema_version(2)
                                         .with_duration_us(dispatch_us);
+                                        stamp_client_cwd(&mut storage_event, &gate_req);
                                         append_audit_event_best_effort(
                                             self.audit_batch.as_ref(),
                                             store,

@@ -154,7 +154,10 @@ pub use blob::{
     DEFAULT_BLOB_HYDRATION_BYTES,
 };
 pub use build_info::{BuildInfo, BUILD_INFO, BUILD_VERSION};
-pub use config::{ann_fresh_tail_enabled_from_env, process_ref_from_env, WalCeilingSource};
+pub use config::{
+    ann_fresh_tail_enabled_from_env, client_cwd_from_process, process_ref_from_env,
+    WalCeilingSource,
+};
 pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};
 pub use curation::{
     entity_embedding_text, entity_fts_document, entity_merge_guard_compared_values,

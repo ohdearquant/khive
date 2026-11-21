@@ -35,6 +35,7 @@ impl KhiveMcpServer {
             // of rejecting it or silently stamping writes under its own actor.
             actor_id: self.actor_id().map(str::to_string),
             process_ref: khive_runtime::process_ref_from_env(),
+            client_cwd: khive_runtime::client_cwd_from_process(),
             visible_namespaces: self
                 .visible_namespaces()
                 .iter()
