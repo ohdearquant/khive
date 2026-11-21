@@ -92,7 +92,8 @@ contract the driver's tests bind to; the record above stands where not restated.
    `..` component or a symlink escape is refused before materialization.
 2. **Environment.** The caller supplies the environment values; the `[exec] env` config allow-lists
    the keys that may pass; the server sets `HOME` to the run directory; nothing is inherited from the
-   host. The receipt records `env_keys`.
+   host. The receipt records `env_keys`, and in `env_dropped` the caller's keys whose value did not
+   reach the child as given: a key outside the allow-list, or `HOME`.
 3. **`declared_write_paths`** (optional). When given, a change outside the declared set makes the run
    `success: false`, names the offending paths in `undeclared_changes`, and drops their bytes: they
    are neither stored nor part of `tree_out`.
