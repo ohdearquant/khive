@@ -110,6 +110,17 @@ widen their namespace visibility, or grant an aggregate mode to profile resoluti
 or binding listing. See the [brain API reference](guide/api-reference.md#brainevent_counts--assertive)
 for actor-filter and anonymous-caller behavior.
 
+### Exec cache roots
+
+The optional `[exec] cache_roots` list names absolute directories that every
+`exec.run` may read, write and load code from, and that are kept between runs:
+a compiler's package cache and build output belong there. Nothing under a cache
+root is captured into a run's output tree, and a run can read and change what an
+earlier run left, so runs that share a cache root share a trust boundary. A
+cache root may not hold the exec root or sit inside it. Its size is bounded by
+its volume, not by the run limits. Each receipt's `sandbox.cache_roots_digest`
+names the list the run had.
+
 ### Exec sandbox path matches
 
 The optional `[exec] never` list names executable paths that `exec.run` refuses
