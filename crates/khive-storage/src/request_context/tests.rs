@@ -138,3 +138,46 @@ async fn request_correlation_is_scoped_kept_by_an_empty_inner_scope_and_inherite
         "a task outside every scope has no id"
     );
 }
+
+#[tokio::test]
+async fn request_client_cwd_is_scoped_kept_by_an_empty_inner_scope_and_inherited() {
+    assert_eq!(current_request_client_cwd(), None);
+
+    let (after_empty, child, after_correlation) =
+        scope_request_client_cwd(Some("/work/a".to_string()), async {
+            let after_empty =
+                scope_request_client_cwd(None, async { current_request_client_cwd() }).await;
+            let child = tokio::spawn(inherit_request_read_context(async {
+                current_request_client_cwd()
+            }))
+            .await
+            .expect("child task");
+            let after_correlation =
+                scope_request_correlation(Some(7), async { current_request_client_cwd() }).await;
+            (after_empty, child, after_correlation)
+        })
+        .await;
+
+    assert_eq!(
+        after_empty.as_deref(),
+        Some("/work/a"),
+        "an empty inner scope keeps the outer value"
+    );
+    assert_eq!(
+        child.as_deref(),
+        Some("/work/a"),
+        "an inheriting child keeps the value"
+    );
+    assert_eq!(
+        after_correlation.as_deref(),
+        Some("/work/a"),
+        "a nested correlation scope keeps the value"
+    );
+    assert_eq!(
+        tokio::spawn(async { current_request_client_cwd() })
+            .await
+            .unwrap(),
+        None,
+        "a task outside every scope has no value"
+    );
+}

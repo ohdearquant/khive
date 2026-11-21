@@ -334,6 +334,16 @@ pub fn process_ref_from_env() -> Option<String> {
     }
 }
 
+/// The current process's working directory as text, for the daemon frame's `client_cwd`.
+///
+/// `None` when the directory cannot be read. A non-Unicode path is converted lossily: the value
+/// is attribution text on an audit row, never a path anything opens.
+pub fn client_cwd_from_process() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .map(|dir| dir.to_string_lossy().into_owned())
+}
+
 // ---- RuntimeConfig ----
 
 /// Runtime configuration.

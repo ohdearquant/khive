@@ -445,14 +445,17 @@ pub(super) async fn handle_conn_with_lifecycle<D: DaemonDispatch>(
                         read_timeout,
                         khive_storage::scope_request_correlation(
                             frame.request_id,
-                            dispatcher.dispatch_with_error_detail(
-                                frame.ops,
-                                frame.presentation,
-                                frame.presentation_per_op,
-                                frame.format,
-                                frame.format_per_op,
-                                frame.from_wire,
-                                Some(identity),
+                            khive_storage::scope_request_client_cwd(
+                                frame.client_cwd,
+                                dispatcher.dispatch_with_error_detail(
+                                    frame.ops,
+                                    frame.presentation,
+                                    frame.presentation_per_op,
+                                    frame.format,
+                                    frame.format_per_op,
+                                    frame.from_wire,
+                                    Some(identity),
+                                ),
                             ),
                         ),
                     ),

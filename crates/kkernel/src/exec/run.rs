@@ -1785,6 +1785,7 @@ pub(super) async fn run_exec_inline_with_forward(
             namespace: cfg.default_namespace.as_str().to_string(),
             actor_id: cfg.actor_id.clone(),
             process_ref: khive_runtime::process_ref_from_env(),
+            client_cwd: khive_runtime::client_cwd_from_process(),
             visible_namespaces: cfg
                 .visible_namespaces
                 .iter()

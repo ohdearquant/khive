@@ -378,6 +378,7 @@ pub struct RequestReadContext {
     deadline: Option<RequestReadDeadline>,
     store_acquisition_operation: Option<&'static str>,
     correlation_id: Option<u64>,
+    client_cwd: Option<Arc<str>>,
 }
 
 impl RequestReadContext {
@@ -543,6 +544,30 @@ where
 pub fn current_request_correlation() -> Option<u64> {
     REQUEST_READ_CONTEXT
         .try_with(|context| context.correlation_id)
+        .ok()
+        .flatten()
+}
+
+/// Scope `future` to the working directory the request's client reported, as
+/// text. Attribution only: it authorizes nothing and nothing reads it as a
+/// path. `None` leaves an outer value in place. Children spawned through
+/// [`inherit_request_read_context`] carry it with the rest of the context.
+pub async fn scope_request_client_cwd<F>(client_cwd: Option<String>, future: F) -> F::Output
+where
+    F: Future,
+{
+    let mut context = capture_request_read_context();
+    if let Some(client_cwd) = client_cwd {
+        context.client_cwd = Some(Arc::from(client_cwd));
+    }
+    REQUEST_READ_CONTEXT.scope(context, future).await
+}
+
+/// The client working directory scoped by [`scope_request_client_cwd`] on this
+/// task, if any.
+pub fn current_request_client_cwd() -> Option<Arc<str>> {
+    REQUEST_READ_CONTEXT
+        .try_with(|context| context.client_cwd.clone())
         .ok()
         .flatten()
 }
