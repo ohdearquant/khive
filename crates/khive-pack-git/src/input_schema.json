@@ -436,6 +436,24 @@
     ],
     "additionalProperties": false
   },
+  "git.pr_state": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "number": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "required": [
+      "repo",
+      "number"
+    ],
+    "additionalProperties": false
+  },
   "git.status": {
     "type": "object",
     "properties": {

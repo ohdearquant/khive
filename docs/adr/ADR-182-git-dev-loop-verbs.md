@@ -908,3 +908,82 @@ This amendment adds one ledger table with its trigger and backfill, and introduc
 receipt mutation, operator-wide read, snapshot ownership,
 new backend opener or change to the git write/reconciliation protocol. Implementation and native
 validation remain pending while this amendment is Proposed.
+
+## Amendment 14 (2026-11-21): reading a pull request's state
+
+**Status**: Proposed. The ADR's Accepted status and every amendment above stand unchanged.
+
+Adopted from a reading of a real caller, as Amendment 8 was. A client with no shell can commit,
+push and open a pull request through this pack, and then cannot see what became of it: whether its
+checks ran, whether anyone reviewed the head, whether the platform will merge it. `git.pr_merge`
+answers only by refusing, and `git.reconcile` reads a pull request only to settle an unknown merge
+receipt. The one remaining reason such a client reaches for the platform's own command line is this
+read, so it enters here.
+
+1. **`git.pr_state(repo, number)`.** Returns `state`, `merged`, `draft`, `opened_by`, `head`
+   (`ref`, `sha`, `fork`), `base` (`ref`, `sha`), `mergeable`, `mergeable_state`, `merged_sha`,
+   `checks`, `statuses`, `reviews` and `text_altered`, beside the `repo`, `gate`, `slug` and
+   `number` the call resolved to.
+2. **Gated like a read, credentialed like a pull request verb.** The order is arguments, the
+   repo-only allowlist match, `tool.check`, the repository mapping, the dispatching actor's
+   credential, the platform. A local mapping refuses `remote_scheme` and a caller with no actor row
+   refuses `actor_unmapped`, each before any credential is resolved or any platform request is
+   made. The repository's name and visibility are compared with the configured row before the pull
+   request is read, because a renamed or transferred repository answers under its new name with
+   success; a difference refuses `repository_identity_mismatch`. The verb takes no `expected_head`:
+   it reports the head it found, and a caller that needs a pinned head compares.
+3. **No receipt, no write, no verdict.** Every platform request is a `GET`. Nothing is stored
+   except the policy decision row `tool.check` writes for every gated read, which is why the verb
+   is listed with `git.gates`, `git.status` and `git.log` among the reads whose accounting row is
+   not droppable. The result carries no field that says "passing" or "ready". `mergeable` and
+   `mergeable_state` are the platform's own values, null while it has not computed them, and each
+   check row carries the platform's `status` and `conclusion`. Which checks a branch requires is
+   repository configuration this verb does not read, so a required-check ruling is the caller's
+   reading of the rows by name.
+4. **Checks are the rows at the head, with the count the platform gave.** `checks.runs` holds the
+   check runs for `head.sha`, the platform's latest per name, each with `id`, `name`, `status`,
+   `conclusion`, `app`, `suite_id`, `started_at` and `completed_at`. At most 500 are read;
+   `checks.total` is the platform's count and `checks.truncated` is true when it exceeds the rows
+   returned, so a capped page never reads as the whole set. `checks.counts` groups the returned
+   rows by conclusion, and a run that has not completed is counted under its status, so a queued
+   run is a counted row and never an absent one. `statuses` holds the combined commit status for
+   the same sha with its `total`: the platform reports `pending` when no status exists at all, and
+   `total` zero beside it is how a caller tells that from a status still running.
+5. **Reviews are each account's latest decisive review.** Comment-only and pending reviews do not
+   replace an earlier approval or change request, the rule `git.pr_merge` already applies. Each
+   row carries `login`, `state`, `commit_id` and `at_head`, so an approval of an older head is
+   visibly not an approval of this one. The list is read to its end or the call refuses
+   `review_evidence_limit`; a partial list could omit the review that withdrew an approval.
+6. **`merged_sha` is null until the pull request is merged.** Before a merge the platform keeps a
+   trial merge commit in the same field of its reply; returning it would let a caller read an
+   unmerged pull request as merged.
+7. **Names are returned without hidden characters.** A branch name or a check name is written by
+   whoever opened the pull request, and the reader of this result may be a terminal or a language
+   model. Control characters, format characters and the line and paragraph separators are removed
+   by Unicode category, never by an allow-list, so accented and CJK names are returned whole; each
+   string is bounded in length. `text_altered` is true when either changed a returned string, so a
+   caller knows a name is not the platform's exact one.
+
+What this does not cover: the event that triggered a check run (a run on the bare branch and a run
+on the merge ref carry the same name), required-check and ruleset configuration, review comments
+and their text, and the pull request's title and body. A caller that needs any of these still needs
+another surface; none of them is implied by a field here.
+
+Acceptance arms added: 51 a pull request with a passing, a failing and an unfinished check, one
+commit status, an approval at the head, an approval at an older head by a second account and a
+later comment returns each of those rows with its platform value, `counts` of one each, the
+comment not replacing the approval, `at_head` true and false, and `merged_sha` null beside a trial
+merge commit, while the platform write count, the caller's receipt count and the repository's refs
+are unchanged and every request is a `GET` under the caller's credential; 52 with nothing posted,
+`checks.total` and `statuses.total` are zero beside the platform's `pending`; 53 a missing policy
+row, a zero, a text and an absent `number`, an unknown argument and a caller with no actor row
+each refuse with no platform request and no credential read; 54 a repository outside the allowlist
+refuses before the policy check runs; 55 a repository answering under another name or visibility
+refuses after exactly one request, the same call answers once it matches (control), an unknown
+number is the platform's refusal and a transport failure is `remote_unavailable`; 56 a check name
+holding a direction override, an escape and a zero-width space, and a 400-character branch name,
+return cleaned and bounded with `text_altered` true, and a CJK name returns exactly with it false
+(control); 57 250 check runs are read in three pages and all returned, and 620 return 500 with
+`truncated` true; 58 a merged pull request reports `merged` and its `merged_sha`, and a review
+list that never ends refuses `review_evidence_limit`; 59 a local mapping refuses `remote_scheme`
+with no credential read and no receipt.

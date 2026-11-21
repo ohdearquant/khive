@@ -986,7 +986,7 @@ impl GitPack {
     /// no credential and writes no receipt. `git.gates` established this shape (ADR-182
     /// Amendment 4 item 4): the match is repo-only, and `gate.id` is the lowest matching entry
     /// index, so removing a duplicate row never changes which id a caller already saw.
-    async fn read_gate(
+    pub(crate) async fn read_gate(
         &self,
         token: &NamespaceToken,
         registry: &VerbRegistry,

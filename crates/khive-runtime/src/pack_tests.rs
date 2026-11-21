@@ -99,6 +99,7 @@ const KNOWN_ADMISSION_UNSAFE_VERBS: &[&str] = &[
     "git.diff",
     "git.gates",
     "git.log",
+    "git.pr_state",
     "git.receipts",
     "git.reconcile",
     "git.status",
@@ -686,11 +687,12 @@ fn policy_decision_receipts_are_admission_unsafe_under_trusted_owners() {
         }
     }
     static TOOL_HANDLERS: [HandlerDef; 2] = [handler("tool.check"), handler("tool.describe")];
-    static GIT_HANDLERS: [HandlerDef; 4] = [
+    static GIT_HANDLERS: [HandlerDef; 5] = [
         handler("git.receipts"),
         handler("git.gates"),
         handler("git.status"),
         handler("git.log"),
+        handler("git.pr_state"),
     ];
 
     let mut builder = VerbRegistryBuilder::new();
@@ -715,6 +717,7 @@ fn policy_decision_receipts_are_admission_unsafe_under_trusted_owners() {
         "git.gates",
         "git.status",
         "git.log",
+        "git.pr_state",
     ] {
         assert!(
             !registry.admission_degrade_safe_probe(verb),

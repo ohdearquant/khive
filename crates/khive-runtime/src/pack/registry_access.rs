@@ -500,7 +500,7 @@ impl VerbRegistry {
     ///   receipt on every dispatch (checkout and diff also write a manifest
     ///   or diff blob), so their accounting row is not droppable.
     /// - `tool.check` persists a policy decision receipt. `git.receipts`,
-    ///   `git.gates`, `git.status` and `git.log` dispatch that same check,
+    ///   `git.gates`, `git.status`, `git.log` and `git.pr_state` dispatch that same check,
     ///   so their read results also carry a required decision write.
     /// - `comm.withheld_body` writes an access audit event on every call;
     ///   the record of who read a withheld original is the point of the
