@@ -45,7 +45,13 @@ khive-pack-workspace = { version = "0.21.0", path = "../khive-pack-workspace" }
 khive-pack-charter = { version = "0.21.0", path = "../khive-pack-charter" }
 uuid = { workspace = true }
 inventory = { workspace = true }
-rmcp = { workspace = true, features = ["server", "transport-io"] }
+rmcp = { workspace = true, features = [
+    "server",
+    "transport-io",
+    "client",
+    "reqwest",
+    "transport-streamable-http-client-reqwest",
+] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
@@ -113,7 +119,13 @@ tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
 khive-runtime = { version = "0.21.0", path = "../khive-runtime", features = ["fault-injection", "test-internals"] }
 khive-storage = { version = "0.21.0", path = "../khive-storage", features = ["test-support"] }
-rmcp = { workspace = true, features = ["server", "transport-io", "client"] }
+rmcp = { workspace = true, features = [
+    "server",
+    "transport-io",
+    "client",
+    "transport-streamable-http-client-unix-socket",
+    "transport-streamable-http-server",
+] }
 async-trait = { workspace = true }
 serial_test = { workspace = true }
 khive-pack-knowledge = { version = "0.21.0", path = "../khive-pack-knowledge" }
