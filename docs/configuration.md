@@ -117,9 +117,14 @@ The optional `[exec] cache_roots` list names absolute directories that every
 a compiler's package cache and build output belong there. Nothing under a cache
 root is captured into a run's output tree, and a run can read and change what an
 earlier run left, so runs that share a cache root share a trust boundary. A
-cache root may not hold the exec root or sit inside it. Its size is bounded by
-its volume, not by the run limits. Each receipt's `sandbox.cache_roots_digest`
-names the list the run had.
+cache root must exist when a run starts, and it is compared in canonical form,
+so a symbolic link or a `..` component does not hide an overlap. It may not
+hold the exec root or sit inside it, and it may not equal, hold or sit inside
+any read root; a run is refused with the reason otherwise. The check does not
+judge what else a cache root holds: a root that holds a home directory, a
+credential or a store is the operator's error and is not refused. Its size is
+bounded by its volume, not by the run limits. Each receipt's
+`sandbox.cache_roots_digest` names the list the run had.
 
 ### Exec sandbox path matches
 

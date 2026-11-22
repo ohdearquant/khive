@@ -1431,7 +1431,7 @@ async fn execute(
     let root = std::fs::canonicalize(&cfg.root).map_err(|e| {
         RuntimeError::Unconfigured(format!("exec root {}: {e}", cfg.root.display()))
     })?;
-    if let Some(conflict) = sandbox::cache_root_conflict(&root, &cfg.cache_roots) {
+    if let Some(conflict) = sandbox::cache_root_conflict(&root, &cfg.read_roots, &cfg.cache_roots) {
         return Err(RuntimeError::Unconfigured(conflict));
     }
     let run_dir = root.join(&receipt.id);
@@ -2071,3 +2071,33 @@ mod capture_run_tests;
 #[cfg(all(test, unix))]
 #[path = "handlers/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod identity_cache_roots_tests {
+    use super::*;
+    use khive_runtime::engine_config::ExecSectionConfig;
+
+    #[test]
+    fn identity_carries_the_cache_roots_digest_and_it_follows_the_configuration() {
+        let none = identity(&sandbox::resolve(&ExecSectionConfig::default()));
+        assert_eq!(none["cache_roots"], json!([]));
+        assert_eq!(
+            none["cache_roots_digest"],
+            json!(sandbox::cache_roots_digest(&[])),
+            "no cache root reports the empty list's digest"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = std::fs::canonicalize(dir.path()).unwrap();
+        let one = identity(&sandbox::resolve(&ExecSectionConfig {
+            cache_roots: vec![cache.to_string_lossy().into_owned()],
+            ..Default::default()
+        }));
+        assert_eq!(one["cache_roots"], json!([cache.to_string_lossy()]));
+        assert_eq!(
+            one["cache_roots_digest"],
+            json!(sandbox::cache_roots_digest(std::slice::from_ref(&cache)))
+        );
+        assert_ne!(one["cache_roots_digest"], none["cache_roots_digest"]);
+    }
+}

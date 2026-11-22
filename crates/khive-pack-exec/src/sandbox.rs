@@ -178,22 +178,50 @@ pub fn read_roots_digest(read_roots: &[PathBuf]) -> String {
     digest_hex(&read_roots_serialization(read_roots))
 }
 
-/// Why the configured cache roots cannot be used with the run root, if they
-/// cannot. A cache root that holds the run root, or sits inside it, would let
-/// one run write into another run's directory, and a relative one names a
-/// different directory per working directory.
-pub fn cache_root_conflict(root: &Path, cache_roots: &[PathBuf]) -> Option<String> {
+/// Why the configured cache roots cannot be used with the run root and the
+/// read roots, if they cannot. A cache root that holds the run root, or sits
+/// inside it, would let one run write into another run's directory. One that
+/// equals, holds or sits inside a read root would make a directory the
+/// configuration calls read-only writable. A relative one names a different
+/// directory per working directory, and one that cannot be resolved cannot be
+/// compared with either, so each is refused.
+///
+/// Entries are compared in canonical form, so a symbolic link or a `..`
+/// component cannot hide an overlap. `read_roots` are the resolved read roots.
+/// The check does not judge what else a cache root holds.
+pub fn cache_root_conflict(
+    root: &Path,
+    read_roots: &[PathBuf],
+    cache_roots: &[PathBuf],
+) -> Option<String> {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    for cache in cache_roots {
-        if !cache.is_absolute() {
+    for entry in cache_roots {
+        if !entry.is_absolute() {
             return Some(format!(
-                "[exec] cache_roots entry {cache:?} is not an absolute path"
+                "[exec] cache_roots entry {entry:?} is not an absolute path"
             ));
         }
-        if root.starts_with(cache) || cache.starts_with(&root) {
+        let cache = match std::fs::canonicalize(entry) {
+            Ok(cache) => cache,
+            Err(error) => {
+                return Some(format!(
+                    "[exec] cache_roots entry {entry:?} cannot be resolved ({error}); \
+                     it must exist when a run starts"
+                ));
+            }
+        };
+        if root.starts_with(&cache) || cache.starts_with(&root) {
             return Some(format!(
-                "[exec] cache_roots entry {cache:?} overlaps the run root {root:?}"
+                "[exec] cache_roots entry {entry:?} overlaps the run root {root:?}"
             ));
+        }
+        for read in read_roots {
+            let read_canonical = std::fs::canonicalize(read).unwrap_or_else(|_| read.clone());
+            if read_canonical.starts_with(&cache) || cache.starts_with(&read_canonical) {
+                return Some(format!(
+                    "[exec] cache_roots entry {entry:?} overlaps the read root {read:?}"
+                ));
+            }
         }
     }
     None

@@ -159,23 +159,104 @@ fn profile_grants_a_cache_root_reads_writes_and_code_loading() {
     assert!(!profile.contains("network"));
 }
 
+#[cfg(unix)]
 #[test]
-fn cache_roots_must_be_absolute_and_clear_of_the_run_root() {
-    let root = Path::new("/nonexistent-exec-root/runs");
-    assert_eq!(cache_root_conflict(root, &[]), None);
+fn cache_roots_must_exist_be_absolute_and_clear_of_the_run_root() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let base = std::fs::canonicalize(dir.path()).expect("canonical base");
+    let root = base.join("runs");
+    let inner = root.join("inner");
+    let sibling = base.join("cache");
+    std::fs::create_dir_all(&inner).expect("inner directory");
+    std::fs::create_dir_all(&sibling).expect("sibling directory");
+    let alias = base.join("alias");
+    std::os::unix::fs::symlink(&inner, &alias).expect("symbolic link into the run root");
+
+    assert_eq!(cache_root_conflict(&root, &[], &[]), None);
     assert_eq!(
-        cache_root_conflict(root, &[PathBuf::from("/nonexistent-exec-root/cache")]),
+        cache_root_conflict(&root, &[], std::slice::from_ref(&sibling)),
         None
     );
-    for bad in [
-        "/nonexistent-exec-root",
-        "/nonexistent-exec-root/runs",
-        "/nonexistent-exec-root/runs/inner",
-        "relative/cache",
-    ] {
+
+    let refused = [
+        ("holds the run root", base.clone()),
+        ("equals the run root", root.clone()),
+        ("sits inside the run root", inner.clone()),
+        ("alias of a directory inside the run root", alias),
+        (
+            "`..` path that resolves inside the run root",
+            base.join("cache").join("..").join("runs").join("inner"),
+        ),
+        ("relative", PathBuf::from("relative/cache")),
+    ];
+    for (why, entry) in refused {
+        let message = cache_root_conflict(&root, &[], std::slice::from_ref(&entry))
+            .unwrap_or_else(|| panic!("{why} must be refused"));
+        assert!(message.contains(&format!("{entry:?}")), "{why}: {message}");
+    }
+
+    let missing = base.join("missing");
+    let message = cache_root_conflict(&root, &[], std::slice::from_ref(&missing))
+        .expect("a cache root that does not exist must be refused");
+    assert!(message.contains(&format!("{missing:?}")), "{message}");
+    assert!(message.contains("must exist"), "{message}");
+
+    // A missing path under a real directory is refused too, even though its
+    // text sits inside a directory the check can resolve.
+    let under_run_root = inner.join("not-yet");
+    assert!(
+        cache_root_conflict(&root, &[], std::slice::from_ref(&under_run_root)).is_some(),
+        "a missing path inside the run root must be refused"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_roots_must_not_overlap_a_read_root() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let base = std::fs::canonicalize(dir.path()).expect("canonical base");
+    let root = base.join("runs");
+    let shared = base.join("shared");
+    let deep = shared.join("deep");
+    let read = base.join("read");
+    let read_sibling = base.join("read-cache");
+    let cache = base.join("cache");
+    for path in [&root, &deep, &read, &read_sibling, &cache] {
+        std::fs::create_dir_all(path).expect("fixture directory");
+    }
+
+    // Control: siblings, including a name that only shares a text prefix.
+    for sibling in [&cache, &read_sibling] {
+        assert_eq!(
+            cache_root_conflict(
+                &root,
+                std::slice::from_ref(&read),
+                std::slice::from_ref(sibling)
+            ),
+            None,
+            "{sibling:?} sits beside the read root and must be accepted"
+        );
+    }
+
+    let overlaps = [
+        ("equals", shared.clone(), shared.clone()),
+        ("holds", deep.clone(), shared.clone()),
+        ("sits inside", shared.clone(), deep.clone()),
+    ];
+    for (why, read_root, cache_root) in overlaps {
+        let message = cache_root_conflict(
+            &root,
+            std::slice::from_ref(&read_root),
+            std::slice::from_ref(&cache_root),
+        )
+        .unwrap_or_else(|| panic!("a cache root that {why} a read root must be refused"));
         assert!(
-            cache_root_conflict(root, &[PathBuf::from(bad)]).is_some(),
-            "{bad} must be refused"
+            message.contains(&format!("{cache_root:?}")),
+            "{why}: {message}"
+        );
+        assert!(
+            message.contains(&format!("{read_root:?}")),
+            "{why}: {message}"
         );
     }
 }

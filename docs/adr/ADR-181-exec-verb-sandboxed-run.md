@@ -1736,9 +1736,14 @@ that are hashed and stored on every run and thrown away with the directory, so t
    `file-read-metadata` (with the exact ancestor directories), `file-map-executable` and `file-write*`. Nothing else
    in the profile changes. In particular there is still no network, and the version-control and `never` denials of
    Amendment 9 apply to a binary under a cache root as they do anywhere.
-3. **Refusal.** A run is refused before materialization, with the reason, when a cache root is not absolute, or when
-   a cache root holds the exec root or sits inside it. Either overlap would let one run write another run's
-   directory.
+3. **Refusal.** A run is refused before materialization, with the reason, when a cache root is not absolute, when it
+   does not exist or cannot be resolved, when it holds the exec root or sits inside it, or when it equals, holds or
+   sits inside a read root. A cache root must exist when a run starts; the operator creates it. Entries are compared
+   in canonical form, so a symbolic link or a `..` component does not hide an overlap. An overlap with the exec root
+   would let one run write another run's directory, and an overlap with a read root would make a directory the
+   configuration calls read-only writable. The refusal names the entry and, for an overlap, the root it overlaps.
+   The check does not judge what else a cache root holds. A root that holds a home directory, a credential or a
+   store is the operator's error and is not refused.
 4. **Capture.** Nothing under a cache root is part of the run's output. It is not walked, not hashed, not stored, and
    it is not removed when the run directory is.
 5. **Receipt and identity.** The receipt's `sandbox` object carries `cache_roots_digest`: the BLAKE3 hex of the
@@ -1774,3 +1779,12 @@ do not bound it. A quota on its volume does.
     undeclared paths and an unchanged output tree, its receipt carries a `cache_roots_digest` other than the empty
     list's, the file is on disk after the run directory is gone, and a second run reads it. On a host with no cache
     root the same write fails and the receipt's digest is the empty list's.
+73. **Existence.** A cache root that does not exist is refused with a reason that names the entry and says it must
+    exist when a run starts. A sibling directory that exists is accepted (control).
+74. **Canonical form.** A cache root that is an alias, through a symbolic link, of a directory inside the exec root,
+    and a cache root written with `..` components that resolves inside the exec root, are each refused.
+75. **Read roots.** A cache root equal to a read root, holding one, or inside one is refused with a reason that names
+    both entries. A read root and a cache root that are siblings are accepted (control), including two names that
+    share only a text prefix.
+76. **Identity.** Without a configured cache root `exec.identity` reports an empty `cache_roots` and the digest of
+    the empty list. With one it reports the root and a different digest. This is checked without a sandbox.
