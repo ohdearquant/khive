@@ -60,6 +60,10 @@ fn is_cjk_dominant_query_accepts_pure_cjk() {
     // Hiragana, Katakana, and Hangul count as CJK.
     assert!(is_cjk_dominant_query("これはペンです"));
     assert!(is_cjk_dominant_query("안녕하세요"));
+    // The iteration mark and ideographic zero are CJK letters, not other letters.
+    assert!(is_cjk_dominant_query("人々"));
+    assert!(is_cjk_dominant_query("時々 a"));
+    assert!(is_cjk_dominant_query("〇〇"));
 }
 
 #[test]
