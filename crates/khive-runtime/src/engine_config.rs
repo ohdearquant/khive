@@ -25,6 +25,14 @@ mod peers;
 pub use peers::EngineConfig;
 pub(crate) use peers::{canonical_engine_name, validate_peer_engines};
 
+#[path = "engine_config_computer.rs"]
+mod computer;
+pub use computer::{
+    read_computer_key, ComputerEndpoint, ComputerKey, ComputerKeyError, ComputerKeyRefusal,
+    ComputerSectionConfig, COMMAND_RUNNING_PACKS, COMPUTER_ROUTABLE_PACKS,
+    DEFAULT_COMPUTER_CALL_TIMEOUT_S, MAX_COMPUTER_CALL_TIMEOUT_S, MAX_COMPUTER_KEY_BYTES,
+};
+
 // ---- Error type ----
 
 /// Errors produced while loading or validating a `KhiveConfig`.
@@ -222,6 +230,12 @@ pub enum ConfigError {
     #[error("[web] {key}: {reason}")]
     InvalidWebConfig { key: String, reason: String },
 
+    #[error("[computer].{key}: {reason}")]
+    InvalidComputerConfig { key: String, reason: String },
+
+    #[error("[actor].computer {reason}")]
+    InvalidActorComputer { reason: String },
+
     #[error("[runtime] {key}: {reason}")]
     InvalidRuntimeConfig { key: String, reason: String },
 
@@ -311,6 +325,7 @@ impl ConfigError {
 /// display_name = "example actor"   # human label (optional)
 /// visible_namespaces = ["lambda:khive", "local"]  # widens default read scope (ADR-007 Rev 4 Rule 3b)
 /// require_attributed = true                       # refuse comm without an actor (optional)
+/// computer = "build-1"                             # with a [computer] table only (ADR-220)
 /// ```
 ///
 /// `visible_namespaces` is consumed by OSS dispatch to widen the DEFAULT
@@ -396,6 +411,15 @@ pub struct ActorConfig {
     /// read. Valid without `id`. Defaults to `false`.
     #[serde(default)]
     pub require_attributed: bool,
+
+    /// The name of this caller's computer (ADR-220). Required exactly when a
+    /// `[computer]` table is present, and equal to its `name`: either one
+    /// without the other fails startup. The field lives in this closed table
+    /// so that a build which predates `[computer]` but closes `[actor]`
+    /// refuses the file, instead of starting with the table ignored and the
+    /// command verbs dispatching on the store's machine.
+    #[serde(default)]
+    pub computer: Option<String>,
 }
 
 /// Built-in caller-enrollment policy configured by `[gate]`.
@@ -1524,7 +1548,7 @@ where
 /// - `[code_ingest]`: directories `code.ingest` may read and write under
 ///
 /// Unknown top-level keys are silently ignored by serde for forward
-/// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, `[knowledge]`, `[git_digest]`, `[code_ingest]` and `[telemetry]` tables are closed
+/// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, `[knowledge]`, `[git_digest]`, `[code_ingest]`, `[telemetry]` and `[computer]` tables are closed
 /// with `deny_unknown_fields` so a misspelled policy key always fails startup.
 /// `[storage]`, `[[backends]]` entries and `[exec]` are also closed so unknown
 /// destination keys cannot be silently dropped, as are `[web]` and `[[mounts]]` entries.
@@ -1666,6 +1690,13 @@ pub struct KhiveConfig {
     /// allowlist configured).
     #[serde(default)]
     pub web: WebSectionConfig,
+
+    /// The caller's computer (ADR-220). Absent leaves every pack on the
+    /// store's machine; present routes `packs` to that computer. Read only by
+    /// the process that resolved this file, and not part of the daemon's
+    /// configuration id: the daemon never routes.
+    #[serde(default)]
+    pub computer: Option<ComputerSectionConfig>,
 }
 
 /// `[runtime]` section in `khive.toml`.
@@ -2163,6 +2194,10 @@ impl KhiveConfig {
         self.git_write.validate_dev_loop()?;
         self.telemetry.validate()?;
         self.web.validate()?;
+        if let Some(computer) = &self.computer {
+            computer.validate()?;
+        }
+        computer::validate_actor_computer(self.computer.as_ref(), self.actor.computer.as_deref())?;
         crate::credentials::CredentialConfig::validate_all(&self.credentials)?;
         if let Some(receipts) = &self.visibility_receipts {
             receipts.validate(&self.credentials)?;

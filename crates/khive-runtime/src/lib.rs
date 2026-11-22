@@ -180,10 +180,13 @@ pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderP
 pub use embedding::{EmbeddingModelRecord, EmbeddingModelStatus};
 pub use embedding_reranker::{EmbeddingCosineReranker, EmbeddingRerankHit};
 pub use engine_config::{
-    config_from_env, resolve_wal_ceiling, BackendConfig, BackendKind, BlobConfig,
-    BrainSectionConfig, CodeIngestSectionConfig, CodeMapConfig, ConfigError, EngineConfig,
-    GateSectionConfig, GitDigestSectionConfig, GitWriteEntryConfig, GitWriteSectionConfig,
-    KhiveConfig, KnowledgeSectionConfig, PackConfig, ResolvedWalCeiling, StorageSectionConfig,
+    config_from_env, read_computer_key, resolve_wal_ceiling, BackendConfig, BackendKind,
+    BlobConfig, BrainSectionConfig, CodeIngestSectionConfig, CodeMapConfig, ComputerEndpoint,
+    ComputerKey, ComputerKeyError, ComputerKeyRefusal, ComputerSectionConfig, ConfigError,
+    EngineConfig, GateSectionConfig, GitDigestSectionConfig, GitWriteEntryConfig,
+    GitWriteSectionConfig, KhiveConfig, KnowledgeSectionConfig, PackConfig, ResolvedWalCeiling,
+    StorageSectionConfig, COMMAND_RUNNING_PACKS, COMPUTER_ROUTABLE_PACKS,
+    DEFAULT_COMPUTER_CALL_TIMEOUT_S, MAX_COMPUTER_CALL_TIMEOUT_S, MAX_COMPUTER_KEY_BYTES,
 };
 pub use error::{
     fts_text_leg_or_err, AdmissionFailureContext, AuditObligationFailure, AuditObligationReason,
