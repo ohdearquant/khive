@@ -236,7 +236,8 @@ computer through a connector seam: in production it connects to `url` over TCP o
 over a Unix socket, so every arm runs on a machine that allows no TCP and no nested sandbox. A spy
 daemon records every frame it receives, as the existing actor forwarding tests do. Arms 3, 4 and 8
 also run with the real `exec` pack, and arm 1 also runs over loopback TCP; those variants need a
-host that allows both, and run in the hosted checks.
+host that allows both, and run in the hosted checks. A green local run does not cover those
+variants: arms 3, 4 and 8 with the real `exec` pack pass only on hosted macOS.
 
 1. **One tool.** A session whose only tool is khive, with a `[computer]` table naming a test
    computer, runs `exec.run` and reads the run's receipt with a second call. The receipt's actor is
