@@ -102,6 +102,11 @@ use server_core::{stdio_serve_mode_for, StdioServeMode};
 
 mod batch_execution;
 mod bridge;
+// ADR-220 routing. The bridge wiring and the HTTP transport arrive in the same
+// change as this module; until then only its tests call it.
+#[cfg(unix)]
+#[allow(dead_code)]
+mod computer_routing;
 mod dispatch_helpers;
 mod execution;
 mod rendering;
