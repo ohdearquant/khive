@@ -66,7 +66,13 @@ fn clean(value: Option<&Value>, limit: usize, altered: &mut bool) -> Value {
 }
 
 fn refuse(failure: Failure) -> RuntimeError {
-    RuntimeError::InvalidInput(failure.reason.into())
+    // A spent allowance is the one refusal whose detail the caller needs: when to ask again.
+    match (failure.reason, failure.detail) {
+        ("remote_rate_limited", Some(detail)) => {
+            RuntimeError::InvalidInput(format!("remote_rate_limited: {detail}"))
+        }
+        (reason, _) => RuntimeError::InvalidInput(reason.into()),
+    }
 }
 
 fn count(value: &Value, pointer: &str) -> Result<u64, Failure> {

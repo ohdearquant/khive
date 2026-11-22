@@ -984,6 +984,9 @@ number is the platform's refusal and a transport failure is `remote_unavailable`
 holding a direction override, an escape and a zero-width space, and a 400-character branch name,
 return cleaned and bounded with `text_altered` true, and a CJK name returns exactly with it false
 (control); 57 250 check runs are read in three pages and all returned, and 620 return 500 with
-`truncated` true; 58 a merged pull request reports `merged` and its `merged_sha`, and a review
-list that never ends refuses `review_evidence_limit`; 59 a local mapping refuses `remote_scheme`
-with no credential read and no receipt.
+`truncated` true; 58 a merged pull request reports `merged` and its `merged_sha`, and a review list
+that never ends refuses `review_evidence_limit`; 59 a local mapping refuses `remote_scheme` with no
+credential read and no receipt; 60 a platform refusal that reports a spent request allowance is
+`remote_rate_limited` with the second the allowance returns, after exactly one request, an effect
+verb refuses the same way as not committed with no write, and both answer once the allowance is back
+(control).

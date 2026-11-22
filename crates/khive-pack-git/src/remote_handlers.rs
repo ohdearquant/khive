@@ -29,6 +29,11 @@ impl From<RemoteError> for Failure {
     fn from(error: RemoteError) -> Self {
         match error {
             RemoteError::Refused => Self::refused("remote_refused"),
+            RemoteError::RateLimited { reset } => Self {
+                reason: "remote_rate_limited",
+                ambiguous: false,
+                detail: reset.map(|at| format!("the allowance returns at epoch second {at}")),
+            },
             RemoteError::Unavailable => Self::refused("remote_unavailable"),
             RemoteError::InvalidResponse => Self::refused("remote_response"),
             RemoteError::Unknown => Self::unknown("remote_unknown"),

@@ -81,6 +81,7 @@ struct State {
     merge_race: Option<String>,
     lost_ack: bool,
     api_failure: bool,
+    rate_limited: Option<u64>,
     malformed_merge_reply: bool,
     review_decision: Value,
     decision_head: Option<String>,
@@ -163,6 +164,9 @@ impl RemoteTransport for Recording {
         s.calls.push(json!({"method":request.method,"path":request.path,"body":request.body,"token_hash":blake3::hash(token.as_bytes()).to_hex().to_string()}));
         if s.api_failure {
             return Err(RemoteError::Unavailable);
+        }
+        if let Some(reset) = s.rate_limited {
+            return Err(RemoteError::RateLimited { reset: Some(reset) });
         }
         let path = request.path.as_str();
         if path == "user" {
@@ -397,6 +401,7 @@ impl Fixture {
                 merge_race: None,
                 lost_ack: false,
                 api_failure: false,
+                rate_limited: None,
                 malformed_merge_reply: false,
                 review_decision: json!("APPROVED"),
                 decision_head: None,

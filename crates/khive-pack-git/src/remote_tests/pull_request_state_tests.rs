@@ -361,3 +361,40 @@ async fn remote_pr_state_reports_a_merge_and_refuses_an_unbounded_review_list() 
         .to_string();
     assert!(error.contains("review_evidence_limit"), "{error}");
 }
+
+#[tokio::test]
+async fn remote_spent_allowance_is_named_with_the_time_it_returns() {
+    let f = Fixture::new(true, None).await;
+    let n = f.open().await;
+    f.policy(&f.actor, "git.pr_state", "allow").await;
+    f.remote.state.lock().unwrap().rate_limited = Some(1_795_346_246);
+    let before = state_calls(&f).len();
+    let error = f
+        .call(&f.actor, "git.pr_state", json!({"number":n}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("remote_rate_limited: the allowance returns at epoch second 1795346246"),
+        "{error}"
+    );
+    assert!(!error.contains("remote_refused"), "{error}");
+    // The read stops at the first refused request.
+    assert_eq!(state_calls(&f).len(), before + 1);
+    // An effect verb is refused with the same reason, as not committed and with no write.
+    let receipt = f
+        .refusal(
+            &f.reviewer,
+            "git.pr_review",
+            json!({"number":n,"verdict":"approve","body":"","expected_head":f.head}),
+            "remote_rate_limited",
+        )
+        .await;
+    assert_eq!(receipt.reason.as_deref(), Some("remote_rate_limited"));
+    // Control: both answer once the allowance is back.
+    f.remote.state.lock().unwrap().rate_limited = None;
+    f.call(&f.actor, "git.pr_state", json!({"number":n}))
+        .await
+        .unwrap();
+    f.review(&f.reviewer, n).await.unwrap();
+}
