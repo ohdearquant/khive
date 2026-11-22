@@ -266,8 +266,10 @@ the routed packs, served over streamable HTTP. Its `exec` is a recording stand-i
 receipt row (actor and operations) to the test computer's own store instead of starting a sandboxed
 process; a sentinel command is one that stand-in turns into a file. The client reaches the test
 computer through a connector seam: in production it connects to `url` over TCP or TLS, in tests
-over a Unix socket, so every arm except the redirect case of arm 5 runs on a machine that allows no
-TCP and no nested sandbox. A spy daemon records every frame it receives, as the existing actor
+over an in-process pipe with no socket, so every arm except the redirect case of arm 5 runs on a
+machine that allows no socket of any kind and no nested sandbox. The pipe carries real HTTP/1.1
+between the client and the test computer, so the arms still see real status codes, the 404 for a
+lost session included. A spy daemon records every frame it receives, as the existing actor
 forwarding tests do. Arms 3, 4 and 8 also run with the real `exec` pack, and arm 1 also runs over
 loopback TCP. The redirect case of arm 5 runs only over loopback TCP, because the property it
 checks belongs to the production HTTP client. Those variants need a host that allows the real
