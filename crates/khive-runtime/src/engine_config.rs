@@ -724,6 +724,15 @@ fn names_one_repository(remote: &str) -> bool {
     !host.is_empty() && path.len() >= 2 && path.iter().all(|segment| !segment.is_empty())
 }
 
+/// Whether a `scheme://` entry carries userinfo (a user name, with or without a
+/// password) in its authority, the part between `://` and the first `/`, `?` or `#`.
+fn authority_carries_userinfo(remote: &str) -> bool {
+    remote
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .is_some_and(|authority| authority.contains('@'))
+}
+
 /// `[git_digest]` policy: the sources `git.digest` may read. Absent or empty
 /// lists refuse every source of that kind.
 ///
@@ -2103,6 +2112,22 @@ impl KhiveConfig {
             return Err(ConfigError::InvalidRuntimeConfig {
                 key: "code_ingest.roots".to_owned(),
                 reason: format!("{root:?} is not an absolute path"),
+            });
+        }
+        // Checked before the refusals below, because those quote the entry: an
+        // entry carrying userinfo may hold a credential, so its refusal names the
+        // key and never the value.
+        if self
+            .git_digest
+            .remotes
+            .iter()
+            .any(|remote| authority_carries_userinfo(remote))
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "git_digest.remotes".to_owned(),
+                reason: "an entry carries a user name or password before its host; \
+                         list the repository URL without credentials"
+                    .to_owned(),
             });
         }
         if let Some(remote) = self
