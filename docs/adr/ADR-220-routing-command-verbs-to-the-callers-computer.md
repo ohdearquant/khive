@@ -240,10 +240,12 @@ One caller has at most one computer.
 ### 10. Wire contract
 
 - MCP over streamable HTTP to `url`, with `Authorization: Bearer <key>`. One MCP session per
-  bridge process. If the server reports the session expired, the bridge initializes once more;
-  `initialize` writes nothing, so repeating it is safe. A `tools/call` is never repeated. rmcp's
-  client re-sends the in-flight request after re-initializing unless that is turned off; the
-  bridge turns it off and re-initializes itself (arm 12).
+  bridge process. A server that no longer holds the session answers HTTP 404 before it handles
+  the request, so that request did not run. The bridge then initializes once more (`initialize`
+  writes nothing), repeats the `whoami` check of section 3, and sends that request once on the
+  new session. rmcp's client can re-initialize and re-send by itself, but it would skip the
+  `whoami` check, so the bridge turns that off and does it itself (arm 12). A `tools/call` that
+  the server accepted is never sent again.
 - A routed request is one `tools/call` of `request` with `ops` and the caller's presentation and
   format options. The bridge's request id is passed through so the computer's receipts can be
   matched to the caller's request.
@@ -292,7 +294,8 @@ variants: arms 3, 4 and 8 with the real `exec` pack pass only on hosted macOS.
     computers each fail startup; a key file with group or other permission bits, a symbolic link
     and a FIFO at `key_file` each refuse routed operations with `computer_key_unavailable`.
 12. **No repeated call.** Across a session expiry reported by the test computer, one `exec.run`
-    executes exactly once on the test computer: its run list for the actor gains one receipt.
+    executes exactly once on the test computer: its run list for the actor gains one receipt, and
+    the test computer answers `whoami` on the new session before that run.
 13. **Scheduled command refused.** For a caller with a `[computer]` table, `schedule.schedule`
     whose action is `exec.run(...)`, a nested `schedule.schedule` of one, or a `$prev` value is
     refused with `runs_on_computer`, and the store holds no new scheduled event; a
