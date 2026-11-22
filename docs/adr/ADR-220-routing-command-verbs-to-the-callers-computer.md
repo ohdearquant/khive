@@ -46,7 +46,8 @@ Facts at the grounding commit that this record builds on:
 - The git write surface already resolves a credential by reference at call time and never stores
   or returns it: `[git_write] actors.<actor>.credential_ref`. Source:
   `crates/khive-runtime/src/engine_config.rs` lines 825-889.
-- `[actor]` is a closed table: a misspelled key fails startup. Source:
+- `[actor]` is a closed table: a misspelled key fails startup. It has been closed since #2902
+  (2026-09-17); unknown top-level tables are accepted. Source:
   `crates/khive-runtime/src/engine_config.rs` lines 325-399.
 
 This record decides how one khive tool reaches the caller's computer. It does not define the
@@ -89,6 +90,10 @@ The table is read from the same configuration file as `[actor]`, so the two alwa
 file. Example:
 
 ```toml
+[actor]
+id = "lambda:example"
+computer = "build-1"
+
 [computer]
 name = "build-1"
 url = "http://127.0.0.1:8700/mcp"
@@ -113,6 +118,10 @@ call_timeout_s = 3700
   long run on the computer is not cut off by the bridge first.
 - No value in the table is a secret. `Debug` of the parsed table prints `key_file` as a path and
   never reads it.
+- `[actor].computer`: required when the table is present, and equal to its `name`. The table
+  without the field, and the field without the table, both fail startup. The field sits in the
+  closed `[actor]` table so that a build which does not know `[computer]` refuses the file instead
+  of starting with the table ignored (Consequences).
 
 One caller has at most one computer.
 
@@ -120,9 +129,10 @@ One caller has at most one computer.
 
 - Only the process that resolved the caller's configuration reads the key, from `key_file`, when it
   first needs it and again after a reconnect. The file must be a regular file owned by the process's
-  user with no group or other permission bits, and must hold one nonempty token of at most 4096
-  bytes with no inner whitespace (a trailing newline is ignored). Any other state refuses routed
-  operations with `computer_key_unavailable`; store operations are unaffected.
+  user with no group or other permission bits, and must hold one nonempty value of visible ASCII
+  (0x21 to 0x7e), at most 4096 bytes, one trailing LF or CRLF ignored; a symbolic link or a FIFO
+  at that path is refused. Any other state refuses routed operations with
+  `computer_key_unavailable`; store operations are unaffected.
 - The key is held in a buffer cleared on drop and is placed only in the `Authorization` header of
   requests to `url`. It never appears in a result, a refusal, a log or tracing field, a daemon
   frame, `bridge.diagnostics`, the store, or the catalog. A refusal names the table key
@@ -164,8 +174,18 @@ One caller has at most one computer.
 - **A `[computer]` table:** operations in `packs` go to the computer. An operation in the
   command-running set `exec`, `git`, `code`, `workspace`, `tool` that is not in `packs` is refused
   with `runs_on_computer` (this caller's commands run on its computer, and that pack is not routed)
-  before anything is forwarded. So no configuration with a `[computer]` table can run a command on
-  the store's machine, whatever `packs` lists.
+  before anything is forwarded. So no request from a caller with a `[computer]` table runs a verb
+  of a command-running pack on the store's machine, whatever `packs` lists.
+- **Scheduled actions:** `schedule.schedule` stores a verb string that the store dispatches later
+  on its own machine, as the creating actor, from the daemon's tick or from
+  `kkernel exec --pending-events`. For a caller with a `[computer]` table, the routing process
+  refuses `schedule.schedule` with `runs_on_computer` when its action, or an action nested in it,
+  names a command-running pack or a routed pack. An action that is not a literal string, does not
+  parse, or nests more than eight deep cannot be read before it is stored and is refused the same
+  way. A scheduled-event note written with a generic `create` does not fire: the drain replays only
+  a row whose creator provenance event the schedule pack appended.
+- Other dispatch that starts on the store's machine is listed under Not covered, with what a
+  deployment does about it.
 
 ### 7. Requests that mix store and computer operations
 
@@ -221,7 +241,9 @@ One caller has at most one computer.
 
 - MCP over streamable HTTP to `url`, with `Authorization: Bearer <key>`. One MCP session per
   bridge process. If the server reports the session expired, the bridge initializes once more;
-  `initialize` writes nothing, so repeating it is safe. A `tools/call` is never repeated.
+  `initialize` writes nothing, so repeating it is safe. A `tools/call` is never repeated. rmcp's
+  client re-sends the in-flight request after re-initializing unless that is turned off; the
+  bridge turns it off and re-initializes itself (arm 12).
 - A routed request is one `tools/call` of `request` with `ops` and the caller's presentation and
   format options. The bridge's request id is passed through so the computer's receipts can be
   matched to the caller's request.
@@ -265,14 +287,32 @@ variants: arms 3, 4 and 8 with the real `exec` pack pass only on hosted macOS.
    byte-identical to the same call made directly to the computer.
 10. **Catalog.** For a caller with a computer, `verbs(pack="git")` lists exactly the computer's git
     verbs; for a caller without one it lists the store's.
-11. **Configuration rules.** An `http` URL to a non-loopback host fails startup; a key file with
-    group or other permission bits refuses routed operations with `computer_key_unavailable`.
+11. **Configuration rules.** An `http` URL to a non-loopback host fails startup; a `[computer]`
+    table without `[actor].computer`, the field without the table, and the two naming different
+    computers each fail startup; a key file with group or other permission bits, a symbolic link
+    and a FIFO at `key_file` each refuse routed operations with `computer_key_unavailable`.
+12. **No repeated call.** Across a session expiry reported by the test computer, one `exec.run`
+    executes exactly once on the test computer: its run list for the actor gains one receipt.
+13. **Scheduled command refused.** For a caller with a `[computer]` table, `schedule.schedule`
+    whose action is `exec.run(...)`, a nested `schedule.schedule` of one, or a `$prev` value is
+    refused with `runs_on_computer`, and the store holds no new scheduled event; a
+    `schedule.schedule` of `memory.remember(...)` is stored as today.
+
+Not run: a key file owned by another user. The reader refuses it, but creating such a file needs
+root or a second account, and the test suites run as neither, so the arm is stated and not
+exercised.
 
 ## Consequences
 
-- A caller's configuration gains one table with five keys. Whatever writes those files writes
-  `name`, `url`, `key_file`, `packs` and `call_timeout_s`.
-- A caller that passes arms 1 to 11 can drop its second tool.
+- A caller's configuration gains one table with five keys and one `[actor]` key. Whatever writes
+  those files writes `name`, `url`, `key_file`, `packs`, `call_timeout_s` and `[actor].computer`.
+- A build that predates the `[computer]` table ignores it, since unknown top-level tables are
+  accepted, and would dispatch that caller's command verbs on the store's machine.
+  `[actor].computer` makes such a build fail closed: every build from #2902 (2026-09-17) on
+  refuses a file that carries it and does not start. A build older than #2902 also ignores unknown
+  `[actor]` keys; it starts and runs that caller's command verbs on the store's machine, so a
+  deployment replaces such a build before it writes a `[computer]` table.
+- A caller that passes arms 1 to 13 can drop its second tool.
 - The bridge process holds one HTTP client and one key. The key already lives with the process
   that starts the session today; this record moves where it is read, not who holds it.
 - A long routed call holds one of the bridge's outstanding request slots for up to
@@ -286,7 +326,24 @@ variants: arms 3, 4 and 8 with the real `exec` pack pass only on hosted macOS.
 - A computer that also serves the store packs (option c).
 - Named tools that write only inside the calling caller's own folder (a session log, notes,
   lessons). These would be store verbs scoped by the caller's actor, not routed operations, and
-  belong in their own record.
+  belong in their own record. The route named for them is the store's blob pack with a sync, and
+  section 2 makes a routed `blob` hide the store's blob verbs from the caller, so a caller that
+  writes its files that way does not list `blob` in `packs` until that record decides how the two
+  meet.
+- Scheduled events stored before the caller's configuration gained a `[computer]` table. They fire
+  on the store's machine as stored. Before writing the table, a deployment lists them with
+  `schedule.agenda` as that caller and cancels with `schedule.cancel` each one whose action names
+  a command-running pack.
+- Mounted tool sources (`[[mounts]]`). A mount is a process the store's operator configures; the
+  store starts it on its own machine and serves its tools as verbs named `<mount>.<tool>` to every
+  caller, whatever that caller's table says. A deployment that serves callers with a `[computer]`
+  table configures no mount whose tools run commands.
+- Dispatch that no caller's request starts: the channel loops (email, telegram, polling and
+  ingest), which dispatch only `comm.*` and `blob.put`; the daemon's own processes (the events
+  daemon, its launch and self-heal, its liveness probe); and operator subcommands such as
+  `kkernel kg init` and `kkernel kg commit`, which run `git` and `/bin/sh` on the machine where
+  they are run. None of these takes a command from a caller.
+- Builds older than #2902 (Consequences).
 - Issuing, rotating and revoking computer keys.
 - More than one computer per caller.
 - Streaming a long run's output while it runs.
