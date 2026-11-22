@@ -233,6 +233,9 @@ pub enum ConfigError {
     #[error("[computer].{key}: {reason}")]
     InvalidComputerConfig { key: String, reason: String },
 
+    #[error("[actor].computer {reason}")]
+    InvalidActorComputer { reason: String },
+
     #[error("[runtime] {key}: {reason}")]
     InvalidRuntimeConfig { key: String, reason: String },
 
@@ -322,6 +325,7 @@ impl ConfigError {
 /// display_name = "example actor"   # human label (optional)
 /// visible_namespaces = ["lambda:khive", "local"]  # widens default read scope (ADR-007 Rev 4 Rule 3b)
 /// require_attributed = true                       # refuse comm without an actor (optional)
+/// computer = "build-1"                             # with a [computer] table only (ADR-220)
 /// ```
 ///
 /// `visible_namespaces` is consumed by OSS dispatch to widen the DEFAULT
@@ -407,6 +411,15 @@ pub struct ActorConfig {
     /// read. Valid without `id`. Defaults to `false`.
     #[serde(default)]
     pub require_attributed: bool,
+
+    /// The name of this caller's computer (ADR-220). Required exactly when a
+    /// `[computer]` table is present, and equal to its `name`: either one
+    /// without the other fails startup. The field lives in this closed table
+    /// so that a build which predates `[computer]` but closes `[actor]`
+    /// refuses the file, instead of starting with the table ignored and the
+    /// command verbs dispatching on the store's machine.
+    #[serde(default)]
+    pub computer: Option<String>,
 }
 
 /// Built-in caller-enrollment policy configured by `[gate]`.
@@ -2184,6 +2197,7 @@ impl KhiveConfig {
         if let Some(computer) = &self.computer {
             computer.validate()?;
         }
+        computer::validate_actor_computer(self.computer.as_ref(), self.actor.computer.as_deref())?;
         crate::credentials::CredentialConfig::validate_all(&self.credentials)?;
         if let Some(receipts) = &self.visibility_receipts {
             receipts.validate(&self.credentials)?;
