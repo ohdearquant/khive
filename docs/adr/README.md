@@ -239,6 +239,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-209](ADR-209-root-policy-overrides-and-flow-history.md)            | Root Policy Overrides, Resource Grants, and Verifiable Flow History                                        |
 | [ADR-211](ADR-211-event-archive-backfill.md)                            | Event Archive Backfill                                                                                     |
 | [ADR-212](ADR-212-expendable-event-retention-class.md)                  | Expendable Event Retention Class                                                                           |
+| [ADR-220](ADR-220-routing-command-verbs-to-the-callers-computer.md)     | Routing Command Verbs to the Caller's Computer                                                             |
 
 <!-- END GENERATED ADR CATALOG -->
 
