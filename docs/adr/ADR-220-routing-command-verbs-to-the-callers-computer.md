@@ -133,10 +133,12 @@ One caller has at most one computer.
   (0x21 to 0x7e), at most 4096 bytes, one trailing LF or CRLF ignored; a symbolic link or a FIFO
   at that path is refused. Any other state refuses routed operations with
   `computer_key_unavailable`; store operations are unaffected.
-- The key is held in a buffer cleared on drop and is placed only in the `Authorization` header of
-  requests to `url`. It never appears in a result, a refusal, a log or tracing field, a daemon
-  frame, `bridge.diagnostics`, the store, or the catalog. A refusal names the table key
-  (`[computer].key_file`), not the path and never the contents.
+- The bridge reads the key into a buffer cleared on drop and gives the HTTP client a copy for each
+  session, used only for the `Authorization` header of requests to `url`; the HTTP client keeps
+  that copy for the session and frees it without clearing it. The HTTP client follows no redirect,
+  so the header is sent only to the host and port of `url`. The key never appears in a result, a
+  refusal, a log or tracing field, a daemon frame, `bridge.diagnostics`, the store, or the catalog.
+  A refusal names the table key (`[computer].key_file`), not the path and never the contents.
 - On its first routed call, and after every reconnect, the bridge calls `whoami` on the computer.
   If the actor the computer reports differs from the caller's `[actor].id`, every routed operation
   is refused with `computer_identity_mismatch`, naming both actor ids. A key copied from another
@@ -264,11 +266,13 @@ the routed packs, served over streamable HTTP. Its `exec` is a recording stand-i
 receipt row (actor and operations) to the test computer's own store instead of starting a sandboxed
 process; a sentinel command is one that stand-in turns into a file. The client reaches the test
 computer through a connector seam: in production it connects to `url` over TCP or TLS, in tests
-over a Unix socket, so every arm runs on a machine that allows no TCP and no nested sandbox. A spy
-daemon records every frame it receives, as the existing actor forwarding tests do. Arms 3, 4 and 8
-also run with the real `exec` pack, and arm 1 also runs over loopback TCP; those variants need a
-host that allows both, and run in the hosted checks. A green local run does not cover those
-variants: arms 3, 4 and 8 with the real `exec` pack pass only on hosted macOS.
+over a Unix socket, so every arm except the redirect case of arm 5 runs on a machine that allows no
+TCP and no nested sandbox. A spy daemon records every frame it receives, as the existing actor
+forwarding tests do. Arms 3, 4 and 8 also run with the real `exec` pack, and arm 1 also runs over
+loopback TCP. The redirect case of arm 5 runs only over loopback TCP, because the property it
+checks belongs to the production HTTP client. Those variants need a host that allows the real
+`exec` pack and TCP, and run in the hosted checks. A green local run does not cover them: arms 3,
+4 and 8 with the real `exec` pack pass only on hosted macOS.
 
 1. **One tool.** A session whose only tool is khive, with a `[computer]` table naming a test
    computer, runs `exec.run` and reads the run's receipt with a second call. The receipt's actor is
@@ -283,7 +287,9 @@ variants: arms 3, 4 and 8 with the real `exec` pack pass only on hosted macOS.
    creates its file and the spy daemon receives the frame.
 5. **The key never surfaces.** With a fixture key of known bytes, no response, refusal, log or
    tracing output, `bridge.diagnostics` snapshot or daemon frame contains those bytes, across a
-   success, `computer_unreachable`, `computer_identity_mismatch` and a computer refusal.
+   success, `computer_unreachable`, `computer_identity_mismatch` and a computer refusal. A routed
+   request that the test computer answers with a redirect to a second listener is refused, and the
+   second listener receives no request.
 6. **Wrong key.** A key belonging to another actor is refused with
    `computer_identity_mismatch` before any routed operation runs; the computer's run list is
    unchanged.
