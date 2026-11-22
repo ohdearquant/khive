@@ -1,6 +1,6 @@
 # ADR-220: Routing Command Verbs to the Caller's Computer
 
-- **Status:** Proposed 2026-11-22
+- **Status:** Accepted 2026-11-22 (#6816)
 - **Date:** 2026-11-22
 - **Grounding commit:** `f700206f543444d50b8fcd178c93977440a014c8`
 - **Depends on:** [ADR-016](ADR-016-request-dsl.md), [ADR-096](ADR-096-warm-daemon-per-request-identity.md),
