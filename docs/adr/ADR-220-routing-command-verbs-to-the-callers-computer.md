@@ -152,7 +152,9 @@ One caller has at most one computer.
   the computer returned it. For a request whose operations are all routed, the computer's whole
   envelope is returned unchanged. For a mixed request (section 7) the entries are passed unchanged
   and only `summary` and `status` are recomputed from them.
-- The bridge never retries a routed `tools/call`: re-running a write is a second write.
+- A `tools/call` the computer accepted is never sent again: re-running a write is a second write.
+  A request answered HTTP 404 for a lost session did not run and is sent once on the new session
+  (section 10).
 
 ### 5. Unreachable, misconfigured, or no computer
 
@@ -174,8 +176,8 @@ One caller has at most one computer.
 - **A `[computer]` table:** operations in `packs` go to the computer. An operation in the
   command-running set `exec`, `git`, `code`, `workspace`, `tool` that is not in `packs` is refused
   with `runs_on_computer` (this caller's commands run on its computer, and that pack is not routed)
-  before anything is forwarded. So no request from a caller with a `[computer]` table runs a verb
-  of a command-running pack on the store's machine, whatever `packs` lists.
+  before that operation is forwarded. So no request from a caller with a `[computer]` table runs
+  a verb of a command-running pack on the store's machine, whatever `packs` lists.
 - **Scheduled actions:** `schedule.schedule` stores a verb string that the store dispatches later
   on its own machine, as the creating actor, from the daemon's tick or from
   `kkernel exec --pending-events`. For a caller with a `[computer]` table, the routing process
@@ -240,12 +242,17 @@ One caller has at most one computer.
 ### 10. Wire contract
 
 - MCP over streamable HTTP to `url`, with `Authorization: Bearer <key>`. One MCP session per
-  bridge process. A server that no longer holds the session answers HTTP 404 before it handles
-  the request, so that request did not run. The bridge then initializes once more (`initialize`
-  writes nothing), repeats the `whoami` check of section 3, and sends that request once on the
-  new session. rmcp's client can re-initialize and re-send by itself, but it would skip the
-  `whoami` check, so the bridge turns that off and does it itself (arm 12). A `tools/call` that
-  the server accepted is never sent again.
+  bridge process. The computer must answer HTTP 404 to a request on a session it no longer holds,
+  and must answer before it handles that request. The bridge relies on this: it reads such a 404
+  as a request that did not run, initializes once more (`initialize` writes nothing), repeats the
+  `whoami` check of section 3, and sends that request once on the new session. rmcp's client can
+  re-initialize and re-send by itself, but it would skip the `whoami` check, so the bridge turns
+  that off and does it itself (arm 12). A `tools/call` that the computer accepted is never sent
+  again.
+- The rule that a routed `tools/call` runs at most once rests on that requirement. A computer that
+  handles a request and then answers 404 for its session breaks it, and the bridge cannot detect
+  that: it sends the request again and the computer runs it twice. The computer is specified
+  outside this repository; meeting this requirement is its part of the contract.
 - A routed request is one `tools/call` of `request` with `ops` and the caller's presentation and
   format options. The bridge's request id is passed through so the computer's receipts can be
   matched to the caller's request.
