@@ -107,6 +107,7 @@ mod bridge;
 // stay bare for the error-constructor census.
 mod computer_bridge;
 mod computer_client;
+mod computer_http;
 #[cfg(all(test, unix))]
 mod computer_pipe_tests;
 mod computer_routing;

@@ -31,6 +31,7 @@ use rmcp::{RoleClient, ServiceExt};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+use super::computer_http::{BoundedHttpClient, ResponseTooLarge};
 use super::computer_routing::{HomeOutcome, COMPUTER_PROTOCOL};
 
 /// Failure kind for a computer that cannot be reached or did not answer.
@@ -101,6 +102,9 @@ pub(super) enum TransportFailure {
     SessionExpired,
     /// No connection was made, so the request never left this process.
     NotSent,
+    /// The computer answered with a body over its bound (see
+    /// `computer_http`): the request may have run.
+    Oversized,
     /// The request may have reached the computer.
     Unknown,
 }
@@ -133,7 +137,9 @@ fn classify<C: StreamableHttpClient>(error: &(dyn StdError + 'static)) -> Transp
         Some(StreamableHttpError::Client(client)) => client as &(dyn StdError + 'static),
         _ => error,
     };
-    if never_connected(behind) {
+    if in_chain::<ResponseTooLarge>(behind) {
+        TransportFailure::Oversized
+    } else if never_connected(behind) {
         TransportFailure::NotSent
     } else {
         TransportFailure::Unknown
@@ -158,6 +164,18 @@ fn never_connected(error: &(dyn StdError + 'static)) -> bool {
     false
 }
 
+/// Whether `error` or an error behind it is a `T`.
+fn in_chain<T: StdError + 'static>(error: &(dyn StdError + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.is::<T>() {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
 /// Opens the HTTP transport for one session. Production connects to `url`
 /// over TCP or TLS; the acceptance arms connect over an in-process pipe.
 #[async_trait]
@@ -168,7 +186,7 @@ pub(super) trait Connector: Send + Sync {
     ) -> Result<Connection, String>;
 }
 
-/// Connects to `url` with rmcp's HTTP client.
+/// Connects to `url` with the bounded HTTP client of `computer_http`.
 pub(super) struct HttpConnector;
 
 #[async_trait]
@@ -177,7 +195,11 @@ impl Connector for HttpConnector {
         &self,
         transport: StreamableHttpClientTransportConfig,
     ) -> Result<Connection, String> {
-        connect_transport(StreamableHttpClientTransport::from_config(transport)).await
+        let client = BoundedHttpClient::new()?;
+        connect_transport(StreamableHttpClientTransport::with_client(
+            client, transport,
+        ))
+        .await
     }
 }
 
@@ -464,6 +486,18 @@ impl ComputerClient {
                         DomainDisposition::NotCommitted,
                         true,
                     ),
+                    TransportFailure::Oversized => CallOutcome::Failed {
+                        failure: failure(
+                            COMPUTER_PROTOCOL,
+                            format!(
+                                "computer {} {}; the request may have run",
+                                self.label,
+                                scrub(error.to_string(), &session.key)
+                            ),
+                            DomainDisposition::Unknown,
+                        ),
+                        drop_session: true,
+                    },
                     TransportFailure::Unknown => unreachable(
                         format!("failed after the request was sent: {error}; it may have run"),
                         DomainDisposition::Unknown,

@@ -12,6 +12,7 @@
 //! with the production HTTP client. A socket is needed for those, so they
 //! run in the hosted checks.
 
+use std::convert::Infallible;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,8 +21,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use http::{Request, Response, StatusCode};
-use http_body_util::Full;
-use hyper::body::{Bytes, Incoming};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Bytes, Frame, Incoming};
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use khive_runtime::pack::{HandlerDef, PackRuntime, VerbRegistry, VerbRegistryBuilder};
@@ -43,6 +45,7 @@ use tokio::net::TcpListener;
 
 use super::super::bridge::ForwardFuture;
 use super::super::computer_client::HttpConnector;
+use super::super::computer_http::{MAX_ERROR_BODY, MAX_EVENT, MAX_JSON_BODY};
 use super::super::computer_pipe_tests::{PipeComputer, PipeConnector, URL};
 use super::super::KhiveMcpServer;
 use super::ComputerBridge;
@@ -273,9 +276,15 @@ impl TestComputer {
 
     /// The same configuration with the computer at `url`.
     fn config_at(&self, actor: &str, url: &str) -> KhiveConfig {
+        self.config_with_timeout(actor, url, 30)
+    }
+
+    /// The same configuration with a call timeout of `call_timeout_s`.
+    fn config_with_timeout(&self, actor: &str, url: &str, call_timeout_s: u64) -> KhiveConfig {
         let text = format!(
             "[actor]\nid = \"{actor}\"\ncomputer = \"build-1\"\n\n[computer]\nname = \"build-1\"\n\
-             url = \"{url}\"\nkey_file = \"{}\"\npacks = [\"exec\"]\ncall_timeout_s = 30\n",
+             url = \"{url}\"\nkey_file = \"{}\"\npacks = [\"exec\"]\n\
+             call_timeout_s = {call_timeout_s}\n",
             self.key_file().display()
         );
         toml::from_str(&text).expect("a computer configuration")
@@ -1023,9 +1032,126 @@ impl Loopback {
         }
     }
 
+    /// `computer` served as by [`Loopback::computer`], except that the
+    /// `tools/call` of [`RUN`] never reaches it: `answer` answers it, given
+    /// its JSON-RPC id.
+    async fn intercepting(computer: &TestComputer, answer: Answer) -> Self {
+        let (listener, url) = Self::bind().await;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        let handler = computer.handler.clone();
+        let service = StreamableHttpService::new(
+            move || Ok(handler.clone()),
+            Arc::clone(&computer.sessions),
+            StreamableHttpServerConfig::default(),
+        );
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let service = service.clone();
+                let counted = Arc::clone(&counted);
+                let answer = Arc::clone(&answer);
+                let intercept = hyper::service::service_fn(move |request: Request<Incoming>| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let service = service.clone();
+                    let answer = Arc::clone(&answer);
+                    async move {
+                        let (parts, body) = request.into_parts();
+                        let body = match body.collect().await {
+                            Ok(collected) => collected.to_bytes(),
+                            Err(_) => Bytes::new(),
+                        };
+                        let message: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                        if message["method"] == "tools/call"
+                            && message["params"]["arguments"]["ops"] == RUN
+                        {
+                            return Ok::<_, Infallible>(answer(&message["id"]));
+                        }
+                        let response = service
+                            .handle(Request::from_parts(parts, Full::new(body)))
+                            .await;
+                        Ok(response.map(BodyExt::boxed_unsync))
+                    }
+                });
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), intercept)
+                        .await;
+                });
+            }
+        });
+        Self {
+            url,
+            requests,
+            task,
+        }
+    }
+
     fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
     }
+}
+
+type AnswerBody = UnsyncBoxBody<Bytes, Infallible>;
+
+/// What an intercepting listener answers the `tools/call` of [`RUN`] with.
+type Answer = Arc<dyn Fn(&Value) -> Response<AnswerBody> + Send + Sync>;
+
+const PROBE: &str = "bounded-body-probe";
+
+fn answer_with(status: StatusCode, content_type: &str, body: AnswerBody) -> Response<AnswerBody> {
+    Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, content_type)
+        .body(body)
+        .expect("a response")
+}
+
+/// `bytes` in one body of known length.
+fn whole(bytes: Vec<u8>) -> AnswerBody {
+    Full::new(Bytes::from(bytes)).boxed_unsync()
+}
+
+/// `bytes` in chunks of 1 MiB, with no declared length.
+fn chunked(bytes: Vec<u8>) -> AnswerBody {
+    let frames: Vec<Result<Frame<Bytes>, Infallible>> = bytes
+        .chunks(1 << 20)
+        .map(|chunk| Ok(Frame::data(Bytes::copy_from_slice(chunk))))
+        .collect();
+    StreamBody::new(futures::stream::iter(frames)).boxed_unsync()
+}
+
+/// The JSON-RPC answer to request `id`: a tool result whose text is a khive
+/// envelope naming [`PROBE`], padded with trailing spaces to `size` bytes.
+fn padded_answer(id: &Value, size: usize) -> Vec<u8> {
+    let envelope = json!({
+        "results": [{"ok": true, "tool": "exec.run", "result": {"probe": PROBE}}],
+        "summary": {"total": 1, "succeeded": 1, "failed": 0, "aborted": 0},
+        "status": "success",
+    });
+    let message = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {"content": [{"type": "text", "text": envelope.to_string()}]},
+    });
+    let mut body = message.to_string().into_bytes();
+    assert!(body.len() <= size, "the answer fits in {size} bytes");
+    body.resize(size, b' ');
+    body
+}
+
+/// The routed request failed the way ADR-220 section 5 fails a computer that
+/// answered after the request was sent: the computer may have run it.
+fn assert_may_have_run(envelope: &Value, kind: &str) -> String {
+    let entry = &envelope["results"][0];
+    assert_eq!(entry["ok"], false, "{envelope}");
+    assert_eq!(entry["error"]["kind"], kind, "{envelope}");
+    assert_eq!(entry["domain_disposition"], "unknown", "{envelope}");
+    let message = entry["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(message.contains("build-1"), "{envelope}");
+    message
 }
 
 impl Drop for Loopback {
@@ -1096,5 +1222,186 @@ async fn arm_5_a_redirect_is_refused_and_its_target_receives_no_request() {
     assert!(!computer.sentinel());
     assert!(caller.runs.all().is_empty());
     assert!(!answer.contains(KEY), "{answer}");
+    assert!(frames().is_empty(), "{:?}", frames());
+}
+
+// ---- response bodies are bounded (RUSTSEC-2026-0462) ----
+
+#[tokio::test]
+#[serial_test::serial(computer_bridge)]
+async fn bound_1_a_declared_length_over_the_json_bound_is_refused_before_the_body_is_read() {
+    reset_frames();
+    let computer = TestComputer::start(ACTOR);
+    // The headers declare one byte over the bound and no byte of the body
+    // is ever sent, so a client that read the body would wait for the call
+    // timeout and fail as `computer_unreachable` instead.
+    let listener = Loopback::intercepting(
+        &computer,
+        Arc::new(|_: &Value| {
+            let never = futures::stream::pending::<Result<Frame<Bytes>, Infallible>>();
+            let mut response = answer_with(
+                StatusCode::OK,
+                "application/json",
+                StreamBody::new(never).boxed_unsync(),
+            );
+            response.headers_mut().insert(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from(MAX_JSON_BODY + 1),
+            );
+            response
+        }),
+    )
+    .await;
+    let caller = Caller::new().routing_over_http(&computer.config_at(ACTOR, &listener.url));
+
+    let answer = caller.request(RUN).await;
+    let message = assert_may_have_run(&answer, "computer_protocol");
+    assert!(
+        message.contains(&format!("larger than {MAX_JSON_BODY} bytes")),
+        "{message}"
+    );
+
+    assert_eq!(computer.calls(), ["whoami()"]);
+    assert!(!computer.sentinel());
+    assert!(caller.runs.all().is_empty());
+    assert!(!caller.sentinel());
+    assert!(frames().is_empty(), "{:?}", frames());
+}
+
+#[tokio::test]
+#[serial_test::serial(computer_bridge)]
+async fn bound_2_a_json_body_with_no_length_that_runs_past_the_bound_is_refused() {
+    reset_frames();
+    let computer = TestComputer::start(ACTOR);
+    // The same answer that bound_4 accepts, one byte longer.
+    let listener = Loopback::intercepting(
+        &computer,
+        Arc::new(|id: &Value| {
+            answer_with(
+                StatusCode::OK,
+                "application/json",
+                chunked(padded_answer(id, MAX_JSON_BODY + 1)),
+            )
+        }),
+    )
+    .await;
+    let caller = Caller::new().routing_over_http(&computer.config_at(ACTOR, &listener.url));
+
+    let answer = caller.text(RUN).await;
+    assert!(!answer.contains(PROBE), "no part of the body is used");
+    let envelope: Value = serde_json::from_str(&answer).expect("the khive envelope");
+    let message = assert_may_have_run(&envelope, "computer_protocol");
+    assert!(
+        message.contains(&format!("larger than {MAX_JSON_BODY} bytes")),
+        "{message}"
+    );
+    assert!(caller.runs.all().is_empty());
+    assert!(frames().is_empty(), "{:?}", frames());
+}
+
+#[tokio::test]
+#[serial_test::serial(computer_bridge)]
+async fn bound_3_an_error_body_past_its_bound_is_refused_and_not_quoted() {
+    reset_frames();
+    let computer = TestComputer::start(ACTOR);
+    let listener = Loopback::intercepting(
+        &computer,
+        Arc::new(|_: &Value| {
+            answer_with(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "application/json",
+                chunked(vec![b'x'; MAX_ERROR_BODY + 1]),
+            )
+        }),
+    )
+    .await;
+    let caller = Caller::new().routing_over_http(&computer.config_at(ACTOR, &listener.url));
+
+    let answer = caller.text(RUN).await;
+    assert!(
+        !answer.contains("xxxxxxxxxxxxxxxx"),
+        "the body is not quoted"
+    );
+    let envelope: Value = serde_json::from_str(&answer).expect("the khive envelope");
+    let message = assert_may_have_run(&envelope, "computer_protocol");
+    assert!(message.contains("HTTP 500"), "{message}");
+    assert!(
+        message.contains(&format!("larger than {MAX_ERROR_BODY} bytes")),
+        "{message}"
+    );
+    assert!(caller.runs.all().is_empty());
+    assert!(frames().is_empty(), "{:?}", frames());
+}
+
+#[tokio::test]
+#[serial_test::serial(computer_bridge)]
+async fn bound_4_a_json_body_exactly_at_the_bound_is_read() {
+    reset_frames();
+    let computer = TestComputer::start(ACTOR);
+    let listener = Loopback::intercepting(
+        &computer,
+        Arc::new(|id: &Value| {
+            answer_with(
+                StatusCode::OK,
+                "application/json",
+                whole(padded_answer(id, MAX_JSON_BODY)),
+            )
+        }),
+    )
+    .await;
+    let caller = Caller::new().routing_over_http(&computer.config_at(ACTOR, &listener.url));
+
+    let answer = caller.request(RUN).await;
+    assert_eq!(answer["results"][0]["ok"], true, "{answer}");
+    assert_eq!(answer["results"][0]["result"]["probe"], PROBE, "{answer}");
+    assert_eq!(computer.calls(), ["whoami()"]);
+    assert!(frames().is_empty(), "{:?}", frames());
+}
+
+#[tokio::test]
+#[serial_test::serial(computer_bridge)]
+async fn bound_5_an_event_past_its_bound_stops_the_read() {
+    reset_frames();
+    let computer = TestComputer::start(ACTOR);
+    // One event that never ends: 1 MiB chunks for as long as the client
+    // reads them.
+    let produced = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&produced);
+    let listener = Loopback::intercepting(
+        &computer,
+        Arc::new(move |_: &Value| {
+            let counted = Arc::clone(&counted);
+            let chunk = Bytes::from(vec![b'a'; 1 << 20]);
+            let head = futures::stream::iter([Ok::<_, Infallible>(Frame::data(
+                Bytes::from_static(b"data: "),
+            ))]);
+            let tail = futures::stream::repeat_with(move || {
+                counted.fetch_add(chunk.len(), Ordering::SeqCst);
+                Ok(Frame::data(chunk.clone()))
+            });
+            answer_with(
+                StatusCode::OK,
+                "text/event-stream",
+                StreamBody::new(futures::StreamExt::chain(head, tail)).boxed_unsync(),
+            )
+        }),
+    )
+    .await;
+    let caller =
+        Caller::new().routing_over_http(&computer.config_with_timeout(ACTOR, &listener.url, 3));
+
+    let answer = caller.request(RUN).await;
+    // No answer arrives on the refused stream, so the call ends at its
+    // timeout, which may have run the request.
+    let message = assert_may_have_run(&answer, "computer_unreachable");
+    assert!(message.contains("did not answer within 3 s"), "{message}");
+    // The client stopped reading at the bound. What the listener produced
+    // past it is what the socket buffers held when the client let go.
+    let produced = produced.load(Ordering::SeqCst);
+    assert!(
+        produced <= MAX_EVENT + (16 << 20),
+        "the client read {produced} bytes of one event"
+    );
+    assert!(caller.runs.all().is_empty());
     assert!(frames().is_empty(), "{:?}", frames());
 }
