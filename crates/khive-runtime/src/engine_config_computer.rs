@@ -113,6 +113,31 @@ impl ComputerSectionConfig {
     }
 }
 
+/// ADR-220 section 2: `[actor].computer` names the computer of the
+/// `[computer]` table. Each is refused without the other, and the two names
+/// must be equal.
+pub(super) fn validate_actor_computer(
+    table: Option<&ComputerSectionConfig>,
+    named: Option<&str>,
+) -> Result<(), ConfigError> {
+    let refusal = |reason: String| ConfigError::InvalidActorComputer { reason };
+    match (table, named) {
+        (None, None) => Ok(()),
+        (Some(table), Some(named)) if table.name == named => Ok(()),
+        (Some(table), Some(named)) => Err(refusal(format!(
+            "is {named:?} but [computer].name is {:?}; the two must be equal",
+            table.name
+        ))),
+        (Some(table), None) => Err(refusal(format!(
+            "is required with a [computer] table; set it to {:?}",
+            table.name
+        ))),
+        (None, Some(named)) => Err(refusal(format!(
+            "is {named:?} but there is no [computer] table; remove the field or add the table"
+        ))),
+    }
+}
+
 fn invalid(key: &str, reason: impl Into<String>) -> ConfigError {
     ConfigError::InvalidComputerConfig {
         key: key.to_owned(),

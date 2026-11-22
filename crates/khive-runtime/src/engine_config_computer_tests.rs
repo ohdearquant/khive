@@ -18,8 +18,9 @@ const BASE: [(&str, &str); 5] = [
     ("call_timeout_s", "3700"),
 ];
 
-/// The base table with `key` set to `value`, or left out when `value` is None.
-fn table_with(key: &str, value: Option<&str>) -> String {
+/// The base `[computer]` table alone, with `key` set to `value`, or left out
+/// when `value` is None.
+fn computer_table_with(key: &str, value: Option<&str>) -> String {
     let mut lines = vec!["[computer]".to_owned()];
     for (name, default) in BASE {
         match (name == key, value) {
@@ -29,6 +30,16 @@ fn table_with(key: &str, value: Option<&str>) -> String {
         }
     }
     lines.join("\n") + "\n"
+}
+
+/// A whole file: `[actor].computer` naming the table's computer, then the
+/// table from [`computer_table_with`].
+fn table_with(key: &str, value: Option<&str>) -> String {
+    let name = match (key, value) {
+        ("name", Some(value)) => value,
+        _ => BASE[0].1,
+    };
+    format!("[actor]\ncomputer = {name}\n") + &computer_table_with(key, value)
 }
 
 fn load(text: &str) -> Result<Option<KhiveConfig>, ConfigError> {
@@ -92,6 +103,30 @@ fn the_table_is_closed_and_four_keys_are_required() {
         let error = refused_with(key, None);
         assert!(error.contains(key), "missing {key}: {error}");
     }
+}
+
+#[test]
+fn actor_computer_and_the_table_require_each_other_and_name_one_computer() {
+    let table = computer_table_with("call_timeout_s", Some("3700"));
+    let without_field = refused(&table);
+    assert!(
+        without_field.contains("[actor].computer") && without_field.contains("required"),
+        "{without_field}"
+    );
+    let other = refused(&("[actor]\ncomputer = \"build-2\"\n".to_owned() + &table));
+    assert!(
+        other.contains("[actor].computer") && other.contains("build-2"),
+        "{other}"
+    );
+    let without_table = refused("[actor]\ncomputer = \"build-1\"\n");
+    assert!(
+        without_table.contains("[actor].computer") && without_table.contains("no [computer] table"),
+        "{without_table}"
+    );
+    assert_eq!(
+        accepted_with("call_timeout_s", Some("3700")).name,
+        "build-1"
+    );
 }
 
 #[test]

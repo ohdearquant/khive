@@ -17,7 +17,7 @@ use std::ops::Range;
 use async_trait::async_trait;
 use futures::future::{join, join_all};
 use khive_request::{
-    value_nesting_within_limit, ArgValue, ExecutionMode, ParsedOp, ParsedRequest,
+    parse_request, value_nesting_within_limit, ArgValue, ExecutionMode, ParsedOp, ParsedRequest,
     NESTING_DEPTH_LIMIT,
 };
 use khive_runtime::{ComputerSectionConfig, ConfigError, DomainDisposition, COMMAND_RUNNING_PACKS};
@@ -29,6 +29,12 @@ use super::{aborted_entry, batch_status, failure_entry, substitution_error_paylo
 pub(super) const RUNS_ON_COMPUTER: &str = "runs_on_computer";
 /// Failure kind for a computer response that is not the khive envelope.
 pub(super) const COMPUTER_PROTOCOL: &str = "computer_protocol";
+
+/// The one verb that stores an operation for the store to run later.
+const SCHEDULE_VERB: &str = "schedule.schedule";
+/// How many `schedule.schedule` actions inside one another are read before the
+/// operation is refused as unreadable.
+const MAX_SCHEDULE_NESTING: usize = 8;
 
 /// Where an operation is served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,9 +80,20 @@ impl ComputerRouting {
         &self.label
     }
 
-    /// The placement of one operation, by the pack its tool name carries. A
-    /// bare verb (the kg pack's verbs, `verbs`, `whoami`) is the store's.
-    pub(super) fn place(&self, tool: &str) -> Placement {
+    /// The placement of one operation. A `schedule.schedule` whose action would
+    /// run, when it fires on the store's machine, a pack that may not run there
+    /// for this caller is refused like the pack itself (ADR-220 section 6).
+    pub(super) fn place(&self, op: &ParsedOp) -> Placement {
+        if self.schedules_off_computer(op, 0) {
+            Placement::RunsOnComputer
+        } else {
+            self.place_tool(&op.tool)
+        }
+    }
+
+    /// The placement of a tool name, by the pack it carries. A bare verb (the
+    /// kg pack's verbs, `verbs`, `whoami`) is the store's.
+    fn place_tool(&self, tool: &str) -> Placement {
         let Some((pack, _verb)) = tool.split_once('.') else {
             return Placement::Home(Home::Store);
         };
@@ -89,18 +106,54 @@ impl ComputerRouting {
         }
     }
 
+    /// Whether `op` is a `schedule.schedule` whose action, or an action nested
+    /// in it, names a pack that runs commands or that this caller's computer
+    /// serves. The store runs a scheduled action on its own machine when it
+    /// fires, so neither may be stored. An action that is not a literal string,
+    /// does not parse, or nests deeper than [`MAX_SCHEDULE_NESTING`] cannot be
+    /// read here and counts as one.
+    fn schedules_off_computer(&self, op: &ParsedOp, depth: usize) -> bool {
+        if op.tool != SCHEDULE_VERB {
+            return false;
+        }
+        let action = match op.args.get("action") {
+            // The store refuses the missing argument itself.
+            None => return false,
+            Some(ArgValue::Value(Value::String(action))) => action,
+            Some(_) => return true,
+        };
+        if depth >= MAX_SCHEDULE_NESTING {
+            return true;
+        }
+        let Ok(action) = parse_request(action) else {
+            return true;
+        };
+        action.ops.iter().any(|inner| {
+            self.place_tool(&inner.tool) != Placement::Home(Home::Store)
+                || self.schedules_off_computer(inner, depth + 1)
+        })
+    }
+
     fn runs_on_computer_entry(&self, tool: &str) -> Value {
-        let pack = tool.split_once('.').map_or(tool, |(pack, _)| pack);
+        let message = if tool == SCHEDULE_VERB {
+            format!(
+                "{tool} was not run: this caller's commands run on its computer {}, and a \
+                 scheduled action runs on the store's machine; the action names a pack that \
+                 runs commands or that the computer serves, or cannot be read before it is \
+                 stored",
+                self.label
+            )
+        } else {
+            let pack = tool.split_once('.').map_or(tool, |(pack, _)| pack);
+            format!(
+                "{tool} was not run: this caller's commands run on its computer {}, \
+                 and [computer].packs does not route the {pack} pack",
+                self.label
+            )
+        };
         failure_entry(
             tool,
-            json!({
-                "kind": RUNS_ON_COMPUTER,
-                "message": format!(
-                    "{tool} was not run: this caller's commands run on its computer {}, \
-                     and [computer].packs does not route the {pack} pack",
-                    self.label
-                ),
-            }),
+            json!({ "kind": RUNS_ON_COMPUTER, "message": message }),
             DomainDisposition::NotCommitted,
         )
     }
@@ -153,7 +206,7 @@ impl RoutePlan {
             .map(|range| {
                 let mut segments: Vec<Segment> = Vec::new();
                 for index in range.clone() {
-                    let placement = routing.place(&parsed.ops[index].tool);
+                    let placement = routing.place(&parsed.ops[index]);
                     match segments.last_mut() {
                         Some(last) if last.placement == placement => last.ops.end = index + 1,
                         _ => segments.push(Segment {

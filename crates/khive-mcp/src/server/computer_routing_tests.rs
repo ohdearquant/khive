@@ -33,14 +33,35 @@ fn segment(placement: Placement, ops: std::ops::Range<usize>) -> Segment {
     Segment { placement, ops }
 }
 
+/// The one operation `tool()`.
+fn op(tool: &str) -> ParsedOp {
+    parsed(&format!("{tool}()")).ops.remove(0)
+}
+
+/// `schedule.schedule` storing `action`.
+fn schedule_text(action: &str) -> String {
+    format!(
+        "schedule.schedule(action={}, at=\"2099-06-01T09:00:00Z\")",
+        Value::String(action.to_owned())
+    )
+}
+
 #[test]
 fn each_operation_is_placed_by_its_pack() {
     let r = routing(&["computer", "exec", "git"]);
     for routed in ["exec.run", "git.commit", "computer.fs_read"] {
-        assert_eq!(r.place(routed), Placement::Home(Home::Computer), "{routed}");
+        assert_eq!(
+            r.place(&op(routed)),
+            Placement::Home(Home::Computer),
+            "{routed}"
+        );
     }
     for refused in ["code.search", "workspace.open", "tool.request"] {
-        assert_eq!(r.place(refused), Placement::RunsOnComputer, "{refused}");
+        assert_eq!(
+            r.place(&op(refused)),
+            Placement::RunsOnComputer,
+            "{refused}"
+        );
     }
     for store in [
         "memory.recall",
@@ -50,10 +71,74 @@ fn each_operation_is_placed_by_its_pack() {
         "verbs",
         "whoami",
     ] {
-        assert_eq!(r.place(store), Placement::Home(Home::Store), "{store}");
+        assert_eq!(r.place(&op(store)), Placement::Home(Home::Store), "{store}");
     }
     let with_blob = routing(&["exec", "blob"]);
-    assert_eq!(with_blob.place("blob.get"), Placement::Home(Home::Computer));
+    assert_eq!(
+        with_blob.place(&op("blob.get")),
+        Placement::Home(Home::Computer)
+    );
+}
+
+#[test]
+fn a_scheduled_action_that_would_run_off_the_computer_is_refused() {
+    let r = routing(&["computer", "exec", "git", "blob"]);
+    let place = |action: &str| r.place(&parsed(&schedule_text(action)).ops[0]);
+    for action in [
+        r#"exec.run(tool="sh", args=["-c", "id"])"#,
+        r#"code.search(query="x")"#,
+        r#"workspace.open(path="x")"#,
+        r#"tool.request(tool="x")"#,
+        r#"blob.put(content="x")"#,
+        r#"git.log(limit=1)"#,
+        r#"memory.recall(query="x") | exec.run(tool="sh")"#,
+        r#"[memory.recall(query="x"), tool.request(tool="x")]"#,
+        &schedule_text(r#"exec.run(tool="sh")"#),
+        "not a request",
+        "",
+    ] {
+        assert_eq!(place(action), Placement::RunsOnComputer, "{action}");
+    }
+    for action in [
+        r#"schedule.remind(content="x", at="2099-06-01T09:00:00Z")"#,
+        r#"memory.remember(content="x")"#,
+        r#"create(kind="note", content="x")"#,
+        &schedule_text(r#"comm.send(to="lambda:a", content="b")"#),
+    ] {
+        assert_eq!(place(action), Placement::Home(Home::Store), "{action}");
+    }
+
+    // An action that is not a literal string cannot be read before it runs.
+    let chained = parsed(&format!(
+        "memory.recall(query=\"x\") | {}",
+        r#"schedule.schedule(action="$prev.text", at="2099-06-01T09:00:00Z")"#
+    ));
+    assert_eq!(r.place(&chained.ops[1]), Placement::RunsOnComputer);
+    // A missing action is the store's to refuse.
+    assert_eq!(
+        r.place(&parsed(r#"schedule.schedule(at="2099-06-01T09:00:00Z")"#).ops[0]),
+        Placement::Home(Home::Store)
+    );
+
+    // Eight schedule.schedule operations inside one another are read; a ninth is not.
+    let nested = |levels: usize| {
+        let mut action = r#"memory.recall(query="x")"#.to_owned();
+        for _ in 1..levels {
+            action = schedule_text(&action);
+        }
+        place(&action)
+    };
+    assert_eq!(nested(8), Placement::Home(Home::Store));
+    assert_eq!(nested(9), Placement::RunsOnComputer);
+
+    let entry = r.runs_on_computer_entry("schedule.schedule");
+    let message = entry["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(entry["error"]["kind"], "runs_on_computer", "{entry}");
+    assert!(
+        message.contains("a scheduled action runs on the store's machine")
+            && message.contains("build-1 (127.0.0.1:8700)"),
+        "{message}"
+    );
 }
 
 #[test]
