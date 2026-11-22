@@ -16,8 +16,10 @@ use khive_request::{parse_request, ParsedRequest};
 use khive_runtime::{ConfigError, DomainDisposition, KhiveConfig};
 use rmcp::ErrorData as McpError;
 use serde_json::{json, Value};
+use tokio::sync::OnceCell;
 
 use super::bridge::ForwardFnPtr;
+use super::computer_catalog::{RoutedCatalog, VERBS_VERB};
 use super::computer_client::{ComputerClient, Connector, ForwardedOptions, HttpConnector};
 use super::computer_routing::{
     execute_split, failed_envelope, ComputerRouting, Home, HomeOutcome, HomeSender, Placement,
@@ -29,10 +31,12 @@ use crate::tools::request::RequestParams;
 /// The caller's computer, as the process that resolved its configuration
 /// holds it.
 pub(super) struct ComputerBridge {
-    routing: ComputerRouting,
-    client: ComputerClient,
+    pub(super) routing: ComputerRouting,
+    pub(super) client: ComputerClient,
     call_timeout: Duration,
     routed_requests: AtomicU64,
+    /// The computer's catalog as read when the bridge started (section 8).
+    pub(super) catalog_at_start: OnceCell<Option<RoutedCatalog>>,
 }
 
 impl ComputerBridge {
@@ -61,6 +65,7 @@ impl ComputerBridge {
             client,
             call_timeout: Duration::from_secs(computer.call_timeout_s),
             routed_requests: AtomicU64::new(0),
+            catalog_at_start: OnceCell::new(),
         }))
     }
 
@@ -75,17 +80,20 @@ impl ComputerBridge {
         self.routed_requests.load(Ordering::Relaxed)
     }
 
-    /// The deadline of a request that sends an operation to the computer,
-    /// which replaces the bridge's own (ADR-220 section 2). `None` for a
-    /// request with no such operation, or one that does not parse.
+    /// The deadline of a request that sends an operation to the computer, or
+    /// reads its catalog for `verbs`, which replaces the bridge's own (ADR-220
+    /// section 2). `None` for a request with neither, or one that does not
+    /// parse.
     pub(super) fn deadline_for(&self, ops: &str) -> Option<Duration> {
         let parsed = parse_request(ops).ok()?;
-        RoutePlan::new(&self.routing, &parsed)
-            .units
-            .iter()
-            .flat_map(|unit| &unit.segments)
-            .any(|segment| segment.placement == Placement::Home(Home::Computer))
-            .then_some(self.call_timeout)
+        let reads_catalog = parsed.ops.iter().any(|op| op.tool == VERBS_VERB);
+        (reads_catalog
+            || RoutePlan::new(&self.routing, &parsed)
+                .units
+                .iter()
+                .flat_map(|unit| &unit.segments)
+                .any(|segment| segment.placement == Placement::Home(Home::Computer)))
+        .then_some(self.call_timeout)
     }
 
     /// `plan`, the answer to `plan=true` for `ops`, with each stage's home:

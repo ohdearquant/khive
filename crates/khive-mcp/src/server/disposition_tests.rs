@@ -1284,6 +1284,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
     ),
     (
         "khive-mcp/src/server.rs",
+        "computer_catalog",
+        "khive-mcp/src/server/computer_catalog.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
         "computer_client",
         "khive-mcp/src/server/computer_client.rs",
     ),

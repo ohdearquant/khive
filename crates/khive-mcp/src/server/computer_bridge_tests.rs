@@ -6,7 +6,8 @@
 //! kg pack's `whoami` and an `exec` stand-in that records each run and writes
 //! a sentinel file), reached over the in-process pipe. The store has the same
 //! `exec` stand-in, so a command that runs on the store's machine leaves its
-//! sentinel there.
+//! sentinel there. Each side also has a `git` stand-in with a verb of its own,
+//! so a catalog shows whose verbs it lists.
 //!
 //! The arms at the end of the file reach the same computer over loopback TCP
 //! with the production HTTP client. A socket is needed for those, so they
@@ -42,7 +43,7 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 use super::super::bridge::ForwardFuture;
-use super::super::computer_client::HttpConnector;
+use super::super::computer_client::{HttpConnector, COMPUTER_UNREACHABLE};
 use super::super::computer_pipe_tests::{PipeComputer, PipeConnector, URL};
 use super::super::KhiveMcpServer;
 use super::ComputerBridge;
@@ -150,6 +151,63 @@ impl PackRuntime for ExecStandIn {
     }
 }
 
+// ---- the git stand-in ----
+
+const STORE_GIT_DESCRIPTION: &str = "git stand-in on the store's machine";
+const COMPUTER_GIT_DESCRIPTION: &str = "git stand-in on the computer";
+
+const fn git_handler(name: &'static str, description: &'static str) -> HandlerDef {
+    HandlerDef {
+        name,
+        description,
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[],
+    }
+}
+
+const STORE_GIT: &[HandlerDef] = &[git_handler("git.status", STORE_GIT_DESCRIPTION)];
+const COMPUTER_GIT: &[HandlerDef] = &[git_handler("git.log", COMPUTER_GIT_DESCRIPTION)];
+
+/// A `git` pack whose one verb differs by machine.
+struct GitStandIn<const ON_COMPUTER: bool>;
+
+impl<const ON_COMPUTER: bool> Pack for GitStandIn<ON_COMPUTER> {
+    const NAME: &'static str = "git";
+    const NOTE_KINDS: &'static [&'static str] = &[];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const HANDLERS: &'static [HandlerDef] = if ON_COMPUTER { COMPUTER_GIT } else { STORE_GIT };
+}
+
+#[async_trait]
+impl<const ON_COMPUTER: bool> PackRuntime for GitStandIn<ON_COMPUTER> {
+    fn name(&self) -> &str {
+        "git"
+    }
+
+    fn note_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn entity_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn handlers(&self) -> &'static [HandlerDef] {
+        <Self as Pack>::HANDLERS
+    }
+
+    async fn dispatch(
+        &self,
+        verb: &str,
+        _params: Value,
+        _registry: &VerbRegistry,
+        _token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        Ok(json!({ "verb": verb }))
+    }
+}
+
 // ---- the spy daemon forward ----
 
 static FRAMES: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
@@ -243,6 +301,7 @@ impl TestComputer {
             root,
             runs: runs.clone(),
         });
+        builder.register_trusted(GitStandIn::<true>);
         let server = KhiveMcpServer::from_registry(builder.build().expect("computer registry"))
             .with_runtime(runtime);
         let calls = Arc::new(StdMutex::new(Vec::new()));
@@ -266,16 +325,30 @@ impl TestComputer {
         self.dir.path().join("computer.key")
     }
 
-    /// A caller configuration naming this computer for `actor`.
+    /// A caller configuration naming this computer for `actor`, for `exec`.
     fn config(&self, actor: &str) -> KhiveConfig {
-        self.config_at(actor, URL)
+        self.config_for_packs(actor, &["exec"])
     }
 
     /// The same configuration with the computer at `url`.
     fn config_at(&self, actor: &str, url: &str) -> KhiveConfig {
+        self.config_with(actor, url, &["exec"])
+    }
+
+    /// A caller configuration naming this computer for `actor` and `packs`.
+    fn config_for_packs(&self, actor: &str, packs: &[&str]) -> KhiveConfig {
+        self.config_with(actor, URL, packs)
+    }
+
+    fn config_with(&self, actor: &str, url: &str, packs: &[&str]) -> KhiveConfig {
+        let packs = packs
+            .iter()
+            .map(|pack| format!("\"{pack}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         let text = format!(
             "[actor]\nid = \"{actor}\"\ncomputer = \"build-1\"\n\n[computer]\nname = \"build-1\"\n\
-             url = \"{url}\"\nkey_file = \"{}\"\npacks = [\"exec\"]\ncall_timeout_s = 30\n",
+             url = \"{url}\"\nkey_file = \"{}\"\npacks = [{packs}]\ncall_timeout_s = 30\n",
             self.key_file().display()
         );
         toml::from_str(&text).expect("a computer configuration")
@@ -362,6 +435,7 @@ impl Caller {
             root,
             runs: runs.clone(),
         });
+        builder.register_trusted(GitStandIn::<false>);
         builder
             .with_runtime_event_store(&runtime)
             .expect("the store's event store");
@@ -376,11 +450,17 @@ impl Caller {
     }
 
     /// Attach `computer` as the caller's computer, configured for this caller.
-    fn routing_to(mut self, computer: &TestComputer) -> Self {
+    fn routing_to(self, computer: &TestComputer) -> Self {
+        self.routing_packs_to(computer, &["exec"])
+    }
+
+    /// Attach `computer` as the caller's computer, serving it `packs`.
+    fn routing_packs_to(mut self, computer: &TestComputer, packs: &[&str]) -> Self {
         let connector = Arc::new(PipeConnector {
             computer: Arc::clone(&computer.pipe),
         });
-        self.server.computer = ComputerBridge::from_config(&computer.config(ACTOR), connector)
+        let config = computer.config_for_packs(ACTOR, packs);
+        self.server.computer = ComputerBridge::from_config(&config, connector)
             .expect("a valid computer table")
             .map(Arc::new);
         assert!(self.server.computer.is_some());
@@ -933,9 +1013,173 @@ async fn the_deadline_of_a_request_for_the_computer_is_its_call_timeout() {
         bridge.deadline_for(&format!("stats() | {RUN}")),
         Some(Duration::from_secs(30))
     );
+    assert_eq!(
+        bridge.deadline_for("verbs()"),
+        Some(Duration::from_secs(30))
+    );
     assert_eq!(bridge.deadline_for("stats()"), None);
     assert_eq!(bridge.deadline_for("git.status()"), None);
     assert_eq!(bridge.label(), LABEL);
+}
+
+/// The verb names of the first answer, a `verbs` answer, in order.
+fn verb_names(envelope: &Value) -> Vec<String> {
+    envelope["results"][0]["result"]["verbs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|row| row["verb"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+#[serial_test::serial(computer_bridge)]
+async fn arm_10_verbs_for_a_routed_pack_lists_exactly_the_computers_verbs() {
+    reset_frames();
+    let computer = TestComputer::start(ACTOR);
+    let caller = Caller::new().routing_packs_to(&computer, &["exec", "git"]);
+
+    let listed = caller.request(r#"verbs(pack="git")"#).await;
+    assert_eq!(verb_names(&listed), ["git.log"], "{listed}");
+    let row = &listed["results"][0]["result"]["verbs"][0];
+    assert_eq!(row["served_by"], "computer", "{listed}");
+    assert_eq!(row["computer"], "build-1", "{listed}");
+    assert_eq!(row["description"], COMPUTER_GIT_DESCRIPTION, "{listed}");
+    assert_eq!(
+        listed["results"][0]["result"]["pack_counts"]["git"], 1,
+        "{listed}"
+    );
+    assert_eq!(computer.calls(), ["whoami()", "verbs()"]);
+}
+
+#[tokio::test]
+#[serial_test::serial(computer_bridge)]
+async fn arm_10_without_a_computer_verbs_lists_the_stores_verbs() {
+    reset_frames();
+    let caller = Caller::new();
+
+    let listed = caller.request(r#"verbs(pack="git")"#).await;
+    assert_eq!(verb_names(&listed), ["git.status"], "{listed}");
+    let row = &listed["results"][0]["result"]["verbs"][0];
+    assert_eq!(row["description"], STORE_GIT_DESCRIPTION, "{listed}");
+    assert!(row.get("served_by").is_none(), "{listed}");
+}
+
+#[tokio::test]
+#[serial_test::serial(computer_bridge)]
+async fn arm_10_every_row_names_its_home_and_a_routed_pack_is_the_computers_alone() {
+    reset_frames();
+    let computer = TestComputer::start(ACTOR);
+    let caller = Caller::new().routing_packs_to(&computer, &["exec", "git"]);
+
+    let listed = caller.request("verbs()").await;
+    let rows = listed["results"][0]["result"]["verbs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(!rows.is_empty(), "{listed}");
+    for row in &rows {
+        let routed = matches!(row["pack"].as_str(), Some("exec" | "git"));
+        let home = if routed { "computer" } else { "store" };
+        assert_eq!(row["served_by"], home, "{row}");
+    }
+    let names = verb_names(&listed);
+    assert!(names.iter().any(|name| name == "whoami"), "{listed}");
+    assert!(names.iter().any(|name| name == "git.log"), "{listed}");
+    assert!(!names.iter().any(|name| name == "git.status"), "{listed}");
+    let exec = names
+        .iter()
+        .filter(|name| name.starts_with("exec."))
+        .count();
+    assert_eq!(
+        exec, 2,
+        "the computer's two exec verbs, not a union: {listed}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(computer_bridge)]
+async fn arm_10_help_for_a_routed_verb_is_answered_by_the_computer() {
+    reset_frames();
+    let computer = TestComputer::start(ACTOR);
+    let caller = Caller::new().routing_packs_to(&computer, &["exec", "git"]);
+
+    let help = caller.request("git.log(help=true)").await;
+    assert_eq!(help["results"][0]["ok"], true, "{help}");
+    assert!(
+        help.to_string().contains(COMPUTER_GIT_DESCRIPTION),
+        "{help}"
+    );
+    assert_eq!(computer.calls(), ["whoami()", "git.log(help=true)"]);
+    assert!(frames().is_empty(), "{:?}", frames());
+}
+
+#[tokio::test]
+#[serial_test::serial(computer_bridge)]
+async fn arm_10_the_tool_description_lists_the_computers_verbs_read_once() {
+    reset_frames();
+    let computer = TestComputer::start(ACTOR);
+    let caller = Caller::new().routing_packs_to(&computer, &["exec", "git"]);
+
+    let catalog = caller.server.request_tool_catalog().await;
+    assert!(catalog.contains("git.log"), "{catalog}");
+    assert!(catalog.contains(COMPUTER_GIT_DESCRIPTION), "{catalog}");
+    assert!(!catalog.contains("git.status"), "{catalog}");
+    assert!(catalog.contains("whoami"), "{catalog}");
+    assert_eq!(caller.server.request_tool_catalog().await, catalog);
+    assert_eq!(computer.calls(), ["whoami()", "verbs()"]);
+
+    let without = Caller::new().server.request_tool_catalog().await;
+    assert!(without.contains("git.status"), "{without}");
+    assert!(!without.contains("git.log"), "{without}");
+}
+
+#[tokio::test]
+#[serial_test::serial(computer_bridge)]
+async fn arm_10_a_computer_down_at_start_is_named_in_the_description_and_verbs_reads_it_again() {
+    reset_frames();
+    let computer = TestComputer::start(ACTOR);
+    let caller = Caller::new().routing_packs_to(&computer, &["exec", "git"]);
+    computer.pipe.stop();
+
+    let catalog = caller.server.request_tool_catalog().await;
+    assert!(catalog.contains("git.*"), "{catalog}");
+    assert!(catalog.contains("could not be read"), "{catalog}");
+    assert!(catalog.contains(LABEL), "{catalog}");
+    assert!(!catalog.contains("git.status"), "{catalog}");
+
+    let listed = caller.request(r#"verbs(pack="git")"#).await;
+    assert_failed(&listed, 0, COMPUTER_UNREACHABLE);
+    assert_eq!(listed["status"], "partial", "{listed}");
+
+    computer.pipe.restart();
+    let listed = caller.request(r#"verbs(pack="git")"#).await;
+    assert_eq!(verb_names(&listed), ["git.log"], "{listed}");
+}
+
+#[tokio::test]
+#[serial_test::serial(computer_bridge)]
+async fn arm_10_save_to_is_refused_for_verbs_while_a_computer_serves_part_of_the_catalog() {
+    reset_frames();
+    let computer = TestComputer::start(ACTOR);
+    let caller = Caller::new().routing_packs_to(&computer, &["exec", "git"]);
+    let sink = caller.dir.path().join("catalog.jsonl");
+
+    let error = caller
+        .server
+        .request_with_forward(
+            RequestParams {
+                ops: "verbs()".into(),
+                save_to: Some(sink.display().to_string()),
+                ..Default::default()
+            },
+            spy_forward,
+        )
+        .await
+        .expect_err("save_to is refused");
+    assert!(error.message.contains("nothing was run"), "{error:?}");
+    assert!(!sink.exists());
+    assert!(computer.calls().is_empty());
 }
 
 // ---- over loopback TCP, with the production HTTP client ----

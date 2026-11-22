@@ -106,6 +106,7 @@ mod bridge;
 // modules is Unix-only through its own `#![cfg(unix)]`, so the declarations
 // stay bare for the error-constructor census.
 mod computer_bridge;
+mod computer_catalog;
 mod computer_client;
 #[cfg(all(test, unix))]
 mod computer_pipe_tests;
@@ -759,6 +760,9 @@ impl ServerHandler for KhiveMcpServer {
                 )),
             )
         })?;
+        #[cfg(unix)]
+        let catalog = self.request_tool_catalog().await;
+        #[cfg(not(unix))]
         let catalog = self.verb_catalog();
         for t in &mut tools {
             if t.name == "request" {
