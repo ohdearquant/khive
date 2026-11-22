@@ -7,13 +7,23 @@
 //! a sentinel file), reached over the in-process pipe. The store has the same
 //! `exec` stand-in, so a command that runs on the store's machine leaves its
 //! sentinel there.
+//!
+//! The arms at the end of the file reach the same computer over loopback TCP
+//! with the production HTTP client. A socket is needed for those, so they
+//! run in the hosted checks.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use http::{Request, Response, StatusCode};
+use http_body_util::Full;
+use hyper::body::{Bytes, Incoming};
+use hyper_util::rt::TokioIo;
+use hyper_util::service::TowerToHyperService;
 use khive_runtime::pack::{HandlerDef, PackRuntime, VerbRegistry, VerbRegistryBuilder};
 use khive_runtime::{
     ConfigError, DaemonRequestFrame, KhiveConfig, KhiveRuntime, Namespace, NamespaceToken,
@@ -26,10 +36,13 @@ use rmcp::model::{CallToolRequestParams, CallToolResult, ErrorData as McpError, 
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::session::SessionManager;
+use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::RoleServer;
 use serde_json::{json, Value};
+use tokio::net::TcpListener;
 
 use super::super::bridge::ForwardFuture;
+use super::super::computer_client::HttpConnector;
 use super::super::computer_pipe_tests::{PipeComputer, PipeConnector, URL};
 use super::super::KhiveMcpServer;
 use super::ComputerBridge;
@@ -207,6 +220,7 @@ impl ServerHandler for Recording {
 
 struct TestComputer {
     dir: tempfile::TempDir,
+    handler: Recording,
     pipe: Arc<PipeComputer>,
     sessions: Arc<LocalSessionManager>,
     runs: Runs,
@@ -233,15 +247,14 @@ impl TestComputer {
             .with_runtime(runtime);
         let calls = Arc::new(StdMutex::new(Vec::new()));
         let sessions = Arc::new(LocalSessionManager::default());
-        let pipe = PipeComputer::serve(
-            Recording {
-                inner: server,
-                calls: Arc::clone(&calls),
-            },
-            Arc::clone(&sessions),
-        );
+        let handler = Recording {
+            inner: server,
+            calls: Arc::clone(&calls),
+        };
+        let pipe = PipeComputer::serve(handler.clone(), Arc::clone(&sessions));
         Self {
             dir,
+            handler,
             pipe,
             sessions,
             runs,
@@ -255,9 +268,14 @@ impl TestComputer {
 
     /// A caller configuration naming this computer for `actor`.
     fn config(&self, actor: &str) -> KhiveConfig {
+        self.config_at(actor, URL)
+    }
+
+    /// The same configuration with the computer at `url`.
+    fn config_at(&self, actor: &str, url: &str) -> KhiveConfig {
         let text = format!(
             "[actor]\nid = \"{actor}\"\ncomputer = \"build-1\"\n\n[computer]\nname = \"build-1\"\n\
-             url = \"{URL}\"\nkey_file = \"{}\"\npacks = [\"exec\"]\ncall_timeout_s = 30\n",
+             url = \"{url}\"\nkey_file = \"{}\"\npacks = [\"exec\"]\ncall_timeout_s = 30\n",
             self.key_file().display()
         );
         toml::from_str(&text).expect("a computer configuration")
@@ -363,6 +381,16 @@ impl Caller {
             computer: Arc::clone(&computer.pipe),
         });
         self.server.computer = ComputerBridge::from_config(&computer.config(ACTOR), connector)
+            .expect("a valid computer table")
+            .map(Arc::new);
+        assert!(self.server.computer.is_some());
+        self
+    }
+
+    /// Attach the computer `config` names, reached with the production HTTP
+    /// client.
+    fn routing_over_http(mut self, config: &KhiveConfig) -> Self {
+        self.server.computer = ComputerBridge::from_config(config, Arc::new(HttpConnector))
             .expect("a valid computer table")
             .map(Arc::new);
         assert!(self.server.computer.is_some());
@@ -908,4 +936,165 @@ async fn the_deadline_of_a_request_for_the_computer_is_its_call_timeout() {
     assert_eq!(bridge.deadline_for("stats()"), None);
     assert_eq!(bridge.deadline_for("git.status()"), None);
     assert_eq!(bridge.label(), LABEL);
+}
+
+// ---- over loopback TCP, with the production HTTP client ----
+
+/// One HTTP/1.1 listener on a loopback port that counts the requests it
+/// receives.
+struct Loopback {
+    url: String,
+    requests: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Loopback {
+    async fn bind() -> (TcpListener, String) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let address = listener.local_addr().expect("the loopback address");
+        (listener, format!("http://{address}/mcp"))
+    }
+
+    /// `computer`'s handler and sessions, served by rmcp's streamable HTTP
+    /// service.
+    async fn computer(computer: &TestComputer) -> Self {
+        let (listener, url) = Self::bind().await;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        let handler = computer.handler.clone();
+        let service = StreamableHttpService::new(
+            move || Ok(handler.clone()),
+            Arc::clone(&computer.sessions),
+            StreamableHttpServerConfig::default(),
+        );
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let service = TowerToHyperService::new(service.clone());
+                let counted = Arc::clone(&counted);
+                let counting = hyper::service::service_fn(move |request: Request<Incoming>| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    hyper::service::Service::call(&service, request)
+                });
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), counting)
+                        .await;
+                });
+            }
+        });
+        Self {
+            url,
+            requests,
+            task,
+        }
+    }
+
+    /// Answers every request with a temporary redirect to `location`.
+    async fn redirecting_to(location: &str) -> Self {
+        let (listener, url) = Self::bind().await;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        let location = location.to_owned();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let counted = Arc::clone(&counted);
+                let location = location.clone();
+                let redirect = hyper::service::service_fn(move |_request: Request<Incoming>| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let response = Response::builder()
+                        .status(StatusCode::TEMPORARY_REDIRECT)
+                        .header(http::header::LOCATION, location.as_str())
+                        .body(Full::new(Bytes::new()));
+                    async move { response }
+                });
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), redirect)
+                        .await;
+                });
+            }
+        });
+        Self {
+            url,
+            requests,
+            task,
+        }
+    }
+
+    fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Loopback {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(computer_bridge)]
+async fn arm_1_over_loopback_tcp_one_tool_runs_a_command_and_reads_its_receipt() {
+    reset_frames();
+    let computer = TestComputer::start(ACTOR);
+    let listener = Loopback::computer(&computer).await;
+    let caller = Caller::new().routing_over_http(&computer.config_at(ACTOR, &listener.url));
+
+    let run = caller.request(RUN).await;
+    assert_eq!(run["results"][0]["ok"], true, "{run}");
+    assert_eq!(
+        run["results"][0]["result"]["receipt"]["actor"], ACTOR,
+        "{run}"
+    );
+    let runs = caller.request("exec.runs()").await;
+    let listed = runs["results"][0]["result"]["runs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(listed.len(), 1, "{runs}");
+    assert_eq!(
+        listed[0]["actor"], ACTOR,
+        "the receipt's actor is [actor].id"
+    );
+
+    assert_eq!(computer.calls(), ["whoami()", RUN, "exec.runs()"]);
+    assert!(
+        listener.requests() >= 3,
+        "the calls crossed the socket: {}",
+        listener.requests()
+    );
+    assert!(computer.sentinel());
+    assert!(caller.runs.all().is_empty());
+    assert!(!caller.sentinel());
+    assert!(frames().is_empty(), "{:?}", frames());
+}
+
+#[tokio::test]
+#[serial_test::serial(computer_bridge)]
+async fn arm_5_a_redirect_is_refused_and_its_target_receives_no_request() {
+    reset_frames();
+    let computer = TestComputer::start(ACTOR);
+    // The redirect points at a working computer, so a client that followed
+    // it would run the command there.
+    let target = Loopback::computer(&computer).await;
+    let redirect = Loopback::redirecting_to(&target.url).await;
+    let caller = Caller::new().routing_over_http(&computer.config_at(ACTOR, &redirect.url));
+
+    let answer = caller.text(RUN).await;
+    let refused: Value = serde_json::from_str(&answer).expect("the khive envelope");
+    assert_failed(&refused, 0, "computer_unreachable");
+
+    assert!(redirect.requests() >= 1, "the redirect was answered");
+    assert_eq!(
+        target.requests(),
+        0,
+        "the redirect target received a request"
+    );
+    assert!(computer.calls().is_empty());
+    assert!(!computer.sentinel());
+    assert!(caller.runs.all().is_empty());
+    assert!(!answer.contains(KEY), "{answer}");
+    assert!(frames().is_empty(), "{:?}", frames());
 }
