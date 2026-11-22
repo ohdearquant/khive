@@ -68,9 +68,10 @@ jobs:
     if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'codex/') && github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     # The sweep runs with --release, and a lockfile change invalidates the build cache, so the
-    # usual run pays a cold optimized build of khive-runtime and its dependencies. One such run
-    # measured 14m42s, inside a minute of the former 15-minute limit; 30 leaves room for a
-    # slower runner without letting a hung job hold one for long.
+    # usual run pays a cold optimized build of khive-runtime and its dependencies. Over three days
+    # most runs took 10m37s to 12m31s, two succeeded at 14m52s, and four attempts were cancelled
+    # at the former 15-minute limit, each green on re-run. 30 leaves room for a slower runner
+    # without letting a hung job hold one for long.
     timeout-minutes: 30
     defaults:
       run:
