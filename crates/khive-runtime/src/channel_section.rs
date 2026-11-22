@@ -13,10 +13,22 @@ use crate::RuntimeError;
 ///
 /// Unknown names are retained without effect. Only a registered component
 /// interprets its value; a value alone never starts a component or installs a route.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+///
+/// `Debug` prints component names only: a value is the component's own
+/// configuration and may hold credentials.
+#[derive(Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct ChannelSectionConfig {
     values: BTreeMap<String, toml::Value>,
+}
+
+impl fmt::Debug for ChannelSectionConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChannelSectionConfig")
+            .field("names", &self.values.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl ChannelSectionConfig {
