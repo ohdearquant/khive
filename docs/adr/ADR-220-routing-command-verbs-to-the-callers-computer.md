@@ -210,8 +210,8 @@ One caller has at most one computer.
 
 - In khive: the `[computer]` table and its validation; an MCP HTTP client for any server that
   serves khive's `request` tool and envelope (section 10); the routing in the bridge and in
-  `kkernel exec`; the catalog composition; the refusal kinds named above; and tests that use a stub
-  server or a second khive daemon as the computer.
+  `kkernel exec`; the catalog composition; the refusal kinds named above; and the test computer that
+  the acceptance arms run against.
 - Outside it: the computer itself (sandbox, trees, grants, receipts, its verbs and their schemas),
   how it is hosted, and how its keys are issued, rotated and revoked.
 - The kernel depends on no computer-specific verb. It uses only the `request` tool, `verbs`,
@@ -228,9 +228,15 @@ One caller has at most one computer.
 
 ## Acceptance
 
-Each arm is stated before code exists. A stub computer is a test server that serves the `request`
-tool and the khive envelope; a spy daemon records every frame it receives, as the existing actor
-forwarding tests do.
+Each arm is stated before code exists. The test computer is khive's own `request` handler, carrying
+the routed packs, served over streamable HTTP. Its `exec` is a recording stand-in that writes a
+receipt row (actor and operations) to the test computer's own store instead of starting a sandboxed
+process; a sentinel command is one that stand-in turns into a file. The client reaches the test
+computer through a connector seam: in production it connects to `url` over TCP or TLS, in tests
+over a Unix socket, so every arm runs on a machine that allows no TCP and no nested sandbox. A spy
+daemon records every frame it receives, as the existing actor forwarding tests do. Arms 3, 4 and 8
+also run with the real `exec` pack, and arm 1 also runs over loopback TCP; those variants need a
+host that allows both, and run in the hosted checks.
 
 1. **One tool.** A session whose only tool is khive, with a `[computer]` table naming a test
    computer, runs `exec.run` and reads the run's receipt with a second call. The receipt's actor is
@@ -271,6 +277,8 @@ forwarding tests do.
 - A long routed call holds one of the bridge's outstanding request slots for up to
   `call_timeout_s`.
 - A mixed chain costs one round trip per segment.
+- The HTTP client and the test computer use rmcp's streamable HTTP features, which add the
+  `sse-stream` crate to the lock file.
 
 ## Not covered
 
