@@ -724,13 +724,32 @@ fn names_one_repository(remote: &str) -> bool {
     !host.is_empty() && path.len() >= 2 && path.iter().all(|segment| !segment.is_empty())
 }
 
-/// Whether a `scheme://` entry carries userinfo (a user name, with or without a
-/// password) in its authority, the part between `://` and the first `/`, `?` or `#`.
+/// Whether an entry carries userinfo (a user name, with or without a password)
+/// before its host. Read leniently, because the entry may be mistyped: whatever
+/// precedes the first `:` is dropped as a scheme unless it holds an `@` or a `/`,
+/// leading slashes and backslashes are dropped, and the authority runs to the
+/// first `/`, so a missing scheme, a one-slash scheme or a password holding `?`
+/// or `#` still counts.
 fn authority_carries_userinfo(remote: &str) -> bool {
-    remote
-        .split_once("://")
-        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+    let rest = match remote.split_once(':') {
+        Some((scheme, rest)) if !scheme.contains(['@', '/']) => rest,
+        _ => remote,
+    };
+    rest.trim_start_matches(['/', '\\'])
+        .split('/')
+        .next()
         .is_some_and(|authority| authority.contains('@'))
+}
+
+/// An entry as a refusal may quote it: an entry holding an `@` may carry a
+/// credential the userinfo reading did not recognise, so it is described rather
+/// than quoted.
+fn quoted_remote(remote: &str) -> String {
+    if remote.contains('@') {
+        "an entry holding '@'".to_owned()
+    } else {
+        format!("{remote:?}")
+    }
 }
 
 /// `[git_digest]` policy: the sources `git.digest` may read. Absent or empty
@@ -2138,7 +2157,7 @@ impl KhiveConfig {
         {
             return Err(ConfigError::InvalidRuntimeConfig {
                 key: "git_digest.remotes".to_owned(),
-                reason: format!("{remote:?} is not an https:// URL"),
+                reason: format!("{} is not an https:// URL", quoted_remote(remote)),
             });
         }
         if let Some(remote) = self
@@ -2150,8 +2169,9 @@ impl KhiveConfig {
             return Err(ConfigError::InvalidRuntimeConfig {
                 key: "git_digest.remotes".to_owned(),
                 reason: format!(
-                    "{remote:?} does not name one repository: an entry is a full https://host/owner/repo URL, \
-                     never an owner, a host or a pattern"
+                    "{} does not name one repository: an entry is a full https://host/owner/repo URL, \
+                     never an owner, a host or a pattern",
+                    quoted_remote(remote)
                 ),
             });
         }
