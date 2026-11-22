@@ -1278,6 +1278,21 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "khive-mcp/src/server/server_core.rs",
     ),
     (
+        "khive-mcp/src/server.rs",
+        "computer_bridge",
+        "khive-mcp/src/server/computer_bridge.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
+        "computer_client",
+        "khive-mcp/src/server/computer_client.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
+        "computer_routing",
+        "khive-mcp/src/server/computer_routing.rs",
+    ),
+    (
         "khive-mcp/src/daemon.rs",
         "executable",
         "khive-mcp/src/daemon/executable.rs",

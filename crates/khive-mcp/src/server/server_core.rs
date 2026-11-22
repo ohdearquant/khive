@@ -68,6 +68,10 @@ pub struct KhiveMcpServer {
     pub(super) bridge_executable:
         Option<Arc<std::sync::Mutex<crate::daemon::executable::BridgeExecutable>>>,
     pub(super) stdio_bridge: bool,
+    /// The caller's computer (ADR-220). Present only when the configuration
+    /// this process resolved has a `[computer]` table, and never in the daemon.
+    #[cfg(unix)]
+    pub(super) computer: Option<Arc<super::computer_bridge::ComputerBridge>>,
     /// Namespace this registry was built for. The stdio client passes it to the
     /// daemon; a namespace mismatch triggers local-dispatch fallback.
     pub(super) default_namespace: String,

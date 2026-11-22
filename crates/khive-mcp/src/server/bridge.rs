@@ -268,6 +268,18 @@ impl KhiveMcpServer {
                 bridge_diagnostics_value()
             }
         };
+        #[cfg(unix)]
+        let result = match (&self.computer, is_help) {
+            (Some(computer), false) => {
+                let mut result = result;
+                result["computer"] = json!({
+                    "label": computer.label(),
+                    "routed_requests": computer.routed_requests(),
+                });
+                result
+            }
+            _ => result,
+        };
         let presentation =
             parse_presentation_mode(p.presentation.as_deref()).map_err(invalid_request_error)?;
         let presentation_per_op: Option<Vec<Option<PresentationMode>>> =
@@ -336,7 +348,13 @@ impl KhiveMcpServer {
             return Ok(None);
         }
         p.validate_plan_envelope()?;
-        Ok(Some(self.plan_ops(&p.ops)))
+        let plan = self.plan_ops(&p.ops);
+        #[cfg(unix)]
+        let plan = match &self.computer {
+            Some(computer) => computer.plan_with_homes(plan, &p.ops),
+            None => plan,
+        };
+        Ok(Some(plan))
     }
 
     pub(super) async fn request_with_cancellation(
@@ -404,6 +422,27 @@ impl KhiveMcpServer {
             return self.bridge_diagnostics_response(&p, &parsed);
         }
         validate_request_overrides(&p, parsed.ops.len())?;
+        #[cfg(unix)]
+        if let Some((computer, plan)) = self.computer_route(&parsed) {
+            return self
+                .request_routed(&computer, &plan, &parsed, p, forward_fn)
+                .await;
+        }
+        #[cfg(unix)]
+        return self.request_on_store(p, &parsed, forward_fn).await;
+        #[cfg(not(unix))]
+        return self.request_on_store(p, &parsed).await;
+    }
+
+    /// The store's part of a request: forwarded to the warm daemon or
+    /// dispatched here, as every request was before ADR-220. A request with no
+    /// operation for the caller's computer comes here whole.
+    pub(super) async fn request_on_store(
+        &self,
+        p: RequestParams,
+        parsed: &ParsedRequest,
+        #[cfg(unix)] forward_fn: ForwardFnPtr,
+    ) -> Result<String, McpError> {
         #[cfg(unix)]
         let replay_read_only = !parsed.ops.is_empty()
             && parsed
@@ -686,6 +725,16 @@ fn bridge_diagnostics_help() -> Value {
                     "properties": {
                         "before_dispatch": counter,
                         "after_write": counter
+                    },
+                    "additionalProperties": false
+                },
+                "computer": {
+                    "type":"object",
+                    "description":"Present when this caller's configuration has a [computer] table (ADR-220): the computer as name (host:port), and how many requests with an operation for it this bridge has handled, refused ones included.",
+                    "required": ["label", "routed_requests"],
+                    "properties": {
+                        "label": {"type":"string"},
+                        "routed_requests": counter
                     },
                     "additionalProperties": false
                 }

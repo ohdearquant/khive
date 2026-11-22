@@ -102,6 +102,14 @@ use server_core::{stdio_serve_mode_for, StdioServeMode};
 
 mod batch_execution;
 mod bridge;
+// ADR-220: routing command verbs to the caller's computer. Each of these
+// modules is Unix-only through its own `#![cfg(unix)]`, so the declarations
+// stay bare for the error-constructor census.
+mod computer_bridge;
+mod computer_client;
+#[cfg(all(test, unix))]
+mod computer_pipe_tests;
+mod computer_routing;
 mod dispatch_helpers;
 mod execution;
 mod rendering;
@@ -238,6 +246,8 @@ impl KhiveMcpServer {
             events_readiness: Arc::new(std::sync::OnceLock::new()),
             #[cfg(unix)]
             bridge_executable: None,
+            #[cfg(unix)]
+            computer: None,
             stdio_bridge: false,
             runtime: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
@@ -644,6 +654,14 @@ result (e.g. create then link with the new entity's id)."#)]
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<String, McpError> {
         let timeout = crate::request_policy::read_timeout(&p.ops, request_read_timeout());
+        // A request with an operation for the computer waits as long as the
+        // computer may take (ADR-220 section 2).
+        #[cfg(unix)]
+        let timeout = self
+            .computer
+            .as_ref()
+            .and_then(|computer| computer.deadline_for(&p.ops))
+            .map_or(timeout, |deadline| deadline.max(timeout));
         scope_mcp_request_read_cancellation_with_timeout(
             cancellation,
             timeout,
