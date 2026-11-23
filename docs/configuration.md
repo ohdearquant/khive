@@ -123,7 +123,13 @@ hold the exec root or sit inside it, and it may not equal, hold or sit inside
 any read root; a run is refused with the reason otherwise. The check does not
 judge what else a cache root holds: a root that holds a home directory, a
 credential or a store is the operator's error and is not refused. Its size is
-bounded by its volume, not by the run limits. Each receipt's
+bounded by its volume, not by the run limits. Each entry is resolved again
+when a run starts, and the run's profile grants the paths that check resolved,
+so a cache root created after the server started, or named through a symbolic
+link, is writable under its real path. An entry that resolves through a symbolic
+link sitting inside the exec root or inside a cache root, a link reached through
+another link's target included, is refused, because a run could point that link
+elsewhere. Each receipt's
 `sandbox.cache_roots_digest` names the list the run had.
 
 ### Exec sandbox path matches

@@ -113,13 +113,46 @@ fn fixture_with_optional_blob_fault(
     max_output_bytes: u64,
     fault: Option<(Arc<AtomicBool>, Arc<AtomicUsize>)>,
 ) -> Fixture {
-    fixture_built(keep, limits, max_output_bytes, fault, false)
+    fixture_built(keep, limits, max_output_bytes, fault, CacheRoot::Absent)
 }
 
 /// A fixture whose runs share one cache root beside the run root.
 #[cfg(target_os = "macos")]
 fn fixture_with_cache_root() -> Fixture {
-    fixture_built(false, ExecLimitsConfig::default(), 128, None, true)
+    fixture_built(
+        false,
+        ExecLimitsConfig::default(),
+        128,
+        None,
+        CacheRoot::Existing,
+    )
+}
+
+/// A fixture whose one cache root is configured through a symbolic link and
+/// does not exist when the configuration loads.
+#[cfg(target_os = "macos")]
+fn fixture_with_late_cache_root() -> Fixture {
+    fixture_built(
+        false,
+        ExecLimitsConfig::default(),
+        128,
+        None,
+        CacheRoot::Late,
+    )
+}
+
+/// The `[exec] cache_roots` entry a fixture configures.
+enum CacheRoot {
+    /// No cache root.
+    Absent,
+    /// One existing directory, configured by its canonical path.
+    #[cfg(target_os = "macos")]
+    Existing,
+    /// One directory named through a symbolic link and not created when the
+    /// configuration loads, so the configured text is not its canonical path.
+    /// The test creates it.
+    #[cfg(target_os = "macos")]
+    Late,
 }
 
 fn fixture_built(
@@ -127,19 +160,38 @@ fn fixture_built(
     limits: ExecLimitsConfig,
     max_output_bytes: u64,
     fault: Option<(Arc<AtomicBool>, Arc<AtomicUsize>)>,
-    with_cache_root: bool,
+    cache_root: CacheRoot,
 ) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("exec-root");
     let db = dir.path().join("khive.db");
-    let cache = with_cache_root.then(|| {
-        let cache = dir.path().join("exec-cache");
-        std::fs::create_dir(&cache).expect("cache root");
-        cache.canonicalize().expect("canonical cache root")
-    });
+    // The canonical path the cache root has or will have, and the text the
+    // configuration names it by.
+    let cache: Option<(std::path::PathBuf, std::path::PathBuf)> = match cache_root {
+        CacheRoot::Absent => None,
+        #[cfg(target_os = "macos")]
+        CacheRoot::Existing => {
+            let cache = dir.path().join("exec-cache");
+            std::fs::create_dir(&cache).expect("cache root");
+            let cache = cache.canonicalize().expect("canonical cache root");
+            Some((cache.clone(), cache))
+        }
+        #[cfg(target_os = "macos")]
+        CacheRoot::Late => {
+            let parent = dir.path().join("exec-cache-parent");
+            std::fs::create_dir(&parent).expect("cache root parent");
+            let alias = dir.path().join("exec-cache-alias");
+            std::os::unix::fs::symlink(&parent, &alias).expect("cache root parent alias");
+            let canonical = parent
+                .canonicalize()
+                .expect("canonical cache root parent")
+                .join("exec-cache");
+            Some((canonical, alias.join("exec-cache")))
+        }
+    };
     let cache_roots: Vec<String> = cache
         .iter()
-        .map(|path| path.to_string_lossy().to_string())
+        .map(|(_, configured)| configured.to_string_lossy().to_string())
         .collect();
     let cfg = RuntimeConfig {
         db_path: Some(db),
@@ -191,7 +243,7 @@ fn fixture_built(
         _dir: dir,
         root,
         blobs: blob_root,
-        cache,
+        cache: cache.map(|(canonical, _)| canonical),
     }
 }
 
@@ -1653,6 +1705,50 @@ async fn run_keeps_cache_root_writes_between_runs_and_out_of_the_output_tree() {
         "{receipt}"
     );
     assert!(!unlisted.exists());
+}
+
+/// A cache root that does not exist when the configuration loads, configured
+/// through a symbolic link, is granted under the path it resolves to when the
+/// run starts, and the receipt and `exec.identity` name that path's digest.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_writes_a_cache_root_created_after_load_under_its_canonical_path() {
+    let f = fixture_with_late_cache_root();
+    f.register_sh("sh", "allow").await;
+    let tree = f.tree(&[("input", b"in", 644)]).await;
+    let cache = f.cache.clone().expect("fixture has a cache root");
+    std::fs::create_dir(&cache).expect("cache root created after load");
+    let artifact = cache.join("artifact");
+    let write = format!("printf kept > {}", artifact.display());
+    let run = f
+        .call(
+            "exec.run",
+            json!({
+                "tree": tree, "tool": "sh", "args": ["-c", write], "actor": "local",
+                "session_id": "late-cache"
+            }),
+        )
+        .await;
+    let receipt = &run["receipt"];
+    let profile = f.blob_text(&receipt["profile_ref"]).await;
+    assert!(
+        profile.contains(&format!("(subpath \"{}\")", cache.display())),
+        "the profile must grant the cache root's canonical path: {profile}"
+    );
+    assert_eq!(receipt["success"], true, "{receipt}");
+    assert_eq!(receipt["undeclared_changes"], json!([]), "{receipt}");
+    assert_eq!(std::fs::read(&artifact).expect("artifact written"), b"kept");
+
+    let identity = f.call("exec.identity", json!({})).await;
+    assert_eq!(
+        identity["cache_roots"],
+        json!([cache.to_string_lossy()]),
+        "{identity}"
+    );
+    assert_eq!(
+        receipt["sandbox"]["cache_roots_digest"], identity["cache_roots_digest"],
+        "{receipt}"
+    );
 }
 
 /// ADR-181 Amendment 16 acceptance 79: the run's TMPDIR is its own directory,

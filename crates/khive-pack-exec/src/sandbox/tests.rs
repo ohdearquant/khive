@@ -310,6 +310,201 @@ fn cache_roots_must_not_overlap_a_read_root() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn resolved_cache_roots_are_the_canonical_paths_the_check_compared() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let base = std::fs::canonicalize(dir.path()).expect("canonical base");
+    let root = base.join("runs");
+    let parent = base.join("parent");
+    for path in [&root, &parent] {
+        std::fs::create_dir_all(path).expect("fixture directory");
+    }
+    let alias = base.join("alias");
+    std::os::unix::fs::symlink(&parent, &alias).expect("symbolic link to the parent");
+    let configured = alias.join("cache");
+    let canonical = parent.join("cache");
+
+    // Not created yet: refused, and the current form keeps the configured text.
+    assert!(resolve_cache_roots(&root, &[], std::slice::from_ref(&configured)).is_err());
+    assert_eq!(
+        current_cache_roots(std::slice::from_ref(&configured)),
+        vec![configured.clone()]
+    );
+
+    std::fs::create_dir(&canonical).expect("cache root created after the configuration");
+    let resolved = resolve_cache_roots(&root, &[], &[configured.clone(), canonical.clone()])
+        .expect("both spellings resolve");
+    assert_eq!(
+        resolved,
+        vec![canonical.clone()],
+        "two spellings of one directory resolve to its canonical path once"
+    );
+    assert_eq!(
+        current_cache_roots(&[configured.clone(), canonical.clone()]),
+        resolved
+    );
+
+    let granted = format!("(subpath \"{}\")", canonical.display());
+    let named = format!("(subpath \"{}\")", configured.display());
+    let profile = render_profile(Path::new("/private/tmp/run-1"), &[], &resolved, &[]);
+    assert!(profile.contains(&granted), "{profile}");
+    assert!(!profile.contains(&named), "{profile}");
+    // Control: the configured text rendered as it stands names a path the
+    // sandbox never matches, and not the directory a write reaches.
+    let unresolved = render_profile(
+        Path::new("/private/tmp/run-1"),
+        &[],
+        std::slice::from_ref(&configured),
+        &[],
+    );
+    assert!(unresolved.contains(&named), "{unresolved}");
+    assert!(!unresolved.contains(&granted), "{unresolved}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_cache_root_through_a_link_a_run_can_write_is_refused() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let base = std::fs::canonicalize(dir.path()).expect("canonical base");
+    let root = base.join("runs");
+    let shared = base.join("shared");
+    let target = base.join("target");
+    for path in [&root, &shared, &target.join("sub")] {
+        std::fs::create_dir_all(path).expect("fixture directory");
+    }
+    let in_cache = shared.join("link");
+    std::os::unix::fs::symlink(&target, &in_cache).expect("link inside a cache root");
+    let in_run_root = root.join("link");
+    std::os::unix::fs::symlink(&target, &in_run_root).expect("link inside the run root");
+    let outside = base.join("alias");
+    std::os::unix::fs::symlink(&target, &outside).expect("link where no run writes");
+
+    // Control: a link outside the run root and every cache root is followed.
+    assert_eq!(
+        resolve_cache_roots(&root, &[], std::slice::from_ref(&outside)),
+        Ok(vec![target.clone()])
+    );
+    assert_eq!(
+        resolve_cache_roots(&root, &[], &[shared.clone(), outside.clone()]),
+        Ok(vec![shared.clone(), target.clone()])
+    );
+
+    let refused = [
+        (
+            "a link inside another cache root",
+            vec![shared.clone(), in_cache.clone()],
+            &in_cache,
+            &shared,
+        ),
+        (
+            "a link inside another cache root, as a middle component",
+            vec![shared.clone(), in_cache.join("sub")],
+            &in_cache,
+            &shared,
+        ),
+        (
+            "a link inside the run root",
+            vec![in_run_root.clone()],
+            &in_run_root,
+            &root,
+        ),
+    ];
+    for (why, entries, link, holder) in refused {
+        let message =
+            resolve_cache_roots(&root, &[], &entries).expect_err(&format!("{why} must be refused"));
+        assert!(message.contains(&format!("{link:?}")), "{why}: {message}");
+        assert!(message.contains(&format!("{holder:?}")), "{why}: {message}");
+        assert!(message.contains("symbolic link"), "{why}: {message}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_met_inside_another_links_target_is_checked_like_one_in_the_entry() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let base = std::fs::canonicalize(dir.path()).expect("canonical base");
+    let root = base.join("runs");
+    let shared = base.join("shared");
+    let operator = base.join("op");
+    let target = base.join("target");
+    for path in [&root, &shared, &operator, &target.join("x")] {
+        std::fs::create_dir_all(path).expect("fixture directory");
+    }
+    let symlink = |to: &Path, at: &Path| std::os::unix::fs::symlink(to, at).expect("symbolic link");
+
+    // The operator's alias sits where no run writes, and points through a
+    // `current` link that sits inside the cache root `shared`.
+    let current = shared.join("current");
+    symlink(&target, &current);
+    let alias = operator.join("alias");
+    symlink(&current.join("x"), &alias);
+    let message = resolve_cache_roots(&root, &[], &[shared.clone(), alias.clone()])
+        .expect_err("an alias through a link inside a cache root must be refused");
+    assert!(message.contains(&format!("{current:?}")), "{message}");
+    assert!(message.contains(&format!("{shared:?}")), "{message}");
+    assert!(message.contains(&format!("{alias:?}")), "{message}");
+    // Control: without `shared` among the cache roots nothing a run writes
+    // holds the link, and the alias resolves to the directory behind it.
+    assert_eq!(
+        resolve_cache_roots(&root, &[], std::slice::from_ref(&alias)),
+        Ok(vec![target.join("x")])
+    );
+
+    // A link to a link, both where no run writes, the second relative and
+    // stepping out with `..`, is followed to the directory behind them.
+    let second = operator.join("second");
+    symlink(Path::new("../target"), &second);
+    let first = base.join("first");
+    symlink(&second, &first);
+    assert_eq!(
+        resolve_cache_roots(&root, &[], &[first.join("x")]),
+        Ok(vec![target.join("x")])
+    );
+    assert_eq!(
+        current_cache_roots(&[first.join("x")]),
+        vec![target.join("x")]
+    );
+
+    // A loop is refused rather than followed forever.
+    let one = base.join("loop-one");
+    let two = base.join("loop-two");
+    symlink(&two, &one);
+    symlink(&one, &two);
+    let message = resolve_cache_roots(&root, &[], &[one.join("x")])
+        .expect_err("a loop of links must be refused");
+    assert!(
+        message.contains("follows more than 40 symbolic links"),
+        "{message}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_cache_root_spelled_in_another_letter_case_is_refused() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let base = std::fs::canonicalize(dir.path()).expect("canonical base");
+    let root = base.join("runs");
+    let on_disk = base.join("MixedCase").join("Sub");
+    for path in [&root, &on_disk] {
+        std::fs::create_dir_all(path).expect("fixture directory");
+    }
+    let other_case = base.join("mixedcase").join("sub");
+    if !other_case.exists() {
+        // A case-sensitive volume has no second spelling to refuse.
+        return;
+    }
+    let message = resolve_cache_roots(&root, &[], std::slice::from_ref(&other_case))
+        .expect_err("an entry in another letter case must be refused");
+    assert!(message.contains(&format!("{on_disk:?}")), "{message}");
+    assert!(message.contains(&format!("{other_case:?}")), "{message}");
+    // Control: the on-disk spelling resolves to itself.
+    assert_eq!(
+        resolve_cache_roots(&root, &[], std::slice::from_ref(&on_disk)),
+        Ok(vec![on_disk.clone()])
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn sandboxed_write_reaches_a_cache_root_and_nothing_beside_it() {

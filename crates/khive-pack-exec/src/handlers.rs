@@ -330,6 +330,7 @@ pub async fn events(
 }
 
 pub fn identity(cfg: &Resolved) -> Value {
+    let cache_roots = sandbox::current_cache_roots(&cfg.cache_roots);
     let roots: Vec<String> = cfg
         .read_roots
         .iter()
@@ -340,8 +341,8 @@ pub fn identity(cfg: &Resolved) -> Value {
         "read_roots": roots,
         "read_roots_serialization": "compact JSON array of the sorted canonical read roots; digest = BLAKE3 hex",
         "read_roots_digest": sandbox::read_roots_digest(&cfg.read_roots),
-        "cache_roots": cfg.cache_roots.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
-        "cache_roots_digest": sandbox::cache_roots_digest(&cfg.cache_roots),
+        "cache_roots": cache_roots.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+        "cache_roots_digest": sandbox::cache_roots_digest(&cache_roots),
         "tool_profiles": cfg.tool_profiles.iter().map(sandbox::tool_profile_json).collect::<Vec<_>>(),
         "profile_template_digest": sandbox::template_digest(),
         "system_read_roots": sandbox::SYSTEM_READ_ROOTS,
@@ -1481,11 +1482,14 @@ async fn execute(
     let root = std::fs::canonicalize(&cfg.root).map_err(|e| {
         RuntimeError::Unconfigured(format!("exec root {}: {e}", cfg.root.display()))
     })?;
-    if let Some(conflict) = sandbox::cache_root_conflict(&root, &cfg.read_roots, &cfg.cache_roots) {
-        return Err(RuntimeError::Unconfigured(conflict));
-    }
+    // The cache roots in the form this check resolves now, not the form they
+    // had when the configuration was loaded: the profile grants these and the
+    // receipt's digest names them, so a cache root created after load, whose
+    // configured text is not its canonical path, is writable under that path.
+    let cache_roots = sandbox::resolve_cache_roots(&root, &cfg.read_roots, &cfg.cache_roots)
+        .map_err(RuntimeError::Unconfigured)?;
     if let Some(conflict) =
-        sandbox::tool_profile_conflict(&root, &cfg.read_roots, &cfg.cache_roots, &cfg.tool_profiles)
+        sandbox::tool_profile_conflict(&root, &cfg.read_roots, &cache_roots, &cfg.tool_profiles)
     {
         return Err(RuntimeError::Unconfigured(conflict));
     }
@@ -1535,7 +1539,7 @@ async fn execute(
     let profile = render_profile_for_tool(
         &run_dir,
         &cfg.read_roots,
-        &cfg.cache_roots,
+        &cache_roots,
         &cfg.never,
         ready.tool_profile.as_ref(),
     );
@@ -1550,7 +1554,7 @@ async fn execute(
         "tool_source": format!("exec:{}", ready.registered),
         "tool_registry_id": ready.registry_id.to_string(),
         "read_roots_digest": sandbox::read_roots_digest(&cfg.read_roots),
-        "cache_roots_digest": sandbox::cache_roots_digest(&cfg.cache_roots),
+        "cache_roots_digest": sandbox::cache_roots_digest(&cache_roots),
         "tool_profile": ready.tool_profile.as_ref().map(sandbox::tool_profile_json),
     }));
     receipt.profile_ref = Some(profile_ref.as_str().to_string());

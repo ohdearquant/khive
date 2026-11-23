@@ -27,7 +27,8 @@
 //! bytes as before. Every rule here was accepted by driving it, never by its
 //! text.
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -444,37 +445,178 @@ pub fn cache_root_conflict(
     read_roots: &[PathBuf],
     cache_roots: &[PathBuf],
 ) -> Option<String> {
+    resolve_cache_roots(root, read_roots, cache_roots).err()
+}
+
+/// The cache roots a run starts with: each entry checked as
+/// [`cache_root_conflict`] describes, then returned in the canonical form the
+/// check compared, sorted and without duplicates. The profile grants these
+/// paths and the receipt's digest names them, so a directory created after the
+/// configuration was loaded, or named through a symbolic link, is granted
+/// under the path the sandbox matches rather than the text configured.
+pub fn resolve_cache_roots(
+    root: &Path,
+    read_roots: &[PathBuf],
+    cache_roots: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut walked: Vec<(&PathBuf, Walked)> = Vec::with_capacity(cache_roots.len());
     for entry in cache_roots {
         if !entry.is_absolute() {
-            return Some(format!(
+            return Err(format!(
                 "[exec] cache_roots entry {entry:?} is not an absolute path"
             ));
         }
-        let cache = match std::fs::canonicalize(entry) {
-            Ok(cache) => cache,
-            Err(error) => {
-                return Some(format!(
-                    "[exec] cache_roots entry {entry:?} cannot be resolved ({error}); \
-                     it must exist when a run starts"
+        let walk = walk_entry(entry)
+            .map_err(|detail| format!("[exec] cache_roots entry {entry:?} {detail}"))?;
+        // The walk keeps each component as configured, and a volume that
+        // ignores letter case resolves another spelling of the same
+        // directory, which would then compare unequal to the roots beside
+        // it. An entry not spelled as the file system reports it is refused;
+        // this read can only refuse, never change what is granted.
+        match std::fs::canonicalize(&walk.path) {
+            Ok(on_disk) if on_disk == walk.path => {}
+            Ok(on_disk) => {
+                return Err(format!(
+                    "[exec] cache_roots entry {entry:?} resolves to {:?}, which the file system \
+                     spells {on_disk:?}; write the entry with that spelling",
+                    walk.path
                 ));
             }
-        };
+            Err(error) => {
+                return Err(format!(
+                    "[exec] cache_roots entry {entry:?} cannot be resolved at {:?} ({error}); \
+                     it must exist when a run starts",
+                    walk.path
+                ));
+            }
+        }
+        let cache = walk.path.clone();
         if root.starts_with(&cache) || cache.starts_with(&root) {
-            return Some(format!(
+            return Err(format!(
                 "[exec] cache_roots entry {entry:?} overlaps the run root {root:?}"
             ));
         }
         for read in read_roots {
             let read_canonical = std::fs::canonicalize(read).unwrap_or_else(|_| read.clone());
             if read_canonical.starts_with(&cache) || cache.starts_with(&read_canonical) {
-                return Some(format!(
+                return Err(format!(
                     "[exec] cache_roots entry {entry:?} overlaps the read root {read:?}"
                 ));
             }
         }
+        walked.push((entry, walk));
     }
-    None
+    // Resolving at run start follows each link met on the way as it is now. A
+    // link a run can write could be pointed elsewhere by one run, and the next
+    // run would be granted write wherever it points, so an entry whose walk
+    // met such a link is refused. A link where no run can write is followed.
+    // The grant below is the walk's own result, so no second read of the file
+    // system stands between the check and the path granted.
+    for (entry, walk) in &walked {
+        for link in &walk.links {
+            let holder = if link.starts_with(&root) {
+                Some(format!("the run root {root:?}"))
+            } else {
+                walked
+                    .iter()
+                    .find(|(_, other)| link.starts_with(&other.path))
+                    .map(|(_, other)| format!("the cache root {:?}", other.path))
+            };
+            if let Some(holder) = holder {
+                return Err(format!(
+                    "[exec] cache_roots entry {entry:?} resolves through the symbolic link \
+                     {link:?}, which sits inside {holder} where a run can point it elsewhere"
+                ));
+            }
+        }
+    }
+    let mut resolved: Vec<PathBuf> = walked.into_iter().map(|(_, walk)| walk.path).collect();
+    resolved.sort();
+    resolved.dedup();
+    Ok(resolved)
+}
+
+/// Symbolic links one walk follows before it refuses the entry as a loop.
+const MAX_LINK_HOPS: usize = 40;
+
+/// One cache root entry resolved by [`walk_entry`].
+struct Walked {
+    /// The canonical path the walk reached.
+    path: PathBuf,
+    /// Where each symbolic link the walk followed sits: its directory's
+    /// canonical path joined with its name, not where it points.
+    links: Vec<PathBuf>,
+}
+
+/// Resolve an absolute path one component at a time from the root of the
+/// file system. A component that is a symbolic link is read and its target's
+/// components take its place, so a link met inside another link's target is
+/// followed and recorded like one in the configured text. An absolute target
+/// starts again from the root, `..` leaves the directory reached so far, and
+/// more than [`MAX_LINK_HOPS`] links refuse. The directory reached so far is
+/// canonical at every step, so each recorded location is too.
+fn walk_entry(entry: &Path) -> Result<Walked, String> {
+    let mut pending: Vec<OsString> = Vec::new();
+    push_components(&mut pending, entry);
+    let mut path = PathBuf::from("/");
+    let mut links = Vec::new();
+    while let Some(part) = pending.pop() {
+        if part == ".." {
+            path.pop();
+            continue;
+        }
+        let next = path.join(&part);
+        let metadata = std::fs::symlink_metadata(&next).map_err(|error| {
+            format!("cannot be resolved at {next:?} ({error}); it must exist when a run starts")
+        })?;
+        if !metadata.file_type().is_symlink() {
+            path = next;
+            continue;
+        }
+        if links.len() == MAX_LINK_HOPS {
+            return Err(format!(
+                "follows more than {MAX_LINK_HOPS} symbolic links; the last was {next:?}"
+            ));
+        }
+        let target = std::fs::read_link(&next).map_err(|error| {
+            format!("cannot be resolved: the symbolic link {next:?} cannot be read ({error})")
+        })?;
+        if target.is_absolute() {
+            path = PathBuf::from("/");
+        }
+        push_components(&mut pending, &target);
+        links.push(next);
+    }
+    Ok(Walked { path, links })
+}
+
+/// Queue `path`'s components so the first is popped first. `..` is kept as
+/// itself, which no ordinary component can equal; `.` and the root drop out.
+fn push_components(pending: &mut Vec<OsString>, path: &Path) {
+    let parts: Vec<OsString> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_os_string()),
+            Component::ParentDir => Some(OsString::from("..")),
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
+        })
+        .collect();
+    pending.extend(parts.into_iter().rev());
+}
+
+/// The configured cache roots in the canonical form they have now, sorted and
+/// without duplicates, for `exec.identity`: the form a run starting now would
+/// grant and digest. An entry that does not resolve keeps its configured text,
+/// and a run refuses it.
+pub fn current_cache_roots(cache_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut current: Vec<PathBuf> = cache_roots
+        .iter()
+        .map(|entry| walk_entry(entry).map_or_else(|_| entry.clone(), |walk| walk.path))
+        .collect();
+    current.sort();
+    current.dedup();
+    current
 }
 
 /// Digest of the resolved cache roots, in the read roots' serialization.

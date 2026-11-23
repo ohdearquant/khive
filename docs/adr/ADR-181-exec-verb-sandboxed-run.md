@@ -1732,7 +1732,9 @@ that are hashed and stored on every run and thrown away with the directory, so t
 ### Decision
 
 1. **Config.** `[exec] cache_roots` is a list of absolute directories. It is empty by default. Each entry is
-   canonicalized once at load, like a read root.
+   canonicalized at load, like a read root, and again when a run starts. The run-start form is the one the checks
+   compare, the profile grants and the digest names: a root created after load, or named through a symbolic link,
+   was otherwise granted under a text the sandbox never matches.
 2. **Profile.** For each cache root the profile grants what it grants the run directory: `file-read*`,
    `file-read-metadata` (with the exact ancestor directories), `file-map-executable` and `file-write*`. Nothing else
    in the profile changes. In particular there is still no network, and the version-control and `never` denials of
@@ -1743,12 +1745,21 @@ that are hashed and stored on every run and thrown away with the directory, so t
    in canonical form, so a symbolic link or a `..` component does not hide an overlap. An overlap with the exec root
    would let one run write another run's directory, and an overlap with a read root would make a directory the
    configuration calls read-only writable. The refusal names the entry and, for an overlap, the root it overlaps.
+   Each entry is resolved by one walk, component by component, that follows every symbolic link it meets and records
+   where each link sits; the walk's result is what is checked, granted and digested, so no second read of the file
+   system comes between the check and the grant. An entry is refused when any symbolic link met while resolving it,
+   one met inside another link's target included, sits inside the exec root or inside a cache root, naming the link
+   and that root: a run can point such a link elsewhere, and the next run would be granted write wherever it points.
+   A link where no run can write is followed. A walk that follows more than 40 links is refused. An entry whose
+   walked path is not spelled as the file system reports it (another letter case on a volume that ignores case) is
+   refused, naming the spelling to write; that check can only refuse, and the grant stays the walk's result.
    The check does not judge what else a cache root holds. A root that holds a home directory, a credential or a
    store is the operator's error and is not refused.
 4. **Capture.** Nothing under a cache root is part of the run's output. It is not walked, not hashed, not stored, and
    it is not removed when the run directory is.
 5. **Receipt and identity.** The receipt's `sandbox` object carries `cache_roots_digest`: the BLAKE3 hex of the
-   sorted canonical cache roots in the read roots' serialization (Amendment 1 item 7). `exec.identity` reports
+   sorted canonical cache roots, as resolved when the run starts, in the read roots' serialization (Amendment 1
+   item 7). `exec.identity` reports
    `cache_roots` and the same digest. The digest of the empty list means the run had no cache root.
 
 ### What a cache root costs
