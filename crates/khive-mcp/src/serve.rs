@@ -287,6 +287,10 @@ pub async fn serve_server_with_registrations(
     // coordinator boot path (sweep coverage, ADR-091 Amendment 2).
     // Without this spawn, every multi-backend session is permanently
     // invisible to cross-process WAL-pin attribution.
+    // ADR-220 section 8: the computer's catalog is read once as the bridge
+    // starts; the tool description is built from that read.
+    #[cfg(unix)]
+    server.read_computer_catalog_in_background();
     start_host_background_tasks(args, &server, schedule_rt, prepared_background);
     serve_with_session_sweep(server, args, registry).await
 }

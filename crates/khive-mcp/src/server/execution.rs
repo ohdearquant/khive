@@ -201,6 +201,12 @@ impl KhiveMcpServer {
     /// The list is rebuilt from the runtime registry so it always reflects which
     /// packs are actually loaded.
     pub(super) fn verb_catalog(&self) -> String {
+        self.render_verb_catalog(self.catalog_entries())
+    }
+
+    /// `(pack, verb, description)` for every verb the registry serves, the
+    /// mounted ones included.
+    pub(super) fn catalog_entries(&self) -> Vec<(String, String, String)> {
         let verbs = self
             .registry
             .all_verbs_with_names()
@@ -217,9 +223,14 @@ impl KhiveMcpServer {
                     verb["description"].as_str().unwrap_or_default().to_owned(),
                 )
             });
+        verbs.chain(mounted).collect()
+    }
+
+    /// The catalog text for `verbs` at this server's catalog verbosity.
+    pub(super) fn render_verb_catalog(&self, verbs: Vec<(String, String, String)>) -> String {
         match self.catalog_verbosity {
-            CatalogVerbosity::Full => build_verb_catalog(verbs.chain(mounted)),
-            CatalogVerbosity::Compact => build_compact_verb_catalog(verbs.chain(mounted)),
+            CatalogVerbosity::Full => build_verb_catalog(verbs),
+            CatalogVerbosity::Compact => build_compact_verb_catalog(verbs),
         }
     }
 

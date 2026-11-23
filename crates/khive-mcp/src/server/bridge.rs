@@ -422,6 +422,20 @@ impl KhiveMcpServer {
             return self.bridge_diagnostics_response(&p, &parsed);
         }
         validate_request_overrides(&p, parsed.ops.len())?;
+        // A caller with a computer sees the computer's verbs for each routed
+        // pack (ADR-220 section 8).
+        #[cfg(unix)]
+        if let Some(computer) = self.computer.clone() {
+            if parsed
+                .ops
+                .iter()
+                .any(|op| op.tool == super::computer_catalog::VERBS_VERB)
+            {
+                return self
+                    .request_with_computer_catalog(&computer, p, &parsed, forward_fn)
+                    .await;
+            }
+        }
         #[cfg(unix)]
         if let Some((computer, plan)) = self.computer_route(&parsed) {
             return self

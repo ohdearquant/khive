@@ -60,6 +60,8 @@ pub(super) struct ComputerRouting {
     routed: BTreeSet<String>,
     /// `name (host:port)`, used in every message that names the computer.
     label: String,
+    /// The computer's `name`, as each catalog row it serves carries it.
+    name: String,
 }
 
 impl ComputerRouting {
@@ -74,11 +76,26 @@ impl ComputerRouting {
         Ok(Self {
             routed: config.packs.iter().cloned().collect(),
             label: format!("{} ({host}:{})", config.name, endpoint.port),
+            name: config.name.clone(),
         })
     }
 
     pub(super) fn label(&self) -> &str {
         &self.label
+    }
+
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Whether the caller's computer serves `pack`.
+    pub(super) fn routes_pack(&self, pack: &str) -> bool {
+        self.routed.contains(pack)
+    }
+
+    /// The packs the caller's computer serves, in name order.
+    pub(super) fn routed_packs(&self) -> impl Iterator<Item = &str> {
+        self.routed.iter().map(String::as_str)
     }
 
     /// The placement of one operation. A `schedule.schedule` whose action would
