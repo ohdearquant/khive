@@ -52,3 +52,5 @@ include!("dev_loop_tests/status_tests.rs");
 include!("dev_loop_tests/log_tests.rs");
 
 include!("dev_loop_tests/repository_safety_tests.rs");
+
+include!("dev_loop_tests/fetched_refs_tests.rs");

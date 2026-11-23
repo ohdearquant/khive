@@ -3,7 +3,9 @@
 // are independent of the recording platform's request ledger.
 
 use crate::receipts::{self, Disposition, Receipt};
-use crate::remote_transport::{ApiRequest, PushRequest, RemoteError, RemoteTransport};
+use crate::remote_transport::{
+    ApiRequest, FetchRequest, Fetched, PushRequest, RemoteError, RemoteTransport,
+};
 use crate::GitPack;
 use async_trait::async_trait;
 use khive_pack_kg::KgPack;
@@ -158,6 +160,22 @@ impl RemoteTransport for Recording {
         } else {
             Ok(())
         }
+    }
+    async fn fetch(
+        &self,
+        token: Option<&str>,
+        mut request: FetchRequest,
+    ) -> Result<Fetched, RemoteError> {
+        {
+            let mut s = self.state.lock().unwrap();
+            s.calls.push(json!({"op":"fetch","source":request.source,
+                "token_hash":token.map(|token| blake3::hash(token.as_bytes()).to_hex().to_string())}));
+            if s.api_failure {
+                return Err(RemoteError::Unavailable);
+            }
+        }
+        request.remote = self.bare.display().to_string();
+        crate::remote_transport::fetch_native(Path::new("git"), None, request, true).await
     }
     async fn api(&self, token: &str, request: ApiRequest) -> Result<Value, RemoteError> {
         let mut s = self.state.lock().unwrap();
@@ -555,3 +573,5 @@ include!("remote_tests/pull_request_state_tests.rs");
 include!("remote_tests/outcome_reconciliation_tests.rs");
 
 include!("remote_tests/schema_and_effect_controls_tests.rs");
+
+include!("remote_tests/fetch_credential_tests.rs");

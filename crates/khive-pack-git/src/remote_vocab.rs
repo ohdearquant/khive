@@ -45,6 +45,19 @@ pub(crate) const PUSH: HandlerDef = HandlerDef {
     ],
 };
 
+pub(crate) const FETCH: HandlerDef = HandlerDef {
+    name: "git.fetch",
+    description: "Fetch one branch or one pull request's head from the configured remote. A branch name writes refs/remotes/origin/<ref>; pull/<N> always means pull request N's head and writes refs/fetched/pull/<N>. The transfer runs by URL in a scratch repository whose configuration the pack writes, so the clone's configuration, hooks and remotes are never read; received objects are checked, and the clone's own tips are offered so only missing objects travel. Received objects land in a directory of their own and enter the clone's object store only after the transfer completed and the ref names the expected commit: a refused, failed or timed-out transfer and a mismatch leave the store as it was. The destination moves only by a compare-and-swap from the value read before the fetch: ref_moved (another writer changed it) and ref_locked (another writer holds its lock) leave it unchanged and are safe to retry. Optional expected_remote is the exact 40-hex SHA the fetched ref must have; any other value refuses expected_remote_mismatch with the destination unchanged. remote_ref_absent means the remote has no such ref; objects_refused means the remote sent an object the check rejects. HTTPS uses the dispatching actor credential as git.push does; an absolute path or file:/// remote configured with slug=\"\" uses none. The transfer is bounded at 300 seconds. Durable receipt. Returns ref, sha, previous_sha, remote and receipt_id.",
+    visibility: Visibility::Verb,
+    category: VerbCategory::Commissive,
+    params: &[
+        REPO,
+        p("ref", "string", true, "A branch name, or pull/<N> for pull request N's head."),
+        p("expected_remote", "string", false, "Exact 40-hex SHA the fetched ref must have. Omission accepts whatever the remote holds; null is invalid_params."),
+        SESSION,
+    ],
+};
+
 pub(crate) const PR_OPEN: HandlerDef = HandlerDef {
     name: "git.pr_open",
     description: "Open a pull request after checking configured slug, visibility and exact platform head. Local mappings refuse remote_scheme before resolving credentials; PR verbs require HTTPS. Uses the dispatching actor credential: [git_write] actors.<actor>.credential_ref is resolved through credential_resolver (by default the login keychain item with that service name), never stored, and an unmapped actor or a failed resolver refuses actor_unmapped before any network call. The resolved token must belong to the actor configured platform_identity or the act refuses platform_identity_mismatch. Returns number, url, head_sha and receipt_id.",

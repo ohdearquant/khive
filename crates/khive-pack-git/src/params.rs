@@ -122,6 +122,12 @@ arguments!(PrMerge {
     session_id
 });
 arguments!(PrState { repo, number });
+arguments!(Fetch {
+    repo,
+    r#ref,
+    expected_remote,
+    session_id
+});
 arguments!(Init {
     repo,
     branch,
@@ -187,6 +193,7 @@ pub(crate) fn parse(verb: &str, params: Value) -> Result<Value, RuntimeError> {
         "git.pr_review" => decode::<PrReview>(verb, params),
         "git.pr_merge" => decode::<PrMerge>(verb, params),
         "git.pr_state" => decode::<PrState>(verb, params),
+        "git.fetch" => decode::<Fetch>(verb, params),
         "git.init" => decode::<Init>(verb, params),
         "git.checkout" => decode::<Checkout>(verb, params),
         "git.diff" => decode::<Diff>(verb, params),

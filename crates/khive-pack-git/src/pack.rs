@@ -124,7 +124,7 @@ impl PackRuntime for GitPack {
             "git.commit" => self.handle_commit(token, registry, params).await,
             "git.branch" => self.handle_local(token, registry, verb, params).await,
             "git.update_ref" => self.handle_local(token, registry, verb, params).await,
-            "git.push" | "git.pr_open" | "git.pr_review" | "git.pr_merge" => {
+            "git.push" | "git.fetch" | "git.pr_open" | "git.pr_review" | "git.pr_merge" => {
                 self.handle_remote(token, registry, verb, params).await
             }
             "git.init" | "git.checkout" | "git.diff" | "git.reconcile" => {

@@ -18,6 +18,9 @@ use crate::write_argv::{validate_message, validate_ref_name};
 mod checkout_batch;
 #[path = "local_git_checkout_reuse.rs"]
 mod checkout_reuse;
+#[path = "local_git_fetch.rs"]
+mod fetch;
+pub(crate) use fetch::{exact_ref, fetch_haves, fetch_refs, update_fetched_ref, FetchedRefUpdate};
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 /// Settings only local invocations carry, passed after `git_env::SHARED_SETTINGS`.
@@ -512,6 +515,13 @@ fn oid_output(bytes: &[u8]) -> Result<String> {
 fn checked_ref(reference: &str) -> Result<String> {
     validate_ref_name("ref", reference)
         .map_err(|error| LocalGitError::new("invalid_params", error.to_string()))?;
+    // The pack's own working refs are never an input to another verb.
+    if reference.starts_with("refs/khive/") {
+        return Err(LocalGitError::new(
+            "invalid_params",
+            "refs/khive/ names are reserved for the pack's own use",
+        ));
+    }
     Ok(format!("{reference}^{{commit}}"))
 }
 
@@ -699,18 +709,21 @@ pub(crate) async fn checkout_reusing(
     namespace: Option<&str>,
 ) -> Result<Checkout> {
     let program = rt.config().git_write.git_program();
-    let reference = checked_ref(reference)?;
+    let requested = reference;
+    let reference = checked_ref(requested)?;
     let mut filters = None;
-    let commit = oid_output(
-        &run_async_with_snapshot(
-            program,
-            repo,
-            &["rev-parse", "--verify", "--end-of-options", &reference],
-            None,
-            &mut filters,
-        )
-        .await?,
-    )?;
+    let resolved = run_async_with_snapshot(
+        program,
+        repo,
+        &["rev-parse", "--verify", "--end-of-options", &reference],
+        None,
+        &mut filters,
+    )
+    .await;
+    let commit = match resolved {
+        Ok(bytes) => oid_output(&bytes)?,
+        Err(error) => return Err(fetch::unresolved(program, repo, requested, error).await),
+    };
     if let Some(namespace) = namespace {
         if let Some(tree) = checkout_reuse::reusable_tree(rt, namespace, repo, &commit).await {
             return Ok(Checkout { commit, tree });
