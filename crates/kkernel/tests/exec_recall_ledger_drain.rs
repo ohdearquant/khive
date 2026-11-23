@@ -31,6 +31,11 @@ impl Fixture {
         let root = tempfile::Builder::new()
             .prefix("exec-recall-drain-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("exec-recall-drain-")
+                    .tempdir()
+            })
             .expect("isolated scratch directory");
         let path = root.path().to_path_buf();
         std::fs::create_dir_all(path.join("home")).unwrap();

@@ -16,6 +16,7 @@ fn fixture() -> TempDir {
     tempfile::Builder::new()
         .prefix("exec-log-")
         .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("exec-log-").tempdir())
         .expect("short isolated socket directory")
 }
 
