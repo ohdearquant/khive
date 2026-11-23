@@ -273,14 +273,28 @@ async fn wait_for_hydration_calls(store: &HydrationReadStore, expected: usize) {
     .expect("hydration backend call count should advance");
 }
 
-async fn wait_for_background_task_count(expected: usize) {
-    for _ in 0..10_000 {
-        if crate::background_task_count() == expected {
-            return;
+/// Hydration supervisors in flight, counted under their task name. The
+/// process-wide background counter is shared with every test in this binary
+/// that tracks work, and most of those run in parallel with this file, so a
+/// baseline read from it can move under these tests in either direction.
+fn hydrations_in_flight() -> usize {
+    crate::daemon::background_task_count_named("blob_hydration")
+}
+
+/// Wait for the hydration supervisors to return to `expected`, bounded by the
+/// clock rather than by a number of scheduler yields.
+async fn wait_for_hydrations_in_flight(expected: usize) {
+    let settled = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while hydrations_in_flight() != expected {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(crate::background_task_count(), expected);
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "hydration supervisors in flight stayed at {} instead of returning to {expected}",
+        hydrations_in_flight()
+    );
 }
 
 #[tokio::test]
@@ -305,7 +319,7 @@ async fn hydrator_rejects_an_invalid_maximum_before_admission_or_backend_work() 
 #[tokio::test]
 #[serial(background_tasks)]
 async fn zero_maximum_and_idle_portable_maximum_are_both_admissible() {
-    let before = crate::background_task_count();
+    let before = hydrations_in_flight();
     let empty_store = HydrationReadStore::immediate(Vec::new());
     let empty_hydrator = BlobHydrator::new(
         Arc::clone(&empty_store) as Arc<dyn BlobStore>,
@@ -333,13 +347,13 @@ async fn zero_maximum_and_idle_portable_maximum_are_both_admissible() {
         .expect("an idle minimum-size budget admits every valid maximum");
     assert_eq!(max.bytes(), b"bounded");
     drop(max);
-    wait_for_background_task_count(before).await;
+    wait_for_hydrations_in_flight(before).await;
 }
 
 #[tokio::test]
 #[serial(background_tasks)]
 async fn cancelling_a_waiter_retains_admission_until_backend_completion() {
-    let before = crate::background_task_count();
+    let before = hydrations_in_flight();
     let (store, first_started, first_release) = HydrationReadStore::blocking_first(b"x".to_vec());
     let hydrator = Arc::new(
         BlobHydrator::new(
@@ -358,7 +372,7 @@ async fn cancelling_a_waiter_retains_admission_until_backend_completion() {
             .await
     });
     first_started.await.expect("first backend read must start");
-    assert_eq!(crate::background_task_count(), before + 1);
+    assert_eq!(hydrations_in_flight(), before + 1);
 
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
@@ -384,13 +398,13 @@ async fn cancelling_a_waiter_retains_admission_until_backend_completion() {
     drop(verified);
     wait_for_hydration_calls(&store, 2).await;
 
-    wait_for_background_task_count(before).await;
+    wait_for_hydrations_in_flight(before).await;
 }
 
 #[tokio::test]
 #[serial(background_tasks)]
 async fn verified_blob_retains_its_weighted_lease_until_drop() {
-    let before = crate::background_task_count();
+    let before = hydrations_in_flight();
     let store = HydrationReadStore::immediate(b"x".to_vec());
     let hydrator = Arc::new(
         BlobHydrator::new(
@@ -426,13 +440,13 @@ async fn verified_blob_retains_its_weighted_lease_until_drop() {
         .expect("second hydration should succeed");
     assert_eq!(second.bytes(), b"x");
     drop(second);
-    wait_for_background_task_count(before).await;
+    wait_for_hydrations_in_flight(before).await;
 }
 
 #[tokio::test]
 #[serial(background_tasks)]
 async fn large_queued_reservation_is_not_overtaken_by_a_later_small_one() {
-    let before = crate::background_task_count();
+    let before = hydrations_in_flight();
     let store = HydrationReadStore::immediate(b"x".to_vec());
     let hydrator = BlobHydrator::new(
         Arc::clone(&store) as Arc<dyn BlobStore>,
@@ -477,13 +491,13 @@ async fn large_queued_reservation_is_not_overtaken_by_a_later_small_one() {
     assert_eq!(store.calls(), 2, "cancelled large waiter starts no read");
     drop(verified);
     drop(held);
-    wait_for_background_task_count(before).await;
+    wait_for_hydrations_in_flight(before).await;
 }
 
 #[tokio::test]
 #[serial(background_tasks)]
 async fn cancelling_while_queued_starts_no_backend_work() {
-    let before = crate::background_task_count();
+    let before = hydrations_in_flight();
     let store = HydrationReadStore::immediate(b"x".to_vec());
     let hydrator = Arc::new(
         BlobHydrator::new(
@@ -520,7 +534,7 @@ async fn cancelling_while_queued_starts_no_backend_work() {
     assert_eq!(hydrator.admission.available_permits(), 0);
     assert_eq!(store.calls(), 1, "queued cancellation must start no I/O");
     drop(first);
-    wait_for_background_task_count(before).await;
+    wait_for_hydrations_in_flight(before).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -530,7 +544,7 @@ async fn caller_deadline_drops_only_the_waiter_until_backend_completion() {
         return;
     }
 
-    let before = crate::background_task_count();
+    let before = hydrations_in_flight();
     let (store, first_started, first_release) = HydrationReadStore::blocking_first(b"x".to_vec());
     let hydrator = Arc::new(
         BlobHydrator::new(
@@ -557,7 +571,7 @@ async fn caller_deadline_drops_only_the_waiter_until_backend_completion() {
         error,
         RuntimeError::Storage(StorageError::Timeout { .. })
     ));
-    assert_eq!(crate::background_task_count(), before + 1);
+    assert_eq!(hydrations_in_flight(), before + 1);
 
     let second_hydrator = Arc::clone(&hydrator);
     let second_ref = content_ref.clone();
@@ -571,13 +585,13 @@ async fn caller_deadline_drops_only_the_waiter_until_backend_completion() {
     assert_eq!(verified.bytes(), b"x");
     drop(verified);
     wait_for_hydration_calls(&store, 2).await;
-    wait_for_background_task_count(before).await;
+    wait_for_hydrations_in_flight(before).await;
 }
 
 #[tokio::test]
 #[serial(background_tasks)]
 async fn distinct_hydrators_have_independent_admission_budgets() {
-    let before = crate::background_task_count();
+    let before = hydrations_in_flight();
     let (blocked_store, started, release) = HydrationReadStore::blocking_first(b"one".to_vec());
     let independent_store = HydrationReadStore::immediate(b"two".to_vec());
     let blocked = Arc::new(
@@ -612,13 +626,13 @@ async fn distinct_hydrators_have_independent_admission_budgets() {
 
     release.add_permits(1);
     drop(in_flight.await.unwrap().unwrap());
-    wait_for_background_task_count(before).await;
+    wait_for_hydrations_in_flight(before).await;
 }
 
 #[tokio::test]
 #[serial(background_tasks)]
 async fn typed_backend_failure_holds_then_releases_admission() {
-    let before = crate::background_task_count();
+    let before = hydrations_in_flight();
     let (store, started, release) = HydrationReadStore::blocking_first_error(b"recovered".to_vec());
     let hydrator = Arc::new(
         BlobHydrator::new(
@@ -655,13 +669,13 @@ async fn typed_backend_failure_holds_then_releases_admission() {
     assert_eq!(verified.bytes(), b"recovered");
     assert_eq!(store.calls(), 2);
     drop(verified);
-    wait_for_background_task_count(before).await;
+    wait_for_hydrations_in_flight(before).await;
 }
 
 #[tokio::test]
 #[serial(background_tasks)]
 async fn backend_panic_closes_the_reply_and_restores_admission() {
-    let before = crate::background_task_count();
+    let before = hydrations_in_flight();
     let (store, started, release) = HydrationReadStore::blocking_first_panic(b"recovered".to_vec());
     let hydrator = Arc::new(
         BlobHydrator::new(
@@ -680,12 +694,12 @@ async fn backend_panic_closes_the_reply_and_restores_admission() {
             .await
     });
     started.await.expect("panicking backend work must start");
-    assert_eq!(crate::background_task_count(), before + 1);
+    assert_eq!(hydrations_in_flight(), before + 1);
     release.add_permits(1);
 
     let error = panicking.await.unwrap().unwrap_err();
     assert!(matches!(error, RuntimeError::Internal(_)));
-    wait_for_background_task_count(before).await;
+    wait_for_hydrations_in_flight(before).await;
 
     let recovered = hydrator
         .hydrate_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
@@ -694,7 +708,7 @@ async fn backend_panic_closes_the_reply_and_restores_admission() {
     assert_eq!(recovered.bytes(), b"recovered");
     assert_eq!(store.calls(), 2);
     drop(recovered);
-    wait_for_background_task_count(before).await;
+    wait_for_hydrations_in_flight(before).await;
 }
 
 #[test]

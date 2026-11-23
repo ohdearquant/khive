@@ -242,6 +242,7 @@ mod golden_fixture {
 }
 
 #[tokio::test]
+#[serial_test::serial(background_tasks)]
 async fn manifest_v1_literal_bytes_and_reference_are_stable() {
     const GOLDEN: &[u8] = golden_fixture::BYTES;
     let dir = tempfile::tempdir().unwrap();
@@ -361,6 +362,7 @@ async fn store_publishes_at_byte_limit_and_refuses_over_limit_before_put() {
 }
 
 #[tokio::test]
+#[serial_test::serial(background_tasks)]
 async fn load_preserves_reference_schema_and_missing_entry_refusals() {
     let dir = tempfile::tempdir().unwrap();
     let rt = KhiveRuntime::new(RuntimeConfig {
