@@ -113,6 +113,7 @@ fn every_daemon_host_refuses_before_database_or_lock_files() {
         let dir = tempfile::Builder::new()
             .prefix("evh-")
             .tempdir_in("/tmp")
+            .or_else(|_| tempfile::Builder::new().prefix("evh-").tempdir())
             .unwrap();
         let root = dir.path().canonicalize().unwrap();
         let socket_name = "main.db.events.sock";
@@ -170,6 +171,7 @@ fn standalone_events_daemon_refuses_before_database_or_lock_files() {
     let dir = tempfile::Builder::new()
         .prefix("evd-")
         .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("evd-").tempdir())
         .unwrap();
     let root = dir.path().canonicalize().unwrap();
     let socket = root.join("s".repeat(capacity() - root.as_os_str().as_bytes().len() - 1));
@@ -214,6 +216,7 @@ fn boot_preflight_uses_effective_main_and_preserves_transport_exemptions() {
     let dir = tempfile::Builder::new()
         .prefix("evr-")
         .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("evr-").tempdir())
         .unwrap();
     let root = dir.path().canonicalize().unwrap();
     let long_main = root.join("m".repeat(capacity())).with_extension("db");
@@ -255,6 +258,7 @@ async fn public_builders_refuse_before_opening_any_backend() {
             let private = tempfile::Builder::new()
                 .prefix("evb-env-")
                 .tempdir_in("/tmp")
+                .or_else(|_| tempfile::Builder::new().prefix("evb-env-").tempdir())
                 .unwrap();
             for (key, _) in std::env::vars_os() {
                 if key.to_string_lossy().starts_with("KHIVE_") {
@@ -281,6 +285,7 @@ async fn public_builders_refuse_before_opening_any_backend() {
     let dir = tempfile::Builder::new()
         .prefix("evb-")
         .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("evb-").tempdir())
         .unwrap();
     let root = dir.path().canonicalize().unwrap();
     let main = root.join("m".repeat(capacity())).with_extension("db");
@@ -353,6 +358,7 @@ impl CallerFixture {
         let directory = tempfile::Builder::new()
             .prefix("evc-")
             .tempdir_in("/tmp")
+            .or_else(|_| tempfile::Builder::new().prefix("evc-").tempdir())
             .unwrap();
         let root = directory.path().canonicalize().unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -426,6 +432,7 @@ async fn public_forwarders_refuse_socket_length_without_recovery_time() {
             let directory = tempfile::Builder::new()
                 .prefix("evc-env-")
                 .tempdir_in("/tmp")
+                .or_else(|_| tempfile::Builder::new().prefix("evc-env-").tempdir())
                 .unwrap();
             std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
                 .unwrap();
