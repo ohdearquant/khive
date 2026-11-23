@@ -398,7 +398,7 @@ struct Receipt {
     cwd: String,
     env_keys: Vec<String>,
     // Caller keys whose value did not reach the child as given: not
-    // allow-listed, or HOME, which the server always replaces.
+    // allow-listed, or HOME or TMPDIR, which the server always replaces.
     env_dropped: Vec<String>,
     session_id: Option<String>,
     seq: Option<i64>,
@@ -1451,6 +1451,22 @@ async fn execute(
         return Ok(());
     }
     receipt.owned_run_dir = Some(run_dir.clone());
+    // The run's own temporary directory (ADR-181 Amendment 16): beside the run
+    // directory, so nothing in it is captured, private to this run, and
+    // removed with it by `cleanup`, which derives the same path.
+    let scratch = sandbox::scratch_dir(&run_dir);
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&scratch)
+            .map_err(|e| {
+                RuntimeError::Unconfigured(format!(
+                    "run temporary directory {}: {e}",
+                    scratch.display()
+                ))
+            })?;
+    }
     let capture_root = CaptureRoot::open(&run_dir).map_err(|error| {
         RuntimeError::Unconfigured(format!("open capture root {}: {error}", run_dir.display()))
     })?;
@@ -1484,19 +1500,21 @@ async fn execute(
     }));
     receipt.profile_ref = Some(profile_ref.as_str().to_string());
 
-    // Environment: caller values for allow-listed keys only, plus HOME.
-    // A caller key that does not pass, and a caller HOME (always replaced),
-    // is named on the receipt so the drop is visible to the caller.
+    // Environment: caller values for allow-listed keys only, plus HOME and
+    // TMPDIR. A caller key that does not pass, and a caller HOME or TMPDIR
+    // (always replaced), is named on the receipt so the drop is visible to the
+    // caller. TMPDIR is the run's own directory, never one runs share.
     let mut env: BTreeMap<String, String> = BTreeMap::new();
     let mut env_dropped: Vec<String> = Vec::new();
     for (k, v) in &req.env {
-        if k != "HOME" && cfg.env_keys.iter().any(|allowed| allowed == k) {
+        if k != "HOME" && k != "TMPDIR" && cfg.env_keys.iter().any(|allowed| allowed == k) {
             env.insert(k.clone(), v.clone());
         } else {
             env_dropped.push(k.clone());
         }
     }
     env.insert("HOME".into(), run_dir.to_string_lossy().to_string());
+    env.insert("TMPDIR".into(), scratch.to_string_lossy().to_string());
     receipt.env_keys = env.keys().cloned().collect();
     receipt.env_dropped = env_dropped;
 
@@ -1856,6 +1874,17 @@ fn cleanup(run_dir: &Path, profile_path: &Path, keep: bool) -> Vec<String> {
             failures.push(format!(
                 "remove profile {}: {error}",
                 profile_path.display()
+            ));
+        }
+    }
+    // The run's temporary directory holds no output, so it goes even when the
+    // run directory is kept.
+    let scratch = sandbox::scratch_dir(run_dir);
+    if let Err(error) = std::fs::remove_dir_all(&scratch) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            failures.push(format!(
+                "remove run temporary directory {}: {error}",
+                scratch.display()
             ));
         }
     }
