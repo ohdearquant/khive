@@ -181,7 +181,7 @@ async fn a_stale_expected_head_refuses_both_verbs_before_any_write() {
 }
 
 #[tokio::test]
-async fn a_head_that_moves_during_the_write_or_a_lost_reply_leaves_the_receipt_unknown() {
+async fn a_head_that_moves_during_the_write_leaves_the_receipt_unknown() {
     let f = Fixture::new(true, None).await;
     let n = f.open().await;
     f.remote.state.lock().unwrap().merge_race = Some(f.middle.clone());
@@ -193,14 +193,34 @@ async fn a_head_that_moves_during_the_write_or_a_lost_reply_leaves_the_receipt_u
     assert_eq!(receipt.disposition, Disposition::Unknown);
     assert_eq!(receipt.reason.as_deref(), Some("changed_head_mismatch"));
     assert_eq!(receipt.result["head_sha"], f.middle);
+}
 
-    let g = Fixture::new(true, None).await;
-    let n = g.open().await;
-    g.remote.state.lock().unwrap().lost_ack = true;
-    assert!(g.call(&g.actor, "git.pr_close", close(&g, n)).await.is_err());
-    let receipt = g.last(&g.actor).await;
+#[tokio::test]
+async fn a_lost_reply_to_close_leaves_the_receipt_unknown() {
+    let f = Fixture::new(true, None).await;
+    let n = f.open().await;
+    f.remote.state.lock().unwrap().lost_ack = true;
+    assert!(f.call(&f.actor, "git.pr_close", close(&f, n)).await.is_err());
+    let receipt = f.last(&f.actor).await;
     assert_eq!(receipt.disposition, Disposition::Unknown);
-    assert_eq!(g.remote.pr(n)["state"], "closed");
+    assert_eq!(f.remote.pr(n)["state"], "closed");
+}
+
+#[tokio::test]
+async fn a_second_fixture_beside_a_live_one_fails_at_once() {
+    // Each fixture holds the environment lock until it drops, so a second one built beside it
+    // would wait for its own test forever; the fixture refuses that at once instead.
+    let f = Fixture::new(true, None).await;
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::spawn(async {
+            Fixture::new(true, None).await;
+        }),
+    )
+    .await;
+    drop(f);
+    let joined = second.expect("a second fixture must refuse at once, not wait on the lock");
+    assert!(joined.unwrap_err().is_panic());
 }
 
 #[tokio::test]

@@ -300,6 +300,12 @@ impl RemoteTransport for Recording {
     }
 }
 
+thread_local! {
+    /// Whether a `Fixture` built on this thread is still alive. Each one holds `ENV_MUTEX` until
+    /// it drops, so a second one built beside it would wait forever for a lock its own test holds.
+    static FIXTURE_ALIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 struct Fixture {
     _env_guard: tokio::sync::MutexGuard<'static, ()>,
     dir: tempfile::TempDir,
@@ -333,6 +339,11 @@ impl Fixture {
         merge_refusals: &[&str],
         program: impl FnOnce() -> Option<PathBuf>,
     ) -> Self {
+        assert!(
+            !FIXTURE_ALIVE.with(std::cell::Cell::get),
+            "a second Fixture would wait forever for the environment lock the first one holds; \
+             drop the first before building another"
+        );
         let env_guard = crate::cache::ENV_MUTEX.lock().await;
         let program = program();
         let dir = tempfile::tempdir().unwrap();
@@ -476,6 +487,7 @@ impl Fixture {
             registry,
             remote,
         };
+        FIXTURE_ALIVE.with(|alive| alive.set(true));
         for actor in [&f.actor, &f.reviewer, &f.alias, &f.third] {
             for verb in [
                 "git.push",
@@ -586,6 +598,12 @@ impl Fixture {
         assert_eq!(git(&self.repo, &["show-ref"]), local);
         assert_eq!(remote_head(&self.remote.bare), remote);
         receipt
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        FIXTURE_ALIVE.with(|alive| alive.set(false));
     }
 }
 
