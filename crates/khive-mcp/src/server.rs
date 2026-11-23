@@ -108,6 +108,7 @@ mod bridge;
 mod computer_bridge;
 mod computer_catalog;
 mod computer_client;
+mod computer_http;
 #[cfg(all(test, unix))]
 mod computer_pipe_tests;
 mod computer_routing;
