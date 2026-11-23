@@ -6840,9 +6840,12 @@ async fn public_client_refuses_missing_pack_dependency_before_launch() {
     ] {
         std::env::remove_var(key);
     }
+    // /tmp keeps the socket path short; where /tmp is closed, as in a
+    // sandboxed run, the process's own temporary directory takes its place.
     let directory = tempfile::Builder::new()
         .prefix("pack-preflight-")
         .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("pack-preflight-").tempdir())
         .unwrap();
     let root = directory.path().canonicalize().unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();

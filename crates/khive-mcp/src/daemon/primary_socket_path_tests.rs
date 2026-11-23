@@ -122,9 +122,12 @@ fn files(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
 }
 
 fn directory() -> tempfile::TempDir {
+    // /tmp keeps socket paths short; where /tmp is closed, as in a sandboxed
+    // run, the process's own temporary directory takes its place.
     let directory = tempfile::Builder::new()
         .prefix("primary-path-")
         .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("primary-path-").tempdir())
         .unwrap();
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     directory

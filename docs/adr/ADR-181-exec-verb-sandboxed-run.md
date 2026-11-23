@@ -1789,3 +1789,49 @@ do not bound it. A quota on its volume does.
     share only a text prefix.
 76. **Identity.** Without a configured cache root `exec.identity` reports an empty `cache_roots` and the digest of
     the empty list. With one it reports the root and a different digest. This is checked without a sandbox.
+
+## Amendment 16 (2026-11-22): the run's own temporary directory and unix sockets inside a run
+
+**Status: Accepted 2026-11-22.** Changes every run's profile, so the template digest changes, and every receipt's
+`env_keys` gains `TMPDIR`. It replaces the sentence of Amendment 15 item 2 that says there is still no network: a run
+now has unix-domain sockets under two directories and nothing else.
+
+### Context
+
+The profile refuses every network operation, and binding or connecting a unix-domain socket is one. A test suite that
+starts a server and its client in one process tree, as the daemon and forwarding tests do, therefore fails in a run
+for that reason alone, and its result says nothing about the code. A run also had no temporary directory of its own:
+`TMPDIR` was whatever the caller passed, and on a shared host that is a directory every run writes.
+
+### Decision
+
+1. **Temporary directory.** Before the launch the run verb creates the run directory's sibling `<run id>.tmp` in the
+   exec root, mode 0700, and sets `TMPDIR` to it after the caller's environment is applied, as it sets `HOME`. A
+   caller's `TMPDIR` is never passed; it is named in `env_dropped`. The directory is outside the run directory, so
+   nothing written there is captured. It is removed with the run, also when the run directory is kept, because it
+   holds no output. A failure to create it fails the run before the launch, with the path in the reason.
+2. **Profile.** The temporary directory is granted what the run directory is granted for files: `file-read*`,
+   `file-read-metadata` and `file-write*`. It is not granted `file-map-executable`, so code is not loaded from it.
+3. **Sockets.** One rule is added:
+   `(allow network-bind network-outbound (subpath <run directory>) (subpath <temporary directory>))`. Seatbelt matches
+   a unix-domain socket's bind and connect by its path, so a run may bind a socket under either directory and connect
+   to a socket there. A path filter cannot match an inet address, so TCP and UDP stay refused, loopback included, and
+   so does every socket outside the two directories, the khive daemon's among them. No `network-inbound` rule is
+   added. Both paths are canonical (the exec root is resolved at load and the names come from the run id), so no
+   `/tmp` spelling opens the whole of `/private/tmp`. Read roots and cache roots take no socket.
+4. **Unchanged.** Networked runs (Amendments 13 and 14), read roots, cache roots and the version-control and `never`
+   denials of Amendment 9 are as before.
+
+### Acceptance
+
+77. **Profile, network.** The one network rule names exactly the run directory and the temporary directory. No inet
+    term, no inbound rule, no `/tmp` spelling and no read or cache root appears in it.
+78. **Profile, writes.** The write rule names the run directory and the temporary directory, then each cache root.
+79. **Run.** `TMPDIR` is `<run id>.tmp` and writable; a file written there leaves no changed and no undeclared path
+    and the output tree unchanged; a caller's `TMPDIR` is named in `env_dropped`; after the run the directory is gone
+    and the exec root is empty.
+80. **Seatbelt.** Under the rendered profile a socket binds and takes a connection inside the run directory and
+    inside the temporary directory (control). A bind outside both is refused, including under a sibling whose name
+    shares the run directory's text prefix. A connect to a listener made outside the sandbox is refused, one of them
+    standing for the daemon's socket. A loopback connect is refused. Each refusal has a control that runs the same
+    command outside the sandbox and succeeds.

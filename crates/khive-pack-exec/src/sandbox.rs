@@ -6,8 +6,12 @@
 //! Xcode Python framework: the dyld shared cache under `/System`, `/usr/lib`,
 //! `/Library`, `/private/var/db`, `/private/etc`, `/dev`, and the root
 //! directory itself, which dyld reads to resolve firmlinks). Writes are
-//! allowed only under the run directory, the operator's `[exec] cache_roots`,
-//! and to `/dev/null`. No network operation is allowed at all.
+//! allowed only under the run directory, the run's own temporary directory,
+//! the operator's `[exec] cache_roots`, and to `/dev/null`. The only network
+//! operations allowed are binding and connecting unix-domain sockets whose
+//! paths lie under the run directory or the run's temporary directory; a path
+//! filter cannot match an inet address, so no TCP or UDP endpoint, loopback
+//! included, is reachable.
 //!
 //! A cache root is a directory every run may read, write and load code from,
 //! and that outlives the run: a compiler's package cache and build output
@@ -232,16 +236,27 @@ pub fn cache_roots_digest(cache_roots: &[PathBuf]) -> String {
     digest_hex(&read_roots_serialization(cache_roots))
 }
 
+/// The run's own temporary directory: beside the run directory and named for
+/// the run, so nothing written there is captured into the output tree. The run
+/// verb creates it before the launch, points `TMPDIR` at it and removes it
+/// with the run (ADR-181 Amendment 16). A sibling of a canonical run directory
+/// is itself canonical.
+pub fn scratch_dir(run_dir: &Path) -> PathBuf {
+    run_dir.with_extension("tmp")
+}
+
 /// Render the seatbelt profile for one run. `run_dir` must already be
 /// canonical; both the canonical form and any `/tmp` alias resolve to it
-/// because seatbelt matches canonical paths. With no cache roots the profile
-/// is the one rendered before cache roots existed, byte for byte.
+/// because seatbelt matches canonical paths. The run's temporary directory,
+/// [`scratch_dir`], is granted what the run directory is granted, and the two
+/// are the only places a unix-domain socket may be bound or connected to.
 pub fn render_profile(
     run_dir: &Path,
     read_roots: &[PathBuf],
     cache_roots: &[PathBuf],
     never: &[PathBuf],
 ) -> String {
+    let scratch = scratch_dir(run_dir);
     let mut reads: Vec<String> = SYSTEM_READ_ROOTS
         .iter()
         .map(|p| format!("(subpath {})", quote(Path::new(p))))
@@ -250,6 +265,7 @@ pub fn render_profile(
         reads.push(format!("(subpath {})", quote(root)));
     }
     reads.push(format!("(subpath {})", quote(run_dir)));
+    reads.push(format!("(subpath {})", quote(&scratch)));
     // Metadata is a read too. Permit it for the same trees and their exact
     // ancestor directories, which dyld and pathname traversal must inspect.
     // A bare file-read-metadata allowance would expose every host path.
@@ -275,8 +291,13 @@ pub fn render_profile(
         maps.push(format!("(subpath {})", quote(root)));
     }
     let run = format!("(subpath {})", quote(run_dir));
+    let scratch = format!("(subpath {})", quote(&scratch));
     maps.push(run.clone());
-    let mut writes = vec![run];
+    // Unix-domain sockets are matched by the path filters below and by
+    // nothing else: an inet address has no path, so this rule opens no TCP
+    // or UDP endpoint, loopback included.
+    let sockets = format!("{run} {scratch}");
+    let mut writes = vec![run, scratch];
     for root in cache_roots {
         writes.push(format!("(subpath {})", quote(root)));
     }
@@ -304,7 +325,8 @@ pub fn render_profile(
          (allow file-read* file-test-existence (literal \"/\") {reads})\n\
          (allow file-map-executable {maps})\n\
          (allow file-write* {writes})\n\
-         (allow file-write-data (literal \"/dev/null\"))\n",
+         (allow file-write-data (literal \"/dev/null\"))\n\
+         (allow network-bind network-outbound {sockets})\n",
         denies = denies.join(" "),
         reads = reads.join(" "),
         metadata = metadata.join(" "),

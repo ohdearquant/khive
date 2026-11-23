@@ -1654,6 +1654,43 @@ async fn run_keeps_cache_root_writes_between_runs_and_out_of_the_output_tree() {
     assert!(!unlisted.exists());
 }
 
+/// ADR-181 Amendment 16 acceptance 79: the run's TMPDIR is its own directory,
+/// writable, outside the output tree, replacing any caller value, and gone
+/// when the run is.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_gets_its_own_temporary_directory_outside_the_output_tree() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let tree = f.tree(&[("input", b"in", 644)]).await;
+    let script =
+        "printf kept > \"$TMPDIR/scratch\" && test -f \"$TMPDIR/scratch\" && printf %s \"$TMPDIR\"";
+    let out = f
+        .call(
+            "exec.run",
+            json!({
+                "tree": tree, "tool": "sh", "args": ["-c", script], "actor": "local",
+                "env": { "TMPDIR": "/caller-tmp" },
+                "session_id": "tmp-1"
+            }),
+        )
+        .await;
+    let receipt = &out["receipt"];
+    assert_eq!(receipt["success"], true, "{receipt}");
+    assert_eq!(receipt["changed"], json!([]), "{receipt}");
+    assert_eq!(receipt["undeclared_changes"], json!([]), "{receipt}");
+    assert_eq!(receipt["tree_out"], json!(tree), "{receipt}");
+    assert_eq!(receipt["env_dropped"], json!(["TMPDIR"]), "{receipt}");
+    let tmpdir = f.blob_text(&receipt["stdout_ref"]).await;
+    let run_id = receipt["id"].as_str().expect("run id");
+    assert!(tmpdir.ends_with(&format!("/{run_id}.tmp")), "{tmpdir}");
+    assert!(
+        !std::path::Path::new(&tmpdir).exists(),
+        "{tmpdir} must be removed with the run"
+    );
+    assert!(root_is_empty(&f));
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn run_captures_output_changes_and_receipt() {
@@ -1694,7 +1731,7 @@ async fn run_captures_output_changes_and_receipt() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert_eq!(keys, vec!["E1_ALLOWED", "HOME"]);
+    assert_eq!(keys, vec!["E1_ALLOWED", "HOME", "TMPDIR"]);
     // The caller's unlisted key and its own HOME are named, not dropped in silence.
     assert_eq!(receipt["env_dropped"], json!(["DROP", "HOME"]), "{receipt}");
     let ops: std::collections::BTreeMap<String, String> = receipt["changed"]
