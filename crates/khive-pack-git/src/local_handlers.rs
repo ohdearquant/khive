@@ -811,6 +811,11 @@ impl GitPack {
                     // without resolving a credential or touching the platform.
                     return Ok(json!({"receipt":prior.to_value()}));
                 }
+                if prior.verb == "git.fetch" {
+                    // A fetch is settled by reading its destination ref, and it is safe to run
+                    // again; an unknown fetch receipt stays unknown here.
+                    return Ok(json!({"receipt":prior.to_value()}));
+                }
                 if !matches!(
                     prior.verb.as_str(),
                     "git.branch" | "git.commit" | "git.update_ref"
@@ -891,6 +896,7 @@ impl GitPack {
                 | "git.commit"
                 | "git.update_ref"
                 | "git.push"
+                | "git.fetch"
                 | "git.pr_open"
                 | "git.pr_review"
                 | "git.pr_merge"

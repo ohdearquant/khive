@@ -5,7 +5,7 @@
 
 /// Revision of the reviewed classification contract, included in policy identity.
 /// Bump whenever a classification or the allowed-read contract changes.
-pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v28";
+pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v29";
 
 /// Strongest caller-requested effect of a reviewed operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,6 +117,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("git.commit", OperationAccess::Write),
     ("git.diff", OperationAccess::Write),
     ("git.digest", OperationAccess::Write),
+    ("git.fetch", OperationAccess::Write),
     ("git.gates", OperationAccess::Read),
     ("git.ingest_cursor", OperationAccess::Read),
     ("git.init", OperationAccess::Write),

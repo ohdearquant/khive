@@ -219,6 +219,33 @@
     ],
     "additionalProperties": false
   },
+  "git.fetch": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "ref": {
+        "type": "string",
+        "minLength": 1,
+        "description": "A branch name, or pull/<N> for a pull request's head."
+      },
+      "expected_remote": {
+        "type": "string",
+        "pattern": "^[a-fA-F0-9]{40}$"
+      },
+      "session_id": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "required": [
+      "repo",
+      "ref"
+    ],
+    "additionalProperties": false
+  },
   "git.checkout": {
     "type": "object",
     "properties": {

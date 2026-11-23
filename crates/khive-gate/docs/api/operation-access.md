@@ -100,6 +100,10 @@ request's state, checks, statuses and reviews from the platform with the caller'
 credential and writes no receipt. Like the other gated git reads it dispatches
 `tool.check`, so its policy decision row is retained under admission pressure.
 
+Revision `domain-effects-v29` classifies `git.fetch` as `Write`: it moves one
+remote-tracking or fetched pull request ref in the clone by compare-and-swap and
+writes a durable receipt, so it is admitted as a write like `git.update_ref`.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -197,6 +201,7 @@ credential and writes no receipt. Like the other gated git reads it dispatches
 | `git.commit`                      | Write  | Verb       | [khive-pack-git/src/vocab.rs](../../../khive-pack-git/src/vocab.rs#L157)                                |
 | `git.diff`                        | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L37)                     |
 | `git.digest`                      | Write  | Verb       | [khive-pack-git/src/vocab.rs](../../../khive-pack-git/src/vocab.rs#L106)                                |
+| `git.fetch`                       | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs)                       |
 | `git.gates`                       | Read   | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L57)                     |
 | `git.ingest_cursor`               | Read   | Verb       | [khive-pack-git/src/vocab.rs](../../../khive-pack-git/src/vocab.rs#L84)                                 |
 | `git.init`                        | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L96)                     |
