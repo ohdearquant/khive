@@ -598,8 +598,13 @@ impl GitPack {
                 Ok(result)
             }
             "git.checkout" => {
-                let result =
-                    local_git::checkout(self.runtime(), repo, required(params, "ref")?).await?;
+                let result = local_git::checkout_reusing(
+                    self.runtime(),
+                    repo,
+                    required(params, "ref")?,
+                    Some(&receipt.namespace),
+                )
+                .await?;
                 Ok(json!({"commit":result.commit, "tree":result.tree}))
             }
             "git.diff" => {
