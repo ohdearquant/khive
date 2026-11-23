@@ -908,3 +908,75 @@ This amendment adds one ledger table with its trigger and backfill, and introduc
 receipt mutation, operator-wide read, snapshot ownership,
 new backend opener or change to the git write/reconciliation protocol. Implementation and native
 validation remain pending while this amendment is Proposed.
+
+## Amendment 14 (2026-11-22): a tree commit with a second parent
+
+**Status**: Accepted (2026-11-22, implemented by `git.commit`'s `merge_parent`).
+
+### The gap
+
+A caller that works only through trees takes its base branch in by computing the merged tree
+elsewhere and committing it with `git.commit`. That commit has one parent, the branch head, so git
+still records the branch as forked from the old base. When the base later gains the same content
+through a squash merge, a platform three-way merge of the branch against the base starts from that
+old merge base, sees both sides add the same files and edit neighbouring lines, and reports a
+conflict that the branch's own tree does not contain. The only remedy today is a new branch from the
+current base carrying one commit of the merged tree, which also means a new pull request.
+
+"Known rough edges" keeps local merge out of scope, as ADR-108 does. That stands for computing a
+merge: khive still runs no merge, rebase or conflict resolution. This amendment adds recording one:
+the caller supplies the resolved tree and names the commit it merged.
+
+### A14.1 `merge_parent`
+
+```
+git.commit(repo, branch, tree, message, expected_head, merge_parent?, session_id?)
+    -> {repo, sha, parent, merge_parent?, tree, ref, receipt_id}
+```
+
+- Tree form only. The paths form refuses `merge_parent` with `invalid_params`, as it refuses every
+  key outside its list.
+- 40 hex, normalized to lowercase like `expected_head`. An explicit null, a short or non-hex value and
+  the zero object id refuse `invalid_params`.
+- It must name an existing commit object in the repository; an unknown id or a tree id refuses
+  `invalid_params`.
+- It must be the current tip of a remote-tracking ref: `for-each-ref --points-at <merge_parent>
+  refs/remotes` lists at least one ref, or the call refuses `merge_parent_unpublished`. A commit that
+  is only reachable from a remote-tracking ref, or only the tip of a local branch, refuses. The second
+  side of the merge is then exactly what a remote already holds, so a push of the merge publishes no
+  commit beyond the ones made on the branch through this verb, and every check that reads what a push
+  publishes (commit dates, commit text, added lines) keeps its meaning. A commit made through khive
+  and not yet pushed cannot enter as a second parent.
+- It must not already be in the history of `expected_head` (`merge-base --is-ancestor`), or the call
+  refuses `merge_parent_already_merged`. That covers `merge_parent` equal to `expected_head`.
+- `expected_head` stays the first parent, as `git merge` records it, so first-parent history and a
+  diff against `<sha>^1` show the branch's own line, including what the caller resolved by hand. A
+  reader that scans what a merge commit changed diffs it against its first parent; a combined diff
+  omits every hunk that took one side whole.
+- The checks run after the expected-head compare and before the actor's credential is resolved or
+  any tree object or commit is written. A refusal leaves every ref unchanged and is receipted like the
+  expected-head refusal.
+- The result and the receipt's inputs carry `merge_parent` only on a two-parent commit. A one-parent
+  commit's result is unchanged.
+- The tree is not checked against the two parents. Whether it is a correct merge is the caller's
+  claim, as the tree of a one-parent commit already is.
+- `git.reconcile` is unchanged: it settles the commit by its marker and its reachability, neither of
+  which depends on the parent count.
+
+### Acceptance
+
+1. **The commit.** With the second parent the tip of `refs/remotes/origin/main`, the new commit's
+   parents read `expected_head` then `merge_parent`, the branch moves to it, its tree equals the
+   manifest, and the result and the receipt carry `merge_parent`. A following one-parent commit's
+   result has no `merge_parent` field.
+2. **Published tips only.** The same commit as the tip of a local branch only refuses
+   `merge_parent_unpublished`; reachable from a remote-tracking ref without being its tip refuses the
+   same. In both, every ref is unchanged and no credential is resolved. Control: once the commit is a
+   remote-tracking tip, the identical call commits.
+3. **Shape.** Null, short, zero, unknown and tree-id values refuse `invalid_params`; `expected_head`
+   itself refuses `merge_parent_already_merged`; the paths form with `merge_parent` refuses
+   `invalid_params`.
+
+Mutation expectation: removing the remote-tracking tip check makes both refusals in arm 2 fail,
+because those calls then commit, while arms 1 and 3 stay green. That pair is what shows the check is
+load-bearing.

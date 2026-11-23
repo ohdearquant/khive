@@ -124,6 +124,10 @@
         "type": "string",
         "pattern": "^[a-fA-F0-9]{40}$"
       },
+      "merge_parent": {
+        "type": "string",
+        "pattern": "^[a-fA-F0-9]{40}$"
+      },
       "session_id": {
         "type": "string",
         "minLength": 1
@@ -160,6 +164,18 @@
               }
             ]
           }
+        }
+      },
+      {
+        "if": {
+          "required": [
+            "merge_parent"
+          ]
+        },
+        "then": {
+          "required": [
+            "tree"
+          ]
         }
       }
     ]

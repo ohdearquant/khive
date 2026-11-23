@@ -163,6 +163,7 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 17] = [
             crate::local_vocab::BRANCH,
             crate::local_vocab::TREE,
             crate::local_vocab::EXPECTED_HEAD,
+            crate::local_vocab::MERGE_PARENT,
             crate::local_vocab::SESSION,
             ParamDef {
                 name: "repo",

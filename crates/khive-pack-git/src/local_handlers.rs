@@ -137,6 +137,7 @@ fn validate_operation(verb: &str, params: &Value) -> Result<(), Failure> {
             "tree",
             "message",
             "expected_head",
+            "merge_parent",
             "session_id",
         ],
         "git.reconcile" => &["receipt"],
@@ -211,6 +212,9 @@ fn validate_operation(verb: &str, params: &Value) -> Result<(), Failure> {
             validate_message(required(params, "message")?)
                 .map_err(|_| Failure::refused("invalid_params"))?;
             oid(required(params, "expected_head")?)?;
+            if let Some(merge_parent) = optional(params, "merge_parent")? {
+                oid(merge_parent)?;
+            }
         }
         _ => {}
     }
@@ -223,7 +227,7 @@ fn safe_inputs(verb: &str, params: &Value) -> Value {
         "git.checkout" => &["ref"],
         "git.branch" => &["name", "from", "expected"],
         "git.update_ref" => &["branch", "to", "expected", "reason"],
-        "git.commit" => &["branch", "tree", "message", "expected_head"],
+        "git.commit" => &["branch", "tree", "message", "expected_head", "merge_parent"],
         "git.reconcile" => &["receipt"],
         "git.init" => &["branch"],
         _ => &[],
@@ -733,6 +737,16 @@ impl GitPack {
                 {
                     return Err(Failure::refused("expected_head_mismatch"));
                 }
+                let merge_parent = optional(params, "merge_parent")?.map(str::to_ascii_lowercase);
+                if let Some(merge_parent) = merge_parent.as_deref() {
+                    local_git::verify_merge_parent(
+                        self.runtime().config().git_write.git_program(),
+                        repo,
+                        merge_parent,
+                        &expected,
+                    )
+                    .await?;
+                }
                 let config = &self.runtime().config().git_write;
                 let actor = match credentials::resolve_actor(config, &receipt.actor).await {
                     Ok(actor) => actor,
@@ -750,13 +764,18 @@ impl GitPack {
                     repo,
                     &git_tree,
                     &expected,
+                    merge_parent.as_deref(),
                     required(params, "message")?,
                     &actor.name,
                     &actor.email,
                 )
                 .await?;
-                let result = json!({"repo":repo.display().to_string(), "sha":sha, "parent":expected,
+                let mut result = json!({"repo":repo.display().to_string(), "sha":sha, "parent":expected,
                     "tree":tree, "ref":format!("refs/heads/{branch}"), "receipt_id":receipt.id});
+                // Present only on a two-parent commit, so a one-parent result is unchanged.
+                if let Some(merge_parent) = &merge_parent {
+                    result["merge_parent"] = json!(merge_parent);
+                }
                 receipt.result = result.clone();
                 // The candidate SHA is durable before update-ref can have an effect.
                 receipts::persist(self.runtime(), receipt).await?;

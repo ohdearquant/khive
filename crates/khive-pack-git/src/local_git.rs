@@ -869,17 +869,22 @@ pub(crate) async fn write_manifest_tree(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_commit_sync(
     program: &Path,
     repo: &Path,
     git_tree: &str,
     parent: &str,
+    merge_parent: Option<&str>,
     message: &str,
     author_name: &str,
     author_email: &str,
 ) -> Result<String> {
     validate_oid(git_tree, "git tree")?;
     validate_oid(parent, "expected_head")?;
+    if let Some(merge_parent) = merge_parent {
+        validate_oid(merge_parent, "merge_parent")?;
+    }
     validate_message(message)
         .map_err(|error| LocalGitError::new("invalid_params", error.to_string()))?;
     for (field, value) in [("author name", author_name), ("author email", author_email)] {
@@ -894,21 +899,30 @@ fn create_commit_sync(
             ));
         }
     }
+    let mut argv = vec!["commit-tree", git_tree, "-p", parent];
+    if let Some(merge_parent) = merge_parent {
+        // The branch head stays the first parent, as `git merge` records it, so
+        // first-parent history and a diff against `^1` read the branch's own line.
+        argv.extend(["-p", merge_parent]);
+    }
+    argv.extend(["-m", message]);
     oid_output(&run_git(
         program,
         repo,
-        &["commit-tree", git_tree, "-p", parent, "-m", message],
+        &argv,
         None,
         Some((author_name, author_email)),
         false,
     )?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_commit(
     program: &Path,
     repo: &Path,
     git_tree: &str,
     parent: &str,
+    merge_parent: Option<&str>,
     message: &str,
     author_name: &str,
     author_email: &str,
@@ -917,6 +931,7 @@ pub(crate) async fn create_commit(
     let repo = repo.to_path_buf();
     let git_tree = git_tree.to_string();
     let parent = parent.to_string();
+    let merge_parent = merge_parent.map(str::to_string);
     let message = message.to_string();
     let author_name = author_name.to_string();
     let author_email = author_email.to_string();
@@ -926,10 +941,108 @@ pub(crate) async fn create_commit(
             &repo,
             &git_tree,
             &parent,
+            merge_parent.as_deref(),
             &message,
             &author_name,
             &author_email,
         )
+    })
+    .await
+}
+
+fn verify_merge_parent_sync(
+    program: &Path,
+    repo: &Path,
+    merge_parent: &str,
+    first_parent: &str,
+) -> Result<()> {
+    validate_oid(merge_parent, "merge_parent")?;
+    if merge_parent == ZERO_OID {
+        return Err(LocalGitError::new(
+            "invalid_params",
+            "merge_parent must not be the zero object id",
+        ));
+    }
+    let kind = run_git(
+        program,
+        repo,
+        &["cat-file", "-t", merge_parent],
+        None,
+        None,
+        false,
+    )
+    .map_err(|error| {
+        if error.code() == "git_failed" {
+            LocalGitError::new(
+                "invalid_params",
+                "merge_parent must identify an existing commit",
+            )
+        } else {
+            error
+        }
+    })?;
+    if kind != b"commit\n" {
+        return Err(LocalGitError::new(
+            "invalid_params",
+            "merge_parent must identify a commit object",
+        ));
+    }
+    // The second parent must already be what a remote holds, so a push of the
+    // merge publishes no commit except the ones made on this branch, and every
+    // gate that reads what a push publishes keeps its meaning.
+    let tips = run_git(
+        program,
+        repo,
+        &[
+            "for-each-ref",
+            "--points-at",
+            merge_parent,
+            "--format=%(refname)",
+            "refs/remotes",
+        ],
+        None,
+        None,
+        false,
+    )?;
+    if tips.iter().all(u8::is_ascii_whitespace) {
+        return Err(LocalGitError::new(
+            "merge_parent_unpublished",
+            "merge_parent must be the current tip of a remote-tracking ref",
+        ));
+    }
+    let merged = run_git_output(
+        program,
+        repo,
+        &["merge-base", "--is-ancestor", merge_parent, first_parent],
+        None,
+        None,
+        false,
+        Some(1),
+    )?;
+    if merged.exit_code == 0 {
+        return Err(LocalGitError::new(
+            "merge_parent_already_merged",
+            "merge_parent is already in the history of expected_head",
+        ));
+    }
+    Ok(())
+}
+
+/// Checks a tree commit's optional second parent before any receipt or object
+/// is written: an existing commit, the tip of a remote-tracking ref, and not
+/// already in the first parent's history.
+pub(crate) async fn verify_merge_parent(
+    program: &Path,
+    repo: &Path,
+    merge_parent: &str,
+    first_parent: &str,
+) -> Result<()> {
+    let program = program.to_path_buf();
+    let repo = repo.to_path_buf();
+    let merge_parent = merge_parent.to_string();
+    let first_parent = first_parent.to_string();
+    blocking("merge-parent", false, move || {
+        verify_merge_parent_sync(&program, &repo, &merge_parent, &first_parent)
     })
     .await
 }
