@@ -96,6 +96,10 @@ fn store_monthly_anchor(properties: &mut Value, repeat: Option<&str>, trigger_at
 /// parsed request so callers can inspect verb names without re-parsing.
 fn validate_action(action: &str) -> Result<khive_request::ParsedRequest, RuntimeError> {
     khive_request::parse_request(action).map_err(|e| {
+        // The parser quotes caller text (a bareword value, for one), so its
+        // message is masked like every other refusal that carries caller input.
+        let e = e.to_string();
+        let e = mask_for_redaction_surface(RedactionSurface::GateProbe, &e);
         RuntimeError::InvalidInput(format!(
             "schedule.action: invalid DSL ({e}); \
              provide a valid verb call (e.g. \"schedule.remind(content=\\\"hello\\\")\")"
