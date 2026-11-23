@@ -1793,8 +1793,11 @@ do not bound it. A quota on its volume does.
 ## Amendment 16 (2026-11-22): the run's own temporary directory and unix sockets inside a run
 
 **Status: Accepted 2026-11-22.** Changes every run's profile, so the template digest changes, and every receipt's
-`env_keys` gains `TMPDIR`. It replaces the sentence of Amendment 15 item 2 that says there is still no network: a run
-now has unix-domain sockets under two directories and nothing else.
+`env_keys` gains `TMPDIR`. It replaces three passages of Amendment 15: item 2's sentence that there is still no
+network; acceptance 68, "The write rule names the run directory alone", which acceptance 78 replaces; and the last
+clause of acceptance 69, "and no network operation appears", which acceptance 77 replaces. Decision step 3's "no
+network" and Acceptance 4 now read: TCP and UDP stay refused, loopback included, and a unix-domain socket is allowed
+under the run directory and the run's temporary directory and nowhere else.
 
 ### Context
 
@@ -1830,8 +1833,14 @@ for that reason alone, and its result says nothing about the code. A run also ha
 79. **Run.** `TMPDIR` is `<run id>.tmp` and writable; a file written there leaves no changed and no undeclared path
     and the output tree unchanged; a caller's `TMPDIR` is named in `env_dropped`; after the run the directory is gone
     and the exec root is empty.
-80. **Seatbelt.** Under the rendered profile a socket binds and takes a connection inside the run directory and
-    inside the temporary directory (control). A bind outside both is refused, including under a sibling whose name
-    shares the run directory's text prefix. A connect to a listener made outside the sandbox is refused, one of them
-    standing for the daemon's socket. A loopback connect is refused. Each refusal has a control that runs the same
-    command outside the sandbox and succeeds.
+80. **Seatbelt.** A connect is judged by delivery: the listener writes what it receives to a file and the arm reads
+    its token back, because `nc -U -z` exits 1 against a live unix listener on macOS. Under the rendered profile a
+    sandboxed listener and a sandboxed client deliver a token inside the run directory and inside the temporary
+    directory (control). A bind outside both is refused, including under a sibling whose name shares the run
+    directory's text prefix. A sandboxed client's token does not reach a listener made outside the sandbox, one of
+    them standing for the daemon's socket; nor does it through a symbolic link or a hard link inside the run
+    directory that names that socket, each made outside the sandbox. A hard link to that socket made from inside the
+    sandbox is refused. A bind through a directory link inside the run directory that points outside leaves no
+    socket there. A loopback connect is refused. Each refusal has a control that runs the same command outside the
+    sandbox and succeeds: the same token arrives by the same path, the same link is made, the same bind leaves its
+    socket.

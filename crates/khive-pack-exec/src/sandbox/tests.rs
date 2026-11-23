@@ -358,13 +358,16 @@ fn sandboxed_write_reaches_a_cache_root_and_nothing_beside_it() {
 
 /// ADR-181 Amendment 16 acceptance 80: under the rendered profile a unix
 /// socket binds and takes a connection inside the run directory and inside
-/// the run's temporary directory, and every other bind or connect is refused.
-/// Each refusal has a control that runs the same command outside the sandbox,
-/// so a refusal is the profile's and not the command's.
+/// the run's temporary directory, and every other bind or connect is refused,
+/// through a link included. A connect is judged by delivery: the listener
+/// writes what it receives to a capture file and the arm reads its token back,
+/// because `nc -U -z` exits 1 against a live unix listener on macOS. Each
+/// refusal has a control that runs the same command outside the sandbox and
+/// succeeds, so a refusal is the profile's and not the command's.
 #[cfg(target_os = "macos")]
 #[test]
 fn sandboxed_unix_sockets_reach_the_run_and_its_temporary_directory_only() {
-    use std::os::unix::net::UnixListener;
+    use std::io::Write;
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
@@ -372,10 +375,10 @@ fn sandboxed_unix_sockets_reach_the_run_and_its_temporary_directory_only() {
         return;
     }
     const NC: &str = "/usr/bin/nc";
-    assert!(
-        Path::new(NC).exists(),
-        "{NC} is the socket server and client these arms drive"
-    );
+    const LN: &str = "/bin/ln";
+    for tool in [NC, LN] {
+        assert!(Path::new(tool).exists(), "{tool} drives these arms");
+    }
     // Short names: a unix socket path holds at most 103 bytes on macOS.
     let holder = tempfile::tempdir().expect("base directory");
     let base = std::fs::canonicalize(holder.path()).expect("canonical base");
@@ -384,67 +387,135 @@ fn sandboxed_unix_sockets_reach_the_run_and_its_temporary_directory_only() {
     let outside = base.join("o");
     // Shares the run directory's text prefix, so a prefix match would admit it.
     let sibling = base.join("rx");
-    for dir in [&run_dir, &scratch, &outside, &sibling] {
+    // Listener output lands here, outside every directory under test.
+    let captures = base.join("k");
+    for dir in [&run_dir, &scratch, &outside, &sibling, &captures] {
         std::fs::create_dir(dir).expect("fixture directory");
     }
     let profile_path = base.join("p.sb");
     std::fs::write(&profile_path, render_profile(&run_dir, &[], &[], &[])).expect("write profile");
 
-    let sandboxed = |args: &[&str]| {
+    let sandboxed = |program: &str, args: &[&str]| {
         let mut command = Command::new(SANDBOX_EXEC);
-        command.arg("-f").arg(&profile_path).arg(NC).args(args);
+        command.arg("-f").arg(&profile_path).arg(program).args(args);
         command
     };
-    let plain = |args: &[&str]| {
-        let mut command = Command::new(NC);
+    let plain = |program: &str, args: &[&str]| {
+        let mut command = Command::new(program);
         command.args(args);
         command
     };
-    let quiet = |mut command: Command| {
+    let succeeds = |mut command: Command| {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        command
-    };
-    let succeeds = |command: Command| quiet(command).status().expect("launch nc").success();
-    // Start a listener and wait until its socket exists or it has exited.
-    let listen = |command: Command, path: &Path| -> (bool, Child) {
-        let mut child = quiet(command).spawn().expect("launch nc listener");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !path.exists()
-            && child.try_wait().expect("poll listener").is_none()
-            && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        (path.exists(), child)
+            .stderr(Stdio::null())
+            .status()
+            .expect("launch fixture command")
+            .success()
     };
     let stop = |mut child: Child| {
         let _ = child.kill();
         let _ = child.wait();
     };
     let text = |path: &Path| path.to_str().expect("utf-8 fixture path").to_string();
+    // Start a listener with its output in `capture`; report whether `socket`
+    // appeared before the listener exited.
+    let listen = |mut command: Command, socket: &Path, capture: &Path| -> (bool, Child) {
+        let out = std::fs::File::create(capture).expect("capture file");
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("launch nc listener");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !socket.exists()
+            && child.try_wait().expect("poll listener").is_none()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        (socket.exists(), child)
+    };
+    // Run a client with one token line on its standard input.
+    let send = |mut command: Command, token: &str| {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("launch nc client");
+        if let Some(mut stdin) = child.stdin.take() {
+            // A refused connect closes the pipe; the write error is that refusal.
+            let _ = writeln!(stdin, "{token}");
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().expect("poll client").is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        stop(child);
+    };
+    let holds = |capture: &Path, token: &str| {
+        std::fs::read_to_string(capture)
+            .map(|received| received.lines().any(|line| line == token))
+            .unwrap_or(false)
+    };
+    let arrives = |capture: &Path, token: &str| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !holds(capture, token) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        holds(capture, token)
+    };
+    // The sandboxed send goes first, then the same send unsandboxed. The
+    // listener takes connections in order, so once the control's token has
+    // arrived, a sandboxed token that got through is already in the capture.
+    // Returns (control delivered, sandboxed delivered).
+    let deliveries = |socket: &Path, capture: &Path, name: &str| {
+        let token = format!("{name}-sandboxed");
+        let control = format!("{name}-plain");
+        send(sandboxed(NC, &["-U", &text(socket)]), &token);
+        send(plain(NC, &["-U", &text(socket)]), &control);
+        (arrives(capture, &control), holds(capture, &token))
+    };
 
-    // Control: bind and connect, both inside the sandbox, in each allowed place.
-    for dir in [&run_dir, &scratch] {
-        let path = dir.join("s");
-        let (bound, listener) = listen(sandboxed(&["-U", "-l", &text(&path)]), &path);
-        let connected = bound && succeeds(sandboxed(&["-U", "-z", &text(&path)]));
+    // Control: a sandboxed listener and a sandboxed client deliver a token in
+    // each allowed place.
+    for (n, dir) in [&run_dir, &scratch].into_iter().enumerate() {
+        let socket = dir.join("s");
+        let capture = captures.join(format!("allowed{n}"));
+        let (bound, listener) = listen(
+            sandboxed(NC, &["-U", "-l", "-k", &text(&socket)]),
+            &socket,
+            &capture,
+        );
+        if bound {
+            send(sandboxed(NC, &["-U", &text(&socket)]), "inside");
+        }
+        let delivered = bound && arrives(&capture, "inside");
         stop(listener);
         assert!(bound, "a bind under {dir:?} must be allowed");
-        assert!(connected, "a connect under {dir:?} must be allowed");
+        assert!(delivered, "a connect under {dir:?} must deliver");
     }
 
     // A bind anywhere else is refused, including beside the run directory
     // under a name that shares its text prefix.
-    for dir in [&outside, &sibling] {
+    for (n, dir) in [&outside, &sibling].into_iter().enumerate() {
         let refused = dir.join("b");
-        let (bound, listener) = listen(sandboxed(&["-U", "-l", &text(&refused)]), &refused);
+        let (bound, listener) = listen(
+            sandboxed(NC, &["-U", "-l", "-k", &text(&refused)]),
+            &refused,
+            &captures.join(format!("bind{n}")),
+        );
         stop(listener);
         assert!(!bound, "a bind under {dir:?} must be refused");
         let control = dir.join("c");
-        let (bound, listener) = listen(plain(&["-U", "-l", &text(&control)]), &control);
+        let (bound, listener) = listen(
+            plain(NC, &["-U", "-l", "-k", &text(&control)]),
+            &control,
+            &captures.join(format!("bind-control{n}")),
+        );
         stop(listener);
         assert!(
             bound,
@@ -452,21 +523,112 @@ fn sandboxed_unix_sockets_reach_the_run_and_its_temporary_directory_only() {
         );
     }
 
-    // A connect to a listener made outside the sandbox is refused. The one in
-    // `outside` stands for the khive daemon's socket, which lives outside both
-    // allowed directories by construction.
-    for dir in [&outside, &sibling] {
-        let path = dir.join("daemon.sock");
-        let _listener = UnixListener::bind(&path).expect("listener outside the sandbox");
-        assert!(
-            succeeds(plain(&["-U", "-z", &text(&path)])),
-            "control: {path:?} takes a connection unsandboxed"
+    // A token sent from inside the sandbox does not reach a listener made
+    // outside it. The one in `outside` stands for the khive daemon's socket,
+    // which lives outside both allowed directories by construction.
+    for (n, dir) in [&outside, &sibling].into_iter().enumerate() {
+        let socket = dir.join("d.sock");
+        let capture = captures.join(format!("outside{n}"));
+        let (bound, listener) = listen(
+            plain(NC, &["-U", "-l", "-k", &text(&socket)]),
+            &socket,
+            &capture,
         );
+        let (control, leaked) = if bound {
+            deliveries(&socket, &capture, &format!("direct{n}"))
+        } else {
+            (false, false)
+        };
+        stop(listener);
+        assert!(bound, "control: a listener binds at {socket:?} unsandboxed");
+        assert!(control, "control: a token reaches {socket:?} unsandboxed");
         assert!(
-            !succeeds(sandboxed(&["-U", "-z", &text(&path)])),
-            "a connect to {path:?} must be refused"
+            !leaked,
+            "a sandboxed connect to {socket:?} must not deliver"
         );
     }
+
+    // Nor through a link inside the run directory that names such a socket:
+    // a symbolic link and a hard link, each made outside the sandbox.
+    let socket = outside.join("l.sock");
+    let capture = captures.join("links");
+    let (bound, listener) = listen(
+        plain(NC, &["-U", "-l", "-k", &text(&socket)]),
+        &socket,
+        &capture,
+    );
+    let symbolic = run_dir.join("sl");
+    std::os::unix::fs::symlink(&socket, &symbolic).expect("symbolic link to the outside socket");
+    let hard = run_dir.join("hl");
+    let hard_made = bound && std::fs::hard_link(&socket, &hard).is_ok();
+    let through_symbolic = if bound {
+        deliveries(&symbolic, &capture, "symbolic")
+    } else {
+        (false, false)
+    };
+    let through_hard = if hard_made {
+        deliveries(&hard, &capture, "hard")
+    } else {
+        (false, false)
+    };
+    // A hard link to that socket made from inside the sandbox is refused; the
+    // same link made unsandboxed is the control.
+    let inner = run_dir.join("hi");
+    let linked_inside = succeeds(sandboxed(LN, &[&text(&socket), &text(&inner)]));
+    let inner_exists = inner.exists();
+    let linked_plain = succeeds(plain(LN, &[&text(&socket), &text(&run_dir.join("hc"))]));
+    stop(listener);
+    assert!(bound, "control: a listener binds at {socket:?} unsandboxed");
+    assert!(hard_made, "control: a hard link to {socket:?} can be made");
+    assert!(
+        through_symbolic.0,
+        "control: a token reaches {socket:?} through {symbolic:?} unsandboxed"
+    );
+    assert!(
+        !through_symbolic.1,
+        "a sandboxed connect through the symbolic link {symbolic:?} must not deliver"
+    );
+    assert!(
+        through_hard.0,
+        "control: a token reaches {socket:?} through {hard:?} unsandboxed"
+    );
+    assert!(
+        !through_hard.1,
+        "a sandboxed connect through the hard link {hard:?} must not deliver"
+    );
+    assert!(
+        !linked_inside && !inner_exists,
+        "a hard link to {socket:?} made inside the sandbox must be refused"
+    );
+    assert!(
+        linked_plain,
+        "control: the same hard link is made unsandboxed"
+    );
+
+    // A bind through a directory link inside the run directory that points
+    // outside leaves no socket there; the same bind unsandboxed does.
+    let door = run_dir.join("d");
+    std::os::unix::fs::symlink(&outside, &door).expect("directory link to the outside");
+    let (bound_through, listener) = listen(
+        sandboxed(NC, &["-U", "-l", "-k", &text(&door.join("x"))]),
+        &outside.join("x"),
+        &captures.join("door"),
+    );
+    stop(listener);
+    let (control_through, listener) = listen(
+        plain(NC, &["-U", "-l", "-k", &text(&door.join("y"))]),
+        &outside.join("y"),
+        &captures.join("door-control"),
+    );
+    stop(listener);
+    assert!(
+        !bound_through && !outside.join("x").exists(),
+        "a bind through {door:?} must leave no socket in {outside:?}"
+    );
+    assert!(
+        control_through,
+        "control: the same bind through {door:?} works unsandboxed"
+    );
 
     // Loopback stays refused.
     let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener");
@@ -476,11 +638,11 @@ fn sandboxed_unix_sockets_reach_the_run_and_its_temporary_directory_only() {
         .port()
         .to_string();
     assert!(
-        succeeds(plain(&["-z", "-w", "2", "127.0.0.1", &port])),
+        succeeds(plain(NC, &["-z", "-w", "2", "127.0.0.1", &port])),
         "control: the loopback listener takes a connection unsandboxed"
     );
     assert!(
-        !succeeds(sandboxed(&["-z", "-w", "2", "127.0.0.1", &port])),
+        !succeeds(sandboxed(NC, &["-z", "-w", "2", "127.0.0.1", &port])),
         "a loopback connect must stay refused"
     );
 }
