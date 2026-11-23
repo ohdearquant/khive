@@ -3043,6 +3043,53 @@ fn git_digest_sources_parse_closed_and_checked() {
 }
 
 #[test]
+fn git_digest_remote_with_userinfo_is_refused_without_echoing_it() {
+    let user = "digest-reader";
+    let password = ["pw", "7Kq2", "xZ9m"].concat();
+    let refuse_without_echo = |remote: &str| {
+        let parsed: KhiveConfig =
+            toml::from_str(&format!("[git_digest]\nremotes = [{remote:?}]\n")).unwrap();
+        let error = parsed
+            .validate()
+            .expect_err("an entry carrying userinfo is refused")
+            .to_string();
+        assert!(error.contains("git_digest.remotes"), "{error}");
+        assert!(!error.contains(user), "the refusal echoes the user name");
+        assert!(
+            !error.contains(&password),
+            "the refusal echoes the password"
+        );
+        error
+    };
+    for remote in [
+        format!("https://{user}@github.com/ohdearquant/khive"),
+        format!("https://{user}:{password}@github.com/ohdearquant/khive"),
+        format!("ssh://{user}:{password}@example.com/org/a"),
+        // No scheme, a one-slash scheme, and a password holding `#` or `?`:
+        // each still carries userinfo before its host.
+        format!("{user}:{password}@github.com/ohdearquant/khive"),
+        format!("https:/{user}:{password}@github.com/ohdearquant/khive"),
+        format!("https://{user}:{password}#1@github.com/ohdearquant/khive"),
+        format!("https://{user}:{password}?1@github.com/ohdearquant/khive"),
+        format!(" https://{user}:{password}@github.com/ohdearquant/khive"),
+        "git@github.com:ohdearquant/khive".to_owned(),
+    ] {
+        let error = refuse_without_echo(&remote);
+        assert!(
+            error.contains("user name or password"),
+            "{remote:?} is refused as carrying userinfo: {error}"
+        );
+    }
+    // A password holding `/` ends the authority before the `@`, so the userinfo
+    // reading misses it; the refusal still never quotes an entry holding an `@`.
+    refuse_without_echo(&format!("https://{user}:{password}/x@github.com"));
+    // An `@` past the host belongs to the path and does not count as userinfo.
+    let parsed: KhiveConfig =
+        toml::from_str("[git_digest]\nremotes = [\"https://example.com/org/a@b\"]\n").unwrap();
+    parsed.validate().expect("an @ in the path is not userinfo");
+}
+
+#[test]
 fn code_ingest_roots_parse_closed_and_absolute() {
     let parsed: KhiveConfig = toml::from_str("[code_ingest]\nroots = [\"/srv/code\"]\n").unwrap();
     parsed.validate().expect("absolute roots validate");

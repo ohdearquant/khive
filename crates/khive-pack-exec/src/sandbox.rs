@@ -6,8 +6,15 @@
 //! Xcode Python framework: the dyld shared cache under `/System`, `/usr/lib`,
 //! `/Library`, `/private/var/db`, `/private/etc`, `/dev`, and the root
 //! directory itself, which dyld reads to resolve firmlinks). Writes are
-//! allowed only under the run directory and to `/dev/null`. No network
-//! operation is allowed at all.
+//! allowed only under the run directory, the operator's `[exec] cache_roots`,
+//! and to `/dev/null`. No network operation is allowed at all.
+//!
+//! A cache root is a directory every run may read, write and load code from,
+//! and that outlives the run: a compiler's package cache and build output
+//! live there. Nothing under it is captured into the run's output tree, and
+//! one run can read and change what an earlier run left, so a run that had a
+//! cache root is not a function of its input tree alone. The receipt names
+//! the cache roots' digest for that reason.
 
 use std::path::{Path, PathBuf};
 
@@ -67,6 +74,7 @@ fn quote(path: &Path) -> String {
 pub struct Resolved {
     pub root: PathBuf,
     pub read_roots: Vec<PathBuf>,
+    pub cache_roots: Vec<PathBuf>,
     pub env_keys: Vec<String>,
     pub never: Vec<PathBuf>,
     pub max_output_bytes: u64,
@@ -120,6 +128,13 @@ pub fn resolve(cfg: &ExecSectionConfig) -> Resolved {
         .collect();
     read_roots.sort();
     read_roots.dedup();
+    let mut cache_roots: Vec<PathBuf> = cfg
+        .cache_roots
+        .iter()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p)))
+        .collect();
+    cache_roots.sort();
+    cache_roots.dedup();
     let mut never: Vec<PathBuf> = cfg
         .never
         .iter()
@@ -130,6 +145,7 @@ pub fn resolve(cfg: &ExecSectionConfig) -> Resolved {
     Resolved {
         root,
         read_roots,
+        cache_roots,
         env_keys: cfg.env.clone(),
         never,
         max_output_bytes: cfg.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
@@ -162,15 +178,75 @@ pub fn read_roots_digest(read_roots: &[PathBuf]) -> String {
     digest_hex(&read_roots_serialization(read_roots))
 }
 
+/// Why the configured cache roots cannot be used with the run root and the
+/// read roots, if they cannot. A cache root that holds the run root, or sits
+/// inside it, would let one run write into another run's directory. One that
+/// equals, holds or sits inside a read root would make a directory the
+/// configuration calls read-only writable. A relative one names a different
+/// directory per working directory, and one that cannot be resolved cannot be
+/// compared with either, so each is refused.
+///
+/// Entries are compared in canonical form, so a symbolic link or a `..`
+/// component cannot hide an overlap. `read_roots` are the resolved read roots.
+/// The check does not judge what else a cache root holds.
+pub fn cache_root_conflict(
+    root: &Path,
+    read_roots: &[PathBuf],
+    cache_roots: &[PathBuf],
+) -> Option<String> {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    for entry in cache_roots {
+        if !entry.is_absolute() {
+            return Some(format!(
+                "[exec] cache_roots entry {entry:?} is not an absolute path"
+            ));
+        }
+        let cache = match std::fs::canonicalize(entry) {
+            Ok(cache) => cache,
+            Err(error) => {
+                return Some(format!(
+                    "[exec] cache_roots entry {entry:?} cannot be resolved ({error}); \
+                     it must exist when a run starts"
+                ));
+            }
+        };
+        if root.starts_with(&cache) || cache.starts_with(&root) {
+            return Some(format!(
+                "[exec] cache_roots entry {entry:?} overlaps the run root {root:?}"
+            ));
+        }
+        for read in read_roots {
+            let read_canonical = std::fs::canonicalize(read).unwrap_or_else(|_| read.clone());
+            if read_canonical.starts_with(&cache) || cache.starts_with(&read_canonical) {
+                return Some(format!(
+                    "[exec] cache_roots entry {entry:?} overlaps the read root {read:?}"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Digest of the resolved cache roots, in the read roots' serialization.
+pub fn cache_roots_digest(cache_roots: &[PathBuf]) -> String {
+    digest_hex(&read_roots_serialization(cache_roots))
+}
+
 /// Render the seatbelt profile for one run. `run_dir` must already be
 /// canonical; both the canonical form and any `/tmp` alias resolve to it
-/// because seatbelt matches canonical paths.
-pub fn render_profile(run_dir: &Path, read_roots: &[PathBuf], never: &[PathBuf]) -> String {
+/// because seatbelt matches canonical paths. With no cache roots the profile
+/// is the one rendered before cache roots existed, byte for byte.
+pub fn render_profile(
+    run_dir: &Path,
+    read_roots: &[PathBuf],
+    cache_roots: &[PathBuf],
+    never: &[PathBuf],
+) -> String {
     let mut reads: Vec<String> = SYSTEM_READ_ROOTS
         .iter()
         .map(|p| format!("(subpath {})", quote(Path::new(p))))
         .collect();
-    for root in read_roots {
+    for root in read_roots.iter().chain(cache_roots) {
         reads.push(format!("(subpath {})", quote(root)));
     }
     reads.push(format!("(subpath {})", quote(run_dir)));
@@ -182,6 +258,7 @@ pub fn render_profile(run_dir: &Path, read_roots: &[PathBuf], never: &[PathBuf])
         .iter()
         .map(|root| Path::new(*root))
         .chain(read_roots.iter().map(PathBuf::as_path))
+        .chain(cache_roots.iter().map(PathBuf::as_path))
         .chain(std::iter::once(run_dir))
     {
         for ancestor in root.ancestors().skip(1) {
@@ -194,11 +271,15 @@ pub fn render_profile(run_dir: &Path, read_roots: &[PathBuf], never: &[PathBuf])
         .iter()
         .map(|p| format!("(subpath {})", quote(Path::new(p))))
         .collect();
-    for root in read_roots {
+    for root in read_roots.iter().chain(cache_roots) {
         maps.push(format!("(subpath {})", quote(root)));
     }
     let run = format!("(subpath {})", quote(run_dir));
     maps.push(run.clone());
+    let mut writes = vec![run];
+    for root in cache_roots {
+        writes.push(format!("(subpath {})", quote(root)));
+    }
     // ADR-181 Amendment 9: these name and path matches apply to each sandboxed
     // launch, not only to the registered binary.
     let mut denies: Vec<String> = vec![
@@ -222,20 +303,20 @@ pub fn render_profile(run_dir: &Path, read_roots: &[PathBuf], never: &[PathBuf])
          (allow file-read-metadata {metadata})\n\
          (allow file-read* file-test-existence (literal \"/\") {reads})\n\
          (allow file-map-executable {maps})\n\
-         (allow file-write* {run})\n\
+         (allow file-write* {writes})\n\
          (allow file-write-data (literal \"/dev/null\"))\n",
         denies = denies.join(" "),
         reads = reads.join(" "),
         metadata = metadata.join(" "),
         maps = maps.join(" "),
-        run = run,
+        writes = writes.join(" "),
     )
 }
 
 /// Digest of the template with an empty run directory and no roots: names
 /// the profile shape independently of any run.
 pub fn template_digest() -> String {
-    digest_hex(render_profile(Path::new("/"), &[], &[]).as_bytes())
+    digest_hex(render_profile(Path::new("/"), &[], &[], &[]).as_bytes())
 }
 
 /// Why a registered binary may not run.
