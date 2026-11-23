@@ -18,7 +18,9 @@ use khive_types::{EventKind, EventOutcome, Pack};
 use serde_json::{json, Value};
 
 use crate::receipts::{self, Disposition};
-use crate::remote_transport::{ApiRequest, PushRequest, RemoteError, RemoteTransport};
+use crate::remote_transport::{
+    ApiRequest, FetchRequest, Fetched, PushRequest, RemoteError, RemoteTransport,
+};
 use crate::GitPack;
 
 #[derive(Default)]
@@ -44,6 +46,10 @@ impl RemoteTransport for ObservedRemote {
         Err(RemoteError::Unavailable)
     }
     async fn push(&self, _: Option<&str>, _: PushRequest) -> Result<(), RemoteError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(RemoteError::Unavailable)
+    }
+    async fn fetch(&self, _: Option<&str>, _: FetchRequest) -> Result<Fetched, RemoteError> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Err(RemoteError::Unavailable)
     }
@@ -163,6 +169,7 @@ async fn assert_refusal_evidence(
             | "git.update_ref"
             | "git.reconcile"
             | "git.push"
+            | "git.fetch"
             | "git.pr_open"
             | "git.pr_review"
             | "git.pr_merge"
@@ -173,6 +180,7 @@ async fn assert_refusal_evidence(
             | "git.branch"
             | "git.update_ref"
             | "git.push"
+            | "git.fetch"
             | "git.pr_open"
             | "git.pr_review"
             | "git.pr_merge"
@@ -342,6 +350,11 @@ async fn every_registered_git_verb_rejects_named_unknowns_preserving_refusal_evi
         (
             "git.push",
             json!({"repo":repo,"branch":"main","expected_local":head,"expected_remote":null}),
+            "expected_remote",
+        ),
+        (
+            "git.fetch",
+            json!({"repo":repo,"ref":"main","expected_remote":head}),
             "expected_remote",
         ),
         (

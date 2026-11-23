@@ -29,6 +29,7 @@
 //! | `git.pr_review` | `repo`, `number`, `verdict`, `body`, `expected_head` | Review the expected commit; self-approval refuses |
 //! | `git.pr_merge` | `repo`, `number`, `method`, `subject`, `body`, `expected_head` | Merge with an exact head comparison and an independent approval |
 //! | `git.pr_state` | `repo`, `number` | Read a pull request's state, head, checks, statuses and reviews as the platform reports them |
+//! | `git.fetch` | `repo`, `ref`, `expected_remote?` | Fetch one branch or one pull request's head from the configured remote into a remote-tracking ref by compare-and-swap |
 //!
 //! `kkernel git-ingest` remains the unbounded, all-kinds admin CLI path over
 //! the same shared `ingest::run_ingest` core.

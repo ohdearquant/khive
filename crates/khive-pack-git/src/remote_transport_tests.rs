@@ -255,3 +255,74 @@ fn git_and_gh_commands_keep_their_argv_and_environment() {
     assert!(gh_args.is_empty());
     assert_eq!(gh_envs, expected_envs);
 }
+
+#[test]
+fn pack_files_move_with_each_index_last_and_no_keep_file() {
+    let names = [
+        "pack-b.idx",
+        "pack-a.pack",
+        "tmp_pack_x",
+        "pack-a.idx",
+        "pack-b.keep",
+        "pack-a.rev",
+        "pack-b.pack",
+    ]
+    .map(String::from)
+    .to_vec();
+    assert_eq!(
+        pack_files_in_order(names),
+        [
+            "pack-a.pack",
+            "pack-a.rev",
+            "pack-b.pack",
+            "pack-a.idx",
+            "pack-b.idx"
+        ]
+    );
+}
+
+#[test]
+fn received_objects_are_linked_into_the_store_and_nothing_else_is() {
+    let root = tempfile::tempdir().unwrap();
+    let objects = root.path().join("objects");
+    let incoming = objects.join("khive-incoming-test");
+    let loose = "0".repeat(38);
+    for dir in ["ab", "cd", "info", "pack", "not-hex"] {
+        std::fs::create_dir_all(incoming.join(dir)).unwrap();
+    }
+    std::fs::create_dir_all(objects.join("cd")).unwrap();
+    std::fs::write(incoming.join("ab").join(&loose), "received").unwrap();
+    std::fs::write(incoming.join("ab").join("tmp_obj_x"), "partial").unwrap();
+    // The store already holds this name: its copy stays.
+    std::fs::write(incoming.join("cd").join(&loose), "received").unwrap();
+    std::fs::write(objects.join("cd").join(&loose), "held").unwrap();
+    std::fs::write(incoming.join("info").join("alternates"), "/elsewhere").unwrap();
+    std::fs::write(incoming.join("not-hex").join(&loose), "stray").unwrap();
+    for name in ["pack-a.pack", "pack-a.idx", "pack-a.keep", "tmp_pack_x"] {
+        std::fs::write(incoming.join("pack").join(name), name).unwrap();
+    }
+
+    migrate_incoming(&incoming, &objects).unwrap();
+
+    let read = |path: &[&str]| {
+        let mut full = objects.clone();
+        full.extend(path);
+        std::fs::read_to_string(full).ok()
+    };
+    assert_eq!(read(&["ab", &loose]).as_deref(), Some("received"));
+    assert_eq!(read(&["cd", &loose]).as_deref(), Some("held"));
+    assert_eq!(
+        read(&["pack", "pack-a.pack"]).as_deref(),
+        Some("pack-a.pack")
+    );
+    assert_eq!(read(&["pack", "pack-a.idx"]).as_deref(), Some("pack-a.idx"));
+    for left in [
+        &["ab", "tmp_obj_x"][..],
+        &["info", "alternates"],
+        &["not-hex", &loose],
+        &["pack", "pack-a.keep"],
+        &["pack", "tmp_pack_x"],
+    ] {
+        assert_eq!(read(left), None, "{left:?}");
+    }
+}

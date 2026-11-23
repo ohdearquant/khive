@@ -1062,3 +1062,98 @@ credential read and no receipt; 60 a platform refusal that reports a spent reque
 `remote_rate_limited` with the second the allowance returns, after exactly one request, an effect
 verb refuses the same way as not committed with no write, and both answer once the allowance is back
 (control).
+
+## Amendment 16 (2026-11-23): fetching one ref
+
+**Status**: Accepted 2026-11-23. The ADR's Accepted status and every amendment above stand unchanged.
+
+Adopted from a reading of a real caller, as Amendments 8 and 15 were. A clone served to a client with
+no shell moves only when its operator fetches: `git.checkout` can read only what the clone already
+holds, and Amendment 14's `merge_parent` must be the tip of a remote-tracking ref, so a base that moved
+after the last fetch cannot be checked out or merged until someone else acts. A pull request opened
+from a fork has no remote-tracking ref at all. This amendment lets the caller bring in one ref itself.
+
+1. **`git.fetch(repo, ref, expected_remote?)`.** `ref` is a branch name or `pull/<N>`. A branch is
+   read from the remote's `refs/heads/<ref>` and written to `refs/remotes/origin/<ref>`; `pull/<N>`
+   is read from `refs/pull/<N>/head` and written to `refs/fetched/pull/<N>`. `pull/<N>` always means
+   the pull request, so a branch with that literal name is not fetchable by this verb. `N` is digits
+   with no leading zero. The result is `ref`, `sha`, `previous_sha`, `remote` and `receipt_id`.
+2. **The transfer runs in a scratch repository.** A fresh bare repository whose configuration the pack
+   writes fetches by the mapped URL with an explicit refspec, `--refmap=`, no tags and no submodules, so the clone's configuration, hooks and
+   remotes are never read: a `url.<base>.insteadOf` in the clone cannot redirect the fetch. The clone's
+   tips are offered as haves so only missing objects are sent. Objects are checked as they arrive,
+   because a pull request's head carries objects from whoever opened it; a failed check refuses
+   `objects_refused`. The only ref the transfer writes is the scratch's own, removed with it, and the
+   whole process group is bounded at 300 seconds.
+
+   Received objects are quarantined, as `receive-pack` does for a push. Each git child of the
+   transfer has a fresh directory inside the clone's object directory as its object store and the
+   clone's store as an alternate, so it reads the clone's objects and writes none of them. Only when
+   the transfer completed and the fetched commit equals `expected_remote` (when given) are the loose
+   objects, then the packs with each index last, linked into the clone's store; a name already present
+   is kept. The directory is removed when the call returns, so a refused, failed or timed-out transfer
+   and a mismatch leave the clone's object store exactly as it was.
+3. **One compare-and-swap moves one ref.** The destination's value is read before the transfer and
+   the destination is moved from that value (or from absent) to the fetched commit with `update-ref
+   --no-deref`, its reflog message the receipt marker. A ref another writer moved in between refuses
+   `ref_moved`; a ref whose lock another writer holds refuses `ref_locked`. Neither changes the ref and
+   both are safe to retry, since the retry reads the new value. When git gives no answer the
+   destination is read back: holding the fetched commit is success, anything else refuses. A fetch
+   that finds the ref already at the remote's commit writes nothing.
+4. **`expected_remote` pins what is accepted.** When given, the fetched commit must equal it or the
+   call refuses `expected_remote_mismatch` with the commit found in the receipt and no ref moved.
+   `null` is not a value for it. A ref the remote does not hold refuses `remote_ref_absent`.
+5. **Gated and credentialed like `git.push`.** The order is arguments, the repo-only allowlist match,
+   `tool.check`, the repository mapping, then the credential: a local mapping uses none, an HTTPS
+   mapping the dispatching actor's, and a caller with no actor row refuses `actor_unmapped` before
+   any transfer. It is a write: it writes a receipt and an audit row, and the operation classifier
+   lists it with `git.update_ref` (version 29).
+6. **A fetched pull request head is not published.** It is never written under `refs/remotes/`, so it
+   is not a `merge_parent` (`merge_parent_unpublished`) and still lists as unpublished in
+   `rev-list <sha> --not --remotes`. A branch fetched at the same commit is published.
+7. **Other verbs name the remedy.** `git.checkout` of `origin/<x>`, `refs/remotes/origin/<x>` or
+   `refs/fetched/pull/<N>` that the clone does not hold refuses `not_fetched`, naming `git.fetch`;
+   every other unresolved ref keeps its own refusal. A ref under `refs/khive/` refuses
+   `invalid_params` wherever a ref is taken, present or not, because that namespace belongs to the
+   transfer.
+8. **`git.reconcile` returns a fetch receipt unchanged.** A fetch is settled by reading its
+   destination, and rerunning it is safe.
+
+What this does not cover: fetching tags, many refs in one call, pruning remote-tracking refs the
+remote deleted, and fetching from any remote other than the mapped one. A shallow or partial clone is
+not made whole by this verb. A process that ends without returning (the daemon killed mid-call)
+leaves its quarantine directory behind; it holds no ref and git never reads it, and nothing removes
+it yet. A failure while linking objects into place leaves the objects already linked, which no ref
+names.
+
+Acceptance arms added: 61 a branch fetch over a local mapping, with an `insteadOf` rewrite and three
+hooks planted in the clone, moves `refs/remotes/origin/<ref>` to the remote's commit with
+`previous_sha` null, the object present, the reflog message the receipt marker, a committed receipt
+without a credential, no ref under `refs/khive/`, no hook run and the clone's configuration
+byte-identical; a second fetch after the remote moves reports the first commit as `previous_sha`, and
+a third reports both equal; 62 `pull/7` fetches `refs/pull/7/head` and not a branch named `pull/7`
+into `refs/fetched/pull/7`, no remote-tracking ref points at it and it lists as unpublished, and the
+same commit fetched as a branch is published (control); 63 a wrong `expected_remote` refuses
+`expected_remote_mismatch` with the found commit in the receipt, a missing remote ref refuses
+`remote_ref_absent`, and a null or short `expected_remote`, `pull/07`, `pull/0`, `pull/`, `-feature`
+and `feature..x` each refuse, every clone ref unchanged throughout, and the right `expected_remote`
+moves the ref (control); 64 a remote commit with a malformed author date refuses `objects_refused`
+with no destination ref; 65 a writer that creates the destination during the transfer makes the call
+refuse `ref_moved` with the writer's value kept, a held lock refuses `ref_locked` with the ref
+unchanged, and each retry succeeds from the value then present (controls); 66 over an HTTPS mapping
+the transfer carries the actor's credential and nothing at the platform's API is called, and a
+caller with no actor row refuses `actor_unmapped` with no transfer; 67 `git.checkout` of an absent
+`origin/feature`, `refs/remotes/origin/feature` and `refs/fetched/pull/7` refuses `not_fetched`, each
+checks out once the ref exists (control), and an absent ordinary branch does not say `not_fetched`;
+68 `refs/khive/fetch/staged` refuses `invalid_params` while it exists, and the same commit under
+another name checks out (control); 69 a commit held only at `refs/fetched/pull/7` refuses
+`merge_parent_unpublished` as a `merge_parent` with no ref changed, and commits once it is a
+remote-tracking tip (control); 70 the classifier lists `git.fetch` as a write at version 29 and every
+published verb total counts it; 71 the clone's object directory, listed file by file, is identical
+before and after a mismatch on a transfer large enough to arrive as a pack and on one small enough to
+arrive as loose objects, after `objects_refused`, and after a transfer that completes and then reports
+failure, and in each case `cat-file -e` of the commit it named fails in the clone; the expected commit
+then lands with every object it reaches and a new pack in the clone (control); 72 the linking step,
+on a constructed directory, moves loose objects and pack files, keeps an object the store already
+holds, orders each pack index after the other pack files, and leaves temporary, `.keep` and non-object
+files behind.

@@ -43,6 +43,35 @@ pub struct PushRequest {
     pub expected_remote: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct FetchRequest {
+    /// The canonical clone whose object store receives the fetched objects.
+    pub repo: PathBuf,
+    /// The mapped remote URL. A fetch never names a remote by name.
+    pub remote: String,
+    /// The remote ref read: `refs/heads/<branch>` or `refs/pull/<N>/head`.
+    pub source: String,
+    /// The clone's own tips, offered as haves so only objects the clone lacks are sent.
+    pub haves: Vec<String>,
+    /// The commit the caller expects the remote ref to name, lowercase. When the ref names another
+    /// commit, nothing the transfer brought is kept.
+    pub expected: Option<String>,
+}
+
+/// What a fetch found at the remote, when the transfer itself completed or was refused there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fetched {
+    /// The commit the remote ref names; its objects are now in the clone's store.
+    Commit(String),
+    /// The remote ref names this commit and not the expected one. Nothing the transfer brought is
+    /// in the clone's store.
+    Mismatch(String),
+    /// The remote holds no such ref.
+    Absent,
+    /// An object the remote sent failed the object check, and the transfer was refused.
+    ObjectsRefused,
+}
+
 #[async_trait]
 pub trait RemoteTransport: Send + Sync {
     async fn api(&self, token: &str, request: ApiRequest) -> Result<Value, RemoteError>;
@@ -61,6 +90,12 @@ pub trait RemoteTransport: Send + Sync {
         branch: &str,
     ) -> Result<Option<String>, RemoteError>;
     async fn push(&self, token: Option<&str>, request: PushRequest) -> Result<(), RemoteError>;
+    /// Fetch `request.source` into the clone's object store. No ref of the clone is written.
+    async fn fetch(
+        &self,
+        token: Option<&str>,
+        request: FetchRequest,
+    ) -> Result<Fetched, RemoteError>;
 }
 
 pub struct GhTransport {
@@ -287,6 +322,14 @@ impl RemoteTransport for GhTransport {
     async fn push(&self, token: Option<&str>, request: PushRequest) -> Result<(), RemoteError> {
         push_native(&self.program, token, request, token.is_none()).await
     }
+
+    async fn fetch(
+        &self,
+        token: Option<&str>,
+        request: FetchRequest,
+    ) -> Result<Fetched, RemoteError> {
+        fetch_native(&self.program, token, request, token.is_none()).await
+    }
 }
 
 pub(crate) async fn push_native(
@@ -359,6 +402,250 @@ pub(crate) async fn push_native(
         // '=' is a no-op, not evidence that this operation moved the ref.
         (true, Some("=")) => Err(RemoteError::Refused),
         _ => Err(RemoteError::Unknown),
+    }
+}
+
+/// A fetch is bounded longer than other remote calls: a first fetch of a large branch transfers
+/// its whole history.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
+/// The only ref a fetch writes, and it lives in the scratch repository, never in the clone.
+const FETCH_STAGED: &str = "refs/khive/fetch/staged";
+/// Name prefix of the directory a fetch receives objects into. It sits inside the clone's object
+/// directory, so moving an object into place stays on one filesystem; git reads only the two-hex
+/// directories, `pack` and `info` there, so it never reads this one as part of the store.
+const FETCH_INCOMING_PREFIX: &str = "khive-incoming-";
+/// Settings a fetch child carries after the shared and transport settings. Objects are checked as
+/// they arrive because a pull request's head brings in objects from whoever opened it.
+const FETCH_SETTINGS: &[&str] = &[
+    "transfer.fsckObjects=true",
+    "fetch.prune=false",
+    "fetch.pruneTags=false",
+    "fetch.recurseSubmodules=false",
+    "fetch.writeCommitGraph=false",
+    "submodule.recurse=false",
+    "gc.auto=0",
+    "maintenance.auto=false",
+];
+
+/// Run `command` in its own process group, bounded by `limit`. On expiry the whole group is
+/// killed: a remote helper or `index-pack` left running would keep writing into the clone's object
+/// store after the call has answered. The group is signalled only while its leader is unreaped, so
+/// the id cannot name another group. Returns success and the bounded stderr.
+async fn run_group(mut command: Command, limit: Duration) -> Result<(bool, Vec<u8>), RemoteError> {
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = khive_runtime::process_retry::spawn_retrying_executable_busy_async(
+        &khive_runtime::process_retry::EXECUTABLE_BUSY_BACKOFF_MS,
+        || command.spawn(),
+    )
+    .await
+    .map_err(|_| RemoteError::Unavailable)?;
+    #[cfg(unix)]
+    let group = child.id().and_then(|id| i32::try_from(id).ok());
+    let stdout = child.stdout.take().ok_or(RemoteError::Unavailable)?;
+    let stderr = child.stderr.take().ok_or(RemoteError::Unavailable)?;
+    let completed = tokio::time::timeout(limit, async {
+        let (_stdout, stderr, status) = tokio::try_join!(
+            bounded(stdout, 64 * 1024),
+            bounded(stderr, 64 * 1024),
+            child.wait()
+        )?;
+        Ok::<_, std::io::Error>((status.success(), stderr))
+    })
+    .await;
+    match completed {
+        Ok(Ok(result)) => Ok(result),
+        _ => {
+            #[cfg(unix)]
+            if let Some(group) = group {
+                let _ = khive_runtime::process_group::signal_process_group(group, libc::SIGKILL);
+            }
+            let _ = child.kill().await;
+            Err(RemoteError::Unavailable)
+        }
+    }
+}
+
+/// Fetch one remote ref into the clone's object store from a scratch repository.
+///
+/// The fetch runs in a fresh bare repository whose configuration the pack writes, so the clone's
+/// configuration, hooks and remotes are never read by it: a `url.<base>.insteadOf`, an `http.<url>.*` key or
+/// an `include.path` in the clone cannot change where the fetch goes or what it sends. The remote
+/// is named by its URL and the refspec is explicit, with `--refmap=` so no configured mapping
+/// applies. The clone's tips are created in the scratch first, so they are offered as haves.
+/// The only ref written is the scratch's staging ref, dropped with the scratch.
+///
+/// What the transfer brings lands in a directory of its own inside the clone's object directory.
+/// Every git child that touches the scratch names that directory as its object store and the
+/// clone's store as an alternate (`GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`), so it
+/// reads the clone's objects and writes none of them. The objects move into the clone's store only
+/// after the transfer completed and the remote ref names the expected commit. A refused, failed or
+/// killed transfer, and a mismatch, leave the clone's store as it was: the directory is removed
+/// when the call returns.
+pub(crate) async fn fetch_native(
+    program: &Path,
+    token: Option<&str>,
+    request: FetchRequest,
+    allow_file: bool,
+) -> Result<Fetched, RemoteError> {
+    let scratch = bare(program).await?;
+    let objects = crate::local_git::object_directory(program, &request.repo)
+        .await
+        .map_err(|_| RemoteError::Unavailable)?;
+    let incoming = tempfile::Builder::new()
+        .prefix(FETCH_INCOMING_PREFIX)
+        .tempdir_in(&objects)
+        .map_err(|_| RemoteError::Unavailable)?;
+    std::fs::create_dir(incoming.path().join("pack")).map_err(|_| RemoteError::Unavailable)?;
+    let alternate = serde_json::to_string(&objects.display().to_string())
+        .map_err(|_| RemoteError::Unavailable)?;
+    let quarantined = |mut command: Command| {
+        command
+            .env("GIT_OBJECT_DIRECTORY", incoming.path())
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &alternate);
+        command
+    };
+    if !request.haves.is_empty() {
+        let mut input = String::new();
+        for (index, sha) in request.haves.iter().enumerate() {
+            if !crate::object_id::is_40_hex(sha.as_bytes()) {
+                return Err(RemoteError::Unavailable);
+            }
+            input.push_str(&format!("create refs/khive/have/{index} {sha}\n"));
+        }
+        let mut command = quarantined(git_command(program, scratch.path(), None));
+        command.args(["update-ref", "--stdin"]);
+        if !run(command, Some(input.into_bytes()), false).await?.0 {
+            return Err(RemoteError::Unavailable);
+        }
+    }
+    let refspec = format!("{}:{FETCH_STAGED}", request.source);
+    let mut command = git_command(program, scratch.path(), token);
+    for setting in FETCH_SETTINGS {
+        command.arg("-c").arg(setting);
+    }
+    if allow_file {
+        command.args([
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "protocol.https.allow=never",
+        ]);
+    }
+    let mut command = quarantined(command);
+    // `--no-write-fetch-head` and `--no-auto-maintenance` both need git 2.29 or later, so a git
+    // that takes this command line takes the newer spelling; `--no-auto-gc` is its older name.
+    command.args([
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--no-recurse-submodules",
+        "--no-write-fetch-head",
+        "--no-auto-maintenance",
+        "--refmap=",
+        "--",
+        request.remote.as_str(),
+        refspec.as_str(),
+    ]);
+    let (success, stderr) = run_group(command, FETCH_TIMEOUT).await?;
+    if !success {
+        // The two failures this verb names; every other one is the transport's.
+        let stderr = String::from_utf8_lossy(&stderr);
+        if stderr.contains("couldn't find remote ref") {
+            return Ok(Fetched::Absent);
+        }
+        if stderr.contains("fsck error") {
+            return Ok(Fetched::ObjectsRefused);
+        }
+        return Err(RemoteError::Unavailable);
+    }
+    let staged = format!("{FETCH_STAGED}^{{commit}}");
+    let mut command = quarantined(git_command(program, scratch.path(), None));
+    command.args(["rev-parse", "--verify", "--end-of-options", staged.as_str()]);
+    let (success, bytes) = run(command, None, false).await?;
+    if !success {
+        return Err(RemoteError::InvalidResponse);
+    }
+    let sha = std::str::from_utf8(&bytes)
+        .map_err(|_| RemoteError::InvalidResponse)?
+        .trim();
+    if !crate::object_id::is_40_hex(sha.as_bytes()) {
+        return Err(RemoteError::InvalidResponse);
+    }
+    let sha = sha.to_ascii_lowercase();
+    if request
+        .expected
+        .as_deref()
+        .is_some_and(|expected| !expected.eq_ignore_ascii_case(&sha))
+    {
+        return Ok(Fetched::Mismatch(sha));
+    }
+    let from = incoming.path().to_path_buf();
+    tokio::task::spawn_blocking(move || migrate_incoming(&from, &objects))
+        .await
+        .map_err(|_| RemoteError::Unavailable)?
+        .map_err(|_| RemoteError::Unavailable)?;
+    Ok(Fetched::Commit(sha))
+}
+
+/// Move what a completed transfer received into the clone's object store: loose objects, then
+/// packs with each pack's index last, so no reader finds an index before its pack. An object name
+/// already present is kept, since the name is the content. Temporary files and `.keep` files stay
+/// behind and are removed with the directory.
+fn migrate_incoming(incoming: &Path, objects: &Path) -> std::io::Result<()> {
+    let hex = |name: &str, len: usize| {
+        name.len() == len && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    for entry in std::fs::read_dir(incoming)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !hex(name, 2) || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let target = objects.join(name);
+        std::fs::create_dir_all(&target)?;
+        for object in std::fs::read_dir(entry.path())? {
+            let object = object?;
+            let file = object.file_name();
+            if let Some(file) = file.to_str().filter(|file| hex(file, 38)) {
+                place(&object.path(), &target.join(file))?;
+            }
+        }
+    }
+    let packs = incoming.join("pack");
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(&packs)? {
+        if let Some(name) = entry?.file_name().to_str() {
+            names.push(name.to_string());
+        }
+    }
+    let names = pack_files_in_order(names);
+    if !names.is_empty() {
+        std::fs::create_dir_all(objects.join("pack"))?;
+    }
+    for name in names {
+        place(&packs.join(&name), &objects.join("pack").join(&name))?;
+    }
+    Ok(())
+}
+
+/// The pack files to move, each index after every other file: an index is what makes a pack
+/// visible to a reader.
+fn pack_files_in_order(mut names: Vec<String>) -> Vec<String> {
+    names.retain(|name| name.starts_with("pack-") && !name.ends_with(".keep"));
+    names.sort_by(|a, b| (a.ends_with(".idx"), a).cmp(&(b.ends_with(".idx"), b)));
+    names
+}
+
+/// Link `from` into the store at `to`. A name already there is the same object and stays.
+fn place(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(from, to) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
     }
 }
 

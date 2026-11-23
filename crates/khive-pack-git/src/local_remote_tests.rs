@@ -789,6 +789,8 @@ async fn local_push_reconcile_requires_marker_and_exact_remote_without_credentia
     f.no_credential_read();
 }
 
+include!("local_remote_fetch_tests.rs");
+
 #[tokio::test]
 async fn local_file_url_rejects_decoded_controls_slashes_and_invalid_encoding() {
     for remote in [
