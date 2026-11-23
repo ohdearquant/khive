@@ -1144,6 +1144,11 @@ pub struct ExecSectionConfig {
     pub root: Option<String>,
     #[serde(default)]
     pub read_roots: Vec<String>,
+    /// Directories every run may read, write and load code from, kept between
+    /// runs and never captured into a run's output tree (a compiler's package
+    /// cache and build output). Absolute, outside `root`.
+    #[serde(default)]
+    pub cache_roots: Vec<String>,
     #[serde(default)]
     pub env: Vec<String>,
     #[serde(default)]

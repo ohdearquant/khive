@@ -1713,3 +1713,78 @@ Added arms:
     case red, leaves arm 59 green, and turns arm 65's loopback-address case red (refused naming `network` instead).
 
 Implementation of Amendments 13 and 14 follows acceptance of both and goes through the usual review and gates.
+
+## Amendment 15 (2026-11-21): cache roots, directories a run may write that outlive it
+
+**Status: Proposed 2026-11-21.** Additive. A host that configures no cache root is unaffected: its profile, its
+template digest and its receipts' existing keys are unchanged byte for byte.
+
+### Context
+
+Decision item 3 gives a run one writable place, its run directory, and the run directory is the unit of capture: it
+is walked after the run, a change outside the declared write paths fails the run, and a declared change is stored.
+That is right for a command whose output is the point. It is wrong for a build. A compiler writes a package cache and
+a build directory that are many times the size of the source tree, are worth keeping between runs and are not the
+run's result. Inside the run directory they are either undeclared changes that fail the run, or declared changes
+that are hashed and stored on every run and thrown away with the directory, so the next run starts cold.
+
+### Decision
+
+1. **Config.** `[exec] cache_roots` is a list of absolute directories. It is empty by default. Each entry is
+   canonicalized once at load, like a read root.
+2. **Profile.** For each cache root the profile grants what it grants the run directory: `file-read*`,
+   `file-read-metadata` (with the exact ancestor directories), `file-map-executable` and `file-write*`. Nothing else
+   in the profile changes. In particular there is still no network, and the version-control and `never` denials of
+   Amendment 9 apply to a binary under a cache root as they do anywhere.
+3. **Refusal.** A run is refused before materialization, with the reason, when a cache root is not absolute, when it
+   does not exist or cannot be resolved, when it holds the exec root or sits inside it, or when it equals, holds or
+   sits inside a read root. A cache root must exist when a run starts; the operator creates it. Entries are compared
+   in canonical form, so a symbolic link or a `..` component does not hide an overlap. An overlap with the exec root
+   would let one run write another run's directory, and an overlap with a read root would make a directory the
+   configuration calls read-only writable. The refusal names the entry and, for an overlap, the root it overlaps.
+   The check does not judge what else a cache root holds. A root that holds a home directory, a credential or a
+   store is the operator's error and is not refused.
+4. **Capture.** Nothing under a cache root is part of the run's output. It is not walked, not hashed, not stored, and
+   it is not removed when the run directory is.
+5. **Receipt and identity.** The receipt's `sandbox` object carries `cache_roots_digest`: the BLAKE3 hex of the
+   sorted canonical cache roots in the read roots' serialization (Amendment 1 item 7). `exec.identity` reports
+   `cache_roots` and the same digest. The digest of the empty list means the run had no cache root.
+
+### What a cache root costs
+
+A run with a cache root is not a function of its input tree. It can read what an earlier run left and it can change
+what a later run reads, and that includes code: a build script or a compiler plugin compiled by one run is loaded by
+the next. Two consequences follow, and an operator who configures a cache root accepts both.
+
+- **Runs that share a cache root share a trust boundary.** A cache root belongs to one principal. An operator who
+  serves two principals that must not influence each other gives them separate hosts or no cache root.
+- **A receipt with a non-empty `cache_roots_digest` does not prove its output from its input.** It proves the
+  output from the input and the cache's state, which is not recorded. Re-running against an empty cache root is the
+  way to check an output that matters.
+
+The operator also owns the cache root's size. It is outside the run directory, so the output cap and capture limits
+do not bound it. A quota on its volume does.
+
+### Acceptance
+
+68. **Profile, no cache root.** The write rule names the run directory alone.
+69. **Profile, one cache root.** The read, metadata, executable-map and write rules each name it, the metadata rule
+    names its exact ancestors, and no network operation appears.
+70. **Overlap.** A cache root equal to the exec root, holding it, inside it, or relative is refused with the reason.
+    A sibling directory is not (control).
+71. **Seatbelt.** Under the rendered profile a write into the run directory succeeds (control), a write into the
+    cache root succeeds and the file exists afterwards, a write into a sibling directory is refused, and the same
+    cache directory is refused under a profile rendered without it.
+72. **Run.** On a host with one cache root, a run that writes a file there succeeds with no changed and no
+    undeclared paths and an unchanged output tree, its receipt carries a `cache_roots_digest` other than the empty
+    list's, the file is on disk after the run directory is gone, and a second run reads it. On a host with no cache
+    root the same write fails and the receipt's digest is the empty list's.
+73. **Existence.** A cache root that does not exist is refused with a reason that names the entry and says it must
+    exist when a run starts. A sibling directory that exists is accepted (control).
+74. **Canonical form.** A cache root that is an alias, through a symbolic link, of a directory inside the exec root,
+    and a cache root written with `..` components that resolves inside the exec root, are each refused.
+75. **Read roots.** A cache root equal to a read root, holding one, or inside one is refused with a reason that names
+    both entries. A read root and a cache root that are siblings are accepted (control), including two names that
+    share only a text prefix.
+76. **Identity.** Without a configured cache root `exec.identity` reports an empty `cache_roots` and the digest of
+    the empty list. With one it reports the root and a different digest. This is checked without a sandbox.
