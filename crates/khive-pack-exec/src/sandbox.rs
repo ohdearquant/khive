@@ -444,37 +444,69 @@ pub fn cache_root_conflict(
     read_roots: &[PathBuf],
     cache_roots: &[PathBuf],
 ) -> Option<String> {
+    resolve_cache_roots(root, read_roots, cache_roots).err()
+}
+
+/// The cache roots a run starts with: each entry checked as
+/// [`cache_root_conflict`] describes, then returned in the canonical form the
+/// check compared, sorted and without duplicates. The profile grants these
+/// paths and the receipt's digest names them, so a directory created after the
+/// configuration was loaded, or named through a symbolic link, is granted
+/// under the path the sandbox matches rather than the text configured.
+pub fn resolve_cache_roots(
+    root: &Path,
+    read_roots: &[PathBuf],
+    cache_roots: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut resolved = Vec::with_capacity(cache_roots.len());
     for entry in cache_roots {
         if !entry.is_absolute() {
-            return Some(format!(
+            return Err(format!(
                 "[exec] cache_roots entry {entry:?} is not an absolute path"
             ));
         }
         let cache = match std::fs::canonicalize(entry) {
             Ok(cache) => cache,
             Err(error) => {
-                return Some(format!(
+                return Err(format!(
                     "[exec] cache_roots entry {entry:?} cannot be resolved ({error}); \
                      it must exist when a run starts"
                 ));
             }
         };
         if root.starts_with(&cache) || cache.starts_with(&root) {
-            return Some(format!(
+            return Err(format!(
                 "[exec] cache_roots entry {entry:?} overlaps the run root {root:?}"
             ));
         }
         for read in read_roots {
             let read_canonical = std::fs::canonicalize(read).unwrap_or_else(|_| read.clone());
             if read_canonical.starts_with(&cache) || cache.starts_with(&read_canonical) {
-                return Some(format!(
+                return Err(format!(
                     "[exec] cache_roots entry {entry:?} overlaps the read root {read:?}"
                 ));
             }
         }
+        resolved.push(cache);
     }
-    None
+    resolved.sort();
+    resolved.dedup();
+    Ok(resolved)
+}
+
+/// The configured cache roots in the canonical form they have now, sorted and
+/// without duplicates, for `exec.identity`: the form a run starting now would
+/// grant and digest. An entry that does not resolve keeps its configured text,
+/// and a run refuses it.
+pub fn current_cache_roots(cache_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut current: Vec<PathBuf> = cache_roots
+        .iter()
+        .map(|entry| std::fs::canonicalize(entry).unwrap_or_else(|_| entry.clone()))
+        .collect();
+    current.sort();
+    current.dedup();
+    current
 }
 
 /// Digest of the resolved cache roots, in the read roots' serialization.

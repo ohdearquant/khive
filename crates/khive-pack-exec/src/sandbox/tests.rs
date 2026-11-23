@@ -310,6 +310,58 @@ fn cache_roots_must_not_overlap_a_read_root() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn resolved_cache_roots_are_the_canonical_paths_the_check_compared() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let base = std::fs::canonicalize(dir.path()).expect("canonical base");
+    let root = base.join("runs");
+    let parent = base.join("parent");
+    for path in [&root, &parent] {
+        std::fs::create_dir_all(path).expect("fixture directory");
+    }
+    let alias = base.join("alias");
+    std::os::unix::fs::symlink(&parent, &alias).expect("symbolic link to the parent");
+    let configured = alias.join("cache");
+    let canonical = parent.join("cache");
+
+    // Not created yet: refused, and the current form keeps the configured text.
+    assert!(resolve_cache_roots(&root, &[], std::slice::from_ref(&configured)).is_err());
+    assert_eq!(
+        current_cache_roots(std::slice::from_ref(&configured)),
+        vec![configured.clone()]
+    );
+
+    std::fs::create_dir(&canonical).expect("cache root created after the configuration");
+    let resolved = resolve_cache_roots(&root, &[], &[configured.clone(), canonical.clone()])
+        .expect("both spellings resolve");
+    assert_eq!(
+        resolved,
+        vec![canonical.clone()],
+        "two spellings of one directory resolve to its canonical path once"
+    );
+    assert_eq!(
+        current_cache_roots(&[configured.clone(), canonical.clone()]),
+        resolved
+    );
+
+    let granted = format!("(subpath \"{}\")", canonical.display());
+    let named = format!("(subpath \"{}\")", configured.display());
+    let profile = render_profile(Path::new("/private/tmp/run-1"), &[], &resolved, &[]);
+    assert!(profile.contains(&granted), "{profile}");
+    assert!(!profile.contains(&named), "{profile}");
+    // Control: the configured text rendered as it stands names a path the
+    // sandbox never matches, and not the directory a write reaches.
+    let unresolved = render_profile(
+        Path::new("/private/tmp/run-1"),
+        &[],
+        std::slice::from_ref(&configured),
+        &[],
+    );
+    assert!(unresolved.contains(&named), "{unresolved}");
+    assert!(!unresolved.contains(&granted), "{unresolved}");
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn sandboxed_write_reaches_a_cache_root_and_nothing_beside_it() {
