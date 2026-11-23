@@ -959,8 +959,8 @@ The cross-pack source census classifies every current public Assertive handler e
 `knowledge.search` / `knowledge.suggest` / `knowledge.compose` (persistent ANN
 consumer/checkpoint maintenance), `git.checkout` / `git.diff` / `git.reconcile` (a durable receipt
 on every dispatch), `tool.check` (a required policy decision receipt), `git.receipts` /
-`git.gates` / `git.status` / `git.log` (each runs that policy check first, so it carries the
-same receipt write) and `telemetry.channels` / `telemetry.counts` / `telemetry.emit` /
+`git.gates` / `git.status` / `git.log` / `git.pr_state` (each runs that policy check first, so it
+carries the same receipt write) and `telemetry.channels` / `telemetry.counts` / `telemetry.emit` /
 `telemetry.read` (telemetry answers that must refuse when their audit cannot be recorded) remain
 explicitly fail-closed. A new Assertive handler is not
 eligible until its side effects are reviewed and the closed census is updated.

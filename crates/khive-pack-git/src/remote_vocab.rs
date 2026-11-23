@@ -91,3 +91,11 @@ pub(crate) const PR_MERGE: HandlerDef = HandlerDef {
         SESSION,
     ],
 };
+
+pub(crate) const PR_STATE: HandlerDef = HandlerDef {
+    name: "git.pr_state",
+    description: "Read what the platform says about one pull request: state, merged, draft, opener, head and base, the platform's own mergeable and mergeable_state, the check runs and commit statuses at the head, and each reviewer's latest decisive review with whether it is at the head. Reads with the dispatching actor's credential after the allowlist match and the policy decision; local mappings refuse remote_scheme before any credential read. Writes no receipt and returns no verdict: a required-check ruling is the caller's read of the rows. Check runs are the platform's latest per name, at most 500, with total and truncated. A combined status with total 0 says pending and means no status was posted. Names are returned with control and format characters removed and bounded in length; text_altered says when that changed one.",
+    visibility: Visibility::Verb,
+    category: VerbCategory::Assertive,
+    params: &[REPO, NUMBER],
+};
