@@ -1157,3 +1157,74 @@ then lands with every object it reaches and a new pack in the clone (control); 7
 on a constructed directory, moves loose objects and pack files, keeps an object the store already
 holds, orders each pack index after the other pack files, and leaves temporary, `.keep` and non-object
 files behind.
+
+## Amendment 17 (2026-11-23): editing and closing a pull request
+
+**Status**: Accepted 2026-11-23. The ADR's Accepted status and every amendment above stand unchanged.
+
+Adopted from a reading of a real caller, as Amendments 8, 15 and 16 were. A client with no shell opens
+a pull request through `git.pr_open` and then cannot correct its description or withdraw it: the title
+and body are fixed at the moment of opening, and a pull request that a later one supersedes stays open
+until someone with the platform's own tools closes it. These two acts enter here, under the same gates
+as the other pull request writes.
+
+1. **`git.pr_edit(repo, number, expected_head, title?, body?)`.** At least one of `title` and `body`
+   is required; a title may not be empty, a body may. Only the fields given are sent, so an omitted one
+   keeps its current text. The pull request may be open, closed or merged: a description is corrected
+   after the fact as often as before. The result is `number`, `head_sha`, `state`, `edited` (the field
+   names sent), `authority` and `receipt_id`.
+2. **`git.pr_close(repo, number, expected_head)`.** Closes an open pull request without merging it. A
+   closed or merged one refuses `pull_request_closed`. The head branch is left in place; deleting a
+   branch is not part of this verb. The result is `number`, `head_sha`, `state`, `authority` and
+   `receipt_id`.
+3. **Gated and credentialed like `git.pr_review`.** The order is arguments, the repo-only allowlist
+   match, `tool.check` for the verb, the repository mapping, the dispatching actor's credential, the
+   platform account, the repository's name and visibility, then the pull request read. A local mapping
+   refuses `remote_scheme` before any credential is resolved. The head the platform reports must equal
+   `expected_head` or the call refuses `expected_head_mismatch` before any write, the same binding the
+   other pull request writes carry.
+4. **Only the opener changes a pull request, unless policy says otherwise.** The caller is the opener
+   when its platform login is the pull request's author, or when a `git.pr_open` receipt for this
+   repository and number belongs to this actor or this credential reference (the evidence the review
+   and merge refusals already use). Anyone else needs the `<verb>.others` policy row
+   (`git.pr_edit.others`, `git.pr_close.others`), checked as the fork rows of Amendment 3 are; without
+   it the call refuses `not_opener` before any write, with the decision on the receipt. `authority` in
+   the result says which of the three admitted the call: `platform_login`, `pr_open_receipt` or
+   `policy` with the policy decision.
+5. **The reply must show the change.** Each verb is one `PATCH` of the pull request. For an edit the
+   reply must carry every sent field as sent (the platform answers an empty body as null, read as
+   empty); for a close it must say closed and not merged; for both it must name the same number. A
+   reply that does not leaves the receipt unknown with `remote_response`, because the change may or may
+   not have landed. A reply whose head differs from `expected_head` (the head moved between the read
+   and the write) leaves it unknown with `changed_head_mismatch`: the change landed on a head the caller
+   did not name.
+6. **`git.reconcile` leaves both unknown.** As with `git.pr_open` and `git.pr_review`, a title, a body
+   or a closed state can be the work of anyone, so reading the pull request cannot show that this
+   receipt caused it. Reconcile returns the receipt unchanged without resolving a credential or
+   touching the platform.
+7. **Both are writes.** Each writes a receipt and an audit row, and the operation classifier lists
+   them with `git.pr_review` (version 30).
+
+What this does not cover: reopening a closed pull request, changing its base branch, draft state,
+labels, reviewers or assignees, and deleting the head branch. Comments are not edited or written by
+these verbs.
+
+Acceptance arms added: 73 the opener's edit of title and body is one `PATCH` of `pulls/<N>` carrying
+exactly those two fields, the platform then holds both, `edited` names them, `authority` is
+`platform_login` and the receipt is committed; 74 an edit of the body alone sends only `body`, an empty
+body reads back from the platform's null, and the title is unchanged; 75 an edit naming neither field,
+an empty title and a non-string title each refuse `invalid_params` with no platform request; 76 a
+caller that did not open the pull request refuses `not_opener` for each verb with the policy decision
+on the receipt and no write, and the same call succeeds once `<verb>.others` allows it, naming that
+policy row (control); 77 an opener whose platform login is not the pull request's author is admitted
+by its `git.pr_open` receipt, and the account the platform names refuses `not_opener` (control); 78 a
+close leaves the pull request closed and unmerged, a second close and a close of a merged pull request
+refuse `pull_request_closed`, and an edit of the closed pull request succeeds (control); 79 a stale
+`expected_head` refuses `expected_head_mismatch` for each verb with nothing changed; 80 a head that
+moves between the read and the write leaves the receipt unknown with `changed_head_mismatch` and the
+head the platform reported, and a lost reply leaves a close unknown; 81 a reply carrying another title,
+a non-string body, an open state, a merged flag or another number each leave the receipt unknown with
+`remote_response`; 82 `git.reconcile` returns an unknown edit or close receipt unchanged with no
+platform request and no credential read; 83 a local mapping refuses each verb `remote_scheme` with no
+credential read, and the classifier lists both as writes at version 30 with every published verb
+total counting them.

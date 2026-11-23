@@ -85,6 +85,7 @@ struct State {
     api_failure: bool,
     rate_limited: Option<u64>,
     malformed_merge_reply: bool,
+    patch_reply: Option<Value>,
     review_decision: Value,
     decision_head: Option<String>,
     check_runs: Vec<Value>,
@@ -200,7 +201,8 @@ impl RemoteTransport for Recording {
         }
         if path == format!("repos/{SLUG}/pulls") && request.method == "POST" {
             let n = s.prs.len() as u64 + 1;
-            let pr = json!({"number":n,"html_url":format!("https://github.com/{SLUG}/pull/{n}"),"state":"open","merged":false,"head":{"sha":s.head,"ref":"work","repo":{"full_name":if s.fork{"fork/project"}else{SLUG}}},"base":{"repo":{"full_name":SLUG}},"user":{"login":s.author}});
+            let opened = request.body.clone().unwrap_or(Value::Null);
+            let pr = json!({"number":n,"html_url":format!("https://github.com/{SLUG}/pull/{n}"),"state":"open","merged":false,"title":opened["title"],"body":opened["body"],"head":{"sha":s.head,"ref":"work","repo":{"full_name":if s.fork{"fork/project"}else{SLUG}}},"base":{"repo":{"full_name":SLUG}},"user":{"login":s.author}});
             s.prs.insert(n, pr.clone());
             s.writes += 1;
             return Ok(pr);
@@ -271,6 +273,28 @@ impl RemoteTransport for Recording {
                 return Ok(json!({"sha":"d".repeat(40)}));
             }
             return Ok(json!({"merged":true,"sha":"d".repeat(40)}));
+        }
+        if request.method == "PATCH" {
+            // The head may move between the read and the write, as on the platform.
+            if let Some(sha) = s.merge_race.take() {
+                s.prs.get_mut(&n).unwrap()["head"]["sha"] = json!(sha);
+            }
+            let body = request.body.unwrap();
+            let pr = s.prs.get_mut(&n).ok_or(RemoteError::Refused)?;
+            for (field, value) in body.as_object().unwrap() {
+                // The platform stores an empty body as null.
+                pr[field] = if field == "body" && value == "" {
+                    Value::Null
+                } else {
+                    value.clone()
+                };
+            }
+            let pr = pr.clone();
+            s.writes += 1;
+            if s.lost_ack {
+                return Err(RemoteError::Unknown);
+            }
+            return Ok(s.patch_reply.take().unwrap_or(pr));
         }
         s.prs.get(&n).cloned().ok_or(RemoteError::Refused)
     }
@@ -421,6 +445,7 @@ impl Fixture {
                 api_failure: false,
                 rate_limited: None,
                 malformed_merge_reply: false,
+                patch_reply: None,
                 review_decision: json!("APPROVED"),
                 decision_head: None,
                 check_runs: vec![],
@@ -457,6 +482,8 @@ impl Fixture {
                 "git.pr_open",
                 "git.pr_review",
                 "git.pr_merge",
+                "git.pr_edit",
+                "git.pr_close",
                 "git.reconcile",
             ] {
                 f.policy(actor, verb, "allow").await;
@@ -573,5 +600,7 @@ include!("remote_tests/pull_request_state_tests.rs");
 include!("remote_tests/outcome_reconciliation_tests.rs");
 
 include!("remote_tests/schema_and_effect_controls_tests.rs");
+
+include!("remote_tests/pull_request_change_tests.rs");
 
 include!("remote_tests/fetch_credential_tests.rs");

@@ -479,6 +479,79 @@
     ],
     "additionalProperties": false
   },
+  "git.pr_edit": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "number": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "title": {
+        "type": "string",
+        "minLength": 1
+      },
+      "body": {
+        "type": "string"
+      },
+      "expected_head": {
+        "type": "string",
+        "pattern": "^[a-fA-F0-9]{40}$"
+      },
+      "session_id": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "required": [
+      "repo",
+      "number",
+      "expected_head"
+    ],
+    "anyOf": [
+      {
+        "required": [
+          "title"
+        ]
+      },
+      {
+        "required": [
+          "body"
+        ]
+      }
+    ],
+    "additionalProperties": false
+  },
+  "git.pr_close": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "number": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "expected_head": {
+        "type": "string",
+        "pattern": "^[a-fA-F0-9]{40}$"
+      },
+      "session_id": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "required": [
+      "repo",
+      "number",
+      "expected_head"
+    ],
+    "additionalProperties": false
+  },
   "git.pr_state": {
     "type": "object",
     "properties": {

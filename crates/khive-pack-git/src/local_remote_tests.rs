@@ -179,6 +179,8 @@ impl Fixture {
                 "git.pr_open",
                 "git.pr_review",
                 "git.pr_merge",
+                "git.pr_edit",
+                "git.pr_close",
                 "git.gates",
                 "git.reconcile",
             ] {
@@ -571,6 +573,11 @@ async fn local_pr_verbs_refuse_remote_scheme_before_credentials() {
             "git.pr_merge",
             json!({"number":1,"method":"merge","subject":"Fixture","body":"","expected_head":f.head}),
         ),
+        (
+            "git.pr_edit",
+            json!({"number":1,"title":"Fixture","expected_head":f.head}),
+        ),
+        ("git.pr_close", json!({"number":1,"expected_head":f.head})),
     ] {
         let receipt = f.refusal(verb, params, "remote_scheme").await;
         assert_eq!(receipt.credential, json!({"source":"none"}));
