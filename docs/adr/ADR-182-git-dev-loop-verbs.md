@@ -187,7 +187,10 @@ item 1 is amended again in item 3.
    receipt, error or table row carries a credential value.
 8. **Trees and diffs.** `git.checkout(repo, ref)` returns `{commit, tree}` from `rev-parse`,
    `ls-tree -r` and bounded `cat-file --batch` blob reads, falling back to `cat-file blob` for
-   exceptional object responses; symlink and submodule entries refuse. `git.diff(repo, input_kind,
+   exceptional object responses; symlink and submodule entries refuse. Each blob is hashed first and
+   written only when the store does not already hold it (2026-11-23), so a checkout does not refresh
+   the publish grace ([ADR-111](ADR-111-blob-store.md) §8) of an object the store already held.
+   `git.diff(repo, input_kind,
    base, head)` with `input_kind` `commits` or `trees` runs `git diff-tree -p
    --no-ext-diff --no-textconv --no-color --no-renames <base> <head>` and `--numstat` for
    `summary: {files, additions, deletions}`; tree inputs are written to a scratch repository with

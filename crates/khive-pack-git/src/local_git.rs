@@ -753,7 +753,15 @@ pub(crate) async fn checkout_reusing(
             .expect("nonempty tree has a blob reader")
             .next()
             .await?;
-        let content_ref = store.put(frame.bytes).await?;
+        // A blob the store already holds is not written again: a `put` of known bytes
+        // still makes its refresh durable, and on a repeat checkout that is most of the cost.
+        // The object's publish grace is therefore not refreshed (ADR-182 Amendment 2, item 8).
+        let digest = ContentRef::from_digest_bytes(blake3::hash(&frame.bytes).as_bytes());
+        let content_ref = if store.exists(&digest).await? {
+            digest
+        } else {
+            store.put(frame.bytes).await?
+        };
         frame
             .consumed
             .send(())
