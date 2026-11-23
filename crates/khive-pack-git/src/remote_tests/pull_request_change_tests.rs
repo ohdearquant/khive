@@ -82,7 +82,14 @@ async fn an_edit_naming_nothing_or_an_empty_title_refuses_before_any_platform_ca
     let f = Fixture::new(true, None).await;
     let n = f.open().await;
     let calls = f.remote.state.lock().unwrap().calls.len();
-    for fields in [json!({}), json!({"title":""}), json!({"title":7})] {
+    for fields in [
+        json!({}),
+        json!({"title":""}),
+        json!({"title":7}),
+        json!({"title":" Padded"}),
+        json!({"title":"Padded "}),
+        json!({"title":"Two\nlines"}),
+    ] {
         let error = f
             .call(&f.actor, "git.pr_edit", edit(&f, n, fields.clone()))
             .await

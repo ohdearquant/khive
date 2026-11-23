@@ -1175,7 +1175,9 @@ as the other pull request writes.
    is required; a title may not be empty, a body may. Only the fields given are sent, so an omitted one
    keeps its current text. The pull request may be open, closed or merged: a description is corrected
    after the fact as often as before. The result is `number`, `head_sha`, `state`, `edited` (the field
-   names sent), `authority` and `receipt_id`.
+   names sent), `authority` and `receipt_id`. A title also may not start or end with whitespace or
+   hold a control character such as a line break (2026-11-23): item 5 compares the reply with the
+   title as sent, so a title the platform stored altered would leave an edit that landed unknown.
 2. **`git.pr_close(repo, number, expected_head)`.** Closes an open pull request without merging it. A
    closed or merged one refuses `pull_request_closed`. The head branch is left in place; deleting a
    branch is not part of this verb. The result is `number`, `head_sha`, `state`, `authority` and
@@ -1193,7 +1195,9 @@ as the other pull request writes.
    (`git.pr_edit.others`, `git.pr_close.others`), checked as the fork rows of Amendment 3 are; without
    it the call refuses `not_opener` before any write, with the decision on the receipt. `authority` in
    the result says which of the three admitted the call: `platform_login`, `pr_open_receipt` or
-   `policy` with the policy decision.
+   `policy` with the policy decision. The `.others` rows also cover a pull request opened from a fork
+   (2026-11-23). There is no separate fork row like the ones that guard an approval or a merge
+   (Amendment 1 item 3), because neither an edit nor a close brings a fork's code into the repository.
 5. **The reply must show the change.** Each verb is one `PATCH` of the pull request. For an edit the
    reply must carry every sent field as sent (the platform answers an empty body as null, read as
    empty); for a close it must say closed and not merged; for both it must name the same number. A
@@ -1216,7 +1220,8 @@ Acceptance arms added: 73 the opener's edit of title and body is one `PATCH` of 
 exactly those two fields, the platform then holds both, `edited` names them, `authority` is
 `platform_login` and the receipt is committed; 74 an edit of the body alone sends only `body`, an empty
 body reads back from the platform's null, and the title is unchanged; 75 an edit naming neither field,
-an empty title and a non-string title each refuse `invalid_params` with no platform request; 76 a
+an empty title, a non-string title, and (2026-11-23) a title with leading or trailing whitespace or a
+line break each refuse `invalid_params` with no platform request; 76 a
 caller that did not open the pull request refuses `not_opener` for each verb with the policy decision
 on the receipt and no write, and the same call succeeds once `<verb>.others` allows it, naming that
 policy row (control); 77 an opener whose platform login is not the pull request's author is admitted

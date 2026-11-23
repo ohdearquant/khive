@@ -107,13 +107,13 @@ pub(crate) const PR_MERGE: HandlerDef = HandlerDef {
 
 pub(crate) const PR_EDIT: HandlerDef = HandlerDef {
     name: "git.pr_edit",
-    description: "Change a pull request's title, body or both, bound to expected_head. At least one of title and body is required; a title may not be empty, a body may. Works on open, closed and merged pull requests. The caller must have opened the pull request (the same platform account, or a git.pr_open receipt of this actor or credential reference); anyone else needs git.pr_edit.others, and without it the act refuses not_opener before any platform write. Local mappings refuse remote_scheme before any credential read; PR verbs require HTTPS. The reply must show the supplied text and the expected head, or the receipt stays unknown, and git.reconcile leaves it unknown. Returns number, head_sha, state, edited, authority and receipt_id.",
+    description: "Change a pull request's title, body or both, bound to expected_head. At least one of title and body is required; a title may not be empty, start or end with whitespace, or hold a control character, a body may be empty. Works on open, closed and merged pull requests. The caller must have opened the pull request (the same platform account, or a git.pr_open receipt of this actor or credential reference); anyone else needs git.pr_edit.others, and without it the act refuses not_opener before any platform write. Local mappings refuse remote_scheme before any credential read; PR verbs require HTTPS. The reply must show the supplied text and the expected head, or the receipt stays unknown, and git.reconcile leaves it unknown. Returns number, head_sha, state, edited, authority and receipt_id.",
     visibility: Visibility::Verb,
     category: VerbCategory::Commissive,
     params: &[
         REPO,
         NUMBER,
-        p("title", "string", false, "New title. Omit to keep the current one; empty is invalid."),
+        p("title", "string", false, "New title. Omit to keep the current one; empty, surrounding whitespace and control characters are invalid."),
         p("body", "string", false, "New body. Omit to keep the current one; may be empty."),
         HEAD,
         SESSION,

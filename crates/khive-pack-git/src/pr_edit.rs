@@ -25,9 +25,18 @@ pub(super) struct Opened<'a> {
 }
 
 /// The PATCH body for `git.pr_edit`: the fields the caller supplied, as supplied.
+///
+/// The reply must carry each field as sent, so a title the platform could store altered
+/// (surrounding whitespace, a line break or another control character) is refused here: its
+/// edit could land and still leave the receipt unknown.
 fn edit_fields(params: &Value) -> Result<Map<String, Value>, Failure> {
     let mut fields = Map::new();
     if let Some(title) = optional(params, "title")? {
+        if title.trim() != title || title.chars().any(char::is_control) {
+            return Err(Failure::invalid(
+                "title must not start or end with whitespace or hold a control character",
+            ));
+        }
         fields.insert("title".into(), json!(title));
     }
     if let Some(body) = params.get("body") {
@@ -149,5 +158,35 @@ impl GitPack {
             return Err(Failure::unknown("changed_head_mismatch"));
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate;
+    use serde_json::json;
+
+    fn reason(title: &str) -> Option<&'static str> {
+        let params = json!({"number": 1, "title": title, "expected_head": "a".repeat(40)});
+        validate("git.pr_edit", &params)
+            .err()
+            .map(|failure| failure.reason)
+    }
+
+    #[test]
+    fn a_title_the_platform_could_store_altered_is_refused() {
+        for title in [
+            " leading",
+            "trailing ",
+            "   ",
+            "\ttab",
+            "two\nlines",
+            "carriage\rreturn",
+        ] {
+            assert_eq!(reason(title), Some("invalid_params"), "{title:?}");
+        }
+        for title in ["Plain title", "Inner  spaces stay", "fix(git): one word"] {
+            assert_eq!(reason(title), None, "{title:?}");
+        }
     }
 }
