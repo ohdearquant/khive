@@ -15,6 +15,7 @@ const fn param(name: &'static str, required: bool, description: &'static str) ->
 pub(crate) const BRANCH: ParamDef = param("branch", false, "Target branch; required for a tree commit. Its head must equal expected_head at the atomic ref update.");
 pub(crate) const TREE: ParamDef = param("tree", false, "Complete khive-tree/v1 manifest reference. Mutually exclusive with paths; author, actor and credential overrides are refused.");
 pub(crate) const EXPECTED_HEAD: ParamDef = param("expected_head", false, "Required 40-hex parent SHA for a tree commit. Null is refused. Ref update compares the current head atomically against this value.");
+pub(crate) const MERGE_PARENT: ParamDef = param("merge_parent", false, "Optional 40-hex second parent for a tree commit that takes in another line of history; the tree is the caller's resolved result. It must be an existing commit, the current tip of a remote-tracking ref (refs/remotes/*), and not already in expected_head's history. expected_head stays the first parent. Null is refused.");
 pub(crate) const SESSION: ParamDef = param(
     "session_id",
     false,

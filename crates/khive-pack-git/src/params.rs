@@ -68,6 +68,7 @@ arguments!(Commit {
     tree,
     branch,
     expected_head,
+    merge_parent,
     session_id
 });
 arguments!(Branch {
