@@ -36,7 +36,7 @@ An always-machine-readable copy of this page is at
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
-`kkernel git-ingest` CLI drive. Its twenty-one verbs are `git.digest` (read/ingest), `git.ingest_cursor` (a read of the
+`kkernel git-ingest` CLI drive. Its 21 verbs are `git.digest` (read/ingest), `git.ingest_cursor` (a read of the
 stored ingest cursor and checkpoint for one project and source kind), the four
 write verbs `git.commit` / `git.branch` / `git.update_ref` / `git.push` (ADR-108) that shell to system git
 with hardened, allowlisted argv construction, the three read verbs `git.status` /
