@@ -362,6 +362,63 @@ fn resolved_cache_roots_are_the_canonical_paths_the_check_compared() {
     assert!(!unresolved.contains(&granted), "{unresolved}");
 }
 
+#[cfg(unix)]
+#[test]
+fn a_cache_root_through_a_link_a_run_can_write_is_refused() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let base = std::fs::canonicalize(dir.path()).expect("canonical base");
+    let root = base.join("runs");
+    let shared = base.join("shared");
+    let target = base.join("target");
+    for path in [&root, &shared, &target.join("sub")] {
+        std::fs::create_dir_all(path).expect("fixture directory");
+    }
+    let in_cache = shared.join("link");
+    std::os::unix::fs::symlink(&target, &in_cache).expect("link inside a cache root");
+    let in_run_root = root.join("link");
+    std::os::unix::fs::symlink(&target, &in_run_root).expect("link inside the run root");
+    let outside = base.join("alias");
+    std::os::unix::fs::symlink(&target, &outside).expect("link where no run writes");
+
+    // Control: a link outside the run root and every cache root is followed.
+    assert_eq!(
+        resolve_cache_roots(&root, &[], std::slice::from_ref(&outside)),
+        Ok(vec![target.clone()])
+    );
+    assert_eq!(
+        resolve_cache_roots(&root, &[], &[shared.clone(), outside.clone()]),
+        Ok(vec![shared.clone(), target.clone()])
+    );
+
+    let refused = [
+        (
+            "a link inside another cache root",
+            vec![shared.clone(), in_cache.clone()],
+            &in_cache,
+            &shared,
+        ),
+        (
+            "a link inside another cache root, as a middle component",
+            vec![shared.clone(), in_cache.join("sub")],
+            &in_cache,
+            &shared,
+        ),
+        (
+            "a link inside the run root",
+            vec![in_run_root.clone()],
+            &in_run_root,
+            &root,
+        ),
+    ];
+    for (why, entries, link, holder) in refused {
+        let message =
+            resolve_cache_roots(&root, &[], &entries).expect_err(&format!("{why} must be refused"));
+        assert!(message.contains(&format!("{link:?}")), "{why}: {message}");
+        assert!(message.contains(&format!("{holder:?}")), "{why}: {message}");
+        assert!(message.contains("symbolic link"), "{why}: {message}");
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn sandboxed_write_reaches_a_cache_root_and_nothing_beside_it() {

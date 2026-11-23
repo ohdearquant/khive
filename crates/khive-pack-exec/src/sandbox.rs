@@ -490,9 +490,57 @@ pub fn resolve_cache_roots(
         }
         resolved.push(cache);
     }
+    // Resolving at run start follows each link on the entry's path as it is
+    // now. A link a run can write could be pointed elsewhere by one run, and
+    // the next run would be granted write wherever it points, so an entry that
+    // passes through such a link is refused. A link where no run can write is
+    // followed.
+    for entry in cache_roots {
+        if let Some((link, holder)) = writable_link_on_path(entry, &root, &resolved) {
+            return Err(format!(
+                "[exec] cache_roots entry {entry:?} passes through the symbolic link {link:?}, \
+                 which sits inside {holder} where a run can point it elsewhere"
+            ));
+        }
+    }
     resolved.sort();
     resolved.dedup();
     Ok(resolved)
+}
+
+/// The first symbolic link on `entry`'s path, the last component included,
+/// whose own location is inside the run root or inside a resolved cache root,
+/// with that root named. A link's location is its parent's canonical path
+/// joined with its name, so the comparison is with where the link itself sits,
+/// not with where it points.
+fn writable_link_on_path(
+    entry: &Path,
+    root: &Path,
+    cache_roots: &[PathBuf],
+) -> Option<(PathBuf, String)> {
+    let mut prefix = PathBuf::new();
+    for component in entry.components() {
+        prefix.push(component);
+        let is_link = std::fs::symlink_metadata(&prefix)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_link {
+            continue;
+        }
+        let (Some(parent), Some(name)) = (prefix.parent(), prefix.file_name()) else {
+            continue;
+        };
+        let location = std::fs::canonicalize(parent)
+            .unwrap_or_else(|_| parent.to_path_buf())
+            .join(name);
+        if location.starts_with(root) {
+            return Some((prefix, format!("the run root {root:?}")));
+        }
+        if let Some(cache) = cache_roots.iter().find(|cache| location.starts_with(cache)) {
+            return Some((prefix, format!("the cache root {cache:?}")));
+        }
+    }
+    None
 }
 
 /// The configured cache roots in the canonical form they have now, sorted and
