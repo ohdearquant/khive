@@ -646,3 +646,541 @@ fn sandboxed_unix_sockets_reach_the_run_and_its_temporary_directory_only() {
         "a loopback connect must stay refused"
     );
 }
+
+#[test]
+fn profile_metadata_names_the_root_links_and_nothing_under_them() {
+    let profile = render_profile(Path::new("/private/tmp/run-1"), &[], &[], &[]);
+    let metadata_rule = profile
+        .lines()
+        .find(|line| line.trim_start().starts_with("(allow file-read-metadata "))
+        .expect("scoped metadata rule");
+    for link in SYSTEM_ROOT_LINKS {
+        assert!(metadata_rule.contains(&format!("(literal \"{link}\")")));
+        assert!(!profile.contains(&format!("(subpath \"{link}\")")));
+    }
+    assert!(!profile.contains("(subpath \"/private/var\")"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn system_files_resolve_through_the_root_links() {
+    if !Path::new(SANDBOX_EXEC).exists() {
+        return;
+    }
+    let run = tempfile::tempdir().expect("run directory");
+    let run_dir = std::fs::canonicalize(run.path()).expect("canonical run directory");
+    let profile_path = run_dir.join("profile.sb");
+    std::fs::write(&profile_path, render_profile(&run_dir, &[], &[], &[])).expect("write profile");
+    let reads = |path: &str| {
+        std::process::Command::new(SANDBOX_EXEC)
+            .arg("-f")
+            .arg(&profile_path)
+            .arg("/bin/cat")
+            .arg(path)
+            .output()
+            .expect("launch sandboxed cat")
+            .status
+            .success()
+    };
+    assert!(reads("/private/etc/hosts"), "resolved-path control");
+    assert!(reads("/etc/hosts"), "read through the /etc link");
+    if Path::new("/usr/share/zoneinfo/UTC").exists() {
+        assert!(reads("/usr/share/zoneinfo/UTC"), "read through /var");
+    }
+    // The links open nothing the roots do not: a log under /private/var stays refused by either name.
+    if Path::new("/private/var/log/install.log").exists() {
+        assert!(!reads("/private/var/log/install.log"));
+        assert!(!reads("/var/log/install.log"));
+    }
+    let lists = std::process::Command::new(SANDBOX_EXEC)
+        .arg("-f")
+        .arg(&profile_path)
+        .arg("/bin/ls")
+        .arg("/var/")
+        .output()
+        .expect("launch sandboxed ls")
+        .status
+        .success();
+    assert!(!lists, "the directory behind /var does not list");
+}
+
+#[test]
+fn profile_reads_the_system_tool_directory_and_no_neighbour() {
+    let profile = render_profile(Path::new("/private/tmp/run-1"), &[], &[], &[]);
+    let rule = |head: &str| {
+        profile
+            .lines()
+            .find(|line| line.trim_start().starts_with(head))
+            .unwrap_or_else(|| panic!("no rule starting {head}"))
+            .to_string()
+    };
+    assert!(rule("(allow file-read* ").contains("(subpath \"/bin\")"));
+    assert!(rule("(allow file-read-metadata ").contains("(subpath \"/bin\")"));
+    // Code loading is as it was: the launch of a tool there never needed it.
+    assert!(!rule("(allow file-map-executable ").contains("\"/bin\""));
+    assert!(!rule("(allow file-write* ").contains("\"/bin\""));
+    for neighbour in ["/sbin", "/opt", "/Applications", "/Users"] {
+        assert!(!profile.contains(&format!("(subpath \"{neighbour}\")")));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_shell_finds_a_system_tool_by_name() {
+    if !Path::new(SANDBOX_EXEC).exists() {
+        return;
+    }
+    let run = tempfile::tempdir().expect("run directory");
+    let run_dir = std::fs::canonicalize(run.path()).expect("canonical run directory");
+    let rendered = render_profile(&run_dir, &[], &[], &[]);
+    let profile_path = run_dir.join("profile.sb");
+    std::fs::write(&profile_path, &rendered).expect("write profile");
+    // Control: the same profile with the `/bin` root taken out of both rules,
+    // which is the template as it was before the root was added.
+    let before = rendered.replace(" (subpath \"/bin\")", "");
+    assert_eq!(rendered.matches(" (subpath \"/bin\")").count(), 2);
+    let control_path = run_dir.join("control.sb");
+    std::fs::write(&control_path, &before).expect("write control profile");
+    let shell = |profile: &Path, script: &str| {
+        std::process::Command::new(SANDBOX_EXEC)
+            .arg("-f")
+            .arg(profile)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(&run_dir)
+            .output()
+            .expect("launch sandboxed shell")
+    };
+
+    let made = shell(&profile_path, "mkdir by-name && command -v mkdir");
+    assert!(
+        made.status.success(),
+        "mkdir by name: {}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&made.stdout).trim(), "/bin/mkdir");
+    assert!(run_dir.join("by-name").is_dir());
+
+    let control = shell(&control_path, "mkdir control-by-name");
+    assert_eq!(
+        control.status.code(),
+        Some(127),
+        "without the root the shell does not find it: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    assert!(!run_dir.join("control-by-name").exists());
+    // The control's refusal is the search and not the launch.
+    assert!(shell(&control_path, "/bin/mkdir control-by-path")
+        .status
+        .success());
+
+    // The root opens that directory and no neighbour.
+    assert!(shell(&profile_path, "ls /bin").status.success());
+    assert!(!shell(&profile_path, "ls /sbin").status.success());
+    assert!(!shell(&profile_path, "mkdir /bin/khive-no-such-dir")
+        .status
+        .success());
+}
+
+fn tool_profile(cfg: ExecToolProfileConfig, user_cache: Option<&str>) -> ToolProfile {
+    resolve_tool_profile(&cfg, user_cache.map(PathBuf::from))
+}
+
+fn named(tool: &str) -> ExecToolProfileConfig {
+    ExecToolProfileConfig {
+        tool: tool.into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_run_with_no_tool_profile_gets_the_template_byte_for_byte() {
+    let run = Path::new("/private/tmp/run-1");
+    let roots = [PathBuf::from("/opt/py")];
+    let cache = [PathBuf::from("/Volumes/work/cache")];
+    let template = render_profile(run, &roots, &cache, &[]);
+    assert_eq!(
+        render_profile_for_tool(run, &roots, &cache, &[], None),
+        template
+    );
+    // A profile that turns nothing on adds nothing either.
+    let empty = tool_profile(named("sh-empty"), Some("/private/var/folders/aa/bb/C"));
+    assert_eq!(render_tool_rules(&empty), "");
+    assert_eq!(
+        render_profile_for_tool(run, &roots, &cache, &[], Some(&empty)),
+        template
+    );
+}
+
+#[test]
+fn metal_rules_name_the_device_the_compiler_and_metals_own_cache_folder() {
+    let profile = tool_profile(
+        ExecToolProfileConfig {
+            metal: true,
+            ..named("sh-gpu")
+        },
+        Some("/private/var/folders/aa/bb/C"),
+    );
+    assert_eq!(
+        profile.metal_cache.as_deref(),
+        Some(Path::new("/private/var/folders/aa/bb/C/com.apple.metal"))
+    );
+    let rules = render_tool_rules(&profile);
+    assert!(
+        rules.contains("(allow iokit-open (iokit-user-client-class \"AGXDeviceUserClient\"))\n")
+    );
+    assert!(rules.contains(
+        "(allow mach-lookup (global-name \"com.apple.MTLCompilerService\") (global-name \"com.apple.bsd.dirhelper\"))\n"
+    ));
+    assert!(rules.contains(
+        "(allow file-read* file-write* (subpath \"/private/var/folders/aa/bb/C/com.apple.metal\"))\n"
+    ));
+    // The user's cache folder is named for traversal only: nothing in it but
+    // Metal's own folder is readable or writable.
+    let metadata = rules
+        .lines()
+        .find(|line| line.starts_with("(allow file-read-metadata "))
+        .expect("metadata rule");
+    for literal in [
+        "(literal \"/private/var/folders/aa/bb/C\")",
+        "(literal \"/private/var/folders/aa/bb\")",
+        "(literal \"/private/var/folders\")",
+        "(literal \"/var\")",
+    ] {
+        assert!(metadata.contains(literal), "{literal} missing: {metadata}");
+    }
+    assert!(!rules.contains("(subpath \"/private/var/folders/aa/bb/C\")"));
+    assert!(!rules.contains("network"));
+    assert_eq!(rules.matches("iokit-open").count(), 1);
+    assert_eq!(rules.matches("mach-lookup").count(), 1);
+
+    // Off means off: the same entry without `metal` names no device.
+    let off = tool_profile(named("sh-gpu"), Some("/private/var/folders/aa/bb/C"));
+    assert_eq!(off.metal_cache, None);
+    assert!(!render_tool_rules(&off).contains("iokit"));
+}
+
+/// The `unix_sockets` key loads, adds no rule and is reported as superseded:
+/// the template's one socket rule is the only network rule a profiled run has.
+#[test]
+fn the_unix_sockets_key_adds_no_rule_and_is_reported_superseded() {
+    let run = Path::new("/private/tmp/run-1");
+    let cache = [PathBuf::from("/Volumes/work/cache")];
+    let base = ExecToolProfileConfig {
+        files: vec!["/khive-no-such-dir/locks/gpu.lock".into()],
+        ..named("sh-sock")
+    };
+    let without = tool_profile(base.clone(), None);
+    let with = tool_profile(
+        ExecToolProfileConfig {
+            unix_sockets: true,
+            ..base
+        },
+        None,
+    );
+    assert_eq!(render_tool_rules(&with), render_tool_rules(&without));
+    assert_eq!(tool_rules_digest(&with), tool_rules_digest(&without));
+    let rendered = render_profile_for_tool(run, &[], &cache, &[], Some(&with));
+    assert_eq!(network_rules(&rendered), vec![RUN_1_SOCKETS]);
+    assert!(!rendered.contains("unix-socket"), "{rendered}");
+    assert!(!rendered.contains("network-inbound"), "{rendered}");
+    assert_eq!(with.superseded_keys, vec!["unix_sockets"]);
+    assert!(without.superseded_keys.is_empty());
+    assert_eq!(
+        tool_profile_json(&with)["superseded_keys"],
+        json!(["unix_sockets"])
+    );
+    assert_eq!(tool_profile_json(&without)["superseded_keys"], json!([]));
+}
+
+#[test]
+fn file_and_directory_rules_are_exact_paths_with_their_ancestors() {
+    let profile = tool_profile(
+        ExecToolProfileConfig {
+            files: vec!["/khive-no-such-dir/locks/gpu.lock".into()],
+            list_dirs: vec!["/khive-no-such-dir/models".into()],
+            ..named("sh-files")
+        },
+        None,
+    );
+    let rules = render_tool_rules(&profile);
+    assert!(rules.contains(
+        "(allow file-read* file-write* (literal \"/khive-no-such-dir/locks/gpu.lock\"))\n"
+    ));
+    assert!(rules.contains("(allow file-read-data (literal \"/khive-no-such-dir/models\"))\n"));
+    assert!(!rules.contains("subpath"));
+    let metadata = rules
+        .lines()
+        .find(|line| line.starts_with("(allow file-read-metadata "))
+        .expect("metadata rule");
+    assert_eq!(
+        metadata,
+        "(allow file-read-metadata (literal \"/\") (literal \"/khive-no-such-dir\") \
+         (literal \"/khive-no-such-dir/locks\") (literal \"/khive-no-such-dir/models\"))"
+    );
+}
+
+#[test]
+fn tool_profile_conflicts_are_refused_with_the_reason() {
+    let root = Path::new("/khive-no-such-dir/exec-root");
+    let ok = tool_profile(
+        ExecToolProfileConfig {
+            files: vec!["/khive-no-such-dir/locks/gpu.lock".into()],
+            ..named("sh-gpu")
+        },
+        None,
+    );
+    let reads = [PathBuf::from("/khive-no-such-dir/models")];
+    let caches = [PathBuf::from("/khive-no-such-dir/cache")];
+    let conflict =
+        |profiles: &[ToolProfile]| tool_profile_conflict(root, &reads, &caches, profiles);
+    // Control: a well-formed list is accepted, twice over two names, and a
+    // directory under a read root may be listed.
+    let other = ToolProfile {
+        tool: "sh-other".into(),
+        ..tool_profile(
+            ExecToolProfileConfig {
+                files: vec!["/khive-no-such-dir/locks/other.lock".into()],
+                list_dirs: vec!["/khive-no-such-dir/models/weights".into()],
+                ..named("sh-other")
+            },
+            None,
+        )
+    };
+    assert_eq!(conflict(&[ok.clone(), other]), None);
+
+    let unnamed = tool_profile(named("  "), None);
+    assert!(conflict(&[unnamed])
+        .expect("empty name refused")
+        .contains("empty tool name"));
+    assert!(conflict(&[ok.clone(), ok.clone()])
+        .expect("duplicate refused")
+        .contains("more than once"));
+    for (file, kind, root_named) in [
+        (
+            "/Library/khive-no-such-file.lock",
+            "system read root",
+            "/Library",
+        ),
+        (
+            "/khive-no-such-dir/models/weights.lock",
+            "read root",
+            "/khive-no-such-dir/models",
+        ),
+        (
+            "/khive-no-such-dir/cache/shared.lock",
+            "cache root",
+            "/khive-no-such-dir/cache",
+        ),
+    ] {
+        let under = tool_profile(
+            ExecToolProfileConfig {
+                files: vec![file.into()],
+                ..named("sh-under")
+            },
+            None,
+        );
+        let reason = conflict(&[under]).unwrap_or_else(|| panic!("{file} refused"));
+        assert!(
+            reason.contains(&format!("is under the {kind} {root_named:?}"))
+                && reason.contains(file),
+            "{file}: {reason}"
+        );
+    }
+    let relative = tool_profile(
+        ExecToolProfileConfig {
+            list_dirs: vec!["models".into()],
+            ..named("sh-rel")
+        },
+        None,
+    );
+    assert!(conflict(&[relative])
+        .expect("relative path refused")
+        .contains("not an absolute path"));
+    let inside = tool_profile(
+        ExecToolProfileConfig {
+            files: vec!["/khive-no-such-dir/exec-root/other-run/file".into()],
+            ..named("sh-in")
+        },
+        None,
+    );
+    assert!(conflict(&[inside])
+        .expect("path under the run root refused")
+        .contains("under the run root"));
+}
+
+#[test]
+fn tool_profile_report_names_what_is_on_and_a_digest_that_follows_it() {
+    let gpu = tool_profile(
+        ExecToolProfileConfig {
+            metal: true,
+            ..named("sh-gpu")
+        },
+        Some("/private/var/folders/aa/bb/C"),
+    );
+    let report = tool_profile_json(&gpu);
+    assert_eq!(report["tool"], "sh-gpu");
+    assert_eq!(report["metal"], true);
+    assert_eq!(
+        report["metal_cache"],
+        "/private/var/folders/aa/bb/C/com.apple.metal"
+    );
+    assert_eq!(report["files"], json!([]));
+    assert_eq!(report["superseded_keys"], json!([]));
+    let plain = tool_profile(named("sh-gpu"), None);
+    assert_ne!(tool_rules_digest(&gpu), tool_rules_digest(&plain));
+    assert_eq!(report["rules_digest"], json!(tool_rules_digest(&gpu)));
+    assert_eq!(
+        tool_profile_for(&[plain.clone(), gpu.clone()], "sh-gpu"),
+        Some(&plain)
+    );
+    assert_eq!(tool_profile_for(&[gpu], "sh"), None);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_user_cache_folder_resolves_to_an_existing_directory() {
+    let cache = user_cache_dir().expect("the system names a cache folder for this user");
+    assert!(cache.is_absolute(), "{cache:?}");
+    assert!(cache.is_dir(), "{cache:?}");
+    assert_eq!(std::fs::canonicalize(&cache).expect("canonical"), cache);
+}
+
+/// Run `program` with `args` under `profile`, written into `run_dir`.
+#[cfg(target_os = "macos")]
+fn sandboxed_status(run_dir: &Path, profile: &str, program: &str, args: &[&str]) -> bool {
+    let profile_path = run_dir.join("profile.sb");
+    std::fs::write(&profile_path, profile).expect("write profile");
+    std::process::Command::new(SANDBOX_EXEC)
+        .arg("-f")
+        .arg(&profile_path)
+        .arg(program)
+        .args(args)
+        .output()
+        .expect("launch sandboxed program")
+        .status
+        .success()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sandboxed_run_reaches_a_named_file_and_directory_and_nothing_beside_them() {
+    if !Path::new(SANDBOX_EXEC).exists() {
+        return;
+    }
+    let run = tempfile::tempdir().expect("run directory");
+    let outside = tempfile::tempdir().expect("directory outside the run");
+    let run_dir = std::fs::canonicalize(run.path()).expect("canonical run directory");
+    // The spelling a program would use: on macOS a temporary directory is
+    // named through a link, and the profile must admit both spellings.
+    let written = outside.path().to_path_buf();
+    let canonical = std::fs::canonicalize(&written).expect("canonical outside directory");
+    std::fs::create_dir(canonical.join("listed")).expect("listed directory");
+    std::fs::create_dir(canonical.join("listed").join("below")).expect("directory below");
+    std::fs::write(canonical.join("listed").join("entry"), b"x").expect("entry");
+    let lock = written.join("gpu.lock");
+    let listed = written.join("listed");
+
+    let profile = tool_profile(
+        ExecToolProfileConfig {
+            files: vec![lock.to_string_lossy().into()],
+            list_dirs: vec![listed.to_string_lossy().into()],
+            ..named("sh-files")
+        },
+        None,
+    );
+    let with_tool = render_profile_for_tool(&run_dir, &[], &[], &[], Some(&profile));
+    let template = render_profile(&run_dir, &[], &[], &[]);
+    let path = |p: &Path| p.to_string_lossy().to_string();
+    let run_with = |program: &str, target: &Path| {
+        sandboxed_status(&run_dir, &with_tool, program, &[&path(target)])
+    };
+    let run_template = |program: &str, target: &Path| {
+        sandboxed_status(&run_dir, &template, program, &[&path(target)])
+    };
+
+    assert!(
+        run_with("/usr/bin/touch", &run_dir.join("inside")),
+        "run-tree control must work"
+    );
+    // The named file, by the spelling in the configuration and by its
+    // resolved path, and not for a run without the profile.
+    assert!(run_with("/usr/bin/touch", &lock));
+    assert!(canonical.join("gpu.lock").exists());
+    assert!(run_with("/usr/bin/touch", &canonical.join("gpu.lock")));
+    assert!(
+        !run_with("/usr/bin/touch", &written.join("beside")),
+        "a file beside the named one must be refused"
+    );
+    assert!(!canonical.join("beside").exists());
+    assert!(
+        !run_template("/usr/bin/touch", &written.join("unlisted")),
+        "the template alone reaches nothing outside the run"
+    );
+    assert!(!canonical.join("unlisted").exists());
+    // The named directory lists; what is below it and beside it does not.
+    assert!(run_with("/bin/ls", &listed));
+    assert!(!run_with("/bin/ls", &listed.join("below")));
+    assert!(!run_with("/bin/cat", &listed.join("entry")));
+    assert!(!run_with("/bin/ls", &written));
+    assert!(!run_template("/bin/ls", &listed));
+}
+
+/// Acceptance on a host with a GPU. The probe is `tests/fixtures/metal_probe.swift`,
+/// compiled by the operator; its path is given in `KHIVE_EXEC_METAL_PROBE`. It
+/// compiles a compute kernel from source, runs it on the device and prints
+/// `METAL-OK` only when the numbers are right.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs a Metal GPU and a compiled probe named in KHIVE_EXEC_METAL_PROBE"]
+fn sandboxed_run_computes_on_the_gpu_only_with_the_metal_profile() {
+    let probe = std::env::var("KHIVE_EXEC_METAL_PROBE")
+        .expect("KHIVE_EXEC_METAL_PROBE names the compiled probe");
+    let probe = std::fs::canonicalize(&probe).expect("the probe exists");
+    let probe_dir = probe.parent().expect("probe directory").to_path_buf();
+    let run = tempfile::tempdir().expect("run directory");
+    let run_dir = std::fs::canonicalize(run.path()).expect("canonical run directory");
+    let reads = [probe_dir];
+    let output = |profile: Option<String>| {
+        let mut command = match &profile {
+            Some(profile) => {
+                let profile_path = run_dir.join("profile.sb");
+                std::fs::write(&profile_path, profile).expect("write profile");
+                let mut command = std::process::Command::new(SANDBOX_EXEC);
+                command.arg("-f").arg(profile_path).arg(&probe);
+                command
+            }
+            None => std::process::Command::new(&probe),
+        };
+        let out = command.output().expect("launch the probe");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    // Control: the host has a device and the probe works on it.
+    assert!(
+        output(None).contains("METAL-OK"),
+        "the probe must pass unsandboxed"
+    );
+
+    let cache = user_cache_dir().expect("user cache folder");
+    let gpu = resolve_tool_profile(
+        &ExecToolProfileConfig {
+            metal: true,
+            ..named("sh-gpu")
+        },
+        Some(cache),
+    );
+    let with_tool = render_profile_for_tool(&run_dir, &reads, &[], &[], Some(&gpu));
+    assert!(
+        output(Some(with_tool)).contains("METAL-OK"),
+        "the Metal profile must reach the device"
+    );
+    let template = render_profile(&run_dir, &reads, &[], &[]);
+    let refused = output(Some(template));
+    assert!(
+        !refused.contains("METAL-OK") && refused.contains("FAIL device"),
+        "the template alone must see no device: {refused}"
+    );
+}

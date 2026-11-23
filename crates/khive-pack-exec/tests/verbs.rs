@@ -155,6 +155,7 @@ fn fixture_built(
             binary_digest_timeout_s: None,
             keep,
             limits,
+            tool_profiles: Vec::new(),
         },
         // No embedding model: tool.register would otherwise build the default
         // embedder, which needs a model file the test host may not have.
@@ -2725,6 +2726,7 @@ fn string_refusal_fixture() -> StringRefusalFixture {
             binary_digest_timeout_s: None,
             keep: false,
             limits: ExecLimitsConfig::default(),
+            tool_profiles: Vec::new(),
         },
         ..RuntimeConfig::no_embeddings()
     })

@@ -1844,3 +1844,117 @@ for that reason alone, and its result says nothing about the code. A run also ha
     socket there. A loopback connect is refused. Each refusal has a control that runs the same command outside the
     sandbox and succeeds: the same token arrives by the same path, the same link is made, the same bind leaves its
     socket.
+
+## Amendment 17 (2026-11-23): tool profiles, `/bin` and the root links
+
+**Status: Accepted 2026-11-23.** Items 1 and 2 change every run's profile, so the template digest changes. Items 3
+to 6 change nothing on a host that configures no tool profile, and nothing for a tool that has none: its profile is
+the template, byte for byte.
+
+### Context
+
+Three things a run needs were refused by the template, each for a reason that reads as the program's own.
+
+- A shell searching `PATH` inspects each candidate before it launches one. `/bin` was not a read root, so that
+  inspection was refused and `mkdir` by name answered "command not found" whatever `PATH` held, while `/bin/mkdir`
+  by its path ran.
+- `/etc` and `/var` are links on macOS, to `private/etc` and `private/var`. The roots under `/private` were
+  readable, the links were not, so `/etc/hosts`, `/etc/ssl/cert.pem` and every file under `/usr/share/zoneinfo`
+  (itself a link into `/var/db/timezone`) were refused under the names programs use.
+- Some tools need one more thing than any run should have: a GPU test needs the Metal device and Metal's shader
+  cache; a test that serializes on a lock file needs that one file outside the run; a tool that looks for a volume
+  needs to list one directory. Granting any of these to every run widens every run.
+
+### Decision
+
+1. **`/bin`.** `/bin` is a system read root: `file-read*` and `file-read-metadata`, with the exact ancestors. It is
+   not granted `file-map-executable` or any write. It holds the system's own tools on the sealed volume, as `/usr`
+   does.
+2. **Root links.** The metadata rule names `/etc` and `/var` as literals: a run may inspect each link and follows
+   it to a path the roots already allow. Nothing under `/private/var` outside the roots becomes readable, by either
+   name, and the directory behind `/var` does not list.
+3. **Tool profiles.** `[[exec.tool_profiles]]` entries each name one registered tool and any of:
+   - `metal = true`: the GPU's user-client class `AGXDeviceUserClient`, the global names
+     `com.apple.MTLCompilerService` and `com.apple.bsd.dirhelper`, and read and write under Metal's own folder
+     `com.apple.metal` inside the cache folder the system names for the user the runs execute as
+     (`_CS_DARWIN_USER_CACHE_DIR`), with that folder's ancestors and `/var` for traversal only. Without the cache
+     folder every pipeline is compiled again on every run.
+   - `files = [...]`: read and write of each exact path. A path that does not exist yet resolves through its
+     directory, so a lock file a run creates still matches.
+   - `list_dirs = [...]`: opening and listing each exact directory, nothing below it.
+
+   Each path is kept in the spelling the configuration gives and in its resolved form, because a program opens the
+   spelling and the sandbox matches the resolved path while it checks each directory the spelling walks through.
+   The additions are appended after the template and change nothing in it. An entry that turns nothing on adds
+   nothing.
+4. **Sockets: one rule.** Amendment 16's rule stays the only socket rule: a run binds and connects unix-domain
+   sockets under its run directory and its own temporary directory, and nowhere else. A tool profile adds no socket
+   rule. An earlier form of tool profiles carried a `unix_sockets` key that allowed sockets under the run directory
+   and the cache roots, with an inbound rule; it is not adopted, for three reasons. Amendment 16 already gives every
+   run what the key was for: a test makes its sockets under its temporary directory, and `TMPDIR` is now the run's
+   own directory instead of a caller's path into a cache root. The key's one addition was the cache roots, which
+   outlive the run and are shared by every run on the host at once, so a socket there is a channel between
+   concurrent runs; Amendment 16 item 3 keeps read and cache roots free of sockets for that reason. And Amendment
+   16's form is the one acceptance 80 drives through links and a shared text prefix. The key still loads, because
+   `[exec]` refuses unknown keys and configurations that set it must keep starting; it adds no rule and the profile
+   reports it under `superseded_keys`.
+5. **Honoured.** A profile is given only to a run whose decision came from a grant, for a caller that is not
+   anonymous. A run of a profiled tool allowed any other way is refused with `tool_profile_unhonoured:` and the
+   reason, before the tree is read and before anything is materialized, rather than run without the additions and
+   fail later for a reason that reads as the tool's. A Metal profile on a host that cannot name the user's cache
+   folder is refused the same way. A configuration with an empty tool name, a tool named twice, a relative path, a
+   path under the exec root, or a `files` path under a system read root, a configured read root or a cache root
+   refuses every run before materialization, naming the entry and the root. A `files` path under a read root would
+   make writable what the configuration keeps read-only, and one under a cache root would grant per tool what every
+   run already shares. A `list_dirs` path only lists, so a root above it is no conflict.
+6. **Receipt and identity.** The receipt's `sandbox` object carries `tool_profile`: `null` for a run without one,
+   else the tool, `metal`, `metal_cache`, the resolved `files` and `list_dirs`, `superseded_keys`, and
+   `rules_digest`, the BLAKE3 hex of the rendered additions. The additions name no run directory, so the digest is
+   the same for every run of the tool; `profile_digest` already names the whole profile of the run.
+   `exec.identity` reports `tool_profiles` in the same form and `system_root_links`.
+
+### What a tool profile costs
+
+A profiled run is wider than the template, and the width is the operator's choice per tool. The Metal device is
+shared hardware, and Metal's cache folder is kept between runs and shared by every run of the tool, so it carries
+the trust boundary a cache root carries (Amendment 15). A named file is shared by every run that names it; that is
+its point for a lock. Only a grant hands the width to a caller, never a policy allow (item 5). A grant names the
+tool, not a profile: a profile the operator adds or changes later applies to grants already made, as read and cache
+roots do, and the receipt's `rules_digest` is the record of what a run had.
+
+### Acceptance
+
+81. **Profile, `/bin`.** The read and metadata rules name `/bin`; the executable-map and write rules do not; no
+    rule names `/sbin`, `/opt`, `/Applications` or `/Users`.
+82. **Seatbelt, `/bin`.** A sandboxed shell with `PATH=/usr/bin:/bin` makes a directory with `mkdir` by name and
+    `command -v mkdir` prints `/bin/mkdir`. Control: the same profile with `/bin` taken out of both rules exits 127
+    for the same command and launches `/bin/mkdir` by path. `ls /sbin` and a `mkdir` under `/bin` are refused.
+83. **Root links.** The metadata rule names `/etc` and `/var` as literals and no rule names either as a subpath or
+    names `/private/var` as one. Under the rendered profile `/etc/hosts` reads (control: `/private/etc/hosts`), a
+    zoneinfo file reads, a log under `/private/var/log` is refused by both names, and `/var/` does not list.
+84. **No profile.** With no tool profile, and with an entry that turns nothing on, the rendered profile equals the
+    template byte for byte.
+85. **Metal.** The rules name the user-client class, the two global names once each, read and write of Metal's
+    folder only, and the cache folder's ancestors and `/var` for traversal; no network term. Off means off. On a
+    host with a GPU and the compiled probe (`tests/fixtures/metal_probe.swift`) the probe passes unsandboxed
+    (control), passes under the Metal profile, and fails at the device under the template.
+86. **Files and directories.** The rules are exact literals with exact ancestors and no subpath. Under the rendered
+    profile the named file is written by its configured spelling and by its resolved path, a file beside it is
+    refused, and the template refuses it; the named directory lists, and a directory below it, a file in it and its
+    parent do not, and the template does not list it.
+87. **Conflicts.** An empty tool name, a tool named twice, a relative path, a path under the exec root, and a
+    `files` path under a system read root, under a configured read root and under a cache root are each refused with
+    the reason, the last three naming the root; two well-formed entries are accepted, one of them listing a
+    directory under a read root (control).
+88. **Sockets.** A profile that sets `unix_sockets` renders the same additions and the same `rules_digest` as the
+    same profile without it; the rendered profile's only network rule is Amendment 16's; `superseded_keys` names
+    the key. A configuration that sets it loads, and a misspelled key in an entry is refused.
+89. **Honoured.** A profiled tool allowed by policy is refused `tool_profile_unhonoured:` naming the policy, and an
+    anonymous caller naming a granted actor is refused naming anonymity, each before the tree is read and with
+    nothing materialized. Control: an unprofiled tool allowed the same way reaches the tree refusal.
+90. **Run.** A granted run of the profiled tool writes the named file; its receipt's `tool_profile` names the tool,
+    the file and a `rules_digest` equal to the one `exec.identity` reports, and its `profile_digest` differs from a
+    plain tool's. The plain tool, granted the same way, cannot write the file and its receipt's `tool_profile` is
+    `null`. The profiled tool cannot write the named file's neighbour.
+91. **Identity.** `exec.identity` reports each tool profile with its digest, `system_root_links` and `/bin` among
+    the system read roots.

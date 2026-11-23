@@ -1194,6 +1194,46 @@ pub struct ExecSectionConfig {
     pub keep: bool,
     #[serde(default)]
     pub limits: ExecLimitsConfig,
+    /// Additions to the sandbox for the runs of one registered tool each
+    /// (`[[exec.tool_profiles]]`). Empty by default.
+    #[serde(default)]
+    pub tool_profiles: Vec<ExecToolProfileConfig>,
+}
+
+/// What the runs of one registered tool get on top of the sandbox every run
+/// has. Each field is off or empty unless set, and a tool with no entry runs
+/// under the unchanged sandbox.
+///
+/// ```toml
+/// [[exec.tool_profiles]]
+/// tool = "sh-gpu"
+/// metal = true
+/// files = ["/tmp/gpu-test.lock"]
+/// list_dirs = ["/Volumes/work"]
+/// ```
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecToolProfileConfig {
+    /// The registered tool's name, exactly.
+    pub tool: String,
+    /// The Metal GPU device, the system shader compiler and Metal's own
+    /// per-user shader cache folder.
+    #[serde(default)]
+    pub metal: bool,
+    /// Accepted and adds no rule. Every run may already bind and connect
+    /// unix-domain sockets under its run directory and its own temporary
+    /// directory, which is the one socket rule. The key still loads so a
+    /// configuration that sets it keeps working, and `exec.identity` names
+    /// it under the profile's `superseded_keys`.
+    #[serde(default)]
+    pub unix_sockets: bool,
+    /// Exact files, absolute, that a run may read, create and write.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Exact directories, absolute, that a run may open and list. Nothing
+    /// below them is granted.
+    #[serde(default)]
+    pub list_dirs: Vec<String>,
 }
 
 pub const DEFAULT_EXEC_BINARY_DIGEST_TIMEOUT_S: u64 = 10;

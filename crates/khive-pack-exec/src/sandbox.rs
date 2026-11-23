@@ -19,17 +19,33 @@
 //! one run can read and change what an earlier run left, so a run that had a
 //! cache root is not a function of its input tree alone. The receipt names
 //! the cache roots' digest for that reason.
+//!
+//! A tool profile is a short list of additions the operator configures for
+//! the runs of one registered tool: the Metal GPU, exact extra files, and
+//! exact directories it may list. The additions are appended to the profile
+//! above and to nothing else, so a tool with no entry runs under the same
+//! bytes as before. Every rule here was accepted by driving it, never by its
+//! text.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use khive_runtime::engine_config::{ExecSectionConfig, DEFAULT_EXEC_BINARY_DIGEST_TIMEOUT_S};
+use khive_runtime::engine_config::{
+    ExecSectionConfig, ExecToolProfileConfig, DEFAULT_EXEC_BINARY_DIGEST_TIMEOUT_S,
+};
 
 use crate::tree::digest_hex;
 
 /// Directories every run may read: runtime necessities, never a home.
+///
+/// `/bin` is here for name lookup. A run could always launch `/bin/mkdir` by
+/// its path, but a shell searching `PATH` inspects each candidate before it
+/// launches one, and that inspection was refused, so `mkdir` by name answered
+/// "command not found" whatever `PATH` held. It holds the system's own tools
+/// on the sealed volume, as `/usr` does.
 pub const SYSTEM_READ_ROOTS: &[&str] = &[
+    "/bin",
     "/System",
     "/usr",
     "/Library",
@@ -39,6 +55,14 @@ pub const SYSTEM_READ_ROOTS: &[&str] = &[
     "/private/preboot",
     "/dev",
 ];
+
+/// Root links through which macOS names two of the roots above: `/etc` is a
+/// link to `private/etc` and `/var` a link to `private/var`. A run may read
+/// each link itself and nothing through it that the roots do not already
+/// allow. Without this `/etc/hosts`, `/etc/ssl/cert.pem` and every file under
+/// `/usr/share/zoneinfo` (a link into `/var/db/timezone`) are refused under
+/// the names programs use, while the same files read under `/private`.
+pub const SYSTEM_ROOT_LINKS: &[&str] = &["/etc", "/var"];
 
 /// Registered binaries the run verb refuses by canonical file name regardless
 /// of registry label (ADR-181 Amendment 1 item 8). The seatbelt also refuses
@@ -87,6 +111,32 @@ pub struct Resolved {
     pub binary_digest_timeout_s: u64,
     pub keep: bool,
     pub limits: Limits,
+    pub tool_profiles: Vec<ToolProfile>,
+}
+
+/// One path an operator named in a tool profile: the spelling in the
+/// configuration and the path it resolves to. Both are kept because a program
+/// opens the spelling, and the sandbox matches the resolved path while still
+/// checking each directory the spelling walks through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedPath {
+    pub written: PathBuf,
+    pub canonical: PathBuf,
+}
+
+/// The additions one registered tool's runs get, resolved once at load.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolProfile {
+    pub tool: String,
+    pub metal: bool,
+    /// Metal's shader cache folder for the user the runs execute as. `None`
+    /// when `metal` is off, or when the host could not name the folder, in
+    /// which case a run is refused rather than run without the device.
+    pub metal_cache: Option<PathBuf>,
+    pub files: Vec<NamedPath>,
+    pub list_dirs: Vec<NamedPath>,
+    /// Configuration keys the entry set that no longer add a rule.
+    pub superseded_keys: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -165,7 +215,203 @@ pub fn resolve(cfg: &ExecSectionConfig) -> Resolved {
             file_size: cfg.limits.file_size,
             nproc: cfg.limits.nproc,
         },
+        tool_profiles: cfg
+            .tool_profiles
+            .iter()
+            .map(|profile| resolve_tool_profile(profile, user_cache_dir()))
+            .collect(),
     }
+}
+
+/// The name of Metal's shader cache folder inside a user's cache folder.
+pub const METAL_CACHE_DIR: &str = "com.apple.metal";
+
+/// The calling user's cache folder, as the system names it, resolved.
+#[cfg(target_os = "macos")]
+pub fn user_cache_dir() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut buffer = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: the buffer is valid for its whole length and confstr writes at
+    // most that many bytes, including the terminator.
+    let written = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_CACHE_DIR,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    if written == 0 || written > buffer.len() {
+        return None;
+    }
+    buffer.truncate(written - 1);
+    std::fs::canonicalize(PathBuf::from(std::ffi::OsString::from_vec(buffer))).ok()
+}
+
+/// No platform but macOS has the folder, and no run starts there either.
+#[cfg(not(target_os = "macos"))]
+pub fn user_cache_dir() -> Option<PathBuf> {
+    None
+}
+
+/// Resolve a path that may not exist yet: its directory is resolved and its
+/// last component kept, so a lock file a run creates still resolves.
+fn resolve_named(written: &str) -> NamedPath {
+    let written = PathBuf::from(written);
+    let canonical = std::fs::canonicalize(&written).unwrap_or_else(|_| {
+        match (written.parent(), written.file_name()) {
+            (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+                .map(|parent| parent.join(name))
+                .unwrap_or_else(|_| written.clone()),
+            _ => written.clone(),
+        }
+    });
+    NamedPath { written, canonical }
+}
+
+/// Resolve one configured tool profile. `user_cache` is the cache folder of
+/// the user the runs execute as; it is an argument so the result does not
+/// depend on which host renders it.
+pub fn resolve_tool_profile(
+    cfg: &ExecToolProfileConfig,
+    user_cache: Option<PathBuf>,
+) -> ToolProfile {
+    let named = |paths: &[String]| {
+        let mut out: Vec<NamedPath> = paths.iter().map(|path| resolve_named(path)).collect();
+        out.sort_by(|a, b| {
+            a.canonical
+                .cmp(&b.canonical)
+                .then(a.written.cmp(&b.written))
+        });
+        out.dedup();
+        out
+    };
+    // Every run may bind and connect unix-domain sockets under its run
+    // directory and its temporary directory (ADR-181 Amendment 16), which is
+    // the one socket rule (Amendment 17 item 4), so the key adds nothing.
+    let mut superseded_keys = Vec::new();
+    if cfg.unix_sockets {
+        superseded_keys.push("unix_sockets");
+    }
+    ToolProfile {
+        tool: cfg.tool.clone(),
+        metal: cfg.metal,
+        metal_cache: cfg
+            .metal
+            .then(|| user_cache.map(|cache| cache.join(METAL_CACHE_DIR)))
+            .flatten(),
+        files: named(&cfg.files),
+        list_dirs: named(&cfg.list_dirs),
+        superseded_keys,
+    }
+}
+
+/// Why the configured tool profiles cannot be used, if they cannot. A profile
+/// with no tool name or a name used twice does not say which runs it is for,
+/// a relative path names a different place per working directory, and a path
+/// under the run root would reach into another run's directory. A `files`
+/// entry under a system read root or a configured read root would make writable
+/// a path the configuration keeps read-only, and one under a cache root would
+/// grant per tool a path every run already shares; each is refused, naming the
+/// root. A `list_dirs` entry only lists, so a root above it is no conflict.
+/// `read_roots` and `cache_roots` are the resolved roots; paths are compared in
+/// canonical form.
+pub fn tool_profile_conflict(
+    root: &Path,
+    read_roots: &[PathBuf],
+    cache_roots: &[PathBuf],
+    profiles: &[ToolProfile],
+) -> Option<String> {
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let root = canonical(root);
+    let system: Vec<PathBuf> = SYSTEM_READ_ROOTS.iter().map(PathBuf::from).collect();
+    let covering: Vec<(&str, &Path, PathBuf)> = system
+        .iter()
+        .map(|named| ("system read root", named.as_path()))
+        .chain(
+            read_roots
+                .iter()
+                .map(|named| ("read root", named.as_path())),
+        )
+        .chain(
+            cache_roots
+                .iter()
+                .map(|named| ("cache root", named.as_path())),
+        )
+        .map(|(kind, named)| (kind, named, canonical(named)))
+        .collect();
+    let mut seen: Vec<&str> = Vec::new();
+    for profile in profiles {
+        if profile.tool.trim().is_empty() {
+            return Some("[[exec.tool_profiles]] entry has an empty tool name".into());
+        }
+        if seen.contains(&profile.tool.as_str()) {
+            return Some(format!(
+                "[[exec.tool_profiles]] names tool {:?} more than once",
+                profile.tool
+            ));
+        }
+        seen.push(&profile.tool);
+        for (key, paths) in [("files", &profile.files), ("list_dirs", &profile.list_dirs)] {
+            for path in paths {
+                if !path.written.is_absolute() {
+                    return Some(format!(
+                        "[[exec.tool_profiles]] {key} entry {:?} for tool {:?} is not an absolute path",
+                        path.written, profile.tool
+                    ));
+                }
+                if path.canonical.starts_with(&root) {
+                    return Some(format!(
+                        "[[exec.tool_profiles]] {key} entry {:?} for tool {:?} is under the run root {root:?}",
+                        path.written, profile.tool
+                    ));
+                }
+                if key != "files" {
+                    continue;
+                }
+                if let Some((kind, named, _)) = covering
+                    .iter()
+                    .find(|(_, _, resolved)| path.canonical.starts_with(resolved))
+                {
+                    return Some(format!(
+                        "[[exec.tool_profiles]] files entry {:?} for tool {:?} is under the {kind} {named:?}",
+                        path.written, profile.tool
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The profile configured for a registered tool's name, if there is one.
+pub fn tool_profile_for<'a>(profiles: &'a [ToolProfile], tool: &str) -> Option<&'a ToolProfile> {
+    profiles.iter().find(|profile| profile.tool == tool)
+}
+
+/// What a receipt and `exec.identity` say about a tool profile.
+pub fn tool_profile_json(profile: &ToolProfile) -> Value {
+    let paths = |paths: &[NamedPath]| -> Vec<String> {
+        paths
+            .iter()
+            .map(|path| path.canonical.to_string_lossy().to_string())
+            .collect()
+    };
+    json!({
+        "tool": profile.tool,
+        "metal": profile.metal,
+        "metal_cache": profile.metal_cache.as_ref().map(|p| p.to_string_lossy().to_string()),
+        "files": paths(&profile.files),
+        "list_dirs": paths(&profile.list_dirs),
+        "superseded_keys": profile.superseded_keys,
+        "rules_digest": tool_rules_digest(profile),
+    })
+}
+
+/// Digest of a tool profile's rules: they name no run directory, so it
+/// names the additions independently of any run.
+pub fn tool_rules_digest(profile: &ToolProfile) -> String {
+    digest_hex(render_tool_rules(profile).as_bytes())
 }
 
 /// Canonical serialization of the resolved read roots: a compact JSON array
@@ -281,6 +527,9 @@ pub fn render_profile(
             metadata.push(format!("(literal {})", quote(ancestor)));
         }
     }
+    for link in SYSTEM_ROOT_LINKS {
+        metadata.push(format!("(literal {})", quote(Path::new(link))));
+    }
     metadata.sort();
     metadata.dedup();
     let mut maps: Vec<String> = ["/System", "/usr", "/Library"]
@@ -333,6 +582,94 @@ pub fn render_profile(
         maps = maps.join(" "),
         writes = writes.join(" "),
     )
+}
+
+/// Literal metadata rules for every directory above `path`, and for `path`
+/// itself when `with_self` is set.
+fn ancestor_literals(path: &Path, with_self: bool, out: &mut Vec<String>) {
+    for ancestor in path.ancestors().skip(if with_self { 0 } else { 1 }) {
+        out.push(format!("(literal {})", quote(ancestor)));
+    }
+}
+
+/// The rules a tool profile appends to the template. Each block is the
+/// smallest set that a driven run needed (macOS 27.2, Apple silicon):
+///
+/// - Metal: the GPU's user-client class, the system shader compiler, the
+///   service that names the per-user cache folder, and Metal's own folder
+///   inside it. Without the last two every pipeline is compiled again on
+///   every run.
+/// - Files: read and write of each exact path.
+/// - Directories: opening and listing each exact path, nothing below it.
+///
+/// No rule here names a socket or an address: the template's one socket
+/// rule is the only one a run has.
+pub fn render_tool_rules(profile: &ToolProfile) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut metadata: Vec<String> = Vec::new();
+    if profile.metal {
+        lines.push(
+            "(allow iokit-open (iokit-user-client-class \"AGXDeviceUserClient\"))".to_string(),
+        );
+        lines.push(
+            "(allow mach-lookup (global-name \"com.apple.MTLCompilerService\") \
+             (global-name \"com.apple.bsd.dirhelper\"))"
+                .to_string(),
+        );
+        if let Some(cache) = &profile.metal_cache {
+            lines.push(format!(
+                "(allow file-read* file-write* (subpath {}))",
+                quote(cache)
+            ));
+            ancestor_literals(cache, false, &mut metadata);
+            // The system names the folder through `/var`, a link.
+            metadata.push("(literal \"/var\")".to_string());
+        }
+    }
+    for file in &profile.files {
+        lines.push(format!(
+            "(allow file-read* file-write* (literal {}))",
+            quote(&file.canonical)
+        ));
+        ancestor_literals(&file.canonical, false, &mut metadata);
+        ancestor_literals(&file.written, false, &mut metadata);
+    }
+    for dir in &profile.list_dirs {
+        lines.push(format!(
+            "(allow file-read-data (literal {}))",
+            quote(&dir.canonical)
+        ));
+        ancestor_literals(&dir.canonical, true, &mut metadata);
+        ancestor_literals(&dir.written, true, &mut metadata);
+    }
+    metadata.sort();
+    metadata.dedup();
+    if !metadata.is_empty() {
+        lines.push(format!("(allow file-read-metadata {})", metadata.join(" ")));
+    }
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// The profile for one run of a tool: the template, then the tool's
+/// additions when the operator configured some. With no tool profile the
+/// result is `render_profile`'s, byte for byte.
+pub fn render_profile_for_tool(
+    run_dir: &Path,
+    read_roots: &[PathBuf],
+    cache_roots: &[PathBuf],
+    never: &[PathBuf],
+    tool: Option<&ToolProfile>,
+) -> String {
+    let mut profile = render_profile(run_dir, read_roots, cache_roots, never);
+    if let Some(tool) = tool {
+        profile.push_str(&render_tool_rules(tool));
+    }
+    profile
 }
 
 /// Digest of the template with an empty run directory and no roots: names
