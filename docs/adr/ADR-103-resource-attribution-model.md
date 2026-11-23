@@ -929,7 +929,7 @@ the per-dispatch audit row for a verb on `VerbRegistry::ADMISSION_DEGRADE_SAFE_V
 dropped best-effort instead of failing the dispatch. The caller still receives the read's
 successful result. The set is the constant `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`
 (`crates/khive-runtime/src/pack/registry_access.rs`), and the list below is that constant grouped by
-owning pack. Its count is taken from the code: at this revision the constant holds 71 entries. A
+owning pack. Its count is taken from the code: at this revision the constant holds 70 entries. A
 test fails when this list or this count differs from the constant, so an entry added on one side
 only cannot pass unnoticed.
 
@@ -941,8 +941,7 @@ only cannot pass unnoticed.
 - code: `code.deps`, `code.list`, `code.search`;
 - comm: `comm.delivered`, `comm.transport_status`, `comm.inbox`, `comm.unread`, `comm.thread`,
   `comm.health`, `comm.probe`;
-- exec: `exec.tree_get`, `exec.tree_diff`, `exec.receipt`, `exec.runs`, `exec.events`,
-  `exec.identity`;
+- exec: `exec.tree_get`, `exec.receipt`, `exec.runs`, `exec.events`, `exec.identity`;
 - git: `git.ingest_cursor`;
 - gtd: `gtd.census`, `gtd.counts`, `gtd.next`, `gtd.tasks`;
 - kg: `get`, `list`, `stats`, `count`, `search`, `neighbors`, `traverse`, `context`, `query`,
@@ -961,8 +960,9 @@ consumer/checkpoint maintenance), `git.checkout` / `git.diff` / `git.reconcile` 
 on every dispatch), `tool.check` (a required policy decision receipt), `git.receipts` /
 `git.gates` / `git.status` / `git.log` / `git.pr_state` (each runs that policy check first, so it
 carries the same receipt write) and `telemetry.channels` / `telemetry.counts` / `telemetry.emit` /
-`telemetry.read` (telemetry answers that must refuse when their audit cannot be recorded) remain
-explicitly fail-closed. A new Assertive handler is not
+`telemetry.read` (telemetry answers that must refuse when their audit cannot be recorded) and
+`exec.tree_diff` (it writes the full change list as a blob whenever its reply cuts that list, ADR-181
+Amendment 18) remain explicitly fail-closed. A new Assertive handler is not
 eligible until its side effects are reviewed and the closed census is updated.
 
 Eligibility is bound to the owning pack and verb together, not the verb name alone: each entry on

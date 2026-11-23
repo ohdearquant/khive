@@ -95,6 +95,7 @@ const KNOWN_ADMISSION_UNSAFE_VERBS: &[&str] = &[
     "comm.suppression_list",
     "comm.withheld_body",
     "db_diagnostics",
+    "exec.tree_diff",
     "git.checkout",
     "git.diff",
     "git.gates",

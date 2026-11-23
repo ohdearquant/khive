@@ -1961,7 +1961,7 @@ roots do, and the receipt's `rules_digest` is the record of what a run had.
 
 ## Amendment 18 (2026-11-23): bounded change lists and directory deletes
 
-**Status: Proposed 2026-11-23.** A reply of at most 1000 changes within 262,144 bytes is the same as today plus three
+**Status: Accepted 2026-11-23.** A reply of at most 1000 changes within 262,144 bytes is the same as today plus three
 fields. A delete without `recursive` is unchanged.
 
 ### Context

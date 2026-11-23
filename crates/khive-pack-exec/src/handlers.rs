@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::future::Future;
 use std::io::Read;
+use std::ops::Bound::{Included, Unbounded};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,7 @@ use khive_storage::ContentRef;
 
 #[cfg(unix)]
 use crate::capture::{drain_until, walk, CaptureRead, CaptureRoot, DrainStop, Drained, Tail};
+use crate::changes;
 #[cfg(unix)]
 use crate::group_child::GroupChild;
 use crate::membership::{MembershipWork, SuppliedRefs};
@@ -116,6 +118,14 @@ fn edit_mode(edit: &Value, index: usize) -> Result<Option<u64>, RuntimeError> {
     }
 }
 
+/// The refusal for an edit under a directory another edit of the same call deletes recursively.
+fn under_recursive_delete(dir_index: usize, dir: &str, index: usize, path: &str) -> RuntimeError {
+    let (first, second) = (dir_index.min(index), dir_index.max(index));
+    RuntimeError::InvalidInput(format!(
+        "edits[{first}] and edits[{second}] overlap: edits[{dir_index}] deletes directory {dir:?} recursively and edits[{index}] names {path:?} under it; an edit under a recursively deleted directory is refused"
+    ))
+}
+
 /// Apply a list of edits to a tree and return the new tree. The tree is an immutable manifest
 /// blob, so this mints a new one and never mutates the input; a single-path edit is a list of one.
 ///
@@ -142,6 +152,8 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
                 .into(),
         ));
     }
+    // Refused here, before any write (Amendment 4 item 2).
+    let limit = changes::changed_limit(&params)?;
     let base = tree::load(rt, &tree_ref).await?;
     let mut entries: BTreeMap<String, (String, u64)> = base
         .iter()
@@ -154,6 +166,8 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
         .collect();
 
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    // Directories deleted recursively so far, by the index of the edit that deleted them.
+    let mut recursive_dirs: BTreeMap<String, usize> = BTreeMap::new();
     let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
     let mut supplied_refs: Vec<String> = Vec::new();
     for (index, edit) in edits.iter().enumerate() {
@@ -175,6 +189,16 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
             )));
         }
         seen.insert(path.clone(), index);
+        // An edit under a directory that another edit of this call deletes recursively is
+        // refused in either order, naming both, as duplicates are: otherwise the result would
+        // depend on the order of the list, and one of the two intents would vanish.
+        if let Some((dir, dir_index)) = path
+            .match_indices('/')
+            .map(|(at, _)| &path[..at])
+            .find_map(|dir| recursive_dirs.get(dir).map(|at| (dir.to_string(), *at)))
+        {
+            return Err(under_recursive_delete(dir_index, &dir, index, &path));
+        }
 
         let deleting = match edit.get("delete") {
             None | Some(Value::Null) => false,
@@ -182,6 +206,15 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
             Some(_) => {
                 return Err(RuntimeError::InvalidInput(format!(
                     "edits[{index}].delete must be a boolean"
+                )));
+            }
+        };
+        let recursive = match edit.get("recursive") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(recursive)) => *recursive,
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "edits[{index}].recursive must be a boolean"
                 )));
             }
         };
@@ -195,15 +228,64 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
                 "edits[{index}] names {named} of ref, content and delete; exactly one is required"
             )));
         }
+        if recursive && !deleting {
+            return Err(RuntimeError::InvalidInput(format!(
+                "edits[{index}] sets recursive on an edit that is not a delete; recursive applies only with delete: true"
+            )));
+        }
         if deleting {
             if edit.get("mode").is_some_and(|mode| !mode.is_null()) {
                 return Err(RuntimeError::InvalidInput(format!(
                     "edits[{index}] is a delete and cannot carry a mode"
                 )));
             }
+            // Matched by path component: `dir/` is the prefix, so `dir2` and `dir.txt` never
+            // fall under `dir`.
+            let prefix = format!("{path}/");
+            if recursive {
+                if let Some((under, under_index)) = seen
+                    .range::<str, _>((Included(prefix.as_str()), Unbounded))
+                    .next()
+                    .filter(|(under, _)| under.starts_with(&prefix))
+                {
+                    return Err(under_recursive_delete(index, &path, *under_index, under));
+                }
+                if entries.contains_key(&path) {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "edits[{index}] deletes {path:?} recursively, but the tree holds {path:?} as a file or link entry, not a directory; delete it without recursive"
+                    )));
+                }
+                // A link under the directory is removed as an entry: a tree stores a link as its
+                // target text, so nothing it names is read or touched.
+                let doomed: Vec<String> = entries
+                    .range::<str, _>((Included(prefix.as_str()), Unbounded))
+                    .map(|(entry, _)| entry)
+                    .take_while(|entry| entry.starts_with(&prefix))
+                    .cloned()
+                    .collect();
+                if doomed.is_empty() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "edits[{index}] deletes directory {path:?} recursively, but the tree holds no entry under it"
+                    )));
+                }
+                for entry in &doomed {
+                    entries.remove(entry);
+                }
+                recursive_dirs.insert(path, index);
+                continue;
+            }
             // A delete of a path the tree does not hold refuses rather than succeeding quietly,
             // because a silent no-op is how a caller comes to believe it removed something.
             if entries.remove(&path).is_none() {
+                let is_directory = entries
+                    .range::<str, _>((Included(prefix.as_str()), Unbounded))
+                    .next()
+                    .is_some_and(|(entry, _)| entry.starts_with(&prefix));
+                if is_directory {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "edits[{index}] deletes path {path:?}, which is a directory in the tree; set recursive: true to delete every entry under it"
+                    )));
+                }
                 return Err(RuntimeError::InvalidInput(format!(
                     "edits[{index}] deletes path {path:?}, which the tree does not hold"
                 )));
@@ -265,7 +347,11 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
         .iter()
         .map(Change::to_json)
         .collect();
-    Ok(json!({ "tree": next_ref, "base": tree_ref, "entries": next.len(), "changed": changed }))
+    // No receipt row keeps this list, so the blob is written whenever the list is not empty.
+    let changed_ref = changes::store_list(rt, &changed).await?;
+    let mut reply = json!({ "tree": next_ref, "base": tree_ref, "entries": next.len() });
+    changes::bound_reply(&mut reply, &changed, changed_ref.as_deref(), limit);
+    Ok(reply)
 }
 
 pub async fn tree_get(rt: &KhiveRuntime, params: Value) -> Result<Value, RuntimeError> {
@@ -277,13 +363,24 @@ pub async fn tree_get(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
 pub async fn tree_diff(rt: &KhiveRuntime, params: Value) -> Result<Value, RuntimeError> {
     let base_ref = req_str(&params, "base")?;
     let head_ref = req_str(&params, "head")?;
+    let limit = changes::changed_limit(&params)?;
     let base = tree::load(rt, &base_ref).await?;
     let head = tree::load(rt, &head_ref).await?;
     let changed: Vec<Value> = tree::diff(&base, &head)
         .iter()
         .map(Change::to_json)
         .collect();
-    Ok(json!({ "base": base_ref, "head": head_ref, "changed": changed }))
+    // The list can be computed again from the two trees, so the blob is written only when the
+    // reply cuts the list.
+    let cut = changes::prefix(&changed, limit, changes::CHANGED_BYTE_BOUND);
+    let changed_ref = if cut.kept < changed.len() {
+        changes::store_list(rt, &changed).await?
+    } else {
+        None
+    };
+    let mut reply = json!({ "base": base_ref, "head": head_ref });
+    changes::bound_reply(&mut reply, &changed, changed_ref.as_deref(), limit);
+    Ok(reply)
 }
 
 // ── receipts ─────────────────────────────────────────────────────────────────
@@ -294,7 +391,11 @@ pub async fn receipt(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let id = req_str(&params, "id")?;
-    receipts::get(rt, token.namespace().as_str(), &id).await
+    let limit = changes::changed_limit(&params)?;
+    let mut value = receipts::get(rt, token.namespace().as_str(), &id).await?;
+    let mut budget = changes::CHANGED_BYTE_BOUND;
+    changes::bound_stored(&mut value, limit, &mut budget);
+    Ok(value)
 }
 
 pub async fn runs(
@@ -306,7 +407,8 @@ pub async fn runs(
     let tool = opt_str(&params, "tool")?;
     let session_id = opt_str(&params, "session_id")?;
     let limit = opt_limit(&params, "limit", 20, 500)?;
-    let rows = receipts::list(
+    let changed_limit = changes::changed_limit(&params)?;
+    let mut rows = receipts::list(
         rt,
         token.namespace().as_str(),
         &actor,
@@ -315,6 +417,12 @@ pub async fn runs(
         limit,
     )
     .await?;
+    // One byte bound across the whole reply, spent in the reply's order; changed_limit
+    // applies to each row.
+    let mut budget = changes::CHANGED_BYTE_BOUND;
+    for row in &mut rows {
+        changes::bound_stored(row, changed_limit, &mut budget);
+    }
     Ok(json!({ "runs": rows, "count": rows.len() }))
 }
 
@@ -496,6 +604,7 @@ struct Request {
     timeout: Duration,
     session_id: Option<String>,
     declared: Option<Vec<String>>,
+    changed_limit: usize,
 }
 
 fn parse_request(params: &Value, cfg: &Resolved) -> Result<Request, RuntimeError> {
@@ -545,6 +654,7 @@ fn parse_request(params: &Value, cfg: &Resolved) -> Result<Request, RuntimeError
             tree::validate_relative_path(p, "declared_write_paths")?;
         }
     }
+    let changed_limit = changes::changed_limit(params)?;
     Ok(Request {
         tree_in,
         tool,
@@ -555,6 +665,7 @@ fn parse_request(params: &Value, cfg: &Resolved) -> Result<Request, RuntimeError
         timeout,
         session_id,
         declared,
+        changed_limit,
     })
 }
 
@@ -917,19 +1028,48 @@ pub async fn run(
                     finish_cleanup(&mut receipt, &run_dir, &profile_path, false);
                 }
             }
+            // The full list goes to a blob before the row is written, so the row can name it and
+            // exec.receipt and exec.runs read the reference without writing. A failed write
+            // fails the run, as a failed output capture does: the receipt still lands, with the
+            // full list, and says why.
+            let full: Vec<Value> = receipt.changed.iter().map(Change::to_json).collect();
+            let changed_ref = match changes::store_list(rt, &full).await {
+                Ok(changed_ref) => changed_ref,
+                Err(error) => {
+                    append_failure_reason(
+                        &mut receipt,
+                        format!("the change list could not be written to the blob store: {error}"),
+                    );
+                    None
+                }
+            };
             let mut value = receipt.to_json();
+            value["changed_count"] = json!(full.len());
+            value["changed_ref"] = json!(changed_ref);
             let seq = receipts::insert(rt, &ns, &value).await?;
             value["seq"] = seq.map_or(Value::Null, Value::from);
-            Ok(json!({
-                "receipt": value,
-                "changed": receipt.changed.iter().map(Change::to_json).collect::<Vec<_>>(),
-            }))
+            // The reply carries the list twice, at the top level and inside the receipt, and
+            // both are the same bounded list with the same three fields.
+            changes::bound_reply(&mut value, &full, changed_ref.as_deref(), req.changed_limit);
+            let mut reply = json!({});
+            for key in [
+                "changed",
+                "changed_count",
+                "changed_truncated",
+                "changed_ref",
+            ] {
+                reply[key] = value[key].clone();
+            }
+            reply["receipt"] = value;
+            Ok(reply)
         }
         Err(reason) => {
             receipt.denied = true;
             receipt.success = false;
             receipt.reason = Some(reason.clone());
-            let value = receipt.to_json();
+            let mut value = receipt.to_json();
+            value["changed_count"] = json!(0);
+            value["changed_ref"] = Value::Null;
             receipts::insert(rt, &ns, &value).await?;
             Err(refusal_error(&reason, &receipt))
         }

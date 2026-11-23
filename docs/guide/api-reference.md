@@ -3252,12 +3252,12 @@ sandbox semantics.
 
 ### `exec.tree`, `exec.tree_get`, `exec.tree_put`, `exec.tree_diff`
 
-| Verb             | Parameters                                                      | Result                           |
-| ---------------- | --------------------------------------------------------------- | -------------------------------- |
-| `exec.tree`      | `entries: [{path, ref, mode}]`                                  | `{tree}`                         |
-| `exec.tree_get`  | `tree`                                                          | `{tree, entries}`                |
-| `exec.tree_put`  | `tree`, nonempty `edits: [{path, ref\|content\|delete, mode?}]` | `{tree, base, entries, changed}` |
-| `exec.tree_diff` | `base`, `head`                                                  | `{base, head, changed}`          |
+| Verb             | Parameters                                                                                    | Result                           |
+| ---------------- | --------------------------------------------------------------------------------------------- | -------------------------------- |
+| `exec.tree`      | `entries: [{path, ref, mode}]`                                                                | `{tree}`                         |
+| `exec.tree_get`  | `tree`                                                                                        | `{tree, entries}`                |
+| `exec.tree_put`  | `tree`, nonempty `edits: [{path, ref\|content\|delete, mode?, recursive?}]`, `changed_limit?` | `{tree, base, entries, changed}` |
+| `exec.tree_diff` | `base`, `head`, `changed_limit?`                                                              | `{base, head, changed}`          |
 
 Entry modes are decimal `644` (file), `755` (executable file) or `120000`
 (symlink). A symlink's blob holds its literal target bytes, without an added
@@ -3272,6 +3272,20 @@ an existing mode or defaults to `644` for a new path; deletes cannot carry a mod
 Retargeting a link or switching between a symlink and a file is `modified`.
 Unsupported modes, duplicate edit paths and deletion of a missing path refuse
 the call without publishing a new tree.
+
+An edit `{path, delete: true, recursive: true}` removes every entry under the
+directory `path`, matched by path component (`dir` never removes `dir2`); a link
+under it is removed as an entry and not followed. It refuses when nothing is
+under the directory, when the path is a file, and beside any other edit under
+it. A plain delete of a directory refuses and names `recursive`.
+
+The change list of `exec.tree_put`, `exec.tree_diff`, `exec.run`,
+`exec.receipt` and `exec.runs` is bounded: at most `changed_limit` changes
+(default 1000, at most 10,000; a larger value refuses) and 262,144 bytes of its
+JSON-lines form, one bound across a whole `exec.runs` reply. Beside it,
+`changed_count` is the full length, `changed_truncated` says whether the reply
+was cut, and `changed_ref` names a blob holding the full list as JSON lines,
+read in slices with `blob.get` and `range`. See ADR-181 Amendment 18.
 
 `exec.run` materializes real symlinks, including absolute or escaping targets.
 Seatbelt constrains access to resolved targets; `declared_write_paths` names

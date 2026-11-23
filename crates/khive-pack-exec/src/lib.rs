@@ -7,6 +7,7 @@
 //! rendered from a fixed template; see [`sandbox`].
 
 mod capture;
+mod changes;
 #[cfg(unix)]
 mod group_child;
 mod handlers;
