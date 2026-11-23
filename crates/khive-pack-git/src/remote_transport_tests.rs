@@ -113,6 +113,61 @@ fn api_redacts_json_escaped_credentials_in_keys_and_values() {
 }
 
 #[test]
+fn api_spent_allowance_is_its_own_refusal_and_carries_the_reset() {
+    let spent = RemoteError::RateLimited {
+        reset: Some(1_795_346_246),
+    };
+    for status in ["403 Forbidden", "429 Too Many Requests"] {
+        for effect in [true, false] {
+            let response = format!(
+                "HTTP/2.0 {status}\r\nContent-Type: application/json\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: 1795346246\r\n\r\n{{}}"
+            );
+            assert_eq!(
+                parse_api_response(false, response.into_bytes(), "secret", effect),
+                Err(spent),
+                "{status} effect={effect}"
+            );
+        }
+    }
+    // Header names are matched without regard to case, and a missing or unreadable reset
+    // still names the cause.
+    for (headers, reset) in [
+        ("x-ratelimit-remaining: 0\nx-ratelimit-reset: 12", Some(12)),
+        ("X-RateLimit-Remaining: 0", None),
+        ("X-RateLimit-Remaining: 0\nX-RateLimit-Reset: soon", None),
+    ] {
+        let response = format!("HTTP/2.0 403 Forbidden\n{headers}\n\n{{}}");
+        assert_eq!(
+            parse_api_response(false, response.into_bytes(), "secret", false),
+            Err(RemoteError::RateLimited { reset }),
+            "{headers}"
+        );
+    }
+    // Controls: allowance left, no allowance header, and another refusal status with a zero
+    // count are the plain refusal; a zero count on a success is a success.
+    for response in [
+        "HTTP/2.0 403 Forbidden\nX-Ratelimit-Remaining: 12\n\n{}",
+        "HTTP/2.0 403 Forbidden\n\n{}",
+        "HTTP/2.0 404 Not Found\nX-Ratelimit-Remaining: 0\n\n{}",
+    ] {
+        assert_eq!(
+            parse_api_response(false, response.as_bytes().to_vec(), "secret", false),
+            Err(RemoteError::Refused),
+            "{response}"
+        );
+    }
+    assert_eq!(
+        parse_api_response(
+            true,
+            b"HTTP/2.0 200 OK\nX-Ratelimit-Remaining: 0\n\n{}".to_vec(),
+            "secret",
+            false
+        ),
+        Ok(json!({}))
+    );
+}
+
+#[test]
 fn api_ambiguous_effect_replies_are_unknown_and_explicit_refusals_are_not() {
     for response in [
         b"HTTP/2.0 503 Unavailable\n\n{}".as_slice(),

@@ -17,6 +17,11 @@ use crate::git_env;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteError {
     Refused,
+    /// The platform refused because the credential's request allowance is spent. `reset` is
+    /// the epoch second the platform says the allowance returns, when it said one.
+    RateLimited {
+        reset: Option<u64>,
+    },
     Unavailable,
     Unknown,
     InvalidResponse,
@@ -385,6 +390,14 @@ fn parse_api_response(
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|s| s.parse::<u16>().ok());
     if !success || !status.is_some_and(|status| (200..300).contains(&status)) {
+        // A spent allowance is refused before the platform acts on the request, and the
+        // response says so itself: a caller told only "refused" cannot tell it from a
+        // missing permission and has no reason to stop asking.
+        if matches!(status, Some(403 | 429)) {
+            if let Some(reset) = spent_allowance(headers) {
+                return Err(RemoteError::RateLimited { reset });
+            }
+        }
         // Only explicit platform refusals prove there was no effect. Server or
         // transport failures can follow a committed write.
         return Err(
@@ -407,6 +420,18 @@ fn parse_api_response(
         }
     })?;
     Ok(redact(value, token))
+}
+
+/// `Some(reset)` when the response headers report a remaining allowance of zero.
+fn spent_allowance(headers: &str) -> Option<Option<u64>> {
+    let field = |name: &str| {
+        headers.lines().skip(1).find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    };
+    (field("x-ratelimit-remaining")? == "0")
+        .then(|| field("x-ratelimit-reset").and_then(|at| at.parse().ok()))
 }
 
 fn redact(value: Value, token: &str) -> Value {

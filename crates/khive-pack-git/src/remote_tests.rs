@@ -81,9 +81,12 @@ struct State {
     merge_race: Option<String>,
     lost_ack: bool,
     api_failure: bool,
+    rate_limited: Option<u64>,
     malformed_merge_reply: bool,
     review_decision: Value,
     decision_head: Option<String>,
+    check_runs: Vec<Value>,
+    combined: Value,
 }
 impl Recording {
     fn login(token: &str) -> &str {
@@ -162,6 +165,9 @@ impl RemoteTransport for Recording {
         if s.api_failure {
             return Err(RemoteError::Unavailable);
         }
+        if let Some(reset) = s.rate_limited {
+            return Err(RemoteError::RateLimited { reset: Some(reset) });
+        }
         let path = request.path.as_str();
         if path == "user" {
             return Ok(json!({"login":Self::login(token)}));
@@ -183,6 +189,25 @@ impl RemoteTransport for Recording {
         }
         if path.contains("/reviews?") {
             return Ok(json!(s.reviews));
+        }
+        if let Some(rest) = path.strip_prefix(&format!("repos/{SLUG}/commits/")) {
+            if rest.contains("/status?") {
+                return Ok(s.combined.clone());
+            }
+            // The platform pages one hundred check runs at a time and repeats the full count.
+            let page = rest
+                .split_once("/check-runs?per_page=100&page=")
+                .and_then(|(_, page)| page.parse::<usize>().ok())
+                .filter(|page| *page > 0)
+                .ok_or(RemoteError::InvalidResponse)?;
+            let rows: Vec<Value> = s
+                .check_runs
+                .iter()
+                .skip((page - 1) * 100)
+                .take(100)
+                .cloned()
+                .collect();
+            return Ok(json!({"total_count":s.check_runs.len(),"check_runs":rows}));
         }
         let part = path
             .strip_prefix(&format!("repos/{SLUG}/pulls/"))
@@ -376,9 +401,12 @@ impl Fixture {
                 merge_race: None,
                 lost_ack: false,
                 api_failure: false,
+                rate_limited: None,
                 malformed_merge_reply: false,
                 review_decision: json!("APPROVED"),
                 decision_head: None,
+                check_runs: vec![],
+                combined: json!({"state":"pending","total_count":0,"statuses":[]}),
             }),
         });
         let mut builder = VerbRegistryBuilder::new();
@@ -521,6 +549,8 @@ include!("remote_tests/review_provenance_tests.rs");
 include!("remote_tests/push_admission_tests.rs");
 
 include!("remote_tests/pull_request_decisions_tests.rs");
+
+include!("remote_tests/pull_request_state_tests.rs");
 
 include!("remote_tests/outcome_reconciliation_tests.rs");
 

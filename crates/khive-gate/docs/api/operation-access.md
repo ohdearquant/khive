@@ -95,6 +95,11 @@ process-wide quiet deadline controlling background work. Its state is in memory,
 but caller-requested control changes require write permission. Ordinary dispatch
 audit retention and failure handling still apply.
 
+Revision `domain-effects-v28` classifies `git.pr_state` as `Read`: it reads one pull
+request's state, checks, statuses and reviews from the platform with the caller's
+credential and writes no receipt. Like the other gated git reads it dispatches
+`tool.check`, so its policy decision row is retained under admission pressure.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -199,6 +204,7 @@ audit retention and failure handling still apply.
 | `git.pr_merge`                    | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs#L78)                   |
 | `git.pr_open`                     | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs#L47)                   |
 | `git.pr_review`                   | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs#L63)                   |
+| `git.pr_state`                    | Read   | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs)                       |
 | `git.push`                        | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs#L33)                   |
 | `git.receipts`                    | Read   | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L44)                     |
 | `git.reconcile`                   | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L64)                     |

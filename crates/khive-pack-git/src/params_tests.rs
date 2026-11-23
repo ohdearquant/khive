@@ -359,6 +359,7 @@ async fn every_registered_git_verb_rejects_named_unknowns_preserving_refusal_evi
             json!({"repo":repo,"number":1,"method":"squash","subject":"fixture","body":"","expected_head":head}),
             "method",
         ),
+        ("git.pr_state", json!({"repo":repo,"number":1}), "number"),
         ("git.init", json!({"repo":blank,"branch":"main"}), "branch"),
         ("git.checkout", json!({"repo":repo,"ref":"HEAD"}), "ref"),
         (
