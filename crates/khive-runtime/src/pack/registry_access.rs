@@ -502,6 +502,9 @@ impl VerbRegistry {
     /// - `tool.check` persists a policy decision receipt. `git.receipts`,
     ///   `git.gates`, `git.status`, `git.log` and `git.pr_state` dispatch that same check,
     ///   so their read results also carry a required decision write.
+    /// - `exec.tree_diff` writes the full change list as a blob whenever its
+    ///   reply cuts the list (ADR-181 Amendment 18), so a read result can
+    ///   carry a required write.
     /// - `comm.withheld_body` writes an access audit event on every call;
     ///   the record of who read a withheld original is the point of the
     ///   verb, so its accounting row is never droppable.
@@ -542,9 +545,9 @@ impl VerbRegistry {
         ("agent", "agent.observe"),
         // exec (reads of the blob store, the run receipt and event tables, or
         // the resolved configuration; the writers are exec.tree and
-        // exec.tree_put, Declarations, and exec.run, a Directive)
+        // exec.tree_put, Declarations, and exec.run, a Directive; exec.tree_diff
+        // writes a change-list blob when it cuts the list, so it is not here)
         ("exec", "exec.tree_get"),
-        ("exec", "exec.tree_diff"),
         ("exec", "exec.receipt"),
         ("exec", "exec.runs"),
         ("exec", "exec.events"),
