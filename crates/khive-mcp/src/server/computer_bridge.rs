@@ -125,11 +125,11 @@ impl ComputerBridge {
         }
         for (stage, op) in stages.iter_mut().zip(&parsed.ops) {
             match self.routing.place(op) {
-                Placement::Home(Home::Store) => stage["served_by"] = json!("store"),
-                Placement::Home(Home::Computer) => stage["served_by"] = json!("computer"),
+                Placement::Home(Home::Store) => stage["served_by"] = Value::from("store"),
+                Placement::Home(Home::Computer) => stage["served_by"] = Value::from("computer"),
                 Placement::RunsOnComputer => {
                     stage["served_by"] = Value::Null;
-                    stage["refused"] = json!(RUNS_ON_COMPUTER);
+                    stage["refused"] = Value::from(RUNS_ON_COMPUTER);
                 }
             }
         }

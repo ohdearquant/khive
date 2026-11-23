@@ -139,8 +139,25 @@ fn assert_adapter_dependencies(method: &syn::ImplItemFn) {
             ),
             "plan_response" => (
                 &["Some", "Ok"],
-                &["validate_plan_envelope", "plan_ops"],
-                &["p.plan", "p.ops"],
+                // A caller with a computer marks each stage with its home;
+                // `plan_with_homes` is guarded below and sends nothing.
+                &["validate_plan_envelope", "plan_ops", "plan_with_homes"],
+                &["p.plan", "p.ops", "self.computer"],
+            ),
+            // Reads the local routing table for each stage and writes its
+            // `served_by` (or `refused`) field. No connector, no session.
+            "plan_with_homes" => (
+                &["serde_json::from_str", "parse_request", "Value::from"],
+                &[
+                    "get_mut",
+                    "and_then",
+                    "len",
+                    "iter_mut",
+                    "zip",
+                    "place",
+                    "to_string",
+                ],
+                &["parsed.ops", "self.routing"],
             ),
             "validate_plan_envelope" => (
                 &["Err", "Ok", "rmcp::ErrorData::invalid_params"],
@@ -198,6 +215,12 @@ fn mcp_plan_adapters_only_validate_presence_read_catalog_and_plan() {
         "RequestParams",
         "validate_plan_envelope",
     ));
+    let computer = include_str!("../src/server/computer_bridge.rs");
+    assert_adapter_dependencies(&adapter_method(
+        computer,
+        "ComputerBridge",
+        "plan_with_homes",
+    ));
 }
 
 #[test]
@@ -218,6 +241,11 @@ fn mcp_plan_adapter_guards_reject_effect_calls() {
             "RequestParams",
             "validate_plan_envelope",
         ),
+        (
+            include_str!("../src/server/computer_bridge.rs"),
+            "ComputerBridge",
+            "plan_with_homes",
+        ),
     ] {
         let mut method = adapter_method(source, owner, name);
         method
@@ -227,6 +255,24 @@ fn mcp_plan_adapter_guards_reject_effect_calls() {
         assert!(
             std::panic::catch_unwind(|| assert_adapter_dependencies(&method)).is_err(),
             "{owner}::{name} accepted the mutation"
+        );
+    }
+}
+
+#[test]
+fn the_computer_plan_adapter_guard_rejects_a_send_or_a_session() {
+    let source = include_str!("../src/server/computer_bridge.rs");
+    let mutations: [syn::Stmt; 3] = [
+        syn::parse_quote!(let _ = self.client.send(ops.to_owned(), &options);),
+        syn::parse_quote!(let _ = self.routing.connect(transport);),
+        syn::parse_quote!(let _ = session.connection.service.call_tool(params);),
+    ];
+    for (index, mutation) in mutations.into_iter().enumerate() {
+        let mut method = adapter_method(source, "ComputerBridge", "plan_with_homes");
+        method.block.stmts.insert(0, mutation);
+        assert!(
+            std::panic::catch_unwind(|| assert_adapter_dependencies(&method)).is_err(),
+            "plan_with_homes accepted mutation {index}"
         );
     }
 }
