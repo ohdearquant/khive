@@ -1745,9 +1745,12 @@ that are hashed and stored on every run and thrown away with the directory, so t
    in canonical form, so a symbolic link or a `..` component does not hide an overlap. An overlap with the exec root
    would let one run write another run's directory, and an overlap with a read root would make a directory the
    configuration calls read-only writable. The refusal names the entry and, for an overlap, the root it overlaps.
-   An entry whose path passes through a symbolic link, the last component included, is refused when the link itself
-   sits inside the exec root or inside a cache root, naming the link and that root: a run can point such a link
-   elsewhere, and the next run would be granted write wherever it points. A link where no run can write is followed.
+   Each entry is resolved by one walk, component by component, that follows every symbolic link it meets and records
+   where each link sits; the walk's result is what is checked, granted and digested, so no second read of the file
+   system comes between the check and the grant. An entry is refused when any symbolic link met while resolving it,
+   one met inside another link's target included, sits inside the exec root or inside a cache root, naming the link
+   and that root: a run can point such a link elsewhere, and the next run would be granted write wherever it points.
+   A link where no run can write is followed. A walk that follows more than 40 links is refused.
    The check does not judge what else a cache root holds. A root that holds a home directory, a credential or a
    store is the operator's error and is not refused.
 4. **Capture.** Nothing under a cache root is part of the run's output. It is not walked, not hashed, not stored, and

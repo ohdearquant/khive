@@ -126,9 +126,10 @@ credential or a store is the operator's error and is not refused. Its size is
 bounded by its volume, not by the run limits. Each entry is resolved again
 when a run starts, and the run's profile grants the paths that check resolved,
 so a cache root created after the server started, or named through a symbolic
-link, is writable under its real path. An entry whose path passes through a
-symbolic link that sits inside the exec root or inside a cache root is refused,
-because a run could point that link elsewhere. Each receipt's
+link, is writable under its real path. An entry that resolves through a symbolic
+link sitting inside the exec root or inside a cache root, a link reached through
+another link's target included, is refused, because a run could point that link
+elsewhere. Each receipt's
 `sandbox.cache_roots_digest` names the list the run had.
 
 ### Exec sandbox path matches

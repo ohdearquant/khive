@@ -419,6 +419,66 @@ fn a_cache_root_through_a_link_a_run_can_write_is_refused() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_link_met_inside_another_links_target_is_checked_like_one_in_the_entry() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let base = std::fs::canonicalize(dir.path()).expect("canonical base");
+    let root = base.join("runs");
+    let shared = base.join("shared");
+    let operator = base.join("op");
+    let target = base.join("target");
+    for path in [&root, &shared, &operator, &target.join("x")] {
+        std::fs::create_dir_all(path).expect("fixture directory");
+    }
+    let symlink = |to: &Path, at: &Path| std::os::unix::fs::symlink(to, at).expect("symbolic link");
+
+    // The operator's alias sits where no run writes, and points through a
+    // `current` link that sits inside the cache root `shared`.
+    let current = shared.join("current");
+    symlink(&target, &current);
+    let alias = operator.join("alias");
+    symlink(&current.join("x"), &alias);
+    let message = resolve_cache_roots(&root, &[], &[shared.clone(), alias.clone()])
+        .expect_err("an alias through a link inside a cache root must be refused");
+    assert!(message.contains(&format!("{current:?}")), "{message}");
+    assert!(message.contains(&format!("{shared:?}")), "{message}");
+    assert!(message.contains(&format!("{alias:?}")), "{message}");
+    // Control: without `shared` among the cache roots nothing a run writes
+    // holds the link, and the alias resolves to the directory behind it.
+    assert_eq!(
+        resolve_cache_roots(&root, &[], std::slice::from_ref(&alias)),
+        Ok(vec![target.join("x")])
+    );
+
+    // A link to a link, both where no run writes, the second relative and
+    // stepping out with `..`, is followed to the directory behind them.
+    let second = operator.join("second");
+    symlink(Path::new("../target"), &second);
+    let first = base.join("first");
+    symlink(&second, &first);
+    assert_eq!(
+        resolve_cache_roots(&root, &[], &[first.join("x")]),
+        Ok(vec![target.join("x")])
+    );
+    assert_eq!(
+        current_cache_roots(&[first.join("x")]),
+        vec![target.join("x")]
+    );
+
+    // A loop is refused rather than followed forever.
+    let one = base.join("loop-one");
+    let two = base.join("loop-two");
+    symlink(&two, &one);
+    symlink(&one, &two);
+    let message = resolve_cache_roots(&root, &[], &[one.join("x")])
+        .expect_err("a loop of links must be refused");
+    assert!(
+        message.contains("follows more than 40 symbolic links"),
+        "{message}"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn sandboxed_write_reaches_a_cache_root_and_nothing_beside_it() {

@@ -27,7 +27,8 @@
 //! bytes as before. Every rule here was accepted by driving it, never by its
 //! text.
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -459,22 +460,16 @@ pub fn resolve_cache_roots(
     cache_roots: &[PathBuf],
 ) -> Result<Vec<PathBuf>, String> {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let mut resolved = Vec::with_capacity(cache_roots.len());
+    let mut walked: Vec<(&PathBuf, Walked)> = Vec::with_capacity(cache_roots.len());
     for entry in cache_roots {
         if !entry.is_absolute() {
             return Err(format!(
                 "[exec] cache_roots entry {entry:?} is not an absolute path"
             ));
         }
-        let cache = match std::fs::canonicalize(entry) {
-            Ok(cache) => cache,
-            Err(error) => {
-                return Err(format!(
-                    "[exec] cache_roots entry {entry:?} cannot be resolved ({error}); \
-                     it must exist when a run starts"
-                ));
-            }
-        };
+        let walk = walk_entry(entry)
+            .map_err(|detail| format!("[exec] cache_roots entry {entry:?} {detail}"))?;
+        let cache = walk.path.clone();
         if root.starts_with(&cache) || cache.starts_with(&root) {
             return Err(format!(
                 "[exec] cache_roots entry {entry:?} overlaps the run root {root:?}"
@@ -488,59 +483,104 @@ pub fn resolve_cache_roots(
                 ));
             }
         }
-        resolved.push(cache);
+        walked.push((entry, walk));
     }
-    // Resolving at run start follows each link on the entry's path as it is
-    // now. A link a run can write could be pointed elsewhere by one run, and
-    // the next run would be granted write wherever it points, so an entry that
-    // passes through such a link is refused. A link where no run can write is
-    // followed.
-    for entry in cache_roots {
-        if let Some((link, holder)) = writable_link_on_path(entry, &root, &resolved) {
-            return Err(format!(
-                "[exec] cache_roots entry {entry:?} passes through the symbolic link {link:?}, \
-                 which sits inside {holder} where a run can point it elsewhere"
-            ));
+    // Resolving at run start follows each link met on the way as it is now. A
+    // link a run can write could be pointed elsewhere by one run, and the next
+    // run would be granted write wherever it points, so an entry whose walk
+    // met such a link is refused. A link where no run can write is followed.
+    // The grant below is the walk's own result, so no second read of the file
+    // system stands between the check and the path granted.
+    for (entry, walk) in &walked {
+        for link in &walk.links {
+            let holder = if link.starts_with(&root) {
+                Some(format!("the run root {root:?}"))
+            } else {
+                walked
+                    .iter()
+                    .find(|(_, other)| link.starts_with(&other.path))
+                    .map(|(_, other)| format!("the cache root {:?}", other.path))
+            };
+            if let Some(holder) = holder {
+                return Err(format!(
+                    "[exec] cache_roots entry {entry:?} resolves through the symbolic link \
+                     {link:?}, which sits inside {holder} where a run can point it elsewhere"
+                ));
+            }
         }
     }
+    let mut resolved: Vec<PathBuf> = walked.into_iter().map(|(_, walk)| walk.path).collect();
     resolved.sort();
     resolved.dedup();
     Ok(resolved)
 }
 
-/// The first symbolic link on `entry`'s path, the last component included,
-/// whose own location is inside the run root or inside a resolved cache root,
-/// with that root named. A link's location is its parent's canonical path
-/// joined with its name, so the comparison is with where the link itself sits,
-/// not with where it points.
-fn writable_link_on_path(
-    entry: &Path,
-    root: &Path,
-    cache_roots: &[PathBuf],
-) -> Option<(PathBuf, String)> {
-    let mut prefix = PathBuf::new();
-    for component in entry.components() {
-        prefix.push(component);
-        let is_link = std::fs::symlink_metadata(&prefix)
-            .map(|metadata| metadata.file_type().is_symlink())
-            .unwrap_or(false);
-        if !is_link {
+/// Symbolic links one walk follows before it refuses the entry as a loop.
+const MAX_LINK_HOPS: usize = 40;
+
+/// One cache root entry resolved by [`walk_entry`].
+struct Walked {
+    /// The canonical path the walk reached.
+    path: PathBuf,
+    /// Where each symbolic link the walk followed sits: its directory's
+    /// canonical path joined with its name, not where it points.
+    links: Vec<PathBuf>,
+}
+
+/// Resolve an absolute path one component at a time from the root of the
+/// file system. A component that is a symbolic link is read and its target's
+/// components take its place, so a link met inside another link's target is
+/// followed and recorded like one in the configured text. An absolute target
+/// starts again from the root, `..` leaves the directory reached so far, and
+/// more than [`MAX_LINK_HOPS`] links refuse. The directory reached so far is
+/// canonical at every step, so each recorded location is too.
+fn walk_entry(entry: &Path) -> Result<Walked, String> {
+    let mut pending: Vec<OsString> = Vec::new();
+    push_components(&mut pending, entry);
+    let mut path = PathBuf::from("/");
+    let mut links = Vec::new();
+    while let Some(part) = pending.pop() {
+        if part == ".." {
+            path.pop();
             continue;
         }
-        let (Some(parent), Some(name)) = (prefix.parent(), prefix.file_name()) else {
+        let next = path.join(&part);
+        let metadata = std::fs::symlink_metadata(&next).map_err(|error| {
+            format!("cannot be resolved at {next:?} ({error}); it must exist when a run starts")
+        })?;
+        if !metadata.file_type().is_symlink() {
+            path = next;
             continue;
-        };
-        let location = std::fs::canonicalize(parent)
-            .unwrap_or_else(|_| parent.to_path_buf())
-            .join(name);
-        if location.starts_with(root) {
-            return Some((prefix, format!("the run root {root:?}")));
         }
-        if let Some(cache) = cache_roots.iter().find(|cache| location.starts_with(cache)) {
-            return Some((prefix, format!("the cache root {cache:?}")));
+        if links.len() == MAX_LINK_HOPS {
+            return Err(format!(
+                "follows more than {MAX_LINK_HOPS} symbolic links; the last was {next:?}"
+            ));
         }
+        let target = std::fs::read_link(&next).map_err(|error| {
+            format!("cannot be resolved: the symbolic link {next:?} cannot be read ({error})")
+        })?;
+        if target.is_absolute() {
+            path = PathBuf::from("/");
+        }
+        push_components(&mut pending, &target);
+        links.push(next);
     }
-    None
+    Ok(Walked { path, links })
+}
+
+/// Queue `path`'s components so the first is popped first. `..` is kept as
+/// itself, which no ordinary component can equal; `.` and the root drop out.
+fn push_components(pending: &mut Vec<OsString>, path: &Path) {
+    let parts: Vec<OsString> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_os_string()),
+            Component::ParentDir => Some(OsString::from("..")),
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
+        })
+        .collect();
+    pending.extend(parts.into_iter().rev());
 }
 
 /// The configured cache roots in the canonical form they have now, sorted and
@@ -550,7 +590,7 @@ fn writable_link_on_path(
 pub fn current_cache_roots(cache_roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut current: Vec<PathBuf> = cache_roots
         .iter()
-        .map(|entry| std::fs::canonicalize(entry).unwrap_or_else(|_| entry.clone()))
+        .map(|entry| walk_entry(entry).map_or_else(|_| entry.clone(), |walk| walk.path))
         .collect();
     current.sort();
     current.dedup();
