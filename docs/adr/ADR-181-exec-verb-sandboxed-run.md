@@ -1977,7 +1977,10 @@ minted and the caller never saw its reference.
 1. **The bound.** A reply carries at most `changed_limit` changes, 1000 when the call does not set it, and at most
    262,144 bytes of them, counted in the JSON-lines form of item 3: each change's compact JSON and its newline. The
    list stops before the first change that would cross either bound, so a reply holds a prefix of the full list in
-   its path order. No argument raises the byte bound.
+   its path order. No argument raises the byte bound. `exec.runs` returns many rows in one reply, and its byte bound
+   is one bound across the whole reply: rows in the reply's order, each list a prefix of its row's list, and once
+   262,144 bytes are spent every remaining row carries an empty list with its own `changed_count`,
+   `changed_truncated: true` and `changed_ref`. `changed_limit` applies to each row.
 2. **`changed_limit`.** `exec.tree_put`, `exec.tree_diff`, `exec.run`, `exec.receipt` and `exec.runs` accept
    `changed_limit`, an integer from 0 to 10,000. A larger value is refused and the refusal names 10,000; it is not
    clamped. A negative or non-integer value is refused. On `exec.tree_put` the refusal comes before any write, under
@@ -1986,7 +1989,11 @@ minted and the caller never saw its reference.
    `changed_truncated`, true when the reply holds fewer changes than that; and `changed_ref`, the blob reference of
    the full list as JSON lines: one change per line in path order, each the same object the reply uses in compact
    JSON, each line ending in a newline. The blob is content addressed, so one list has one reference whichever verb
-   wrote it.
+   wrote it. It is a committed object like any other, and nothing in the runtime removes a committed object (the
+   store's reclamation sweeps only unfinished uploads), so it lasts as long as the blob store does and
+   `exec.tree_put`, which keeps no receipt row, needs nothing else to hold it; if the store has lost it, `blob.get`
+   refuses as not found naming the reference, and the list is computed again by `exec.tree_diff` of the call's
+   `base` and `tree`, or read from a run's persisted receipt.
    - `exec.tree_put` and `exec.run` write the blob whenever the list is not empty; `changed_ref` is null only for an
      empty list.
    - `exec.run` stores `changed_count` and `changed_ref` on the persisted receipt. `exec.receipt` and `exec.runs`
@@ -1994,7 +2001,9 @@ minted and the caller never saw its reference.
    - `exec.tree_diff` writes the blob only when it cuts the list and otherwise returns `changed_ref: null`. That
      write takes it off the admission degrade-safe list, where it is classified with the reads that write.
 4. **One list per reply.** `exec.run`'s reply keeps the list at the top level and inside `receipt`, and both are the
-   same bounded list with the same three fields, so the reply holds at most twice the byte bound of change data.
+   same bounded list with the same three fields, so the reply holds at most twice the byte bound of change data,
+   524,288 bytes. That sits under the daemon frame, the 8 MiB (8,388,608-byte) limit on every reply the daemon
+   writes, which is also the frame item 6's `blob.get` slices must fit.
    Dropping the copy inside `receipt` would bound the reply at once the byte bound but break item 8 for every caller
    that reads `receipt.changed`.
 5. **The persisted receipt keeps the full list.** The bound applies to replies only. A receipt stored before this
@@ -2011,10 +2020,13 @@ minted and the caller never saw its reference.
 7. **Directory delete.** An edit `{"path": D, "delete": true, "recursive": true}` removes every entry whose path is
    D followed by `/` and more. The match is by path component: `dir` never removes `dir2` or anything under it. A
    symbolic-link entry under D is removed as an entry; its target is not read and nothing it names is touched,
-   because a tree stores a link as its target text (Amendment 5). Refused, each naming the edit: D that holds no
-   entry, D that names a file entry, D that names the root of the tree (empty, `.` or `/`), `recursive` on an edit
-   that is not a delete, and any other edit in the same call whose path is under D, naming both indices as the
-   duplicate rule does (Amendment 4 item 4). `recursive: false` is the same as leaving it out. A delete without it
+   because a tree stores a link as its target text (Amendment 5). D passes the path rules every edit path passes
+   (the tree manifest rule at the head of this record, tested by Amendment 4's acceptance 27): an empty path, a
+   leading `/`, a trailing slash, and an empty, `.` or `..` component are refused before any match, so `dir/`,
+   `./dir` and `dir/../dir` are refused rather than read as `dir`, and the root of the tree (empty, `.` or `/`)
+   is refused by the same rule. Refused, each naming the edit: D that holds no entry, D that names a file entry,
+   `recursive` on an edit that is not a delete, and any other edit in the same call whose path is under D, naming
+   both indices as the duplicate rule does (Amendment 4 item 4). `recursive: false` is the same as leaving it out. A delete without it
    that names a directory is refused as today, and the refusal now names `recursive`.
 8. **Compatibility.** A reply of at most 1000 changes within 262,144 bytes is the same as today plus the three
    fields of item 3.
@@ -2033,10 +2045,13 @@ minted and the caller never saw its reference.
     declared files returns the bounded reply, and the same route gives a list equal to the persisted receipt's.
 96. **Run reply.** The top-level and receipt lists are equal and bounded, with equal fields; `exec.receipt` and
     `exec.runs` return the bounded list and the stored `changed_ref`, and leave the blob store object count unchanged.
+    `exec.runs` over several runs whose lists each fill the byte bound returns at most 262,144 bytes of changes in
+    the whole reply, and the rows after the bound is spent carry empty lists with their own three fields.
 97. **Diff.** `exec.tree_diff` under the bound leaves the object count unchanged and returns `changed_ref: null`;
     over it, it writes one object whose reference equals `exec.tree_put`'s for the same list.
 98. **Directory delete.** `dir` removes `dir/a` and `dir/sub/b` and keeps `dir2` and `dir2/x`; a link `dir/l` to
     `../keep` is removed and `keep` stays; `recursive` on a file path, on the root (each spelling), on a directory
     with no entries and on a put is refused; a second edit under `dir` is refused naming both indices; a plain
-    delete of `dir` is refused naming `recursive`.
+    delete of `dir` is refused naming `recursive`; `dir/`, `./dir` and `dir/../dir` with `recursive` are each
+    refused by the path rule.
 99. **Compatibility.** A three-change reply from each verb equals today's reply plus the three fields.
