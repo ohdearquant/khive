@@ -1995,7 +1995,8 @@ minted and the caller never saw its reference.
    refuses as not found naming the reference, and the list is computed again by `exec.tree_diff` of the call's
    `base` and `tree`, or read from a run's persisted receipt.
    - `exec.tree_put` and `exec.run` write the blob whenever the list is not empty; `changed_ref` is null only for an
-     empty list.
+     empty list, with one exception: when `exec.run` cannot write the blob, its reply and its receipt keep the bounded
+     list with `changed_ref: null`, `success` is false, and the reason says the change list could not be written.
    - `exec.run` stores `changed_count` and `changed_ref` on the persisted receipt. `exec.receipt` and `exec.runs`
      return them from the row and write nothing.
    - `exec.tree_diff` writes the blob only when it cuts the list and otherwise returns `changed_ref: null`. That

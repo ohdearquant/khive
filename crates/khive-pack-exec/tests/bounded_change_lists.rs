@@ -672,5 +672,21 @@ mod runs {
         assert_eq!(out["changed_truncated"], false);
         assert_eq!(&f.read_list(&out["changed_ref"]).await, list(&out));
         assert_eq!(out["receipt"]["changed"], out["changed"]);
+
+        let stored = f
+            .call("exec.receipt", json!({ "id": out["receipt"]["id"] }))
+            .await;
+        let runs = f
+            .call(
+                "exec.runs",
+                json!({ "actor": "local", "session_id": "small" }),
+            )
+            .await;
+        for row in [&stored, &runs["runs"][0]] {
+            assert_eq!(row["changed"], out["changed"], "{row}");
+            assert_eq!(row["changed_count"], 3, "{row}");
+            assert_eq!(row["changed_truncated"], false, "{row}");
+            assert_eq!(row["changed_ref"], out["changed_ref"], "{row}");
+        }
     }
 }
