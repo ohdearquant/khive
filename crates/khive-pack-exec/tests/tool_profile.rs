@@ -133,6 +133,8 @@ impl Fixture {
         assert_eq!(granted["grant"]["status"], "granted", "{granted}");
     }
 
+    /// Only the macOS run below materializes a tree.
+    #[cfg(target_os = "macos")]
     async fn tree(&self) -> String {
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode(b"in");
