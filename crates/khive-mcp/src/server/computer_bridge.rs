@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use tokio::sync::OnceCell;
 
 use super::bridge::ForwardFnPtr;
-use super::computer_catalog::{RoutedCatalog, VERBS_VERB};
+use super::computer_catalog::{RoutedCatalog, CATALOG_READ_TIMEOUT, VERBS_VERB};
 use super::computer_client::{ComputerClient, Connector, ForwardedOptions, HttpConnector};
 use super::computer_routing::{
     execute_split, failed_envelope, ComputerRouting, Home, HomeOutcome, HomeSender, Placement,
@@ -34,6 +34,9 @@ pub(super) struct ComputerBridge {
     pub(super) routing: ComputerRouting,
     pub(super) client: ComputerClient,
     call_timeout: Duration,
+    /// How long one read of the computer's catalog may take: the smaller of
+    /// `call_timeout` and [`CATALOG_READ_TIMEOUT`] (section 8).
+    pub(super) catalog_timeout: Duration,
     routed_requests: AtomicU64,
     /// The computer's catalog as read when the bridge started (section 8).
     pub(super) catalog_at_start: OnceCell<Option<RoutedCatalog>>,
@@ -64,9 +67,17 @@ impl ComputerBridge {
             routing,
             client,
             call_timeout: Duration::from_secs(computer.call_timeout_s),
+            catalog_timeout: Duration::from_secs(computer.call_timeout_s).min(CATALOG_READ_TIMEOUT),
             routed_requests: AtomicU64::new(0),
             catalog_at_start: OnceCell::new(),
         }))
+    }
+
+    /// The same bridge with `timeout` as the bound of a catalog read.
+    #[cfg(test)]
+    pub(super) fn with_catalog_timeout(mut self, timeout: Duration) -> Self {
+        self.catalog_timeout = timeout;
+        self
     }
 
     /// `name (host:port)`, the way every message names the computer.

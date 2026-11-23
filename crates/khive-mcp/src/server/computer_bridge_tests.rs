@@ -37,6 +37,7 @@ use khive_types::{Pack, VerbCategory, Visibility};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ErrorData as McpError, ServerInfo};
 use rmcp::service::RequestContext;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::session::SessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
@@ -45,7 +46,8 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 use super::super::bridge::ForwardFuture;
-use super::super::computer_client::{HttpConnector, COMPUTER_UNREACHABLE};
+use super::super::computer_catalog::CATALOG_READ_TIMEOUT;
+use super::super::computer_client::{Connection, Connector, HttpConnector, COMPUTER_UNREACHABLE};
 use super::super::computer_http::{MAX_ERROR_BODY, MAX_EVENT, MAX_JSON_BODY};
 use super::super::computer_pipe_tests::{PipeComputer, PipeConnector, URL};
 use super::super::KhiveMcpServer;
@@ -1194,6 +1196,73 @@ async fn arm_10_save_to_is_refused_for_verbs_while_a_computer_serves_part_of_the
         .expect_err("save_to is refused");
     assert!(error.message.contains("nothing was run"), "{error:?}");
     assert!(!sink.exists());
+    assert!(computer.calls().is_empty());
+}
+
+/// A computer that accepts the connection and never answers: the session it
+/// is asked to open never completes.
+struct SilentConnector;
+
+#[async_trait]
+impl Connector for SilentConnector {
+    async fn connect(
+        &self,
+        _transport: StreamableHttpClientTransportConfig,
+    ) -> Result<Connection, String> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn a_catalog_read_is_bounded_by_the_smaller_of_the_call_timeout_and_its_own() {
+    let computer = TestComputer::start(ACTOR);
+    let bridge = |call_timeout_s| {
+        ComputerBridge::from_config(
+            &computer.config_with(ACTOR, URL, &["exec"], call_timeout_s),
+            Arc::new(SilentConnector),
+        )
+        .expect("a valid table")
+        .expect("a computer")
+    };
+
+    assert_eq!(bridge(3700).catalog_timeout, CATALOG_READ_TIMEOUT);
+    assert_eq!(bridge(3).catalog_timeout, Duration::from_secs(3));
+}
+
+#[tokio::test]
+#[serial_test::serial(computer_bridge)]
+async fn arm_10_a_computer_that_accepts_and_never_answers_costs_only_the_routed_catalog() {
+    reset_frames();
+    let computer = TestComputer::start(ACTOR);
+    let mut caller = Caller::new();
+    let config = computer.config_with(ACTOR, URL, &["exec", "git"], 3700);
+    caller.server.computer = ComputerBridge::from_config(&config, Arc::new(SilentConnector))
+        .expect("a valid computer table")
+        .map(|bridge| Arc::new(bridge.with_catalog_timeout(Duration::from_secs(1))));
+    let bound = Duration::from_secs(10);
+
+    let started = std::time::Instant::now();
+    let catalog = caller.server.request_tool_catalog().await;
+    assert!(started.elapsed() < bound, "{:?}", started.elapsed());
+    assert!(catalog.contains("git.*"), "{catalog}");
+    assert!(catalog.contains("could not be read"), "{catalog}");
+    assert!(catalog.contains(LABEL), "{catalog}");
+    assert!(catalog.contains("whoami"), "{catalog}");
+
+    let started = std::time::Instant::now();
+    let listed = caller.request(r#"verbs(pack="git")"#).await;
+    assert!(started.elapsed() < bound, "{:?}", started.elapsed());
+    assert_failed(&listed, 0, COMPUTER_UNREACHABLE);
+    let message = listed["results"][0]["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("within 1 s"), "{listed}");
+
+    let started = std::time::Instant::now();
+    let store = caller.request("whoami()").await;
+    assert!(started.elapsed() < bound, "{:?}", started.elapsed());
+    assert_eq!(store["results"][0]["ok"], true, "{store}");
+    assert_eq!(store["results"][0]["result"]["actor_id"], ACTOR, "{store}");
     assert!(computer.calls().is_empty());
 }
 

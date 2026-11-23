@@ -6,9 +6,14 @@
 //! from the read made when the bridge starts; `verbs()` reads the computer
 //! again each time it is called. `<verb>(help=true)` for a routed verb needs
 //! nothing here: its pack sends it to the computer, which answers it.
+//!
+//! Every read of the computer's catalog has its own deadline, shorter than
+//! the call timeout, so a computer that accepts a connection and never
+//! answers costs the caller the routed packs' catalog and nothing else.
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use khive_request::{ArgValue, ParsedOp, ParsedRequest};
 use khive_runtime::{
@@ -19,7 +24,7 @@ use serde_json::{json, Map, Value};
 
 use super::bridge::ForwardFnPtr;
 use super::computer_bridge::ComputerBridge;
-use super::computer_client::ForwardedOptions;
+use super::computer_client::{ForwardedOptions, COMPUTER_UNREACHABLE};
 use super::computer_routing::{ComputerRouting, COMPUTER_PROTOCOL};
 use super::{
     batch_status, failure_entry, invalid_request_error, parse_output_format,
@@ -29,6 +34,10 @@ use crate::tools::request::RequestParams;
 
 /// The introspection verb whose answer this module composes.
 pub(super) const VERBS_VERB: &str = "verbs";
+
+/// The longest a read of the computer's catalog may take, session open
+/// included, when the call timeout is longer.
+pub(super) const CATALOG_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The computer's catalog rows for the packs it serves this caller.
 #[derive(Debug, Clone)]
@@ -40,18 +49,31 @@ pub(super) struct RoutedCatalog {
 }
 
 impl ComputerBridge {
-    /// Reads the computer's catalog with one `verbs()` call.
+    /// Reads the computer's catalog with one `verbs()` call, within
+    /// `catalog_timeout`. A read that does not finish in time fails with
+    /// `computer_unreachable` and commits nothing.
     pub(super) async fn read_catalog(&self) -> Result<RoutedCatalog, (Value, DomainDisposition)> {
         let options = ForwardedOptions {
             presentation: Some("verbose".into()),
             format: Some("json".into()),
             ..ForwardedOptions::default()
         };
-        let text = self
-            .client
-            .send(format!("{VERBS_VERB}()"), &options)
-            .await
-            .map_err(|failure| (failure.error, failure.disposition))?;
+        let read = self.client.send(format!("{VERBS_VERB}()"), &options);
+        let text = match tokio::time::timeout(self.catalog_timeout, read).await {
+            Ok(answer) => answer.map_err(|failure| (failure.error, failure.disposition))?,
+            Err(_) => {
+                let error = json!({
+                    "kind": COMPUTER_UNREACHABLE,
+                    "message": format!(
+                        "the computer {} did not answer verbs() within {} s; a catalog read \
+                         commits nothing",
+                        self.label(),
+                        self.catalog_timeout.as_secs()
+                    ),
+                });
+                return Err((error, DomainDisposition::NotCommitted));
+            }
+        };
         let envelope: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let entry = &envelope["results"][0];
         let protocol = || {
