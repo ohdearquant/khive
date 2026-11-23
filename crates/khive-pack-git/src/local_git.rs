@@ -16,6 +16,8 @@ use crate::write_argv::{validate_message, validate_ref_name};
 
 #[path = "local_git_checkout_batch.rs"]
 mod checkout_batch;
+#[path = "local_git_checkout_reuse.rs"]
+mod checkout_reuse;
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 /// Settings only local invocations carry, passed after `git_env::SHARED_SETTINGS`.
@@ -682,7 +684,20 @@ fn parse_listing(bytes: &[u8]) -> Result<Vec<ListedBlob>> {
     Ok(entries)
 }
 
+/// A checkout that always reads and stores the commit's tree, never reusing an earlier one.
+#[cfg(test)]
 pub(crate) async fn checkout(rt: &KhiveRuntime, repo: &Path, reference: &str) -> Result<Checkout> {
+    checkout_reusing(rt, repo, reference, None).await
+}
+
+/// `checkout`, answering from an earlier committed checkout of the same commit by `namespace` in
+/// this repository when that tree is still whole in the blob store (`checkout_reuse`).
+pub(crate) async fn checkout_reusing(
+    rt: &KhiveRuntime,
+    repo: &Path,
+    reference: &str,
+    namespace: Option<&str>,
+) -> Result<Checkout> {
     let program = rt.config().git_write.git_program();
     let reference = checked_ref(reference)?;
     let mut filters = None;
@@ -696,6 +711,11 @@ pub(crate) async fn checkout(rt: &KhiveRuntime, repo: &Path, reference: &str) ->
         )
         .await?,
     )?;
+    if let Some(namespace) = namespace {
+        if let Some(tree) = checkout_reuse::reusable_tree(rt, namespace, repo, &commit).await {
+            return Ok(Checkout { commit, tree });
+        }
+    }
     let listing = run_async_with_snapshot(
         program,
         repo,
