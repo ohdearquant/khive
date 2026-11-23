@@ -1593,6 +1593,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -2263,6 +2264,10 @@ dependencies = [
  "clap",
  "criterion",
  "futures",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "inventory",
  "khive-channel",
  "khive-channel-email",
@@ -2296,12 +2301,14 @@ dependencies = [
  "khive-types",
  "lattice-embed",
  "libc",
+ "reqwest 0.12.28",
  "rmcp",
  "rusqlite",
  "serde",
  "serde_json",
  "serial_test",
  "sha2",
+ "sse-stream",
  "syn",
  "tempfile",
  "tokio",
@@ -4631,20 +4638,28 @@ checksum = "14db48ee17a9ba61810ab1a9c1beb7d06d8136ae39ac25a1137f10d357af01af"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "futures",
+ "http",
+ "http-body",
+ "http-body-util",
  "pastey",
  "pin-project-lite",
  "process-wrap",
+ "rand 0.10.3",
  "rmcp-macros",
  "schemars",
  "serde",
  "serde_json",
+ "sse-stream",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tower-service",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -5150,6 +5165,19 @@ dependencies = [
  "js-sys",
  "rsqlite-vfs",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "sse-stream"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c25ac7aff0abd1dbc474536e40416e1102c7dd9bfba0b9861c6d357f835dcfb4"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "pin-project-lite",
 ]
 
 [[package]]

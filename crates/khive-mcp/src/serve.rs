@@ -263,6 +263,8 @@ pub async fn serve_server_with_registrations(
         prepare_host_background_tasks_with_registrations(args, &server, &registrations).await?;
     #[cfg(unix)]
     if args.daemon {
+        // The daemon serves many callers and never routes (ADR-220 section 1).
+        let server = server.without_computer();
         khive_runtime::daemon::run_daemon_with_options_and_boot_guard_and_start(
             server,
             boot_guard,

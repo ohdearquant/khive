@@ -157,6 +157,14 @@ blake3 = { version = "1", default-features = false }
 fs4 = "1.1"
 regorus = "0.10"
 rmcp = "2.2"
+# The test computer that the ADR-220 acceptance tests run against, and the
+# HTTP/1.1 pipe that reaches it; all are already in the tree as dependencies
+# of rmcp.
+http = "1"
+http-body-util = "0.1"
+hyper = "1"
+hyper-util = "0.1"
+sse-stream = "0.2"
 futures = "0.3"
 serial_test = "3"
 libc = "0.2"

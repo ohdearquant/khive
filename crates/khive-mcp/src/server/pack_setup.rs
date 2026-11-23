@@ -139,6 +139,8 @@ impl KhiveMcpServer {
             events_readiness: Arc::new(std::sync::OnceLock::new()),
             #[cfg(unix)]
             bridge_executable: None,
+            #[cfg(unix)]
+            computer: None,
             stdio_bridge: false,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: Some(runtime.clone()),

@@ -425,6 +425,8 @@ pub(super) async fn build_server_from_prepared(
                     .with_daemon_spawn_overrides(spawn_config, spawn_db)
             })
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        #[cfg(unix)]
+        let server = server.with_computer(&khive_cfg)?;
         return Ok((server, schedule_rt));
     }
 
@@ -451,6 +453,8 @@ pub(super) async fn build_server_from_prepared(
         args.catalog_verbosity,
     )
     .with_daemon_spawn_overrides(spawn_config, spawn_db);
+    #[cfg(unix)]
+    let server = server.with_computer(&khive_cfg)?;
     Ok((server, schedule_rt))
 }
 
