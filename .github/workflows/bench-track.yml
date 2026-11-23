@@ -324,9 +324,12 @@ jobs:
     with:
       component: packs
       crates: khive-pack-gtd khive-pack-kg khive-pack-knowledge khive-pack-memory khive-pack-schedule
-      # Reserve 25 minutes for compilation, ten for Criterion, and five for
+      # Reserve 40 minutes for compilation, ten for Criterion, and five for
       # setup, bounded termination and publishing even after a phase times out.
-      timeout_minutes: 40
+      # The compile budget assumes a cold cache: the component's saved cache is
+      # usually evicted before the next run reads it. A cold compile of these
+      # crates has taken 18 minutes on one runner and more than 25 on another.
+      timeout_minutes: 55
 
   # The crates of these two components are gaining their first benchmark targets one change at a
   # time; until a crate has one, the component job leaves it out (bench-component.yml).
