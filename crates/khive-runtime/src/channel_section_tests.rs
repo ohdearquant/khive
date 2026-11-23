@@ -192,6 +192,33 @@ fn component_shape_refusal_remains_typed_and_debug_omits_callback_state() {
 }
 
 #[test]
+fn debug_names_channel_components_and_omits_their_values() {
+    let value = "channel-value-not-for-logs";
+    let section = parse(&format!(
+        "[channel.stand_in]\nlabel = {value:?}\n[channel.other]\nport = 4242\n"
+    ));
+    assert_eq!(
+        format!("{section:?}"),
+        "ChannelSectionConfig { names: [\"other\", \"stand_in\"] }"
+    );
+    let mut config = RuntimeConfig {
+        db_path: None,
+        ..RuntimeConfig::no_embeddings()
+    };
+    config.channel = section;
+    let formatted = format!("{config:?}");
+    assert!(formatted.contains("stand_in"), "{formatted}");
+    assert!(
+        !formatted.contains(value),
+        "RuntimeConfig debug echoes a channel value"
+    );
+    assert!(
+        !formatted.contains("4242"),
+        "RuntimeConfig debug echoes a channel value"
+    );
+}
+
+#[test]
 #[serial_test::serial(config_ledger)]
 fn channel_values_and_registered_callbacks_survive_both_runtime_conversion_paths() {
     for engines in [
