@@ -1677,7 +1677,8 @@ async fn run_captures_output_changes_and_receipt() {
             "exec.run",
             json!({
                 "tree": tree, "tool": "sh", "args": ["-c", script], "actor": "local",
-                "env": { "E1_ALLOWED": "caller", "DROP": "x" }, "session_id": "s1"
+                "env": { "E1_ALLOWED": "caller", "DROP": "x", "HOME": "/caller-home" },
+                "session_id": "s1"
             }),
         )
         .await;
@@ -1694,6 +1695,8 @@ async fn run_captures_output_changes_and_receipt() {
         .map(|v| v.as_str().unwrap())
         .collect();
     assert_eq!(keys, vec!["E1_ALLOWED", "HOME"]);
+    // The caller's unlisted key and its own HOME are named, not dropped in silence.
+    assert_eq!(receipt["env_dropped"], json!(["DROP", "HOME"]), "{receipt}");
     let ops: std::collections::BTreeMap<String, String> = receipt["changed"]
         .as_array()
         .unwrap()
