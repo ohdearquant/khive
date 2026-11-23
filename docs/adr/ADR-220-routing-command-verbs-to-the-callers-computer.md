@@ -228,6 +228,11 @@ One caller has at most one computer.
   pack as served by the named computer with its catalog unavailable. Calls are still routed and
   are answered by the computer or refused with `computer_unreachable`; `verbs()` reads the
   computer's catalog again at call time.
+- Every read of the computer's catalog, at start and at call time, is bounded by the smaller of
+  `call_timeout_s` and 15 seconds, session open included. A computer that accepts the connection
+  and does not answer within that bound is unreachable for the catalog: the tool description lists
+  its routed packs as unavailable, and `verbs()` fails with `computer_unreachable` and
+  `not_committed`. The store's verbs are never held behind it.
 - A caller with no `[computer]` table sees the catalog it sees today.
 
 ### 9. What this repository carries
