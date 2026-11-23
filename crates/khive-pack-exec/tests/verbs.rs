@@ -82,6 +82,9 @@ struct Fixture {
     _dir: tempfile::TempDir,
     root: std::path::PathBuf,
     blobs: std::path::PathBuf,
+    /// The one `[exec] cache_roots` entry, when the fixture was built with one.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    cache: Option<std::path::PathBuf>,
 }
 
 fn fixture() -> Fixture {
@@ -110,14 +113,40 @@ fn fixture_with_optional_blob_fault(
     max_output_bytes: u64,
     fault: Option<(Arc<AtomicBool>, Arc<AtomicUsize>)>,
 ) -> Fixture {
+    fixture_built(keep, limits, max_output_bytes, fault, false)
+}
+
+/// A fixture whose runs share one cache root beside the run root.
+#[cfg(target_os = "macos")]
+fn fixture_with_cache_root() -> Fixture {
+    fixture_built(false, ExecLimitsConfig::default(), 128, None, true)
+}
+
+fn fixture_built(
+    keep: bool,
+    limits: ExecLimitsConfig,
+    max_output_bytes: u64,
+    fault: Option<(Arc<AtomicBool>, Arc<AtomicUsize>)>,
+    with_cache_root: bool,
+) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("exec-root");
     let db = dir.path().join("khive.db");
+    let cache = with_cache_root.then(|| {
+        let cache = dir.path().join("exec-cache");
+        std::fs::create_dir(&cache).expect("cache root");
+        cache.canonicalize().expect("canonical cache root")
+    });
+    let cache_roots: Vec<String> = cache
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect();
     let cfg = RuntimeConfig {
         db_path: Some(db),
         exec: ExecSectionConfig {
             root: Some(root.to_string_lossy().to_string()),
             read_roots: vec!["/bin".into(), "/usr/bin".into()],
+            cache_roots: cache_roots.clone(),
             env: vec!["E1_ALLOWED".into()],
             never: vec!["/usr/bin/true".into()],
             max_output_bytes: Some(max_output_bytes),
@@ -126,6 +155,7 @@ fn fixture_with_optional_blob_fault(
             binary_digest_timeout_s: None,
             keep,
             limits,
+            tool_profiles: Vec::new(),
         },
         // No embedding model: tool.register would otherwise build the default
         // embedder, which needs a model file the test host may not have.
@@ -161,6 +191,7 @@ fn fixture_with_optional_blob_fault(
         _dir: dir,
         root,
         blobs: blob_root,
+        cache,
     }
 }
 
@@ -1554,6 +1585,78 @@ async fn run_capture_read_failure_persists_failed_receipt_and_cleans_up() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn run_keeps_cache_root_writes_between_runs_and_out_of_the_output_tree() {
+    let f = fixture_with_cache_root();
+    f.register_sh("sh", "allow").await;
+    let tree = f.tree(&[("input", b"in", 644)]).await;
+    let cache = f.cache.clone().expect("fixture has a cache root");
+    let artifact = cache.join("artifact");
+    let write = format!("printf kept > {}", artifact.display());
+    let first = f
+        .call(
+            "exec.run",
+            json!({
+                "tree": tree, "tool": "sh", "args": ["-c", write], "actor": "local",
+                "session_id": "cache-1"
+            }),
+        )
+        .await;
+    let receipt = &first["receipt"];
+    assert_eq!(receipt["success"], true, "{receipt}");
+    assert_eq!(receipt["changed"], json!([]), "{receipt}");
+    assert_eq!(receipt["undeclared_changes"], json!([]), "{receipt}");
+    assert_eq!(receipt["tree_out"], json!(tree), "{receipt}");
+    let digest = receipt["sandbox"]["cache_roots_digest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("receipt names no cache roots digest: {receipt}"));
+    assert_ne!(
+        digest,
+        blake3::hash(b"[]").to_hex().as_str(),
+        "the digest must name the configured cache root, not the empty set"
+    );
+    assert_eq!(std::fs::read(&artifact).expect("artifact kept"), b"kept");
+
+    let read = format!("/bin/cat {}", artifact.display());
+    let second = f
+        .call(
+            "exec.run",
+            json!({
+                "tree": tree, "tool": "sh", "args": ["-c", read], "actor": "local",
+                "session_id": "cache-1"
+            }),
+        )
+        .await;
+    let receipt = &second["receipt"];
+    assert_eq!(receipt["success"], true, "{receipt}");
+    assert_eq!(f.blob_text(&receipt["stdout_ref"]).await, "kept");
+
+    // The same directory is closed to a computer that names no cache root.
+    let plain = fixture();
+    plain.register_sh("sh", "allow").await;
+    let tree = plain.tree(&[("input", b"in", 644)]).await;
+    let unlisted = cache.join("unlisted");
+    let write = format!("printf leaked > {}", unlisted.display());
+    let refused = plain
+        .call(
+            "exec.run",
+            json!({
+                "tree": tree, "tool": "sh", "args": ["-c", write], "actor": "local",
+                "session_id": "cache-2"
+            }),
+        )
+        .await;
+    let receipt = &refused["receipt"];
+    assert_ne!(receipt["exit_code"], 0, "{receipt}");
+    assert_eq!(
+        receipt["sandbox"]["cache_roots_digest"],
+        json!(blake3::hash(b"[]").to_hex().as_str()),
+        "{receipt}"
+    );
+    assert!(!unlisted.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn run_captures_output_changes_and_receipt() {
     let f = fixture();
     let registered = f.register_sh("sh", "allow").await;
@@ -2574,6 +2677,7 @@ fn string_refusal_fixture() -> StringRefusalFixture {
         exec: ExecSectionConfig {
             root: Some(root.to_string_lossy().to_string()),
             read_roots: vec!["/bin".into(), "/usr/bin".into()],
+            cache_roots: Vec::new(),
             env: vec!["E1_ALLOWED".into()],
             never: vec!["/usr/bin/true".into()],
             max_output_bytes: Some(128),
@@ -2582,6 +2686,7 @@ fn string_refusal_fixture() -> StringRefusalFixture {
             binary_digest_timeout_s: None,
             keep: false,
             limits: ExecLimitsConfig::default(),
+            tool_profiles: Vec::new(),
         },
         ..RuntimeConfig::no_embeddings()
     })

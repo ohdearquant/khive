@@ -1120,6 +1120,11 @@ pub struct ExecSectionConfig {
     pub root: Option<String>,
     #[serde(default)]
     pub read_roots: Vec<String>,
+    /// Directories every run may read, write and load code from, kept between
+    /// runs and never captured into a run's output tree (a compiler's package
+    /// cache and build output). Absolute, outside `root`.
+    #[serde(default)]
+    pub cache_roots: Vec<String>,
     #[serde(default)]
     pub env: Vec<String>,
     #[serde(default)]
@@ -1137,6 +1142,44 @@ pub struct ExecSectionConfig {
     pub keep: bool,
     #[serde(default)]
     pub limits: ExecLimitsConfig,
+    /// Additions to the sandbox for the runs of one registered tool each
+    /// (`[[exec.tool_profiles]]`). Empty by default.
+    #[serde(default)]
+    pub tool_profiles: Vec<ExecToolProfileConfig>,
+}
+
+/// What the runs of one registered tool get on top of the sandbox every run
+/// has. Each field is off or empty unless set, and a tool with no entry runs
+/// under the unchanged sandbox.
+///
+/// ```toml
+/// [[exec.tool_profiles]]
+/// tool = "sh-gpu"
+/// metal = true
+/// unix_sockets = true
+/// files = ["/tmp/gpu-test.lock"]
+/// list_dirs = ["/Volumes/work"]
+/// ```
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecToolProfileConfig {
+    /// The registered tool's name, exactly.
+    pub tool: String,
+    /// The Metal GPU device, the system shader compiler and Metal's own
+    /// per-user shader cache folder.
+    #[serde(default)]
+    pub metal: bool,
+    /// Unix-domain sockets under the run directory and the cache roots. No
+    /// other socket of any kind.
+    #[serde(default)]
+    pub unix_sockets: bool,
+    /// Exact files, absolute, that a run may read, create and write.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Exact directories, absolute, that a run may open and list. Nothing
+    /// below them is granted.
+    #[serde(default)]
+    pub list_dirs: Vec<String>,
 }
 
 pub const DEFAULT_EXEC_BINARY_DIGEST_TIMEOUT_S: u64 = 10;
