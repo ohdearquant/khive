@@ -1750,7 +1750,9 @@ that are hashed and stored on every run and thrown away with the directory, so t
    system comes between the check and the grant. An entry is refused when any symbolic link met while resolving it,
    one met inside another link's target included, sits inside the exec root or inside a cache root, naming the link
    and that root: a run can point such a link elsewhere, and the next run would be granted write wherever it points.
-   A link where no run can write is followed. A walk that follows more than 40 links is refused.
+   A link where no run can write is followed. A walk that follows more than 40 links is refused. An entry whose
+   walked path is not spelled as the file system reports it (another letter case on a volume that ignores case) is
+   refused, naming the spelling to write; that check can only refuse, and the grant stays the walk's result.
    The check does not judge what else a cache root holds. A root that holds a home directory, a credential or a
    store is the operator's error and is not refused.
 4. **Capture.** Nothing under a cache root is part of the run's output. It is not walked, not hashed, not stored, and

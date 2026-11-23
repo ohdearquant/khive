@@ -481,6 +481,32 @@ fn a_link_met_inside_another_links_target_is_checked_like_one_in_the_entry() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn a_cache_root_spelled_in_another_letter_case_is_refused() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let base = std::fs::canonicalize(dir.path()).expect("canonical base");
+    let root = base.join("runs");
+    let on_disk = base.join("MixedCase").join("Sub");
+    for path in [&root, &on_disk] {
+        std::fs::create_dir_all(path).expect("fixture directory");
+    }
+    let other_case = base.join("mixedcase").join("sub");
+    if !other_case.exists() {
+        // A case-sensitive volume has no second spelling to refuse.
+        return;
+    }
+    let message = resolve_cache_roots(&root, &[], std::slice::from_ref(&other_case))
+        .expect_err("an entry in another letter case must be refused");
+    assert!(message.contains(&format!("{on_disk:?}")), "{message}");
+    assert!(message.contains(&format!("{other_case:?}")), "{message}");
+    // Control: the on-disk spelling resolves to itself.
+    assert_eq!(
+        resolve_cache_roots(&root, &[], std::slice::from_ref(&on_disk)),
+        Ok(vec![on_disk.clone()])
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn sandboxed_write_reaches_a_cache_root_and_nothing_beside_it() {
     if !Path::new(SANDBOX_EXEC).exists() {
         return;

@@ -469,6 +469,28 @@ pub fn resolve_cache_roots(
         }
         let walk = walk_entry(entry)
             .map_err(|detail| format!("[exec] cache_roots entry {entry:?} {detail}"))?;
+        // The walk keeps each component as configured, and a volume that
+        // ignores letter case resolves another spelling of the same
+        // directory, which would then compare unequal to the roots beside
+        // it. An entry not spelled as the file system reports it is refused;
+        // this read can only refuse, never change what is granted.
+        match std::fs::canonicalize(&walk.path) {
+            Ok(on_disk) if on_disk == walk.path => {}
+            Ok(on_disk) => {
+                return Err(format!(
+                    "[exec] cache_roots entry {entry:?} resolves to {:?}, which the file system \
+                     spells {on_disk:?}; write the entry with that spelling",
+                    walk.path
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "[exec] cache_roots entry {entry:?} cannot be resolved at {:?} ({error}); \
+                     it must exist when a run starts",
+                    walk.path
+                ));
+            }
+        }
         let cache = walk.path.clone();
         if root.starts_with(&cache) || cache.starts_with(&root) {
             return Err(format!(
