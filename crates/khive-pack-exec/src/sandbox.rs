@@ -308,9 +308,38 @@ pub fn resolve_tool_profile(
 /// Why the configured tool profiles cannot be used, if they cannot. A profile
 /// with no tool name or a name used twice does not say which runs it is for,
 /// a relative path names a different place per working directory, and a path
-/// under the run root would reach into another run's directory.
-pub fn tool_profile_conflict(root: &Path, profiles: &[ToolProfile]) -> Option<String> {
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+/// under the run root would reach into another run's directory. A `files`
+/// entry under a system read root or a configured read root would make writable
+/// a path the configuration keeps read-only, and one under a cache root would
+/// grant per tool a path every run already shares; each is refused, naming the
+/// root. A `list_dirs` entry only lists, so a root above it is no conflict.
+/// `read_roots` and `cache_roots` are the resolved roots; paths are compared in
+/// canonical form.
+pub fn tool_profile_conflict(
+    root: &Path,
+    read_roots: &[PathBuf],
+    cache_roots: &[PathBuf],
+    profiles: &[ToolProfile],
+) -> Option<String> {
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let root = canonical(root);
+    let system: Vec<PathBuf> = SYSTEM_READ_ROOTS.iter().map(PathBuf::from).collect();
+    let covering: Vec<(&str, &Path, PathBuf)> = system
+        .iter()
+        .map(|named| ("system read root", named.as_path()))
+        .chain(
+            read_roots
+                .iter()
+                .map(|named| ("read root", named.as_path())),
+        )
+        .chain(
+            cache_roots
+                .iter()
+                .map(|named| ("cache root", named.as_path())),
+        )
+        .map(|(kind, named)| (kind, named, canonical(named)))
+        .collect();
     let mut seen: Vec<&str> = Vec::new();
     for profile in profiles {
         if profile.tool.trim().is_empty() {
@@ -334,6 +363,18 @@ pub fn tool_profile_conflict(root: &Path, profiles: &[ToolProfile]) -> Option<St
                 if path.canonical.starts_with(&root) {
                     return Some(format!(
                         "[[exec.tool_profiles]] {key} entry {:?} for tool {:?} is under the run root {root:?}",
+                        path.written, profile.tool
+                    ));
+                }
+                if key != "files" {
+                    continue;
+                }
+                if let Some((kind, named, _)) = covering
+                    .iter()
+                    .find(|(_, _, resolved)| path.canonical.starts_with(resolved))
+                {
+                    return Some(format!(
+                        "[[exec.tool_profiles]] files entry {:?} for tool {:?} is under the {kind} {named:?}",
                         path.written, profile.tool
                     ));
                 }

@@ -1902,8 +1902,11 @@ Three things a run needs were refused by the template, each for a reason that re
    anonymous. A run of a profiled tool allowed any other way is refused with `tool_profile_unhonoured:` and the
    reason, before the tree is read and before anything is materialized, rather than run without the additions and
    fail later for a reason that reads as the tool's. A Metal profile on a host that cannot name the user's cache
-   folder is refused the same way. A configuration with an empty tool name, a tool named twice, a relative path or a
-   path under the exec root refuses every run before materialization, naming the entry.
+   folder is refused the same way. A configuration with an empty tool name, a tool named twice, a relative path, a
+   path under the exec root, or a `files` path under a system read root, a configured read root or a cache root
+   refuses every run before materialization, naming the entry and the root. A `files` path under a read root would
+   make writable what the configuration keeps read-only, and one under a cache root would grant per tool what every
+   run already shares. A `list_dirs` path only lists, so a root above it is no conflict.
 6. **Receipt and identity.** The receipt's `sandbox` object carries `tool_profile`: `null` for a run without one,
    else the tool, `metal`, `metal_cache`, the resolved `files` and `list_dirs`, `superseded_keys`, and
    `rules_digest`, the BLAKE3 hex of the rendered additions. The additions name no run directory, so the digest is
@@ -1915,7 +1918,9 @@ Three things a run needs were refused by the template, each for a reason that re
 A profiled run is wider than the template, and the width is the operator's choice per tool. The Metal device is
 shared hardware, and Metal's cache folder is kept between runs and shared by every run of the tool, so it carries
 the trust boundary a cache root carries (Amendment 15). A named file is shared by every run that names it; that is
-its point for a lock. A grant is the act that hands the width to a caller, which is why a policy allow does not.
+its point for a lock. Only a grant hands the width to a caller, never a policy allow (item 5). A grant names the
+tool, not a profile: a profile the operator adds or changes later applies to grants already made, as read and cache
+roots do, and the receipt's `rules_digest` is the record of what a run had.
 
 ### Acceptance
 
@@ -1937,8 +1942,10 @@ its point for a lock. A grant is the act that hands the width to a caller, which
     profile the named file is written by its configured spelling and by its resolved path, a file beside it is
     refused, and the template refuses it; the named directory lists, and a directory below it, a file in it and its
     parent do not, and the template does not list it.
-87. **Conflicts.** An empty tool name, a tool named twice, a relative path and a path under the exec root are each
-    refused with the reason; two well-formed entries are accepted (control).
+87. **Conflicts.** An empty tool name, a tool named twice, a relative path, a path under the exec root, and a
+    `files` path under a system read root, under a configured read root and under a cache root are each refused with
+    the reason, the last three naming the root; two well-formed entries are accepted, one of them listing a
+    directory under a read root (control).
 88. **Sockets.** A profile that sets `unix_sockets` renders the same additions and the same `rules_digest` as the
     same profile without it; the rendered profile's only network rule is Amendment 16's; `superseded_keys` names
     the key. A configuration that sets it loads, and a misspelled key in an entry is refused.

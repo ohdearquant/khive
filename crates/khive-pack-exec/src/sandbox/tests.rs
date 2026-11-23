@@ -933,20 +933,63 @@ fn tool_profile_conflicts_are_refused_with_the_reason() {
         },
         None,
     );
-    // Control: a well-formed list is accepted, twice over two names.
+    let reads = [PathBuf::from("/khive-no-such-dir/models")];
+    let caches = [PathBuf::from("/khive-no-such-dir/cache")];
+    let conflict =
+        |profiles: &[ToolProfile]| tool_profile_conflict(root, &reads, &caches, profiles);
+    // Control: a well-formed list is accepted, twice over two names, and a
+    // directory under a read root may be listed.
     let other = ToolProfile {
         tool: "sh-other".into(),
-        ..ok.clone()
+        ..tool_profile(
+            ExecToolProfileConfig {
+                files: vec!["/khive-no-such-dir/locks/other.lock".into()],
+                list_dirs: vec!["/khive-no-such-dir/models/weights".into()],
+                ..named("sh-other")
+            },
+            None,
+        )
     };
-    assert_eq!(tool_profile_conflict(root, &[ok.clone(), other]), None);
+    assert_eq!(conflict(&[ok.clone(), other]), None);
 
     let unnamed = tool_profile(named("  "), None);
-    assert!(tool_profile_conflict(root, &[unnamed])
+    assert!(conflict(&[unnamed])
         .expect("empty name refused")
         .contains("empty tool name"));
-    assert!(tool_profile_conflict(root, &[ok.clone(), ok.clone()])
+    assert!(conflict(&[ok.clone(), ok.clone()])
         .expect("duplicate refused")
         .contains("more than once"));
+    for (file, kind, root_named) in [
+        (
+            "/Library/khive-no-such-file.lock",
+            "system read root",
+            "/Library",
+        ),
+        (
+            "/khive-no-such-dir/models/weights.lock",
+            "read root",
+            "/khive-no-such-dir/models",
+        ),
+        (
+            "/khive-no-such-dir/cache/shared.lock",
+            "cache root",
+            "/khive-no-such-dir/cache",
+        ),
+    ] {
+        let under = tool_profile(
+            ExecToolProfileConfig {
+                files: vec![file.into()],
+                ..named("sh-under")
+            },
+            None,
+        );
+        let reason = conflict(&[under]).unwrap_or_else(|| panic!("{file} refused"));
+        assert!(
+            reason.contains(&format!("is under the {kind} {root_named:?}"))
+                && reason.contains(file),
+            "{file}: {reason}"
+        );
+    }
     let relative = tool_profile(
         ExecToolProfileConfig {
             list_dirs: vec!["models".into()],
@@ -954,7 +997,7 @@ fn tool_profile_conflicts_are_refused_with_the_reason() {
         },
         None,
     );
-    assert!(tool_profile_conflict(root, &[relative])
+    assert!(conflict(&[relative])
         .expect("relative path refused")
         .contains("not an absolute path"));
     let inside = tool_profile(
@@ -964,7 +1007,7 @@ fn tool_profile_conflicts_are_refused_with_the_reason() {
         },
         None,
     );
-    assert!(tool_profile_conflict(root, &[inside])
+    assert!(conflict(&[inside])
         .expect("path under the run root refused")
         .contains("under the run root"));
 }

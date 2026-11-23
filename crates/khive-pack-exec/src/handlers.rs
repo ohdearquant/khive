@@ -1484,7 +1484,9 @@ async fn execute(
     if let Some(conflict) = sandbox::cache_root_conflict(&root, &cfg.read_roots, &cfg.cache_roots) {
         return Err(RuntimeError::Unconfigured(conflict));
     }
-    if let Some(conflict) = sandbox::tool_profile_conflict(&root, &cfg.tool_profiles) {
+    if let Some(conflict) =
+        sandbox::tool_profile_conflict(&root, &cfg.read_roots, &cfg.cache_roots, &cfg.tool_profiles)
+    {
         return Err(RuntimeError::Unconfigured(conflict));
     }
     let run_dir = root.join(&receipt.id);
