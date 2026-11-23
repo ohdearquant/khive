@@ -36,7 +36,7 @@ use crate::group_child::GroupChild;
 use crate::membership::{MembershipWork, SuppliedRefs};
 use crate::process_cleanup::{ProcessCleanup, TreeQuiescence};
 use crate::receipts;
-use crate::sandbox::{self, check_binary, render_profile, Resolved};
+use crate::sandbox::{self, check_binary, render_profile_for_tool, Resolved, ToolProfile};
 use crate::tree::{self, digest_hex, Change, TreeEntry};
 
 const MAX_RUN_INPUT_BYTES: u64 = 256 * 1024 * 1024;
@@ -342,8 +342,10 @@ pub fn identity(cfg: &Resolved) -> Value {
         "read_roots_digest": sandbox::read_roots_digest(&cfg.read_roots),
         "cache_roots": cfg.cache_roots.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
         "cache_roots_digest": sandbox::cache_roots_digest(&cfg.cache_roots),
+        "tool_profiles": cfg.tool_profiles.iter().map(sandbox::tool_profile_json).collect::<Vec<_>>(),
         "profile_template_digest": sandbox::template_digest(),
         "system_read_roots": sandbox::SYSTEM_READ_ROOTS,
+        "system_root_links": sandbox::SYSTEM_ROOT_LINKS,
         "env_keys": cfg.env_keys,
         "never": cfg.never.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
         "max_output_bytes": cfg.max_output_bytes,
@@ -939,6 +941,8 @@ struct Ready {
     binary_digest: String,
     registered: String,
     registry_id: Uuid,
+    /// The operator's additions for this tool, when the run earned them.
+    tool_profile: Option<ToolProfile>,
     entries: Vec<TreeEntry>,
     input_sizes: BTreeMap<String, u64>,
 }
@@ -1064,6 +1068,12 @@ async fn preflight(
             req.actor, entity.name, decision.decision, decision.source
         ));
     }
+    let tool_profile = honoured_tool_profile(
+        cfg,
+        &entity.name,
+        &decision.source,
+        token.actor().is_anonymous(),
+    )?;
     let maximum_digest_timeout = khive_runtime::engine_config::MAX_EXEC_BINARY_DIGEST_TIMEOUT_S;
     if !(1..=maximum_digest_timeout).contains(&cfg.binary_digest_timeout_s) {
         return Err(format!(
@@ -1122,9 +1132,42 @@ async fn preflight(
         binary_digest,
         registered,
         registry_id: entity.id,
+        tool_profile,
         entries,
         input_sizes,
     })
+}
+
+/// The tool profile a run gets, or the reason it is refused. A tool with no
+/// configured profile gets none. A configured profile is a wider sandbox, so
+/// it is given only to a run a grant allowed for a named caller, and a run
+/// that would not get it is refused rather than run without it: the tool
+/// would fail later for a reason that reads as its own.
+fn honoured_tool_profile(
+    cfg: &Resolved,
+    tool: &str,
+    decision_source: &str,
+    anonymous: bool,
+) -> Result<Option<ToolProfile>, String> {
+    let Some(profile) = sandbox::tool_profile_for(&cfg.tool_profiles, tool) else {
+        return Ok(None);
+    };
+    if decision_source != "grant" {
+        return Err(format!(
+            "tool_profile_unhonoured: tool {tool:?} has a sandbox profile on this host, which a run gets only when a grant allows it; this run was allowed by {decision_source}"
+        ));
+    }
+    if anonymous {
+        return Err(format!(
+            "tool_profile_unhonoured: tool {tool:?} has a sandbox profile on this host, which an anonymous caller does not get"
+        ));
+    }
+    if profile.metal && profile.metal_cache.is_none() {
+        return Err(format!(
+            "tool_profile_unhonoured: tool {tool:?} is configured for Metal and this host did not name the user's cache folder"
+        ));
+    }
+    Ok(Some(profile.clone()))
 }
 
 #[cfg(unix)]
@@ -1441,6 +1484,9 @@ async fn execute(
     if let Some(conflict) = sandbox::cache_root_conflict(&root, &cfg.read_roots, &cfg.cache_roots) {
         return Err(RuntimeError::Unconfigured(conflict));
     }
+    if let Some(conflict) = sandbox::tool_profile_conflict(&root, &cfg.tool_profiles) {
+        return Err(RuntimeError::Unconfigured(conflict));
+    }
     let run_dir = root.join(&receipt.id);
     if let Err(error) = materialize_hydrated(rt, &run_dir, &ready.entries, &ready.input_sizes).await
     {
@@ -1484,7 +1530,13 @@ async fn execute(
 
     // Profile: rendered per run, stored as a blob, written beside the run
     // directory for sandbox-exec to read, removed with it.
-    let profile = render_profile(&run_dir, &cfg.read_roots, &cfg.cache_roots, &cfg.never);
+    let profile = render_profile_for_tool(
+        &run_dir,
+        &cfg.read_roots,
+        &cfg.cache_roots,
+        &cfg.never,
+        ready.tool_profile.as_ref(),
+    );
     let profile_ref = store.put(profile.clone().into_bytes()).await?;
     let profile_path = root.join(format!("{}.sb", receipt.id));
     std::fs::write(&profile_path, &profile).map_err(|e| {
@@ -1497,6 +1549,7 @@ async fn execute(
         "tool_registry_id": ready.registry_id.to_string(),
         "read_roots_digest": sandbox::read_roots_digest(&cfg.read_roots),
         "cache_roots_digest": sandbox::cache_roots_digest(&cfg.cache_roots),
+        "tool_profile": ready.tool_profile.as_ref().map(sandbox::tool_profile_json),
     }));
     receipt.profile_ref = Some(profile_ref.as_str().to_string());
 
