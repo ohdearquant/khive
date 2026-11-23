@@ -78,6 +78,15 @@ fn keys(verb: &str) -> &'static [&'static str] {
             "expected_head",
             "session_id",
         ],
+        "git.pr_edit" => &[
+            "repo",
+            "number",
+            "title",
+            "body",
+            "expected_head",
+            "session_id",
+        ],
+        "git.pr_close" => &["repo", "number", "expected_head", "session_id"],
         _ => &[],
     }
 }
@@ -150,6 +159,9 @@ fn validate(verb: &str, params: &Value) -> Result<(), Failure> {
                 ))
             }
         }
+    } else if matches!(verb, "git.pr_edit" | "git.pr_close") {
+        oid(required(params, "expected_head")?)?;
+        pr_edit::validate(verb, params)?;
     } else {
         oid(required(params, "expected_head")?)?;
         text(params, "body")?;
@@ -542,13 +554,28 @@ impl GitPack {
         if head != expected {
             return Err(Failure::refused("expected_head_mismatch"));
         }
-        if pr.get("merged").and_then(Value::as_bool) == Some(true)
-            || pr.get("state").and_then(Value::as_str) != Some("open")
+        // A title or body may be corrected after a pull request closes; every other write
+        // needs it open.
+        if verb != "git.pr_edit"
+            && (pr.get("merged").and_then(Value::as_bool) == Some(true)
+                || pr.get("state").and_then(Value::as_str) != Some("open"))
         {
             return Err(Failure::refused("pull_request_closed"));
         }
         if observed_string(&pr, "/base/repo/full_name")? != target.slug {
             return Err(Failure::refused("repository_identity_mismatch"));
+        }
+        if matches!(verb, "git.pr_edit" | "git.pr_close") {
+            let opened = pr_edit::Opened {
+                secret,
+                target: &target,
+                pr: &pr,
+                login,
+                credential_ref: &identity.credential_ref,
+            };
+            return self
+                .change_pr(token, registry, verb, params, receipt, opened)
+                .await;
         }
         let author = observed_string(&pr, "/user/login")?;
         let fork = observed_string(&pr, "/head/repo/full_name")? != target.slug;
@@ -1164,3 +1191,6 @@ impl GitPack {
 
 #[path = "pr_state.rs"]
 mod pr_state;
+
+#[path = "pr_edit.rs"]
+mod pr_edit;

@@ -105,6 +105,29 @@ pub(crate) const PR_MERGE: HandlerDef = HandlerDef {
     ],
 };
 
+pub(crate) const PR_EDIT: HandlerDef = HandlerDef {
+    name: "git.pr_edit",
+    description: "Change a pull request's title, body or both, bound to expected_head. At least one of title and body is required; a title may not be empty, a body may. Works on open, closed and merged pull requests. The caller must have opened the pull request (the same platform account, or a git.pr_open receipt of this actor or credential reference); anyone else needs git.pr_edit.others, and without it the act refuses not_opener before any platform write. Local mappings refuse remote_scheme before any credential read; PR verbs require HTTPS. The reply must show the supplied text and the expected head, or the receipt stays unknown, and git.reconcile leaves it unknown. Returns number, head_sha, state, edited, authority and receipt_id.",
+    visibility: Visibility::Verb,
+    category: VerbCategory::Commissive,
+    params: &[
+        REPO,
+        NUMBER,
+        p("title", "string", false, "New title. Omit to keep the current one; empty is invalid."),
+        p("body", "string", false, "New body. Omit to keep the current one; may be empty."),
+        HEAD,
+        SESSION,
+    ],
+};
+
+pub(crate) const PR_CLOSE: HandlerDef = HandlerDef {
+    name: "git.pr_close",
+    description: "Close an open pull request without merging it, bound to expected_head. A closed or merged pull request refuses pull_request_closed. The caller must have opened the pull request (the same platform account, or a git.pr_open receipt of this actor or credential reference); anyone else needs git.pr_close.others, and without it the act refuses not_opener before any platform write. The head branch is left in place. Local mappings refuse remote_scheme before any credential read; PR verbs require HTTPS. The reply must show the pull request closed, unmerged and at the expected head, or the receipt stays unknown, and git.reconcile leaves it unknown. Returns number, head_sha, state, authority and receipt_id.",
+    visibility: Visibility::Verb,
+    category: VerbCategory::Commissive,
+    params: &[REPO, NUMBER, HEAD, SESSION],
+};
+
 pub(crate) const PR_STATE: HandlerDef = HandlerDef {
     name: "git.pr_state",
     description: "Read what the platform says about one pull request: state, merged, draft, opener, head and base, the platform's own mergeable and mergeable_state, the check runs and commit statuses at the head, and each reviewer's latest decisive review with whether it is at the head. Reads with the dispatching actor's credential after the allowlist match and the policy decision; local mappings refuse remote_scheme before any credential read. Writes no receipt and returns no verdict: a required-check ruling is the caller's read of the rows. Check runs are the platform's latest per name, at most 500, with total and truncated. A combined status with total 0 says pending and means no status was posted. Names are returned with control and format characters removed and bounded in length; text_altered says when that changed one.",

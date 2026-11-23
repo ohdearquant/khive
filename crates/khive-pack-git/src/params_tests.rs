@@ -173,6 +173,8 @@ async fn assert_refusal_evidence(
             | "git.pr_open"
             | "git.pr_review"
             | "git.pr_merge"
+            | "git.pr_edit"
+            | "git.pr_close"
     ) || (verb == "git.commit" && params.get("tree").is_some());
     let has_audit = matches!(
         verb,
@@ -184,6 +186,8 @@ async fn assert_refusal_evidence(
             | "git.pr_open"
             | "git.pr_review"
             | "git.pr_merge"
+            | "git.pr_edit"
+            | "git.pr_close"
     );
     let after = refusal_evidence(rt, actor, verb).await;
     assert!(
@@ -373,6 +377,16 @@ async fn every_registered_git_verb_rejects_named_unknowns_preserving_refusal_evi
             "method",
         ),
         ("git.pr_state", json!({"repo":repo,"number":1}), "number"),
+        (
+            "git.pr_edit",
+            json!({"repo":repo,"number":1,"title":"fixture","expected_head":head}),
+            "title",
+        ),
+        (
+            "git.pr_close",
+            json!({"repo":repo,"number":1,"expected_head":head}),
+            "expected_head",
+        ),
         ("git.init", json!({"repo":blank,"branch":"main"}), "branch"),
         ("git.checkout", json!({"repo":repo,"ref":"HEAD"}), "ref"),
         (

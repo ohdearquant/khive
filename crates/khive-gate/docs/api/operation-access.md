@@ -104,6 +104,11 @@ Revision `domain-effects-v29` classifies `git.fetch` as `Write`: it moves one
 remote-tracking or fetched pull request ref in the clone by compare-and-swap and
 writes a durable receipt, so it is admitted as a write like `git.update_ref`.
 
+Revision `domain-effects-v30` classifies `git.pr_edit` and `git.pr_close` as
+`Write`: each changes one pull request on the platform (its title or body, or its
+state) and writes a durable receipt, so they are admitted as writes like
+`git.pr_review`.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -206,6 +211,8 @@ writes a durable receipt, so it is admitted as a write like `git.update_ref`.
 | `git.ingest_cursor`               | Read   | Verb       | [khive-pack-git/src/vocab.rs](../../../khive-pack-git/src/vocab.rs#L84)                                 |
 | `git.init`                        | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L96)                     |
 | `git.log`                         | Read   | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L83)                     |
+| `git.pr_close`                    | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs)                       |
+| `git.pr_edit`                     | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs)                       |
 | `git.pr_merge`                    | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs#L78)                   |
 | `git.pr_open`                     | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs#L47)                   |
 | `git.pr_review`                   | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs#L63)                   |

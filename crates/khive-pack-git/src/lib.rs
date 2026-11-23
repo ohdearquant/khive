@@ -30,6 +30,8 @@
 //! | `git.pr_merge` | `repo`, `number`, `method`, `subject`, `body`, `expected_head` | Merge with an exact head comparison and an independent approval |
 //! | `git.pr_state` | `repo`, `number` | Read a pull request's state, head, checks, statuses and reviews as the platform reports them |
 //! | `git.fetch` | `repo`, `ref`, `expected_remote?` | Fetch one branch or one pull request's head from the configured remote into a remote-tracking ref by compare-and-swap |
+//! | `git.pr_edit` | `repo`, `number`, `title?`, `body?`, `expected_head` | Change a pull request's title or body; its opener, or a caller `git.pr_edit.others` allows |
+//! | `git.pr_close` | `repo`, `number`, `expected_head` | Close an open pull request without merging; its opener, or a caller `git.pr_close.others` allows |
 //!
 //! `kkernel git-ingest` remains the unbounded, all-kinds admin CLI path over
 //! the same shared `ingest::run_ingest` core.

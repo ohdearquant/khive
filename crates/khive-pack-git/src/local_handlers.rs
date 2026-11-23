@@ -809,8 +809,11 @@ impl GitPack {
                     self.reconcile_remote(repo, &mut prior).await?;
                     return Ok(json!({"receipt":prior.to_value()}));
                 }
-                if matches!(prior.verb.as_str(), "git.pr_open" | "git.pr_review") {
-                    // Neither platform operation has receipt-specific evidence. An absent PR or
+                if matches!(
+                    prior.verb.as_str(),
+                    "git.pr_open" | "git.pr_review" | "git.pr_edit" | "git.pr_close"
+                ) {
+                    // No such platform operation has receipt-specific evidence. An absent PR or
                     // review cannot prove that the original write did not happen, and a later
                     // matching object cannot prove this receipt caused it. Preserve unknown
                     // without resolving a credential or touching the platform.
@@ -905,6 +908,8 @@ impl GitPack {
                 | "git.pr_open"
                 | "git.pr_review"
                 | "git.pr_merge"
+                | "git.pr_edit"
+                | "git.pr_close"
         ) {
             self.emit_write_audit(
                 token,
