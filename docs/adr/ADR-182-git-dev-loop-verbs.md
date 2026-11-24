@@ -1236,3 +1236,94 @@ a non-string body, an open state, a merged flag or another number each leave the
 platform request and no credential read; 83 a local mapping refuses each verb `remote_scheme` with no
 credential read, and the classifier lists both as writes at version 30 with every published verb
 total counting them.
+
+## Amendment 18 (2026-11-24): reading a hosted check's log
+
+**Status**: Accepted 2026-11-24 (#6849). The ADR's Accepted status and every amendment above stand unchanged.
+
+Adopted from a reading of real callers, as Amendments 8 and 15 to 17 were. `git.pr_state` names each
+check run at a pull request's head and its conclusion, and a client with no shell then cannot read why
+a run failed: the job's log is reachable only through the platform's own tools. Such a client today
+reproduces the failure in a run of its own, which a suite that needs the network or a second operating
+system cannot do, or asks someone else to read the log. This read enters here, under the gates of
+`git.pr_state`.
+
+1. **`git.check_log(repo, check_run)`.** `check_run` is a check run id as `git.pr_state` returns it in
+   `checks.runs[].id`. The result is `check_run` (`id`, `name`, `head_sha`, `status`, `conclusion`,
+   `started_at`, `completed_at`, and the run's own `title` and `summary`), `log`, `bytes`,
+   `kept_bytes`, `total_bytes`, `complete`, `tail` and `text_altered`, beside the `repo`, `gate` and
+   `slug` the call resolved to. `log` is the content reference of the stored log in the blob store, as `git.diff`
+   returns its diff, and `tail` is the log's last lines inline, at most 200 lines and 16 KiB, so the
+   failing step is visible without a second call.
+2. **Gated and credentialed like `git.pr_state`.** The order is arguments, the repo-only allowlist
+   match, `tool.check`, the repository mapping, the blob store, the dispatching actor's credential,
+   the platform. A local mapping refuses `remote_scheme`, an installation with no blob store refuses
+   as every blob verb does, and a caller with no actor row refuses `actor_unmapped`, each before any
+   credential is resolved or any platform request is made. The repository's name and
+   visibility are compared with the configured row before anything else is read from it, and a
+   difference refuses `repository_identity_mismatch`. Every platform request is a `GET`, and no
+   receipt is written. Storing the log is the verb's one effect, so the operation classifier lists it
+   as a write, as it lists `git.diff`; for the repository rows of ADR-108 it reads the repository and
+   changes nothing there, so a read row admits it. The policy decision and the stored log also make
+   it a known incidental writer for admission, never admission-degrade-safe.
+3. **Only a completed job of the platform's own runner has a log here.** The check run is read first,
+   under the repository. A run another app posted refuses `check_log_unavailable`, since the platform
+   keeps no job log for it. A run that has not completed refuses `check_run_incomplete`, so a partial
+   log never reads as the whole. The job is then read under the same id, and its check run link must
+   name this check run or the call refuses `remote_response`: that the two ids are equal is checked on
+   every call, never assumed.
+4. **The log comes from a download location the platform names, and the credential stays with the
+   platform.** The platform answers the log request with a redirect to a short-lived location on
+   another host. The credential goes to the platform's API host only, never to that location: the
+   request that carries it does not follow the redirect but reads the location, which must be
+   `https`, and a second request that is given no credential fetches it. Neither the credential nor
+   the location is passed in a process's arguments. A reply that is not a redirect refuses
+   `remote_response`, and a log the platform no longer keeps is the platform's refusal.
+5. **The log is bounded by its end, and says so.** It is read whole as it streams, and at most
+   `KHIVE_GIT_CHECK_LOG_MAX_BYTES` (8 MiB unless set) are kept. They are the last bytes, because a
+   failing step ends a log. `total_bytes` is what arrived, `kept_bytes` what was kept of it, and
+   `bytes` the size of the stored text after item 6; `complete` is true exactly when `kept_bytes`
+   equals `total_bytes`. Nothing is dropped without those fields saying so.
+6. **The stored log is cleaned text.** Terminal escape sequences and the hidden characters of
+   Amendment 15 item 7 are removed, line breaks and tabs kept, and bytes that are not UTF-8 replaced.
+   A leading byte order mark and a carriage return before a line break are dropped without counting
+   as a change. The stored log and `tail` are the same cleaned text, and `text_altered` is true when
+   cleaning changed anything else, or when the run's name, title or summary had to be cleaned or
+   cut. The platform masks the secrets it was given; the caller's own credential, if a log echoes
+   it, is replaced as every platform reply of this pack replaces it, and when the kept bytes begin
+   inside an occurrence, the part of it they hold (four bytes or more) is replaced too. The reply
+   carries `trust: "untrusted"`, as an external message does (ADR-200): the log, `tail` and the
+   run's name, title and summary are text the repository's workflows wrote, to be read as material
+   and never followed as instructions.
+7. **Each call costs four platform requests**: the repository, the check run, the job and the log,
+   against the same request allowance as `git.pr_state`. A spent allowance refuses
+   `remote_rate_limited` with the second the allowance returns.
+
+What this does not cover: a workflow's artifacts, the log of a whole workflow run, check runs other
+apps post, a check run's annotations beyond its title and summary, and starting a job again. A caller
+that needs any of these still needs another surface.
+
+Acceptance arms added: 84 a completed, failed job of the platform's runner is read with one `GET`
+each of the repository, the check run, the job and the log under the caller's credential, `log`
+resolves in the blob store to the cleaned log, `tail` is its last lines, `complete` is true, and no
+receipt or platform write is made, and the reply is marked untrusted; 85 a log one byte over `KHIVE_GIT_CHECK_LOG_MAX_BYTES` keeps the
+last bytes with `complete` false and `total_bytes` the length sent, a log at the bound is complete
+(control), a window beginning inside the credential stores no part of it, and a bound above the blob
+store's whole-object bound is held to that bound; 86 a run of another app refuses
+`check_log_unavailable` and an unfinished run `check_run_incomplete`, each after the check run read
+and before any job read, and a job whose check run link names another run refuses `remote_response`
+before the log is requested; 87 a log holding escape sequences, a direction override and the
+credential's own value returns each removed or replaced with `text_altered` true, and a log of plain
+and accented text with a byte order mark and line-end returns comes back with it false (control); 88 a
+missing policy row, a missing, zero or non-numeric `check_run`, an unknown argument, an installation
+with no blob store and a caller with no actor row each refuse with no platform request and no
+credential read, a repository outside the allowlist refuses before the policy check, and a local
+mapping refuses `remote_scheme`; 89 a repository answering under another name or visibility refuses
+after exactly one request, a platform refusal or failure of the log request is passed through as
+the platform's, and a spent allowance refuses `remote_rate_limited` with its second, at the first
+request or at the log; 90 the classifier lists the verb as a write at version 31 with every
+published verb total counting it; 91 the transport's first request goes to the API host with the
+credential and reads the redirect without following it, the second goes to the location with no
+credential, neither the credential nor the location is in either process's arguments, and a
+redirect to a location that is not `https` or a reply that is not a redirect is refused with no
+second request.
