@@ -31,7 +31,7 @@ use rmcp::{RoleClient, ServiceExt};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use super::computer_http::{BoundedHttpClient, ResponseTooLarge};
+use super::computer_http::{BoundedHttpClient, NotJsonRpc, ResponseTooLarge};
 use super::computer_routing::{HomeOutcome, COMPUTER_PROTOCOL};
 
 /// Failure kind for a computer that cannot be reached or did not answer.
@@ -102,9 +102,10 @@ pub(super) enum TransportFailure {
     SessionExpired,
     /// No connection was made, so the request never left this process.
     NotSent,
-    /// The computer answered with a body over its bound (see
-    /// `computer_http`): the request may have run.
-    Oversized,
+    /// The computer answered with a body this client does not use (see
+    /// `computer_http`): over its bound, or JSON answering a request that is
+    /// not a JSON-RPC message. The request may have run.
+    Unusable,
     /// The request may have reached the computer.
     Unknown,
 }
@@ -137,8 +138,8 @@ fn classify<C: StreamableHttpClient>(error: &(dyn StdError + 'static)) -> Transp
         Some(StreamableHttpError::Client(client)) => client as &(dyn StdError + 'static),
         _ => error,
     };
-    if in_chain::<ResponseTooLarge>(behind) {
-        TransportFailure::Oversized
+    if in_chain::<ResponseTooLarge>(behind) || in_chain::<NotJsonRpc>(behind) {
+        TransportFailure::Unusable
     } else if never_connected(behind) {
         TransportFailure::NotSent
     } else {
@@ -147,10 +148,18 @@ fn classify<C: StreamableHttpClient>(error: &(dyn StdError + 'static)) -> Transp
 }
 
 /// Whether `error` or an error behind it is a connection that could not be
-/// opened: refused, no such socket, or no such address.
+/// opened: refused, no such socket, no such address, a name that did not
+/// resolve, or a TLS handshake that failed. Each of these ends before the
+/// first byte of the request is written.
 fn never_connected(error: &(dyn StdError + 'static)) -> bool {
     let mut current = Some(error);
     while let Some(error) = current {
+        if error
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_connect)
+        {
+            return true;
+        }
         if let Some(io) = error.downcast_ref::<std::io::Error>() {
             if matches!(
                 io.kind(),
@@ -486,7 +495,7 @@ impl ComputerClient {
                         DomainDisposition::NotCommitted,
                         true,
                     ),
-                    TransportFailure::Oversized => CallOutcome::Failed {
+                    TransportFailure::Unusable => CallOutcome::Failed {
                         failure: failure(
                             COMPUTER_PROTOCOL,
                             format!(

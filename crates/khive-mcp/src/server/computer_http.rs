@@ -14,6 +14,9 @@
 //!
 //! A `Content-Length` over the bound is refused before the body is read.
 //! Redirects are not followed, so the key is never sent to another address.
+//! A successful `application/json` answer to a request that is not a JSON-RPC
+//! message is refused at once with [`NotJsonRpc`], since no answer to the
+//! request will follow it.
 #![cfg(unix)]
 
 use std::borrow::Cow;
@@ -81,11 +84,26 @@ impl fmt::Display for ResponseTooLarge {
 
 impl StdError for ResponseTooLarge {}
 
+/// A successful `application/json` answer to a request that is not a
+/// JSON-RPC message. The request was sent, so it may have run, and no answer
+/// to it will follow. Nothing of the body is used or quoted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NotJsonRpc;
+
+impl fmt::Display for NotJsonRpc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("answered a request with JSON that is not a JSON-RPC message")
+    }
+}
+
+impl StdError for NotJsonRpc {}
+
 /// An error of [`BoundedHttpClient`].
 #[derive(Debug)]
 pub(super) enum BoundedHttpError {
     Http(reqwest::Error),
     TooLarge(ResponseTooLarge),
+    NotJsonRpc(NotJsonRpc),
 }
 
 impl fmt::Display for BoundedHttpError {
@@ -93,6 +111,7 @@ impl fmt::Display for BoundedHttpError {
         match self {
             Self::Http(error) => write!(f, "{error}"),
             Self::TooLarge(error) => write!(f, "{error}"),
+            Self::NotJsonRpc(error) => write!(f, "{error}"),
         }
     }
 }
@@ -102,6 +121,7 @@ impl StdError for BoundedHttpError {
         match self {
             Self::Http(error) => Some(error),
             Self::TooLarge(error) => Some(error),
+            Self::NotJsonRpc(error) => Some(error),
         }
     }
 }
@@ -337,20 +357,23 @@ impl StreamableHttpClient for BoundedHttpClient {
         }
         if is(content_type.as_deref(), JSON_MIME_TYPE) {
             let body = read_bounded(response, BodyKind::Json, MAX_JSON_BODY).await?;
-            // As rmcp's own client does: a body that is not a JSON-RPC
-            // message, such as a 200 to a notification, is taken as 202.
-            return Ok(
-                match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
-                    Ok(message) => StreamableHttpPostResponse::Json(message, session_id),
-                    Err(error) => {
-                        tracing::warn!(
-                            "computer answered JSON that is not a JSON-RPC message, taken as \
-                             accepted: {error}"
-                        );
-                        StreamableHttpPostResponse::Accepted
-                    }
-                },
-            );
+            return match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
+                Ok(answer) => Ok(StreamableHttpPostResponse::Json(answer, session_id)),
+                // A request waits for its answer and none will follow, so
+                // the call ends now instead of at its timeout.
+                Err(_) if matches!(message, ClientJsonRpcMessage::Request(_)) => Err(
+                    StreamableHttpError::Client(BoundedHttpError::NotJsonRpc(NotJsonRpc)),
+                ),
+                // As rmcp's own client does: a body that is not a JSON-RPC
+                // message, such as a 200 to a notification, is taken as 202.
+                Err(error) => {
+                    tracing::warn!(
+                        "computer answered JSON that is not a JSON-RPC message, taken as \
+                         accepted: {error}"
+                    );
+                    Ok(StreamableHttpPostResponse::Accepted)
+                }
+            };
         }
         Err(StreamableHttpError::UnexpectedContentType(content_type))
     }
