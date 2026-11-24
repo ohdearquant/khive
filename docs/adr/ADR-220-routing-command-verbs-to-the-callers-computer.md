@@ -415,7 +415,7 @@ date, that this amendment builds on:
    sent to the daemon and never routed by section 1. It must be the only operation in an
    unbatched request. Arguments: `target`, the name of a share target (item 2); `receiver`, the
    actor id the share is addressed to; `paths`, a nonempty array of distinct paths relative to
-   the share root; `note`, an optional string of at most 1024 bytes passed to the computer. The
+   the share root; `note`, an optional string of at most 512 bytes passed to the computer. The
    reply is `{share_id, target, receiver, tree, files: [{path, digest, size}]}`, where `share_id`
    is the computer's answer and `digest` is the BLAKE3 reference of the bytes sent.
 
@@ -450,7 +450,7 @@ date, that this amendment builds on:
      runs. Everything under it can be shared, and nothing else.
    - `max_file_bytes`: optional, default and maximum 67108864 (64 MiB, the computer's per-blob
      limit). `max_total_bytes`: optional, default 268435456, at most 1073741824. `max_files`:
-     optional, default 256, at most 4096.
+     optional, default 256, at most 1000, the most files the computer accepts in one share.
    - Each target's `name`, `url`, `key_file` and `call_timeout_s` follow the rules section 2 and
      section 3 give the `[computer]` keys of the same names, the loopback rule for plain `http`,
      the key file rules and the `whoami` check included. Target names are distinct.
@@ -469,19 +469,23 @@ date, that this amendment builds on:
 
 3. **What it reads.** Each path is checked with the `blob.import` rules against `root`: a
    relative path, no `..` component, no symbolic link at any component, a regular file, at most
-   `max_file_bytes`. Every path is checked, and the count and total size are checked against
-   `max_files` and `max_total_bytes`, before anything is sent; a failure refuses the whole share,
-   names the first failing path and its rule, and sends nothing. Nothing is truncated. Each file
-   is then opened without following links, its bytes are read once, and those bytes are both
-   hashed and uploaded, so the digest names exactly what was sent. A file whose size differs
-   from the size checked is refused with `share_file_changed`. In the tree a file's path is its
-   path relative to `root`, with `/` separators, and its mode is 644.
+   `max_file_bytes`. It is also checked against the path rules the computer's tree applies to
+   each entry: no empty component (`a//b`), no `.` or `..` component, no backslash and no NUL
+   byte, so a path the tree would refuse is refused before any blob is sent. Every path is
+   checked, and the count and total size are checked against `max_files` and `max_total_bytes`,
+   before anything is sent; a failure refuses the whole share, names the first failing path and
+   its rule, and sends nothing. Nothing is truncated. Each file is then opened without following
+   links, its bytes are read once, and those bytes are both hashed and uploaded, so the digest
+   names exactly what was sent. A file whose size differs from the size checked is refused with
+   `share_file_changed`. In the tree a file's path is its path relative to `root`, with `/`
+   separators, and its mode is 644.
 
 4. **Order on the computer, and what each failure leaves.** After the `whoami` check the bridge
    uploads each file (`blob.begin` with its size and digest, which skips a blob the computer
    already holds, then `blob.put_part` and `blob.commit`), builds the tree with `exec.tree`, and
    calls `computer.share` last, with the tree, the receiver, each path with its digest, and the
-   note.
+   note. The receiver must already hold a live key on the target computer; the computer refuses a
+   share to any other actor (`receiver_unknown`).
 
    - A failure before `computer.share` is sent leaves no share and records nothing on the
      computer; blobs already committed and a tree already built stay in its store and count
@@ -506,7 +510,7 @@ date, that this amendment builds on:
 7. **Refusal kinds.** `share_not_configured`; `share_target_unknown`; `share_path_refused`
    (naming the path and the rule it broke); `share_too_large` (a file over `max_file_bytes`, or
    the count or total over its limit, naming which); `share_file_changed`; `invalid_input` (an
-   empty `paths`, a repeated path, a `note` over 1024 bytes, or another operation in the same
+   empty `paths`, a repeated path, a `note` over 512 bytes, or another operation in the same
    request). The section 3 and section 5 kinds apply to a target as they do to a computer.
 
 ### Acceptance
@@ -521,11 +525,12 @@ it received.
   receiver, the digest and the actor of the target key; the reply's `share_id` is that record's.
 - **S2. The digest.** The reply's digest equals the BLAKE3 of the file computed by the test and
   equals the tree entry's reference.
-- **S3. Bounds refuse before anything is sent.** An absolute path, a `..` component, a symbolic
-  link inside `root` to a file inside `root`, a path through a linked directory, a directory, a
-  FIFO, a file of `max_file_bytes` plus one byte, a total over `max_total_bytes`, more than
-  `max_files` paths, a repeated path and an empty `paths` are each refused with the kind item 7
-  names, and the test computer's request log gains no operation.
+- **S3. Bounds refuse before anything is sent.** An absolute path, a `..` component, an empty
+  component (`a//b.md`), a `.` component (`./a.md`), a file name holding a backslash, a path
+  holding a NUL byte, a symbolic link inside `root` to a file inside `root`, a path through a
+  linked directory, a directory, a FIFO, a file of `max_file_bytes` plus one byte, a total over
+  `max_total_bytes`, more than `max_files` paths, a repeated path and an empty `paths` are each
+  refused with the kind item 7 names, and the test computer's request log gains no operation.
 - **S4. S3 can fail.** With the link check removed, the inside-link case of S3 reaches the test
   computer.
 - **S5. Unknown target.** `share_target_unknown`, and no connection is opened.
@@ -565,4 +570,6 @@ it received.
 - Sharing a directory or a pattern: paths name files one by one.
 - Revoking a share or removing a shared tree; the computer keeps its share records append-only.
 - The receiving side: the receiver reads the tree with the file verbs its computer already grants.
+  The computer has no verb listing the shares addressed to an actor, so the receiver learns of a
+  share from the sender's own message carrying the share id and the tree.
 - Sharing from one computer to another: the files are read on the sending caller's machine.
