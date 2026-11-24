@@ -146,10 +146,12 @@ impl KhiveMcpServer {
         Ok(self)
     }
 
-    /// This server without its computer. The daemon serves many callers and
-    /// never routes, so a server that becomes the daemon drops it first.
+    /// This server without its computer and its share targets. The daemon
+    /// serves many callers and never routes or shares, so a server that
+    /// becomes the daemon drops both first.
     pub(crate) fn without_computer(mut self) -> Self {
         self.computer = None;
+        self.share = super::bridge_share::ShareSetup::default();
         self
     }
 

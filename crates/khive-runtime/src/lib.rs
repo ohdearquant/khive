@@ -185,8 +185,10 @@ pub use engine_config::{
     ComputerKey, ComputerKeyError, ComputerKeyRefusal, ComputerSectionConfig, ConfigError,
     EngineConfig, GateSectionConfig, GitDigestSectionConfig, GitRepoAccess, GitWriteEntryConfig,
     GitWriteSectionConfig, KhiveConfig, KnowledgeSectionConfig, PackConfig, ResolvedWalCeiling,
-    StorageSectionConfig, COMMAND_RUNNING_PACKS, COMPUTER_ROUTABLE_PACKS,
-    DEFAULT_COMPUTER_CALL_TIMEOUT_S, MAX_COMPUTER_CALL_TIMEOUT_S, MAX_COMPUTER_KEY_BYTES,
+    ShareSectionConfig, ShareTargetConfig, StorageSectionConfig, COMMAND_RUNNING_PACKS,
+    COMPUTER_ROUTABLE_PACKS, DEFAULT_COMPUTER_CALL_TIMEOUT_S, DEFAULT_SHARE_FILES,
+    DEFAULT_SHARE_TOTAL_BYTES, MAX_COMPUTER_CALL_TIMEOUT_S, MAX_COMPUTER_KEY_BYTES,
+    MAX_SHARE_FILES, MAX_SHARE_FILE_BYTES, MAX_SHARE_TOTAL_BYTES,
 };
 pub use error::{
     fts_text_leg_or_err, AdmissionFailureContext, AuditObligationFailure, AuditObligationReason,

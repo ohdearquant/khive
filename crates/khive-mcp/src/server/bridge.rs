@@ -197,7 +197,7 @@ impl KhiveMcpServer {
             serde_json::from_str(&self.plan_ops(ops)).expect("plan output is always JSON");
         if let Some(stages) = plan.get_mut("stages").and_then(Value::as_array_mut) {
             for stage in stages {
-                if stage["verb"] == "bridge.diagnostics" {
+                if stage["verb"] == "bridge.diagnostics" || stage["verb"] == "bridge.share" {
                     stage["known"] = Value::Bool(true);
                     stage["pack"] = json!("bridge-control");
                 }
@@ -280,6 +280,26 @@ impl KhiveMcpServer {
             }
             _ => result,
         };
+        #[cfg(unix)]
+        let result = match (&self.share.bridge, is_help) {
+            (Some(share), false) => {
+                let mut result = result;
+                result["share"] = share.diagnostics();
+                result
+            }
+            _ => result,
+        };
+        self.bridge_result_envelope(p, "bridge.diagnostics", result)
+    }
+
+    /// The envelope of one bridge verb's result, presented and formatted as
+    /// the request asks.
+    pub(super) fn bridge_result_envelope(
+        &self,
+        p: &RequestParams,
+        tool: &str,
+        result: Value,
+    ) -> Result<String, McpError> {
         let presentation =
             parse_presentation_mode(p.presentation.as_deref()).map_err(invalid_request_error)?;
         let presentation_per_op: Option<Vec<Option<PresentationMode>>> =
@@ -337,7 +357,7 @@ impl KhiveMcpServer {
             ))
         };
         Ok(serialize_response_value(&json!({
-            "results": [{"ok": true, "tool": "bridge.diagnostics", "result": formatted}],
+            "results": [{"ok": true, "tool": tool, "result": formatted}],
             "summary": {"total": 1, "succeeded": 1, "failed": 0, "aborted": 0},
             "status": "success",
         })))
@@ -363,6 +383,16 @@ impl KhiveMcpServer {
     ) -> Result<String, McpError> {
         let parsed = parse_request(&p.ops);
         if let Ok(ref parsed) = parsed {
+            #[cfg(unix)]
+            if super::bridge_share::parsed_contains_bridge_share(parsed) {
+                if p.plan == Some(true) && self.stdio_bridge {
+                    p.validate_plan_envelope()?;
+                    return Ok(self.plan_bridge_ops(&p.ops));
+                }
+                if p.plan != Some(true) {
+                    return self.bridge_share_response(&p, parsed).await;
+                }
+            }
             if parsed_contains_bridge_diagnostics(parsed) {
                 if p.plan == Some(true) && self.stdio_bridge {
                     p.validate_plan_envelope()?;
@@ -418,6 +448,10 @@ impl KhiveMcpServer {
         // the same RPC contract; valid requests are still parsed authoritatively
         // inside `dispatch_request_inner` at the dispatch seam.
         let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
+        #[cfg(unix)]
+        if super::bridge_share::parsed_contains_bridge_share(&parsed) {
+            return self.bridge_share_response(&p, &parsed).await;
+        }
         if parsed_contains_bridge_diagnostics(&parsed) {
             return self.bridge_diagnostics_response(&p, &parsed);
         }

@@ -310,6 +310,13 @@ impl KhiveMcpServer {
                 "bridge.diagnostics is available only on the stdio bridge".into(),
             ));
         }
+        if parsed.ops.iter().any(|op| op.tool == "bridge.share") {
+            return Err(invalid_request_error(
+                "bridge.share is answered only by the stdio bridge and kkernel exec; nothing was \
+                 sent"
+                    .into(),
+            ));
+        }
         validate_request_overrides(&p, parsed.ops.len())?;
         let ParsedDispatchPolicy {
             strict_refusals,

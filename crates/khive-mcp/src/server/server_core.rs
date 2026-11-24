@@ -72,6 +72,10 @@ pub struct KhiveMcpServer {
     /// this process resolved has a `[computer]` table, and never in the daemon.
     #[cfg(unix)]
     pub(super) computer: Option<Arc<super::computer_bridge::ComputerBridge>>,
+    /// The caller's `[share]` table (ADR-220 Amendment 1), held like the
+    /// computer: only by the process that resolved the configuration.
+    #[cfg(unix)]
+    pub(super) share: super::bridge_share::ShareSetup,
     /// Namespace this registry was built for. The stdio client passes it to the
     /// daemon; a namespace mismatch triggers local-dispatch fallback.
     pub(super) default_namespace: String,

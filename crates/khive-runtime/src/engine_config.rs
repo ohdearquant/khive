@@ -33,6 +33,13 @@ pub use computer::{
     DEFAULT_COMPUTER_CALL_TIMEOUT_S, MAX_COMPUTER_CALL_TIMEOUT_S, MAX_COMPUTER_KEY_BYTES,
 };
 
+#[path = "engine_config_share.rs"]
+mod share;
+pub use share::{
+    ShareSectionConfig, ShareTargetConfig, DEFAULT_SHARE_FILES, DEFAULT_SHARE_TOTAL_BYTES,
+    MAX_SHARE_FILES, MAX_SHARE_FILE_BYTES, MAX_SHARE_TOTAL_BYTES,
+};
+
 // ---- Error type ----
 
 /// Errors produced while loading or validating a `KhiveConfig`.
@@ -235,6 +242,9 @@ pub enum ConfigError {
 
     #[error("[actor].computer {reason}")]
     InvalidActorComputer { reason: String },
+
+    #[error("[share].{key}: {reason}")]
+    InvalidShareConfig { key: String, reason: String },
 
     #[error("[runtime] {key}: {reason}")]
     InvalidRuntimeConfig { key: String, reason: String },
@@ -1643,7 +1653,7 @@ where
 /// - `[code_ingest]`: directories `code.ingest` may read and write under
 ///
 /// Unknown top-level keys are silently ignored by serde for forward
-/// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, `[knowledge]`, `[git_digest]`, `[code_ingest]`, `[telemetry]` and `[computer]` tables are closed
+/// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, `[knowledge]`, `[git_digest]`, `[code_ingest]`, `[telemetry]`, `[computer]` and `[share]` tables are closed
 /// with `deny_unknown_fields` so a misspelled policy key always fails startup.
 /// `[storage]`, `[[backends]]` entries and `[exec]` are also closed so unknown
 /// destination keys cannot be silently dropped, as are `[web]` and `[[mounts]]` entries.
@@ -1792,6 +1802,12 @@ pub struct KhiveConfig {
     /// configuration id: the daemon never routes.
     #[serde(default)]
     pub computer: Option<ComputerSectionConfig>,
+
+    /// What `bridge.share` may send and where (ADR-220 Amendment 1). Absent
+    /// refuses every share. Read only by the process that resolved this
+    /// file, like `computer`, and not part of the daemon's configuration id.
+    #[serde(default)]
+    pub share: Option<ShareSectionConfig>,
 }
 
 /// `[runtime]` section in `khive.toml`.
@@ -2310,6 +2326,9 @@ impl KhiveConfig {
             computer.validate()?;
         }
         computer::validate_actor_computer(self.computer.as_ref(), self.actor.computer.as_deref())?;
+        if let Some(share) = &self.share {
+            share.validate()?;
+        }
         crate::credentials::CredentialConfig::validate_all(&self.credentials)?;
         if let Some(receipts) = &self.visibility_receipts {
             receipts.validate(&self.credentials)?;

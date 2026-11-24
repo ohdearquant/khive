@@ -426,7 +426,9 @@ pub(super) async fn build_server_from_prepared(
             })
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         #[cfg(unix)]
-        let server = server.with_computer(&khive_cfg)?;
+        let server = server
+            .with_computer(&khive_cfg)?
+            .with_share(&khive_cfg, config_source.as_deref())?;
         return Ok((server, schedule_rt));
     }
 
@@ -454,7 +456,9 @@ pub(super) async fn build_server_from_prepared(
     )
     .with_daemon_spawn_overrides(spawn_config, spawn_db);
     #[cfg(unix)]
-    let server = server.with_computer(&khive_cfg)?;
+    let server = server
+        .with_computer(&khive_cfg)?
+        .with_share(&khive_cfg, config_source.as_deref())?;
     Ok((server, schedule_rt))
 }
 
