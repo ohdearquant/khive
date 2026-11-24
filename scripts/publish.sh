@@ -27,15 +27,17 @@ set -euo pipefail
 #       (catches missing files, accidental excludes, license drift)
 #     - The whole workspace compiles against current path deps
 #
-#   It does NOT exercise `cargo publish --dry-run`, because that command
-#   tries to resolve transitive deps against the live crates.io index.
-#   For any workspace bump (e.g. 0.1.2 → 0.1.3), downstream crates fail
-#   immediately on the second crate: cargo cannot find `khive-score 0.1.3`
-#   in the index until it has actually been published. There is no flag
-#   (`--no-verify`, `--allow-dirty`, …) that bypasses this resolution
-#   step. The only path that exercises the full transitive build with
-#   published deps is `--live`, one crate at a time, with the 30s index
-#   wait between each.
+#   It does NOT run `cargo publish --dry-run`. Run one crate at a time,
+#   that command resolves each crate's khive dependencies against the live
+#   crates.io index, so after a workspace bump (e.g. 0.1.2 → 0.1.3) the
+#   second crate fails: `khive-score 0.1.3` is not in the index until it
+#   has been published. The workspace form,
+#   `cargo publish --dry-run --locked --workspace`, packages every crate
+#   and verifies each against the others' packaged sources, so it passes on
+#   a bumped tree. It needs network access to the index and fails offline.
+#   That run, at the commit being published, is what NO_VERIFY=1 above
+#   relies on; `--live` then publishes one crate at a time with the 30s
+#   index wait between each.
 #
 # Prerequisites:
 #   cargo login                                 (one-time crates.io token setup)

@@ -7,6 +7,146 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-23
+
+### Added
+
+- A `[computer]` table sends a caller's command verbs to one khive computer (ADR-220). It names
+  the computer (`name`, `url`), a `key_file` that is read only when a routed operation needs the
+  key, the packs to route (any of `computer`, `exec`, `git`, `code`, `workspace`, `blob` and
+  `tool`) and `call_timeout_s` (default 3700, at most 7200); `[actor].computer` must name the
+  same computer. With the table, the command-running packs (`exec`, `git`, `code`, `workspace`,
+  `tool`) never dispatch on the store's machine: a listed pack is routed and an unlisted one is
+  refused with `runs_on_computer`. Only the bridge that resolved the caller's configuration
+  routes; the daemon never does. `bridge.diagnostics` reports the computer and how many requests
+  it has routed (#6818, #6820).
+- With a computer, the `request` tool's catalog lists the routed packs' verbs as the computer
+  serves them, read once when the bridge starts, and `verbs()` reads them again at call time.
+  Each read is bounded by the smaller of `call_timeout_s` and the catalog's own limit; a computer
+  that does not answer leaves its packs listed as unreadable and the rest of the catalog served
+  (#6824).
+- `git.pr_state` reads one pull request's state, the check runs and commit statuses at its head,
+  and each account's latest decisive review, with no write (#6828).
+- `git.fetch` brings one branch, or one pull request's head, from the mapped remote through a
+  scratch repository and moves one ref by compare-and-swap; a pull request head lands under
+  `refs/fetched/pull/` and stays unpublished (#6832).
+- `git.pr_edit` changes a pull request's title or body and `git.pr_close` closes one unmerged.
+  Each is bound to `expected_head`, open to the pull request's opener or to a caller the
+  `<verb>.others` policy allows, and reports an unknown outcome when the platform's reply does
+  not show the change. A title with leading or trailing whitespace or a control character is
+  refused, since the platform could store it altered (#6835, #6843).
+- `git.commit` takes an optional `merge_parent`, which must be the current tip of a
+  remote-tracking ref and not already merged; `expected_head` stays the first parent. khive
+  records a merge the caller resolved and computes none (#6825).
+- `[exec] cache_roots` names directories every `exec.run` may read, write and load code from, and
+  that outlive the run: a compiler's package cache and build output belong there. Nothing under a
+  cache root is captured into a run's output tree. A cache root may not hold or sit inside the
+  exec root or a read root, each entry is resolved again when a run starts, and an entry that
+  resolves through a symbolic link inside the exec root or a cache root is refused. Each receipt
+  names the list in `sandbox.cache_roots_digest` (#6807, #6836).
+- `[[exec.tool_profiles]]` adds the Metal GPU, exact files and exact listable directories to the
+  runs of one registered tool, only on a grant to a named caller, with a rules digest on the
+  receipt. A profile's `unix_sockets` key loads, adds nothing and is reported as superseded
+  (#6831).
+- `exec.run` may bind and connect unix-domain sockets under the run directory and the run's own
+  temporary directory; inet, loopback included, stays refused (#6826).
+- `exec.tree_put` takes `{path, delete: true, recursive: true}` to remove every entry under a
+  directory, matched by path component; a plain delete of a directory refuses and names
+  `recursive` (#6841).
+- An `exec.run` receipt lists in `env_dropped` the caller's environment keys whose value did not
+  reach the run (#6808).
+- `comm.quiet(ttl_secs=...)` requests a process-wide quiet window of 1 to 300 seconds for
+  background warm and maintenance work. Requests keep the later deadline, so a shorter one cannot
+  end another caller's window, and `comm.health.resource.quiet_until` reports the deadline or null.
+  Foreground requests, in-flight work, finalization and shutdown continue (#6538).
+- `list(kind="memory", exclude_superseded=true)` leaves out memories that have a visible live
+  incoming `supersedes` edge, before pagination. A scan stops at 10,000 rows and then reports
+  `scan_incomplete: true` with `has_more: true`; continue with the cursor (#6568).
+- An `add_edge` changeset in a proposal accepts `metadata`, validated and applied as `link` does
+  when the proposal is approved (#6612).
+- `khive_vcs` records a snapshot's coverage beside its content hash in the remote cache
+  (`SnapshotIdentity`), `read_remote_snapshot_identity` reads it back, and the sync report carries
+  the coverage (#6520).
+- An audit row written for the anonymous caller carries `client_cwd`, the directory the client
+  process reported, with control and format characters removed and cut to 512 bytes. Rows of an
+  attributed actor never carry it, and it reaches no gate decision (#6803).
+
+### Changed
+
+- Every `exec.run` gets its own `TMPDIR` beside the run directory, replacing any value the caller
+  passes, and removed with the run (#6826).
+- `/bin` joins the system read roots of every run, so a shell finds a tool by name, and the `/etc`
+  and `/var` links may be inspected so files resolve under the names programs use (#6831).
+- The change list in `exec.tree_put`, `exec.tree_diff`, `exec.run`, `exec.receipt` and
+  `exec.runs` replies is bounded: at most `changed_limit` changes (default 1000, at most 10,000)
+  and 262,144 bytes, one byte bound across a whole `exec.runs` reply. `changed_count` gives the
+  full length, `changed_truncated` says whether the list was cut, and `changed_ref` names a blob
+  holding the full list as JSON lines (#6841).
+- The `writer_attempt` row's `attempt_seq` counts from 1 in each sink directory's file instead of
+  per process, and an attempt for a database with no sink route takes no number, so a gap in one
+  file's sequence is a row that sink was handed and did not write (#6792).
+
+### Performance
+
+- `git.checkout` of a commit that the same namespace already checked out in the same repository
+  answers with the stored tree when every blob of it is still in the store (#6829), and a checkout
+  writes only the blobs the store lacks (#6842).
+
+### Fixed
+
+- A store is claimed under ancestor directories the daemon may pass through but not list: the
+  ancestors are opened search-only (#6827).
+- After authentication, each IMAP command of the email channel has a 15-second budget, and each
+  message body fetch 15 seconds plus one second per 512 KiB; a timeout leaves the page's progress
+  unchanged for the next poll (#6668).
+- A `[git_digest]` remote that carries a user name or password before its host is refused, and
+  the refusal names the key without quoting the entry (#6813).
+- `ChannelSectionConfig`'s `Debug` prints component names only, since a component's values may
+  hold credentials (#6814).
+- A `schedule` refusal of an invalid DSL action masks the parser's message, which can quote caller
+  text (#6815); wrong-type `schedule.create` and Charter operands are masked the same way in
+  their refusals (#6531).
+- `khive-text` counts the three ideographic letters of the CJK Symbols and Punctuation block
+  (U+3005, U+3006, U+3007) as CJK (#6811).
+
+### Security
+
+- `url` is updated to 2.5.9 and `form_urlencoded` to 1.2.3 for RUSTSEC-2026-0592 (#6809).
+
+### Breaking (configuration)
+
+- `knowledge.import`, `git.digest` and `code.ingest` read only under configured roots, and none
+  are configured by default, so each refuses every path until its section names one:
+  `[knowledge] import_roots`, `[git_digest] local_roots` and `remotes`, and `[code_ingest] roots`.
+  Paths are resolved, symbolic links included, before the check; a `remotes` entry is one full
+  `https://host/owner/repo` URL (#6570).
+- Config loading now refuses invalid known embedding settings that were previously accepted with
+  any value; the daemon does not start with these values: `embed.model` as an empty string or a
+  non-string; `embed.dimensions` as zero, a negative value or a non-integer; `embed.device` as
+  anything other than `"metal"`, `"cuda"` or `"cpu"`; `embed.auto_embed` as a non-boolean;
+  `embed.fields` as a non-table; and `embed.fields.include` as anything other than a non-empty
+  array of strings with no blank name, exact duplicate or literal `"kind"`. Valid legacy `model`,
+  `dimensions` and `device` values still select no provider, vector size or hardware:
+  `[[engines]]` controls providers. A differing model name, dimensions that disagree with the
+  default engine's declared dimensions, or any supplied device produces a startup warning;
+  agreement is silent. Unknown `[embed]` and `[embed.fields]` keys still warn and load (#6537).
+
+### Breaking (Rust crates)
+
+- `khive_runtime::RuntimeConfig` gains the public fields `knowledge`, `git_digest` and
+  `code_ingest`; `khive_runtime::KhiveConfig` gains the same three and `computer`; and
+  `khive_runtime::engine_config::ActorConfig` gains `computer`. A struct literal must set them or
+  take them from `Default` (#6570, #6818).
+- `khive_runtime::engine_config::ExecSectionConfig` gains the public fields `cache_roots` and
+  `tool_profiles`, and `khive_pack_exec::sandbox::Resolved` gains `cache_roots` and
+  `tool_profiles`; `khive_pack_exec::sandbox::render_profile` takes the cache roots as a third
+  argument (#6807, #6831).
+- `khive_runtime::engine_config::EmbedSectionConfig` gains the public fields `auto_embed`, `fields`,
+  `model`, `dimensions` and `device`; a struct literal must supply them or end with
+  `..Default::default()` (#6537).
+- `khive_runtime::DaemonRequestFrame` gains the public field `client_cwd` (#6803).
+- `khive_vcs::sync::RemoteSyncReport` gains the public field `coverage` (#6520).
+
 ## [0.21.0] - 2026-11-18
 
 ### Added
@@ -91,26 +231,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quoted local-part misdelivery, a panic on a CR or LF in a display name, a panic on a
   whitespace-only EHLO reply, and unbounded reply buffering (#6768).
 
-### Breaking (configuration)
-
-- Config loading now refuses invalid known embedding settings that were previously accepted with
-  any value; the daemon does not start with these values: `embed.model` as an empty string or a
-  non-string; `embed.dimensions` as zero, a negative value or a non-integer; `embed.device` as
-  anything other than `"metal"`, `"cuda"` or `"cpu"`; `embed.auto_embed` as a non-boolean;
-  `embed.fields` as a non-table; and `embed.fields.include` as anything other than a non-empty
-  array of strings with no blank name, exact duplicate or literal `"kind"`. Valid legacy `model`,
-  `dimensions` and `device` values still select no provider, vector size or hardware:
-  `[[engines]]` controls providers. A differing model name, dimensions that disagree with the
-  default engine's declared dimensions, or any supplied device produces a startup warning;
-  agreement is silent. Unknown `[embed]` and `[embed.fields]` keys still warn and load.
-
 ### Breaking (Rust crates)
 
-- `khive_runtime::RuntimeError` adds the variant `AttachmentCutoverRequired`; an exhaustive match on
-  `RuntimeError` needs an arm for it.
-- `khive_runtime::engine_config::EmbedSectionConfig` gains the public fields `auto_embed`, `fields`,
-  `model`, `dimensions` and `device`; a struct literal must supply them or end with
-  `..Default::default()`.
 - The exhaustive `khive_storage::StorageError` enum gains `SecretDetected` for credential-shaped
   note keys (#6728). Downstream exhaustive matches must handle
   the new variant. The shared detector and `SecretMatch` live in
