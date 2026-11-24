@@ -26,7 +26,7 @@ const REVIEW_PAGES: u64 = 10;
 /// library answers only Cc, so the Cf, Zl and Zp code points are listed here as Unicode 15.0
 /// assigns them; a code point a later version adds to those categories passes until the list
 /// is updated.
-fn hidden(c: char) -> bool {
+pub(super) fn hidden(c: char) -> bool {
     c.is_control()
         || matches!(
             u32::from(c),
@@ -57,7 +57,7 @@ fn hidden(c: char) -> bool {
 /// Platform text with hidden characters removed and at most `limit` characters kept. `altered`
 /// is set when either changed the text, so a caller can tell a returned name is not the
 /// platform's exact one. A missing or non-string value stays null.
-fn clean(value: Option<&Value>, limit: usize, altered: &mut bool) -> Value {
+pub(super) fn clean(value: Option<&Value>, limit: usize, altered: &mut bool) -> Value {
     let Some(text) = value.and_then(Value::as_str) else {
         return Value::Null;
     };
@@ -68,7 +68,7 @@ fn clean(value: Option<&Value>, limit: usize, altered: &mut bool) -> Value {
     Value::String(kept)
 }
 
-fn refuse(failure: Failure) -> RuntimeError {
+pub(super) fn refuse(failure: Failure) -> RuntimeError {
     // A spent allowance is the one refusal whose detail the caller needs: when to ask again.
     match (failure.reason, failure.detail) {
         ("remote_rate_limited", Some(detail)) => {

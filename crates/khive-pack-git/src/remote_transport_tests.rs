@@ -326,3 +326,413 @@ fn received_objects_are_linked_into_the_store_and_nothing_else_is() {
         assert_eq!(read(left), None, "{left:?}");
     }
 }
+
+/// A reader that hands out at most `step` bytes per read, so a header block and a body arrive
+/// split across reads.
+struct Trickle<'a> {
+    data: &'a [u8],
+    step: usize,
+}
+
+impl tokio::io::AsyncRead for Trickle<'_> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let n = self.step.min(self.data.len()).min(buf.remaining());
+        let (now, rest) = self.data.split_at(n);
+        buf.put_slice(now);
+        self.data = rest;
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn read_by_end_keeps_the_header_whole_and_the_body_by_its_end() {
+    let body: Vec<u8> = (0..150_000_u32).map(|i| (i % 251) as u8).collect();
+    for header in [
+        &b"HTTP/2.0 200 OK\r\nContent-Type: text/plain\r\n\r\n"[..],
+        b"HTTP/2.0 200 OK\nContent-Type: text/plain\n\n",
+    ] {
+        let mut response = header.to_vec();
+        response.extend_from_slice(&body);
+        let expected_head = &header[..header.len()
+            - if header[header.len() - 2] == b'\r' {
+                4
+            } else {
+                2
+            }];
+        for step in [3, 4096, 64 * 1024] {
+            for limit in [0_u64, 1, 10, 70_000, 149_999, 150_000, 500_000] {
+                let (head, kept, total) = read_by_end(
+                    Trickle {
+                        data: &response,
+                        step,
+                    },
+                    limit,
+                )
+                .await
+                .unwrap();
+                assert_eq!(head, expected_head, "step {step} limit {limit}");
+                assert_eq!(total, body.len() as u64, "step {step} limit {limit}");
+                let keep = (limit as usize).min(body.len());
+                assert_eq!(
+                    kept,
+                    &body[body.len() - keep..],
+                    "step {step} limit {limit}"
+                );
+            }
+        }
+    }
+    // A header block alone is an empty body; a header with no end past the bound is refused.
+    let (head, kept, total) = read_by_end(&b"HTTP/2.0 204 No Content\n\n"[..], 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        (head.as_slice(), kept.len(), total),
+        (&b"HTTP/2.0 204 No Content"[..], 0, 0)
+    );
+    let endless = vec![b'h'; HEADER_LIMIT + 2];
+    assert!(read_by_end(&endless[..], 10).await.is_err());
+}
+
+#[test]
+fn redact_bytes_replaces_the_credential_and_a_cut_ending() {
+    let held = "tok-0123456789";
+    assert_eq!(
+        redact_bytes(b"a tok-0123456789 b tok-0123456789".to_vec(), held, false),
+        b"a [redacted] b [redacted]"
+    );
+    // The window starts inside an occurrence: its last four or more bytes are replaced.
+    assert_eq!(
+        redact_bytes(b"6789 rest".to_vec(), held, true),
+        b"[redacted] rest"
+    );
+    assert_eq!(
+        redact_bytes(b"0123456789 rest tok-0123456789".to_vec(), held, true),
+        b"[redacted] rest [redacted]"
+    );
+    // Controls: three bytes are too few to be taken for an ending, a whole log is never read
+    // as cut, and an empty credential changes nothing.
+    assert_eq!(redact_bytes(b"789 rest".to_vec(), held, true), b"789 rest");
+    assert_eq!(
+        redact_bytes(b"6789 rest".to_vec(), held, false),
+        b"6789 rest"
+    );
+    assert_eq!(redact_bytes(b"any".to_vec(), "", true), b"any");
+}
+
+#[test]
+fn parse_download_reads_the_status() {
+    let ok = b"HTTP/2.0 200 OK\r\nContent-Type: text/plain";
+    assert_eq!(
+        parse_download(true, ok, b"x y".to_vec(), 100),
+        Ok(Download {
+            kept: b"x y".to_vec(),
+            total: 100
+        })
+    );
+    for (status, expected) in [
+        ("400 Bad Request", RemoteError::Refused),
+        ("401 Unauthorized", RemoteError::Refused),
+        ("403 Forbidden", RemoteError::Refused),
+        ("404 Not Found", RemoteError::Refused),
+        ("410 Gone", RemoteError::Refused),
+        ("422 Unprocessable Entity", RemoteError::Refused),
+        ("500 Internal Server Error", RemoteError::Unavailable),
+        ("302 Found", RemoteError::Unavailable),
+    ] {
+        let headers = format!("HTTP/2.0 {status}\nContent-Type: application/json");
+        assert_eq!(
+            parse_download(false, headers.as_bytes(), b"{}".to_vec(), 2),
+            Err(expected),
+            "{status}"
+        );
+    }
+    for status in ["403 Forbidden", "429 Too Many Requests"] {
+        let headers = format!("HTTP/2.0 {status}\nX-Ratelimit-Remaining: 0\nX-Ratelimit-Reset: 12");
+        assert_eq!(
+            parse_download(false, headers.as_bytes(), Vec::new(), 0),
+            Err(RemoteError::RateLimited { reset: Some(12) }),
+            "{status}"
+        );
+    }
+    // A success status from a process that failed, no status line, and headers that are not
+    // text are never read as a log.
+    assert_eq!(
+        parse_download(false, ok, b"x".to_vec(), 1),
+        Err(RemoteError::Unavailable)
+    );
+    assert_eq!(
+        parse_download(true, b"", b"x".to_vec(), 1),
+        Err(RemoteError::Unavailable)
+    );
+    assert_eq!(
+        parse_download(true, b"HTTP/2.0 200 \xFF", b"x".to_vec(), 1),
+        Err(RemoteError::InvalidResponse)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn download_sends_the_credential_to_the_api_host_only_and_reads_the_log_by_its_end() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = crate::cache::ENV_MUTEX.lock().await;
+    struct RestorePath(Option<std::ffi::OsString>);
+    impl Drop for RestorePath {
+        fn drop(&mut self) {
+            if let Some(path) = &self.0 {
+                std::env::set_var("PATH", path);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+    let _restore = RestorePath(std::env::var_os("PATH"));
+    let dir = tempfile::tempdir().unwrap();
+    let quoted = |name: &str| {
+        format!(
+            "'{}'",
+            dir.path()
+                .join(name)
+                .display()
+                .to_string()
+                .replace('\'', "'\\''")
+        )
+    };
+    // Each invocation records its arguments and the configuration it read, and answers with the
+    // response numbered for it.
+    std::fs::write(
+        dir.path().join("curl"),
+        format!(
+            "#!/bin/sh\nn=$(/bin/cat {count} 2>/dev/null || echo 0)\nn=$((n + 1))\necho \"$n\" > {count}\nprintf '%s\\n' \"$@\" > {argv}.$n\n/bin/cat > {config}.$n\n/bin/cat {response}.$n\n",
+            count = quoted("count"),
+            argv = quoted("argv"),
+            config = quoted("config"),
+            response = quoted("response"),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        dir.path().join("curl"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let shimmed = match std::env::var_os("PATH") {
+        Some(prior) => {
+            let mut paths = vec![dir.path().to_path_buf()];
+            paths.extend(std::env::split_paths(&prior));
+            std::env::join_paths(paths).unwrap()
+        }
+        None => dir.path().as_os_str().to_os_string(),
+    };
+    std::env::set_var("PATH", shimmed);
+
+    let body = "line fixture-secret\nlast\n";
+    let path = "repos/owner/project/actions/jobs/7/logs";
+    let location = "https://logs.example.invalid/job/7?sig=abc";
+    let redirect = format!("HTTP/2 302 \r\nlocation: {location}\r\ncontent-length: 0\r\n\r\n");
+    let log = format!("HTTP/2 200 \r\ncontent-type: text/plain\r\n\r\n{body}");
+    let whole = Download {
+        kept: body.as_bytes().to_vec(),
+        total: body.len() as u64,
+    };
+    let cut = Download {
+        kept: b"cret\nlast\n".to_vec(),
+        total: body.len() as u64,
+    };
+    // An arm: its name, the response to each invocation in turn, the bound, the result.
+    type Arm = (
+        &'static str,
+        Vec<String>,
+        u64,
+        Result<Download, RemoteError>,
+    );
+    let arms: Vec<Arm> = vec![
+        (
+            "whole",
+            vec![redirect.clone(), log.clone()],
+            1024,
+            Ok(whole),
+        ),
+        (
+            "by its end",
+            vec![redirect.clone(), log.clone()],
+            10,
+            Ok(cut),
+        ),
+        (
+            "log gone",
+            vec![redirect.clone(), "HTTP/2 410 \r\n\r\n".into()],
+            1024,
+            Err(RemoteError::Refused),
+        ),
+        (
+            "job unknown",
+            vec!["HTTP/2 404 \r\n\r\n{}".into()],
+            1024,
+            Err(RemoteError::Refused),
+        ),
+        (
+            "plain-text location",
+            vec!["HTTP/2 302 \r\nlocation: http://logs.example.invalid/x\r\n\r\n".into()],
+            1024,
+            Err(RemoteError::InvalidResponse),
+        ),
+        (
+            "no redirect",
+            vec![log.clone()],
+            1024,
+            Err(RemoteError::InvalidResponse),
+        ),
+        (
+            "allowance spent",
+            vec![
+                "HTTP/2 403 \r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: 12\r\n\r\n{}".into(),
+            ],
+            1024,
+            Err(RemoteError::RateLimited { reset: Some(12) }),
+        ),
+    ];
+    let argv =
+        "-q\n--silent\n--show-error\n--include\n--proto\n=https\n--max-redirs\n0\n--config\n-\n";
+    for (arm, responses, limit, expected) in arms {
+        for name in ["count", "argv.1", "argv.2", "config.1", "config.2"] {
+            let _ = std::fs::remove_file(dir.path().join(name));
+        }
+        for (n, response) in responses.iter().enumerate() {
+            std::fs::write(dir.path().join(format!("response.{}", n + 1)), response).unwrap();
+        }
+        let actual = GhTransport::new("git".into())
+            .download("fixture-secret", path.into(), limit)
+            .await;
+        assert_eq!(actual, expected, "{arm}");
+        let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap();
+        assert_eq!(read("count").trim(), responses.len().to_string(), "{arm}");
+        // The first process is sent to the API host with the credential, which never appears in
+        // its arguments.
+        assert_eq!(read("argv.1"), argv, "{arm}");
+        assert_eq!(
+            read("config.1"),
+            format!(
+                "url = \"https://api.github.com/{path}\"\nheader = \"User-Agent: khive\"\nheader = \"X-GitHub-Api-Version: 2022-11-28\"\nheader = \"Authorization: Bearer fixture-secret\"\n"
+            ),
+            "{arm}"
+        );
+        // The second is sent to the location alone and is never given the credential.
+        if responses.len() == 2 {
+            assert_eq!(read("argv.2"), argv, "{arm}");
+            let config = read("config.2");
+            assert_eq!(
+                config,
+                format!("url = \"{location}\"\nheader = \"User-Agent: khive\"\n"),
+                "{arm}"
+            );
+            assert!(!config.contains("fixture-secret"), "{arm}");
+            assert!(!config.contains("Authorization"), "{arm}");
+        }
+    }
+}
+
+#[test]
+fn parse_redirect_takes_only_an_https_location_from_a_redirect() {
+    let to = "https://logs.example.invalid/a?sig=b";
+    for status in ["301", "302", "303", "307", "308"] {
+        let reply = format!("HTTP/2 {status} \r\nLocation: {to}\r\n\r\n");
+        assert_eq!(
+            parse_redirect(true, reply.as_bytes()),
+            Ok(to.to_string()),
+            "{status}"
+        );
+    }
+    // Header names are matched without regard to case, and bare line feeds are read too.
+    assert_eq!(
+        parse_redirect(
+            true,
+            format!("HTTP/1.1 302 Found\nlocation:  {to} \n\n").as_bytes()
+        ),
+        Ok(to.to_string())
+    );
+    for (reply, expected) in [
+        ("HTTP/2 302 \r\n\r\n", RemoteError::InvalidResponse),
+        (
+            "HTTP/2 302 \r\nLocation: http://logs.example.invalid/a\r\n\r\n",
+            RemoteError::InvalidResponse,
+        ),
+        (
+            "HTTP/2 302 \r\nLocation: /relative\r\n\r\n",
+            RemoteError::InvalidResponse,
+        ),
+        (
+            "HTTP/2 302 \r\nLocation: https://logs.example.invalid/a b\r\n\r\n",
+            RemoteError::InvalidResponse,
+        ),
+        (
+            "HTTP/2 302 \r\nLocation: https://logs.example.invalid/a\"b\r\n\r\n",
+            RemoteError::InvalidResponse,
+        ),
+        (
+            "HTTP/2 302 \r\nLocation: https://logs.example.invalid/a\\b\r\n\r\n",
+            RemoteError::InvalidResponse,
+        ),
+        ("HTTP/2 200 \r\n\r\nlog", RemoteError::InvalidResponse),
+        ("HTTP/2 404 \r\n\r\n{}", RemoteError::Refused),
+        ("HTTP/2 410 \r\n\r\n", RemoteError::Refused),
+        (
+            "HTTP/2 403 \r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: 12\r\n\r\n",
+            RemoteError::RateLimited { reset: Some(12) },
+        ),
+        ("HTTP/2 500 \r\n\r\n", RemoteError::Unavailable),
+        ("", RemoteError::Unavailable),
+    ] {
+        assert_eq!(
+            parse_redirect(true, reply.as_bytes()),
+            Err(expected),
+            "{reply:?}"
+        );
+    }
+    // A process that failed is unavailable whatever it printed.
+    let reply = format!("HTTP/2 302 \r\nLocation: {to}\r\n\r\n");
+    assert_eq!(
+        parse_redirect(false, reply.as_bytes()),
+        Err(RemoteError::Unavailable)
+    );
+}
+
+#[test]
+fn curl_config_carries_the_credential_only_when_given_and_refuses_unquotable_text() {
+    assert_eq!(
+        curl_config("https://api.github.com/x", Some("tok_1"))
+            .unwrap()
+            .as_str(),
+        "url = \"https://api.github.com/x\"\nheader = \"User-Agent: khive\"\nheader = \"X-GitHub-Api-Version: 2022-11-28\"\nheader = \"Authorization: Bearer tok_1\"\n"
+    );
+    assert_eq!(
+        curl_config("https://logs.example.invalid/y?sig=z", None)
+            .unwrap()
+            .as_str(),
+        "url = \"https://logs.example.invalid/y?sig=z\"\nheader = \"User-Agent: khive\"\n"
+    );
+    for (url, token) in [
+        ("https://x.invalid/\"", None),
+        ("https://x.invalid/\\", None),
+        ("https://x.invalid/ y", None),
+        ("https://x.invalid/\ny", None),
+        ("https://x.invalid/\u{e9}", None),
+        ("", None),
+        ("https://x.invalid/", Some("a\"b")),
+        ("https://x.invalid/", Some("a\nb")),
+        ("https://x.invalid/", Some("")),
+    ] {
+        assert_eq!(
+            curl_config(url, token).map(|config| config.to_string()),
+            Err(RemoteError::Unavailable),
+            "{url:?} {token:?}"
+        );
+    }
+}
