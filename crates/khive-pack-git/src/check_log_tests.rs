@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-use super::{clean_lines, clean_log, tail, TAIL_BYTES, TAIL_LINES};
+use super::{clean_lines, clean_log, stored_log, tail, TAIL_BYTES, TAIL_LINES};
 
 #[test]
 fn clean_log_keeps_lines_and_tabs_and_removes_escapes() {
@@ -42,6 +42,44 @@ fn clean_log_reports_every_other_change() {
             String::from_utf8_lossy(raw)
         );
     }
+}
+
+#[test]
+fn a_line_break_after_or_inside_an_escape_is_kept() {
+    for (raw, expected) in [
+        (&b"a\x1b\nb\n"[..], "a\nb\n"),
+        (&b"a\x1b[31\nb\n"[..], "a\nb\n"),
+        (&b"a\x1b]0;title\nb\n"[..], "a\nb\n"),
+        (&b"a\x1b(\nb\n"[..], "a\nb\n"),
+    ] {
+        assert_eq!(
+            clean_log(raw),
+            (expected.to_string(), true),
+            "{:?}",
+            String::from_utf8_lossy(raw)
+        );
+    }
+}
+
+#[test]
+fn the_credential_is_replaced_again_over_the_cleaned_text() {
+    let value = concat!("tok", "-split-", "value");
+    // An escape sequence inside one occurrence and a hidden character inside another.
+    let raw = "a tok-split\u{1b}[0m-value b tok-\u{200B}split-value c\n";
+    assert_eq!(
+        stored_log(raw.as_bytes().to_vec(), value, false),
+        ("a [redacted] b [redacted] c\n".to_string(), true)
+    );
+    // A window that begins inside an occurrence an escape sequence split.
+    assert_eq!(
+        stored_log("split\u{1b}[0m-value z".as_bytes().to_vec(), value, true),
+        ("[redacted] z".to_string(), true)
+    );
+    // Control: a whole occurrence is replaced by the first pass and is no change of cleaning.
+    assert_eq!(
+        stored_log(b"x tok-split-value y".to_vec(), value, false),
+        ("x [redacted] y".to_string(), false)
+    );
 }
 
 #[test]

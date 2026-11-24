@@ -29,10 +29,25 @@ fn log_limit() -> u64 {
         .clamp(1, khive_storage::MAX_BLOB_WHOLE_BYTES)
 }
 
+/// The kept log bytes as the text that is stored, and whether cleaning changed it. The credential
+/// is replaced in the bytes, the text is cleaned, and the credential is replaced again over the
+/// cleaned text: an occurrence that an escape sequence or a hidden character split does not match
+/// the first pass and is whole again after cleaning.
+pub(super) fn stored_log(kept: Vec<u8>, secret: &str, cut: bool) -> (String, bool) {
+    let raw = redact_bytes(kept, secret, cut);
+    let (text, altered) = clean_log(&raw);
+    let again = redact_bytes(text.into_bytes(), secret, cut);
+    // Whole occurrences of a UTF-8 value replaced with ASCII leave the text UTF-8.
+    let text = String::from_utf8(again)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+    (text, altered)
+}
+
 /// Log bytes as text a terminal or a model can be shown. Bytes that are not UTF-8 are replaced,
 /// terminal escape sequences and the hidden characters `git.pr_state` removes are removed, and
-/// line breaks and tabs are kept. A leading byte order mark and a carriage return before a line
-/// break are dropped without counting as a change; the flag says whether anything else changed.
+/// line breaks and tabs are kept: a line break ends an escape sequence it interrupts. A leading
+/// byte order mark and a carriage return before a line break are dropped without counting as a
+/// change; the flag says whether anything else changed.
 pub(super) fn clean_log(bytes: &[u8]) -> (String, bool) {
     let bytes = bytes.strip_prefix("\u{FEFF}".as_bytes()).unwrap_or(bytes);
     let text = String::from_utf8_lossy(bytes);
@@ -45,10 +60,18 @@ pub(super) fn clean_log(bytes: &[u8]) -> (String, bool) {
             '\r' if chars.peek() == Some(&'\n') => {}
             '\u{1B}' => {
                 altered = true;
+                // A line break after an escape is the log's own and is kept.
+                if chars.peek() == Some(&'\n') {
+                    continue;
+                }
                 match chars.next() {
                     // A control sequence: parameter and intermediate bytes, then one final byte.
                     Some('[') => {
                         for c in chars.by_ref() {
+                            if c == '\n' {
+                                out.push(c);
+                                break;
+                            }
                             if ('\u{40}'..='\u{7E}').contains(&c) {
                                 break;
                             }
@@ -57,6 +80,10 @@ pub(super) fn clean_log(bytes: &[u8]) -> (String, bool) {
                     // An operating system command, ended by a bell or by escape and backslash.
                     Some(']') => {
                         while let Some(c) = chars.next() {
+                            if c == '\n' {
+                                out.push(c);
+                                break;
+                            }
                             if c == '\u{07}' {
                                 break;
                             }
@@ -72,6 +99,10 @@ pub(super) fn clean_log(bytes: &[u8]) -> (String, bool) {
                     // its first final byte.
                     Some(c) if ('\u{20}'..='\u{2F}').contains(&c) => {
                         for c in chars.by_ref() {
+                            if c == '\n' {
+                                out.push(c);
+                                break;
+                            }
                             if ('\u{30}'..='\u{7E}').contains(&c) {
                                 break;
                             }
@@ -181,12 +212,11 @@ impl GitPack {
         // them, so `complete` compares like with like. A window that begins inside an occurrence
         // has that part replaced too.
         let kept = read.download.kept.len() as u64;
-        let raw = redact_bytes(
+        let (text, mut altered) = stored_log(
             read.download.kept,
             secret.value(),
             read.download.total > kept,
         );
-        let (text, mut altered) = clean_log(&raw);
         let bytes = text.len() as u64;
         let last = tail(&text).to_string();
         let log = store
