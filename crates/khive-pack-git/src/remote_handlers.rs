@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use khive_runtime::engine_config::GitWriteRepositoryConfig;
+use khive_runtime::engine_config::{GitWriteAuthorConfig, GitWriteRepositoryConfig};
 use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::types::{SqlStatement, SqlValue};
 use serde_json::{json, Value};
@@ -268,6 +268,26 @@ fn repository_refusal(path: &str) -> Value {
 }
 
 impl GitPack {
+    /// The commit identity the `[git_write.repositories]` row for `repo` names, with the row's
+    /// key, matched as `remote_repository` matches (ADR-182 Amendment 20). No row, or a row with
+    /// no `author`, answers `None` and the actor's own identity applies.
+    pub(crate) fn repository_author(
+        &self,
+        repo: &Path,
+    ) -> Result<Option<(String, GitWriteAuthorConfig)>, Failure> {
+        let configured = &self.runtime().config().git_write.repositories;
+        let mut matches = configured
+            .iter()
+            .filter(|(path, _)| std::fs::canonicalize(path).ok().as_deref() == Some(repo));
+        let Some((path, row)) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(Failure::refused("repository_ambiguous"));
+        }
+        Ok(row.author.clone().map(|author| (path.clone(), author)))
+    }
+
     pub(crate) fn remote_repository(
         &self,
         repo: &Path,

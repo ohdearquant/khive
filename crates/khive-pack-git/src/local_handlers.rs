@@ -762,6 +762,13 @@ impl GitPack {
                         return Err(Failure::refused("actor_unmapped"));
                     }
                 };
+                // A repository row's own identity replaces the actor's name and email; the actor
+                // row has already authorized the call (ADR-182 Amendment 20).
+                let repository_author = self.repository_author(repo)?;
+                let (author_name, author_email) = match &repository_author {
+                    Some((_, author)) => (author.name.as_str(), author.email.as_str()),
+                    None => (actor.name.as_str(), actor.email.as_str()),
+                };
                 receipt.credential = json!({"source":"actor", "ref":actor.credential_ref, "platform_identity":actor.platform_identity});
                 receipts::persist(self.runtime(), receipt).await?;
                 let tree = required(params, "tree")?;
@@ -773,8 +780,8 @@ impl GitPack {
                     &expected,
                     merge_parent.as_deref(),
                     required(params, "message")?,
-                    &actor.name,
-                    &actor.email,
+                    author_name,
+                    author_email,
                 )
                 .await?;
                 let mut result = json!({"repo":repo.display().to_string(), "sha":sha, "parent":expected,
@@ -782,6 +789,12 @@ impl GitPack {
                 // Present only on a two-parent commit, so a one-parent result is unchanged.
                 if let Some(merge_parent) = &merge_parent {
                     result["merge_parent"] = json!(merge_parent);
+                }
+                // Present only when a repository row supplied the identity, so a commit under the
+                // actor's own identity reads as before.
+                if let Some((key, _)) = &repository_author {
+                    result["author_source"] =
+                        json!({"table": "git_write.repositories", "key": key});
                 }
                 receipt.result = result.clone();
                 // The candidate SHA is durable before update-ref can have an effect.

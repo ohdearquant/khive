@@ -1360,3 +1360,37 @@ its blob, never that file's content, with `git status` and the index unchanged; 
 submodule entry still refuses `unsupported_entry` with a refusal receipt, and the listing parser
 refuses mode `120000` with any kind but `blob` (control); 94 a commit made from a manifest holding a
 link checks out to that same manifest.
+
+## Amendment 20 (2026-11-24): a repository's own commit identity
+
+**Status**: Accepted 2026-11-24 (#6855).
+
+Amendment 2 item 3 takes the author name and email of a tree commit only from the calling actor's
+`[git_write.actors]` row. One installation can hold repositories whose commits must carry different
+identities: a repository whose hosting or deployment checks the commit author, beside others whose
+commits carry the actor's own. With one identity per actor, such an installation has no way to say
+so. This amendment adds the identity to the repository row and leaves authorization and credentials
+with the actor.
+
+1. **`author` on the repository row.** `[git_write.repositories."<path>"]` may carry
+   `author = { name, email }`. Unknown keys inside it refuse at load, and a name or email that is
+   empty, blank, or holds a control character or an angle bracket refuses at load with key
+   `repositories.<path>.author`, the rule a commit already applies to an actor's identity.
+2. **It replaces the actor's identity for that repository's tree commits.** `git.commit` with a
+   `tree` resolves the actor row first, as today: an actor without a row still refuses
+   `actor_unmapped`, and the receipt's `credential` still names the actor. It then reads the
+   repository row matched as the pull-request verbs match it; when that row has an `author`, the
+   commit's author and committer are that name and email, and the result and receipt carry
+   `author_source: {table: "git_write.repositories", key}`. With no row, or a row with no `author`,
+   the actor's identity applies and `author_source` is absent, so such a commit reads as before. Two
+   rows matching one repository refuse `repository_ambiguous` before anything is written.
+3. **Nothing else moves.** `git.push`, the pull-request verbs and their checks present and compare
+   the actor's credential and platform login, never the repository's identity. The paths form of
+   `git.commit` keeps the rules of ADR-108.
+
+Acceptance arms added: 95 a tree commit in a repository whose row names an author carries that name
+and email as author and committer, returns `author_source` naming the row's key, and its receipt's
+`credential` names the actor's reference; 96 the same commit with a row that has no `author` carries
+the actor's identity and no `author_source` (control); 97 a row whose author name or email is empty,
+blank, holds an angle bracket or a line break refuses at load naming `repositories.<path>.author`, an
+unknown key inside `author` refuses at parse, and a row without `author` writes none back.

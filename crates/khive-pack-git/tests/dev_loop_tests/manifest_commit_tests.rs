@@ -229,3 +229,53 @@ async fn merge_parent_refuses_malformed_merged_and_paths_form_values() {
     assert!(error.contains("invalid_params"), "{error}");
     assert_eq!(f.git_text(&["rev-parse", "refs/heads/work"]), f.base);
 }
+
+#[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
+async fn a_repository_author_replaces_the_actor_identity_and_the_actor_still_authorizes() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
+    let f = Fixture::with_repository_row(Some(("Repository Author", "repository@example.invalid")))
+        .await;
+    f.policy("git.commit", "allow").await;
+    let manifest = f.tree(&[("a.txt", b"repository identity\n", 644)]).await;
+    let result = f.call("git.commit", f.commit_params(&manifest)).await;
+    let sha = result["sha"].as_str().expect("commit SHA");
+    assert_eq!(
+        f.git_text(&["show", "-s", "--format=%an <%ae>|%cn <%ce>", sha]),
+        "Repository Author <repository@example.invalid>|Repository Author <repository@example.invalid>"
+    );
+    assert_eq!(
+        result["author_source"],
+        json!({"table":"git_write.repositories","key":f.repo.display().to_string()})
+    );
+    let row = f.success_receipt(&result).await;
+    assert_eq!(
+        row["credential"],
+        json!({"source":"actor","ref":"fixture-reference","platform_identity":"fixture-login"}),
+        "the actor's row still authorizes the commit"
+    );
+    assert_eq!(f.resolver_count(), 1);
+}
+
+#[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
+async fn a_repository_row_without_an_author_keeps_the_actor_identity() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
+    let f = Fixture::with_repository_row(None).await;
+    f.policy("git.commit", "allow").await;
+    let manifest = f.tree(&[("a.txt", b"actor identity\n", 644)]).await;
+    let result = f.call("git.commit", f.commit_params(&manifest)).await;
+    let sha = result["sha"].as_str().expect("commit SHA");
+    assert_eq!(
+        f.git_text(&["show", "-s", "--format=%an <%ae>|%cn <%ce>", sha]),
+        "Mapped Author <mapped@example.invalid>|Mapped Author <mapped@example.invalid>"
+    );
+    assert!(result.get("author_source").is_none(), "{result}");
+    f.success_receipt(&result).await;
+}
