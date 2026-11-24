@@ -1330,7 +1330,7 @@ second request.
 
 ## Amendment 19 (2026-11-24): a checkout keeps symlinks as links
 
-**Status**: Proposed 2026-11-24.
+**Status**: Accepted 2026-11-24 (#6854). The ADR's Accepted status stands; this amendment supersedes only the checkout refusal of Amendment 2 item 8 and of the note under its item 2.
 
 Amendment 2 item 8 has `git.checkout` refuse a tree holding a symlink, and the 2026-09-10 note under
 its item 2 kept that refusal when `git.commit` began to accept mode `120000`. Every other user of a
