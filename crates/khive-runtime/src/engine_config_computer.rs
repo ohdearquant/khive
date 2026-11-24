@@ -145,7 +145,7 @@ fn invalid(key: &str, reason: impl Into<String>) -> ConfigError {
     }
 }
 
-fn validate_name(name: &str) -> Result<(), ConfigError> {
+pub(super) fn validate_name(name: &str) -> Result<(), ConfigError> {
     let well_formed = (1..=MAX_COMPUTER_NAME_BYTES).contains(&name.len())
         && name
             .bytes()
@@ -185,7 +185,7 @@ fn validate_packs(packs: &[String]) -> Result<(), ConfigError> {
 
 /// Parse a `[computer].url`. A refusal never repeats the URL: it may hold a
 /// user name or password, and a refusal names only the host when it must.
-fn parse_computer_url(url: &str) -> Result<ComputerEndpoint, ConfigError> {
+pub(super) fn parse_computer_url(url: &str) -> Result<ComputerEndpoint, ConfigError> {
     if !url.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(invalid(
             "url",

@@ -141,6 +141,8 @@ impl KhiveMcpServer {
             bridge_executable: None,
             #[cfg(unix)]
             computer: None,
+            #[cfg(unix)]
+            share: Default::default(),
             stdio_bridge: false,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: Some(runtime.clone()),

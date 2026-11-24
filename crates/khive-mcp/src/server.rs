@@ -105,6 +105,7 @@ mod bridge;
 // ADR-220: routing command verbs to the caller's computer. Each of these
 // modules is Unix-only through its own `#![cfg(unix)]`, so the declarations
 // stay bare for the error-constructor census.
+mod bridge_share;
 mod computer_bridge;
 mod computer_catalog;
 mod computer_client;
@@ -129,6 +130,8 @@ use bridge::{
 };
 #[cfg(all(unix, test))]
 use bridge::{strict_fallback_envelope_response, ForwardFuture};
+#[cfg(unix)]
+pub use bridge_share::answer_bridge_share_for_exec;
 use dispatch_helpers::{
     apply_presentation_to_result, chain_aggregation_depth_reject, chain_ok_envelope_or_depth_error,
     decorate_schedule_agenda_with_ticker_health, dispatch_via_coordinator_inner,
@@ -250,6 +253,8 @@ impl KhiveMcpServer {
             bridge_executable: None,
             #[cfg(unix)]
             computer: None,
+            #[cfg(unix)]
+            share: Default::default(),
             stdio_bridge: false,
             runtime: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
@@ -768,6 +773,11 @@ impl ServerHandler for KhiveMcpServer {
         for t in &mut tools {
             if t.name == "request" {
                 let base = t.description.as_deref().unwrap_or("");
+                #[cfg(unix)]
+                let base = match self.share.bridge {
+                    Some(_) => format!("{base}\n\n{}", bridge_share::SHARE_DESCRIPTION),
+                    None => base.to_owned(),
+                };
                 t.description = Some(std::borrow::Cow::Owned(format!(
                     "{base}\n\nVerbs registered on this server:\n{catalog}"
                 )));

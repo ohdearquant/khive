@@ -20,6 +20,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use khive_runtime::{
     read_computer_key, ComputerKey, ComputerKeyError, ComputerSectionConfig, DomainDisposition,
+    ShareTargetConfig,
 };
 use rmcp::model::{CallToolRequestParams, CallToolResult, ErrorData as McpError, JsonObject};
 use rmcp::service::{RunningService, ServiceError};
@@ -254,6 +255,27 @@ impl ComputerClient {
             url: config.url.clone(),
             key_file: config.key_file.clone(),
             call_timeout: Duration::from_secs(config.call_timeout_s),
+            label,
+            actor,
+            session: Mutex::new(None),
+            next_generation: AtomicU64::new(0),
+        }
+    }
+
+    /// The client of one `[[share.targets]]` entry (ADR-220 Amendment 1),
+    /// held to the same key, session and `whoami` rules as the caller's
+    /// computer.
+    pub(super) fn for_share_target(
+        target: &ShareTargetConfig,
+        label: String,
+        actor: String,
+        connector: Arc<dyn Connector>,
+    ) -> Self {
+        Self {
+            connector,
+            url: target.url.clone(),
+            key_file: target.key_file.clone(),
+            call_timeout: Duration::from_secs(target.call_timeout_s),
             label,
             actor,
             session: Mutex::new(None),

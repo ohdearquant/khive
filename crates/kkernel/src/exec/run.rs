@@ -1734,6 +1734,19 @@ pub(super) async fn run_exec_inline_with_forward(
     // every call.
     let (khive_cfg, config_source) = load_exec_config(&db_context)?;
 
+    // ADR-220 Amendment 1: `bridge.share` is answered by this process, which
+    // resolved the caller's configuration, and never by a daemon.
+    #[cfg(unix)]
+    if let Some(answer) =
+        khive_mcp::server::answer_bridge_share_for_exec(&khive_cfg, config_source.as_deref(), &ops)
+            .await
+    {
+        let output = answer.map_err(|error| anyhow::anyhow!("config error: {error}"))?;
+        let output = prepare_exec_output(&output, strict);
+        println!("{output}");
+        return enforce_strict_batch_result(&output, strict);
+    }
+
     // #1226: apply the same --db/[[backends]] conflict guard the in-process
     // fallback below applies, BEFORE the daemon fast-path — otherwise a warm
     // daemon answers this request without the override ever being checked at
