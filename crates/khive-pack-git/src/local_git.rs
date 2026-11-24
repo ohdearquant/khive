@@ -674,10 +674,13 @@ fn parse_listing(bytes: &[u8]) -> Result<Vec<ListedBlob>> {
         let mode = match (fields[0], fields[1]) {
             ("100644", "blob") => 644,
             ("100755", "blob") => 755,
+            // A symlink's blob is its literal target, kept as a link entry and never resolved
+            // here (ADR-182 Amendment 19); a tree's consumers decide what a link may reach.
+            ("120000", "blob") => 120000,
             _ => {
                 return Err(LocalGitError::new(
                     "unsupported_entry",
-                    "checkout refuses symlinks, submodules, and unsupported tree entries",
+                    "checkout refuses submodules and unsupported tree entries",
                 ))
             }
         };

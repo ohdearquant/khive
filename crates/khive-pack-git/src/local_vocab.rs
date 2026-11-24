@@ -51,7 +51,7 @@ const REPO: ParamDef = param(
 
 pub(crate) const CHECKOUT: HandlerDef = HandlerDef {
     name: "git.checkout",
-    description: "Read one resolved commit into an immutable khive tree manifest without changing refs, index or working files. Symlinks and submodules refuse. Returns commit, tree and receipt_id.",
+    description: "Read one resolved commit into an immutable khive tree manifest without changing refs, index or working files. A symlink becomes a mode 120000 entry whose blob is its literal target; submodules refuse. Returns commit, tree and receipt_id.",
     visibility: Visibility::Verb,
     category: VerbCategory::Assertive,
     params: &[REPO, param("ref", true, "Commit SHA or ref resolved exactly once before reading its objects."), SESSION],
