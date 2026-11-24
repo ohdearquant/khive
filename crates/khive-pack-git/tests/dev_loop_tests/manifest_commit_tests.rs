@@ -30,13 +30,15 @@ async fn manifest_commit_preserves_symlink_mode_and_literal_target() {
     assert_eq!(std::fs::read(f.repo.join("a.txt")).unwrap(), worktree);
     assert!(std::fs::symlink_metadata(f.repo.join("link")).is_err());
     f.success_receipt(&result).await;
-    let error = f
-        .err("git.checkout", json!({"repo":f.repo,"ref":sha}))
+    let checkout = f
+        .call("git.checkout", json!({"repo":f.repo,"ref":sha}))
         .await;
-    assert!(error.contains("unsupported_entry"), "{error}");
-    let receipt = f.refusal_receipt(&error).await;
+    assert_eq!(
+        checkout["tree"], manifest,
+        "a checkout of the commit gives back the link manifest it was made from"
+    );
+    let receipt = f.success_receipt(&checkout).await;
     assert_eq!(receipt["verb"], "git.checkout");
-    assert_eq!(receipt["reason"], "unsupported_entry");
 }
 
 #[tokio::test]
