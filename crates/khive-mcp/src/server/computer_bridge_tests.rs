@@ -1724,3 +1724,38 @@ async fn bound_5_an_event_past_its_bound_stops_the_read() {
     assert!(caller.runs.all().is_empty());
     assert!(frames().is_empty(), "{:?}", frames());
 }
+
+#[tokio::test]
+#[serial_test::serial(computer_bridge)]
+async fn bound_6_json_that_is_not_json_rpc_answering_a_request_is_refused_at_once() {
+    reset_frames();
+    let computer = TestComputer::start(ACTOR);
+    let listener = Loopback::intercepting(
+        &computer,
+        Arc::new(|_: &Value| {
+            answer_with(
+                StatusCode::OK,
+                "application/json",
+                whole(json!({ "probe": PROBE }).to_string().into_bytes()),
+            )
+        }),
+    )
+    .await;
+    // No answer to the request follows such a body. A client that waited
+    // for one would end at this timeout as `computer_unreachable` instead.
+    let caller =
+        Caller::new().routing_over_http(&computer.config_with_timeout(ACTOR, &listener.url, 30));
+
+    let started = std::time::Instant::now();
+    let answer = caller.text(RUN).await;
+    let elapsed = started.elapsed();
+    assert!(!answer.contains(PROBE), "no part of the body is used");
+    let envelope: Value = serde_json::from_str(&answer).expect("the khive envelope");
+    let message = assert_may_have_run(&envelope, "computer_protocol");
+    assert!(message.contains("not a JSON-RPC message"), "{message}");
+    assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
+
+    assert_eq!(computer.calls(), ["whoami()"]);
+    assert!(caller.runs.all().is_empty());
+    assert!(frames().is_empty(), "{:?}", frames());
+}
