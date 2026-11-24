@@ -939,6 +939,19 @@ pub struct GitWriteRepositoryConfig {
     /// default) refuses neither.
     #[serde(default)]
     pub merge_refusals: Vec<String>,
+    /// The commit identity `git.commit` uses in this repository (ADR-182 Amendment 20). When
+    /// present it replaces the calling actor's name and email as author and committer; the
+    /// actor's row still authorizes the call, and pushes still present the actor's credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<GitWriteAuthorConfig>,
+}
+
+/// A repository's own commit identity (ADR-182 Amendment 20).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitWriteAuthorConfig {
+    pub name: String,
+    pub email: String,
 }
 
 impl GitWriteRepositoryConfig {
@@ -1061,6 +1074,22 @@ impl GitWriteSectionConfig {
                     return Err(invalid(&key, "entries must not repeat"));
                 }
                 seen.push(entry);
+            }
+            if let Some(author) = &repository.author {
+                // The same rule the commit applies to an actor's identity, checked at load so a
+                // bad row refuses at startup rather than at the first commit.
+                let invalid_value = |value: &str| {
+                    value.trim().is_empty()
+                        || value
+                            .chars()
+                            .any(|c| c.is_control() || matches!(c, '<' | '>'))
+                };
+                if invalid_value(&author.name) || invalid_value(&author.email) {
+                    return Err(invalid(
+                        &format!("repositories.{path}.author"),
+                        "name and email must be non-empty and hold no control character or angle bracket",
+                    ));
+                }
             }
         }
         // The default keychain program is Unix-only. Legacy configurations with

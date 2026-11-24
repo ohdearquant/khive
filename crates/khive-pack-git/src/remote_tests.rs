@@ -475,6 +475,7 @@ impl Fixture {
                         slug: SLUG.into(),
                         visibility: "private".into(),
                         merge_refusals: merge_refusals.iter().map(|e| e.to_string()).collect(),
+                        author: None,
                     },
                 )]),
                 credential_resolver: vec![resolver.display().to_string(), "{ref}".into()],

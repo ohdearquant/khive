@@ -2550,6 +2550,74 @@ credential = "not-an-accepted-field""#
 }
 
 #[test]
+fn git_repository_author_is_optional_and_refuses_an_invalid_identity_at_load() {
+    let row = |author: Option<(&str, &str)>| GitWriteSectionConfig {
+        repositories: BTreeMap::from([(
+            "/repo".to_string(),
+            GitWriteRepositoryConfig {
+                remote: "https://github.com/example/repo".to_string(),
+                slug: "example/repo".to_string(),
+                visibility: "private".to_string(),
+                merge_refusals: vec![],
+                author: author.map(|(name, email)| GitWriteAuthorConfig {
+                    name: name.to_string(),
+                    email: email.to_string(),
+                }),
+            },
+        )]),
+        ..Default::default()
+    };
+    row(None).validate_dev_loop().unwrap();
+    row(Some(("Example Author", "author@example.invalid")))
+        .validate_dev_loop()
+        .unwrap();
+    for (name, email) in [
+        ("", "author@example.invalid"),
+        ("Example Author", "  "),
+        ("Example <Author>", "author@example.invalid"),
+        ("Example Author", "author@example.invalid\n"),
+    ] {
+        assert!(matches!(
+            row(Some((name, email))).validate_dev_loop(),
+            Err(ConfigError::InvalidGitWriteConfig { key, .. })
+                if key == "repositories./repo.author"
+        ));
+    }
+    let parsed: GitWriteRepositoryConfig = toml::from_str(
+        r#"remote = "https://github.com/example/repo"
+slug = "example/repo"
+visibility = "private"
+author = { name = "Example Author", email = "author@example.invalid" }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        parsed.author,
+        Some(GitWriteAuthorConfig {
+            name: "Example Author".to_string(),
+            email: "author@example.invalid".to_string(),
+        })
+    );
+    let absent: GitWriteRepositoryConfig = toml::from_str(
+        r#"remote = "https://github.com/example/repo"
+slug = "example/repo"
+visibility = "private""#,
+    )
+    .unwrap();
+    assert_eq!(absent.author, None);
+    assert!(
+        !toml::to_string(&absent).unwrap().contains("author"),
+        "an absent author writes nothing back"
+    );
+    assert!(toml::from_str::<GitWriteRepositoryConfig>(
+        r#"remote = "https://github.com/example/repo"
+slug = "example/repo"
+visibility = "private"
+author = { name = "Example Author", email = "author@example.invalid", credential_ref = "ref" }"#
+    )
+    .is_err());
+}
+
+#[test]
 fn git_repository_merge_refusals_accept_only_the_two_named_entries() {
     let row = |refusals: &[&str]| GitWriteSectionConfig {
         repositories: BTreeMap::from([(
@@ -2559,6 +2627,7 @@ fn git_repository_merge_refusals_accept_only_the_two_named_entries() {
                 slug: "example/repo".to_string(),
                 visibility: "private".to_string(),
                 merge_refusals: refusals.iter().map(|entry| entry.to_string()).collect(),
+                author: None,
             },
         )]),
         ..Default::default()

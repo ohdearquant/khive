@@ -147,6 +147,7 @@ impl Fixture {
                             slug: slug.into(),
                             visibility: "private".into(),
                             merge_refusals: vec![],
+                            author: None,
                         },
                     ),
                     (
@@ -156,6 +157,7 @@ impl Fixture {
                             slug: "fixture/project".into(),
                             visibility: "private".into(),
                             merge_refusals: vec![],
+                            author: None,
                         },
                     ),
                 ]),

@@ -22,7 +22,8 @@ use khive_pack_kg::KgPack;
 use khive_pack_tool::ToolPack;
 use khive_runtime::blob_tree as tree;
 use khive_runtime::engine_config::{
-    GitWriteActorConfig, GitWriteEntryConfig, GitWriteSectionConfig,
+    GitWriteActorConfig, GitWriteAuthorConfig, GitWriteEntryConfig, GitWriteRepositoryConfig,
+    GitWriteSectionConfig,
 };
 use khive_runtime::{
     KhiveRuntime, RequestIdentity, RuntimeConfig, VerbRegistry, VerbRegistryBuilder,
