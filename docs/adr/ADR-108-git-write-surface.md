@@ -465,7 +465,7 @@ would execute as a side effect of an otherwise-successful, policy-permitted writ
 
 ## Amendment 2 (2026-11-23) - Read-Only Repository Rows
 
-**Status**: Accepted 2026-11-23. The ADR's Accepted status and Amendment 1 stand unchanged.
+**Status**: Accepted 2026-11-23 (#6847). The ADR's Accepted status and Amendment 1 stand unchanged.
 
 ### Context
 
