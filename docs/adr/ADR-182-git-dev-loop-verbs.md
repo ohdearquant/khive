@@ -1327,3 +1327,36 @@ credential and reads the redirect without following it, the second goes to the l
 credential, neither the credential nor the location is in either process's arguments, and a
 redirect to a location that is not `https` or a reply that is not a redirect is refused with no
 second request.
+
+## Amendment 19 (2026-11-24): a checkout keeps symlinks as links
+
+**Status**: Proposed 2026-11-24.
+
+Amendment 2 item 8 has `git.checkout` refuse a tree holding a symlink, and the 2026-09-10 note under
+its item 2 kept that refusal when `git.commit` began to accept mode `120000`. Every other user of a
+tree manifest already takes a link: the manifest itself (ADR-181), `exec.tree_put`, a run's
+materialization and its captured output, `git.diff` and `git.commit`. Only the read that brings a
+repository in refused it, so a client with no filesystem of its own could not read any repository
+that tracks a link anywhere, however far the link was from its change, and had to rebuild the files
+it needed from a diff. This amendment changes `git.checkout` alone and supersedes that refusal.
+
+1. **A symlink entry is a link entry.** An `ls-tree` entry of mode `120000` and kind `blob` becomes a
+   manifest entry of mode `120000` whose blob is the object's bytes as `cat-file` returns them, which
+   for a link are its literal target. The target is not read, resolved or checked: a link to a path
+   outside the repository, an absolute target, a dangling one and one whose bytes are not UTF-8 are
+   stored alike, and nothing they name is opened. The bounds, blob reuse and manifest limit of item 8
+   apply unchanged.
+2. **Submodules and every other entry still refuse.** Mode `160000`, and any mode and kind other than
+   `100644`, `100755` or `120000` with `blob`, refuse `unsupported_entry` before any blob is read.
+3. **What a link may reach is its consumer's question.** A tree from a checkout is a tree
+   `exec.tree_put` could already make with the same entry. A run's materialization, its working
+   directory check and its sandbox decide what a link may reach (ADR-181), and `git.commit` writes the
+   link back unchanged, so a checkout followed by a commit of the same tree gives back the same git
+   tree.
+
+Acceptance arms added: 92 a commit tracking a link to `../outside`, beside a file at that path outside
+the repository, checks out to a manifest whose link entry has mode `120000` and the literal target as
+its blob, never that file's content, with `git status` and the index unchanged; 93 a commit holding a
+submodule entry still refuses `unsupported_entry` with a refusal receipt, and the listing parser
+refuses mode `120000` with any kind but `blob` (control); 94 a commit made from a manifest holding a
+link checks out to that same manifest.
