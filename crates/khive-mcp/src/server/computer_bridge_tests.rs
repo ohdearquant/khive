@@ -1759,3 +1759,8 @@ async fn bound_6_json_that_is_not_json_rpc_answering_a_request_is_refused_at_onc
     assert!(caller.runs.all().is_empty());
     assert!(frames().is_empty(), "{:?}", frames());
 }
+
+// Arms 3, 4 and 8 with the real `exec` pack on the store's side.
+#[cfg(target_os = "macos")]
+#[path = "computer_bridge_exec_tests.rs"]
+mod real_exec;
