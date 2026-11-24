@@ -132,6 +132,7 @@ impl PackRuntime for GitPack {
                 self.handle_local(token, registry, verb, params).await
             }
             "git.pr_state" => self.handle_pr_state(token, registry, params).await,
+            "git.check_log" => self.handle_check_log(token, registry, params).await,
             "git.receipts" => self.handle_receipts(token, registry, params).await,
             "git.gates" => self.handle_gates(token, registry, params).await,
             "git.status" => self.handle_status(token, registry, params).await,

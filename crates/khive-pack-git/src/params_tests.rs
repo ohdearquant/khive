@@ -293,6 +293,7 @@ async fn every_registered_git_verb_rejects_named_unknowns_preserving_refusal_evi
                 .map(|path| GitWriteEntryConfig {
                     repo: path.display().to_string(),
                     branches: vec!["*".into()],
+                    access: Default::default(),
                 })
                 .collect(),
             ..Default::default()
@@ -377,6 +378,11 @@ async fn every_registered_git_verb_rejects_named_unknowns_preserving_refusal_evi
             "method",
         ),
         ("git.pr_state", json!({"repo":repo,"number":1}), "number"),
+        (
+            "git.check_log",
+            json!({"repo":repo,"check_run":1}),
+            "check_run",
+        ),
         (
             "git.pr_edit",
             json!({"repo":repo,"number":1,"title":"fixture","expected_head":head}),

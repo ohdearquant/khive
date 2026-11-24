@@ -135,3 +135,14 @@ pub(crate) const PR_STATE: HandlerDef = HandlerDef {
     category: VerbCategory::Assertive,
     params: &[REPO, NUMBER],
 };
+
+pub(crate) const CHECK_LOG: HandlerDef = HandlerDef {
+    name: "git.check_log",
+    description: "Read the log of one completed check run of the platform's own runner, named by the id git.pr_state returns in checks.runs[].id. Reads with the dispatching actor's credential after the allowlist match and the policy decision; local mappings refuse remote_scheme before any credential read. Four GET requests: the repository, the check run, the job (which must link back to the same check run) and the log. A run another app posted refuses check_log_unavailable and an unfinished run check_run_incomplete. The log is stored in the blob store, bounded by its end at KHIVE_GIT_CHECK_LOG_MAX_BYTES (8 MiB unless set): log is its content reference, tail its last lines inline (at most 200 lines and 16 KiB), and total_bytes, kept_bytes and complete say whether anything was dropped. Terminal escape sequences and control and format characters are removed and text_altered says when that changed anything. Writes no receipt.",
+    visibility: Visibility::Verb,
+    category: VerbCategory::Assertive,
+    params: &[
+        REPO,
+        p("check_run", "integer", true, "Positive check run id, as git.pr_state returns it."),
+    ],
+};

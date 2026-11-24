@@ -127,6 +127,7 @@ impl Fixture {
                     .map(|repo| GitWriteEntryConfig {
                         repo: repo.display().to_string(),
                         branches: vec!["work".into(), "new".into()],
+                        access: Default::default(),
                     })
                     .collect(),
                 actors: BTreeMap::from([(
@@ -613,6 +614,25 @@ async fn local_pr_state_refuses_remote_scheme_before_credentials() {
             .len(),
         before
     );
+    f.no_credential_read();
+}
+
+#[tokio::test]
+async fn local_check_log_refuses_remote_scheme_before_credentials() {
+    let f = Fixture::file().await;
+    f.registry
+        .dispatch(
+            "tool.policy",
+            json!({"actor":f.actor,"tool":"git.check_log","decision":"allow"}),
+        )
+        .await
+        .unwrap();
+    let error = f
+        .call(&f.actor, "git.check_log", json!({"check_run":1}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("remote_scheme"), "{error}");
     f.no_credential_read();
 }
 

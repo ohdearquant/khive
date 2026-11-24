@@ -58,6 +58,15 @@ pub struct FetchRequest {
     pub expected: Option<String>,
 }
 
+/// A text body read by its end (ADR-182 Amendment 18).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Download {
+    /// The body's last bytes, at most the limit the read was given.
+    pub kept: Vec<u8>,
+    /// Every body byte that arrived, kept or not.
+    pub total: u64,
+}
+
 /// What a fetch found at the remote, when the transfer itself completed or was refused there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fetched {
@@ -96,6 +105,19 @@ pub trait RemoteTransport: Send + Sync {
         token: Option<&str>,
         request: FetchRequest,
     ) -> Result<Fetched, RemoteError>;
+    /// `GET` a platform path the platform answers with a redirect to a text download, keeping the
+    /// body's last `limit` bytes as the download location sent them: the caller removes the
+    /// credential from them. The credential goes to the platform's API host only, never to the
+    /// download location. A transport without this read refuses it as unavailable.
+    async fn download(
+        &self,
+        token: &str,
+        path: String,
+        limit: u64,
+    ) -> Result<Download, RemoteError> {
+        let _ = (token, path, limit);
+        Err(RemoteError::Unavailable)
+    }
 }
 
 pub struct GhTransport {
@@ -187,6 +209,223 @@ async fn run(
     .map_err(|_| failure)?
     .map_err(|_| failure)?;
     Ok(result)
+}
+
+/// Header bytes accepted before a response body begins.
+const HEADER_LIMIT: usize = 64 * 1024;
+/// How long one download may take, end to end.
+const DOWNLOAD_SECONDS: u64 = 300;
+
+/// Where a response's header block ends and its body begins, at the first blank line.
+fn header_end(bytes: &[u8]) -> Option<(usize, usize)> {
+    let crlf = bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|at| (at, at + 4));
+    let lf = bytes
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .map(|at| (at, at + 2));
+    match (crlf, lf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Read a response printed as a header block, a blank line and a body. The header block is kept
+/// whole up to `HEADER_LIMIT`; of the body only the last `limit` bytes are kept, and every body
+/// byte is counted. Returns the header block, the kept bytes and the body's full length.
+async fn read_by_end(
+    mut pipe: impl AsyncRead + Unpin,
+    limit: u64,
+) -> std::io::Result<(Vec<u8>, Vec<u8>, u64)> {
+    use tokio::io::AsyncReadExt;
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut head = Vec::new();
+    let mut body = Vec::new();
+    let mut in_body = false;
+    let mut total = 0_u64;
+    let mut chunk = vec![0_u8; 64 * 1024];
+    loop {
+        let n = pipe.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        if in_body {
+            total += n as u64;
+            body.extend_from_slice(&chunk[..n]);
+        } else {
+            head.extend_from_slice(&chunk[..n]);
+            if let Some((end, start)) = header_end(&head) {
+                body = head.split_off(start);
+                head.truncate(end);
+                total = body.len() as u64;
+                in_body = true;
+            } else if head.len() > HEADER_LIMIT {
+                return Err(std::io::Error::other("response header exceeded limit"));
+            }
+        }
+        // Dropping the front only once the buffer is twice the limit keeps the copying linear.
+        if body.len() >= limit.saturating_mul(2).max(limit.saturating_add(64 * 1024)) {
+            body.drain(..body.len() - limit);
+        }
+    }
+    if body.len() > limit {
+        body.drain(..body.len() - limit);
+    }
+    Ok((head, body, total))
+}
+
+/// The credential's own value replaced wherever the kept bytes hold it. When the kept window
+/// begins inside an occurrence, the part of it the window holds is replaced too.
+pub(crate) fn redact_bytes(kept: Vec<u8>, token: &str, cut: bool) -> Vec<u8> {
+    const MARK: &[u8] = b"[redacted]";
+    let token = token.as_bytes();
+    if token.is_empty() {
+        return kept;
+    }
+    let mut start = 0;
+    if cut {
+        // At least four bytes, so a chance match of a short ending is not taken for one.
+        for k in (4..token.len()).rev() {
+            if kept.starts_with(&token[token.len() - k..]) {
+                start = k;
+                break;
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(kept.len());
+    if start > 0 {
+        out.extend_from_slice(MARK);
+    }
+    let mut at = start;
+    while at < kept.len() {
+        if kept[at] == token[0] && kept[at..].starts_with(token) {
+            out.extend_from_slice(MARK);
+            at += token.len();
+        } else {
+            out.push(kept[at]);
+            at += 1;
+        }
+    }
+    out
+}
+
+/// The platform's API origin. Only a request to it carries the credential.
+const API_ORIGIN: &str = "https://api.github.com/";
+
+/// The status code on the first line of a printed response.
+fn status_code(headers: &str) -> Option<u16> {
+    headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+}
+
+/// A response's first header of this name, matched without regard to case.
+fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    headers.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
+/// A response that is neither the expected success nor a redirect, read as
+/// `parse_api_response` reads one: a spent allowance names itself, a refusal is the platform's,
+/// and anything else is unavailable.
+fn status_failure(status: Option<u16>, headers: &str) -> RemoteError {
+    if matches!(status, Some(403 | 429)) {
+        if let Some(reset) = spent_allowance(headers) {
+            return RemoteError::RateLimited { reset };
+        }
+    }
+    // A log the platform no longer keeps answers 410.
+    if matches!(status, Some(400 | 401 | 403 | 404 | 410 | 422)) {
+        RemoteError::Refused
+    } else {
+        RemoteError::Unavailable
+    }
+}
+
+/// The downloaded log's response; a body is returned only under a 2xx status.
+fn parse_download(
+    success: bool,
+    headers: &[u8],
+    kept: Vec<u8>,
+    total: u64,
+) -> Result<Download, RemoteError> {
+    let headers = std::str::from_utf8(headers).map_err(|_| RemoteError::InvalidResponse)?;
+    let status = status_code(headers);
+    if !success || !status.is_some_and(|status| (200..300).contains(&status)) {
+        return Err(status_failure(status, headers));
+    }
+    Ok(Download { kept, total })
+}
+
+/// Text that can stand inside a quoted curl configuration value as it is: printable ASCII with
+/// no space, quote or backslash.
+fn plain(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
+}
+
+/// The location the platform's reply to the log request redirects to. The platform answers that
+/// request with a redirect to a short-lived location on another host, and the redirect is never
+/// followed by the process that holds the credential.
+fn parse_redirect(success: bool, reply: &[u8]) -> Result<String, RemoteError> {
+    let end = header_end(reply).map_or(reply.len(), |(end, _)| end);
+    let headers = std::str::from_utf8(&reply[..end]).map_err(|_| RemoteError::InvalidResponse)?;
+    if !success {
+        return Err(RemoteError::Unavailable);
+    }
+    match status_code(headers) {
+        Some(301 | 302 | 303 | 307 | 308) => header_value(headers, "location")
+            .filter(|location| location.starts_with("https://") && plain(location))
+            .map(str::to_string)
+            .ok_or(RemoteError::InvalidResponse),
+        Some(status) if (200..300).contains(&status) => Err(RemoteError::InvalidResponse),
+        status => Err(status_failure(status, headers)),
+    }
+}
+
+/// A curl that reads no configuration file of the user's, speaks only HTTPS, follows no
+/// redirect, prints the response's headers before its body, and takes its URL and headers from
+/// its standard input, so neither the credential nor a signed location is in its arguments.
+fn curl() -> Command {
+    let mut command = isolated("curl");
+    command
+        .args([
+            "-q",
+            "--silent",
+            "--show-error",
+            "--include",
+            "--proto",
+            "=https",
+            "--max-redirs",
+            "0",
+            "--config",
+            "-",
+        ])
+        .stdin(Stdio::piped());
+    command
+}
+
+/// The configuration a `curl()` reads: the URL, and the credential only when one is given.
+fn curl_config(url: &str, token: Option<&str>) -> Result<Zeroizing<String>, RemoteError> {
+    if !plain(url) || token.is_some_and(|token| !plain(token)) {
+        return Err(RemoteError::Unavailable);
+    }
+    let mut config = Zeroizing::new(format!("url = \"{url}\"\nheader = \"User-Agent: khive\"\n"));
+    if let Some(token) = token {
+        config.push_str("header = \"X-GitHub-Api-Version: 2022-11-28\"\n");
+        config.push_str("header = \"Authorization: Bearer ");
+        config.push_str(token);
+        config.push_str("\"\n");
+    }
+    Ok(config)
 }
 
 async fn bare(program: &Path) -> Result<tempfile::TempDir, RemoteError> {
@@ -321,6 +560,46 @@ impl RemoteTransport for GhTransport {
 
     async fn push(&self, token: Option<&str>, request: PushRequest) -> Result<(), RemoteError> {
         push_native(&self.program, token, request, token.is_none()).await
+    }
+
+    /// Two processes. The first sends the credential to the platform's API host and reads the
+    /// redirect without following it. The second fetches the location that redirect names, and is
+    /// never given the credential.
+    async fn download(
+        &self,
+        token: &str,
+        path: String,
+        limit: u64,
+    ) -> Result<Download, RemoteError> {
+        let config = curl_config(&format!("{API_ORIGIN}{path}"), Some(token))?;
+        let (success, reply) = run(curl(), Some(config.as_bytes().to_vec()), false).await?;
+        let location = parse_redirect(success, &reply)?;
+        let config = curl_config(&location, None).map_err(|_| RemoteError::InvalidResponse)?;
+        let mut command = curl();
+        let mut child = khive_runtime::process_retry::spawn_retrying_executable_busy_async(
+            &khive_runtime::process_retry::EXECUTABLE_BUSY_BACKOFF_MS,
+            || command.spawn(),
+        )
+        .await
+        .map_err(|_| RemoteError::Unavailable)?;
+        let mut stdin = child.stdin.take().ok_or(RemoteError::Unavailable)?;
+        let stdout = child.stdout.take().ok_or(RemoteError::Unavailable)?;
+        let stderr = child.stderr.take().ok_or(RemoteError::Unavailable)?;
+        let (success, (headers, kept, total)) =
+            tokio::time::timeout(Duration::from_secs(DOWNLOAD_SECONDS), async {
+                stdin.write_all(config.as_bytes()).await?;
+                drop(stdin);
+                let (read, _stderr, status) = tokio::try_join!(
+                    read_by_end(stdout, limit),
+                    bounded(stderr, 64 * 1024),
+                    child.wait()
+                )?;
+                Ok::<_, std::io::Error>((status.success(), read))
+            })
+            .await
+            .map_err(|_| RemoteError::Unavailable)?
+            .map_err(|_| RemoteError::Unavailable)?;
+        parse_download(success, &headers, kept, total)
     }
 
     async fn fetch(

@@ -370,3 +370,206 @@ exercised.
 - Issuing, rotating and revoking computer keys.
 - More than one computer per caller.
 - Streaming a long run's output while it runs.
+
+## Amendment 1 (2026-11-24) - Sharing Named Files into a Computer
+
+**Status**: Accepted 2026-11-24 (#6850). The ADR's Accepted status stands unchanged.
+
+**Grounding commit:** `621f0a01827e30aa7cb79b5089e41696696630b9`
+
+### Context
+
+A caller on a computer reads only what that computer's store holds as trees. A file that lives on
+another machine, such as a handoff note, a report or a draft that its owner or another caller wrote
+there, can reach it today only as text pasted into a message or a store note. That copies the
+text, loses the file's bytes and name, and has no size rule. The computer side of the fix is a node
+verb, `computer.share`, specified with the computer outside this repository: called with a tree,
+a receiving actor and the files it holds, it records who shared which files with whom and returns
+the share's id. This amendment decides the sending side: how one khive tool turns named local
+files into a tree on a target computer and makes that call.
+
+Facts at the grounding commit, and of the computer's verbs as the computer serves them at the same
+date, that this amendment builds on:
+
+- `blob.import` reads a file only under a configured import root: no `..` component, no symbolic
+  link at any component (a link whose target is inside the root included), canonical containment
+  in the root, a regular file opened without following links, and at most 64 MiB. Source:
+  `crates/khive-runtime/src/file_policy.rs` lines 173-246;
+  `crates/khive-pack-blob/tests/file_transfers_tests/transfer_and_root_policy_tests.rs`.
+- `bridge.diagnostics` is answered by the stdio bridge itself and must be the only operation in
+  its request. Source: `crates/khive-mcp/src/server/bridge.rs` lines 195-240.
+- A computer names a blob, and a tree entry's content, by the lowercase hex BLAKE3 of its bytes:
+  a file holding `abc` is entered as `6437b3ac...9d85`, the published BLAKE3 test vector.
+  `blob.begin(size, content_ref?)` takes at most 64 MiB and answers an existing reference without
+  staging; `blob.put_part` appends a part; `blob.commit` checks the declared size and reference.
+  `exec.tree(entries)` builds a tree from `{path, ref, mode}` entries; `exec.tree_put` needs an
+  existing tree to edit.
+- Section 2 gives a caller at most one computer, and that table also routes the caller's command
+  packs. The caller that shares a file is usually not a caller of the receiving computer in that
+  sense: it may have no computer, or a computer of its own.
+
+### Decision
+
+1. **A bridge verb, `bridge.share`.** It is answered by the process that resolved the caller's
+   configuration, the stdio bridge and `kkernel exec`, like `bridge.diagnostics`: it is never
+   sent to the daemon and never routed by section 1. It must be the only operation in an
+   unbatched request. Arguments: `target`, the name of a share target (item 2); `receiver`, the
+   actor id the share is addressed to; `paths`, a nonempty array of distinct paths relative to
+   the share root; `note`, an optional string of at most 512 bytes passed to the computer. The
+   reply is `{share_id, target, receiver, tree, files: [{path, digest, size}]}`, where `share_id`
+   is the computer's answer and `digest` is the BLAKE3 reference of the bytes sent.
+
+   Options considered:
+
+   - **(a) A verb of the store's `blob` pack.** Rejected: the daemon would read callers' files and
+     hold computer keys, which section 1 option (d) rules out.
+   - **(b) A verb the computer serves.** Impossible: the computer cannot reach the sending
+     machine's files.
+   - **(c) A verb the caller's own process answers.** Chosen. The name sits under `bridge.`
+     because a `computer.*` name would be routed by section 1.
+
+2. **Where a share goes: `[share]` targets, separate from `[computer]`.** Example:
+
+   ```toml
+   [share]
+   root = "/home/example/share"
+   max_file_bytes = 67108864
+   max_total_bytes = 268435456
+   max_files = 256
+
+   [[share.targets]]
+   name = "build-1"
+   url = "https://build-1.example/mcp"
+   key_file = "/home/example/.secrets/share-build-1.key"
+   call_timeout_s = 600
+   ```
+
+   - The table and each target are closed: an unknown key fails startup. A `[share]` table with
+     no target fails startup.
+   - `root`: required; an absolute path to an existing directory, canonicalized when a share
+     runs. Everything under it can be shared, and nothing else.
+   - `max_file_bytes`: optional, default and maximum 67108864 (64 MiB, the computer's per-blob
+     limit). `max_total_bytes`: optional, default 268435456, at most 1073741824. `max_files`:
+     optional, default 256, at most 1000, the most files the computer accepts in one share.
+   - Each target's `name`, `url`, `key_file` and `call_timeout_s` follow the rules section 2 and
+     section 3 give the `[computer]` keys of the same names, the loopback rule for plain `http`,
+     the key file rules and the `whoami` check included. Target names are distinct.
+   - A target's key is one the target computer's owner issues to this caller, holding the grants a
+     share uses: the blob upload verbs, `exec.tree` and `computer.share`. Issuing it is outside this
+     repository, as section 9 says of every computer key.
+   - A target may be the caller's own computer; it is still reached through its target entry.
+
+   Options considered:
+
+   - **(a) Share only into the caller's own `[computer]`.** Rejected: the usual sender has no
+     computer, or shares into a computer that is not its own, and adding a `[computer]` table to
+     reach the receiver's computer would route the sender's command packs there.
+   - **(b) Named targets in their own table.** Chosen. Routing (sections 1 to 8) is unchanged by
+     it, and the rule of one computer per caller still holds for routing.
+
+3. **What it reads.** Each path is checked with the `blob.import` rules against `root`: a
+   relative path, no `..` component, no symbolic link at any component, a regular file, at most
+   `max_file_bytes`. It is also checked against the path rules the computer's tree applies to
+   each entry: no empty component (`a//b`), no `.` or `..` component, no backslash and no NUL
+   byte, so a path the tree would refuse is refused before any blob is sent. Every path is
+   checked, and the count and total size are checked against `max_files` and `max_total_bytes`,
+   before anything is sent; a failure refuses the whole share, names the first failing path and
+   its rule, and sends nothing. Nothing is truncated. Each file is then opened without following
+   links, its bytes are read once, and those bytes are both hashed and uploaded, so the digest
+   names exactly what was sent. A file whose size differs from the size checked is refused with
+   `share_file_changed`. In the tree a file's path is its path relative to `root`, with `/`
+   separators, and its mode is 644.
+
+4. **Order on the computer, and what each failure leaves.** After the `whoami` check the bridge
+   uploads each file (`blob.begin` with its size and digest, which skips a blob the computer
+   already holds, then `blob.put_part` and `blob.commit`), builds the tree with `exec.tree`, and
+   calls `computer.share` last, with the tree, the receiver, each path with its digest, and the
+   note. The receiver must already hold a live key on the target computer; the computer refuses a
+   share to any other actor (`receiver_unknown`).
+
+   - A failure before `computer.share` is sent leaves no share and records nothing on the
+     computer; blobs already committed and a tree already built stay in its store and count
+     against its budget. The refusal carries `domain_disposition: not_committed` and names the
+     tree if one was built.
+   - A refusal by `computer.share` reaches the caller unchanged (section 4).
+   - A failure after `computer.share` was sent is `computer_unreachable` with
+     `domain_disposition: unknown` (section 5), names the tree, and is never sent again
+     (section 4). Whether the share was recorded is the computer's to answer.
+
+5. **The record is the computer's.** As in section 4, the store writes no receipt and no dispatch
+   row for a share: the computer's share record, which names the actor its key belongs to as the
+   sharer, is the record. `bridge.diagnostics` counts shares per target in memory.
+
+6. **What the bridge never does.** It reads no path outside `root` and follows no link; it puts
+   no file byte in a result, a refusal, a log or tracing field, `bridge.diagnostics` or a daemon
+   frame (a result carries paths, digests and sizes); it sends a target's key only to that
+   target's `url`; and without a `[share]` table it reads no file and refuses `bridge.share` with
+   `share_not_configured`, naming the configuration file. The tool description lists
+   `bridge.share` only when the caller's configuration has a `[share]` table.
+
+7. **Refusal kinds.** `share_not_configured`; `share_target_unknown`; `share_path_refused`
+   (naming the path and the rule it broke); `share_too_large` (a file over `max_file_bytes`, or
+   the count or total over its limit, naming which); `share_file_changed`; `invalid_input` (an
+   empty `paths`, a repeated path, a `note` over 512 bytes, or another operation in the same
+   request). The section 3 and section 5 kinds apply to a target as they do to a computer.
+
+### Acceptance
+
+Each arm is stated before code exists. They run against the test computer of the base Acceptance,
+which gains a stand-in `computer.share` that derives each digest from the tree's own entries,
+refuses a mismatch, and records the share in its own store; its request log shows every operation
+it received.
+
+- **S1. One file.** A file under `root` shared to a named receiver yields a tree on the test
+  computer whose entry at that path holds the file's bytes; the stand-in's record names the
+  receiver, the digest and the actor of the target key; the reply's `share_id` is that record's.
+- **S2. The digest.** The reply's digest equals the BLAKE3 of the file computed by the test and
+  equals the tree entry's reference.
+- **S3. Bounds refuse before anything is sent.** An absolute path, a `..` component, an empty
+  component (`a//b.md`), a `.` component (`./a.md`), a file name holding a backslash, a path
+  holding a NUL byte, a symbolic link inside `root` to a file inside `root`, a path through a
+  linked directory, a directory, a FIFO, a file of `max_file_bytes` plus one byte, a total over
+  `max_total_bytes`, more than `max_files` paths, a repeated path and an empty `paths` are each
+  refused with the kind item 7 names, and the test computer's request log gains no operation.
+- **S4. S3 can fail.** With the link check removed, the inside-link case of S3 reaches the test
+  computer.
+- **S5. Unknown target.** `share_target_unknown`, and no connection is opened.
+- **S6. Wrong key.** A target key of another actor is refused with `computer_identity_mismatch`
+  before any upload.
+- **S7. A computer refusal passes through.** With the stand-in refusing every share as a digest
+  mismatch, the caller receives that refusal unchanged, the tree exists, and the stand-in records
+  nothing.
+- **S8. Unknown outcome, one call.** With the connection cut after `computer.share` is sent, the
+  reply is `computer_unreachable` with `domain_disposition: unknown` and names the tree, and the
+  stand-in received `computer.share` exactly once.
+- **S9. A file that changes.** Through a test seam between the size check and the read, a file
+  that grows is refused with `share_file_changed` and is not uploaded.
+- **S10. No bytes and no key surface.** With a fixture key and a fixture file of known bytes, no
+  reply, refusal, log or tracing output, `bridge.diagnostics` snapshot or daemon frame holds the
+  key or the file's bytes, across S1, S3, S6, S7 and S8.
+- **S11. Configuration rules.** A relative `root`, a target with a plain `http` URL to a
+  non-loopback host, two targets with one name, a limit over its maximum, and a `[share]` table
+  with no target each fail startup. Without a `[share]` table, `bridge.share` is refused with
+  `share_not_configured` and no file is opened.
+- **S12. Alone in its request.** `bridge.share` beside another operation, in a batch or a chain,
+  is refused with `invalid_input` and nothing is sent.
+
+### Consequences
+
+- A configuration gains one optional table. A build without this amendment ignores the table,
+  since unknown top-level tables are accepted, and does not know `bridge.share`, so a share fails
+  there before any file is read.
+- Each target needs its own key from that computer's owner, and the receiving computer must know
+  the sending actor to issue it.
+- A share that fails before its last call leaves blobs and possibly a tree in the target's store.
+- The whole of `root` is shareable by any request the bridge serves, so `root` is chosen as a
+  directory that holds only what may leave the machine.
+
+### Not covered
+
+- Sharing a directory or a pattern: paths name files one by one.
+- Revoking a share or removing a shared tree; the computer keeps its share records append-only.
+- The receiving side: the receiver reads the tree with the file verbs its computer already grants.
+  The computer has no verb listing the shares addressed to an actor, so the receiver learns of a
+  share from the sender's own message carrying the share id and the tree.
+- Sharing from one computer to another: the files are read on the sending caller's machine.

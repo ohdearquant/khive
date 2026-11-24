@@ -109,6 +109,10 @@ Revision `domain-effects-v30` classifies `git.pr_edit` and `git.pr_close` as
 state) and writes a durable receipt, so they are admitted as writes like
 `git.pr_review`.
 
+Revision `domain-effects-v31` classifies `git.check_log` as `Write`: it changes
+nothing on the platform or in the repository, but it stores the log it reads in
+the blob store, so it is admitted as a write like `git.diff`.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -202,6 +206,7 @@ state) and writes a durable receipt, so they are admitted as writes like
 | `exec.tree_put`                   | Write  | Verb       | [khive-pack-exec/src/vocab.rs](../../../khive-pack-exec/src/vocab.rs#L73)                               |
 | `get`                             | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L203)                    |
 | `git.branch`                      | Write  | Verb       | [khive-pack-git/src/vocab.rs](../../../khive-pack-git/src/vocab.rs#L200)                                |
+| `git.check_log`                   | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs)                       |
 | `git.checkout`                    | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L30)                     |
 | `git.commit`                      | Write  | Verb       | [khive-pack-git/src/vocab.rs](../../../khive-pack-git/src/vocab.rs#L157)                                |
 | `git.diff`                        | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L37)                     |
@@ -345,7 +350,7 @@ See [runtime token minting](../../../khive-runtime/src/runtime.rs#L1086).
   `brain.emit` is the deprecated Write alias of `brain.feedback`.
 - `tool.policy_delete` persists retirement metadata on the exact live policy
   row and changes future policy decisions. It is Write, like `tool.policy`.
-- `git.diff` and `git.checkout` publish artifacts/receipts; `git.reconcile` changes
+- `git.diff`, `git.check_log` and `git.checkout` publish artifacts/receipts; `git.reconcile` changes
   receipt state. `exec.tree` persists a manifest. They are Write despite possible
   read-oriented names. `exec.tree_diff` only returns a comparison and is Read.
 - `knowledge.fold` computes a result from supplied candidates and is Read;

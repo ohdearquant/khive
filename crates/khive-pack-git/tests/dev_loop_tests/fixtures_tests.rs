@@ -223,10 +223,12 @@ impl Fixture {
                         GitWriteEntryConfig {
                             repo: repo.display().to_string(),
                             branches: vec!["*".into()],
+                            access: Default::default(),
                         },
                         GitWriteEntryConfig {
                             repo: blank.display().to_string(),
                             branches: vec!["*".into()],
+                            access: Default::default(),
                         },
                     ]
                 } else {

@@ -4,7 +4,7 @@
 
 use crate::receipts::{self, Disposition, Receipt};
 use crate::remote_transport::{
-    ApiRequest, FetchRequest, Fetched, PushRequest, RemoteError, RemoteTransport,
+    ApiRequest, Download, FetchRequest, Fetched, PushRequest, RemoteError, RemoteTransport,
 };
 use crate::GitPack;
 use async_trait::async_trait;
@@ -90,6 +90,9 @@ struct State {
     decision_head: Option<String>,
     check_runs: Vec<Value>,
     combined: Value,
+    jobs: BTreeMap<u64, Value>,
+    logs: BTreeMap<u64, Vec<u8>>,
+    log_failure: Option<RemoteError>,
 }
 impl Recording {
     fn login(token: &str) -> &str {
@@ -229,6 +232,23 @@ impl RemoteTransport for Recording {
                 .collect();
             return Ok(json!({"total_count":s.check_runs.len(),"check_runs":rows}));
         }
+        if let Some(id) = path.strip_prefix(&format!("repos/{SLUG}/check-runs/")) {
+            let id = id
+                .parse::<u64>()
+                .map_err(|_| RemoteError::InvalidResponse)?;
+            return s
+                .check_runs
+                .iter()
+                .find(|run| run["id"] == id)
+                .cloned()
+                .ok_or(RemoteError::Refused);
+        }
+        if let Some(id) = path.strip_prefix(&format!("repos/{SLUG}/actions/jobs/")) {
+            let id = id
+                .parse::<u64>()
+                .map_err(|_| RemoteError::InvalidResponse)?;
+            return s.jobs.get(&id).cloned().ok_or(RemoteError::Refused);
+        }
         let part = path
             .strip_prefix(&format!("repos/{SLUG}/pulls/"))
             .ok_or(RemoteError::InvalidResponse)?;
@@ -297,6 +317,31 @@ impl RemoteTransport for Recording {
             return Ok(s.patch_reply.take().unwrap_or(pr));
         }
         s.prs.get(&n).cloned().ok_or(RemoteError::Refused)
+    }
+    async fn download(
+        &self,
+        token: &str,
+        path: String,
+        limit: u64,
+    ) -> Result<Download, RemoteError> {
+        let mut s = self.state.lock().unwrap();
+        s.calls
+            .push(json!({"op":"download","path":path,"limit":limit,
+            "token_hash":blake3::hash(token.as_bytes()).to_hex().to_string()}));
+        if let Some(error) = s.log_failure {
+            return Err(error);
+        }
+        let id = path
+            .strip_prefix(&format!("repos/{SLUG}/actions/jobs/"))
+            .and_then(|rest| rest.strip_suffix("/logs"))
+            .and_then(|id| id.parse::<u64>().ok())
+            .ok_or(RemoteError::InvalidResponse)?;
+        let log = s.logs.get(&id).ok_or(RemoteError::Refused)?;
+        let keep = usize::try_from(limit).unwrap_or(usize::MAX).min(log.len());
+        Ok(Download {
+            kept: log[log.len() - keep..].to_vec(),
+            total: log.len() as u64,
+        })
     }
 }
 
@@ -417,6 +462,7 @@ impl Fixture {
                     vec![GitWriteEntryConfig {
                         repo: repo.display().to_string(),
                         branches: vec!["work".into()],
+                        access: Default::default(),
                     }]
                 } else {
                     vec![]
@@ -461,6 +507,9 @@ impl Fixture {
                 decision_head: None,
                 check_runs: vec![],
                 combined: json!({"state":"pending","total_count":0,"statuses":[]}),
+                jobs: BTreeMap::new(),
+                logs: BTreeMap::new(),
+                log_failure: None,
             }),
         });
         let mut builder = VerbRegistryBuilder::new();
@@ -622,3 +671,5 @@ include!("remote_tests/schema_and_effect_controls_tests.rs");
 include!("remote_tests/pull_request_change_tests.rs");
 
 include!("remote_tests/fetch_credential_tests.rs");
+
+include!("remote_tests/check_log_tests.rs");
