@@ -1330,7 +1330,7 @@ second request.
 
 ## Amendment 20 (2026-11-24): a repository's own commit identity
 
-**Status**: Proposed 2026-11-24.
+**Status**: Accepted 2026-11-24 (#6855).
 
 Amendment 2 item 3 takes the author name and email of a tree commit only from the calling actor's
 `[git_write.actors]` row. One installation can hold repositories whose commits must carry different
