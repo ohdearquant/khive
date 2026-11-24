@@ -399,25 +399,25 @@ async fn read_by_end_keeps_the_header_whole_and_the_body_by_its_end() {
 
 #[test]
 fn redact_bytes_replaces_the_credential_and_a_cut_ending() {
-    let token = "tok-0123456789";
+    let held = "tok-0123456789";
     assert_eq!(
-        redact_bytes(b"a tok-0123456789 b tok-0123456789".to_vec(), token, false),
+        redact_bytes(b"a tok-0123456789 b tok-0123456789".to_vec(), held, false),
         b"a [redacted] b [redacted]"
     );
     // The window starts inside an occurrence: its last four or more bytes are replaced.
     assert_eq!(
-        redact_bytes(b"6789 rest".to_vec(), token, true),
+        redact_bytes(b"6789 rest".to_vec(), held, true),
         b"[redacted] rest"
     );
     assert_eq!(
-        redact_bytes(b"0123456789 rest tok-0123456789".to_vec(), token, true),
+        redact_bytes(b"0123456789 rest tok-0123456789".to_vec(), held, true),
         b"[redacted] rest [redacted]"
     );
     // Controls: three bytes are too few to be taken for an ending, a whole log is never read
     // as cut, and an empty credential changes nothing.
-    assert_eq!(redact_bytes(b"789 rest".to_vec(), token, true), b"789 rest");
+    assert_eq!(redact_bytes(b"789 rest".to_vec(), held, true), b"789 rest");
     assert_eq!(
-        redact_bytes(b"6789 rest".to_vec(), token, false),
+        redact_bytes(b"6789 rest".to_vec(), held, false),
         b"6789 rest"
     );
     assert_eq!(redact_bytes(b"any".to_vec(), "", true), b"any");
