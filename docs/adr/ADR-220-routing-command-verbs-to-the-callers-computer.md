@@ -373,7 +373,7 @@ exercised.
 
 ## Amendment 1 (2026-11-24) - Sharing Named Files into a Computer
 
-**Status**: Proposed. The ADR's Accepted status stands unchanged.
+**Status**: Accepted 2026-11-24 (#6850). The ADR's Accepted status stands unchanged.
 
 **Grounding commit:** `621f0a01827e30aa7cb79b5089e41696696630b9`
 
