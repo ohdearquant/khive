@@ -1239,7 +1239,7 @@ total counting them.
 
 ## Amendment 18 (2026-11-24): reading a hosted check's log
 
-**Status**: Accepted 2026-11-24 (#6848). The ADR's Accepted status and every amendment above stand unchanged.
+**Status**: Accepted 2026-11-24 (#6849). The ADR's Accepted status and every amendment above stand unchanged.
 
 Adopted from a reading of real callers, as Amendments 8 and 15 to 17 were. `git.pr_state` names each
 check run at a pull request's head and its conclusion, and a client with no shell then cannot read why
