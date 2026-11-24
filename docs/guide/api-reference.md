@@ -3451,7 +3451,17 @@ at most one `*` wildcard.
 [[git_write.allowed]]
 repo = "/abs/path/repo"
 branches = ["main", "feat/*", "release-*"]
+
+[[git_write.allowed]]
+repo = "/abs/path/other"
+access = "read"
 ```
+
+A row with `access = "read"` names a repository and no branches (ADR-108 Amendment 2). It
+admits the verbs that change neither the repository nor its remote: `git.checkout`,
+`git.diff`, `git.status`, `git.log`, `git.gates`, `git.pr_state` and `git.reconcile`. Every
+other verb refuses on it with `repo_read_only`. A row without `access` is a write row, which
+also admits every read.
 
 | Verb         | Param     | Type            | Required | Notes                                                                                                                                                                          |
 | ------------ | --------- | --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |

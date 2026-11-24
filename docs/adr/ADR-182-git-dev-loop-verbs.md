@@ -1264,7 +1264,8 @@ system cannot do, or asks someone else to read the log. This read enters here, u
    difference refuses `repository_identity_mismatch`. Every platform request is a `GET`, and no
    receipt is written. Storing the log is the verb's one effect, so the operation classifier lists it
    as a write, as it lists `git.diff`; for the repository rows of ADR-108 it reads the repository and
-   changes nothing there.
+   changes nothing there, so a read row admits it. The policy decision and the stored log also make
+   it a known incidental writer for admission, never admission-degrade-safe.
 3. **Only a completed job of the platform's own runner has a log here.** The check run is read first,
    under the repository. A run another app posted refuses `check_log_unavailable`, since the platform
    keeps no job log for it. A run that has not completed refuses `check_run_incomplete`, so a partial

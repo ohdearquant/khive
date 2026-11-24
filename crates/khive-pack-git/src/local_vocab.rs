@@ -78,7 +78,7 @@ pub(crate) const RECEIPTS: HandlerDef = HandlerDef {
 };
 pub(crate) const GATES: HandlerDef = HandlerDef {
     name: "git.gates",
-    description: "Read effective repository allowlist rows, preserving their configured entry indices and branch patterns. target names the configured remote, slug, visibility and kind (local or platform); absent mappings return null and invalid mappings return kind=unavailable with a reason.",
+    description: "Read effective repository allowlist rows, preserving their configured entry indices, branch patterns and access (read or write). target names the configured remote, slug, visibility and kind (local or platform); absent mappings return null and invalid mappings return kind=unavailable with a reason.",
     visibility: Visibility::Verb,
     category: VerbCategory::Assertive,
     params: &[REPO],
