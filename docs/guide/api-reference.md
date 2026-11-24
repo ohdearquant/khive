@@ -27,7 +27,7 @@ An always-machine-readable copy of this page is at
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 21    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 7     | `KHIVE_PACKS=kg,session`                   | Yes                 |
-| `git`       | 21    | `KHIVE_PACKS=kg,git`                       | Yes                 |
+| `git`       | 22    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 4     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 9     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
@@ -36,13 +36,13 @@ An always-machine-readable copy of this page is at
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
-`kkernel git-ingest` CLI drive. Its 21 verbs are `git.digest` (read/ingest), `git.ingest_cursor` (a read of the
+`kkernel git-ingest` CLI drive. Its 22 verbs are `git.digest` (read/ingest), `git.ingest_cursor` (a read of the
 stored ingest cursor and checkpoint for one project and source kind), the four
 write verbs `git.commit` / `git.branch` / `git.update_ref` / `git.push` (ADR-108) that shell to system git
 with hardened, allowlisted argv construction, the three read verbs `git.status` /
 `git.log` / `git.init`, and the dev-loop verbs `git.checkout` /
 `git.diff` / `git.gates` / `git.receipts` / `git.reconcile` / `git.pr_open` / `git.pr_review` /
-`git.pr_merge` / `git.pr_state` / `git.fetch` / `git.pr_edit` / `git.pr_close` (ADR-182). Initial remote cache setup failures and terminal refetch/reclone
+`git.pr_merge` / `git.pr_state` / `git.fetch` / `git.pr_edit` / `git.pr_close` / `git.check_log` (ADR-182). Initial remote cache setup failures and terminal refetch/reclone
 cache failures in `git.digest` return `RemoteFetchError` in-process. On the MCP `request`
 wire, the failed `tool: "git.digest"` result carries
 `error: {kind: "remote_fetch_error", remote, message, domain_disposition}`. `remote`
@@ -3300,11 +3300,11 @@ This does not change the separate `git.checkout` symlink-refusal contract.
 
 ---
 
-## `git` pack — 21 verbs
+## `git` pack — 22 verbs
 
 The entries below cover the ingest and write surface; the dev-loop verbs
 (`git.checkout`, `git.diff`, `git.gates`, `git.receipts`, `git.reconcile`, `git.status`,
-`git.log`, `git.init`, `git.pr_open`, `git.pr_review`, `git.pr_merge`, `git.pr_state`, `git.fetch`, `git.pr_edit`, `git.pr_close`) are specified in
+`git.log`, `git.init`, `git.pr_open`, `git.pr_review`, `git.pr_merge`, `git.pr_state`, `git.fetch`, `git.pr_edit`, `git.pr_close`, `git.check_log`) are specified in
 ADR-182 and its amendments.
 
 Git-history ingester plus a hardened write surface (ADR-088,

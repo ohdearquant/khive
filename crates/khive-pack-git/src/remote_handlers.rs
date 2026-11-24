@@ -1194,3 +1194,6 @@ mod pr_state;
 
 #[path = "pr_edit.rs"]
 mod pr_edit;
+
+#[path = "check_log.rs"]
+mod check_log;
