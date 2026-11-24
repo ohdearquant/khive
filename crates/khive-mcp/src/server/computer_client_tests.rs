@@ -1,8 +1,12 @@
 //! The computer client against a computer served over streamable HTTP
 //! (ADR-220 acceptance: the connector seam). The client reaches it over an
 //! in-process pipe carrying HTTP/1.1, so no socket is bound and the real status
-//! codes, the 404 for a lost session included, reach the client.
+//! codes, the 404 for a lost session included, reach the client. The arms at
+//! the end read how a failed send is classified; two of them need a loopback
+//! socket and run in the hosted checks.
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -14,15 +18,17 @@ use rmcp::model::{
     ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext;
+use rmcp::transport::streamable_http_client::StreamableHttpError;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::session::SessionManager;
 use rmcp::RoleServer;
 use serde_json::{json, Value};
 
+use super::super::computer_http::{BoundedHttpClient, BoundedHttpError};
 use super::super::computer_pipe_tests::{PipeComputer, PipeConnector, URL};
 use super::{
-    ComputerClient, ForwardedOptions, RoutedFailure, COMPUTER_IDENTITY_MISMATCH,
-    COMPUTER_UNREACHABLE,
+    classify, ComputerClient, ForwardedOptions, RoutedFailure, TransportFailure,
+    COMPUTER_IDENTITY_MISMATCH, COMPUTER_UNREACHABLE,
 };
 
 const ACTOR: &str = "lambda:test-caller";
@@ -353,4 +359,74 @@ async fn a_key_file_open_to_others_is_refused_before_the_computer_is_reached() {
     );
     assert!(computer.ops().is_empty());
     assert!(computer.authorization().is_empty());
+}
+
+// ---- what a failed send says about the request ----
+//
+// The classifier read with the errors the HTTP client really returns. The
+// name lookup binds no socket. The two loopback listeners do, so those arms
+// run in the hosted checks.
+
+/// The error the HTTP client returns for a POST to `url`, as the bounded
+/// client hands it on.
+async fn send_failure(url: &str) -> StreamableHttpError<BoundedHttpError> {
+    let error = reqwest::Client::new()
+        .post(url)
+        .body("{}")
+        .send()
+        .await
+        .expect_err("the POST fails");
+    StreamableHttpError::Client(BoundedHttpError::Http(error))
+}
+
+#[tokio::test]
+async fn a_name_that_does_not_resolve_was_not_sent() {
+    // The `invalid` top-level domain never resolves (RFC 2606).
+    let error = send_failure("http://computer.invalid/mcp").await;
+    assert_eq!(
+        classify::<BoundedHttpClient>(&error),
+        TransportFailure::NotSent,
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_tls_handshake_that_fails_was_not_sent() {
+    // The listener answers in plain HTTP where a TLS handshake was expected.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+    let port = listener.local_addr().expect("its address").port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("one connection");
+        let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n");
+    });
+
+    let error = send_failure(&format!("https://127.0.0.1:{port}/mcp")).await;
+    server.join().expect("the listener thread");
+    assert_eq!(
+        classify::<BoundedHttpClient>(&error),
+        TransportFailure::NotSent,
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_connection_closed_after_the_request_was_written_may_have_run() {
+    // The listener reads the request and closes without an answer: the
+    // connection was made and the request written, so this is not a
+    // connection that could not be opened.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+    let port = listener.local_addr().expect("its address").port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("one connection");
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+    });
+
+    let error = send_failure(&format!("http://127.0.0.1:{port}/mcp")).await;
+    server.join().expect("the listener thread");
+    assert_eq!(
+        classify::<BoundedHttpClient>(&error),
+        TransportFailure::Unknown,
+        "{error}"
+    );
 }
