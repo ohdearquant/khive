@@ -293,6 +293,7 @@ async fn every_registered_git_verb_rejects_named_unknowns_preserving_refusal_evi
                 .map(|path| GitWriteEntryConfig {
                     repo: path.display().to_string(),
                     branches: vec!["*".into()],
+                    access: Default::default(),
                 })
                 .collect(),
             ..Default::default()

@@ -2377,6 +2377,84 @@ branches = []
     );
 }
 
+// ADR-108 Amendment 2: a read entry names a repository and no branches, and a
+// row with no `access` key keeps its write meaning.
+#[test]
+fn test_git_write_read_entry_parses_and_access_defaults_to_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_toml(
+        &dir,
+        r#"
+[[git_write.allowed]]
+repo = "/abs/read"
+access = "read"
+
+[[git_write.allowed]]
+repo = "/abs/write"
+branches = ["main"]
+"#,
+    );
+    let cfg = KhiveConfig::load(Some(&path))
+        .expect("no error")
+        .expect("file found");
+    assert_eq!(cfg.git_write.allowed[0].access, GitRepoAccess::Read);
+    assert!(cfg.git_write.allowed[0].branches.is_empty());
+    assert_eq!(cfg.git_write.allowed[1].access, GitRepoAccess::Write);
+}
+
+#[test]
+fn test_git_write_read_entry_with_branches_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_toml(
+        &dir,
+        r#"
+[[git_write.allowed]]
+repo = "/abs/path"
+access = "read"
+branches = ["main"]
+"#,
+    );
+    let err = KhiveConfig::load(Some(&path)).expect_err("a read entry names no branches");
+    assert!(
+        matches!(config_error_root(&err), ConfigError::InvalidGitWriteEntry { ref reason, .. } if reason == "a read entry names no branches"),
+        "expected InvalidGitWriteEntry, got {err:?}"
+    );
+}
+
+// Omitting `branches` on a write entry is the empty list, refused as before.
+#[test]
+fn test_git_write_write_entry_without_branches_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_toml(
+        &dir,
+        r#"
+[[git_write.allowed]]
+repo = "/abs/path"
+access = "write"
+"#,
+    );
+    let err = KhiveConfig::load(Some(&path)).expect_err("a write entry needs branches");
+    assert!(
+        matches!(config_error_root(&err), ConfigError::InvalidGitWriteEntry { ref reason, .. } if reason == "branches must not be empty"),
+        "expected InvalidGitWriteEntry, got {err:?}"
+    );
+}
+
+#[test]
+fn test_git_write_unknown_access_rejected() {
+    let parsed: Result<KhiveConfig, _> = toml::from_str(
+        r#"
+[[git_write.allowed]]
+repo = "/abs/path"
+access = "admin"
+"#,
+    );
+    assert!(
+        parsed.is_err(),
+        "an access other than read or write must not parse"
+    );
+}
+
 #[test]
 fn git_actor_mapping_and_resolver_defaults_parse_without_resolution() {
     let cfg: KhiveConfig = toml::from_str(

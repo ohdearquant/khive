@@ -127,6 +127,7 @@ impl Fixture {
                     .map(|repo| GitWriteEntryConfig {
                         repo: repo.display().to_string(),
                         branches: vec!["work".into(), "new".into()],
+                        access: Default::default(),
                     })
                     .collect(),
                 actors: BTreeMap::from([(

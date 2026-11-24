@@ -3103,6 +3103,7 @@ async fn daemon_rejects_client_after_git_write_policy_is_revoked() {
         allowed: vec![GitWriteEntryConfig {
             repo: "/srv/repos/alpha".to_string(),
             branches: vec!["feat/*".to_string()],
+            access: Default::default(),
         }],
         ..Default::default()
     };

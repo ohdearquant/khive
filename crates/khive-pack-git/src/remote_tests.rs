@@ -417,6 +417,7 @@ impl Fixture {
                     vec![GitWriteEntryConfig {
                         repo: repo.display().to_string(),
                         branches: vec!["work".into()],
+                        access: Default::default(),
                     }]
                 } else {
                     vec![]
