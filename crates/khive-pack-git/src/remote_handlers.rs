@@ -401,7 +401,11 @@ impl GitPack {
         let policy =
             crate::write_policy::GitWritePolicy::from_config(&self.runtime().config().git_write);
         let (canonical, index) = policy
-            .match_entry(Path::new(&receipt.repo), branch)
+            .match_entry(
+                Path::new(&receipt.repo),
+                crate::write_policy::repo_access(verb),
+                branch,
+            )
             .map_err(|error| {
                 let reason = gate_reason(&error);
                 receipt.gate = denied(reason);

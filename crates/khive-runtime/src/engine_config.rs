@@ -844,22 +844,44 @@ pub struct BrainSectionConfig {
 
 // ---- git-write policy (ADR-108 Amendment) ----
 
+/// What an allowlisted repository row lets the git verbs do (ADR-108 Amendment 2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitRepoAccess {
+    /// Only the verbs that change neither the repository nor its remote.
+    Read,
+    /// Every verb, writes limited to the row's branch patterns. The default,
+    /// so a row written before this field existed keeps its meaning.
+    #[default]
+    Write,
+}
+
 /// One `[[git_write.allowed]]` entry: a repo this operator has declared
-/// trusted for khive-mediated git writes, plus the branches on it a write
-/// verb (`git.commit`/`git.branch`/`git.update_ref`/`git.push`) may target.
+/// trusted for khive-mediated git work. A write row names the branches a
+/// write verb (`git.commit`/`git.branch`/`git.update_ref`/`git.push`) may
+/// target; a read row (`access = "read"`) names none and admits only the verbs
+/// that change neither the repository nor its remote.
 ///
 /// ```toml
 /// [[git_write.allowed]]
 /// repo = "/abs/path/repo"
 /// branches = ["feat/*", "fix/*"]
+///
+/// [[git_write.allowed]]
+/// repo = "/abs/path/other"
+/// access = "read"
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitWriteEntryConfig {
     /// Absolute local path to the allowlisted repository.
     pub repo: String,
-    /// Non-empty list of exact branch names or single-`*`-wildcard globs
-    /// this repo entry permits writes against.
+    /// Exact branch names or single-`*`-wildcard globs this repo entry
+    /// permits writes against: non-empty on a write row, empty on a read row.
+    #[serde(default)]
     pub branches: Vec<String>,
+    /// What the row admits; `write` when absent.
+    #[serde(default)]
+    pub access: GitRepoAccess,
 }
 
 /// `[git_write]` section — the closed repo/branch allowlist consulted by
@@ -2594,11 +2616,13 @@ impl KhiveConfig {
         }
 
         // Validate [[git_write.allowed]] entries (ADR-108 Amendment): each
-        // repo must be a non-empty absolute path, and each entry must carry
-        // at least one branch pattern — an entry with an empty `branches`
-        // list would silently allowlist a repo for no branch at all, which
-        // reads as "configured" while behaving identically to "not
-        // allowlisted"; reject it loudly instead of leaving that trap.
+        // repo must be a non-empty absolute path, and each write entry must
+        // carry at least one branch pattern — a write entry with an empty
+        // `branches` list would silently allowlist a repo for no branch at all,
+        // which reads as "configured" while behaving identically to "not
+        // allowlisted"; reject it loudly instead of leaving that trap. A read
+        // entry names no branches (Amendment 2): a pattern on it would read as
+        // a write grant it does not give.
         for entry in &self.git_write.allowed {
             if entry.repo.trim().is_empty() {
                 return Err(ConfigError::InvalidGitWriteEntry {
@@ -2612,11 +2636,20 @@ impl KhiveConfig {
                     reason: "repo must be an absolute path".to_string(),
                 });
             }
-            if entry.branches.is_empty() {
-                return Err(ConfigError::InvalidGitWriteEntry {
-                    repo: entry.repo.clone(),
-                    reason: "branches must not be empty".to_string(),
-                });
+            match entry.access {
+                GitRepoAccess::Write if entry.branches.is_empty() => {
+                    return Err(ConfigError::InvalidGitWriteEntry {
+                        repo: entry.repo.clone(),
+                        reason: "branches must not be empty".to_string(),
+                    });
+                }
+                GitRepoAccess::Read if !entry.branches.is_empty() => {
+                    return Err(ConfigError::InvalidGitWriteEntry {
+                        repo: entry.repo.clone(),
+                        reason: "a read entry names no branches".to_string(),
+                    });
+                }
+                _ => {}
             }
             if entry.branches.iter().any(|b| b.trim().is_empty()) {
                 return Err(ConfigError::InvalidGitWriteEntry {

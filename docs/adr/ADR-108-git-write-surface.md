@@ -462,3 +462,80 @@ would execute as a side effect of an otherwise-successful, policy-permitted writ
 - Operators who want the write verbs to work at all must maintain the `[git_write]` section
   as repos and branch conventions change; this is an explicit operational cost of the
   fail-closed default, accepted in exchange for closing the reachable-by-default gap.
+
+## Amendment 2 (2026-11-23) - Read-Only Repository Rows
+
+**Status**: Accepted 2026-11-23. The ADR's Accepted status and Amendment 1 stand unchanged.
+
+### Context
+
+Amendment 1's allowlist is the only way to name a repository to the git pack, and every row
+names at least one branch, so a repository an operator wants read and never written can only
+be named as a write row. The read verbs ADR-182 added (`git.checkout`, `git.diff`,
+`git.status`, `git.log`, `git.gates`, `git.pr_state`) match a row by repository alone. A
+caller that needs to read a repository therefore receives write reach on every branch its row
+lists, and an operator who wants to grant reads alone has no row that says so. A client with
+no shell met this when it asked to read a repository that had no row.
+
+### Decision
+
+1. **A row carries `access`, `read` or `write`.** Absent means `write`, so every existing row
+   keeps its meaning. A write row needs at least one branch pattern, as before. A read row
+   names no branches; one that does is refused at config load (`a read entry names no
+   branches`), because a pattern on it would read as a write grant it does not give. Any
+   other value of `access` does not parse.
+
+   ```toml
+   [[git_write.allowed]]
+   repo = "/abs/path/repo"
+   branches = ["feat/*", "fix/*"]
+
+   [[git_write.allowed]]
+   repo = "/abs/path/other"
+   access = "read"
+   ```
+
+2. **Each verb needs read or write from the row that names its repository.** Read:
+   `git.checkout`, `git.diff`, `git.status`, `git.log`, `git.gates`, `git.pr_state` and
+   `git.reconcile`, the verbs that change neither the repository nor its remote. Write: every
+   other verb that consults the allowlist (`git.init`, `git.branch`, `git.commit`,
+   `git.update_ref`, `git.push`, `git.fetch`, `git.pr_open`, `git.pr_review`,
+   `git.pr_merge`, `git.pr_edit`, `git.pr_close`). A verb the table does not name needs write,
+   so a verb added later is refused on a read row until it is classified. This is a different
+   axis from the operation classifier (ADR-182 Amendment 16 item 5), which counts effects on
+   khive's own store, where a checkout writes trees; this one asks whether the repository or
+   its remote changes. `git.fetch` needs write because it moves a remote-tracking ref and adds
+   objects to the clone; a repository named for reads is kept current by its operator.
+
+3. **Matching.** A read is answered by the lowest-index row naming the repository, whatever
+   its access, so `gate.id` on a read is the id ADR-182 Amendment 4 item 4 already gives. A
+   write is answered by the lowest-index write row naming the repository, so a read row listed
+   before a write row for the same repository never hides it, and that row's branch patterns
+   are checked as before. A repository named only by read rows refuses a write
+   `repo_read_only` (gate id `deny:repo_read_only`) at the step where `repo_not_allowlisted`
+   refuses, so no credential is read and no git process starts. A read row for another
+   repository leaves this one `repo_not_allowlisted`.
+
+4. **`git.gates` names each row's `access`** beside its `branches`.
+
+### Consequences
+
+- Reads of a repository can be granted without any write reach, and the refusal names the
+  row's access rather than reading as an absent row.
+- A configuration written before this amendment loads and behaves exactly as before.
+- A build older than this amendment refuses to load a read row rather than treating it as a
+  write row: it ignores `access` and requires a non-empty `branches`.
+- Not covered: limiting which refs a read verb may name on a read row, and a read-only form
+  of `git.fetch`.
+
+Acceptance arms: a read row parses with no branches and a row with no `access` is a write row;
+a read row naming a branch, a write row with no branches and an `access` of any other value
+are refused at load; a read row admits a read and refuses a write `repo_read_only`; a write
+row admits a read; with a read row listed before a write row for the same repository a read
+answers id 0, a write on an allowed branch answers id 1 and a write on another branch refuses
+`branch_not_allowed`; a read row for another repository leaves this one
+`repo_not_allowlisted`; every verb the pack declares is listed with the access it needs, and
+an unlisted verb needs write; `git.gates` names each row's access; `git.pr_close` on a read
+row refuses `repo_read_only` with a deny gate, no policy decision and no credential read, and
+the same call on a write row passes the allowlist with gate id 0 and stops at the repository
+mapping (control).

@@ -28,18 +28,38 @@
 
 use std::path::{Path, PathBuf};
 
+pub use khive_runtime::engine_config::GitRepoAccess;
 use khive_runtime::engine_config::GitWriteSectionConfig;
 
-/// One allowlisted `(repo_path, branch_patterns)` entry.
+/// One allowlisted `(repo_path, branch_patterns, access)` entry.
 #[derive(Debug, Clone)]
 pub struct GitWritePolicyEntry {
     /// Absolute repo path as configured. Canonicalized at check time, not
     /// load time, so the check reflects the filesystem state at the moment
     /// of the write, not at daemon startup.
     pub repo_path: PathBuf,
-    /// Non-empty list of exact branch names or single-`*`-wildcard globs
-    /// (e.g. `"main"`, `"release-*"`, `"*"`).
+    /// Exact branch names or single-`*`-wildcard globs (e.g. `"main"`,
+    /// `"release-*"`, `"*"`); empty on a read entry.
     pub branch_patterns: Vec<String>,
+    /// What the entry admits (ADR-108 Amendment 2).
+    pub access: GitRepoAccess,
+}
+
+/// What `verb` needs from the allowlist entry that names its repository
+/// (ADR-108 Amendment 2): `Read` for a verb that changes neither the
+/// repository nor its remote, `Write` for every other verb. A verb this table
+/// does not name needs `Write`, so a verb added without a review here is
+/// refused on a read entry rather than admitted.
+///
+/// This is a different axis from `khive_gate::operation`'s classifier, which
+/// counts effects on khive's own store: `git.checkout` and `git.diff` write
+/// trees there and are `Read` here, because the repository is unchanged.
+pub fn repo_access(verb: &str) -> GitRepoAccess {
+    match verb {
+        "git.checkout" | "git.diff" | "git.reconcile" | "git.status" | "git.log" | "git.gates"
+        | "git.pr_state" => GitRepoAccess::Read,
+        _ => GitRepoAccess::Write,
+    }
 }
 
 /// The parsed `[git_write]` allowlist.
@@ -64,6 +84,9 @@ pub enum GitWritePolicyError {
     /// `repo` is allowlisted but `branch` matches none of that entry's
     /// `branch_patterns`.
     BranchNotAllowed { repo: String, branch: String },
+    /// `repo` is allowlisted only by read entries and the verb changes it
+    /// or its remote (ADR-108 Amendment 2).
+    RepoReadOnly(String),
 }
 
 impl std::fmt::Display for GitWritePolicyError {
@@ -82,6 +105,11 @@ impl std::fmt::Display for GitWritePolicyError {
                 f,
                 "branch {branch:?} in repo {repo:?} does not match any allowed \
                  branch pattern for that repo's [git_write] entry"
+            ),
+            Self::RepoReadOnly(repo) => write!(
+                f,
+                "repo {repo:?} is allowlisted for reads only and this verb changes it \
+                 or its remote"
             ),
         }
     }
@@ -112,14 +140,23 @@ impl GitWritePolicy {
     /// widens what is reachable, only normalizes how the same repo can be
     /// spelled.
     pub fn check(&self, repo: &Path, branch: &str) -> Result<PathBuf, GitWritePolicyError> {
-        self.match_entry(repo, Some(branch)).map(|(repo, _)| repo)
+        self.match_entry(repo, GitRepoAccess::Write, Some(branch))
+            .map(|(repo, _)| repo)
     }
 
     /// Match a canonical repository and, for mutations, its target branch.
     /// The entry index is the stable identifier in the configured allowlist.
+    ///
+    /// `access` is what the verb needs ([`repo_access`]). A read is answered by
+    /// the lowest-index entry naming the repository, whatever its access; a
+    /// write by the lowest-index write entry, so a read entry listed first
+    /// never hides a write entry for the same repository. A repository named
+    /// only by read entries refuses a write with
+    /// [`GitWritePolicyError::RepoReadOnly`].
     pub fn match_entry(
         &self,
         repo: &Path,
+        access: GitRepoAccess,
         branch: Option<&str>,
     ) -> Result<(PathBuf, usize), GitWritePolicyError> {
         if self.allowed.is_empty() {
@@ -127,14 +164,25 @@ impl GitWritePolicy {
         }
         let canonical_repo = std::fs::canonicalize(repo)
             .map_err(|_| GitWritePolicyError::RepoNotAllowlisted(repo.display().to_string()))?;
-        let matched = self.allowed.iter().enumerate().find(|(_, entry)| {
+        let mut named = self.allowed.iter().enumerate().filter(|(_, entry)| {
             std::fs::canonicalize(&entry.repo_path)
                 .is_ok_and(|candidate| candidate == canonical_repo)
         });
+        let mut read_only = false;
+        let matched = named.find(|(_, entry)| match access {
+            GitRepoAccess::Read => true,
+            GitRepoAccess::Write => {
+                read_only |= entry.access == GitRepoAccess::Read;
+                entry.access == GitRepoAccess::Write
+            }
+        });
         let Some((index, entry)) = matched else {
-            return Err(GitWritePolicyError::RepoNotAllowlisted(
-                repo.display().to_string(),
-            ));
+            let repo = repo.display().to_string();
+            return Err(if read_only {
+                GitWritePolicyError::RepoReadOnly(repo)
+            } else {
+                GitWritePolicyError::RepoNotAllowlisted(repo)
+            });
         };
         if let Some(branch) = branch {
             if !entry
@@ -209,6 +257,7 @@ impl GitWritePolicy {
             .map(|entry| GitWritePolicyEntry {
                 repo_path: PathBuf::from(&entry.repo),
                 branch_patterns: entry.branches.clone(),
+                access: entry.access,
             })
             .collect();
         GitWritePolicy { allowed }

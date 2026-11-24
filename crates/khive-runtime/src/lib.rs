@@ -183,7 +183,7 @@ pub use engine_config::{
     config_from_env, read_computer_key, resolve_wal_ceiling, BackendConfig, BackendKind,
     BlobConfig, BrainSectionConfig, CodeIngestSectionConfig, CodeMapConfig, ComputerEndpoint,
     ComputerKey, ComputerKeyError, ComputerKeyRefusal, ComputerSectionConfig, ConfigError,
-    EngineConfig, GateSectionConfig, GitDigestSectionConfig, GitWriteEntryConfig,
+    EngineConfig, GateSectionConfig, GitDigestSectionConfig, GitRepoAccess, GitWriteEntryConfig,
     GitWriteSectionConfig, KhiveConfig, KnowledgeSectionConfig, PackConfig, ResolvedWalCeiling,
     StorageSectionConfig, COMMAND_RUNNING_PACKS, COMPUTER_ROUTABLE_PACKS,
     DEFAULT_COMPUTER_CALL_TIMEOUT_S, MAX_COMPUTER_CALL_TIMEOUT_S, MAX_COMPUTER_KEY_BYTES,

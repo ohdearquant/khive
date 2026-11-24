@@ -13,7 +13,7 @@ use crate::write_argv::{validate_message, validate_ref_name, validate_repo_path}
 #[cfg(test)]
 use crate::write_handlers::repo_write_lock;
 use crate::write_handlers::repo_write_lock_async;
-use crate::write_policy::{GitWritePolicy, GitWritePolicyError};
+use crate::write_policy::{repo_access, GitRepoAccess, GitWritePolicy, GitWritePolicyError};
 use crate::GitPack;
 
 pub(crate) struct Failure {
@@ -255,6 +255,7 @@ pub(crate) fn gate_reason(error: &GitWritePolicyError) -> &'static str {
         GitWritePolicyError::NotConfigured => "not_configured",
         GitWritePolicyError::RepoNotAllowlisted(_) => "repo_not_allowlisted",
         GitWritePolicyError::BranchNotAllowed { .. } => "branch_not_allowed",
+        GitWritePolicyError::RepoReadOnly(_) => "repo_read_only",
     }
 }
 
@@ -460,27 +461,28 @@ impl GitPack {
         }
 
         let allowlist = GitWritePolicy::from_config(&self.runtime().config().git_write);
-        let canonical = match allowlist.match_entry(Path::new(&receipt.repo), branch) {
-            Ok((repo, index)) => {
-                receipt.repo = repo.display().to_string();
-                receipt.gate =
-                    json!({"decision":"allow", "source":"git_write.allowed", "id":index});
-                repo
-            }
-            Err(error) => {
-                let reason = gate_reason(&error);
-                receipt.gate = denied(reason);
-                self.require_receipt_storage(
-                    token,
-                    &receipt,
-                    receipts::insert(self.runtime(), &receipt).await,
-                )
-                .await?;
-                let mut failure = Failure::refused(reason);
-                failure.detail = Some(error.to_string());
-                return self.finish_local(token, receipt, Err(failure)).await;
-            }
-        };
+        let canonical =
+            match allowlist.match_entry(Path::new(&receipt.repo), repo_access(verb), branch) {
+                Ok((repo, index)) => {
+                    receipt.repo = repo.display().to_string();
+                    receipt.gate =
+                        json!({"decision":"allow", "source":"git_write.allowed", "id":index});
+                    repo
+                }
+                Err(error) => {
+                    let reason = gate_reason(&error);
+                    receipt.gate = denied(reason);
+                    self.require_receipt_storage(
+                        token,
+                        &receipt,
+                        receipts::insert(self.runtime(), &receipt).await,
+                    )
+                    .await?;
+                    let mut failure = Failure::refused(reason);
+                    failure.detail = Some(error.to_string());
+                    return self.finish_local(token, receipt, Err(failure)).await;
+                }
+            };
         if verb == "git.update_ref" {
             if let Err(error) = validate_repo_path(&canonical) {
                 self.require_receipt_storage(
@@ -1030,7 +1032,7 @@ impl GitPack {
     ) -> Result<(PathBuf, usize), RuntimeError> {
         let allowlist = GitWritePolicy::from_config(&self.runtime().config().git_write);
         let (canonical, index) = allowlist
-            .match_entry(Path::new(repo), None)
+            .match_entry(Path::new(repo), GitRepoAccess::Read, None)
             .map_err(|error| RuntimeError::InvalidInput(gate_reason(&error).into()))?;
         let decision = checked_policy(registry, token, verb).await?;
         if decision["decision"] != "allow" {
@@ -1139,7 +1141,7 @@ impl GitPack {
         let config = &self.runtime().config().git_write;
         let allowlist = GitWritePolicy::from_config(config);
         let (canonical, index) = allowlist
-            .match_entry(Path::new(repo), None)
+            .match_entry(Path::new(repo), GitRepoAccess::Read, None)
             .map_err(|error| RuntimeError::InvalidInput(gate_reason(&error).into()))?;
         let decision = checked_policy(registry, token, "git.gates").await?;
         if decision["decision"] != "allow" {
@@ -1147,7 +1149,7 @@ impl GitPack {
         }
         let rows: Vec<Value> = config.allowed.iter().enumerate().filter_map(|(id, row)| {
             std::fs::canonicalize(&row.repo).ok().filter(|path| *path == canonical)
-                .map(|_| json!({"id":id, "repo":canonical.display().to_string(), "branches":row.branches}))
+                .map(|_| json!({"id":id, "repo":canonical.display().to_string(), "branches":row.branches, "access":row.access}))
         }).collect();
         let target = match self.remote_repository(&canonical) {
             Ok(target) => json!({
