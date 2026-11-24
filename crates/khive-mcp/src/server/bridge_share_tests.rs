@@ -765,6 +765,39 @@ async fn s9_a_file_that_grows_after_its_check_is_refused_and_not_uploaded() {
     assert!(target.records().is_empty());
 }
 
+/// A directory replaced by a link after the checks: the link refusal on the
+/// last component does not cover a parent, so the opened handle's own path
+/// decides.
+#[tokio::test]
+#[serial_test::serial(bridge_share)]
+async fn s9_a_directory_swapped_for_a_link_after_its_check_is_refused_and_not_uploaded() {
+    reset_frames();
+    let target = Target::start(ACTOR);
+    let sharer = Sharer::new(&target);
+    sharer.write("sub/same.md", b"abc");
+    // Outside the root: a directory holding a file of the same name and size.
+    let outside = sharer.dir.path().join("elsewhere");
+    std::fs::create_dir(&outside).expect("a directory outside the root");
+    std::fs::write(outside.join("same.md"), b"xyz").expect("a file outside the root");
+    *sharer
+        .bridge()
+        .seams
+        .before_read
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(move |path: &Path| {
+        let parent = path.parent().expect("the file's directory");
+        std::fs::rename(parent, parent.with_file_name("sub-checked"))
+            .expect("move the checked directory away");
+        std::os::unix::fs::symlink(&outside, parent).expect("a link where the directory was");
+    }));
+
+    let reply = sharer.request(&share_ops(&["sub/same.md"])).await;
+    let message = refusal(&reply, "share_path_refused", "not_committed");
+    assert!(message.contains("outside the share root"), "{message}");
+    assert_eq!(target.received("blob.begin"), 0, "{:?}", target.calls());
+    assert!(target.records().is_empty());
+}
+
 /// Every byte the log writer is handed.
 #[derive(Clone, Default)]
 struct Capture(Arc<StdMutex<Vec<u8>>>);
