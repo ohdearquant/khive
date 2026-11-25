@@ -54,6 +54,33 @@
     ],
     "additionalProperties": false
   },
+  "git.branch_delete": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "name": {
+        "type": "string",
+        "minLength": 1
+      },
+      "expected": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{40}$"
+      },
+      "session_id": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "required": [
+      "repo",
+      "name",
+      "expected"
+    ],
+    "additionalProperties": false
+  },
   "git.update_ref": {
     "type": "object",
     "properties": {

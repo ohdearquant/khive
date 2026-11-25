@@ -639,6 +639,35 @@ async fn local_check_log_refuses_remote_scheme_before_credentials() {
 }
 
 #[tokio::test]
+async fn local_branch_delete_refuses_remote_scheme_before_credentials() {
+    let f = Fixture::file().await;
+    f.registry
+        .dispatch(
+            "tool.policy",
+            json!({"actor":f.actor,"tool":"git.branch_delete","decision":"allow"}),
+        )
+        .await
+        .unwrap();
+    git(&f.repo, &["checkout", "-q", "--detach"]);
+    // A local mapping names no platform, so whether a pull request is open cannot be asked.
+    let error = f
+        .call(
+            &f.actor,
+            "git.branch_delete",
+            json!({"name":"work","expected":f.head}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("remote_scheme"), "{error}");
+    let receipt = f.last(&f.actor).await;
+    assert_eq!(receipt.disposition, Disposition::NotCommitted);
+    assert_eq!(receipt.credential, json!({"source":"none"}));
+    assert_eq!(git(&f.repo, &["rev-parse", "refs/heads/work"]), f.head);
+    f.no_credential_read();
+}
+
+#[tokio::test]
 async fn remote_refusals_name_the_config_table_they_read() {
     let f = Fixture::file().await;
     let unmapped_actor = format!("{}:unmapped", f.actor);

@@ -99,6 +99,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("exec.tree_put", OperationAccess::Write),
     ("get", OperationAccess::Read),
     ("git.branch", OperationAccess::Write),
+    ("git.branch_delete", OperationAccess::Write),
     ("git.check_log", OperationAccess::Write),
     ("git.checkout", OperationAccess::Write),
     ("git.commit", OperationAccess::Write),
@@ -231,7 +232,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
 
 #[test]
 fn proposal_cleanup_revision_preserves_every_existing_classification() {
-    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v31");
+    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v32");
     assert_eq!(CLASSIFIED_OPERATIONS, EXPECTED);
     for &(name, access) in EXPECTED {
         assert_eq!(classify_operation(name), Some(access), "{name}");

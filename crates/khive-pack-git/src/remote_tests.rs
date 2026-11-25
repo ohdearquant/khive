@@ -93,6 +93,7 @@ struct State {
     jobs: BTreeMap<u64, Value>,
     logs: BTreeMap<u64, Vec<u8>>,
     log_failure: Option<RemoteError>,
+    open_pulls_reply: Option<Value>,
 }
 impl Recording {
     fn login(token: &str) -> &str {
@@ -248,6 +249,28 @@ impl RemoteTransport for Recording {
                 .parse::<u64>()
                 .map_err(|_| RemoteError::InvalidResponse)?;
             return s.jobs.get(&id).cloned().ok_or(RemoteError::Refused);
+        }
+        if let Some(query) = path.strip_prefix(&format!("repos/{SLUG}/pulls?")) {
+            if let Some(reply) = s.open_pulls_reply.clone() {
+                return Ok(reply);
+            }
+            // The platform's `head` filter names the branch as `owner:branch`.
+            let head = query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("head="))
+                .ok_or(RemoteError::InvalidResponse)?;
+            let open: Vec<Value> = s
+                .prs
+                .values()
+                .filter(|pr| {
+                    pr["state"] == "open"
+                        && pr["head"]["ref"]
+                            .as_str()
+                            .is_some_and(|branch| format!("fixture:{branch}") == head)
+                })
+                .cloned()
+                .collect();
+            return Ok(json!(open));
         }
         let part = path
             .strip_prefix(&format!("repos/{SLUG}/pulls/"))
@@ -511,6 +534,7 @@ impl Fixture {
                 jobs: BTreeMap::new(),
                 logs: BTreeMap::new(),
                 log_failure: None,
+                open_pulls_reply: None,
             }),
         });
         let mut builder = VerbRegistryBuilder::new();
@@ -637,7 +661,8 @@ impl Fixture {
     }
     async fn refusal(&self, actor: &str, verb: &str, p: Value, reason: &str) -> Receipt {
         let before = self.remote.writes();
-        let local = git(&self.repo, &["show-ref"]);
+        // for-each-ref, not show-ref: show-ref exits 1 once the repository holds no ref at all.
+        let local = git(&self.repo, &["for-each-ref"]);
         let remote = remote_head(&self.remote.bare);
         let error = self.call(actor, verb, p).await.unwrap_err().to_string();
         assert!(error.contains(reason), "{error}");
@@ -645,7 +670,7 @@ impl Fixture {
         assert_eq!(receipt.disposition, Disposition::NotCommitted);
         assert!(error.contains(&receipt.id));
         assert_eq!(self.remote.writes(), before);
-        assert_eq!(git(&self.repo, &["show-ref"]), local);
+        assert_eq!(git(&self.repo, &["for-each-ref"]), local);
         assert_eq!(remote_head(&self.remote.bare), remote);
         receipt
     }
@@ -674,3 +699,5 @@ include!("remote_tests/pull_request_change_tests.rs");
 include!("remote_tests/fetch_credential_tests.rs");
 
 include!("remote_tests/check_log_tests.rs");
+
+include!("remote_tests/branch_delete_tests.rs");

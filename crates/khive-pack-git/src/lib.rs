@@ -32,6 +32,7 @@
 //! | `git.fetch` | `repo`, `ref`, `expected_remote?` | Fetch one branch or one pull request's head from the configured remote into a remote-tracking ref by compare-and-swap |
 //! | `git.pr_edit` | `repo`, `number`, `title?`, `body?`, `expected_head` | Change a pull request's title or body; its opener, or a caller `git.pr_edit.others` allows |
 //! | `git.pr_close` | `repo`, `number`, `expected_head` | Close an open pull request without merging; its opener, or a caller `git.pr_close.others` allows |
+//! | `git.branch_delete` | `repo`, `name`, `expected` | Delete one local branch at an expected tip when no worktree has it checked out and no open pull request has it as its head |
 //! | `git.check_log` | `repo`, `check_run` | Read one completed runner job's log into the blob store, bounded by its end, with its last lines inline |
 //!
 //! `kkernel git-ingest` remains the unbounded, all-kinds admin CLI path over

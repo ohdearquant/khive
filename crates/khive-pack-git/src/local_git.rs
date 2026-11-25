@@ -18,6 +18,9 @@ use crate::write_argv::{validate_message, validate_ref_name};
 mod checkout_batch;
 #[path = "local_git_checkout_reuse.rs"]
 mod checkout_reuse;
+#[path = "local_git_delete.rs"]
+mod delete;
+pub(crate) use delete::{branch_state, checked_out, delete_branch, BranchState};
 #[path = "local_git_fetch.rs"]
 mod fetch;
 pub(crate) use fetch::{exact_ref, fetch_haves, fetch_refs, update_fetched_ref, FetchedRefUpdate};

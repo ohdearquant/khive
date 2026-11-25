@@ -1394,3 +1394,86 @@ and email as author and committer, returns `author_source` naming the row's key,
 the actor's identity and no `author_source` (control); 97 a row whose author name or email is empty,
 blank, holds an angle bracket or a line break refuses at load naming `repositories.<path>.author`, an
 unknown key inside `author` refuses at parse, and a row without `author` writes none back.
+
+## Amendment 21 (2026-11-25): deleting a local branch
+
+**Status**: Accepted 2026-11-25 (#6856). The ADR's Accepted status and every amendment above stand unchanged.
+
+`git.branch` makes a branch and `git.update_ref` moves one, and nothing removes one. A client with no
+shell that finishes its work on a branch leaves the branch behind, and each later inventory of the
+clone reads it again. This amendment adds the delete, for a local branch only, and only when nothing
+still uses it.
+
+1. **`git.branch_delete(repo, name, expected)`.** `expected` is the commit the caller believes the
+   branch holds, as 40 lowercase hexadecimal characters; the zero object id is refused
+   `invalid_params`, because `update-ref -d` reads it as no compare at all. The result is `repo`,
+   `ref`, `from` (the commit the branch held) and `receipt_id`. The name goes at once. The branch's
+   reflog goes with it, so commits that no other ref reaches stay only until git's own collection
+   prunes them once they pass `gc.pruneExpire` (a `HEAD` reflog entry in some worktree only delays
+   it); until then `git.branch` with the receipt's `from` makes the name again. The verb deletes a
+   branch at `expected` whether or not it was pushed, so work meant to be kept is pushed first.
+2. **Order.** Arguments, `tool.check`, the allowlist row with the branch (a write row whose branch
+   patterns admit `name`), the repository mapping, the dispatching actor's credential, and then,
+   under the repository write lock: the branch's tip, the worktrees, the platform, and last one
+   compare-and-delete: one `update-ref --no-deref --stdin` transaction, `start`, `delete <ref>
+   <expected>`, `prepare`, `commit`. A branch outside the row refuses
+   `branch_not_allowed` before any git process or credential read. A local mapping refuses
+   `remote_scheme`, since it names no platform to ask, before any credential is read.
+3. **Refusals before the delete.** A branch that does not exist refuses `branch_absent`; one at a
+   commit other than `expected` refuses `expected_head_mismatch`; a symbolic ref refuses
+   `ref_symbolic` before its existence is asked, so a dangling one never reads as absent. A branch
+   that the main worktree or any linked worktree has checked out refuses `branch_checked_out`.
+   Every refusal leaves a receipt that was not committed and the branch as it was.
+4. **The platform is asked, and an unanswered question refuses.** Two `GET` requests under the
+   caller's credential: the repository, whose name and visibility must match the configured row or
+   the call refuses `repository_identity_mismatch`, and its open pull requests whose head is this
+   branch of this repository. One such pull request refuses `pull_request_open`, naming its number.
+   A failed, refused or rate-limited request, or a reply that is not a list, refuses with the
+   platform's reason: it is never read as no pull request. A pull request is named only when its
+   head is this branch of this repository; a platform that cannot parse the head filter answers
+   with every open pull request, so a row with another head refuses `remote_response`. Nothing is
+   written to the platform.
+5. **The delete is one compare.** The commit being deleted is recorded in the receipt before the
+   delete can have an effect. A transaction that stops before git prints `prepare: ok` changed no
+   ref, since the prepare takes the lock and compares the value, and the branch is read again: one
+   that moved after the checks refuses `expected_head_mismatch`, one removed meanwhile
+   `branch_absent`, and one still at `expected` `not_committed`. All three settle as not committed.
+   A transaction that prepared and then failed, or any other reply, leaves the receipt unknown.
+   The outcome is read from git's status lines and the branch, never from git's error text, which
+   differs between git versions.
+6. **`git.reconcile` reports and settles nothing.** Git drops a branch's reflog with the branch, so
+   no receipt marker survives a delete. The reply carries `observed`: `ref_absent`,
+   `ref_at_expected` or `ref_moved`. An absent branch shows the goal state and not who removed it,
+   and a branch at the receipt's `from` may have been made again at that commit afterwards, so an
+   unknown receipt stays unknown. An unknown receipt blocks no later call on the name: a second
+   delete answers `branch_absent`, and `git.branch` can make the name again.
+7. **Classified and audited as a write.** The operation classifier lists the verb as a write, and
+   each call emits the write audit event the other local write verbs emit.
+
+What this does not cover: deleting a branch on the remote, deleting a remote-tracking ref or a
+fetched pull request head, and deleting several branches in one call. A worktree whose branch is in
+the middle of a rebase lists as detached, so this check does not see it.
+
+Acceptance arms added: 98 a branch at `expected` with no worktree on it and no open pull request is
+deleted after exactly two `GET` requests under the caller's credential, the receipt is committed, its
+commit is still readable, nothing is written to the platform and the remote's branch is unchanged;
+99 a branch the main worktree has checked out, and one a linked worktree has, each refuse
+`branch_checked_out` with no platform request, and the same call deletes it once the worktree is
+detached (control); 100 an open pull request from the branch refuses `pull_request_open` naming its
+number, and once it is closed the same call deletes the branch (control); 101 an unavailable
+platform, a spent allowance, a repository answering under another name or visibility, and a pull
+request reply that is not a list, and one whose pull request has another head, each refuse with
+the branch intact, and the same call succeeds once
+the platform answers (control); 102 a branch moved to another commit after the checks, with the
+repository write lock held, refuses `expected_head_mismatch` from the compare with the branch at the
+new commit and the receipt not committed, and a branch removed at that point refuses `branch_absent`;
+103 a stale `expected` refuses `expected_head_mismatch` with no platform request, a branch already
+deleted refuses `branch_absent` with no platform request, and the zero object id refuses
+`invalid_params`; 104 a branch outside the allowlist row refuses `branch_not_allowed` with no git
+process, platform request or credential read, while a delete the row admits runs git (control), a
+denying policy refuses `policy_denied`, and a local mapping refuses `remote_scheme` before any
+credential read; 105 a delete whose reply is lost after its effect leaves the receipt unknown,
+`git.reconcile` reports `ref_absent` and keeps it unknown, a second delete refuses `branch_absent`,
+`git.branch` makes the name again, and `git.reconcile` then reports `ref_at_expected` and still keeps
+it unknown; 106 the classifier lists the verb as a write at version 32 with every published verb
+total counting it.

@@ -201,6 +201,7 @@ fn every_git_verb_is_classified_for_repository_access() {
     use GitRepoAccess::{Read, Write};
     const EXPECTED: &[(&str, Option<GitRepoAccess>)] = &[
         ("git.branch", Some(Write)),
+        ("git.branch_delete", Some(Write)),
         ("git.check_log", Some(Read)),
         ("git.checkout", Some(Read)),
         ("git.commit", Some(Write)),
