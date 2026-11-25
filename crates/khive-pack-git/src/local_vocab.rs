@@ -43,6 +43,18 @@ pub(crate) const UPDATE_REF: HandlerDef = HandlerDef {
         SESSION,
     ],
 };
+pub(crate) const BRANCH_DELETE: HandlerDef = HandlerDef {
+    name: "git.branch_delete",
+    description: "Delete one local branch whose tip equals expected, in one compare-and-delete. Refuses branch_absent when the branch does not exist, expected_head_mismatch when its tip differs, branch_checked_out when any worktree has it checked out, and pull_request_open when an open pull request on the mapped platform has it as its head; a failed platform read refuses with the platform's reason. The configured git-write branch allowlist applies, a local mapping refuses remote_scheme, and the remote branch is never deleted. Two GET requests per call. Returns ref, from and receipt_id.",
+    visibility: Visibility::Verb,
+    category: VerbCategory::Commissive,
+    params: &[
+        REPO,
+        param("name", true, "Existing local branch to delete; the configured git-write branch allowlist applies."),
+        param("expected", true, "Required exact 40-hex lowercase current tip of the branch. Omission, null and the zero object id refuse."),
+        SESSION,
+    ],
+};
 const REPO: ParamDef = param(
     "repo",
     true,
@@ -85,7 +97,7 @@ pub(crate) const GATES: HandlerDef = HandlerDef {
 };
 pub(crate) const RECONCILE: HandlerDef = HandlerDef {
     name: "git.reconcile",
-    description: "Reconcile a caller-owned receipt without repeating its write. Local ref receipts require the receipt marker and SHA in the reflog, with that SHA at the current head or an ancestor. Push receipts require an acknowledged local marker and exact remote SHA; explicitly local remote mappings read that SHA without resolving credentials. PR merge receipts read platform merged state and SHA. Unknown PR open and review receipts remain unknown because they have no receipt-specific platform marker; no credential or platform read is attempted for them. Missing evidence leaves unknown.",
+    description: "Reconcile a caller-owned receipt without repeating its write. Local ref receipts require the receipt marker and SHA in the reflog, with that SHA at the current head or an ancestor. Push receipts require an acknowledged local marker and exact remote SHA; explicitly local remote mappings read that SHA without resolving credentials. PR merge receipts read platform merged state and SHA. Unknown PR open and review receipts remain unknown because they have no receipt-specific platform marker; no credential or platform read is attempted for them. Branch delete receipts report observed (ref_absent, ref_at_expected or ref_moved) and stay unknown, since a deleted ref keeps no marker. Missing evidence leaves unknown.",
     visibility: Visibility::Verb,
     category: VerbCategory::Assertive,
     params: &[param("receipt", true, "Caller-owned receipt UUID of a branch, tree commit, push, PR open, review or merge operation.")],

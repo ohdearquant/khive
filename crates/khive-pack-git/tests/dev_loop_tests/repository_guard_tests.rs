@@ -33,6 +33,9 @@ async fn amendment12_arm5_program_is_unknown_on_every_repository_verb() {
             "git.update_ref" => {
                 vec![json!({"repo":f.repo,"branch":"work","to":f.base,"expected":f.base})]
             }
+            "git.branch_delete" => {
+                vec![json!({"repo":f.repo,"name":"work","expected":f.base})]
+            }
             "git.commit" => vec![
                 f.commit_params(&manifest),
                 json!({"repo":f.repo,"paths":["a.txt"],"message":"legacy program control"}),

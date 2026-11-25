@@ -113,6 +113,10 @@ Revision `domain-effects-v31` classifies `git.check_log` as `Write`: it changes
 nothing on the platform or in the repository, but it stores the log it reads in
 the blob store, so it is admitted as a write like `git.diff`.
 
+Revision `domain-effects-v32` classifies `git.branch_delete` as `Write`: it deletes
+one local branch by compare-and-delete and writes a durable receipt, so it is
+admitted as a write like `git.update_ref`. Its two platform reads change nothing.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -206,6 +210,7 @@ the blob store, so it is admitted as a write like `git.diff`.
 | `exec.tree_put`                   | Write  | Verb       | [khive-pack-exec/src/vocab.rs](../../../khive-pack-exec/src/vocab.rs#L73)                               |
 | `get`                             | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L203)                    |
 | `git.branch`                      | Write  | Verb       | [khive-pack-git/src/vocab.rs](../../../khive-pack-git/src/vocab.rs#L200)                                |
+| `git.branch_delete`               | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs)                         |
 | `git.check_log`                   | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs)                       |
 | `git.checkout`                    | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L30)                     |
 | `git.commit`                      | Write  | Verb       | [khive-pack-git/src/vocab.rs](../../../khive-pack-git/src/vocab.rs#L157)                                |

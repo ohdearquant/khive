@@ -87,6 +87,12 @@ arguments!(UpdateRef {
     reason,
     session_id
 });
+arguments!(BranchDelete {
+    repo,
+    name,
+    expected,
+    session_id
+});
 arguments!(Push {
     repo,
     branch,
@@ -203,6 +209,7 @@ pub(crate) fn parse(verb: &str, params: Value) -> Result<Value, RuntimeError> {
         "git.commit" => decode::<Commit>(verb, params),
         "git.branch" => decode::<Branch>(verb, params),
         "git.update_ref" => decode::<UpdateRef>(verb, params),
+        "git.branch_delete" => decode::<BranchDelete>(verb, params),
         "git.push" => decode::<Push>(verb, params),
         "git.pr_open" => decode::<PrOpen>(verb, params),
         "git.pr_review" => decode::<PrReview>(verb, params),

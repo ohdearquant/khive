@@ -550,7 +550,7 @@ impl GitPack {
         if stored.is_err()
             && matches!(
                 receipt.verb.as_str(),
-                "git.branch" | "git.commit" | "git.update_ref"
+                "git.branch" | "git.commit" | "git.update_ref" | "git.branch_delete"
             )
         {
             self.emit_write_audit(
@@ -834,6 +834,10 @@ impl GitPack {
                     // without resolving a credential or touching the platform.
                     return Ok(json!({"receipt":prior.to_value()}));
                 }
+                if prior.verb == "git.branch_delete" {
+                    let observed = self.reconcile_branch_delete(repo, &prior).await?;
+                    return Ok(json!({"receipt":prior.to_value(), "observed":observed}));
+                }
                 if prior.verb == "git.fetch" {
                     // A fetch is settled by reading its destination ref, and it is safe to run
                     // again; an unknown fetch receipt stays unknown here.
@@ -918,6 +922,7 @@ impl GitPack {
             "git.branch"
                 | "git.commit"
                 | "git.update_ref"
+                | "git.branch_delete"
                 | "git.push"
                 | "git.fetch"
                 | "git.pr_open"

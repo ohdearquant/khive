@@ -1221,3 +1221,6 @@ mod pr_edit;
 
 #[path = "check_log.rs"]
 mod check_log;
+
+#[path = "branch_delete.rs"]
+pub(crate) mod branch_delete;

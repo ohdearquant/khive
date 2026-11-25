@@ -167,6 +167,7 @@ async fn assert_refusal_evidence(
             | "git.diff"
             | "git.branch"
             | "git.update_ref"
+            | "git.branch_delete"
             | "git.reconcile"
             | "git.push"
             | "git.fetch"
@@ -181,6 +182,7 @@ async fn assert_refusal_evidence(
         "git.commit"
             | "git.branch"
             | "git.update_ref"
+            | "git.branch_delete"
             | "git.push"
             | "git.fetch"
             | "git.pr_open"
@@ -350,6 +352,11 @@ async fn every_registered_git_verb_rejects_named_unknowns_preserving_refusal_evi
         (
             "git.update_ref",
             json!({"repo":repo,"branch":"main","to":head,"expected":null}),
+            "expected",
+        ),
+        (
+            "git.branch_delete",
+            json!({"repo":repo,"name":"candidate","expected":head}),
             "expected",
         ),
         (
