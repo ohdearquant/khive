@@ -260,9 +260,6 @@ struct GitOutput {
 }
 
 fn cas_refused(argv: &[&str], stderr: &[u8]) -> bool {
-    if let ["update-ref", "--no-deref", "-d", reference, expected] = argv {
-        return delete::delete_refused(reference, expected, stderr);
-    }
     let ["update-ref", "--no-deref", "--create-reflog", "-m", _, reference, _, expected] = argv
     else {
         return false;

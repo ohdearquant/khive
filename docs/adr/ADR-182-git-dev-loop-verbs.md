@@ -1415,7 +1415,8 @@ still uses it.
 2. **Order.** Arguments, `tool.check`, the allowlist row with the branch (a write row whose branch
    patterns admit `name`), the repository mapping, the dispatching actor's credential, and then,
    under the repository write lock: the branch's tip, the worktrees, the platform, and last one
-   compare-and-delete, `update-ref --no-deref -d <ref> <expected>`. A branch outside the row refuses
+   compare-and-delete: one `update-ref --no-deref --stdin` transaction, `start`, `delete <ref>
+   <expected>`, `prepare`, `commit`. A branch outside the row refuses
    `branch_not_allowed` before any git process or credential read. A local mapping refuses
    `remote_scheme`, since it names no platform to ask, before any credential is read.
 3. **Refusals before the delete.** A branch that does not exist refuses `branch_absent`; one at a
@@ -1433,10 +1434,13 @@ still uses it.
    with every open pull request, so a row with another head refuses `remote_response`. Nothing is
    written to the platform.
 5. **The delete is one compare.** The commit being deleted is recorded in the receipt before the
-   delete can have an effect. When the compare refuses because the branch moved after the checks,
-   the call refuses `expected_head_mismatch` with the branch where it moved to; when it refuses
-   because the branch was removed meanwhile, `branch_absent`. Both settle as not committed. Any
-   other failure of the delete leaves the receipt unknown.
+   delete can have an effect. A transaction that stops before git prints `prepare: ok` changed no
+   ref, since the prepare takes the lock and compares the value, and the branch is read again: one
+   that moved after the checks refuses `expected_head_mismatch`, one removed meanwhile
+   `branch_absent`, and one still at `expected` `not_committed`. All three settle as not committed.
+   A transaction that prepared and then failed, or any other reply, leaves the receipt unknown.
+   The outcome is read from git's status lines and the branch, never from git's error text, which
+   differs between git versions.
 6. **`git.reconcile` reports and settles nothing.** Git drops a branch's reflog with the branch, so
    no receipt marker survives a delete. The reply carries `observed`: `ref_absent`,
    `ref_at_expected` or `ref_moved`. An absent branch shows the goal state and not who removed it,

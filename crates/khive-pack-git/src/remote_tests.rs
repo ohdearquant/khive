@@ -661,7 +661,8 @@ impl Fixture {
     }
     async fn refusal(&self, actor: &str, verb: &str, p: Value, reason: &str) -> Receipt {
         let before = self.remote.writes();
-        let local = git(&self.repo, &["show-ref"]);
+        // for-each-ref, not show-ref: show-ref exits 1 once the repository holds no ref at all.
+        let local = git(&self.repo, &["for-each-ref"]);
         let remote = remote_head(&self.remote.bare);
         let error = self.call(actor, verb, p).await.unwrap_err().to_string();
         assert!(error.contains(reason), "{error}");
@@ -669,7 +670,7 @@ impl Fixture {
         assert_eq!(receipt.disposition, Disposition::NotCommitted);
         assert!(error.contains(&receipt.id));
         assert_eq!(self.remote.writes(), before);
-        assert_eq!(git(&self.repo, &["show-ref"]), local);
+        assert_eq!(git(&self.repo, &["for-each-ref"]), local);
         assert_eq!(remote_head(&self.remote.bare), remote);
         receipt
     }

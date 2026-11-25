@@ -75,32 +75,26 @@ pub(crate) async fn checked_out(program: &Path, repo: &Path, branch: &str) -> Re
     .await
 }
 
-/// Whether stderr from `update-ref --no-deref -d <reference> <expected>` is git's refusal of the
-/// compare: the ref is at another commit, or no longer exists. A delete reports that refusal
-/// through `error:`, where a ref move dies through `fatal: update_ref failed`. Every other failure
-/// of a delete stays unestablished, because the ref may already be gone.
-pub(super) fn delete_refused(reference: &str, expected: &str, stderr: &[u8]) -> bool {
-    let Ok(message) = std::str::from_utf8(stderr) else {
-        return false;
-    };
-    let prefix = format!("error: cannot lock ref '{reference}': ");
-    let Some(reason) = message
-        .strip_prefix(&prefix)
-        .and_then(|value| value.strip_suffix('\n'))
-    else {
-        return false;
-    };
-    let expected = expected.to_ascii_lowercase();
-    if reason == format!("reference is missing but expected {expected}") {
-        return true;
+/// How the delete's `update-ref --stdin` transaction ended, read from the status lines it printed.
+/// Each of `start`, `prepare` and `commit` prints `<command>: ok` once it succeeds, and git stops at
+/// the first that fails. Preparing takes the ref's lock and compares its value, and a prepare that
+/// fails releases the lock, so a transaction that never printed `prepare: ok` changed no ref. Why it
+/// stopped is never read from git's error text, which differs between git versions.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum DeleteOutcome {
+    Deleted,
+    NotCommitted,
+    Unknown,
+}
+
+pub(super) fn delete_outcome(exit_code: i32, stdout: &[u8]) -> DeleteOutcome {
+    match (exit_code, stdout) {
+        (0, b"start: ok\nprepare: ok\ncommit: ok\n") => DeleteOutcome::Deleted,
+        (0, _) => DeleteOutcome::Unknown,
+        (_, b"" | b"start: ok\n") => DeleteOutcome::NotCommitted,
+        // Prepared and then failed, or a reply it does not know: the ref may already be gone.
+        _ => DeleteOutcome::Unknown,
     }
-    reason
-        .strip_prefix("is at ")
-        .and_then(|value| value.strip_suffix(&format!(" but expected {expected}")))
-        .is_some_and(|observed| {
-            crate::object_id::is_40_hex(observed.as_bytes())
-                && !observed.eq_ignore_ascii_case(&expected)
-        })
 }
 
 fn delete_branch_sync(program: &Path, repo: &Path, branch: &str, expected: &str) -> Result<()> {
@@ -116,19 +110,30 @@ fn delete_branch_sync(program: &Path, repo: &Path, branch: &str, expected: &str)
     let reference = branch_ref(branch)?;
     // A symref installed after inspection must never redirect the delete to its target.
     require_direct_ref(program, repo, &reference)?;
-    run_git(
+    // `branch_ref` admits no whitespace and `expected` is 40 hex digits, so each is one field of
+    // its line. git dies with status 128 on a failed command; any other status stays unknown.
+    let input = format!("start\ndelete {reference} {expected}\nprepare\ncommit\n");
+    let output = run_git_output(
         program,
         repo,
-        &["update-ref", "--no-deref", "-d", &reference, expected],
-        None,
+        &["update-ref", "--no-deref", "--stdin"],
+        Some(input.as_bytes()),
         None,
         true,
+        Some(128),
     )?;
-    Ok(())
+    match delete_outcome(output.exit_code, &output.stdout) {
+        DeleteOutcome::Deleted => Ok(()),
+        DeleteOutcome::NotCommitted => Err(LocalGitError::new(
+            "not_committed",
+            "git update-ref stopped before preparing the delete",
+        )),
+        DeleteOutcome::Unknown => Err(LocalGitError::after_start("update-ref", true)),
+    }
 }
 
-/// Delete `branch` if and only if it is at `expected`, in one compare-and-delete. A refusal of the
-/// compare is `not_committed`; any other failure is ambiguous.
+/// Delete `branch` if and only if it is at `expected`, in one compare-and-delete. A transaction
+/// that stopped before its prepare is `not_committed`; any other failure is ambiguous.
 pub(crate) async fn delete_branch(
     program: &Path,
     repo: &Path,

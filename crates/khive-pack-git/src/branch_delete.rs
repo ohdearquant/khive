@@ -216,10 +216,14 @@ impl GitPack {
             if error.code() != "not_committed" {
                 return Err(error.into());
             }
-            // The compare refused, so nothing was deleted: say whether the branch moved or went.
+            // The transaction stopped before its prepare, so nothing was deleted: say whether the
+            // branch moved or went. A branch still at `expected` stopped it for another cause.
             return Err(match local_git::branch_state(program, repo, name).await {
                 Ok(BranchState::Absent) => Failure::refused("branch_absent"),
-                _ => Failure::refused("expected_head_mismatch"),
+                Ok(BranchState::At(head)) if head != expected => {
+                    Failure::refused("expected_head_mismatch")
+                }
+                _ => error.into(),
             });
         }
         if config.contract_faults
