@@ -1397,7 +1397,7 @@ unknown key inside `author` refuses at parse, and a row without `author` writes 
 
 ## Amendment 21 (2026-11-25): deleting a local branch
 
-**Status**: Accepted 2026-11-25. The ADR's Accepted status and every amendment above stand unchanged.
+**Status**: Accepted 2026-11-25 (#6856). The ADR's Accepted status and every amendment above stand unchanged.
 
 `git.branch` makes a branch and `git.update_ref` moves one, and nothing removes one. A client with no
 shell that finishes its work on a branch leaves the branch behind, and each later inventory of the
