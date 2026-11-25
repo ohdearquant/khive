@@ -1407,8 +1407,11 @@ still uses it.
 1. **`git.branch_delete(repo, name, expected)`.** `expected` is the commit the caller believes the
    branch holds, as 40 lowercase hexadecimal characters; the zero object id is refused
    `invalid_params`, because `update-ref -d` reads it as no compare at all. The result is `repo`,
-   `ref`, `from` (the commit the branch held) and `receipt_id`. The branch's commits stay in the
-   repository; only the name goes.
+   `ref`, `from` (the commit the branch held) and `receipt_id`. The name goes at once. The branch's
+   reflog goes with it, so commits that no other ref reaches stay only until git's own collection
+   prunes them once they pass `gc.pruneExpire` (a `HEAD` reflog entry in some worktree only delays
+   it); until then `git.branch` with the receipt's `from` makes the name again. The verb deletes a
+   branch at `expected` whether or not it was pushed, so work meant to be kept is pushed first.
 2. **Order.** Arguments, `tool.check`, the allowlist row with the branch (a write row whose branch
    patterns admit `name`), the repository mapping, the dispatching actor's credential, and then,
    under the repository write lock: the branch's tip, the worktrees, the platform, and last one
@@ -1425,7 +1428,10 @@ still uses it.
    the call refuses `repository_identity_mismatch`, and its open pull requests whose head is this
    branch of this repository. One such pull request refuses `pull_request_open`, naming its number.
    A failed, refused or rate-limited request, or a reply that is not a list, refuses with the
-   platform's reason: it is never read as no pull request. Nothing is written to the platform.
+   platform's reason: it is never read as no pull request. A pull request is named only when its
+   head is this branch of this repository; a platform that cannot parse the head filter answers
+   with every open pull request, so a row with another head refuses `remote_response`. Nothing is
+   written to the platform.
 5. **The delete is one compare.** The commit being deleted is recorded in the receipt before the
    delete can have an effect. When the compare refuses because the branch moved after the checks,
    the call refuses `expected_head_mismatch` with the branch where it moved to; when it refuses
@@ -1452,7 +1458,8 @@ commit is still readable, nothing is written to the platform and the remote's br
 detached (control); 100 an open pull request from the branch refuses `pull_request_open` naming its
 number, and once it is closed the same call deletes the branch (control); 101 an unavailable
 platform, a spent allowance, a repository answering under another name or visibility, and a pull
-request reply that is not a list each refuse with the branch intact, and the same call succeeds once
+request reply that is not a list, and one whose pull request has another head, each refuse with
+the branch intact, and the same call succeeds once
 the platform answers (control); 102 a branch moved to another commit after the checks, with the
 repository write lock held, refuses `expected_head_mismatch` from the compare with the branch at the
 new commit and the receipt not committed, and a branch removed at that point refuses `branch_absent`;

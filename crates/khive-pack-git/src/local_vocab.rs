@@ -45,7 +45,7 @@ pub(crate) const UPDATE_REF: HandlerDef = HandlerDef {
 };
 pub(crate) const BRANCH_DELETE: HandlerDef = HandlerDef {
     name: "git.branch_delete",
-    description: "Delete one local branch whose tip equals expected, in one compare-and-delete. Refuses branch_absent when the branch does not exist, expected_head_mismatch when its tip differs, branch_checked_out when any worktree has it checked out, and pull_request_open when an open pull request on the mapped platform has it as its head; a failed platform read refuses with the platform's reason. The configured git-write branch allowlist applies, a local mapping refuses remote_scheme, and the remote branch is never deleted. Two GET requests per call. Returns ref, from and receipt_id.",
+    description: "Delete one local branch whose tip equals expected, in one compare-and-delete. Refuses branch_absent when the branch does not exist, expected_head_mismatch when its tip differs, branch_checked_out when any worktree has it checked out, and pull_request_open when an open pull request on the mapped platform has it as its head; a failed platform read refuses with the platform's reason. The configured git-write branch allowlist applies, a local mapping refuses remote_scheme, and the remote branch is never deleted. Two GET requests per call; a pull request with another head than this branch refuses remote_response. The name goes at once: commits no other ref reaches stay only until git's garbage collection prunes them, and git.branch with the returned from makes the name again before that, so push work meant to be kept first. Returns ref, from and receipt_id.",
     visibility: Visibility::Verb,
     category: VerbCategory::Commissive,
     params: &[

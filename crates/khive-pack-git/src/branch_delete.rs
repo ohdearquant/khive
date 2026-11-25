@@ -274,6 +274,14 @@ impl GitPack {
             .as_array()
             .ok_or_else(|| Failure::refused("remote_response"))?;
         if let Some(row) = rows.first() {
+            // A head filter the platform cannot parse is answered with every open pull request,
+            // so a row is named only when it is this branch of this repository. Any other row
+            // says nothing about this branch, and that is no answer.
+            if row.pointer("/head/ref").and_then(Value::as_str) != Some(name)
+                || row.pointer("/head/repo/full_name").and_then(Value::as_str) != Some(slug)
+            {
+                return Err(Failure::refused("remote_response"));
+            }
             let mut failure = Failure::refused("pull_request_open");
             failure.detail = row
                 .get("number")

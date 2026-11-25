@@ -164,7 +164,7 @@ async fn remote_branch_delete_refuses_when_the_platform_does_not_answer_the_ques
     let f = Fixture::new(true, None).await;
     delete_ready(&f).await;
     type Unanswered = fn(&mut State);
-    let unanswered: [(&str, Unanswered); 5] = [
+    let unanswered: [(&str, Unanswered); 6] = [
         ("remote_unavailable", |s| s.api_failure = true),
         ("remote_rate_limited", |s| s.rate_limited = Some(1_700_000_000)),
         ("repository_identity_mismatch", |s| {
@@ -174,6 +174,11 @@ async fn remote_branch_delete_refuses_when_the_platform_does_not_answer_the_ques
         // A reply that is not a list of pull requests is no answer either.
         ("remote_response", |s| {
             s.open_pulls_reply = Some(json!({"message":"Not Found"}))
+        }),
+        // A platform that did not apply the head filter answers with another branch's pull
+        // request; that row says nothing about this branch.
+        ("remote_response", |s| {
+            s.open_pulls_reply = Some(json!([{"number":7,"state":"open","head":{"ref":"other","repo":{"full_name":SLUG}}}]))
         }),
     ];
     for (reason, set) in unanswered {
