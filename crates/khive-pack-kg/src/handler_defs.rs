@@ -1435,6 +1435,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                     add_entity — {kind: \"add_entity\", entity: {kind: <entity-kind>, name: <string>, description?: <string>, properties?: <object>, tags?: [<string>]}}; \
                     update_entity — {kind: \"update_entity\", id: <full UUID>, patch: {name?: <string>, description?: <string|null>, properties?: <object>, tags?: [<string>]}}; \
                     add_edge — {kind: \"add_edge\", source: <full UUID>, target: <full UUID>, relation: <EdgeRelation>, weight?: <float>}; \
+                    retire_edge — {kind: \"retire_edge\", source: <full UUID>, target: <full UUID>, relation: <EdgeRelation>}: soft-deletes the live edge with that key, which restore brings back; \
+                    supersede_edge — {kind: \"supersede_edge\", old: {source, target, relation}, new: {source, target, relation, weight?, metadata?}}: retires old and adds new in one unit, both or neither; \
                     add_note — {kind: \"add_note\", note: {kind: <note-kind>, content: <string>, name?: <string>, properties?: <object>}}; \
                     merge_entities — {kind: \"merge_entities\", into: <full UUID>, from: <full UUID>}; \
                     supersede_entity — {kind: \"supersede_entity\", old: <full UUID>, new: <full UUID>}; \
