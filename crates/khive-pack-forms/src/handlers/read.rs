@@ -13,8 +13,8 @@ use super::views::{field_reply, usage, value_reply};
 use super::write::{DECISION, FORMAT, LOG_KEYS};
 use super::Ctx;
 use crate::store::{
-    definition, invalid, is_general, label, prop, prop_text, props, quoted_names, scalar, strings,
-    type_of, wordings, Graph,
+    definition, invalid, is_general, label, pending_premises, prop, prop_text, props, quoted_names,
+    scalar, strings, type_of, wordings, Graph,
 };
 use crate::text::normalize;
 use crate::vocab::{
@@ -566,8 +566,10 @@ pub(crate) async fn check(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runtime
             );
             continue;
         }
-        answered.insert(field.id);
+        // A choice field is answered only through a value it lists: an answer
+        // outside its values is reported below and holds no premise or item.
         if prop_text(field, "value_type").as_deref() != Some("choice") {
+            answered.insert(field.id);
             continue;
         }
         let values = graph.values_of_field(field.id);
@@ -578,7 +580,10 @@ pub(crate) async fn check(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runtime
                     .is_some_and(|e| normalize(&e.name) == normalize(text))
             });
             match hit {
-                Some(value) => given.push((field.id, value)),
+                Some(value) => {
+                    answered.insert(field.id);
+                    given.push((field.id, value));
+                }
                 None => findings.push(json!({
                     "kind": "value_outside_domain",
                     "field": field.name,
@@ -620,11 +625,36 @@ pub(crate) async fn check(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runtime
     }
 
     let given_values: HashSet<Uuid> = given.iter().map(|(_, v)| *v).collect();
+    let mut unchecked = Vec::new();
     for rule in graph.of_type(FORM_RULE) {
         let Some(form) = graph.form_of(rule) else {
             continue;
         };
         if !in_set.contains(&form.id) {
+            continue;
+        }
+        let pending = pending_premises(rule);
+        if !pending.is_empty() {
+            // Its bound premises are only part of the printed rule, so it is
+            // not evaluated until every premise names a field.
+            let mut waiting: Vec<String> = Vec::new();
+            for (wording, _) in pending {
+                if !waiting.contains(&wording) {
+                    waiting.push(wording);
+                }
+            }
+            let text = prop_text(rule, "text").unwrap_or_else(|| rule.name.clone());
+            unchecked.push(json!({
+                "rule": text,
+                "form": cite(form),
+                "page": prop(rule, "source_page"),
+                "pending": waiting,
+                "message": format!(
+                    "{} states \"{text}\"; it is not checked until {} is decided with forms.same or forms.split",
+                    form_name(form),
+                    waiting.iter().map(|w| format!("\"{w}\"")).collect::<Vec<_>>().join(", ")
+                ),
+            }));
             continue;
         }
         let premises = graph.out(rule.id, EdgeRelation::DependsOn);
@@ -670,9 +700,10 @@ pub(crate) async fn check(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runtime
 
     Ok(json!({
         "forms": set.iter().map(|f| cite(f)).collect::<Vec<_>>(),
-        "consistent": findings.is_empty(),
+        "consistent": findings.is_empty() && unresolved.is_empty() && unchecked.is_empty(),
         "findings": findings,
         "unresolved_answers": unresolved,
+        "rules_unchecked": unchecked,
     }))
 }
 

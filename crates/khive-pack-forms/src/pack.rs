@@ -42,7 +42,7 @@ const ITEM_ID: ParamDef = param(
 pub(crate) static FORMS_HANDLERS: [HandlerDef; 10] = [
     HandlerDef {
         name: "forms.load",
-        description: "Load one form revision from one document in one transaction: the form, its issuer, sections, items, the fields and choice values the items mean, printed rules, and relations to forms already loaded. Loading the same form_id and revision again changes nothing. A live field with the same name, definition and value type is reused; a live field of that name with another meaning leaves the items asking for it without a field, with a warning, to be decided with forms.same or forms.split.",
+        description: "Load one form revision from one document in one transaction: the form, its issuer, sections, items, the fields and choice values the items mean, printed rules, and relations to forms already loaded. Loading the same form_id and revision again changes nothing. A live field with the same name, definition and value type is reused; a live field of that name with another meaning leaves the items asking for it without a field, with a warning, to be decided with forms.same or forms.split; a printed rule whose premise names such a field is kept, marked as waiting on it. An exclusive choice field holds at most 48 values, and a reused exclusive field's new values exclude its existing ones.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[DOCUMENT],
@@ -61,7 +61,7 @@ pub(crate) static FORMS_HANDLERS: [HandlerDef; 10] = [
     },
     HandlerDef {
         name: "forms.same",
-        description: "Give an item that has no field its field: an existing one (field) or a new one (new_field). The item's label becomes an alias of an existing field unless another field already answers to it. The decision is logged on the field.",
+        description: "Give an item that has no field its field: an existing one (field) or a new one (new_field). The item's label becomes an alias of an existing field unless another field already answers to it. The decision is logged on the field. A rule of the item's form waiting on the wording the item named takes its premise on that field, and the reply lists, as rules_settled, the rules left with none waiting.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
@@ -72,7 +72,7 @@ pub(crate) static FORMS_HANDLERS: [HandlerDef; 10] = [
     },
     HandlerDef {
         name: "forms.split",
-        description: "Record, in one transaction, that an item's wording names a different field than the live field of that name. The live field is renamed existing_name and keeps its items; a new field new_name is created for the item; the shared wording becomes a general field containing both, so resolving it returns both, flagged ambiguous. Item labels never change, and the renamed field keeps its former name. The decision is logged.",
+        description: "Record, in one transaction, that an item's wording names a different field than the live field of that name. The live field is renamed existing_name and keeps its items; a new field new_name is created for the item; the shared wording becomes a general field containing both, so resolving it returns both, flagged ambiguous. Item labels never change, and the renamed field keeps its former name. The decision is logged. A rule of the item's form waiting on the wording the item named takes its premise on new_name, as with forms.same.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
@@ -107,7 +107,7 @@ pub(crate) static FORMS_HANDLERS: [HandlerDef; 10] = [
     },
     HandlerDef {
         name: "forms.check",
-        description: "Check a set of forms, and optional answers, against the forms' own rules. Findings: two competing forms both present; a form that must be attached is absent; a printed rule whose premise holds and whose section, item or form is not filled; an answer outside its field's values; two exclusive values given together. Each finding cites its form and, for a rule, the page that prints it. Answers that name no single field are listed apart.",
+        description: "Check a set of forms, and optional answers, against the forms' own rules. Findings: two competing forms both present; a form that must be attached is absent; a printed rule whose premise holds and whose section, item or form is not filled; an answer outside its field's values; two exclusive values given together. Each finding cites its form and, for a rule, the page that prints it. Answers that name no single field are listed apart, and so are rules still waiting on a field to be decided (rules_unchecked). consistent is true only when there are no findings, no such answers and no such rules.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[

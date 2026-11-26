@@ -113,6 +113,34 @@ pub(crate) fn label(entity: &Entity) -> String {
     prop_text(entity, "label").unwrap_or_else(|| entity.name.clone())
 }
 
+/// The premises a rule could not bind when it was loaded: each a field wording
+/// and an optional value name, waiting for that wording to be decided.
+pub(crate) fn pending_premises(rule: &Entity) -> Vec<(String, Option<String>)> {
+    prop(rule, "premises_pending")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|entry| {
+                    let field = entry.get("field")?.as_str()?.to_owned();
+                    let value = entry
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    Some((field, value))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One pending premise as a rule stores it.
+pub(crate) fn pending_premise(field: &str, value: Option<&str>) -> Value {
+    match value {
+        Some(value) => serde_json::json!({"field": field, "value": value}),
+        None => serde_json::json!({"field": field}),
+    }
+}
+
 /// The content key of one form revision.
 pub(crate) fn form_key(form_id: &str, revision: &str) -> String {
     format!("form:{form_id}@{revision}")

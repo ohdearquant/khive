@@ -13,8 +13,8 @@ use super::params::{self, Args};
 use super::views::{field_reply, nearest};
 use super::Ctx;
 use crate::store::{
-    aliases, form_key, invalid, is_general, label, prop_text, props, quoted_names, scalar, strings,
-    type_of, wordings, Graph, Writes, GRAPH_RELATIONS,
+    aliases, form_key, invalid, is_general, label, pending_premise, pending_premises, prop_text,
+    props, quoted_names, scalar, strings, type_of, wordings, Graph, Writes, GRAPH_RELATIONS,
 };
 use crate::text::normalize;
 use crate::vocab::{
@@ -36,6 +36,11 @@ pub(crate) const LOG_KEYS: [&str; 7] = [
     "existing_name",
     "new_name",
 ];
+
+/// The most values an exclusive choice field holds. Each pair of its values is
+/// linked, so the bound keeps one load's links (48 values: 1,128) well inside
+/// one transaction.
+pub(crate) const MAX_EXCLUSIVE_VALUES: usize = 48;
 
 fn map<const N: usize>(pairs: [(&str, Value); N]) -> Map<String, Value> {
     pairs
@@ -69,16 +74,39 @@ fn field_spec(obj: &Args) -> Result<FieldSpec, RuntimeError> {
             "field \"{name}\" lists values, so its value_type must be choice"
         )));
     }
+    let exclusive = obj
+        .get("exclusive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    refuse_exclusive_size(&name, exclusive, values.len())?;
     Ok(FieldSpec {
         definition: params::text(obj, "definition")?,
         aliases: params::string_list(obj, "aliases")?,
-        exclusive: obj
-            .get("exclusive")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        exclusive,
         name,
         value_type,
         values,
+    })
+}
+
+/// An exclusive field links every pair of its values, so its size is bounded
+/// before the pairs are staged.
+fn refuse_exclusive_size(name: &str, exclusive: bool, count: usize) -> Result<(), RuntimeError> {
+    if exclusive && count > MAX_EXCLUSIVE_VALUES {
+        return Err(invalid(format!(
+            "field \"{name}\" is exclusive and has {count} values; an exclusive field holds at most {MAX_EXCLUSIVE_VALUES}, since each pair of its values is linked"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether any two of these values already exclude each other.
+fn competing(graph: &Graph, values: &[Uuid]) -> bool {
+    values.iter().any(|value| {
+        graph
+            .either(*value, EdgeRelation::CompetesWith)
+            .iter()
+            .any(|other| values.contains(other))
     })
 }
 
@@ -389,6 +417,8 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
     }
 
     let mut fields: HashMap<String, Slot> = HashMap::new();
+    // Each wording of a field left undecided, to the name the document gives it.
+    let mut blocked: HashMap<String, String> = HashMap::new();
     for field in params::list(doc, "fields")? {
         let mut spec = field_spec(params::entry(field, "field")?)?;
         let folded = normalize(&spec.name);
@@ -416,6 +446,8 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
             {
                 counts.fields_reused += 1;
                 let mut values = graph_values(&graph, existing.id);
+                let old: Vec<Uuid> = values.values().copied().collect();
+                let mut added = Vec::new();
                 let mut next = values.len();
                 for (name, definition) in &spec.values {
                     if values.contains_key(&normalize(name)) {
@@ -430,7 +462,18 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                     )?;
                     writes.link(existing.id, EdgeRelation::Contains, value);
                     values.insert(normalize(name), value);
+                    added.push(value);
                     counts.values += 1;
+                }
+                // A field whose values exclude each other keeps doing so for the
+                // values this document adds.
+                if !added.is_empty() && (spec.exclusive || competing(&graph, &old)) {
+                    refuse_exclusive_size(&spec.name, true, old.len() + added.len())?;
+                    for (i, first) in added.iter().enumerate() {
+                        for second in old.iter().chain(&added[i + 1..]) {
+                            writes.link(*first, EdgeRelation::CompetesWith, *second);
+                        }
+                    }
                 }
                 Some((existing.id, values))
             }
@@ -443,6 +486,12 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                 None
             }
         };
+        if slot.is_none() {
+            blocked.insert(folded.clone(), spec.name.clone());
+            for alias in &spec.aliases {
+                blocked.insert(normalize(alias), spec.name.clone());
+            }
+        }
         for alias in &spec.aliases {
             let folded_alias = normalize(alias);
             if folded_alias != folded {
@@ -490,16 +539,36 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                 ))
             })?,
         };
-        let id = writes.create_entity(FORM_ITEM, &spec.label, None, item_props(&spec, &key))?;
+        let field_name = params::opt_text(obj, "field")?;
+        let value_name = params::opt_text(obj, "value")?;
+        if field_name.is_none() && value_name.is_some() {
+            return Err(invalid(format!(
+                "item \"{}\" names a value; name its field too",
+                spec.label
+            )));
+        }
+        let slot = match &field_name {
+            Some(name) => Some(document_field(&fields, &graph, name)?),
+            None => None,
+        };
+        let mut item_properties = item_props(&spec, &key);
+        if let (Some(name), Some(None)) = (&field_name, &slot) {
+            // The wording waits for forms.same or forms.split, and so do the
+            // rules of this form that take it as a premise.
+            let waiting = blocked
+                .get(&normalize(name))
+                .cloned()
+                .unwrap_or_else(|| name.clone());
+            item_properties.insert("field_pending".to_owned(), json!(waiting));
+        }
+        let id = writes.create_entity(FORM_ITEM, &spec.label, None, item_properties)?;
         writes.link(parent, EdgeRelation::Contains, id);
         counts.items += 1;
 
-        let field_name = params::opt_text(obj, "field")?;
-        let value_name = params::opt_text(obj, "value")?;
         let mut bound = Value::Null;
-        match (field_name, value_name) {
-            (Some(field_name), value_name) => {
-                if let Some((field, values)) = document_field(&fields, &graph, &field_name)? {
+        match (field_name, slot) {
+            (Some(field_name), Some(slot)) => {
+                if let Some((field, values)) = slot {
                     match value_name {
                         Some(value_name) => {
                             let value = values.get(&normalize(&value_name)).ok_or_else(|| {
@@ -518,13 +587,8 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                     }
                 }
             }
-            (None, Some(_)) => {
-                return Err(invalid(format!(
-                    "item \"{}\" names a value; name its field too",
-                    spec.label
-                )))
-            }
-            (None, None) => {
+            (Some(_), None) => {}
+            (None, _) => {
                 if vocab::item_needs_field(&spec.item_kind) {
                     warnings.push(format!(
                         "item \"{}\" names no field; forms.lint lists it until it is bound",
@@ -563,37 +627,47 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
     for rule in params::list(doc, "rules")? {
         let obj = params::entry(rule, "rule")?;
         let text = params::text(obj, "text")?;
-        let id = writes.create_entity(
-            FORM_RULE,
-            &text,
-            None,
-            map([
-                ("text", json!(text)),
-                ("source_page", params::number(obj, "page")?),
-                ("form_key", json!(key)),
-            ]),
-        )?;
-        counts.rules += 1;
+        let mut premises = Vec::new();
+        let mut waiting = Vec::new();
         for premise in params::list(obj, "depends_on")? {
             let premise = params::entry(premise, "premise")?;
             let field_name = params::text(premise, "field")?;
+            let value_name = params::opt_text(premise, "value")?;
             let Some((field, values)) = document_field(&fields, &graph, &field_name)? else {
+                let name = blocked
+                    .get(&normalize(&field_name))
+                    .cloned()
+                    .unwrap_or(field_name);
                 warnings.push(format!(
-                    "rule \"{text}\" keeps no premise on \"{field_name}\" until that field is decided"
+                    "rule \"{text}\" is not checked until \"{name}\" is decided"
                 ));
+                waiting.push(pending_premise(&name, value_name.as_deref()));
                 continue;
             };
-            match params::opt_text(premise, "value")? {
+            match value_name {
                 Some(value_name) => {
                     let value = values.get(&normalize(&value_name)).ok_or_else(|| {
                         invalid(format!(
                             "rule \"{text}\" names value \"{value_name}\", which field \"{field_name}\" does not list"
                         ))
                     })?;
-                    writes.link(id, EdgeRelation::DependsOn, *value);
+                    premises.push(*value);
                 }
-                None => writes.link(id, EdgeRelation::DependsOn, field),
+                None => premises.push(field),
             }
+        }
+        let mut rule_properties = map([
+            ("text", json!(text)),
+            ("source_page", params::number(obj, "page")?),
+            ("form_key", json!(key)),
+        ]);
+        if !waiting.is_empty() {
+            rule_properties.insert("premises_pending".to_owned(), json!(waiting));
+        }
+        let id = writes.create_entity(FORM_RULE, &text, None, rule_properties)?;
+        counts.rules += 1;
+        for target in premises {
+            writes.link(id, EdgeRelation::DependsOn, target);
         }
         for conclusion in params::list(obj, "enables")? {
             let conclusion = params::entry(conclusion, "conclusion")?;
@@ -754,6 +828,67 @@ fn bind_same(
     Ok(added)
 }
 
+/// An item that waited on a wording is decided: the rules of its form that
+/// waited on the same wording take their premise on the field it now means.
+/// Returns the rules left with no premise waiting.
+fn settle_pending(
+    graph: &Graph,
+    writes: &mut Writes,
+    item: &Entity,
+    field: Uuid,
+    values: &HashMap<String, Uuid>,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<String>, RuntimeError> {
+    let Some(wording) = prop_text(item, "field_pending") else {
+        return Ok(Vec::new());
+    };
+    let mut item_properties = props(item);
+    item_properties.remove("field_pending");
+    writes.update_entity(item, None, None, Some(item_properties))?;
+
+    let form = prop_text(item, "form_key");
+    let folded = normalize(&wording);
+    let mut settled = Vec::new();
+    for rule in graph.of_type(FORM_RULE) {
+        if prop_text(rule, "form_key") != form {
+            continue;
+        }
+        let pending = pending_premises(rule);
+        if !pending.iter().any(|(w, _)| normalize(w) == folded) {
+            continue;
+        }
+        let text = prop_text(rule, "text").unwrap_or_else(|| rule.name.clone());
+        let mut left = Vec::new();
+        for (name, value) in pending {
+            if normalize(&name) != folded {
+                left.push(pending_premise(&name, value.as_deref()));
+                continue;
+            }
+            match value {
+                None => writes.link(rule.id, EdgeRelation::DependsOn, field),
+                Some(value_name) => match values.get(&normalize(&value_name)) {
+                    Some(value) => writes.link(rule.id, EdgeRelation::DependsOn, *value),
+                    None => {
+                        warnings.push(format!(
+                            "rule \"{text}\" names value \"{value_name}\" of \"{name}\", which the field it now means does not list; the rule stays unchecked"
+                        ));
+                        left.push(pending_premise(&name, Some(&value_name)));
+                    }
+                },
+            }
+        }
+        let mut rule_properties = props(rule);
+        if left.is_empty() {
+            rule_properties.remove("premises_pending");
+            settled.push(text);
+        } else {
+            rule_properties.insert("premises_pending".to_owned(), json!(left));
+        }
+        writes.update_entity(rule, None, None, Some(rule_properties))?;
+    }
+    Ok(settled)
+}
+
 /// forms.add_item: one printed item on a loaded form, and what it means.
 pub(crate) async fn add_item(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeError> {
     let args = params::args(params)?;
@@ -884,6 +1019,7 @@ pub(crate) async fn same(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
     let mut writes = Writes::new(ctx.token);
     let mut warnings = Vec::new();
     let mut reply = json!({"status": "bound", "item": {"id": item.id.to_string(), "label": item_label, "form": form}});
+    let mut settled = Vec::new();
     if let Some(field) = field {
         let field = graph.find_field(&field)?;
         refuse_general(&graph, field)?;
@@ -894,6 +1030,14 @@ pub(crate) async fn same(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
             &item_label,
             &form,
             field,
+            &mut warnings,
+        )?;
+        settled = settle_pending(
+            &graph,
+            &mut writes,
+            item,
+            field.id,
+            &graph_values(&graph, field.id),
             &mut warnings,
         )?;
         reply["field"] = json!({"id": field.id.to_string(), "name": field.name});
@@ -909,10 +1053,12 @@ pub(crate) async fn same(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
             )));
         }
         keep_free_aliases(&graph, &mut proposed, &mut warnings);
-        let (id, _) = stage_field(&mut writes, &proposed)?;
+        let (id, values) = stage_field(&mut writes, &proposed)?;
         writes.link(item.id, EdgeRelation::VariantOf, id);
+        settled = settle_pending(&graph, &mut writes, item, id, &values, &mut warnings)?;
         reply["field"] = json!({"id": id.to_string(), "name": proposed.name});
     }
+    reply["rules_settled"] = json!(settled);
 
     let committed = writes.commit(ctx.runtime, ctx.registry, ctx.token).await?;
     warnings.extend(committed.index_warning);
@@ -1004,6 +1150,15 @@ pub(crate) async fn split(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runtime
         },
     )?;
     writes.link(item.id, EdgeRelation::VariantOf, narrow);
+    let mut warnings = Vec::new();
+    let settled = settle_pending(
+        &graph,
+        &mut writes,
+        item,
+        narrow,
+        &HashMap::new(),
+        &mut warnings,
+    )?;
 
     let general = writes.create_entity(
         FIELD,
@@ -1040,13 +1195,15 @@ pub(crate) async fn split(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runtime
     )?;
 
     let committed = writes.commit(ctx.runtime, ctx.registry, ctx.token).await?;
+    warnings.extend(committed.index_warning);
     Ok(json!({
+        "rules_settled": settled,
         "status": "split",
         "general": {"id": general.to_string(), "name": shared},
         "existing": {"id": field.id.to_string(), "name": existing_name},
         "new": {"id": narrow.to_string(), "name": new_name},
         "item": {"id": item.id.to_string(), "label": item_label, "form": form},
-        "warnings": committed.index_warning.into_iter().collect::<Vec<_>>(),
+        "warnings": warnings,
     }))
 }
 

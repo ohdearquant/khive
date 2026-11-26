@@ -661,3 +661,371 @@ async fn a_refused_write_leaves_nothing_behind() {
     let after = store.call("forms.export", json!({})).await;
     assert_eq!(after, before);
 }
+
+const ACCT: &str = "ACCT-1";
+const JOINT_RULE: &str = "Give the account type when a joint holder is named";
+const CERT: &str = "CERT-1";
+const CERT_RULE: &str = "A certificate number is given for common shares";
+
+/// A form whose two rules hang on a choice field: one takes the choice as its
+/// premise, the other requires the choice's item.
+fn form_d() -> Value {
+    json!({
+        "form_id": ACCT,
+        "revision": "2026-04",
+        "title": "Account opening",
+        "source": {"url": "https://forms.example/acct-1.pdf", "sha256": "4".repeat(64)},
+        "fields": [
+            {
+                "name": "account type",
+                "definition": "Who owns the account.",
+                "value_type": "choice",
+                "exclusive": true,
+                "values": [
+                    {"name": "individual", "definition": "One owner."},
+                    {"name": "joint", "definition": "Two owners."}
+                ]
+            },
+            {"name": "joint holder name", "definition": "Full legal name of the second owner.", "value_type": "text"}
+        ],
+        "items": [
+            item("Account type", 1, 1, "choice", "account type"),
+            item("Joint holder name", 1, 2, "text", "joint holder name")
+        ],
+        "rules": [
+            {
+                "text": "Name the joint holder once the account type is given",
+                "page": 1,
+                "depends_on": [{"field": "account type"}],
+                "enables": [{"item": "Joint holder name"}]
+            },
+            {
+                "text": JOINT_RULE,
+                "page": 1,
+                "depends_on": [{"field": "joint holder name"}],
+                "enables": [{"item": "Account type"}]
+            }
+        ]
+    })
+}
+
+/// A form whose field "amount" means something other than A's "amount", with a
+/// rule that takes it as a premise.
+fn form_e() -> Value {
+    json!({
+        "form_id": CERT,
+        "revision": "2026-05",
+        "title": "Share certificate request",
+        "source": {"url": "https://forms.example/cert-1.pdf", "sha256": "5".repeat(64)},
+        "fields": [
+            {"name": "amount", "definition": "Number of shares on the certificate.", "value_type": "amount"},
+            {
+                "name": "share class",
+                "definition": "Class of the shares.",
+                "value_type": "choice",
+                "exclusive": true,
+                "values": [
+                    {"name": "common", "definition": "Common shares."},
+                    {"name": "preferred", "definition": "Preferred shares."}
+                ]
+            },
+            {"name": "certificate number", "definition": "Number printed on the certificate.", "value_type": "identifier"}
+        ],
+        "items": [
+            item("Number of shares", 1, 1, "text", "amount"),
+            item("Share class", 1, 2, "choice", "share class"),
+            item("Certificate number", 1, 3, "text", "certificate number")
+        ],
+        "rules": [
+            {
+                "text": CERT_RULE,
+                "page": 1,
+                "depends_on": [{"field": "amount"}, {"field": "share class", "value": "common"}],
+                "enables": [{"item": "Certificate number"}]
+            }
+        ]
+    })
+}
+
+fn kinds(reply: &Value) -> Vec<String> {
+    texts(&reply["findings"], "kind")
+}
+
+fn node_of<'a>(export: &'a Value, node_type: &str, name: &str) -> &'a Value {
+    export["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .find(|n| n["type"] == node_type && n["name"] == name)
+        .unwrap_or_else(|| panic!("no {node_type} named {name}: {export}"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_choice_answer_outside_its_values_answers_nothing() {
+    let store = Store::new();
+    store
+        .call("forms.load", json!({"document": form_d()}))
+        .await;
+
+    let outside = store
+        .call(
+            "forms.check",
+            json!({"forms": [ACCT], "answers": {"account type": "corporate"}}),
+        )
+        .await;
+    assert_eq!(
+        kinds(&outside),
+        ["value_outside_domain"],
+        "an answer outside the values holds no premise: {outside}"
+    );
+
+    let required = store
+        .call(
+            "forms.check",
+            json!({"forms": [ACCT], "answers": {"account type": "corporate", "joint holder name": "Pat Doe"}}),
+        )
+        .await;
+    let mut found = kinds(&required);
+    found.sort();
+    assert_eq!(
+        found,
+        ["rule_unmet", "value_outside_domain"],
+        "an answer outside the values fills no required item: {required}"
+    );
+    let unmet = required["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .find(|f| f["kind"] == "rule_unmet")
+        .expect("rule_unmet");
+    assert_eq!(unmet["rule"], JOINT_RULE, "{required}");
+    assert_eq!(unmet["unmet"][0]["name"], "Account type", "{required}");
+
+    let within = store
+        .call(
+            "forms.check",
+            json!({"forms": [ACCT], "answers": {"account type": "joint", "joint holder name": "Pat Doe"}}),
+        )
+        .await;
+    assert_eq!(within["findings"], json!([]), "{within}");
+    assert_eq!(within["consistent"], true, "{within}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_that_names_no_field_leaves_the_set_unconfirmed() {
+    let scenario = Scenario::loaded().await;
+    let store = &scenario.store;
+    let reply = store
+        .call(
+            "forms.check",
+            json!({"forms": [B], "answers": {"no such field": "x"}}),
+        )
+        .await;
+    assert_eq!(reply["findings"], json!([]), "{reply}");
+    assert_eq!(
+        reply["unresolved_answers"]
+            .as_array()
+            .expect("unresolved_answers")
+            .len(),
+        1,
+        "{reply}"
+    );
+    assert_eq!(
+        reply["consistent"], false,
+        "an answer that was never checked confirms nothing: {reply}"
+    );
+
+    let checked = store
+        .call(
+            "forms.check",
+            json!({"forms": [B], "answers": {"transfer": "all assets"}}),
+        )
+        .await;
+    assert_eq!(checked["consistent"], true, "{checked}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rule_on_an_undecided_field_is_not_checked_until_the_field_is_decided() {
+    let store = Store::new();
+    store
+        .call("forms.load", json!({"document": form_a()}))
+        .await;
+    let loaded = store
+        .call("forms.load", json!({"document": form_e()}))
+        .await;
+    let shares = loaded["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|i| i["label"] == "Number of shares")
+        .expect("the item asking for amount");
+    assert_eq!(
+        shares["field"],
+        Value::Null,
+        "amount names another meaning: {loaded}"
+    );
+
+    let common = json!({"forms": [CERT], "answers": {"share class": "common"}});
+    let waiting = store.call("forms.check", common.clone()).await;
+    assert_eq!(
+        waiting["findings"],
+        json!([]),
+        "the rule's other premise alone is not the rule: {waiting}"
+    );
+    let unchecked = waiting["rules_unchecked"]
+        .as_array()
+        .expect("rules_unchecked");
+    assert_eq!(unchecked.len(), 1, "{waiting}");
+    assert_eq!(unchecked[0]["rule"], CERT_RULE, "{waiting}");
+    assert_eq!(unchecked[0]["pending"], json!(["amount"]), "{waiting}");
+    assert_eq!(waiting["consistent"], false, "{waiting}");
+
+    let exported = store.call("forms.export", json!({})).await;
+    let replayed = Store::new();
+    replayed
+        .call("forms.replay", json!({"document": exported}))
+        .await;
+    let after_replay = replayed.call("forms.check", common.clone()).await;
+    let replayed_unchecked = after_replay["rules_unchecked"]
+        .as_array()
+        .expect("rules_unchecked");
+    assert_eq!(
+        replayed_unchecked.len(),
+        1,
+        "the mark survives export and replay: {after_replay}"
+    );
+    assert_eq!(replayed_unchecked[0]["rule"], CERT_RULE, "{after_replay}");
+    assert_eq!(
+        replayed_unchecked[0]["pending"],
+        json!(["amount"]),
+        "{after_replay}"
+    );
+
+    let decided = store
+        .call(
+            "forms.same",
+            json!({
+                "item": shares["id"],
+                "new_field": {"name": "share count", "definition": "Number of shares on the certificate.", "value_type": "amount"}
+            }),
+        )
+        .await;
+    assert_eq!(decided["rules_settled"], json!([CERT_RULE]), "{decided}");
+
+    let settled = store.call("forms.check", common).await;
+    assert_eq!(settled["findings"], json!([]), "{settled}");
+    assert_eq!(settled["rules_unchecked"], json!([]), "{settled}");
+    assert_eq!(settled["consistent"], true, "{settled}");
+
+    let holds = store
+        .call(
+            "forms.check",
+            json!({"forms": [CERT], "answers": {"share class": "common", "share count": "10"}}),
+        )
+        .await;
+    assert_eq!(kinds(&holds), ["rule_unmet"], "{holds}");
+    assert_eq!(holds["findings"][0]["rule"], CERT_RULE, "{holds}");
+    assert_eq!(
+        holds["findings"][0]["unmet"][0]["name"], "Certificate number",
+        "{holds}"
+    );
+
+    let export = store.call("forms.export", json!({})).await;
+    let rule = node_of(&export, "form_rule", CERT_RULE);
+    assert!(
+        rule["properties"].get("premises_pending").is_none(),
+        "{rule}"
+    );
+    let item = node_of(&export, "form_item", "Number of shares");
+    assert!(item["properties"].get("field_pending").is_none(), "{item}");
+}
+
+fn branch_document(values: usize, exclusive: bool) -> Value {
+    let values: Vec<Value> = (1..=values)
+        .map(
+            |n| json!({"name": format!("branch {n}"), "definition": format!("Branch number {n}.")}),
+        )
+        .collect();
+    json!({
+        "form_id": if exclusive { "HOME-1" } else { "VISIT-1" },
+        "revision": format!("2026-{:02}", values.len()),
+        "title": "Branch choice",
+        "source": {"url": "https://forms.example/branch.pdf", "sha256": "6".repeat(64)},
+        "fields": [{
+            "name": if exclusive { "home branch" } else { "visited branches" },
+            "definition": "The branch the account is held at.",
+            "value_type": "choice",
+            "exclusive": exclusive,
+            "values": values
+        }],
+        "items": [item("Branch", 1, 1, "choice", if exclusive { "home branch" } else { "visited branches" })]
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exclusive_field_with_more_values_than_the_cap_is_refused() {
+    let store = Store::new();
+    let message = store
+        .refused("forms.load", json!({"document": branch_document(49, true)}))
+        .await;
+    assert!(message.contains("at most 48"), "{message}");
+    assert!(message.contains("home branch"), "{message}");
+
+    let at_cap = store
+        .call("forms.load", json!({"document": branch_document(48, true)}))
+        .await;
+    assert_eq!(at_cap["loaded"], true, "{at_cap}");
+    let open = store
+        .call(
+            "forms.load",
+            json!({"document": branch_document(49, false)}),
+        )
+        .await;
+    assert_eq!(
+        open["loaded"], true,
+        "the cap binds exclusive fields only: {open}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reused_exclusive_field_links_its_new_values_to_the_old() {
+    let store = Store::new();
+    store
+        .call("forms.load", json!({"document": form_a()}))
+        .await;
+    let recall = json!({
+        "form_id": "WIRE-3",
+        "revision": "2026-06",
+        "title": "Wire recall",
+        "source": {"url": "https://forms.example/wire-3.pdf", "sha256": "7".repeat(64)},
+        "fields": [{
+            "name": "fee paid by",
+            "definition": "Who pays the transfer fees.",
+            "value_type": "choice",
+            "exclusive": true,
+            "values": [
+                {"name": "sender", "definition": "The sender pays every fee."},
+                {"name": "waived", "definition": "No fee is charged."},
+                {"name": "split evenly", "definition": "Each side pays half of every fee."}
+            ]
+        }],
+        "items": [item("Fee paid by", 1, 1, "choice", "fee paid by")]
+    });
+    let loaded = store.call("forms.load", json!({"document": recall})).await;
+    assert_eq!(loaded["counts"]["fields_reused"], 1, "{loaded}");
+    assert_eq!(loaded["counts"]["values"], 2, "{loaded}");
+
+    for pair in [
+        ["sender", "waived"],
+        ["waived", "split evenly"],
+        ["shared", "split evenly"],
+    ] {
+        let reply = store
+            .call(
+                "forms.check",
+                json!({"forms": ["WIRE-3"], "answers": {"fee paid by": pair}}),
+            )
+            .await;
+        assert_eq!(kinds(&reply), ["exclusive_values"], "{pair:?}: {reply}");
+    }
+}
