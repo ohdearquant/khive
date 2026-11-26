@@ -39,6 +39,7 @@ fn declarations() -> Vec<Declared> {
         declared::<khive_pack_code::CodePack>(),
         declared::<khive_pack_comm::CommPack>(),
         declared::<khive_pack_exec::ExecPack>(),
+        declared::<khive_pack_forms::FormsPack>(),
         declared::<khive_pack_git::GitPack>(),
         declared::<khive_pack_gtd::GtdPack>(),
         declared::<khive_pack_kg::KgPack>(),
@@ -414,6 +415,7 @@ fn every_repository_pack_schema_stays_auxiliary() {
     let mut expected: BTreeSet<String> = RuntimeConfig::built_in_packs().into_iter().collect();
     expected.insert("template".into());
     expected.insert("charter".into());
+    expected.insert("forms".into());
     for (name, enabled) in [
         ("agent", cfg!(feature = "pack-agent")),
         ("telemetry", cfg!(feature = "pack-telemetry")),
@@ -425,7 +427,7 @@ fn every_repository_pack_schema_stays_auxiliary() {
             expected.insert(name.into());
         }
     }
-    let expected_count = 16
+    let expected_count = 17
         + [
             cfg!(feature = "pack-agent"),
             cfg!(feature = "pack-telemetry"),

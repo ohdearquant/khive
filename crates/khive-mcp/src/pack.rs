@@ -26,6 +26,8 @@ pub use khive_pack_comm::CommPack as _CommPack;
 #[doc(hidden)]
 pub use khive_pack_exec::ExecPack as _ExecPack;
 #[doc(hidden)]
+pub use khive_pack_forms::FormsPack as _FormsPack;
+#[doc(hidden)]
 pub use khive_pack_git::GitPack as _GitPack;
 #[doc(hidden)]
 pub use khive_pack_gtd::GtdPack as _GtdPack;

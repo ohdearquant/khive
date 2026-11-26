@@ -117,6 +117,12 @@ Revision `domain-effects-v32` classifies `git.branch_delete` as `Write`: it dele
 one local branch by compare-and-delete and writes a durable receipt, so it is
 admitted as a write like `git.update_ref`. Its two platform reads change nothing.
 
+Revision `domain-effects-v33` classifies the ten verbs of the forms pack.
+`forms.load`, `forms.add_item`, `forms.same`, `forms.split` and `forms.replay`
+are `Write`: each commits graph records in one transaction. `forms.resolve`,
+`forms.neighbourhood`, `forms.check`, `forms.lint` and `forms.export` are
+`Read`: they read the graph and write nothing.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -208,6 +214,16 @@ admitted as a write like `git.update_ref`. Its two platform reads change nothing
 | `exec.tree_diff`                  | Read   | Verb       | [khive-pack-exec/src/vocab.rs](../../../khive-pack-exec/src/vocab.rs#L84)                               |
 | `exec.tree_get`                   | Read   | Verb       | [khive-pack-exec/src/vocab.rs](../../../khive-pack-exec/src/vocab.rs#L66)                               |
 | `exec.tree_put`                   | Write  | Verb       | [khive-pack-exec/src/vocab.rs](../../../khive-pack-exec/src/vocab.rs#L73)                               |
+| `forms.add_item`                  | Write  | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L51)                               |
+| `forms.check`                     | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L109)                              |
+| `forms.export`                    | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L126)                              |
+| `forms.lint`                      | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L119)                              |
+| `forms.load`                      | Write  | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L44)                               |
+| `forms.neighbourhood`             | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L99)                               |
+| `forms.replay`                    | Write  | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L133)                              |
+| `forms.resolve`                   | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L89)                               |
+| `forms.same`                      | Write  | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L63)                               |
+| `forms.split`                     | Write  | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L74)                               |
 | `get`                             | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L203)                    |
 | `git.branch`                      | Write  | Verb       | [khive-pack-git/src/vocab.rs](../../../khive-pack-git/src/vocab.rs#L200)                                |
 | `git.branch_delete`               | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs)                         |

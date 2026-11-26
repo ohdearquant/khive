@@ -2282,6 +2282,7 @@ dependencies = [
  "khive-pack-code",
  "khive-pack-comm",
  "khive-pack-exec",
+ "khive-pack-forms",
  "khive-pack-git",
  "khive-pack-gtd",
  "khive-pack-kg",
@@ -2514,6 +2515,23 @@ dependencies = [
  "khive-types",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "khive-pack-forms"
+version = "0.22.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "inventory",
+ "khive-changeset",
+ "khive-pack-kg",
+ "khive-runtime",
+ "khive-storage",
+ "khive-types",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -3194,6 +3212,7 @@ dependencies = [
  "khive-pack-comm",
  "khive-pack-exec",
  "khive-pack-formal",
+ "khive-pack-forms",
  "khive-pack-git",
  "khive-pack-gtd",
  "khive-pack-kg",

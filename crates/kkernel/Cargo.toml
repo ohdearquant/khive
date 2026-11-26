@@ -47,6 +47,7 @@ khive-pack-blob = { version = "0.22.0", path = "../khive-pack-blob" }
 khive-pack-moodboard = { version = "0.22.0", path = "../khive-pack-moodboard", optional = true }
 khive-pack-workspace = { version = "0.22.0", path = "../khive-pack-workspace" }
 khive-pack-charter = { version = "0.22.0", path = "../khive-pack-charter" }
+khive-pack-forms = { version = "0.22.0", path = "../khive-pack-forms" }
 khive-request = { version = "0.22.0", path = "../khive-request" }
 khive-changeset = { version = "0.22.0", path = "../khive-changeset" }
 # Without `repo-showcase` only the hardened Git helpers are linked (`kg diff` uses them).

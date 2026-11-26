@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The `forms` pack (`khive-pack-forms`) stores printed forms as a typed graph: the issuer, each
+  form revision, its sections and items, the field each item means, the allowed values of a choice
+  field and the rules printed on the form. One field stands for one meaning however many forms print
+  it and however they word it. Ten verbs: `forms.load`, `forms.add_item`, `forms.same`,
+  `forms.split` and `forms.replay` write, each in one transaction that writes nothing when refused;
+  `forms.resolve`, `forms.neighbourhood`, `forms.check`, `forms.lint` and `forms.export` read. An
+  export replayed into an empty namespace exports identically. The pack is selected by name beside
+  `kg` and is not in the default pack set (#6858).
+
+### Changed
+
+- A link refused because its endpoints do not fit the relation now lists every endpoint pair the
+  relation admits, from the base allowlist and from the loaded packs' rules, in the runtime's
+  refusal and in the kg `link` verb's message (#6858).
+
 ## [0.22.0] - 2026-11-23
 
 ### Added
