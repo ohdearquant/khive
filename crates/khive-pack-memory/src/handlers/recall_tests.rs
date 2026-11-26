@@ -7828,6 +7828,95 @@ async fn recall_persists_recall_executed_event_with_full_payload() {
         candidates, &selected,
         "candidates mirrors selected at this emission boundary"
     );
+    assert!(
+        event.payload.get("label").is_none(),
+        "a recall without label stores none: {:?}",
+        event.payload
+    );
+}
+
+/// #6802 K54: a caller's `label` rides the recall_executed payload so
+/// brain.event_counts can count recalls by call site; malformed labels are
+/// refused before any read.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_label_is_kept_on_the_recall_executed_event() {
+    const NOTE_TEXT: &str = "call site label coverage note for recall events";
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+    rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+        .await
+        .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    let registry = builder.build().expect("registry");
+
+    for bad in ["", " hook", "hook ", "ho\nok"] {
+        let error = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({"query": NOTE_TEXT, "label": bad}),
+            )
+            .await
+            .expect_err("a malformed label is refused");
+        assert!(error.to_string().contains("label"), "{bad:?}: {error}");
+    }
+    let too_long = "l".repeat(129);
+    let error = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({"query": NOTE_TEXT, "label": too_long}),
+        )
+        .await
+        .expect_err("a label over 128 characters is refused");
+    assert!(error.to_string().contains("128"), "{error}");
+
+    let before = khive_runtime::background_task_count();
+    for label in ["session hook", "session hook", "wake"] {
+        registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({"query": NOTE_TEXT, "limit": 5, "label": label}),
+            )
+            .await
+            .expect("labelled recall succeeds");
+    }
+    for _ in 0..200 {
+        if khive_runtime::background_task_count() <= before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let page = rt
+        .events(&token)
+        .expect("event store")
+        .query_events(
+            khive_storage::event::EventFilter {
+                kinds: vec![khive_types::EventKind::RecallExecuted],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query_events");
+    let mut labels: Vec<&str> = page
+        .items
+        .iter()
+        .map(|event| event.payload["label"].as_str().expect("label stored"))
+        .collect();
+    labels.sort_unstable();
+    assert_eq!(labels, ["session hook", "session hook", "wake"]);
 }
 
 /// created_after/created_before: half-open [after, before) window over

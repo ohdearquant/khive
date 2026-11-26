@@ -47,6 +47,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tool.list` accepts `after` and returns `next_after` for stable paging; offset paging is
   unchanged (#6859).
 - `tool.policies` accepts `policy_id` (#6859).
+- `tool.list` accepts `source` (exact) or `source_prefix` (case-sensitive prefix) to keep only
+  registrations from that source, and `include_decision=true` with an optional `actor` to return
+  each row's `decision` as `tool.describe` reports it (#6869).
+- `memory.recall` accepts `prefer_tags`: memories carrying any of those tags rank first and the
+  others fill the remaining places (#6867).
+- `memory.recall` accepts `label`, a caller tag kept on the recall's `recall_executed` event, and
+  `brain.event_counts` counts those recalls by label in `counts_by_label` (#6866).
+- `propose` accepts two edge changesets: `retire_edge` (`source`, `target`, `relation`)
+  soft-deletes the live edge with that key when the proposal is applied, and `supersede_edge`
+  (`old`, `new`) retires the old edge and adds the new one in the same apply (#6868).
 
 ### Changed
 
@@ -61,6 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `apply_changeset` help shows an envelope line and an operation line, the `neighbors` help
   lists the fields each projection carries, and the `kkernel exec --ops-file` help says the stdout
   summary holds no per-op results (#6864).
+- An unknown `entity_type` refusal ends with a hint: entity types come from the loaded packs and
+  cannot be declared per store yet, so a domain-specific type goes in properties or tags (#6871).
+- `tool.unregister` says the name is retired for good: its help states that the name cannot be
+  registered again in the namespace, and both of its answers carry `name_retired: true` (#6871).
 
 ### Fixed
 
@@ -70,6 +84,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run (#6846).
 - `tool.check` screens an `mcp__plugin_<name>_<name>__<callable>` id by component, ending false
   credential refusals (#6859).
+- `context` lists a neighbor that several anchors reach under each of those anchors; before, only
+  the first anchor to reach it listed it (#6865).
 
 ### Breaking (Rust crates)
 
@@ -80,6 +96,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them (#6847, #6852, #6855).
 - `khive_runtime::ConfigError` gains the variant `InvalidShareConfig`; an exhaustive `match` needs
   an arm for it (#6852).
+- `khive_types::ProposalChangeset` gains the variants `RetireEdge` and `SupersedeEdge`; an
+  exhaustive `match` needs arms for them (#6868).
+- `khive_storage::EntityFilter` gains the public field `property_prefixes`; a struct literal must
+  set it (#6869).
 
 ## [0.22.0] - 2026-11-23
 

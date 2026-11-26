@@ -232,6 +232,10 @@ KHIVE_DB=/path/to/my.db kkernel mcp        # same, via env
 kkernel mcp --db :memory:                  # ephemeral in-memory storage
 ```
 
+For a throwaway database, `KHIVE_NO_DAEMON=1 kkernel exec --db /path/to/scratch.db '...'`
+dispatches in-process against that file. Without `KHIVE_NO_DAEMON=1`, `kkernel exec` forwards the
+path to a warm daemon it spawns for that file (see the next section).
+
 ### `[[backends]]` declared
 
 Once one or more `[[backends]]` entries exist in the resolved config, the

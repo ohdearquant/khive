@@ -1729,6 +1729,12 @@ Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
 | `tags`              | array   | no       | Filter by `properties.tags`.                                            |
 | `tag_mode`          | string  | no       | `any` (default, OR) or `all` (AND).                                     |
 | `namespace`         | string  | no       | Exact-match read scope; absent uses the caller's visible namespace set. |
+| `label`             | string  | no       | Caller tag stored on the `RecallExecuted` event; see below.             |
+
+`label` names the purpose of a recall (for example `hook` or `wake`) so a caller can
+count its recalls by purpose with `brain.event_counts`. It does not change ranking or
+results. It must be 1 to 128 characters with no control characters and no leading or
+trailing whitespace; anything else is refused before the recall runs.
 
 Each result carries `namespace` (where the memory is stored), `tags` (`[]` when none) and
 `properties` (the stored object, including `memory_type` and `tags`; `{}` when none).
@@ -1927,6 +1933,11 @@ only `counts_by_verb_and_actor_page_scoped` is emitted; the complete-looking
 cross key is absent. Existing marginal field names are unchanged. Limits count
 event rows, not distinct group cells, so a denser cross cannot trigger a separate
 cap. An occupied-cell count cannot exceed the number of events aggregated.
+
+`counts_by_label: {<label>: <count>}` counts `RecallExecuted` events by the `label`
+the recall was called with. Events of other kinds and recalls without a label are
+not counted there, and the key is absent when no matching event carries a label.
+When `truncated=true` it is emitted as `counts_by_label_page_scoped` instead.
 
 For a dispatch-audit census, request `kind="audit"` with the cross. That filter
 is applied before the existing event cap; the special unfiltered audit/non-audit
