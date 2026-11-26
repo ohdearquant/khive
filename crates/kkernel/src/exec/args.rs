@@ -151,9 +151,10 @@ pub struct ExecArgs {
     /// The source is capped at 512 MiB total and 96 MiB per physical line, then
     /// spooled to a validated temporary snapshot before writes. Dispatch chunks
     /// are capped at 100 ops and 32 MiB (one larger op runs alone). Progress is
-    /// printed per chunk to stderr; the final aggregate summary is printed to
-    /// stdout, or `--save-file` incrementally writes ordered JSONL rows to a
-    /// sibling temp file. Success atomically publishes the complete file and
+    /// printed per chunk to stderr; the final aggregate summary (counts and any
+    /// failures, with no per-op results and so no created ids) is printed to
+    /// stdout. To keep every op's result, ids included, pass `--save-file`: it
+    /// incrementally writes ordered JSONL rows to a sibling temp file. Success atomically publishes the complete file and
     /// prints its ordinary manifest. A later failure leaves database effects
     /// incremental, discards the incomplete temp file, and prints an aborted
     /// reconciliation manifest before returning non-zero.

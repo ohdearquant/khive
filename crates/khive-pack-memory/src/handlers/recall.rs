@@ -379,6 +379,8 @@ impl MemoryPack {
             }
         }
 
+        let label = super::common::validate_recall_label(p.label.as_deref())?;
+
         let prof = super::common::recall_profile_enabled(&self.runtime);
         let call_id = PROF_CID.try_with(|id| *id).unwrap_or(0);
         let mut t_stage = if prof { Some(Instant::now()) } else { None };
@@ -776,6 +778,7 @@ impl MemoryPack {
                     latency_us: recall_start.elapsed().as_micros() as i64,
                     ann_degraded,
                     ann_degraded_reason: ann_degraded_reason.clone(),
+                    label: label.as_deref(),
                 },
             );
             if let Ok(mut state) = self.recall_state.lock() {
@@ -1381,6 +1384,7 @@ impl MemoryPack {
                 latency_us: recall_start.elapsed().as_micros() as i64,
                 ann_degraded,
                 ann_degraded_reason: ann_degraded_reason.clone(),
+                label: label.as_deref(),
             },
         );
 
@@ -1543,7 +1547,9 @@ impl MemoryPack {
             latency_us,
             ann_degraded,
             ann_degraded_reason,
+            label,
         } = fields;
+        let label = label.map(str::to_string);
         let registry = registry.clone();
         let namespace = token.namespace().as_str().to_string();
         let query_raw = query_raw.to_string();
@@ -1599,6 +1605,7 @@ impl MemoryPack {
                     latency_us,
                     ann_degraded,
                     ann_degraded_reason,
+                    label,
                 },
             )
             .await;
@@ -1621,6 +1628,8 @@ struct RecallServeFields<'a> {
     /// Reason captured at the failure site, `None` when the recall was not
     /// degraded.
     ann_degraded_reason: Option<String>,
+    /// The caller's validated `label`, when one was supplied.
+    label: Option<&'a str>,
 }
 
 /// Fields for the best-effort `RecallExecuted` telemetry event. Grouped into a
@@ -1636,6 +1645,7 @@ struct RecallExecutedFields {
     latency_us: i64,
     ann_degraded: bool,
     ann_degraded_reason: Option<String>,
+    label: Option<String>,
 }
 
 /// Append best-effort recall telemetry without affecting the recall response.
@@ -1663,6 +1673,7 @@ async fn emit_recall_executed_event(
         latency_us,
         ann_degraded,
         ann_degraded_reason,
+        label,
     } = fields;
     let batch = registry.audit_batch_handle();
     // Only the legacy no-batch route obtains a token-decorated runtime store.
@@ -1706,6 +1717,11 @@ async fn emit_recall_executed_event(
         payload["degraded_reason"] =
             json!(ann_degraded_reason
                 .unwrap_or_else(|| super::common::ANN_DEGRADED_REASON.to_string()));
+    }
+    // The caller's call-site label: `brain.event_counts` counts recall_executed
+    // rows by it in counts_by_label. Absent when the caller gave none.
+    if let Some(label) = label {
+        payload["label"] = json!(label);
     }
     let event = khive_storage::Event::new(
         token.namespace().as_str(),
