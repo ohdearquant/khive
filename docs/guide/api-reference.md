@@ -1728,6 +1728,7 @@ Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
 | `full_content`      | bool    | no       | Default true; false truncates content to 200 chars.                     |
 | `tags`              | array   | no       | Filter by `properties.tags`.                                            |
 | `tag_mode`          | string  | no       | `any` (default, OR) or `all` (AND).                                     |
+| `prefer_tags`       | array   | no       | Memories with any of these tags rank first; others fill the rest.       |
 | `namespace`         | string  | no       | Exact-match read scope; absent uses the caller's visible namespace set. |
 | `label`             | string  | no       | Caller tag stored on the `RecallExecuted` event; see below.             |
 

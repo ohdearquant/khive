@@ -373,6 +373,13 @@ static MEMORY_HANDLERS: [HandlerDef; 11] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "prefer_tags",
+                param_type: "array",
+                required: false,
+                description: "Rank memories whose stored tags include any of these values ahead of the rest. Unlike tags, nothing is dropped: other matches fill the remaining slots, and each group keeps its score order.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "include_source_id",
                 param_type: "boolean",
                 required: false,
