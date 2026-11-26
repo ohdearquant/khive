@@ -544,6 +544,39 @@ pub(super) struct RecallParams {
     /// `brain.event_counts` since/until convention.
     #[serde(default)]
     pub(super) created_before: Option<String>,
+    /// Caller-chosen call-site label, kept on this recall's `recall_executed`
+    /// event so `brain.event_counts` can count recalls by it.
+    #[serde(default)]
+    pub(super) label: Option<String>,
+}
+
+/// Longest `memory.recall` label accepted, in Unicode scalar values.
+pub(super) const MAX_RECALL_LABEL_CHARS: usize = 128;
+
+/// Check a caller-supplied recall label: non-empty, at most
+/// [`MAX_RECALL_LABEL_CHARS`] characters, no control characters and no
+/// leading or trailing whitespace, so a count keyed by it is exact.
+pub(super) fn validate_recall_label(label: Option<&str>) -> Result<Option<String>, RuntimeError> {
+    let Some(label) = label else {
+        return Ok(None);
+    };
+    if label.is_empty() || label.trim() != label {
+        return Err(RuntimeError::InvalidInput(
+            "memory.recall: label must be non-empty with no leading or trailing whitespace"
+                .to_string(),
+        ));
+    }
+    if label.chars().count() > MAX_RECALL_LABEL_CHARS {
+        return Err(RuntimeError::InvalidInput(format!(
+            "memory.recall: label is longer than {MAX_RECALL_LABEL_CHARS} characters"
+        )));
+    }
+    if label.chars().any(char::is_control) {
+        return Err(RuntimeError::InvalidInput(
+            "memory.recall: label must not contain control characters".to_string(),
+        ));
+    }
+    Ok(Some(label.to_string()))
 }
 
 fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>

@@ -88,6 +88,7 @@ pub struct EventCountsAccumulator {
     by_profile_and_signal:
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
     counts_by_work_class: std::collections::BTreeMap<String, u64>,
+    counts_by_label: BTreeMap<String, u64>,
     total_cost_unit: i64,
     cost_unit_by_verb: std::collections::BTreeMap<String, i64>,
     sampled_success_rows: BTreeMap<String, SampledSuccessRows>,
@@ -164,6 +165,13 @@ impl EventCountsAccumulator {
                 .entry(work_class.to_string())
                 .or_insert(0) += 1;
         }
+        // A memory.recall call-site label rides its recall_executed payload.
+        // Other kinds are not read here, whatever their payload holds.
+        if event.kind == EventKind::RecallExecuted {
+            if let Some(label) = event.payload.get("label").and_then(Value::as_str) {
+                *self.counts_by_label.entry(label.to_owned()).or_default() += 1;
+            }
+        }
         if let Some(cost_unit) = event_cost_unit(&event.payload) {
             self.total_cost_unit = self.total_cost_unit.saturating_add(cost_unit);
             let entry = self
@@ -226,11 +234,72 @@ impl EventCountsAccumulator {
         if !self.counts_by_work_class.is_empty() {
             result["counts_by_work_class"] = json!(self.counts_by_work_class);
         }
+        if !self.counts_by_label.is_empty() {
+            result[truncatable_total_key("counts_by_label", truncated)] =
+                json!(self.counts_by_label);
+        }
         if !self.cost_unit_by_verb.is_empty() {
             result[truncatable_total_key("total_cost_unit", truncated)] =
                 json!(self.total_cost_unit);
             result["cost_unit_by_verb"] = json!(self.cost_unit_by_verb);
         }
+    }
+}
+
+#[cfg(test)]
+mod label_count_tests {
+    use super::EventCountsAccumulator;
+    use khive_storage::Event;
+    use khive_types::{EventKind, SubstrateKind};
+    use serde_json::{json, Value};
+
+    fn event(kind: EventKind, verb: &str, label: Option<&str>) -> Event {
+        let mut payload = json!({"query": "q"});
+        if let Some(label) = label {
+            payload["label"] = json!(label);
+        }
+        Event::new("local", verb, kind, SubstrateKind::Event, "actor:a").with_payload(payload)
+    }
+
+    fn counted(events: &[Event], truncated: bool) -> Value {
+        let mut counts = EventCountsAccumulator::new(None, None);
+        for event in events {
+            counts.observe(event);
+        }
+        let mut result = json!({});
+        counts.add_to_result(&mut result, truncated);
+        result
+    }
+
+    #[test]
+    fn recall_executed_rows_count_by_label_and_other_kinds_do_not() {
+        let recall = |label| event(EventKind::RecallExecuted, "memory.recall", label);
+        let events = [
+            recall(Some("hook")),
+            recall(Some("hook")),
+            recall(Some("wake")),
+            recall(None),
+            event(EventKind::Audit, "comm.send", Some("hook")),
+        ];
+        let result = counted(&events, false);
+        assert_eq!(result["counts_by_label"], json!({"hook": 2, "wake": 1}));
+        assert!(result.get("counts_by_label_page_scoped").is_none());
+
+        let truncated = counted(&events, true);
+        assert!(truncated.get("counts_by_label").is_none(), "{truncated}");
+        assert_eq!(
+            truncated["counts_by_label_page_scoped"],
+            json!({"hook": 2, "wake": 1})
+        );
+    }
+
+    #[test]
+    fn counts_by_label_is_absent_when_no_row_carries_one() {
+        let result = counted(
+            &[event(EventKind::RecallExecuted, "memory.recall", None)],
+            false,
+        );
+        assert!(result.get("counts_by_label").is_none(), "{result}");
     }
 }
 
