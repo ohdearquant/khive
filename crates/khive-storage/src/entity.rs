@@ -135,6 +135,9 @@ pub struct EntityFilter {
     /// ANDed SQL JSON equalities; see [`EntityFilter::property_eq`].
     #[serde(default)]
     pub property_equalities: Vec<(String, SqlValue)>,
+    /// ANDed JSON text-prefix matches; see [`EntityFilter::property_prefix`].
+    #[serde(default)]
+    pub property_prefixes: Vec<(String, String)>,
     /// Live-only by default. Liveness builders replace this selection.
     #[serde(default)]
     pub tombstones: EntityTombstones,
@@ -189,6 +192,17 @@ impl EntityFilter {
     /// and arrays compare their serialized SQL text, not structural JSON equality.
     pub fn property_eq(mut self, path: impl Into<String>, value: SqlValue) -> Self {
         self.property_equalities.push((path.into(), value));
+        self
+    }
+
+    /// Require the JSON text at `path` in `properties` to start with `prefix`.
+    ///
+    /// Paths follow the rule of [`EntityFilter::property_eq`]. The comparison
+    /// is case-sensitive and counts characters; a missing field, a value that
+    /// is not JSON text, or properties that are not valid JSON never match.
+    /// Calls are ANDed.
+    pub fn property_prefix(mut self, path: impl Into<String>, prefix: impl Into<String>) -> Self {
+        self.property_prefixes.push((path.into(), prefix.into()));
         self
     }
 

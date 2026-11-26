@@ -3827,7 +3827,10 @@ caller's `decision`.
 ### `tool.describe` / `tool.list` — Assertive
 
 `tool.describe(tool, actor)` returns the full object with `schema`, `capabilities` and `decision`;
-`tool.list(kind, limit=100, offset=0)` pages the registry.
+`tool.list(kind, limit=100, offset=0)` pages the registry. `source` keeps rows whose source equals the value
+and `source_prefix` rows whose source starts with it (case-sensitive, for example `mcp:`); the two do not
+combine. With `include_decision=true` each row carries `decision` for `actor` (default the caller), as
+`tool.describe` reports it, and the response names the `actor`.
 
 ### `tool.check` — Assertive
 
