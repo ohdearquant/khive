@@ -64,6 +64,46 @@ fn canonical_delta_requires_exact_envelope_and_supported_outer_version() {
     assert!(decode_delta(&(text + "{}\n"), None).is_err());
 }
 
+/// The first `{...}` object that follows `marker` in `text`.
+fn object_after<'a>(text: &'a str, marker: &str) -> &'a str {
+    let start = text.find(marker).expect("marker present") + marker.len();
+    let rest = &text[start..];
+    let open = rest.find('{').expect("object opens");
+    let mut depth = 0usize;
+    for (offset, ch) in rest[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &rest[open..open + offset + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("object after {marker:?} never closes");
+}
+
+#[test]
+fn apply_changeset_help_examples_form_a_valid_delta() {
+    let help = crate::handler_defs::KG_HANDLERS
+        .iter()
+        .find(|handler| handler.name == "apply_changeset")
+        .and_then(|handler| handler.params.iter().find(|param| param.name == "delta"))
+        .expect("apply_changeset delta param")
+        .description;
+    let envelope = object_after(help, "Line 1 is the envelope, for example ");
+    let op = object_after(help, "Each later line is one operation, for example ");
+    let decoded = decode_delta(
+        &format!("{envelope}\n{op}\n"),
+        Some(khive_changeset::CURRENT_SCHEMA_VERSION),
+    )
+    .expect("the documented example decodes");
+    assert_eq!(decoded.ops.len(), 1);
+    assert!(matches!(decoded.ops[0], Op::Create(_)));
+}
+
 #[test]
 fn canonical_bound_and_budget_count_the_whole_change_set() {
     let max = khive_types::pack::ATOMIC_MAX_OPS_DEFAULT;

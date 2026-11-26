@@ -166,7 +166,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
-            ParamDef { name: "delta", param_type: "string", required: true, description: "Complete original NDJSON-delta text including its supported schema envelope, at most 2000 operations in source order.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "delta", param_type: "string", required: true, description: "Complete original NDJSON-delta text, at most 2000 operations in source order, one JSON object per line and no blank line. Line 1 is the envelope, for example {\"schema_version\":2,\"producer\":\"agent:x\",\"producer_model_family\":\"family:x\",\"staged_at\":1700000000000000} (staged_at in microseconds since the Unix epoch, an optional batch_id, no other key). Each later line is one operation, for example {\"op\":\"create\",\"id\":\"11111111-1111-4111-8111-111111111111\",\"namespace\":\"local\",\"target\":{\"kind\":\"entity\",\"entity_kind\":\"concept\",\"name\":\"X\"}}.", resolution_mode: IdResolutionMode::NotApplicable },
         ],
     },
     HandlerDef {
@@ -370,7 +370,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                               `kind` (required), `name` (required), and optional \
                               `entity_kind`, `entity_type`, `description`, `properties`, \
                               `tags`. When present, the top-level `kind` is NOT required. \
-                              Capped at 1000 entries per request. Bulk-created entities \
+                              Capped at 1000 entries per request. Each successful \
+                              `results[i].result` carries `id` and `full_id`; agent \
+                              presentation shortens `id`, while `full_id` stays the whole \
+                              UUID to pass to traverse or context. Bulk-created entities \
                               skip vector embedding and are not vector-searchable until \
                               a subsequent `reindex` call.",
                 resolution_mode: IdResolutionMode::NotApplicable,
@@ -1197,7 +1200,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                 name: "projection",
                 param_type: "string",
                 required: false,
-                description: "Neighbor response shape: edge (edge identity and endpoints), summary (neighbor identity and metadata), or record (full current record shape, default).",
+                description: "Neighbor response shape: edge (origin_id, source_id, target_id, edge_id, relation, weight), summary (origin_id, id, edge_id, relation, weight, name, kind, entity_type), or record (default: the summary fields plus the stored source_id and target_id of the edge). No projection carries the neighbor's properties or description or the edge's metadata; traverse with include_properties=true or get returns the node's properties.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

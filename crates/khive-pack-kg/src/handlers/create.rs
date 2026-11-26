@@ -132,8 +132,10 @@ impl BulkWrite {
         }
     }
 
-    /// This item's `results[idx].result` value: an id/kind/created summary
-    /// always, replaced by the full committed record when `verbose`.
+    /// This item's `results[idx].result` value: an id/full_id/kind/created
+    /// summary always, replaced by the full committed record when `verbose`.
+    /// `full_id` is the whole UUID that agent presentation never shortens, so
+    /// a caller can chain it into a verb that takes no prefix.
     fn ok_result(&self, verbose: bool) -> Result<Value, RuntimeError> {
         let (id, kind, full) = match self {
             BulkWrite::Entity { entity, .. } => (
@@ -155,10 +157,11 @@ impl BulkWrite {
         };
         Ok(match full {
             Some(Value::Object(mut record)) => {
+                record.insert("full_id".to_string(), json!(id.to_string()));
                 record.insert("created".to_string(), json!(true));
                 Value::Object(record)
             }
-            _ => json!({"id": id, "kind": kind, "created": true}),
+            _ => json!({"id": id, "full_id": id.to_string(), "kind": kind, "created": true}),
         })
     }
 }
