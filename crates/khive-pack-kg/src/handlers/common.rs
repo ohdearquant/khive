@@ -919,6 +919,14 @@ pub(crate) async fn enrich_allowlist_error(
             relation.as_str()
         ));
     }
+    msg.push_str(&format!(
+        " The allowed pairs for {} are: {}.",
+        relation.as_str(),
+        khive_runtime::operations::allowed_pairs_for_relation_description(
+            &runtime.pack_edge_rules(),
+            relation
+        )
+    ));
     let source_short: String = source_id.to_string().chars().take(8).collect();
     let target_short: String = target_id.to_string().chars().take(8).collect();
     msg.push_str(&format!(
