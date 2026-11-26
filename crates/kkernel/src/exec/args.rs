@@ -160,6 +160,11 @@ pub struct ExecArgs {
     /// Pass `--serial` to retain those logical chunks while awaiting every
     /// handler before starting the next; this keeps one warm server/model and
     /// limits handler concurrency to one.
+    /// Each chunk is one batch request with a shared 4,194,304-byte serialized
+    /// result budget. Accounting is cumulative across that request's per-op
+    /// results, then resets for the next chunk; it is not a whole-file or
+    /// whole-invocation limit. The summary reports `response_budget_refused`
+    /// when any ops are refused, and any such refusal makes `exec` exit non-zero.
     ///
     /// Mutually exclusive with the positional `ops` argument.
     #[arg(long, value_name = "PATH")]
@@ -205,7 +210,8 @@ pub struct ExecArgs {
 
     /// Exit non-zero when any op in the batch fails (or, for `--ops-file`,
     /// when any applied op fails). Without this flag a *partially* failed
-    /// batch still exits 0 — the per-op `results` entries and the
+    /// batch still exits 0, except that `--ops-file` response-budget refusals
+    /// always exit non-zero. The per-op `results` entries and the
     /// `summary`/`status` fields in the printed output are the signal
     /// (#1220). A batch in which *every* op failed always exits non-zero,
     /// with or without this flag (#1339). A rolled-back `--atomic` unit also
