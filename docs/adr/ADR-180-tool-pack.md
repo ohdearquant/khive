@@ -1539,8 +1539,10 @@ retired before that decision commits.
 After confirmed commit, existing entity deletion cleanup attempts FTS removal, vector removal for
 each registered model, and the lifecycle event. Failures are reported as postcommit degradations;
 they do not change the committed retirement into a rollback. The result contains `id`, `full_id`,
-`retired`, `policies_retired`, `grants_revoked` and `post_commit_degradations`. The two counts describe
-rows changed by this transaction, not all rules that might still affect the name.
+`retired`, `name_retired`, `policies_retired`, `grants_revoked` and `post_commit_degradations`. The
+two counts describe rows changed by this transaction, not all rules that might still affect the
+name. `name_retired` is true on both the retiring and the already-retired answer: the name cannot
+be registered again in that namespace.
 
 A recognized tombstone returns `retired:false`, zero counts and no cleanup attempt. In particular,
 it does not change policies or requests created after the original retirement. An unknown target
