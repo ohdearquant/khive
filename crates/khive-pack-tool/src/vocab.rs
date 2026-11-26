@@ -170,7 +170,7 @@ pub static TOOL_HANDLERS: [HandlerDef; 15] = [
     },
     HandlerDef {
         name: "tool.unregister",
-        description: "Soft-delete one registry object in the selected write namespace and atomically retire its literal non-pattern exact-name policies and local pinned or exact-name unpinned grants. Shared rules and foreign grants stay stored; foreign pins become inactive. An already-retired row is unchanged. Returns retired, full_id, policies_retired, grants_revoked and post_commit_degradations; this does not uninstall an executable or deny every future request for the name.",
+        description: "Soft-delete one registry object in the selected write namespace and atomically retire its literal non-pattern exact-name policies and local pinned or exact-name unpinned grants. Shared rules and foreign grants stay stored; foreign pins become inactive. An already-retired row is unchanged. Returns retired, full_id, name_retired, policies_retired, grants_revoked and post_commit_degradations; this does not uninstall an executable or deny every future request for the name. The name is retired for good: registering it again in this namespace is refused, so a registration whose source needs correcting is registered under a new name (name_retired is always true).",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[P_TOOL, P_NAMESPACE],
