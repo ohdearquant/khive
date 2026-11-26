@@ -1288,7 +1288,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
         name: "context",
         description: "Entity-anchored live graph context: resolve anchors from `query` and/or \
                       `entity_ids`, expand 1-2 hops with neighbors_with_query, and assemble \
-                      a budgeted, deterministically-ordered response. `direction` defaults to \
+                      a budgeted, deterministically-ordered response. A neighbor that several \
+                      anchors reach is listed under each of them. `direction` defaults to \
                       \"both\" here (unlike `neighbors`, which defaults to \"outgoing\"). At \
                       least one of `query`/`entity_ids` is required. One embedding inference \
                       when `query` is used; zero for a pure `entity_ids` call. This verb does not \
