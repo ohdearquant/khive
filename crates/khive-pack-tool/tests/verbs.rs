@@ -247,6 +247,39 @@ async fn tool_name_folding_preserves_nul_suffixes() {
     assert_eq!(checked["decision"], "allow");
 }
 
+#[tokio::test]
+async fn tool_check_accepts_long_mcp_plugin_identifier_suffix() {
+    let f = fixture();
+    let tool = "mcp__plugin_sk_live_sk_live__get_tool_name";
+    let checked = f
+        .call("tool.check", json!({"actor":"agent:plugin","tool":tool}))
+        .await;
+    assert_eq!(checked["tool"], tool);
+    assert_eq!(checked["registered"], false);
+}
+
+#[tokio::test]
+async fn tool_check_accepts_short_mcp_plugin_identifier_control() {
+    let f = fixture();
+    let tool = "mcp__plugin_sk_live_sk_live__x";
+    let checked = f
+        .call("tool.check", json!({"actor":"agent:plugin","tool":tool}))
+        .await;
+    assert_eq!(checked["tool"], tool);
+    assert_eq!(checked["registered"], false);
+}
+
+#[tokio::test]
+async fn tool_check_still_screens_credentials_in_mcp_plugin_name_component() {
+    let f = fixture();
+    let payload = "A".repeat(22);
+    let tool = format!("mcp__plugin_namespace_namespace__sk_live_{payload}");
+    let error = f
+        .call_err("tool.check", json!({"actor":"agent:plugin","tool":tool}))
+        .await;
+    assert!(error.contains("tool.check.tool"), "{error}");
+}
+
 fn s(v: &Value, key: &str) -> String {
     v.get(key)
         .and_then(Value::as_str)
@@ -304,6 +337,71 @@ async fn wide_list_limit_clamps_before_narrowing() {
         .call("tool.list", json!({"limit": 4_294_967_296_u64}))
         .await;
     assert_eq!(listed["count"], json!(3), "{listed}");
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn tool_list_cursor_walk_survives_unregistering_an_earlier_row() {
+    let f = fixture();
+    for name in ["t000", "t001", "t002"] {
+        f.call("tool.register", json!({"name": name})).await;
+    }
+
+    let first = f
+        .call("tool.list", json!({"kind":"tool", "limit":2, "after":""}))
+        .await;
+    assert_eq!(first["count"], json!(2), "{first}");
+    assert_eq!(first["tools"][0]["name"], json!("t000"), "{first}");
+    assert_eq!(first["tools"][1]["name"], json!("t001"), "{first}");
+    let after = first["next_after"]
+        .as_str()
+        .expect("first page has a continuation cursor")
+        .to_owned();
+
+    f.call("tool.unregister", json!({"tool":"t000"})).await;
+
+    let second = f
+        .call(
+            "tool.list",
+            json!({"kind":"tool", "limit":2, "after":after}),
+        )
+        .await;
+    assert_eq!(second["count"], json!(1), "{second}");
+    assert_eq!(second["tools"][0]["name"], json!("t002"), "{second}");
+    assert!(second["next_after"].is_null(), "{second}");
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn tool_list_offset_pagination_remains_supported() {
+    let f = fixture();
+    for name in ["t000", "t001", "t002"] {
+        f.call("tool.register", json!({"name": name})).await;
+    }
+
+    let first = f
+        .call("tool.list", json!({"kind":"tool", "limit":2, "offset":0}))
+        .await;
+    let second = f
+        .call("tool.list", json!({"kind":"tool", "limit":2, "offset":2}))
+        .await;
+    assert_eq!(first["count"], json!(2), "{first}");
+    assert_eq!(first["offset"], json!(0), "{first}");
+    assert_eq!(second["count"], json!(1), "{second}");
+    assert_eq!(second["offset"], json!(2), "{second}");
+
+    let mut names: Vec<String> = first["tools"]
+        .as_array()
+        .expect("first page tools")
+        .iter()
+        .chain(second["tools"].as_array().expect("second page tools"))
+        .map(|row| row["name"].as_str().expect("tool name").to_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["t000".to_owned(), "t001".to_owned(), "t002".to_owned()]
+    );
 }
 
 // Arm 2: capabilities are created once and linked with implements edges.
