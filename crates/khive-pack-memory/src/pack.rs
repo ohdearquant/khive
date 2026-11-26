@@ -330,6 +330,13 @@ static MEMORY_HANDLERS: [HandlerDef; 11] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "label",
+                param_type: "string",
+                required: false,
+                description: "Call-site label, up to 128 characters, with no control characters and no leading or trailing whitespace. It does not change the results: it is kept on this recall's recall_executed event, and brain.event_counts counts those events by it in counts_by_label.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "profile_id",
                 param_type: "string",
                 required: false,

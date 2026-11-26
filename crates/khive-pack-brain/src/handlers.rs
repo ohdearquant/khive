@@ -111,7 +111,9 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             for per-profile negative-share); events \
             carrying a work_class (today: phase_started / \
             phase_completed / phase_cancelled payloads, checked before any future \
-            payload.resource.work_class) split by counts_by_work_class. Events carrying \
+            payload.resource.work_class) split by counts_by_work_class. recall_executed rows \
+            whose memory.recall call passed label count by that label in counts_by_label \
+            (counts_by_label_page_scoped when truncated; absent when none was read). Events carrying \
             payload.resource.cost_unit (stamped on every successful verb dispatch) sum into \
             total_cost_unit and cost_unit_by_verb; events with no resource.cost_unit (events \
             older than that stamp, or errored/denied dispatches) simply \
