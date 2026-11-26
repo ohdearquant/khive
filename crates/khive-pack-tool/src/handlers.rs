@@ -173,23 +173,15 @@ fn side_effect_of(e: &Entity) -> Option<String> {
     prop_str(&props_json(e), "side_effect")
 }
 
-async fn registry_entities(
-    rt: &KhiveRuntime,
-    token: &NamespaceToken,
-    kind: Option<&str>,
-    limit: u32,
-    offset: u32,
-) -> Result<Vec<Entity>, RuntimeError> {
-    let filter = EntityFilter {
+fn registry_filter(kind: Option<&str>) -> EntityFilter {
+    EntityFilter {
         kinds: vec![REGISTRY_ENTITY_KIND.into()],
         entity_types: kind
             .map(|value| vec![value.to_string()])
             .unwrap_or_default(),
         tags_any: vec![REGISTRY_TAG.into()],
         ..Default::default()
-    };
-    rt.list_entities_filtered(token, filter, limit, offset)
-        .await
+    }
 }
 
 async fn find_by_name(
@@ -1066,6 +1058,36 @@ pub(crate) async fn list(
         one_of(k, KINDS, "kind")?;
     }
     let limit = opt_u32(&params, "limit", 100, 1000)?;
+    let (cursor_mode, after): (bool, Option<Uuid>) = match params.get("after") {
+        None | Some(Value::Null) => (false, None),
+        Some(Value::String(raw)) if raw.is_empty() => (true, None),
+        Some(Value::String(raw)) => {
+            let after = Uuid::parse_str(raw).map_err(|error| {
+                RuntimeError::InvalidInput(format!(
+                    "after must be the full UUID returned by next_after: {error}"
+                ))
+            })?;
+            (true, Some(after))
+        }
+        Some(_) => {
+            return Err(RuntimeError::InvalidInput(
+                "after must be a UUID string or an empty string to start".into(),
+            ));
+        }
+    };
+    if cursor_mode {
+        let (entities, next_after) = rt
+            .list_entities_after_filtered(token, registry_filter(kind.as_deref()), after, limit)
+            .await?;
+        let tools: Vec<Value> = entities.iter().map(summary).collect();
+        return Ok(json!({
+            "ok": true,
+            "count": tools.len(),
+            "limit": limit,
+            "tools": tools,
+            "next_after": next_after,
+        }));
+    }
     let offset = match params.get("offset") {
         None | Some(Value::Null) => 0,
         Some(v) => v
@@ -1075,7 +1097,9 @@ pub(crate) async fn list(
                 RuntimeError::InvalidInput("offset must be a non-negative integer".into())
             })?,
     };
-    let entities = registry_entities(rt, token, kind.as_deref(), limit, offset).await?;
+    let entities = rt
+        .list_entities_filtered(token, registry_filter(kind.as_deref()), limit, offset)
+        .await?;
     let tools: Vec<Value> = entities.iter().map(summary).collect();
     Ok(json!({
         "ok": true,
@@ -1363,9 +1387,11 @@ pub(crate) async fn policies(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let actor = opt_str(&params, "actor")?;
+    let policy_id = opt_str(&params, "policy_id")?;
     let limit = opt_u32(&params, "limit", 100, 1000)?;
     let ns = token.namespace().as_str().to_string();
-    let rows = policy::list_policies(rt, &ns, actor.as_deref(), limit).await?;
+    let rows =
+        policy::list_policies(rt, &ns, actor.as_deref(), policy_id.as_deref(), limit).await?;
     Ok(json!({
         "ok": true,
         "count": rows.len(),

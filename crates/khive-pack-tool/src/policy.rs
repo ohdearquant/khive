@@ -407,10 +407,15 @@ pub(crate) async fn list_policies(
     rt: &KhiveRuntime,
     ns: &str,
     actor: Option<&str>,
+    policy_id: Option<&str>,
     limit: u32,
 ) -> Result<Vec<PolicyRow>, RuntimeError> {
     let mut sql = format!("SELECT {POLICY_COLUMNS} FROM tool_policy WHERE namespace = ?1");
     let mut params = vec![SqlValue::Text(ns.to_string())];
+    if let Some(policy_id) = policy_id {
+        params.push(SqlValue::Text(policy_id.to_string()));
+        sql.push_str(&format!(" AND id = ?{}", params.len()));
+    }
     if let Some(actor) = actor {
         params.push(SqlValue::Text(actor.to_string()));
         sql.push_str(&format!(
@@ -1178,11 +1183,14 @@ pub async fn decide_with_receipt(
     side_effect: Option<&str>,
     registration: Option<&RegistryPin>,
 ) -> Result<Decision, RuntimeError> {
-    // The receipt copies both strings into the namespace event log, so they get
-    // the same credential refusal every other persisted write path applies.
+    // The receipt copies both strings into the namespace event log, so screen
+    // both before persisting the decision.
     let record = invocation.caller.verb();
     secret_gate::check_at(invocation.actor, record, "actor")?;
-    secret_gate::check_at(invocation.tool, record, "tool")?;
+    match invocation.caller {
+        DecisionCaller::ToolCheck => check_tool_reference_at(invocation.tool, record)?,
+        DecisionCaller::ExecRun => secret_gate::check_at(invocation.tool, record, "tool")?,
+    }
     let decision = decide(
         rt,
         invocation.token.namespace().as_str(),
@@ -1215,6 +1223,68 @@ pub async fn decide_with_receipt(
     .with_payload(json!(payload));
     rt.events(invocation.token)?.append_event(event).await?;
     Ok(decision)
+}
+
+fn check_tool_reference_at(tool: &str, record: &str) -> Result<(), RuntimeError> {
+    if let Some((prefix, name)) = mcp_plugin_identifier_parts(tool) {
+        // Keep the repeated plugin namespace from extending a provider-looking
+        // prefix across the separator into an ordinary callable name. Each
+        // identifier component is still checked independently.
+        secret_gate::check_at(prefix, record, "tool")?;
+        return secret_gate::check_at(name, record, "tool");
+    }
+    secret_gate::check_at(tool, record, "tool")
+}
+
+fn mcp_plugin_identifier_parts(tool: &str) -> Option<(&str, &str)> {
+    let rest = tool.strip_prefix("mcp__plugin_")?;
+    let (prefixes, name) = rest.split_once("__")?;
+    if !is_ordinary_registry_identifier(name) {
+        return None;
+    }
+
+    prefixes
+        .char_indices()
+        .filter(|(_, ch)| *ch == '_')
+        .find_map(|(separator, _)| {
+            let prefix = &prefixes[..separator];
+            let repeated = &prefixes[separator + 1..];
+            (prefix == repeated && is_ordinary_registry_identifier(prefix))
+                .then_some((prefix, name))
+        })
+}
+
+fn is_ordinary_registry_identifier(value: &str) -> bool {
+    !value.is_empty() && value.split(['_', '-', '.']).all(is_ordinary_registry_run)
+}
+
+fn is_ordinary_registry_run(run: &str) -> bool {
+    if run.is_empty() || run.len() > 24 || !run.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return false;
+    }
+    if run.bytes().all(|byte| byte.is_ascii_digit()) {
+        return true;
+    }
+
+    let bytes = run.as_bytes();
+    let letter_end = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_alphabetic())
+        .unwrap_or(bytes.len());
+    if letter_end == 0 || !bytes[letter_end..].iter().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+
+    let letters = &run[..letter_end];
+    if letters.len() <= 4 {
+        return true;
+    }
+    let transitions = letters
+        .as_bytes()
+        .windows(2)
+        .filter(|pair| pair[0].is_ascii_uppercase() != pair[1].is_ascii_uppercase())
+        .count();
+    transitions as f64 / (letters.len() - 1) as f64 <= 0.3
 }
 
 /// Resolution order: an active grant allows; otherwise the most specific

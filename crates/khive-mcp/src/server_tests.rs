@@ -2994,6 +2994,12 @@ async fn typed_serial_dispatch_retains_one_aggregate_response_budget() {
                 .is_some_and(|error| error.contains("batch response budget"))
         })
         .expect("serial tail must contain canonical budget errors");
+    let budget_message = serial_rows[first_serial_budget_error]["error"]["message"]
+        .as_str()
+        .expect("budget error message");
+    assert!(budget_message.contains("per-request"));
+    assert!(budget_message.contains("shared across all ops in this batch request"));
+    assert!(budget_message.contains("resets for the next request"));
     assert!(
         first_serial_budget_error >= 3 && first_serial_budget_error < serial_rows.len(),
         "serial dispatch must spend one aggregate budget, not reset it per op"
