@@ -60,7 +60,8 @@ pub(crate) fn usage(item: &Entity) -> Value {
 }
 
 /// Up to three live, non-general fields of `value_type` nearest to the
-/// proposed definition, then name; fields sharing no word are left out.
+/// proposed definition, then name. A field sharing no word still counts: the
+/// caller is shown the closest fields of the type, not only lexical matches.
 pub(crate) fn nearest(
     graph: &Graph,
     name: &str,
@@ -85,7 +86,6 @@ pub(crate) fn nearest(
                 .fold(0.0, f64::max);
             (by_definition, by_name, field)
         })
-        .filter(|(d, n, _)| *d > 0.0 || *n > 0.0)
         .collect();
     scored.sort_by(|a, b| {
         b.0.total_cmp(&a.0)

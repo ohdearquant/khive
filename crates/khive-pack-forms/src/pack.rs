@@ -49,7 +49,7 @@ pub(crate) static FORMS_HANDLERS: [HandlerDef; 10] = [
     },
     HandlerDef {
         name: "forms.add_item",
-        description: "Add one printed item to a loaded form and say which field it means. With same_as the item means that field and its label becomes an alias of it. With field, a live field already named or aliased by the proposed name comes back as status match, so the caller decides same (forms.same) or different (forms.split); when no field has that name, the up to three nearest fields of the same value type come back as status no_match, or the proposed field is created when none is near (status new_field). In match and no_match the item is added without a field.",
+        description: "Add one printed item to a loaded form and say which field it means. With same_as the item means that field and its label becomes an alias of it. With field, a live field already named or aliased by the proposed name comes back as status match, so the caller decides same (forms.same) or different (forms.split); when no field has that name, the up to three nearest fields of the same value type come back as status no_match, sharing a word or not, and the proposed field is created only when no field of that type exists (status new_field). In match and no_match the item is added without a field.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
@@ -87,7 +87,7 @@ pub(crate) static FORMS_HANDLERS: [HandlerDef; 10] = [
     },
     HandlerDef {
         name: "forms.resolve",
-        description: "Resolve text to fields, choice values and forms through canonical names, aliases and the printed labels of the items that mean them. Each hit says which wording matched and the forms that print it. A wording that names several fields returns each of them, flagged ambiguous. The same graph always gives the same answer.",
+        description: "Resolve text to fields, choice values and forms through canonical names, aliases and the printed labels of the items that mean them. Each hit says how it matched, the wording that matched, and the forms that print it; a value matched through an option's label cites that option. Hits of every type come back in one list ordered by rank, then name. A wording that names several fields returns each of them, flagged ambiguous. The same graph always gives the same answer.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -117,14 +117,14 @@ pub(crate) static FORMS_HANDLERS: [HandlerDef; 10] = [
     },
     HandlerDef {
         name: "forms.lint",
-        description: "List what breaks the forms invariants: items with no field, fields with no definition or no item, wordings shared by several fields, values no option points at, rules with no premise or no conclusion, missing required properties, and nodes with no source.",
+        description: "List what breaks the forms invariants: items with no field, items that mean more than one field or value or a value without being a choice, fields with no definition, fields no item points at directly (marked when their values are printed as options), wordings shared by several fields, values no option points at, rules with no premise or no conclusion, missing required properties, and nodes with no source.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[],
     },
     HandlerDef {
         name: "forms.export",
-        description: "Export the namespace's forms graph as one document: nodes by content key, edges between keys, and the log of decisions about what wordings mean. forms.replay of the document into an empty namespace rebuilds the same graph.",
+        description: "Export the namespace's forms graph as one document: nodes by content key, edges between keys, and the log of decisions about what wordings mean. forms.replay of the document into an empty namespace rebuilds the same graph. Refused, naming the nodes, when a node cannot be written under its own key: two nodes sharing a key, or a node lacking the properties its key is made of.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[],

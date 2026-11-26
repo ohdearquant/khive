@@ -13,8 +13,8 @@ use super::views::{field_reply, usage, value_reply};
 use super::write::{DECISION, FORMAT, LOG_KEYS};
 use super::Ctx;
 use crate::store::{
-    definition, invalid, is_general, label, pending_premises, prop, prop_text, props, quoted_names,
-    scalar, strings, type_of, wordings, Graph,
+    aliases, definition, invalid, is_general, label, pending_premises, prop, prop_text, props,
+    quoted_names, scalar, strings, type_of, wordings, Graph,
 };
 use crate::text::normalize;
 use crate::vocab::{
@@ -96,20 +96,26 @@ fn number_of(node: &Entity, key: &str) -> f64 {
     prop(node, key).and_then(Value::as_f64).unwrap_or(f64::MAX)
 }
 
+/// How a field was found: its rank, the kind of match, the general field it
+/// was reached through, and the wording that matched.
+type Found = (u8, &'static str, Option<String>, Option<String>);
+
 /// Keep the lowest rank a field was found at.
-fn offer(
-    found: &mut BTreeMap<Uuid, (u8, &'static str, Option<String>)>,
-    id: Uuid,
-    rank: u8,
-    how: &'static str,
-    via: Option<String>,
-) {
+fn offer(found: &mut BTreeMap<Uuid, Found>, id: Uuid, entry: Found) {
     match found.get(&id) {
-        Some((known, _, _)) if *known <= rank => {}
+        Some((known, ..)) if *known <= entry.0 => {}
         _ => {
-            found.insert(id, (rank, how, via));
+            found.insert(id, entry);
         }
     }
+}
+
+/// The printed wording of `field` that folds to `folded`.
+fn wording_of(field: &Entity, folded: &str) -> Option<String> {
+    aliases(field)
+        .into_iter()
+        .chain(std::iter::once(field.name.clone()))
+        .find(|w| normalize(w) == folded)
 }
 
 /// forms.resolve: text to fields, values and forms.
@@ -138,13 +144,18 @@ pub(crate) async fn resolve(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runti
             None
         };
         let Some((rank, how)) = how else { continue };
+        let wording = wording_of(field, &folded);
         if is_general(field) {
             general.push(json!({"id": field.id.to_string(), "name": field.name}));
             for child in graph.children_of_field(field.id) {
-                offer(&mut found, child, rank, how, Some(field.name.clone()));
+                offer(
+                    &mut found,
+                    child,
+                    (rank, how, Some(field.name.clone()), wording.clone()),
+                );
             }
         } else {
-            offer(&mut found, field.id, rank, how, None);
+            offer(&mut found, field.id, (rank, how, None, wording));
         }
     }
     let labelled: Vec<&Entity> = graph
@@ -154,24 +165,22 @@ pub(crate) async fn resolve(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runti
         .collect();
     for item in &labelled {
         for field in graph.fields_of_item(item.id) {
-            offer(&mut found, field, 3, "label", None);
+            offer(&mut found, field, (3, "label", None, Some(label(item))));
         }
     }
     let ambiguous = found.len() > 1;
 
-    let mut fields: Vec<(u8, &Entity, &'static str, Option<String>)> = found
+    let fields: Vec<(&Entity, &Found)> = found
         .iter()
-        .filter_map(|(id, (rank, how, via))| graph.get(*id).map(|f| (*rank, f, *how, via.clone())))
+        .filter_map(|(id, entry)| graph.get(*id).map(|f| (f, entry)))
         .collect();
-    fields.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then(a.1.name.cmp(&b.1.name))
-            .then(a.1.id.cmp(&b.1.id))
-    });
 
-    let mut hits = Vec::new();
+    // Every hit with its rank and the name and id it is ordered by, so fields,
+    // values and forms come back as one list in rank order.
+    let mut hits: Vec<(u8, String, Uuid, Value)> = Vec::new();
     if wants(FIELD) {
-        for (rank, field, how, via) in fields {
+        for (field, (rank, how, via, wording)) in fields {
+            let rank = *rank;
             let items: Vec<&Entity> = graph
                 .items_of_field(field.id)
                 .into_iter()
@@ -186,6 +195,7 @@ pub(crate) async fn resolve(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runti
             hit["type"] = json!(FIELD);
             hit["rank"] = json!(rank);
             hit["matched_by"] = json!(how);
+            hit["matched_wording"] = json!(wording);
             hit["ambiguous"] = json!(ambiguous);
             if let Some(via) = via {
                 hit["via"] = json!(via);
@@ -195,27 +205,36 @@ pub(crate) async fn resolve(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runti
             } else {
                 printing
             });
-            hits.push(hit);
+            hits.push((rank, field.name.clone(), field.id, hit));
         }
     }
     if wants(FIELD_VALUE) {
         for value in graph.of_type(FIELD_VALUE) {
             let by_name = normalize(&value.name) == folded;
-            let by_label = labelled
+            let options: Vec<Value> = labelled
                 .iter()
-                .any(|i| graph.out(i.id, EdgeRelation::VariantOf).contains(&value.id));
-            if !(by_name || by_label) {
+                .filter(|i| graph.out(i.id, EdgeRelation::VariantOf).contains(&value.id))
+                .map(|i| usage(i))
+                .collect();
+            if !by_name && options.is_empty() {
                 continue;
             }
+            let rank = if by_name { 2 } else { 3 };
             let mut hit = value_reply(value);
             hit["type"] = json!(FIELD_VALUE);
-            hit["rank"] = json!(if by_name { 2 } else { 3 });
+            hit["rank"] = json!(rank);
             hit["matched_by"] = json!(if by_name { "name" } else { "label" });
+            hit["matched_wording"] = json!(if by_name {
+                value.name.clone()
+            } else {
+                text.clone()
+            });
             hit["field"] = json!(graph
                 .parent_field(value.id)
                 .and_then(|f| graph.get(f))
                 .map(|f| f.name.clone()));
-            hits.push(hit);
+            hit["forms"] = Value::Array(options);
+            hits.push((rank, value.name.clone(), value.id, hit));
         }
     }
     if wants(FORM) {
@@ -226,18 +245,20 @@ pub(crate) async fn resolve(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runti
             if !(by_title || by_id) {
                 continue;
             }
+            let rank = if by_id { 2 } else { 4 };
             let mut hit = cite(form);
             hit["type"] = json!(FORM);
-            hit["rank"] = json!(if by_id { 2 } else { 4 });
+            hit["rank"] = json!(rank);
             hit["matched_by"] = json!(if by_id { "form_id" } else { "title" });
-            hits.push(hit);
+            hits.push((rank, form.name.clone(), form.id, hit));
         }
     }
+    hits.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     Ok(json!({
         "text": text,
         "ambiguous": ambiguous,
         "general": general,
-        "hits": hits,
+        "hits": hits.into_iter().map(|(.., hit)| hit).collect::<Vec<_>>(),
     }))
 }
 
@@ -261,9 +282,23 @@ fn outline(graph: &Graph, container: Uuid) -> Value {
         .filter_map(|c| graph.get(c))
         .filter(|c| matches!(type_of(c), FORM_SECTION | FORM_ITEM))
         .collect();
+    // A section prints no page of its own; it sorts at the first page of
+    // anything it contains, so a mixed form keeps its printed order.
+    let page_of = |node: &Entity| {
+        if type_of(node) == FORM_SECTION {
+            graph
+                .items_in(node.id)
+                .iter()
+                .filter_map(|item| graph.get(*item))
+                .map(|item| number_of(item, "page"))
+                .fold(f64::MAX, f64::min)
+        } else {
+            number_of(node, "page")
+        }
+    };
     children.sort_by(|a, b| {
-        number_of(a, "page")
-            .total_cmp(&number_of(b, "page"))
+        page_of(a)
+            .total_cmp(&page_of(b))
             .then(number_of(a, "order").total_cmp(&number_of(b, "order")))
             .then(a.name.cmp(&b.name))
     });
@@ -453,10 +488,30 @@ fn met(
     match graph.get(target).map(type_of) {
         Some(FORM) => forms.contains(&target),
         Some(FORM_ITEM) => item_answered(graph, target, fields, values),
-        Some(FORM_SECTION) => graph
-            .items_in(target)
-            .iter()
-            .any(|item| item_answered(graph, *item, fields, values)),
+        Some(FORM_SECTION) => {
+            // A section is filled when every item in it that asks for a field
+            // is answered; a section of attachments alone, when any item is.
+            let items = graph.items_in(target);
+            let asking: Vec<Uuid> = items
+                .iter()
+                .copied()
+                .filter(|item| {
+                    graph
+                        .get(*item)
+                        .and_then(|i| prop_text(i, "item_kind"))
+                        .is_some_and(|k| vocab::item_needs_field(&k))
+                })
+                .collect();
+            if asking.is_empty() {
+                items
+                    .iter()
+                    .any(|item| item_answered(graph, *item, fields, values))
+            } else {
+                asking
+                    .iter()
+                    .all(|item| item_answered(graph, *item, fields, values))
+            }
+        }
         _ => true,
     }
 }
@@ -732,23 +787,46 @@ pub(crate) async fn lint(ctx: &Ctx<'_>, _params: Value) -> Result<Value, Runtime
         })
         .map(|i| item_view(&graph, i))
         .collect();
+    // An item means one field, or one value when it is a choice option.
+    let malformed_bindings: Vec<Value> = graph
+        .of_type(FORM_ITEM)
+        .into_iter()
+        .filter_map(|i| {
+            let targets = graph.out(i.id, EdgeRelation::VariantOf);
+            let reason = if targets.len() > 1 {
+                "means more than one field or value"
+            } else if targets.iter().any(|t| graph.is(*t, FIELD_VALUE))
+                && prop_text(i, "item_kind").as_deref() != Some("choice")
+            {
+                "is not a choice item but means a choice value"
+            } else {
+                return None;
+            };
+            let mut view = item_view(&graph, i);
+            view["reason"] = json!(reason);
+            view["means"] = json!(names(&graph, &targets));
+            Some(view)
+        })
+        .collect();
     let fields = graph.of_type(FIELD);
     let without_definition: Vec<Value> = fields
         .iter()
         .filter(|f| definition(f).is_none_or(|d| d.trim().is_empty()))
         .map(|f| brief_of(f))
         .collect();
+    // Every field no item points at directly; one whose values are printed as
+    // options is marked as reached through its values.
     let without_items: Vec<Value> = fields
         .iter()
-        .filter(|f| {
-            !is_general(f)
-                && graph.items_of_field(f.id).is_empty()
-                && graph
-                    .values_of_field(f.id)
-                    .iter()
-                    .all(|v| graph.incoming(*v, EdgeRelation::VariantOf).is_empty())
+        .filter(|f| !is_general(f) && graph.items_of_field(f.id).is_empty())
+        .map(|f| {
+            let mut entry = brief_of(f);
+            entry["through_values"] = json!(graph
+                .values_of_field(f.id)
+                .iter()
+                .any(|v| !graph.incoming(*v, EdgeRelation::VariantOf).is_empty()));
+            entry
         })
-        .map(|f| brief_of(f))
         .collect();
     let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for field in &fields {
@@ -821,6 +899,7 @@ pub(crate) async fn lint(ctx: &Ctx<'_>, _params: Value) -> Result<Value, Runtime
 
     let report = json!({
         "unbound_items": unbound_items,
+        "malformed_bindings": malformed_bindings,
         "fields_without_definition": without_definition,
         "fields_without_items": without_items,
         "shared_names": shared_names,
@@ -841,26 +920,38 @@ pub(crate) async fn lint(ctx: &Ctx<'_>, _params: Value) -> Result<Value, Runtime
 /// forms.export: the namespace's forms graph by content key, with its log.
 pub(crate) async fn export(ctx: &Ctx<'_>, _params: Value) -> Result<Value, RuntimeError> {
     let graph = Graph::load(ctx.runtime, ctx.token).await?;
-    let mut warnings = Vec::new();
+    let warnings: Vec<String> = Vec::new();
     let mut keys: HashMap<Uuid, String> = HashMap::new();
     let mut by_key: BTreeMap<String, &Entity> = BTreeMap::new();
+    // A document that dropped a node would not replay to the same graph, so
+    // every node that cannot be written under its own key refuses the export.
+    let mut lossy = Vec::new();
     for node in graph.nodes() {
         match graph.key(node.id) {
             Some(key) => {
                 if let Some(previous) = by_key.insert(key.clone(), node) {
-                    warnings.push(format!(
-                        "two nodes share the key {key} ({} and {}); one is exported",
+                    lossy.push(format!(
+                        "two nodes share the key {key} ({} and {})",
                         previous.id, node.id
                     ));
                 }
                 keys.insert(node.id, key);
             }
-            None => warnings.push(format!(
-                "{} \"{}\" lacks the properties its key is made of and is not exported",
+            None => lossy.push(format!(
+                "{} \"{}\" ({}) lacks the properties its key is made of",
                 type_of(node),
-                node.name
+                node.name,
+                node.id
             )),
         }
+    }
+    if !lossy.is_empty() {
+        lossy.sort();
+        return Err(invalid(format!(
+            "the forms graph cannot be exported without loss, {} node(s) affected: {}",
+            lossy.len(),
+            lossy.iter().take(5).cloned().collect::<Vec<_>>().join("; ")
+        )));
     }
 
     let nodes: Vec<Value> = by_key

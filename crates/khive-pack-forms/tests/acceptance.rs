@@ -1029,3 +1029,313 @@ async fn a_reused_exclusive_field_links_its_new_values_to_the_old() {
         assert_eq!(kinds(&reply), ["exclusive_values"], "{pair:?}: {reply}");
     }
 }
+
+fn sectioned(label: &str, page: u32, order: u32, section: &str, field: &str) -> Value {
+    let mut entry = item(label, page, order, "text", field);
+    entry["section"] = json!(section);
+    entry
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_section_is_filled_only_when_every_item_in_it_is_answered() {
+    let store = Store::new();
+    store
+        .call(
+            "forms.load",
+            json!({"document": {
+                "form_id": "PART-1",
+                "revision": "2026-07",
+                "title": "Applicant details",
+                "source": {"url": "https://forms.example/part-1.pdf", "sha256": "8".repeat(64)},
+                "fields": [
+                    {
+                        "name": "applicant type",
+                        "definition": "Whether a person or a company applies.",
+                        "value_type": "choice",
+                        "exclusive": true,
+                        "values": [
+                            {"name": "person", "definition": "A natural person."},
+                            {"name": "company", "definition": "A registered company."}
+                        ]
+                    },
+                    {"name": "company name", "definition": "Registered name of the company.", "value_type": "text"},
+                    {"name": "company number", "definition": "Registration number of the company.", "value_type": "identifier"}
+                ],
+                "sections": [{"label": "Company details", "order": 2}],
+                "items": [
+                    item("Applicant type", 1, 1, "choice", "applicant type"),
+                    sectioned("Company name", 1, 2, "Company details", "company name"),
+                    sectioned("Company number", 1, 3, "Company details", "company number")
+                ],
+                "rules": [{
+                    "text": "If a company applies, complete Company details",
+                    "page": 1,
+                    "depends_on": [{"field": "applicant type", "value": "company"}],
+                    "enables": [{"section": "Company details"}]
+                }]
+            }}),
+        )
+        .await;
+
+    let partial = store
+        .call(
+            "forms.check",
+            json!({"forms": ["PART-1"], "answers": {"applicant type": "company", "company name": "Acme"}}),
+        )
+        .await;
+    assert_eq!(
+        kinds(&partial),
+        ["rule_unmet"],
+        "one answered item of two does not fill the section: {partial}"
+    );
+    assert_eq!(partial["consistent"], false, "{partial}");
+
+    let full = store
+        .call(
+            "forms.check",
+            json!({"forms": ["PART-1"], "answers": {"applicant type": "company", "company name": "Acme", "company number": "12345"}}),
+        )
+        .await;
+    assert_eq!(full["findings"], json!([]), "{full}");
+    assert_eq!(full["consistent"], true, "{full}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_section_sorts_at_the_first_page_of_what_it_contains() {
+    let store = Store::new();
+    store
+        .call(
+            "forms.load",
+            json!({"document": {
+                "form_id": "MIX-1",
+                "revision": "2026-07",
+                "title": "Contact sheet",
+                "source": {"url": "https://forms.example/mix-1.pdf", "sha256": "9".repeat(64)},
+                "fields": [
+                    {"name": "contact name", "definition": "Name of the person to contact.", "value_type": "text"},
+                    {"name": "reference", "definition": "Reference printed on the letter.", "value_type": "identifier"}
+                ],
+                "sections": [{"label": "Contact", "order": 1}],
+                "items": [
+                    sectioned("Contact name", 1, 1, "Contact", "contact name"),
+                    item("Reference", 1, 2, "text", "reference")
+                ]
+            }}),
+        )
+        .await;
+    let around = store
+        .call("forms.neighbourhood", json!({"node": "MIX-1"}))
+        .await;
+    let outline = around["outline"].as_array().expect("outline");
+    assert_eq!(outline.len(), 2, "{around}");
+    assert_eq!(outline[0]["section"], "Contact", "{around}");
+    assert_eq!(outline[1]["label"], "Reference", "{around}");
+}
+
+fn payment_form() -> Value {
+    let mut by_cheque = item("By cheque", 1, 2, "choice", "payment method");
+    by_cheque["value"] = json!("cheque");
+    json!({
+        "form_id": "PAY-1",
+        "revision": "2026-08",
+        "title": "Payment instruction",
+        "source": {"url": "https://forms.example/pay-1.pdf", "sha256": "a".repeat(64)},
+        "fields": [
+            {
+                "name": "payment method",
+                "definition": "How the payment is made.",
+                "value_type": "choice",
+                "exclusive": true,
+                "values": [
+                    {"name": "cheque", "definition": "A paper cheque."},
+                    {"name": "card", "definition": "A payment card."}
+                ]
+            },
+            {"name": "card number", "definition": "Number printed on the payment card.", "value_type": "identifier", "aliases": ["card no"]}
+        ],
+        "items": [
+            item("Card", 1, 1, "text", "card number"),
+            by_cheque,
+            item("Payment method", 1, 3, "choice", "payment method")
+        ]
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_orders_every_hit_by_rank_and_names_the_wording_that_matched() {
+    let store = Store::new();
+    store
+        .call("forms.load", json!({"document": payment_form()}))
+        .await;
+
+    let card = store.call("forms.resolve", json!({"text": "card"})).await;
+    let hits = card["hits"].as_array().expect("hits");
+    assert_eq!(hits.len(), 2, "{card}");
+    assert_eq!(
+        (&hits[0]["type"], &hits[0]["name"]),
+        (&json!("field_value"), &json!("card")),
+        "a value named by the text outranks a field reached through a label: {card}"
+    );
+    assert_eq!(
+        (&hits[1]["type"], &hits[1]["name"]),
+        (&json!("field"), &json!("card number")),
+        "{card}"
+    );
+    assert_eq!(hits[1]["matched_by"], "label", "{card}");
+    assert_eq!(hits[1]["matched_wording"], "Card", "{card}");
+
+    let alias = store
+        .call("forms.resolve", json!({"text": "Card No"}))
+        .await;
+    let fields = field_hits(&alias);
+    assert_eq!(fields.len(), 1, "{alias}");
+    assert_eq!(fields[0]["matched_by"], "alias", "{alias}");
+    assert_eq!(fields[0]["matched_wording"], "card no", "{alias}");
+
+    let option = store
+        .call("forms.resolve", json!({"text": "by cheque"}))
+        .await;
+    let value = option["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .find(|hit| hit["type"] == "field_value")
+        .unwrap_or_else(|| panic!("the option's value: {option}"));
+    assert_eq!(value["name"], "cheque", "{option}");
+    assert_eq!(value["matched_by"], "label", "{option}");
+    assert_eq!(value["forms"][0]["item"], "By cheque", "{option}");
+    assert_eq!(value["forms"][0]["form"], "form:PAY-1@2026-08", "{option}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_proposed_field_sharing_no_word_still_gets_the_nearest_fields_of_its_type() {
+    let store = Store::new();
+    store
+        .call(
+            "forms.load",
+            json!({"document": {
+                "form_id": "ADDR-1",
+                "revision": "2026-09",
+                "title": "Change of address",
+                "source": {"url": "https://forms.example/addr-1.pdf", "sha256": "b".repeat(64)},
+                "fields": [{"name": "home location", "definition": "Postal location of the household.", "value_type": "text"}],
+                "items": [item("Home location", 1, 1, "text", "home location")]
+            }}),
+        )
+        .await;
+    let reply = store
+        .call(
+            "forms.add_item",
+            json!({
+                "form": "ADDR-1",
+                "item": {"label": "Residence", "page": 1, "order": 2, "item_kind": "text", "filled_by": "customer"},
+                "field": {"name": "residence", "definition": "Dwelling address.", "value_type": "text"}
+            }),
+        )
+        .await;
+    assert_eq!(reply["status"], "no_match", "{reply}");
+    assert_eq!(reply["nearest"][0]["name"], "home location", "{reply}");
+    assert_eq!(
+        store
+            .call("forms.resolve", json!({"text": "residence"}))
+            .await["hits"],
+        json!([]),
+        "no field was created without a decision"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn export_refuses_rather_than_drop_a_node_that_shares_its_key() {
+    let store = Store::new();
+    let rule = json!({
+        "text": "Sign and date the form",
+        "page": 1,
+        "depends_on": [{"field": "signature date"}],
+        "enables": [{"form": "SIGN-1"}]
+    });
+    store
+        .call(
+            "forms.load",
+            json!({"document": {
+                "form_id": "SIGN-1",
+                "revision": "2026-09",
+                "title": "Signature page",
+                "source": {"url": "https://forms.example/sign-1.pdf", "sha256": "c".repeat(64)},
+                "fields": [{"name": "signature date", "definition": "Date the form is signed.", "value_type": "date"}],
+                "items": [item("Signature date", 1, 1, "text", "signature date")],
+                "rules": [rule.clone(), rule]
+            }}),
+        )
+        .await;
+    let message = store.refused("forms.export", json!({})).await;
+    assert!(message.contains("share the key"), "{message}");
+    assert!(message.contains("without loss"), "{message}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lint_lists_fields_reached_only_through_values_and_items_bound_twice() {
+    let store = Store::new();
+    let mut red = item("Red", 1, 1, "choice", "colour");
+    red["value"] = json!("red");
+    let mut blue = item("Blue", 1, 2, "choice", "colour");
+    blue["value"] = json!("blue");
+    let loaded = store
+        .call(
+            "forms.load",
+            json!({"document": {
+                "form_id": "COLR-1",
+                "revision": "2026-09",
+                "title": "Colour order",
+                "source": {"url": "https://forms.example/colr-1.pdf", "sha256": "d".repeat(64)},
+                "fields": [
+                    {
+                        "name": "colour",
+                        "definition": "Colour of the ordered item.",
+                        "value_type": "choice",
+                        "values": [
+                            {"name": "red", "definition": "Red."},
+                            {"name": "blue", "definition": "Blue."}
+                        ]
+                    },
+                    {"name": "order note", "definition": "Free text about the order.", "value_type": "text"}
+                ],
+                "items": [red, blue, item("Order note", 1, 3, "text", "order note")]
+            }}),
+        )
+        .await;
+
+    let lint = store.call("forms.lint", json!({})).await;
+    let without = lint["fields_without_items"]
+        .as_array()
+        .expect("fields_without_items");
+    assert_eq!(without.len(), 1, "{lint}");
+    assert_eq!(without[0]["name"], "colour", "{lint}");
+    assert_eq!(without[0]["through_values"], true, "{lint}");
+    assert_eq!(lint["malformed_bindings"], json!([]), "{lint}");
+
+    let note = loaded["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|i| i["label"] == "Order note")
+        .expect("the note item");
+    let colour = store.call("forms.resolve", json!({"text": "colour"})).await;
+    let colour_id = field_hits(&colour)[0]["id"].clone();
+    store
+        .call(
+            "link",
+            json!({"source_id": note["id"], "target_id": colour_id, "relation": "variant_of"}),
+        )
+        .await;
+    let lint = store.call("forms.lint", json!({})).await;
+    let malformed = lint["malformed_bindings"]
+        .as_array()
+        .expect("malformed_bindings");
+    assert_eq!(malformed.len(), 1, "{lint}");
+    assert_eq!(malformed[0]["label"], "Order note", "{lint}");
+    assert_eq!(
+        malformed[0]["reason"], "means more than one field or value",
+        "{lint}"
+    );
+    assert_eq!(lint["clean"], false, "{lint}");
+}
