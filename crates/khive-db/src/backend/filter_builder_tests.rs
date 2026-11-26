@@ -359,6 +359,84 @@ async fn entity_property_equalities_bind_paths_values_and_preserve_sql_null_and_
     }
 }
 
+#[tokio::test]
+async fn entity_property_prefixes_match_json_text_case_sensitively() {
+    let backend = memory_backend();
+    backend.prepare_core_schema().unwrap();
+    let store = backend.entities().unwrap();
+    for (n, props) in [
+        (1, json!({"source":"mcp:alpha"})),
+        (2, json!({"source":"mcp:"})),
+        (3, json!({"source":"MCP:beta"})),
+        (4, json!({"source":5})),
+        (5, json!({"other":"mcp:gamma"})),
+        (6, json!({"source":"skills:mcp:x"})),
+        (7, json!({"source":"mcp%_wild"})),
+    ] {
+        store
+            .upsert_entity(entity(n, "alpha", props))
+            .await
+            .unwrap();
+    }
+    assert_entity_routes(
+        store.as_ref(),
+        EntityFilter::default().property_prefix("$.source", "mcp:"),
+        &[1, 2],
+    )
+    .await;
+    assert_entity_routes(
+        store.as_ref(),
+        EntityFilter::default().property_prefix("$.source", "mcp%"),
+        &[7],
+    )
+    .await;
+    assert_entity_routes(
+        store.as_ref(),
+        EntityFilter::default().property_prefix("$.source", "5"),
+        &[],
+    )
+    .await;
+    assert_entity_routes(
+        store.as_ref(),
+        EntityFilter::default()
+            .property_prefix("$.source", "mcp:")
+            .property_eq("$.source", SqlValue::Text("mcp:alpha".into())),
+        &[1],
+    )
+    .await;
+    let filter = EntityFilter::default().property_prefix("$.source' OR 1=1 --", "x");
+    let errors = [
+        store
+            .query_entities(
+                "alpha",
+                filter.clone(),
+                PageRequest {
+                    limit: 1,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap_err(),
+        store
+            .query_entities_after("alpha", filter.clone(), None, 1)
+            .await
+            .unwrap_err(),
+        store.count_entities("alpha", filter).await.unwrap_err(),
+    ];
+    for error in errors {
+        assert!(
+            matches!(
+                error,
+                StorageError::InvalidInput {
+                    capability: StorageCapability::Entities,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+}
+
 fn event(n: u128, namespace: &str, outcome: EventOutcome, payload: serde_json::Value) -> Event {
     let mut row = Event::new(
         namespace,

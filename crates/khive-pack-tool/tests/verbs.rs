@@ -373,6 +373,105 @@ async fn tool_list_cursor_walk_survives_unregistering_an_earlier_row() {
 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
+async fn tool_list_filters_by_source_and_reports_decisions() {
+    let f = fixture();
+    for (name, source) in [
+        ("src_alpha", "mcp:alpha"),
+        ("src_alphabet", "mcp:alphabet"),
+        ("src_beta", "mcp:beta"),
+        ("src_skill", "skills:local"),
+    ] {
+        f.call(
+            "tool.register",
+            json!({"name": name, "source": source, "side_effect": "read"}),
+        )
+        .await;
+    }
+    f.call(
+        "tool.register",
+        json!({"name": "src_none", "side_effect": "read"}),
+    )
+    .await;
+    f.call(
+        "tool.policy",
+        json!({"actor":"agent:lister","tool":"src_beta","decision":"deny"}),
+    )
+    .await;
+    let names = |listed: &Value| -> Vec<String> {
+        let mut names: Vec<String> = listed["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|row| row["name"].as_str().expect("row name").to_owned())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let exact = f.call("tool.list", json!({"source":"mcp:alpha"})).await;
+    assert_eq!(names(&exact), ["src_alpha"], "{exact}");
+    assert!(exact["tools"][0].get("decision").is_none(), "{exact}");
+    assert!(exact.get("actor").is_none(), "{exact}");
+
+    let prefixed = f
+        .call(
+            "tool.list",
+            json!({"source_prefix":"mcp:", "include_decision":true, "actor":"agent:lister"}),
+        )
+        .await;
+    assert_eq!(
+        names(&prefixed),
+        ["src_alpha", "src_alphabet", "src_beta"],
+        "{prefixed}"
+    );
+    assert_eq!(prefixed["actor"], "agent:lister", "{prefixed}");
+    for row in prefixed["tools"].as_array().expect("tools array") {
+        let expected = if row["name"] == "src_beta" {
+            "deny"
+        } else {
+            "allow"
+        };
+        assert_eq!(row["decision"]["decision"], expected, "{row}");
+    }
+
+    let other_case = f.call("tool.list", json!({"source_prefix":"MCP:"})).await;
+    assert_eq!(other_case["count"], json!(0), "{other_case}");
+
+    let first = f
+        .call(
+            "tool.list",
+            json!({"source_prefix":"mcp:", "limit":2, "after":""}),
+        )
+        .await;
+    assert_eq!(names(&first), ["src_alpha", "src_alphabet"], "{first}");
+    let after = first["next_after"]
+        .as_str()
+        .expect("first filtered page has a continuation cursor")
+        .to_owned();
+    let second = f
+        .call(
+            "tool.list",
+            json!({"source_prefix":"mcp:", "limit":2, "after":after}),
+        )
+        .await;
+    assert_eq!(names(&second), ["src_beta"], "{second}");
+    assert!(second["next_after"].is_null(), "{second}");
+
+    let both = f
+        .call_err(
+            "tool.list",
+            json!({"source":"mcp:alpha", "source_prefix":"mcp:"}),
+        )
+        .await;
+    assert!(both.contains("not both"), "{both}");
+    let stray_actor = f
+        .call_err("tool.list", json!({"actor":"agent:lister"}))
+        .await;
+    assert!(stray_actor.contains("include_decision"), "{stray_actor}");
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn tool_list_offset_pagination_remains_supported() {
     let f = fixture();
     for name in ["t000", "t001", "t002"] {

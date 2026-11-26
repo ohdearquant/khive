@@ -449,6 +449,11 @@ impl SqlEntityStore {
             StorageCapability::Entities,
             operation,
         )?;
+        super::validate_json_prefix_paths(
+            &filter.property_prefixes,
+            StorageCapability::Entities,
+            operation,
+        )?;
         let namespace = namespace.to_string();
         let skip_total = mode == EntityPageMode::CountFree || is_complete_id_lookup(&filter, &page);
         let limit_i64 = i64::from(page.limit);
@@ -928,6 +933,12 @@ fn build_entity_where_with_mode(
         "properties",
         &filter.property_equalities,
     );
+    super::append_json_prefixes(
+        &mut conditions,
+        &mut params,
+        "properties",
+        &filter.property_prefixes,
+    );
     let clause = format!(" WHERE {}", conditions.join(" AND "));
     (clause, params)
 }
@@ -993,6 +1004,7 @@ fn build_entity_page_query_from_source(
 fn entity_list_source(filter: &EntityFilter) -> &'static str {
     if filter.tombstones != EntityTombstones::Live
         || !filter.property_equalities.is_empty()
+        || !filter.property_prefixes.is_empty()
         || !filter.ids.is_empty()
         || !filter.kinds.is_empty()
         || !filter.entity_types_by_kind.is_empty()
@@ -1182,6 +1194,7 @@ fn build_entity_cursor_query(
 fn is_complete_id_lookup(filter: &EntityFilter, page: &PageRequest) -> bool {
     !filter.ids.is_empty()
         && filter.property_equalities.is_empty()
+        && filter.property_prefixes.is_empty()
         && filter.kinds.is_empty()
         && filter.entity_types.is_empty()
         && filter.entity_types_by_kind.is_empty()
@@ -1422,6 +1435,11 @@ impl EntityStore for SqlEntityStore {
             StorageCapability::Entities,
             "query_entities_after",
         )?;
+        super::validate_json_prefix_paths(
+            &filter.property_prefixes,
+            StorageCapability::Entities,
+            "query_entities_after",
+        )?;
         if limit == 0 {
             return Ok(SeekPage::default());
         }
@@ -1526,6 +1544,11 @@ impl EntityStore for SqlEntityStore {
     ) -> Result<u64, StorageError> {
         super::validate_json_equality_paths(
             &filter.property_equalities,
+            StorageCapability::Entities,
+            "count_entities",
+        )?;
+        super::validate_json_prefix_paths(
+            &filter.property_prefixes,
             StorageCapability::Entities,
             "count_entities",
         )?;

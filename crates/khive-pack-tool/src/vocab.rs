@@ -210,7 +210,7 @@ pub static TOOL_HANDLERS: [HandlerDef; 15] = [
     },
     HandlerDef {
         name: "tool.list",
-        description: "List registry objects, optionally by kind. Supplying after starts or continues insertion-sequence cursor paging; otherwise offset pagination is used.",
+        description: "List registry objects, optionally by kind and by source. Supplying after starts or continues insertion-sequence cursor paging; otherwise offset pagination is used. With include_decision=true each row also carries the caller's policy decision, as tool.describe reports it.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -218,6 +218,10 @@ pub static TOOL_HANDLERS: [HandlerDef; 15] = [
             ParamDef { name: "limit", param_type: "integer", required: false, description: "Page size (default 100).", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "offset", param_type: "integer", required: false, description: "Page offset; used when after is omitted or null.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "after", param_type: "string", required: false, description: "Full UUID returned as next_after to continue cursor paging, or an empty string to start. When supplied, offset is ignored.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "source", param_type: "string", required: false, description: "Only rows whose source equals this value, for example mcp:example. Not together with source_prefix.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "source_prefix", param_type: "string", required: false, description: "Only rows whose source starts with this text, case-sensitive, for example mcp: for every MCP server. Not together with source.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "include_decision", param_type: "boolean", required: false, description: "When true, each row carries decision, the policy decision for actor (allow, deny or ask, with its source). Default false.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "actor", param_type: "string", required: false, description: "Actor label the decisions are evaluated for (defaults to the caller's actor). Only with include_decision=true.", resolution_mode: IdResolutionMode::NotApplicable },
             P_NAMESPACE,
         ],
     },
