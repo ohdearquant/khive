@@ -210,19 +210,20 @@ pub static TOOL_HANDLERS: [HandlerDef; 15] = [
     },
     HandlerDef {
         name: "tool.list",
-        description: "List registry objects, optionally by kind.",
+        description: "List registry objects, optionally by kind. Supplying after starts or continues insertion-sequence cursor paging; otherwise offset pagination is used.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
             ParamDef { name: "kind", param_type: "string", required: false, description: "tool, skill, plugin or verb.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "limit", param_type: "integer", required: false, description: "Page size (default 100).", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "offset", param_type: "integer", required: false, description: "Page offset.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "offset", param_type: "integer", required: false, description: "Page offset; used when after is omitted or null.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "after", param_type: "string", required: false, description: "Full UUID returned as next_after to continue cursor paging, or an empty string to start. When supplied, offset is ignored.", resolution_mode: IdResolutionMode::NotApplicable },
             P_NAMESPACE,
         ],
     },
     HandlerDef {
         name: "tool.check",
-        description: "Policy decision for an actor calling a tool: allow, deny or ask, with its source (grant, policy or the side-effect default).",
+        description: "Policy decision for an actor calling a tool: allow, deny or ask, with its source (grant, policy or the side-effect default). Credential screening checks the actor and tool fields copied into the decision receipt; standard MCP plugin identifiers are screened by namespace and callable-name component.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[P_TOOL, P_ACTOR, P_NAMESPACE],
@@ -315,11 +316,12 @@ pub static TOOL_HANDLERS: [HandlerDef; 15] = [
     },
     HandlerDef {
         name: "tool.policies",
-        description: "List policy rows with correction history and retirement metadata; retired rows never decide a check.",
+        description: "List policy rows with correction history and retirement metadata; pass policy_id to retrieve an exact row beyond the listing limit. Retired rows never decide a check.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
             ParamDef { name: "actor", param_type: "string", required: false, description: "Optional actor value to match against stored policy patterns. Omit to apply no actor filter within the request namespace.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "policy_id", param_type: "string", required: false, description: "Exact policy row ID, such as the policy_id returned by tool.check.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "limit", param_type: "integer", required: false, description: "Page size (default 100).", resolution_mode: IdResolutionMode::NotApplicable },
             P_NAMESPACE,
         ],
