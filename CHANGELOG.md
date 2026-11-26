@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-26
+
 ### Added
 
 - The `forms` pack (`khive-pack-forms`) stores printed forms as a typed graph: the issuer, each
@@ -17,12 +19,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `forms.resolve`, `forms.neighbourhood`, `forms.check`, `forms.lint` and `forms.export` read. An
   export replayed into an empty namespace exports identically. The pack is selected by name beside
   `kg` and is not in the default pack set (#6858).
+- `bridge.share` sends named files under the `[share]` root of the caller's configuration to a
+  share target, as blobs and one tree, and shares that tree with a receiving actor there through
+  the target's `computer.share`. The `[share]` table names the root, the per-file, total and
+  file-count limits, and its `[[share.targets]]` (`name`, `url`, `key_file`, `call_timeout_s`);
+  without the table every share is refused. The stdio bridge and `kkernel exec` answer the verb;
+  the daemon never sees it, a file's bytes or a target's key (#6850, #6852).
+- `git.check_log` reads the log of one completed check run of the platform's own runner, named by
+  the id `git.pr_state` returns, into the blob store, bounded from its end at
+  `KHIVE_GIT_CHECK_LOG_MAX_BYTES` (8 MiB unless set). It returns the content reference, the last
+  lines inline and whether anything was dropped. Terminal escapes and control characters are
+  removed, and the credential is replaced again after that cleaning (#6851, #6853, #6857).
+- `git.branch_delete` deletes one local branch whose tip equals `expected`, in one
+  compare-and-delete. It refuses a branch that any worktree has checked out or that is the head of
+  an open pull request, and it never deletes the remote branch (#6856).
+- A `[[git_write.allowed]]` row may set `access = "read"`: it names no branches and admits only
+  the git verbs that change neither the repository nor its remote (`git.checkout`, `git.diff`,
+  `git.reconcile`, `git.status`, `git.log`, `git.gates`, `git.pr_state` and `git.check_log`). A
+  row without `access` stays a write row (#6847).
+- A `[git_write.repositories."<path>"]` entry may set `author = { name = "...", email = "..." }`;
+  `git.commit` in that repository then uses it as author and committer in place of the calling
+  actor's identity. The actor's row still authorizes the call and pushes still present the
+  actor's credential. A name or email that is empty or holds a control character or an angle
+  bracket refuses at load (#6855).
+- `create` with `items` returns `full_id` beside `id` in every successful result, so agent output,
+  which shortens `id`, still carries a whole UUID for verbs that take no prefix (#6864).
+- `tool.list` accepts `after` and returns `next_after` for stable paging; offset paging is
+  unchanged (#6859).
+- `tool.policies` accepts `policy_id` (#6859).
 
 ### Changed
 
 - A link refused because its endpoints do not fit the relation now lists every endpoint pair the
   relation admits, from the base allowlist and from the loaded packs' rules, in the runtime's
   refusal and in the kg `link` verb's message (#6858).
+- `git.checkout` keeps a tracked symbolic link as a mode 120000 entry whose blob is the link's
+  literal target (#6854).
+- `kkernel exec --ops-file` reports `response_budget_refused` and exits non-zero when any op was
+  refused for the response budget; the error and the help state that the budget is per chunk. A
+  script that relied on exit 0 in that case now sees a failure (#6860).
+- The `apply_changeset` help shows an envelope line and an operation line, the `neighbors` help
+  lists the fields each projection carries, and the `kkernel exec --ops-file` help says the stdout
+  summary holds no per-op results (#6864).
+
+### Fixed
+
+- A routed computer call that fails before connecting (a name that does not resolve, a refused
+  connection, a failed TLS handshake) is reported as not sent, and a computer that answers a
+  request with JSON that is not a JSON-RPC message is refused as an unusable answer that may have
+  run (#6846).
+- `tool.check` screens an `mcp__plugin_<name>_<name>__<callable>` id by component, ending false
+  credential refusals (#6859).
+
+### Breaking (Rust crates)
+
+- `khive_runtime::KhiveConfig` gains the public field `share`,
+  `khive_runtime::engine_config::GitWriteEntryConfig` gains `access`,
+  `khive_runtime::engine_config::GitWriteRepositoryConfig` gains `author`, and
+  `khive_pack_git::write_policy::GitWritePolicyEntry` gains `access`. A struct literal must set
+  them (#6847, #6852, #6855).
+- `khive_runtime::ConfigError` gains the variant `InvalidShareConfig`; an exhaustive `match` needs
+  an arm for it (#6852).
 
 ## [0.22.0] - 2026-11-23
 
