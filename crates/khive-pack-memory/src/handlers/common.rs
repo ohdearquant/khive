@@ -516,6 +516,11 @@ pub(super) struct RecallParams {
     /// recall everything except its own writes.
     #[serde(default)]
     pub(super) exclude_tags: Option<Vec<String>>,
+    /// Rank memories whose stored tags include any of these values ahead of
+    /// the rest. Unlike `tags` it drops nothing: other matches fill the
+    /// remaining slots, and each group keeps its score order.
+    #[serde(default)]
+    pub(super) prefer_tags: Option<Vec<String>>,
     /// When true every hit carries `source_id`: the target of the memory's
     /// `annotates` edge, or null when the memory has none.
     #[serde(default)]

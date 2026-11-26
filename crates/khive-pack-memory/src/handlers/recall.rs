@@ -1180,6 +1180,16 @@ impl MemoryPack {
         ranked.sort_by(|a, b| {
             compare_rank_scores_desc(a.rank_score, b.rank_score).then(a.id.cmp(&b.id))
         });
+        if let Some(preferred) = p.prefer_tags.as_deref().filter(|tags| !tags.is_empty()) {
+            // A soft preference, applied before `limit`: memories carrying a preferred
+            // tag move ahead of the rest, each group keeps its score order, and
+            // nothing is dropped.
+            let (mut first, rest): (Vec<_>, Vec<_>) = ranked
+                .into_iter()
+                .partition(|sn| note_has_any_tag(sn.note.properties.as_ref(), preferred));
+            first.extend(rest);
+            ranked = first;
+        }
         ranked.truncate(limit);
 
         let pre_budget_count = ranked.len();
