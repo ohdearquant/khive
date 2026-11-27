@@ -241,26 +241,39 @@ pub(super) fn materialize(
     }];
     // ADR-221 section 2: a change that carries the alias set writes exactly
     // that set with the origins it names; the change set is a trusted
-    // carrier for origin, as an archive is.
+    // carrier for origin, as an archive is. Only the difference is written:
+    // an alias kept with the same origin keeps its row and its created_at.
     let aliases_changed = !same_aliases(&live.aliases, &before.aliases);
     if aliases_changed {
-        statements.push(PlanStatement {
-            statement: khive_db::stores::entity::entity_aliases_delete_all_statement(
-                &live.namespace,
-                id,
-            ),
-            guard: None,
-        });
-        statements.extend(live.aliases.iter().map(|held| PlanStatement {
-            statement: khive_db::stores::entity::entity_alias_insert_statement(
-                &live.namespace,
-                id,
-                &held.alias,
-                held.origin,
-                live.updated_at,
-            ),
-            guard: None,
-        }));
+        statements.extend(
+            before
+                .aliases
+                .iter()
+                .filter(|held| !live.aliases.contains(held))
+                .map(|held| PlanStatement {
+                    statement: khive_db::stores::entity::entity_name_alias_delete_statement(
+                        &live.namespace,
+                        id,
+                        &held.alias,
+                    ),
+                    guard: None,
+                }),
+        );
+        statements.extend(
+            live.aliases
+                .iter()
+                .filter(|held| !before.aliases.contains(held))
+                .map(|held| PlanStatement {
+                    statement: khive_db::stores::entity::entity_alias_insert_statement(
+                        &live.namespace,
+                        id,
+                        &held.alias,
+                        held.origin,
+                        live.updated_at,
+                    ),
+                    guard: None,
+                }),
+        );
         changed_fields.push("aliases");
     }
     statements.extend(

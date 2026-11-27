@@ -1,6 +1,7 @@
 use super::*;
 use khive_changeset::{EntityPatch, EntityPreimage, Envelope, UpdatePreimage};
 use khive_storage::entity::{EntityAlias, EntityAliasOrigin};
+use khive_storage::{SqlStatement, SqlValue};
 use khive_types::{Namespace, Timestamp};
 
 struct Fixture {
@@ -420,6 +421,81 @@ async fn an_alias_set_update_writes_exactly_that_set_with_its_origins() {
         sorted_aliases(&entity_row(rt, &token, a).await.unwrap()),
         after
     );
+}
+
+async fn alias_rows(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+) -> Vec<(String, String, i64)> {
+    let mut reader = rt.sql().reader().await.unwrap();
+    let rows = reader
+        .query_all(SqlStatement::new(
+            "SELECT alias, origin, created_at FROM entity_aliases \
+             WHERE namespace = ?1 AND entity_id = ?2 ORDER BY alias",
+            vec![
+                SqlValue::Text(token.namespace().as_str().to_owned()),
+                SqlValue::Text(id.to_string()),
+            ],
+        ))
+        .await
+        .unwrap();
+    rows.iter()
+        .map(|row| {
+            (
+                row.text("alias").unwrap().to_owned(),
+                row.text("origin").unwrap().to_owned(),
+                row.i64("created_at").unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// An alias-set update writes only the difference: an alias it keeps with the
+/// same origin keeps its row and its time, an alias whose origin changes is
+/// written again, and a dropped alias is gone.
+#[tokio::test]
+async fn an_alias_set_update_keeps_the_time_of_an_unchanged_alias() {
+    use EntityAliasOrigin::{Caller, Rename};
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let a = Uuid::new_v4();
+    assert!(matches!(
+        apply(rt, &token, vec![entity_create(a, "name")]).await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    insert_alias(rt, &token, a, "kept").await;
+    insert_alias(rt, &token, a, "moved").await;
+    insert_alias(rt, &token, a, "dropped").await;
+
+    let before = vec![
+        alias("dropped", Caller),
+        alias("kept", Caller),
+        alias("moved", Caller),
+    ];
+    let after = vec![
+        alias("added", Caller),
+        alias("kept", Caller),
+        alias("moved", Rename),
+    ];
+    let op = alias_update(a, "name", "name", before, after.clone());
+    assert!(matches!(
+        apply(rt, &token, vec![op]).await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+
+    assert_eq!(
+        sorted_aliases(&entity_row(rt, &token, a).await.unwrap()),
+        after
+    );
+    let rows = alias_rows(rt, &token, a).await;
+    let names: Vec<&str> = rows.iter().map(|(alias, _, _)| alias.as_str()).collect();
+    assert_eq!(names, ["added", "kept", "moved"]);
+    assert_eq!(rows[1], ("kept".to_owned(), "caller".to_owned(), 1));
+    assert_eq!(rows[2].1, "rename");
+    assert_ne!(rows[2].2, 1, "an origin change writes the alias again");
+    assert_ne!(rows[0].2, 1);
 }
 
 /// ADR-221 section 2: an alias never equals its entity's name. A rename onto
