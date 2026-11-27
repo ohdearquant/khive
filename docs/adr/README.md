@@ -240,6 +240,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-211](ADR-211-event-archive-backfill.md)                            | Event Archive Backfill                                                                                     |
 | [ADR-212](ADR-212-expendable-event-retention-class.md)                  | Expendable Event Retention Class                                                                           |
 | [ADR-220](ADR-220-routing-command-verbs-to-the-callers-computer.md)     | Routing Command Verbs to the Caller's Computer                                                             |
+| [ADR-221](ADR-221-entity-keys-and-aliases.md)                           | Entity Keys and Aliases                                                                                    |
 
 <!-- END GENERATED ADR CATALOG -->
 
