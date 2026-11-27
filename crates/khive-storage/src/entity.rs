@@ -111,6 +111,20 @@ impl Entity {
     }
 }
 
+/// A caller key that one entity released and another live entity now holds.
+///
+/// Restoring the releasing entity would need the key back, so a restore
+/// refuses while any such row exists (ADR-221 section 1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityKeyHolder {
+    /// Entity kind the key is scoped to.
+    pub kind: String,
+    /// The caller key, exactly as stored.
+    pub key: String,
+    /// The live entity that holds the key now.
+    pub holder_id: Uuid,
+}
+
 /// Entity liveness selected by an [`EntityFilter`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -359,4 +373,30 @@ pub trait EntityStore: Send + Sync + 'static {
     /// Returns the entity row even when `deleted_at` is set. Callers use this
     /// to distinguish "soft-deleted" from "never existed".
     async fn get_entity_including_deleted(&self, id: Uuid) -> StorageResult<Option<Entity>>;
+    /// Fetch the live entity that holds `key` for `kind` in `namespace`.
+    ///
+    /// `Ok(None)` means no live entity holds the key: it was never claimed,
+    /// or its holder was deleted and released it.
+    async fn get_entity_by_key(
+        &self,
+        _namespace: &str,
+        _kind: &str,
+        _key: &str,
+    ) -> StorageResult<Option<Entity>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Entities,
+            operation: "get_entity_by_key".into(),
+            message: "this backend does not implement entity keys".into(),
+        })
+    }
+    /// List the keys entity `id` released that another live entity holds now,
+    /// ordered by kind, then key. An empty list means a restore of `id` can
+    /// take every one of its keys back.
+    async fn taken_entity_keys(&self, _id: Uuid) -> StorageResult<Vec<EntityKeyHolder>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Entities,
+            operation: "taken_entity_keys".into(),
+            message: "this backend does not implement entity keys".into(),
+        })
+    }
 }

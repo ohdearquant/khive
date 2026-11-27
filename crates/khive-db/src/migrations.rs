@@ -422,6 +422,13 @@ const V63_UP: &str = include_str!("../sql/063-pending-entity-indexes.sql");
 const V64_UP: &str = include_str!("../sql/064-node-confirmed-pins.sql");
 const V65_UP: &str = include_str!("../sql/065-graph-edges-target-relation-index.sql");
 const V66_UP: &str = include_str!("../sql/066-comm-undelivered-due-index.sql");
+const V67_UP: &str = include_str!("../sql/067-entity-keys.sql");
+
+/// DDL for entity keys (ADR-221): the `entity_keys` table and the triggers on
+/// `entities` that release, reclaim and drop its rows. Shared between
+/// migration V67 and the entity store's idempotent schema setup, so a store
+/// opened without the migration chain still has the table its triggers name.
+pub const ENTITY_KEYS_DDL: &str = V67_UP;
 
 /// Retained V66 schema needs only its ledger restored, not an index rebuild.
 fn migrate_undelivered_due_index(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
@@ -899,6 +906,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 66,
         name: "comm_undelivered_due_index",
         up: V66_UP,
+    },
+    VersionedMigration {
+        version: 67,
+        name: "entity_keys",
+        up: V67_UP,
     },
 ];
 

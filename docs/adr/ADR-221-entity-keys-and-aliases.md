@@ -55,8 +55,9 @@ from the issue's wording, which asks for per namespace and type: `entity_type` c
 `update` and may be null, so a key scoped on it could move or collide when the type changes. A
 caller that wants a key per type puts the type in the key (`paper:smith2024`).
 
-Keys are rows in a new table `entity_keys(namespace, kind, key, entity_id, created_at)` with a
-unique index on `(namespace, kind, key)`. A table rather than a column lets a merge move a key to
+Keys are rows in a new table `entity_keys(namespace, kind, key, entity_id, created_at,
+released_at)` with a unique index on `(namespace, kind, key)` over held rows (`released_at IS
+NULL`), so a deleted entity keeps its released keys for a restore to take back. A table rather than a column lets a merge move a key to
 the kept entity, and lets one entity hold several keys after merges.
 
 A keyed `create` behaves as a keyed note `create` does (ADR-172 Amendment 6):

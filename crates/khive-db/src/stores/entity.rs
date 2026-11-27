@@ -8,7 +8,9 @@ use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use khive_storage::attachment::{Attachment, AttachmentSubstrate};
-use khive_storage::entity::{Entity, EntityFilter, EntityTombstones, EntityTypeCounts};
+use khive_storage::entity::{
+    Entity, EntityFilter, EntityKeyHolder, EntityTombstones, EntityTypeCounts,
+};
 use khive_storage::error::StorageError;
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlStatement, SqlValue,
@@ -119,6 +121,39 @@ fn entity_write_statement(entity: &Entity, insert: &str, label: &str) -> SqlStat
         label: Some(label.to_string()),
     }
 }
+
+/// Claim caller `key` for `kind` in `namespace` on behalf of `entity_id`.
+///
+/// Inserts one row when no live holder has the key and none otherwise, so an
+/// atomic plan guards it at exactly one affected row: zero means another
+/// entity holds the key, and the caller re-reads the holder (ADR-221 section 1).
+pub fn entity_key_claim_statement(
+    namespace: &str,
+    kind: &str,
+    key: &str,
+    entity_id: Uuid,
+    created_at: i64,
+) -> SqlStatement {
+    SqlStatement {
+        sql: "INSERT INTO entity_keys (namespace, kind, key, entity_id, created_at) \
+              SELECT ?1, ?2, ?3, ?4, ?5 \
+              WHERE NOT EXISTS (SELECT 1 FROM entity_keys \
+                WHERE namespace = ?1 AND kind = ?2 AND key = ?3 AND released_at IS NULL)"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(kind.to_string()),
+            SqlValue::Text(key.to_string()),
+            SqlValue::Text(entity_id.to_string()),
+            SqlValue::Integer(created_at),
+        ],
+        label: Some(ENTITY_KEY_CLAIM_LABEL.to_string()),
+    }
+}
+
+/// Statement label of [`entity_key_claim_statement`], matched by callers that
+/// read a failed claim guard as a held key.
+pub const ENTITY_KEY_CLAIM_LABEL: &str = "entity-key-claim";
 
 /// Conditional-insert companion to [`entity_upsert_statement`]. Every
 /// conflict leaves the existing row untouched so a caller can read the
@@ -1510,6 +1545,65 @@ impl EntityStore for SqlEntityStore {
         .await
     }
 
+    async fn get_entity_by_key(
+        &self,
+        namespace: &str,
+        kind: &str,
+        key: &str,
+    ) -> Result<Option<Entity>, StorageError> {
+        let namespace = namespace.to_string();
+        let kind = kind.to_string();
+        let key = key.to_string();
+        self.with_reader("get_entity_by_key", move |conn| {
+            let sql = format!(
+                "SELECT {ENTITY_SELECT_COLUMNS} FROM entity_keys \
+                 JOIN entities ON entities.id = entity_keys.entity_id \
+                 WHERE entity_keys.namespace = ?1 AND entity_keys.kind = ?2 \
+                   AND entity_keys.key = ?3 AND entity_keys.released_at IS NULL \
+                   AND entities.deleted_at IS NULL"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(rusqlite::params![namespace, kind, key])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(read_entity(row)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    async fn taken_entity_keys(&self, id: Uuid) -> Result<Vec<EntityKeyHolder>, StorageError> {
+        let id_str = id.to_string();
+        self.with_reader("taken_entity_keys", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT mine.kind, mine.key, held.entity_id FROM entity_keys AS mine \
+                 JOIN entity_keys AS held \
+                   ON held.namespace = mine.namespace AND held.kind = mine.kind \
+                  AND held.key = mine.key AND held.released_at IS NULL \
+                  AND held.entity_id <> mine.entity_id \
+                 WHERE mine.entity_id = ?1 AND mine.released_at IS NOT NULL \
+                 ORDER BY mine.kind, mine.key",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![id_str], |row| {
+                let holder: String = row.get(2)?;
+                let holder_id = Uuid::parse_str(&holder).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(EntityKeyHolder {
+                    kind: row.get(0)?,
+                    key: row.get(1)?,
+                    holder_id,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
     async fn count_entities_by_type(
         &self,
         namespaces: &[String],
@@ -1609,7 +1703,8 @@ impl EntityStore for SqlEntityStore {
 const ENTITIES_DDL: &str = include_str!("../../sql/entities-ddl.sql");
 
 pub(crate) fn ensure_entities_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(ENTITIES_DDL)
+    conn.execute_batch(ENTITIES_DDL)?;
+    conn.execute_batch(crate::migrations::ENTITY_KEYS_DDL)
 }
 
 #[cfg(test)]

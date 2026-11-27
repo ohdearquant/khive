@@ -155,6 +155,11 @@ impl KhiveRuntime {
         if entity.deleted_at.is_none() {
             return Ok(Some((entity, false)));
         }
+        // ADR-221 section 1: restore takes back every key the delete
+        // released, or none. The restoring UPDATE's trigger reclaims them, and
+        // the held-key index aborts it when one is taken; this read names the
+        // taken keys before any write.
+        self.refuse_restore_over_taken_keys(token, id).await?;
         let updated_at =
             Utc::now()
                 .timestamp_micros()
@@ -233,9 +238,14 @@ impl KhiveRuntime {
                     .map_err(|e| restore_reindex_failed("entity", id, e))?;
                 Ok(Some((restored, true)))
             }
-            Ok(AtomicRunOutcome::RolledBack { failure, .. }) => Err(RuntimeError::Internal(
-                format!("entity restore rolled back: {failure:?}"),
-            )),
+            Ok(AtomicRunOutcome::RolledBack { failure, .. }) => {
+                // A key taken between the read above and the UPDATE aborts
+                // the restore inside the transaction; name it the same way.
+                self.refuse_restore_over_taken_keys(token, id).await?;
+                Err(RuntimeError::Internal(format!(
+                    "entity restore rolled back: {failure:?}"
+                )))
+            }
             Err(error) => Err(RuntimeError::Storage(error.0)),
         }
     }

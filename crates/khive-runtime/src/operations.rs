@@ -331,6 +331,8 @@ pub(crate) fn legacy_post_commit_result_with_embedding<T>(
 mod attachments;
 mod entity_bulk;
 mod entity_create;
+mod entity_keys;
+pub use entity_keys::{entity_key_conflict, KeyedEntityCreate};
 mod entity_indexes;
 #[cfg(any(test, feature = "fault-injection"))]
 mod fault_injection;

@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use khive_runtime::operations::dependency_kind_inference_hint;
 use khive_runtime::{
-    run_atomic_unit, runtime_error_value, AtomicOpPlan, AtomicRunOutcome, DomainDisposition,
-    EntityCreateSpec, KhiveRuntime, KindHook, NamespaceToken, NoteCreateSpec, RuntimeError,
-    VerbRegistry,
+    entity_key_conflict, run_atomic_unit, runtime_error_value, AtomicOpPlan, AtomicRunOutcome,
+    DomainDisposition, EntityCreateSpec, KeyedEntityCreate, KhiveRuntime, KindHook, NamespaceToken,
+    NoteCreateSpec, RuntimeError, VerbRegistry,
 };
 use khive_storage::note::Note;
 use khive_storage::Entity;
@@ -198,11 +198,14 @@ impl KgPack {
                 )));
             }
         }
-        if fields.kind != "note"
-            && (fields.key.is_some() || fields.embed.is_some() || fields.fence.is_some())
-        {
+        if fields.kind != "note" && (fields.embed.is_some() || fields.fence.is_some()) {
             return Err(RuntimeError::InvalidInput(
-                "key, embed and fence apply only to notes".into(),
+                "embed and fence apply only to notes".into(),
+            ));
+        }
+        if fields.kind != "note" && fields.kind != "entity" && fields.key.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "key applies only to notes and entities".into(),
             ));
         }
         let normalized = if fields.kind == "entity" {
@@ -1066,23 +1069,70 @@ impl KgPack {
                 let canonical = sub_kind.clone().expect("entity_kind canonicalized above");
                 let name = p.name.expect("entity fields validated during preparation");
                 let tags = p.tags.unwrap_or_default();
-                let (entity, embedding_report, degradations) = self
-                    .runtime
-                    .create_entity_with_post_commit_report(
-                        token,
-                        &canonical,
-                        p.entity_type.as_deref(),
-                        &name,
-                        p.description.as_deref(),
-                        p.properties,
-                        tags,
-                    )
-                    .await?;
+                let (entity, embedding_report, degradations) = match p.key.as_deref() {
+                    None => {
+                        self.runtime
+                            .create_entity_with_post_commit_report(
+                                token,
+                                &canonical,
+                                p.entity_type.as_deref(),
+                                &name,
+                                p.description.as_deref(),
+                                p.properties,
+                                tags,
+                            )
+                            .await?
+                    }
+                    // ADR-221 section 1: a keyed entity create answers as a
+                    // keyed note create does. A replay writes nothing and
+                    // returns before hooks, dedup and requested edges run.
+                    Some(key) => match self
+                        .runtime
+                        .create_keyed_entity_with_post_commit_report(
+                            token,
+                            &canonical,
+                            key,
+                            p.entity_type.as_deref(),
+                            &name,
+                            p.description.as_deref(),
+                            p.properties,
+                            tags,
+                        )
+                        .await?
+                    {
+                        KeyedEntityCreate::Created {
+                            entity,
+                            embedding,
+                            degradations,
+                        } => (entity, embedding, degradations),
+                        KeyedEntityCreate::Replayed { entity } => {
+                            if registry.allows_entity_key_disclosure(token, &canonical) {
+                                return Ok(json!({
+                                    "id": entity.id.to_string(),
+                                    "created": false,
+                                }));
+                            }
+                            return Err(entity_key_conflict(key, None));
+                        }
+                        KeyedEntityCreate::Conflict { existing_id } => {
+                            let disclosed = registry
+                                .allows_entity_key_disclosure(token, &canonical)
+                                .then_some(existing_id);
+                            return Err(entity_key_conflict(key, disclosed));
+                        }
+                    },
+                };
                 let id = entity.id;
                 let mut entity_json = normalize_entity_timestamps(to_json(&entity)?);
                 if let Some(applied) = entity_type_normalized {
                     if let Some(obj) = entity_json.as_object_mut() {
                         obj.insert("entity_type_normalized".to_string(), applied);
+                    }
+                }
+                // A fresh keyed create says so, as a keyed note create does.
+                if p.key.is_some() {
+                    if let Some(obj) = entity_json.as_object_mut() {
+                        obj.insert("created".to_string(), json!(true));
                     }
                 }
                 (

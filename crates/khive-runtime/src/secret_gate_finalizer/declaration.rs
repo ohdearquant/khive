@@ -797,7 +797,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.create_entity_inner",
         site: "khive-runtime/src/operations/entity_create.rs::KhiveRuntime::create_entity_with_embedding_report_inner",
-        expected_writes: 1,
+        expected_writes: 2,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::KindHookCreate,

@@ -37,7 +37,7 @@ pub use blob::{
 };
 pub use capability::StorageCapability;
 pub use embedding_space::{EmbeddingSpaceIdentity, EmbeddingSpaceIdentityError, EmbeddingSpaceKey};
-pub use entity::{Entity, EntityFilter, EntityStore};
+pub use entity::{Entity, EntityFilter, EntityKeyHolder, EntityStore};
 pub use env::read_env_number;
 pub use error::{CapacityUnavailablePhase, StorageError, WriterTaskRequestState};
 
