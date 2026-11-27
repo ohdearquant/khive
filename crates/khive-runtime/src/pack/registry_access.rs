@@ -579,6 +579,8 @@ impl VerbRegistry {
         ("forms", "forms.check"),
         ("forms", "forms.lint"),
         ("forms", "forms.export"),
+        // operation (SQL reader only; the four writers commit one atomic unit each)
+        ("operation", "operation.frontier"),
         // Registered rollback-mode map reads: no domain or maintenance writes.
         ("code", "code.deps"),
         ("code", "code.list"),
