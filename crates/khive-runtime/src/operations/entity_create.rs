@@ -123,6 +123,8 @@ impl KhiveRuntime {
                 description: Some(document.1.into()),
                 properties,
                 tags: Vec::new(),
+                key: None,
+                aliases: vec![],
             }),
         })];
         if let Some(previous) = previous {
