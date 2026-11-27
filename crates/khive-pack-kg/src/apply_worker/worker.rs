@@ -588,6 +588,59 @@ impl ProposalApplyWorker {
                         }],
                     })
                 }
+                ProposalChangeset::RetireEdge {
+                    source,
+                    target,
+                    relation,
+                } => {
+                    let edge_id = self.live_edge_id(token, source, target, relation).await?;
+                    // Soft delete, the `delete` default: `restore` brings the edge back.
+                    let plan = prepare_op(
+                        &self.runtime,
+                        token,
+                        "delete",
+                        &serde_json::json!({ "id": edge_id }),
+                    )
+                    .await?;
+                    Ok(PreparedApply::Atomic {
+                        plans: vec![plan],
+                        created_records: vec![],
+                    })
+                }
+                ProposalChangeset::SupersedeEdge { old, new } => {
+                    let old_id = self
+                        .live_edge_id(token, &old.source, &old.target, &old.relation)
+                        .await?;
+                    let retire = prepare_op(
+                        &self.runtime,
+                        token,
+                        "delete",
+                        &serde_json::json!({ "id": old_id }),
+                    )
+                    .await?;
+                    let relation = crate::handlers::parse_relation(new.relation.as_str())?;
+                    let args = serde_json::json!({
+                        "source_id": Uuid::from_u128(new.source.to_u128()),
+                        "target_id": Uuid::from_u128(new.target.to_u128()),
+                        "relation": relation.as_str(),
+                        "weight": new.weight.map(f64::from),
+                        "metadata": new.metadata,
+                    });
+                    let add = prepare_op(&self.runtime, token, "link", &args).await?;
+                    let (source_id, target_id) = match &add {
+                        AtomicOpPlan::Link(plan) => (plan.source_id(), plan.target_id()),
+                        _ => unreachable!("link prepare returned a different plan variant"),
+                    };
+                    // One unit: the retirement and the new edge commit together or not at all.
+                    Ok(PreparedApply::Atomic {
+                        plans: vec![retire, add],
+                        created_records: vec![PendingCreatedRecord::Edge {
+                            source_id,
+                            target_id,
+                            relation,
+                        }],
+                    })
+                }
                 ProposalChangeset::AddNote { note } => {
                     let kind =
                         crate::handlers::canonical_note_kind(note.kind.as_str(), registry)?;
@@ -650,6 +703,49 @@ impl ProposalApplyWorker {
                 },
             }
         })
+    }
+
+    /// The id of the live edge with this natural key, read through the caller's
+    /// visible namespaces. A symmetric relation matches either endpoint order.
+    async fn live_edge_id(
+        &self,
+        token: &NamespaceToken,
+        source: &Id128,
+        target: &Id128,
+        relation: &khive_types::EdgeRelation,
+    ) -> Result<Uuid, RuntimeError> {
+        let relation = crate::handlers::parse_relation(relation.as_str())?;
+        let source_id = Uuid::from_u128(source.to_u128());
+        let target_id = Uuid::from_u128(target.to_u128());
+        let mut orders = vec![(source_id, target_id)];
+        if relation.is_symmetric() && source_id != target_id {
+            orders.push((target_id, source_id));
+        }
+        for (source, target) in orders {
+            let found = self
+                .runtime
+                .list_edges(
+                    token,
+                    EdgeListFilter {
+                        source_id: Some(source),
+                        target_id: Some(target),
+                        relations: vec![relation],
+                        ..Default::default()
+                    },
+                    1,
+                    0,
+                )
+                .await?
+                .into_iter()
+                .next();
+            if let Some(edge) = found {
+                return Ok(edge.id.0);
+            }
+        }
+        Err(RuntimeError::NotFound(format!(
+            "no live {} edge from {source_id} to {target_id}",
+            relation.as_str()
+        )))
     }
 
     async fn resolve_created_records(

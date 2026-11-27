@@ -764,6 +764,68 @@ mod serde_opt_opt {
     }
 }
 
+/// Natural key of a stored edge in a proposal: the edge from `source` to
+/// `target` with `relation`.
+#[cfg(feature = "serde")]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProposalEdgeKey {
+    pub source: Id128,
+    pub target: Id128,
+    pub relation: crate::EdgeRelation,
+}
+
+#[cfg(feature = "serde")]
+impl ProposalEdgeKey {
+    /// True when both keys name the same edge. A symmetric relation names one
+    /// edge whichever endpoint comes first.
+    fn names_same_edge(
+        &self,
+        source: &Id128,
+        target: &Id128,
+        relation: &crate::EdgeRelation,
+    ) -> bool {
+        if self.relation != *relation {
+            return false;
+        }
+        (self.source == *source && self.target == *target)
+            || (relation.is_symmetric() && self.source == *target && self.target == *source)
+    }
+}
+
+/// The edge a `SupersedeEdge` change adds. Fields and validation match
+/// `AddEdge`.
+#[cfg(feature = "serde")]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProposalEdgeDraft {
+    pub source: Id128,
+    pub target: Id128,
+    pub relation: crate::EdgeRelation,
+    #[serde(default)]
+    pub weight: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[cfg(feature = "serde")]
+fn validate_proposal_edge_weight(
+    variant: &str,
+    weight: Option<f32>,
+) -> Result<(), alloc::string::String> {
+    if let Some(w) = weight {
+        if !w.is_finite() {
+            return Err(alloc::format!(
+                "ProposalChangeset {variant} weight must be finite, got {w}"
+            ));
+        }
+        if !crate::validate_edge_weight(f64::from(w)) {
+            return Err(alloc::format!(
+                "ProposalChangeset {variant} weight must be in [0.0, 1.0], got {w}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The set of KG mutations a proposal intends to apply as a proposal changeset.
 #[cfg(feature = "serde")]
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -788,6 +850,20 @@ pub enum ProposalChangeset {
         weight: Option<f32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         metadata: Option<serde_json::Value>,
+    },
+    /// Retire the live edge with this natural key by soft deletion, so
+    /// `restore` on the edge's id brings it back. Applying fails, writing
+    /// nothing, when no live edge has the key.
+    RetireEdge {
+        source: Id128,
+        target: Id128,
+        relation: crate::EdgeRelation,
+    },
+    /// Retire the live edge named by `old` as `RetireEdge` does and add `new`
+    /// as `AddEdge` does, in one atomic unit: both land or neither does.
+    SupersedeEdge {
+        old: ProposalEdgeKey,
+        new: ProposalEdgeDraft,
     },
     /// Add a note (entity-annotating or stand-alone).
     AddNote {
@@ -814,18 +890,14 @@ pub enum ProposalChangeset {
 impl ProposalChangeset {
     fn validate(&self) -> Result<(), alloc::string::String> {
         match self {
-            Self::AddEdge { weight, .. } => {
-                if let Some(w) = weight {
-                    if !w.is_finite() {
-                        return Err(alloc::format!(
-                            "ProposalChangeset AddEdge weight must be finite, got {w}"
-                        ));
-                    }
-                    if !crate::validate_edge_weight(f64::from(*w)) {
-                        return Err(alloc::format!(
-                            "ProposalChangeset AddEdge weight must be in [0.0, 1.0], got {w}"
-                        ));
-                    }
+            Self::AddEdge { weight, .. } => validate_proposal_edge_weight("AddEdge", *weight),
+            Self::SupersedeEdge { old, new } => {
+                validate_proposal_edge_weight("SupersedeEdge", new.weight)?;
+                if old.names_same_edge(&new.source, &new.target, &new.relation) {
+                    return Err(
+                        "ProposalChangeset SupersedeEdge new must name a different edge than old"
+                            .into(),
+                    );
                 }
                 Ok(())
             }
@@ -873,6 +945,15 @@ impl<'de> serde::Deserialize<'de> for ProposalChangeset {
                 weight: Option<f32>,
                 metadata: Option<serde_json::Value>,
             },
+            RetireEdge {
+                source: Id128,
+                target: Id128,
+                relation: crate::EdgeRelation,
+            },
+            SupersedeEdge {
+                old: ProposalEdgeKey,
+                new: ProposalEdgeDraft,
+            },
             AddNote {
                 note: NoteDraft,
             },
@@ -907,6 +988,16 @@ impl<'de> serde::Deserialize<'de> for ProposalChangeset {
                 weight,
                 metadata,
             },
+            ProposalChangesetRaw::RetireEdge {
+                source,
+                target,
+                relation,
+            } => Self::RetireEdge {
+                source,
+                target,
+                relation,
+            },
+            ProposalChangesetRaw::SupersedeEdge { old, new } => Self::SupersedeEdge { old, new },
             ProposalChangesetRaw::AddNote { note } => Self::AddNote { note },
             ProposalChangesetRaw::MergeEntities { into, from } => {
                 Self::MergeEntities { into, from }

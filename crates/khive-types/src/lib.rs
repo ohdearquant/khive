@@ -68,7 +68,8 @@ pub use event::{
 };
 #[cfg(feature = "serde")]
 pub use event::{
-    EntityDraft, NoteDraft, ProposalChangeset, ProposalCreatedPayload, ProposalEntityPatch,
+    EntityDraft, NoteDraft, ProposalChangeset, ProposalCreatedPayload, ProposalEdgeDraft,
+    ProposalEdgeKey, ProposalEntityPatch,
 };
 pub use hash::{fnv1a_64, Hash32};
 pub use header::Header;

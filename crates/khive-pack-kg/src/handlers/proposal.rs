@@ -85,6 +85,8 @@ fn reject_reserved_changeset_properties(changeset: &ProposalChangeset) -> Result
             Ok(())
         }
         ProposalChangeset::AddEdge { .. }
+        | ProposalChangeset::RetireEdge { .. }
+        | ProposalChangeset::SupersedeEdge { .. }
         | ProposalChangeset::MergeEntities { .. }
         | ProposalChangeset::SupersedeEntity { .. } => Ok(()),
     }

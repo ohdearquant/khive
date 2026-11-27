@@ -1610,3 +1610,71 @@ proposal whose payload carries a key these types do not define still loads, revi
   live entity is unchanged.
 - The `propose` help states the compound form, the `id` and `metadata` fields and the
   `canonical` arm.
+
+## Amendment (2026-11-26): retiring and superseding edges in proposals
+
+**Status**: Accepted (2026-11-26). Adds two step arms, `RetireEdge` and `SupersedeEdge`, so a
+reviewed proposal can take an edge out of the graph. Every other arm is unchanged. Issue #6802
+(K41).
+
+### Problem
+
+`propose` can add an edge (`AddEdge`) but has no arm that removes one. A proposer who wants an
+edge gone records the intent in an `AddNote`, and the edge stays live after the note is approved
+and applied. A replacement (the edge should point somewhere else) is two separate changes, and
+reviewing the addition without the removal leaves both edges live.
+
+The `Canonical` arm can already delete an edge, but its delete operation carries the edge's full
+preimage, and the proposer encodes it in a change-set delta. The step form exists so a proposer
+does not have to.
+
+### E1. `RetireEdge { source, target, relation }`
+
+The step names an edge by its natural key. At apply, the worker reads the live edge with that
+source, target and relation through the caller's visible namespaces. For a symmetric relation
+either endpoint order names the edge. The worker then soft-deletes the edge through the same
+preparation as `delete` on that edge, which writes `EdgeDeleted`. `restore` on the edge's id
+brings it back, as it does after a direct soft delete.
+
+When no live edge has the key, the apply fails before anything is written and records
+`ProposalApplied { Failed }`. The step creates nothing, so a successful apply lists no created
+records.
+
+### E2. `SupersedeEdge { old, new }`
+
+`old` is an edge key as in E1. `new` has `AddEdge`'s fields: `source`, `target`, `relation`, an
+optional `weight` and optional `metadata`, validated as `AddEdge` validates them. The worker
+prepares the retirement of `old` (E1) and the link for `new` (as for `AddEdge`) and runs both as
+one atomic unit, so either both land or neither does. A failure while preparing either half
+writes nothing. A successful apply lists the new edge's id as its created record.
+
+Decoding refuses a `SupersedeEdge` whose `new` names the same edge as `old`: the same source,
+target and relation, or, for a symmetric relation, the same endpoints in either order. Retiring
+an edge and adding it back under the same key is not a supersession, and the natural key would
+make the second half collide with the first.
+
+### E3. What this amendment does not change
+
+- Both arms are legacy step arms under K3: they carry no preimage, and `review` and apply output
+  state `preimage: none` for them.
+- The retirement runs the `delete` preparation unchanged and adds no rule of its own for which
+  edges a proposal may retire.
+- Multi-step `Compound` handling is unchanged. The 2026-11-14 amendment's translation table has no
+  row for these arms, so until a follow-up maps them to the `Canonical` delete operation, they are
+  used as single steps.
+- Proposals stored before this amendment load and apply as they did.
+
+### E4. Verification
+
+- A `RetireEdge` proposal, approved and applied, leaves the edge soft-deleted, and `restore`
+  makes it live again.
+- A `RetireEdge` for a symmetric relation, written with the endpoints in the other order,
+  retires the edge.
+- A `RetireEdge` whose key matches no live edge fails at apply, and the edge that does exist is
+  unchanged.
+- A `SupersedeEdge` proposal retires the old edge, adds the new one with its weight, and lists the
+  new edge's id as the created record.
+- A `SupersedeEdge` whose new edge cannot be added fails at apply, and the old edge stays live.
+- Decoding refuses a `SupersedeEdge` whose `new` names the same edge as `old`, including a
+  symmetric relation with swapped endpoints, and refuses an out-of-range `new.weight`; a directed
+  relation with reversed endpoints decodes as a different edge.
