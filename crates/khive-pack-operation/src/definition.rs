@@ -495,6 +495,10 @@ fn store(kind: &'static str, id: &str, version: i64, value: &Value, source: &Val
     }
 }
 
+/// Steps one operation type may declare. The cycle check walks the dependency chain one
+/// recursion level per step, so this also bounds its depth.
+pub(crate) const MAX_STEPS: usize = 256;
+
 fn compile_type(source: &Value) -> Result<Compiled, Refusal> {
     let input: TypeInput = serde_json::from_value(source.clone())
         .map_err(|e| Refusal::new("invalid_document", e.to_string()))?;
@@ -512,6 +516,16 @@ fn compile_type(source: &Value) -> Result<Compiled, Refusal> {
         return Err(Refusal::new(
             "no_steps",
             format!("{} declares no step", input.id),
+        ));
+    }
+    if input.steps.len() > MAX_STEPS {
+        return Err(Refusal::new(
+            "too_many_steps",
+            format!(
+                "{} declares {} steps; a type holds at most {MAX_STEPS}",
+                input.id,
+                input.steps.len()
+            ),
         ));
     }
     let mut scope = Scope {

@@ -5,7 +5,7 @@
 //! activate rules, an identity none of them holds for is not asked. A step nobody is asked
 //! is bypassed, and a step after it waits on what the bypassed step waited on. A step is done
 //! when every asked identity acted (`all_of`), when one did (`at_least_one`), or, for a slot
-//! of one identity, when its act is recorded.
+//! of one identity, when an act naming no identity or the identity bound there is recorded.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -344,7 +344,10 @@ pub(crate) fn evaluate(
                     (Some(identity), true) => {
                         acts.is_some_and(|acts| acts.contains(&Some(identity.reference())))
                     }
-                    _ => acts.is_some_and(|acts| !acts.is_empty()),
+                    (Some(identity), false) => acts.is_some_and(|acts| {
+                        acts.contains(&None) || acts.contains(&Some(identity.reference()))
+                    }),
+                    (None, _) => acts.is_some_and(|acts| !acts.is_empty()),
                 };
                 Unit {
                     identity,
