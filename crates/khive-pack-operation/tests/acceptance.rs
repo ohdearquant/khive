@@ -564,6 +564,26 @@ async fn acts_name_an_identity_bound_to_their_slot() {
         )
         .await;
     assert!(refused.contains("act_identity_unbound"), "{refused}");
+    // The preparer slot holds one identity: an act naming anyone else is refused, and it
+    // would otherwise have turned the step done.
+    let refused = store
+        .refused(
+            office(),
+            "operation.record",
+            json!({"operation": operation, "items": [act("request-x", "request", Some("stranger"))]}),
+        )
+        .await;
+    assert!(refused.contains("act_identity_unbound"), "{refused}");
+    let frontier = store.frontier(&operation, json!({})).await;
+    assert_eq!(status(&frontier, "request"), "owed");
+    store
+        .record(
+            &operation,
+            json!([act("request-p", "request", Some(PREPARER))]),
+        )
+        .await;
+    let frontier = store.frontier(&operation, json!({})).await;
+    assert_eq!(status(&frontier, "request"), "done");
     let refused = store
         .refused(
             office(),
@@ -572,6 +592,43 @@ async fn acts_name_an_identity_bound_to_their_slot() {
         )
         .await;
     assert!(refused.contains("unknown_step"), "{refused}");
+}
+
+fn chain(id: &str, steps: usize) -> Value {
+    let steps: Vec<Value> = (0..steps)
+        .map(|i| {
+            let mut step = json!({"name": format!("s{i}"), "by": "office"});
+            if i > 0 {
+                step["after"] = json!([format!("s{}", i - 1)]);
+            }
+            if i + 1 == steps {
+                step["outcome"] = json!(true);
+            }
+            step
+        })
+        .collect();
+    json!({"operation_types": [{"id": id, "version": 1, "slots": [{"name": "office"}], "steps": steps}]})
+}
+
+#[tokio::test]
+async fn a_type_declares_at_most_256_steps() {
+    let store = Store::new();
+    let published = store
+        .call(
+            author(),
+            "operation.define",
+            json!({"document": chain("long", 256)}),
+        )
+        .await;
+    assert_eq!(published["published"][0]["version"], 1, "{published}");
+    let refused = store
+        .refused(
+            author(),
+            "operation.define",
+            json!({"document": chain("longer", 257)}),
+        )
+        .await;
+    assert!(refused.contains("too_many_steps"), "{refused}");
 }
 
 #[tokio::test]

@@ -97,7 +97,7 @@ pub(crate) static OPERATION_HANDLERS: [HandlerDef; 5] = [
                 "items",
                 "array",
                 true,
-                "Items, each {kind, key, observed_at?} with: binding {slot, identity}; fact {field, value, identity?}; act {step, identity?}, where identity is required when the step's slot repeats and must be bound there.",
+                "Items, each {kind, key, observed_at?} with: binding {slot, identity}; fact {field, value, identity?}; act {step, identity?}, where identity is required when the step's slot repeats, and a named identity must be bound to that slot whenever the slot holds one.",
             ),
         ],
     },
@@ -1044,9 +1044,11 @@ impl OperationPack {
                         } => {
                             let by = act_slots.get(step).cloned().unwrap_or_default();
                             let reference = identity.reference();
-                            if slots.get(&by).copied().unwrap_or(false)
-                                && !bound.get(&by).is_some_and(|held| held.contains(&reference))
-                            {
+                            let held = bound.get(&by).map_or(&[][..], Vec::as_slice);
+                            // A repeating slot is asked of each identity bound there; a slot of
+                            // one identity is asked of the identity bound there, once one is.
+                            let repeats = slots.get(&by).copied().unwrap_or(false);
+                            if (repeats || !held.is_empty()) && !held.contains(&reference) {
                                 return Err(refuse(
                                     &unit_verb,
                                     Refusal::new(
