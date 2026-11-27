@@ -120,10 +120,25 @@ impl KhiveRuntime {
     /// The restore is guarded by both the tombstone's id/namespace and the
     /// current uniqueness state, so a caller cannot resurrect over a newer
     /// live record. Indexes are rebuilt only after the row restore commits.
+    /// A `restore_key_conflict` names each taken key's kind and key and no
+    /// holder id; [`Self::restore_entity_with_key_disclosure`] names the
+    /// holders a caller may see.
     pub async fn restore_entity(
         &self,
         token: &NamespaceToken,
         id: Uuid,
+    ) -> RuntimeResult<Option<(Entity, bool)>> {
+        self.restore_entity_with_key_disclosure(token, id, &|_: &str| false)
+            .await
+    }
+
+    /// [`Self::restore_entity`], naming in a `restore_key_conflict` the
+    /// holder of each taken key whose kind `disclose` admits.
+    pub async fn restore_entity_with_key_disclosure(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        disclose: &(dyn Fn(&str) -> bool + Sync),
     ) -> RuntimeResult<Option<(Entity, bool)>> {
         let Some(entity) = self
             .entities(token)?
@@ -155,6 +170,12 @@ impl KhiveRuntime {
         if entity.deleted_at.is_none() {
             return Ok(Some((entity, false)));
         }
+        // ADR-221 section 1: restore takes back every key the delete
+        // released, or none. The restoring UPDATE's trigger reclaims them, and
+        // the held-key index aborts it when one is taken; this read names the
+        // taken keys before any write.
+        self.refuse_restore_over_taken_keys(token, id, disclose)
+            .await?;
         let updated_at =
             Utc::now()
                 .timestamp_micros()
@@ -233,9 +254,15 @@ impl KhiveRuntime {
                     .map_err(|e| restore_reindex_failed("entity", id, e))?;
                 Ok(Some((restored, true)))
             }
-            Ok(AtomicRunOutcome::RolledBack { failure, .. }) => Err(RuntimeError::Internal(
-                format!("entity restore rolled back: {failure:?}"),
-            )),
+            Ok(AtomicRunOutcome::RolledBack { failure, .. }) => {
+                // A key taken between the read above and the UPDATE aborts
+                // the restore inside the transaction; name it the same way.
+                self.refuse_restore_over_taken_keys(token, id, disclose)
+                    .await?;
+                Err(RuntimeError::Internal(format!(
+                    "entity restore rolled back: {failure:?}"
+                )))
+            }
             Err(error) => Err(RuntimeError::Storage(error.0)),
         }
     }

@@ -753,13 +753,17 @@ async fn keyed_create_c10_scope_is_kind_and_namespace_bounded_and_key_length_is_
     assert_ne!(other_ns["id"], obs["id"]);
     assert_eq!(other_ns["created"], true);
 
-    assert!(registry
+    // Entities take keys too, in their own (namespace, kind) scope: the same
+    // key on a concept creates an entity, never a replay of a note.
+    let concept = registry
         .dispatch(
             "create",
-            json!({"kind":"concept", "name":"x", "key":"nope"}),
+            json!({"kind":"concept", "name":"x", "key":"scope/k"}),
         )
         .await
-        .is_err());
+        .unwrap();
+    assert_eq!(concept["created"], true);
+    assert_ne!(concept["id"], obs["id"]);
 
     assert!(registry
         .dispatch(

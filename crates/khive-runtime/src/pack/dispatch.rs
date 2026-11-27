@@ -520,6 +520,20 @@ impl VerbRegistry {
             .is_ok_and(|decision| decision.is_allow())
     }
 
+    /// A keyed entity create may reveal the key's holder only when the same
+    /// caller can list entities of that kind (ADR-221 section 1).
+    pub fn allows_entity_key_disclosure(&self, token: &NamespaceToken, kind: &str) -> bool {
+        let request = GateRequest::new(
+            token.actor().clone(),
+            token.namespace().clone(),
+            "list",
+            serde_json::json!({"kind": kind}),
+        );
+        self.gate
+            .check(&request)
+            .is_ok_and(|decision| decision.is_allow())
+    }
+
     /// The caller's declared owned namespaces for one dispatch: the per-request
     /// identity's list when an identity is supplied, else the registry's baked
     /// list. Entries that fail `Namespace::parse` are dropped, so a malformed
