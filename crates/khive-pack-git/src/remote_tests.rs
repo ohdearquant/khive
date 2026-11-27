@@ -99,6 +99,12 @@ struct State {
     pull_request_list_reply: Option<Value>,
     issue_list_reply: Option<Value>,
 }
+/// Whether a query is the one the listing verbs send. The branch delete asks the same
+/// resource for open pull requests filtered by head, which this must not answer.
+fn is_listing_query(query: &str) -> bool {
+    query.starts_with("state=") && query.contains("&sort=created&direction=desc&")
+}
+
 /// One page of a listing reply as the platform pages it: `per_page` rows starting after
 /// `(page - 1) * per_page`. A reply that is not an array is returned as it stands.
 fn listing_page(reply: Option<Value>, query: &str) -> Value {
@@ -229,7 +235,7 @@ impl RemoteTransport for Recording {
             );
         }
         if let Some(query) = path.strip_prefix(&format!("repos/{SLUG}/issues?")) {
-            if query.starts_with("state=") {
+            if is_listing_query(query) {
                 return Ok(listing_page(s.issue_list_reply.clone(), query));
             }
         }
@@ -347,7 +353,7 @@ impl RemoteTransport for Recording {
             return s.jobs.get(&id).cloned().ok_or(RemoteError::Refused);
         }
         if let Some(query) = path.strip_prefix(&format!("repos/{SLUG}/pulls?")) {
-            if query.starts_with("state=") {
+            if is_listing_query(query) {
                 return Ok(listing_page(s.pull_request_list_reply.clone(), query));
             }
             if let Some(reply) = s.open_pulls_reply.clone() {
