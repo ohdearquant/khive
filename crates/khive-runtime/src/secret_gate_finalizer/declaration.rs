@@ -211,7 +211,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "runtime.atomic.entity.create",
-        site: "khive-runtime/src/atomic_prepare/add_update.rs::add_entity_plan",
+        site: "khive-runtime/src/atomic_prepare/add_update.rs::add_entity_record_plan",
         expected_writes: 2,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,

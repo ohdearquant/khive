@@ -7,6 +7,7 @@ mod envelope;
 mod invert;
 mod op;
 mod preimage;
+mod record;
 mod strict;
 
 pub use changeset::{from_ndjson, to_ndjson, ChangeSet, ChangeSetError};
@@ -18,3 +19,4 @@ pub use op::{
     NotePreimage, Op, RestoreOp, UpdateOp, UpdatePatch, UpdatePreimage,
 };
 pub use preimage::{check_delete, check_update, CanonicalRecordRef, PreimageMismatch};
+pub use record::EntityRecord;

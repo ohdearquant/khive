@@ -207,10 +207,54 @@ pub(crate) fn validate_import_entity_record(
     Ok(())
 }
 
+/// The plan of a canonical change-set create that names a key or aliases
+/// (ADR-221 sections 1 and 2). The aliases are projected onto `entity` before
+/// its row and text document are built, so both carry them, and they are
+/// written in the same unit. The key claim runs first under an exactly-one
+/// guard, so a key another live entity took after preparation rolls the whole
+/// change set back.
+pub(crate) fn canonical_entity_create_plan(
+    entity: &mut khive_storage::Entity,
+    key: Option<&str>,
+    aliases: &crate::EntityAliasChange,
+) -> RuntimeResult<AtomicOpPlan> {
+    let at = entity.created_at;
+    let (_, alias_statements, _) =
+        crate::operations::apply_entity_alias_change(entity, aliases, at, None);
+    let mut plan = add_entity_record_plan(entity, true)?;
+    if let Some(key) = key {
+        plan.statements.insert(
+            0,
+            PlanStatement {
+                statement: khive_db::stores::entity::entity_key_claim_statement(
+                    &entity.namespace,
+                    &entity.kind,
+                    key,
+                    entity.id,
+                    at,
+                ),
+                guard: Some(AffectedRowGuard::exactly(1)),
+            },
+        );
+    }
+    plan.statements
+        .extend(crate::operations::unguarded_alias_statements(
+            alias_statements,
+        ));
+    Ok(AtomicOpPlan::AddEntity(plan))
+}
+
 fn add_entity_plan(
     entity: &khive_storage::Entity,
     insert_if_absent: bool,
 ) -> RuntimeResult<AtomicOpPlan> {
+    add_entity_record_plan(entity, insert_if_absent).map(AtomicOpPlan::AddEntity)
+}
+
+fn add_entity_record_plan(
+    entity: &khive_storage::Entity,
+    insert_if_absent: bool,
+) -> RuntimeResult<AddEntityPlan> {
     // Keep the check at the write owner as well as the callers' early validation
     // boundaries, which preserve their established refusal order.
     crate::secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
@@ -232,13 +276,13 @@ fn add_entity_plan(
         });
     }
 
-    Ok(AtomicOpPlan::AddEntity(AddEntityPlan {
+    Ok(AddEntityPlan {
         entity_id: entity.id,
         statements,
         post_commit: PostCommitEffect::ReindexEntity {
             entity_id: entity.id,
         },
-    }))
+    })
 }
 
 /// Build the prepared plan for an `AddNote` proposal change. Mirrors

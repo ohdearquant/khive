@@ -20,6 +20,7 @@ pub mod edge;
 pub mod edge_rules;
 pub mod email_address;
 pub mod entity;
+pub mod entity_alias;
 pub mod entity_type;
 #[cfg(feature = "std")]
 pub mod env;
@@ -56,6 +57,7 @@ pub use edge_rules::{
     BASE_ENTITY_ENDPOINT_RULES,
 };
 pub use entity::{validate_edge_weight, Entity, EntityKind, ImportKindPolicy, Link, PropertyValue};
+pub use entity_alias::{EntityAlias, EntityAliasOrigin};
 pub use entity_type::{
     to_snake_case, EntityTypeDef, EntityTypeError, EntityTypeRegistry, ResolvedEntityType,
 };
