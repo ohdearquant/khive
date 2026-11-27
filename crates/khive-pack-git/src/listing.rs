@@ -3,6 +3,7 @@
 use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
 use serde_json::{json, Value};
 
+#[cfg(unix)]
 use super::issue::{author, labels, line};
 use super::{endpoint, observed_sha, observed_string};
 use crate::local_handlers::{required, validate_keys, Failure};
