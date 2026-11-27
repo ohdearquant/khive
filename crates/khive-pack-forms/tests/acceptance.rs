@@ -4,9 +4,16 @@
 //! Two invented forms: A, an outgoing international wire, and B, a transfer
 //! of securities. A third form, C, is filed instead of A, never with it.
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use khive_pack_forms::FormsPack;
-use khive_runtime::{KhiveRuntime, PackRegistry, RuntimeConfig, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::{
+    EmbedderProvider, EngineConfig, KhiveRuntime, PackRegistry, RuntimeConfig, RuntimeError,
+    VerbRegistry, VerbRegistryBuilder,
+};
 use khive_types::Pack;
+use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use serde_json::{json, Value};
 
 use khive_pack_kg as _;
@@ -24,16 +31,91 @@ struct Store {
     _runtime: KhiveRuntime,
 }
 
+/// The test embedding model: counts of each letter a to z, so wordings that
+/// share letters point the same way, with no model weights to load.
+const LETTERS: &str = "forms-letter-counts";
+const LETTER_DIMS: usize = 26;
+
+struct LetterService;
+
+#[async_trait]
+impl EmbeddingService for LetterService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts
+            .iter()
+            .map(|text| {
+                let mut counts = vec![0.0; LETTER_DIMS];
+                for c in text.chars().flat_map(char::to_lowercase) {
+                    if c.is_ascii_lowercase() {
+                        counts[usize::from(c as u8 - b'a')] += 1.0;
+                    }
+                }
+                counts
+            })
+            .collect())
+    }
+
+    fn supports_model(&self, _: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        LETTERS
+    }
+}
+
+struct LetterProvider;
+
+#[async_trait]
+impl EmbedderProvider for LetterProvider {
+    fn name(&self) -> &str {
+        LETTERS
+    }
+
+    fn dimensions(&self) -> usize {
+        LETTER_DIMS
+    }
+
+    async fn build(&self) -> Result<Arc<dyn EmbeddingService>, RuntimeError> {
+        Ok(Arc::new(LetterService))
+    }
+}
+
 impl Store {
     fn new() -> Self {
+        Self::build(false)
+    }
+
+    /// A store whose runtime embeds with the letter-count model.
+    fn with_letter_embedder() -> Self {
+        Self::build(true)
+    }
+
+    fn build(embeds: bool) -> Self {
         let packs = vec!["kg".to_owned(), FormsPack::NAME.to_owned()];
-        let runtime = KhiveRuntime::new(RuntimeConfig {
+        let mut config = RuntimeConfig {
             db_path: None,
             packs: packs.clone(),
             actor_id: Some(ACTOR.to_owned()),
             ..RuntimeConfig::no_embeddings()
-        })
-        .expect("in-memory runtime without embedding services");
+        };
+        if embeds {
+            config.engines = Some(vec![EngineConfig {
+                name: LETTERS.to_owned(),
+                weight: 1.0,
+                dims: Some(LETTER_DIMS as i64),
+            }]);
+        }
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        if embeds {
+            runtime
+                .try_register_embedder(LetterProvider)
+                .expect("the letter-count model registers");
+        }
         let mut builder = VerbRegistryBuilder::new();
         builder.with_actor_id(Some(ACTOR.to_owned()));
         PackRegistry::register_packs(&packs, runtime.clone(), &mut builder)
@@ -1373,4 +1455,381 @@ async fn lint_lists_fields_reached_only_through_values_and_items_bound_twice() {
         "{lint}"
     );
     assert_eq!(lint["clean"], false, "{lint}");
+}
+
+/// Two forms that word their fields their own way: one prints the recipient
+/// account number as "3 Recipient's account no.", the other prints the
+/// signature date as "(a) Date".
+fn wording_forms() -> [Value; 2] {
+    [
+        json!({
+            "form_id": "PAYEE-1",
+            "revision": "2026-10",
+            "title": "Payee details",
+            "source": {"url": "https://forms.example/payee-1.pdf", "sha256": "e".repeat(64)},
+            "fields": [{
+                "name": "recipient account number",
+                "definition": "Number of the account that receives the payment.",
+                "value_type": "identifier",
+                "aliases": ["beneficiary account number"]
+            }],
+            "items": [item("3 Recipient's account no.", 1, 3, "text", "recipient account number")]
+        }),
+        json!({
+            "form_id": "ATTEST-1",
+            "revision": "2026-10",
+            "title": "Attestation",
+            "source": {"url": "https://forms.example/attest-1.pdf", "sha256": "f".repeat(64)},
+            "fields": [{"name": "signature date", "definition": "Date the form is signed.", "value_type": "date"}],
+            "items": [item("(a) Date", 1, 1, "text", "signature date")]
+        }),
+    ]
+}
+
+async fn with_wording_forms(store: Store) -> Store {
+    for document in wording_forms() {
+        let loaded = store
+            .call("forms.load", json!({"document": document}))
+            .await;
+        assert_eq!(loaded["loaded"], true, "{loaded}");
+    }
+    store
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_climbs_from_the_exact_wording_to_initials_and_words() {
+    let store = with_wording_forms(Store::new()).await;
+    for (text, name, matched_by, wording) in [
+        (
+            "recipient account number",
+            "recipient account number",
+            "name",
+            "recipient account number",
+        ),
+        (
+            "Recipients account no",
+            "recipient account number",
+            "normalised",
+            "3 Recipient's account no.",
+        ),
+        (
+            "RAN",
+            "recipient account number",
+            "initials",
+            "recipient account number",
+        ),
+        (
+            "account number",
+            "recipient account number",
+            "words",
+            "recipient account number",
+        ),
+        (
+            "number of the account",
+            "recipient account number",
+            "words",
+            "recipient account number",
+        ),
+        ("date signed", "signature date", "words", "signature date"),
+        ("Date", "signature date", "label", "(a) Date"),
+    ] {
+        let reply = store.call("forms.resolve", json!({"text": text})).await;
+        let hits = field_hits(&reply);
+        assert_eq!(hits.len(), 1, "{text}: {reply}");
+        assert_eq!(hits[0]["name"], name, "{text}: {reply}");
+        assert_eq!(hits[0]["matched_by"], matched_by, "{text}: {reply}");
+        assert_eq!(hits[0]["matched_wording"], wording, "{text}: {reply}");
+        assert_eq!(reply["ambiguous"], false, "{text}: {reply}");
+        let again = store.call("forms.resolve", json!({"text": text})).await;
+        assert_eq!(again, reply, "{text}: the same graph gives the same answer");
+    }
+
+    let date = store.call("forms.resolve", json!({"text": "Date"})).await;
+    assert_eq!(
+        field_hits(&date)[0]["forms"][0]["item"],
+        "(a) Date",
+        "the form that prints the wording is cited: {date}"
+    );
+    let partial = store
+        .call("forms.resolve", json!({"text": "number of the account"}))
+        .await;
+    let coverage = field_hits(&partial)[0]["coverage"]
+        .as_f64()
+        .expect("a words match carries its coverage");
+    assert!((coverage - 2.0 / 3.0).abs() < 1e-9, "{partial}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_miss_names_the_nearest_fields_and_min_rung_stops_the_climb() {
+    let store = with_wording_forms(Store::new()).await;
+
+    let miss = store
+        .call("forms.resolve", json!({"text": "routing number"}))
+        .await;
+    assert_eq!(miss["hits"], json!([]), "{miss}");
+    assert_eq!(miss["total"], 0, "{miss}");
+    let near = miss["near"].as_array().expect("near");
+    assert_eq!(near.len(), 1, "{miss}");
+    assert_eq!(near[0]["name"], "recipient account number", "{miss}");
+    assert_eq!(near[0]["shared"], json!(["number"]), "{miss}");
+
+    let nothing = store
+        .call("forms.resolve", json!({"text": "postal code"}))
+        .await;
+    assert_eq!(nothing["near"], json!([]), "{nothing}");
+    assert_eq!(
+        nothing["note"], "no field shares a word with the text",
+        "{nothing}"
+    );
+
+    let exact = store
+        .call(
+            "forms.resolve",
+            json!({"text": "recipient account number", "min_rung": "exact"}),
+        )
+        .await;
+    assert_eq!(exact["hits"].as_array().expect("hits").len(), 1, "{exact}");
+    assert_eq!(exact["hits"][0]["matched_by"], "name", "{exact}");
+    let words_only = store
+        .call(
+            "forms.resolve",
+            json!({"text": "account number", "min_rung": "exact"}),
+        )
+        .await;
+    assert_eq!(words_only["hits"], json!([]), "{words_only}");
+    let initials_only = store
+        .call(
+            "forms.resolve",
+            json!({"text": "RAN", "min_rung": "normalised"}),
+        )
+        .await;
+    assert_eq!(initials_only["hits"], json!([]), "{initials_only}");
+
+    for (args, refusal) in [
+        (json!({"text": "date", "limit": 0}), "limit must be"),
+        (json!({"text": "date", "limit": 101}), "limit must be"),
+        (
+            json!({"text": "date", "min_rung": "fuzzy"}),
+            "min_rung must be one of",
+        ),
+    ] {
+        let message = store.refused("forms.resolve", args).await;
+        assert!(message.contains(refusal), "{message}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_wording_of_a_general_field_answers_with_its_narrower_fields() {
+    let scenario = Scenario::full().await;
+    let reply = scenario
+        .store
+        .call(
+            "forms.resolve",
+            json!({"text": "account number of the recipient"}),
+        )
+        .await;
+    assert_eq!(reply["ambiguous"], true, "{reply}");
+    assert_eq!(
+        reply["general"][0]["name"], "recipient account number",
+        "{reply}"
+    );
+    let hits = field_hits(&reply);
+    assert_eq!(
+        hits.iter()
+            .map(|hit| hit["name"].clone())
+            .collect::<Vec<_>>(),
+        [
+            json!("recipient bank account number"),
+            json!("recipient brokerage account number")
+        ],
+        "{reply}"
+    );
+    for hit in hits {
+        assert_eq!(hit["matched_by"], "words", "{reply}");
+        assert_eq!(hit["via"], "recipient account number", "{reply}");
+        assert_eq!(hit["ambiguous"], true, "{reply}");
+    }
+
+    let first = scenario
+        .store
+        .call(
+            "forms.resolve",
+            json!({"text": "account number of the recipient", "limit": 1}),
+        )
+        .await;
+    assert_eq!(first["hits"].as_array().expect("hits").len(), 1, "{first}");
+    assert_eq!(
+        first["total"], 2,
+        "the reply says how many hits the limit left out: {first}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_semantic_rung_runs_only_when_named_and_never_outranks_a_lexical_hit() {
+    let plain = with_wording_forms(Store::new()).await;
+    let unconfigured = plain
+        .call(
+            "forms.resolve",
+            json!({"text": "account number", "min_rung": "semantic"}),
+        )
+        .await;
+    assert_eq!(unconfigured["semantic"]["ran"], false, "{unconfigured}");
+    assert_eq!(field_hits(&unconfigured).len(), 1, "{unconfigured}");
+
+    let store = with_wording_forms(Store::with_letter_embedder()).await;
+    let lexical = store
+        .call("forms.resolve", json!({"text": "account number"}))
+        .await;
+    assert!(lexical.get("semantic").is_none(), "{lexical}");
+    assert_eq!(field_hits(&lexical).len(), 1, "{lexical}");
+
+    let reply = store
+        .call(
+            "forms.resolve",
+            json!({"text": "account number", "min_rung": "semantic"}),
+        )
+        .await;
+    assert_eq!(reply["semantic"]["ran"], true, "{reply}");
+    let hits = field_hits(&reply);
+    assert_eq!(hits.len(), 2, "{reply}");
+    assert_eq!(hits[0]["name"], "recipient account number", "{reply}");
+    assert_eq!(hits[0]["matched_by"], "words", "{reply}");
+    assert_eq!(hits[1]["name"], "signature date", "{reply}");
+    assert_eq!(hits[1]["matched_by"], "semantic", "{reply}");
+    assert!(
+        hits[1]["rank"].as_u64() > hits[0]["rank"].as_u64(),
+        "a semantic hit ranks below every lexical one: {reply}"
+    );
+    let similarity = hits[1]["similarity"].as_f64().expect("similarity");
+    assert!(similarity > 0.0 && similarity <= 1.0, "{reply}");
+    let again = store
+        .call(
+            "forms.resolve",
+            json!({"text": "account number", "min_rung": "semantic"}),
+        )
+        .await;
+    assert_eq!(again, reply, "same graph, same answer");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_later_revision_keeps_the_short_aliases_of_a_field_it_reuses() {
+    let store = Store::new();
+    store
+        .call("forms.load", json!({"document": form_a()}))
+        .await;
+    let revision = json!({
+        "form_id": A,
+        "revision": "2026-09",
+        "title": "Outgoing international wire",
+        "source": {"url": "https://forms.example/wire-1-2026-09.pdf", "sha256": "8".repeat(64)},
+        "fields": [{
+            "name": "recipient account number",
+            "definition": "Number of the recipient's account at the receiving bank.",
+            "value_type": "identifier",
+            "aliases": ["acct no", "recipient name"]
+        }],
+        "items": [item("Acct no", 1, 1, "text", "acct no")]
+    });
+    let loaded = store
+        .call("forms.load", json!({"document": revision}))
+        .await;
+    assert_eq!(loaded["counts"]["fields_reused"], 1, "{loaded}");
+    assert_eq!(loaded["counts"]["aliases_added"], 1, "{loaded}");
+    let warnings = texts_of(&loaded["warnings"]);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("\"recipient name\" already names")),
+        "{loaded}"
+    );
+
+    let field = store
+        .call(
+            "forms.neighbourhood",
+            json!({"node": "recipient account number"}),
+        )
+        .await;
+    assert_eq!(
+        field["field"]["aliases"],
+        json!(["recipient account number", "acct no"]),
+        "{field}"
+    );
+    let resolved = store
+        .call("forms.resolve", json!({"text": "ACCT NO"}))
+        .await;
+    let hits = field_hits(&resolved);
+    assert_eq!(hits.len(), 1, "{resolved}");
+    assert_eq!(hits[0]["name"], "recipient account number", "{resolved}");
+    assert_eq!(hits[0]["matched_by"], "alias", "{resolved}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_adds_the_further_wordings_it_is_given() {
+    let store = Store::new();
+    store
+        .call("forms.load", json!({"document": form_a()}))
+        .await;
+    let added = store
+        .call(
+            "forms.add_item",
+            json!({
+                "form": A,
+                "item": {"label": "Beneficiary account", "page": 2, "order": 1, "item_kind": "text", "filled_by": "customer"},
+                "field": {"name": "recipient account number", "definition": "Number of the account at the receiving firm.", "value_type": "identifier"}
+            }),
+        )
+        .await;
+    assert_eq!(added["status"], "match", "{added}");
+    let same = store
+        .call(
+            "forms.same",
+            json!({
+                "item": added["item"]["id"],
+                "field": "recipient account number",
+                "aliases": ["RAN", "acct no", "sender name"]
+            }),
+        )
+        .await;
+    assert_eq!(same["alias_added"], "Beneficiary account", "{same}");
+    assert_eq!(same["aliases_added"], json!(["RAN", "acct no"]), "{same}");
+    let warnings = texts_of(&same["warnings"]);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("\"sender name\" already names")),
+        "{same}"
+    );
+
+    let field = store
+        .call(
+            "forms.neighbourhood",
+            json!({"node": "recipient account number"}),
+        )
+        .await;
+    assert_eq!(
+        field["field"]["aliases"],
+        json!([
+            "recipient account number",
+            "Beneficiary account",
+            "RAN",
+            "acct no"
+        ]),
+        "{field}"
+    );
+    let resolved = store
+        .call("forms.resolve", json!({"text": "acct no"}))
+        .await;
+    assert_eq!(
+        field_hits(&resolved)[0]["matched_by"],
+        "alias",
+        "{resolved}"
+    );
+}
+
+fn texts_of(list: &Value) -> Vec<String> {
+    list.as_array()
+        .expect("a list")
+        .iter()
+        .map(|entry| entry.as_str().expect("a string").to_owned())
+        .collect()
 }
