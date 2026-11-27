@@ -14,13 +14,18 @@ CREATE TABLE IF NOT EXISTS entity_aliases (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_aliases_entity
     ON entity_aliases(namespace, entity_id, alias);
 
--- Resolve looks an alias up across the namespace's entities.
+-- Resolve looks an alias up across the namespace's entities. The index
+-- carries entity_id so the lookup reads it alone; without that column SQLite
+-- prefers idx_entity_aliases_entity, which covers the lookup but is ordered by
+-- entity, and walks every alias row of the namespace.
 CREATE INDEX IF NOT EXISTS idx_entity_aliases_alias
-    ON entity_aliases(namespace, alias);
+    ON entity_aliases(namespace, alias, entity_id);
 
--- A hard delete removes the entity's alias rows with it.
+-- A hard delete removes the entity's alias rows with it. The namespace term
+-- lets the delete seek idx_entity_aliases_entity, whose first column it is.
 CREATE TRIGGER IF NOT EXISTS entity_aliases_drop_on_hard_delete
 AFTER DELETE ON entities
 BEGIN
-    DELETE FROM entity_aliases WHERE entity_id = OLD.id;
+    DELETE FROM entity_aliases
+    WHERE namespace = OLD.namespace AND entity_id = OLD.id;
 END;

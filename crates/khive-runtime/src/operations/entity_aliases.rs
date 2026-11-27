@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use super::*;
 use khive_db::stores::entity::{
     entity_alias_insert_statement, entity_caller_alias_delete_statement,
+    entity_name_alias_delete_statement,
 };
 use khive_storage::entity::{EntityAlias, EntityAliasOrigin};
 
@@ -148,35 +149,39 @@ pub(crate) fn apply_entity_alias_change(
         .into_iter()
         .map(str::to_owned)
         .collect();
+    let name = entity.name.clone();
+    // An alias never equals its entity's name: an entity renamed to an alias
+    // it holds loses that row, whatever wrote it. That delete is its own
+    // statement; the caller's removals reach caller-origin rows only.
+    let renamed_onto = entity.aliases.iter().any(|held| held.alias == name);
     let held = caller_alias_set(entity);
     let removed: Vec<String> = if change.replace {
         held.iter()
-            .filter(|alias| !wanted.contains(**alias))
+            .filter(|alias| !wanted.contains(**alias) && **alias != name)
             .map(|alias| (*alias).to_owned())
             .collect()
     } else {
-        let (removed, not_removed): (Vec<String>, Vec<String>) = change
-            .remove
-            .iter()
-            .cloned()
-            .partition(|alias| held.contains(alias.as_str()));
+        let (removed, not_removed): (Vec<String>, Vec<String>) =
+            change.remove.iter().cloned().partition(|alias| {
+                held.contains(alias.as_str()) || (renamed_onto && *alias == name)
+            });
         report.not_removed = not_removed;
-        // An alias never equals its entity's name: a patch that renames the
-        // entity to one of its caller aliases removes that alias.
-        let mut removed = removed;
-        if held.contains(entity.name.as_str()) && !removed.contains(&entity.name) {
-            removed.push(entity.name.clone());
-        }
-        removed
+        removed.into_iter().filter(|alias| *alias != name).collect()
     };
     let namespace = entity.namespace.clone();
     let mut statements: Vec<SqlStatement> = removed
         .iter()
         .map(|alias| entity_caller_alias_delete_statement(&namespace, entity.id, alias))
         .collect();
-    entity
-        .aliases
-        .retain(|held| held.origin != EntityAliasOrigin::Caller || !removed.contains(&held.alias));
+    if renamed_onto {
+        statements.push(entity_name_alias_delete_statement(
+            &namespace, entity.id, &name,
+        ));
+    }
+    entity.aliases.retain(|held| {
+        held.alias != name
+            && (held.origin != EntityAliasOrigin::Caller || !removed.contains(&held.alias))
+    });
     for alias in wanted {
         if entity.aliases.iter().any(|held| held.alias == alias) {
             continue;

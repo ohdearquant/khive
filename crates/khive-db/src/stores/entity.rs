@@ -224,6 +224,27 @@ pub fn entity_caller_alias_delete_statement(
     }
 }
 
+/// Remove the alias row of `entity_id` equal to `name`, whatever wrote it.
+/// An alias never equals its entity's name, so an entity renamed to an alias
+/// it holds loses that row, of any origin (ADR-221 section 2).
+pub fn entity_name_alias_delete_statement(
+    namespace: &str,
+    entity_id: Uuid,
+    name: &str,
+) -> SqlStatement {
+    SqlStatement {
+        sql: "DELETE FROM entity_aliases \
+              WHERE namespace = ?1 AND entity_id = ?2 AND alias = ?3"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(entity_id.to_string()),
+            SqlValue::Text(name.to_string()),
+        ],
+        label: Some("entity-name-alias-delete".to_string()),
+    }
+}
+
 /// Conditional-insert companion to [`entity_upsert_statement`]. Every
 /// conflict leaves the existing row untouched so a caller can read the
 /// winner and explicitly reapply its intended delta.
@@ -909,6 +930,11 @@ fn build_entity_where_with_mode(
                 vec![Box::new(namespace.to_string())],
             )
         };
+    // The namespace parameters are ?1..?N, in the order of `ns_params`.
+    let namespace_placeholders = (1..=ns_params.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let mut conditions: Vec<String> = vec![ns_condition];
     match filter.tombstones {
@@ -1031,11 +1057,20 @@ fn build_entity_where_with_mode(
     if let Some(ref exact) = filter.name_or_alias_exact {
         params.push(Box::new(exact.clone()));
         let index = params.len();
+        // An id list from two index seeks, names from idx_entities_name and
+        // aliases from idx_entity_aliases_alias, each bound to the filter's
+        // namespaces. `entity_read_source` pins the primary key so the list
+        // drives the read. Without statistics SQLite reads an OR of the two
+        // terms, or a subquery that refers to the outer row, by walking the
+        // whole namespace.
         conditions.push(format!(
-            "(name = ?{index} COLLATE BINARY OR EXISTS (SELECT 1 FROM entity_aliases AS entity_alias \
-             WHERE entity_alias.namespace = entities.namespace \
-               AND entity_alias.entity_id = entities.id \
-               AND entity_alias.alias = ?{index} COLLATE BINARY))"
+            "id IN (SELECT named.id FROM entities AS named \
+             WHERE named.namespace IN ({namespace_placeholders}) \
+             AND named.name = ?{index} COLLATE BINARY \
+             UNION ALL SELECT entity_alias.entity_id \
+             FROM entity_aliases AS entity_alias \
+             WHERE entity_alias.namespace IN ({namespace_placeholders}) \
+             AND entity_alias.alias = ?{index} COLLATE BINARY)"
         ));
     }
 
@@ -1089,13 +1124,18 @@ fn build_entity_where_with_mode(
 /// An ID-filtered read is bounded by the caller's IDs, even on a fresh
 /// database without sqlite_stat1. The other predicates can match a large
 /// namespace; letting one of their indexes drive turns a bounded lookup into
-/// a scan of every row in that namespace.
+/// a scan of every row in that namespace. An exact name-or-alias lookup is
+/// bounded the same way, by the id list its predicate seeks.
 fn entity_read_source(filter: &EntityFilter) -> &'static str {
-    if filter.ids.is_empty() {
-        "entities"
-    } else {
+    if reads_by_id_list(filter) {
         "entities INDEXED BY sqlite_autoindex_entities_1"
+    } else {
+        "entities"
     }
+}
+
+fn reads_by_id_list(filter: &EntityFilter) -> bool {
+    !filter.ids.is_empty() || filter.name_or_alias_exact.is_some()
 }
 
 fn build_entity_count_query(filter: &EntityFilter, where_sql: &str) -> String {
@@ -1170,7 +1210,7 @@ fn entity_list_source(filter: &EntityFilter) -> &'static str {
 }
 
 fn entity_list_index(filter: &EntityFilter) -> Option<&'static str> {
-    if !filter.ids.is_empty() {
+    if reads_by_id_list(filter) {
         return None;
     }
     entity_list_source(filter).strip_prefix("entities INDEXED BY ")
@@ -1230,7 +1270,7 @@ fn entity_count_free_source(filter: &EntityFilter) -> &'static str {
 }
 
 fn entity_count_free_index(filter: &EntityFilter) -> Option<&'static str> {
-    if !filter.ids.is_empty() {
+    if reads_by_id_list(filter) {
         return None;
     }
     entity_count_free_source(filter).strip_prefix("entities INDEXED BY ")

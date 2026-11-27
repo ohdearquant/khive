@@ -97,6 +97,42 @@ fn update_lists_removals_it_cannot_make() {
 }
 
 #[test]
+fn a_rename_onto_a_held_alias_removes_it_whatever_wrote_it() {
+    for origin in [
+        EntityAliasOrigin::Caller,
+        EntityAliasOrigin::Rename,
+        EntityAliasOrigin::Merge,
+    ] {
+        let mut entity = Entity::new("ns", "concept", "old");
+        entity.aliases = vec![
+            EntityAlias {
+                alias: "kept".into(),
+                origin: EntityAliasOrigin::Merge,
+            },
+            EntityAlias {
+                alias: "new".into(),
+                origin,
+            },
+        ];
+        entity.name = "new".into();
+        let (changed, statements, report) =
+            apply_entity_alias_change(&mut entity, &EntityAliasChange::default(), 7);
+        assert!(changed, "{origin:?}");
+        assert!(report.is_empty(), "{origin:?}");
+        assert_eq!(
+            held(&entity),
+            vec![("kept".to_owned(), EntityAliasOrigin::Merge)],
+            "{origin:?}"
+        );
+        let labels: Vec<&str> = statements
+            .iter()
+            .map(|statement| statement.label.as_deref().unwrap())
+            .collect();
+        assert_eq!(labels, ["entity-name-alias-delete"], "{origin:?}");
+    }
+}
+
+#[test]
 fn adding_a_held_alias_changes_nothing() {
     let mut entity = Entity::new("ns", "concept", "Name");
     entity.aliases = vec![EntityAlias {

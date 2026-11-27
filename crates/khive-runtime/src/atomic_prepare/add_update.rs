@@ -777,6 +777,13 @@ pub async fn prepare_update(
         ));
     }
 
+    // ADR-221 section 2: every alias is validated and secret-gated before
+    // the target is read, as the kg update handler does.
+    let aliases = crate::EntityAliasChange::update(
+        &optional_alias_list(args, "add_aliases")?,
+        &optional_alias_list(args, "remove_aliases")?,
+    )?;
+
     match runtime.resolve_by_id(token, id).await? {
         Some(Resolved::Entity(entity)) => {
             match &expected_kind {
@@ -835,10 +842,6 @@ pub async fn prepare_update(
                     })
                 })
                 .transpose()?;
-            let aliases = crate::EntityAliasChange::update(
-                &optional_alias_list(args, "add_aliases")?,
-                &optional_alias_list(args, "remove_aliases")?,
-            )?;
             let required_entity_type = match &expected_kind {
                 Some(AtomicUpdateKind::Entity { entity_type, .. }) => entity_type.as_deref(),
                 _ => None,
@@ -1015,6 +1018,7 @@ async fn prepare_update_entity_record_with_version_and_type(
     required_entity_type: Option<&str>,
 ) -> RuntimeResult<(khive_storage::Entity, AtomicOpPlan)> {
     crate::entity_write::validate_expected_version(expected_version)?;
+    let alias_only = patch.is_empty() && remove_properties.is_empty() && !aliases.is_empty();
     let explicit_entity_type_patch = patch.entity_type.is_some();
     let (
         mut entity,
@@ -1041,6 +1045,20 @@ async fn prepare_update_entity_record_with_version_and_type(
     if aliases_changed {
         reindex_required = true;
         changed_fields.push("aliases");
+    }
+    // An update that asks only for alias changes and changes none writes
+    // nothing: the plan only asserts the row is still the one read.
+    if alias_only
+        && !aliases_changed
+        && expected_version.is_none_or(|expected| expected == entity.version)
+    {
+        entity.updated_at = expected_updated_at;
+        entity.deleted_at = expected_deleted_at;
+        let plan = crate::canonical_apply::unchanged_entity_assertion_plan(
+            &entity,
+            "alias-noop-assertion",
+        );
+        return Ok((entity, plan));
     }
     let mut statements = vec![PlanStatement {
         statement: entity_replace_if_unchanged_statement(

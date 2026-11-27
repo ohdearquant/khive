@@ -197,7 +197,9 @@ fn caller_properties(properties: Option<&serde_json::Value>) -> Option<serde_jso
 /// Whether `holder` carries the payload a keyed create asked for: name,
 /// description, `entity_type`, typed-equal properties, tags as a set and
 /// caller-origin aliases as a set (ADR-221 section 1). `aliases` is the
-/// set the request would store, its name already left out.
+/// set the request asks for, its name already left out. A requested alias
+/// the holder holds under a rename or merge origin is left out of it too:
+/// the write keeps that row as it is, so the request would not store it.
 ///
 /// Both sides' properties are read through [`caller_properties`]: the
 /// runtime-owned top-level keys are left out, because no caller can send
@@ -213,7 +215,17 @@ fn same_entity_payload(
     tags: &[String],
     aliases: &BTreeSet<&str>,
 ) -> bool {
-    if super::entity_aliases::caller_alias_set(holder) != *aliases {
+    let stored: BTreeSet<&str> = aliases
+        .iter()
+        .copied()
+        .filter(|alias| {
+            !holder.aliases.iter().any(|held| {
+                held.alias == *alias
+                    && held.origin != khive_storage::entity::EntityAliasOrigin::Caller
+            })
+        })
+        .collect();
+    if super::entity_aliases::caller_alias_set(holder) != stored {
         return false;
     }
     if holder.name != name

@@ -90,6 +90,17 @@ pub struct EntityPatch {
     pub entity_type: Option<Option<String>>,
 }
 
+impl EntityPatch {
+    /// Whether the patch sets no field.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.description.is_none()
+            && self.properties.is_none()
+            && self.tags.is_none()
+            && self.entity_type.is_none()
+    }
+}
+
 /// Policy used when deduplicating two entities.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

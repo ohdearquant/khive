@@ -409,6 +409,7 @@ impl KhiveRuntime {
         aliases: &crate::EntityAliasChange,
     ) -> RuntimeResult<(Entity, EntityUpdateReport)> {
         crate::entity_write::validate_expected_version(expected_version)?;
+        let alias_only = patch.is_empty() && remove_properties.is_empty() && !aliases.is_empty();
         let admission = OrdinaryEntityUpdateContext::capture(token);
         let PreparedEntityUpdate {
             mut entity,
@@ -435,6 +436,20 @@ impl KhiveRuntime {
         if aliases_changed {
             reindex_required = true;
             changed_fields.push("aliases");
+        }
+        // An update that asks only for alias changes and changes none writes
+        // nothing: the version, updated_at and the event log stay as they
+        // are, and the answer still lists what was not stored or removed.
+        if alias_only
+            && !aliases_changed
+            && expected_version.is_none_or(|expected| expected == original.version)
+        {
+            let mut report = EntityUpdateReport::complete(
+                crate::retrieval::EmbeddingTruncationReport::default(),
+                false,
+            );
+            report.aliases = alias_report;
+            return Ok((original, report));
         }
         let entity = match admission.admit(token, entity)? {
             EntityAdmission::Legacy(entity) => entity,

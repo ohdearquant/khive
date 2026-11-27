@@ -1,18 +1,51 @@
 //! Entity aliases through the kg verbs (ADR-221 section 2).
 
-use khive_runtime::{RuntimeError, VerbRegistry};
+use khive_db::stores::entity::entity_alias_insert_statement;
+use khive_runtime::atomic_prepare::prepare_update;
+use khive_runtime::{AtomicOpPlan, KhiveRuntime, Namespace, RuntimeError, VerbRegistry};
+use khive_storage::entity::EntityAliasOrigin;
 use serde_json::{json, Value};
 
 async fn configured() -> VerbRegistry {
+    configured_with_runtime().await.0
+}
+
+async fn configured_with_runtime() -> (VerbRegistry, KhiveRuntime) {
     use crate::KgPack;
     use khive_runtime::VerbRegistryBuilder;
 
-    let rt = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
     let registry = builder.build().expect("kg registry builds");
     rt.install_edge_rules(registry.all_edge_rules());
-    registry
+    (registry, rt)
+}
+
+/// Store an alias row for entity `id` directly, as a rename or a merge
+/// would write it.
+async fn seed_alias(
+    rt: &KhiveRuntime,
+    registry: &VerbRegistry,
+    id: &Value,
+    alias: &str,
+    origin: EntityAliasOrigin,
+) {
+    let got = registry
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("get");
+    let namespace = got["namespace"].as_str().expect("namespace");
+    let id = uuid::Uuid::parse_str(id.as_str().expect("id")).expect("uuid");
+    rt.sql()
+        .writer()
+        .await
+        .expect("writer")
+        .execute(entity_alias_insert_statement(
+            namespace, id, alias, origin, 1,
+        ))
+        .await
+        .expect("seed alias");
 }
 
 /// A concept create; `aliases` is left out when empty.
@@ -274,6 +307,176 @@ async fn remove_aliases_lists_what_it_did_not_remove() {
         format!("{error}").contains("both added and removed"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn keyed_replay_leaves_out_aliases_held_under_another_origin() {
+    let (registry, rt) = configured_with_runtime().await;
+    let created = create(&registry, keyed(concept("N", &["a"]), "k")).await;
+    let id = created["id"].clone();
+    seed_alias(&rt, &registry, &id, "x", EntityAliasOrigin::Rename).await;
+    seed_alias(&rt, &registry, &id, "y", EntityAliasOrigin::Merge).await;
+    let held = registry
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("get");
+
+    for aliases in [&["a", "x"][..], &["a", "x", "y"][..], &["y", "a"][..]] {
+        let replayed = create(&registry, keyed(concept("N", aliases), "k")).await;
+        assert_eq!(replayed, json!({"id": id, "created": false}), "{aliases:?}");
+        let mut reload = keyed(concept("N", aliases), "k");
+        reload["on_key"] = json!("update");
+        let replayed = create(&registry, reload).await;
+        assert_eq!(
+            replayed,
+            json!({"id": id, "created": false}),
+            "on_key {aliases:?}"
+        );
+        for on_key in [false, true] {
+            let mut item = json!({"kind": "concept", "name": "N", "key": "k", "aliases": aliases});
+            if on_key {
+                item["on_key"] = json!("update");
+            }
+            let bulk = create(&registry, json!({"items": [item]})).await;
+            let result = &bulk["results"][0]["result"];
+            assert_eq!(result["created"], json!(false), "{aliases:?}: {bulk}");
+            assert!(result.get("updated").is_none(), "{aliases:?}: {bulk}");
+        }
+    }
+    let again = registry
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("get");
+    assert_eq!(again, held, "a replay writes nothing");
+
+    // A caller alias the request leaves out still differs.
+    let error = registry
+        .dispatch("create", keyed(concept("N", &["x"]), "k"))
+        .await
+        .expect_err("the caller alias a is missing");
+    assert_eq!(reason(&error).as_deref(), Some("key_conflict"), "{error}");
+}
+
+#[tokio::test]
+async fn a_rename_onto_an_alias_of_any_origin_removes_that_row() {
+    let (registry, rt) = configured_with_runtime().await;
+    let created = create(&registry, concept("N", &["c"])).await;
+    let id = created["id"].clone();
+    seed_alias(&rt, &registry, &id, "r", EntityAliasOrigin::Rename).await;
+    seed_alias(&rt, &registry, &id, "m", EntityAliasOrigin::Merge).await;
+
+    let renamed = update(&registry, json!({"id": id, "name": "r"})).await;
+    assert_eq!(renamed["name"], json!("r"), "{renamed}");
+    assert_eq!(
+        aliases_of(&registry, &id).await,
+        json!([
+            {"alias": "c", "origin": "caller"},
+            {"alias": "m", "origin": "merge"}
+        ]),
+        "a rename-origin alias equal to the new name is removed"
+    );
+
+    update(&registry, json!({"id": id, "name": "m"})).await;
+    assert_eq!(
+        aliases_of(&registry, &id).await,
+        caller(&["c"]),
+        "a merge-origin alias equal to the new name is removed"
+    );
+
+    // A caller removal of the new name reads as done, not as not removed.
+    seed_alias(&rt, &registry, &id, "s", EntityAliasOrigin::Merge).await;
+    let renamed = update(
+        &registry,
+        json!({"id": id, "name": "s", "remove_aliases": ["s"]}),
+    )
+    .await;
+    assert!(renamed.get("aliases_not_removed").is_none(), "{renamed}");
+    assert_eq!(aliases_of(&registry, &id).await, caller(&["c"]));
+}
+
+#[tokio::test]
+async fn the_atomic_update_route_refuses_a_bad_alias_before_any_lookup() {
+    let (_registry, rt) = configured_with_runtime().await;
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    // No entity holds this id, so a lookup first would answer not found.
+    let missing = uuid::Uuid::new_v4();
+    for field in ["add_aliases", "remove_aliases"] {
+        let error = prepare_update(
+            &rt,
+            &token,
+            &json!({"id": missing, field: [credential()]}),
+            None,
+        )
+        .await
+        .expect_err("a credential alias on the atomic route");
+        assert!(
+            matches!(error, RuntimeError::SecretDetected(_)),
+            "{field}: {error:?}"
+        );
+    }
+    let error = prepare_update(
+        &rt,
+        &token,
+        &json!({"id": missing, "add_aliases": ["fine"]}),
+        None,
+    )
+    .await
+    .expect_err("a valid alias on a missing id");
+    assert!(matches!(error, RuntimeError::NotFound(_)), "{error:?}");
+}
+
+#[tokio::test]
+async fn an_alias_only_update_that_changes_nothing_writes_nothing() {
+    let (registry, rt) = configured_with_runtime().await;
+    let created = create(&registry, concept("R", &["a"])).await;
+    let id = created["id"].clone();
+    let before = registry
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("get");
+    assert!(before.get("version").is_some(), "{before}");
+
+    let answer = update(&registry, json!({"id": id, "remove_aliases": ["zz"]})).await;
+    assert_eq!(answer["aliases_not_removed"], json!(["zz"]), "{answer}");
+    let answer = update(&registry, json!({"id": id, "add_aliases": ["R"]})).await;
+    assert_eq!(answer["aliases_not_stored"], json!(["R"]), "{answer}");
+    for args in [
+        json!({"id": id, "remove_aliases": ["zz"]}),
+        json!({"id": id, "add_aliases": ["a"]}),
+        json!({"id": id, "add_aliases": ["R"]}),
+    ] {
+        let answer = update(&registry, args.clone()).await;
+        assert_eq!(answer["version"], before["version"], "{args}: {answer}");
+        assert_eq!(
+            answer["updated_at"], before["updated_at"],
+            "{args}: {answer}"
+        );
+    }
+    let after = registry
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("get");
+    assert_eq!(after, before, "an unchanged alias update writes nothing");
+
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    let noop = |plan: &AtomicOpPlan| matches!(plan, AtomicOpPlan::Update(update) if update.is_idempotent_noop());
+    let plan = prepare_update(
+        &rt,
+        &token,
+        &json!({"id": id, "remove_aliases": ["zz"]}),
+        None,
+    )
+    .await
+    .expect("atomic alias-only update");
+    assert!(noop(&plan), "an unchanged alias update plans no write");
+
+    // Controls: an alias change still writes on both routes.
+    let plan = prepare_update(&rt, &token, &json!({"id": id, "add_aliases": ["b"]}), None)
+        .await
+        .expect("atomic alias change");
+    assert!(!noop(&plan), "an alias change plans a write");
+    let changed = update(&registry, json!({"id": id, "add_aliases": ["b"]})).await;
+    assert_ne!(changed["version"], before["version"], "{changed}");
 }
 
 #[tokio::test]
