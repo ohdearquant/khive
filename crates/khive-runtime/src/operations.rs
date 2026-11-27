@@ -332,7 +332,7 @@ mod attachments;
 mod entity_bulk;
 mod entity_create;
 mod entity_keys;
-pub use entity_keys::{entity_key_conflict, KeyedEntityCreate};
+pub use entity_keys::{entity_key_conflict, KeyedEntityCreate, KeyedEntityReload};
 mod entity_indexes;
 #[cfg(any(test, feature = "fault-injection"))]
 mod fault_injection;

@@ -7,6 +7,7 @@ use khive_runtime::{EdgePatch, EntityPatch, NamespaceToken, RuntimeError, VerbRe
 
 use khive_storage::Entity;
 use khive_types::pack::pack_registry_tag;
+use khive_types::KhiveError;
 
 use super::common::{
     description_patch, deser, ensure_entity_subtype, immutable_event_error,
@@ -180,12 +181,66 @@ impl KgPack {
         }
     }
 
+    /// `update` and `delete` with `kind` and `key` in place of `id` (ADR-221
+    /// section 1). The live entity holding the key in the caller's primary
+    /// namespace becomes the target, and the gate judges the call again by
+    /// that id, as a keyed `get` is judged. A deleted entity holds no key, so
+    /// a tombstone is reached by id only.
+    async fn target_entity_key(
+        &self,
+        token: &NamespaceToken,
+        verb: &str,
+        params: &mut Value,
+        registry: &VerbRegistry,
+    ) -> Result<(), RuntimeError> {
+        let Some(args) = params.as_object_mut() else {
+            return Ok(());
+        };
+        let Some(key) = args.remove("key") else {
+            return Ok(());
+        };
+        if args.contains_key("id") {
+            return Err(RuntimeError::InvalidInput(
+                "id and key are mutually exclusive".into(),
+            ));
+        }
+        let Value::String(key) = key else {
+            return Err(RuntimeError::InvalidInput("key must be a string".into()));
+        };
+        let needs_kind = || {
+            RuntimeError::InvalidInput(format!(
+                "{verb} by key needs kind set to the base entity kind the key is scoped to"
+            ))
+        };
+        let Some(Value::String(kind)) = args.get("kind") else {
+            return Err(needs_kind());
+        };
+        let KindSpec::Entity {
+            specific: Some(kind),
+            entity_type: None,
+        } = resolve_kind_spec(kind, registry)?
+        else {
+            return Err(needs_kind());
+        };
+        let entity = self
+            .runtime
+            .get_entity_by_key(token, &kind, &key)
+            .await?
+            .ok_or_else(|| RuntimeError::from(KhiveError::not_found("entity key", &key)))?;
+        args.insert("id".into(), Value::String(entity.id.to_string()));
+        registry
+            .authorize_effective_kg_read(token, verb, params.clone(), entity.id)
+            .await
+    }
+
     pub(crate) async fn handle_update(
         &self,
         token: &NamespaceToken,
         mut params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
+        self.target_entity_key(token, "update", &mut params, registry)
+            .await?;
         let p: UpdateParams = deser(params.clone())?;
         super::common::require_object_param(p.properties.as_ref(), "properties")?;
         if p.entity_kind.is_some() {
@@ -374,9 +429,11 @@ impl KgPack {
     pub(crate) async fn handle_delete(
         &self,
         token: &NamespaceToken,
-        params: Value,
+        mut params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
+        self.target_entity_key(token, "delete", &mut params, registry)
+            .await?;
         let p: DeleteParams = deser(params)?;
         let hard = p.hard.unwrap_or(false);
         let explicit_spec: Option<KindSpec> = if let Some(k) = p.kind.as_deref() {
