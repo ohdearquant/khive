@@ -245,6 +245,82 @@ pub fn entity_name_alias_delete_statement(
     }
 }
 
+/// Remove every alias row of `entity_id`. A merge carries the merged-away
+/// entity's names to the kept entity as `merge` aliases and drops the merged-away
+/// entity's own rows (ADR-221 section 3).
+pub fn entity_aliases_delete_all_statement(namespace: &str, entity_id: Uuid) -> SqlStatement {
+    SqlStatement {
+        sql: "DELETE FROM entity_aliases WHERE namespace = ?1 AND entity_id = ?2".to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(entity_id.to_string()),
+        ],
+        label: Some("entity-aliases-delete-all".to_string()),
+    }
+}
+
+/// Held keys of one entity as `(kind, key)` rows, ordered by kind then key.
+/// Parameters: `?1` namespace, `?2` entity id.
+pub const ENTITY_HELD_KEYS_SQL: &str = "SELECT kind, key FROM entity_keys \
+     WHERE namespace = ?1 AND entity_id = ?2 AND released_at IS NULL \
+     ORDER BY kind, key";
+
+/// The entity holding one key, if any. Parameters: `?1` namespace, `?2` kind,
+/// `?3` key.
+pub const ENTITY_KEY_HOLDER_SQL: &str = "SELECT entity_id FROM entity_keys \
+     WHERE namespace = ?1 AND kind = ?2 AND key = ?3 AND released_at IS NULL";
+
+/// Hand a held key of `from_id` to `into_id` under `into_kind`, as a merge does
+/// before it tombstones `from_id`: the tombstone releases every key its row
+/// still holds (ADR-221 section 3). Affects one row while the key is held.
+pub fn entity_key_move_statement(
+    namespace: &str,
+    from_id: Uuid,
+    from_kind: &str,
+    key: &str,
+    into_id: Uuid,
+    into_kind: &str,
+) -> SqlStatement {
+    SqlStatement {
+        sql: "UPDATE entity_keys SET entity_id = ?5, kind = ?6 \
+              WHERE namespace = ?1 AND entity_id = ?2 AND kind = ?3 AND key = ?4 \
+                AND released_at IS NULL"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(from_id.to_string()),
+            SqlValue::Text(from_kind.to_string()),
+            SqlValue::Text(key.to_string()),
+            SqlValue::Text(into_id.to_string()),
+            SqlValue::Text(into_kind.to_string()),
+        ],
+        label: Some("entity-key-move".to_string()),
+    }
+}
+
+/// Remove a held key row of `entity_id`. A merge drops the merged-away
+/// entity's row for a key the kept entity already holds (ADR-221 section 3).
+pub fn entity_key_drop_statement(
+    namespace: &str,
+    entity_id: Uuid,
+    kind: &str,
+    key: &str,
+) -> SqlStatement {
+    SqlStatement {
+        sql: "DELETE FROM entity_keys \
+              WHERE namespace = ?1 AND entity_id = ?2 AND kind = ?3 AND key = ?4 \
+                AND released_at IS NULL"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(entity_id.to_string()),
+            SqlValue::Text(kind.to_string()),
+            SqlValue::Text(key.to_string()),
+        ],
+        label: Some("entity-key-drop".to_string()),
+    }
+}
+
 /// Conditional-insert companion to [`entity_upsert_statement`]. Every
 /// conflict leaves the existing row untouched so a caller can read the
 /// winner and explicitly reapply its intended delta.

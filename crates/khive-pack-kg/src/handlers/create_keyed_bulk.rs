@@ -7,11 +7,12 @@
 
 use std::collections::HashMap;
 
-use khive_runtime::atomic_prepare::apply_post_commit_effects_with_report;
+use khive_runtime::atomic_prepare::apply_post_commit_effects_with_failures;
 use khive_runtime::{
     entity_carries_create_payload, entity_key_conflict, keyed_replay_assertion_plan,
     run_atomic_unit, same_create_payload, AtomicOpPlan, AtomicRunOutcome, DomainDisposition,
-    EntityCreateSpec, NamespaceToken, PendingEntityId, RuntimeError, VerbRegistry,
+    EntityCreateSpec, NamespaceToken, PendingEntityId, PostCommitEffect, RuntimeError,
+    VerbRegistry,
 };
 use khive_storage::Entity;
 use serde_json::{json, Value};
@@ -28,6 +29,29 @@ const KEYED_BULK_ATTEMPTS: usize = 3;
 /// The id and version of each stored holder a judgment read, in reading
 /// order; `None` where the key was free.
 type HolderReads = Vec<Option<(Uuid, i64)>>;
+
+// A scoped test-only rendezvous between a request's first judgment and its
+// unit, so a test can move a holder the judgment read. Production builds have
+// neither the hook nor a branch for it.
+#[cfg(test)]
+tokio::task_local! {
+    pub(in crate::handlers) static KEYED_BULK_UNIT_TEST_BARRIER: std::cell::RefCell<Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>>;
+}
+
+#[cfg(test)]
+async fn wait_for_keyed_bulk_unit_test_barrier() {
+    let barrier = KEYED_BULK_UNIT_TEST_BARRIER
+        .try_with(|slot| slot.borrow_mut().take())
+        .ok()
+        .flatten();
+    if let Some((reached, proceed)) = barrier {
+        reached.send(()).expect("keyed bulk test barrier observer");
+        proceed.await.expect("keyed bulk test barrier release");
+    }
+}
 
 /// Where an item's key points while the request is judged.
 #[derive(Clone)]
@@ -505,17 +529,26 @@ impl KgPack {
             }
         }
 
-        let mut reindex_error = None;
+        // A reloaded row's post-commit reindex error, by row. A failed effect
+        // that names no entity belongs to every reloaded row.
+        let mut reindex_errors: HashMap<Uuid, String> = HashMap::new();
+        let mut unattributed_error: Option<String> = None;
         if !plans.is_empty() {
             match run_atomic_unit(self.runtime.sql().as_ref(), plans).await {
                 Ok(AtomicRunOutcome::Committed { post_commit }) => {
                     // A reload's reindex runs after the commit, as the
                     // ordinary update's does; a new row has none.
-                    if let Err(error) =
-                        apply_post_commit_effects_with_report(&self.runtime, token, post_commit)
-                            .await
-                    {
-                        reindex_error = Some(error.to_string());
+                    let report =
+                        apply_post_commit_effects_with_failures(&self.runtime, token, post_commit)
+                            .await;
+                    for (effect, error) in report.failed_effects {
+                        let error = format!("post-commit effects failed after commit: {error}");
+                        match effect {
+                            PostCommitEffect::ReindexEntity { entity_id } => {
+                                reindex_errors.insert(entity_id, error);
+                            }
+                            _ => unattributed_error = Some(error),
+                        }
                     }
                 }
                 Ok(AtomicRunOutcome::RolledBack {
@@ -567,7 +600,7 @@ impl KgPack {
                     let (mut result, record) = self
                         .keyed_row_answer(token, *id, kind, true, verbose)
                         .await?;
-                    if let Some(error) = &reindex_error {
+                    if let Some(error) = reindex_errors.get(id).or(unattributed_error.as_ref()) {
                         result["reindex_error"] = json!(error);
                     }
                     ItemAnswer {
@@ -591,7 +624,8 @@ impl KgPack {
                     let (mut result, _) = self
                         .keyed_row_answer(token, id, &kind, *updated, verbose)
                         .await?;
-                    if let (true, Some(error)) = (reloaded, &reindex_error) {
+                    let error = reindex_errors.get(&id).or(unattributed_error.as_ref());
+                    if let (true, Some(error)) = (reloaded, error) {
                         result["reindex_error"] = json!(error);
                     }
                     ItemAnswer {
@@ -664,6 +698,8 @@ impl KgPack {
                     return Err(KeyedBulkFailure::RolledBack { index, failure });
                 }
             }
+            #[cfg(test)]
+            wait_for_keyed_bulk_unit_test_barrier().await;
             match self.run_keyed_bulk_unit(token, verbose, slots).await? {
                 Ok(answers) => return Ok(answers),
                 Err((index, failure)) => last = Some((read, index, failure)),

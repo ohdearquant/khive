@@ -229,7 +229,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::UpdateAgainstSnapshot,
-        reservation: Reservation::NamedCheck { function: "prepare_update_entity", file: "khive-runtime/src/curation/entity_curation.rs" },
+        reservation: Reservation::NamedCheck { function: "prepare_update_entity_with_previous_name", file: "khive-runtime/src/curation/entity_curation.rs" },
         transaction: TransactionOwner::RunAtomicUnit,
         stamp: StampCapability::ReservationOnly,
         family: Some("entity.update"),

@@ -159,6 +159,56 @@ async fn unchanged_entity_update_is_a_no_op_and_replays_without_a_new_revision()
     assert_eq!(events.count_events(updated()).await.unwrap(), 1);
 }
 
+/// ADR-221 section 2: a replayed rename onto a name the entity holds as an
+/// alias deletes that alias row, so the alias never equals the name.
+#[tokio::test]
+async fn a_replayed_rename_onto_a_held_alias_deletes_the_alias() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let a = Uuid::new_v4();
+    let create = changeset(vec![entity_create(a, "old")]);
+    let plans = prepare_canonical_changeset(rt, &registry(), &token, &create)
+        .await
+        .unwrap();
+    crate::run_atomic_unit(rt.sql().as_ref(), plans)
+        .await
+        .unwrap();
+    rt.sql()
+        .writer()
+        .await
+        .unwrap()
+        .execute(khive_db::stores::entity::entity_alias_insert_statement(
+            token.namespace().as_str(),
+            a,
+            "new",
+            khive_storage::entity::EntityAliasOrigin::Caller,
+            1,
+        ))
+        .await
+        .unwrap();
+
+    let cs = changeset(vec![rename(a, "old", "new")]);
+    let plans = prepare_canonical_changeset(rt, &registry(), &token, &cs)
+        .await
+        .unwrap();
+    assert!(matches!(
+        crate::run_atomic_unit(rt.sql().as_ref(), plans)
+            .await
+            .unwrap(),
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    let row = rt
+        .entities(&token)
+        .unwrap()
+        .get_entity(a)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.name, "new");
+    assert!(row.aliases.is_empty(), "{:?}", row.aliases);
+}
+
 #[tokio::test]
 async fn unhooked_writer_drift_survives_but_touched_drift_rolls_back_prior_ops() {
     let f = fixture();

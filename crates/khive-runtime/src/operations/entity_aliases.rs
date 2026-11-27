@@ -42,6 +42,8 @@ pub struct EntityAliasChange {
     add: BTreeSet<String>,
     remove: BTreeSet<String>,
     replace: bool,
+    /// `keep_old_name: false`: a rename keeps no `rename` alias.
+    drop_old_name: bool,
 }
 
 impl EntityAliasChange {
@@ -59,6 +61,7 @@ impl EntityAliasChange {
             add,
             remove,
             replace: false,
+            drop_old_name: false,
         })
     }
 
@@ -69,7 +72,15 @@ impl EntityAliasChange {
             add: validated_set(aliases)?,
             remove: BTreeSet::new(),
             replace: true,
+            drop_old_name: false,
         })
+    }
+
+    /// `keep_old_name`: whether a write that renames the entity keeps the
+    /// old name as a `rename` alias (ADR-221 section 3). Kept by default.
+    pub fn keeping_old_name(mut self, keep: bool) -> Self {
+        self.drop_old_name = !keep;
+        self
     }
 
     /// Whether the change asks for nothing.
@@ -131,6 +142,11 @@ pub(crate) fn caller_alias_set(entity: &Entity) -> BTreeSet<&str> {
 /// return whether the aliases changed, the statements that write the change
 /// at time `at`, and what the change left out.
 ///
+/// `previous_name` is the name the stored row had before this write, `None`
+/// for a row this write creates. When the write renames the entity, the old
+/// name becomes a `rename` alias unless the change drops it, the entity
+/// already holds it, or the old name is empty.
+///
 /// The projection is what the statements leave in `entity_aliases`, so the
 /// text and vector bodies built from `entity` index the aliases the stored
 /// row has.
@@ -138,6 +154,7 @@ pub(crate) fn apply_entity_alias_change(
     entity: &mut Entity,
     change: &EntityAliasChange,
     at: i64,
+    previous_name: Option<&str>,
 ) -> (bool, Vec<SqlStatement>, EntityAliasReport) {
     let before = entity.aliases.clone();
     let mut report = EntityAliasReport {
@@ -198,8 +215,48 @@ pub(crate) fn apply_entity_alias_change(
             origin: EntityAliasOrigin::Caller,
         });
     }
+    // ADR-221 section 3: a rename keeps the old name as a `rename` alias in
+    // the same transaction. A caller alias of that string named by this same
+    // change was written above and is left as it is.
+    if let Some(previous) =
+        previous_name.filter(|previous| *previous != name && !previous.is_empty())
+    {
+        if !change.drop_old_name && !entity.aliases.iter().any(|held| held.alias == previous) {
+            statements.push(entity_alias_insert_statement(
+                &namespace,
+                entity.id,
+                previous,
+                EntityAliasOrigin::Rename,
+                at,
+            ));
+            entity.aliases.push(EntityAlias {
+                alias: previous.to_owned(),
+                origin: EntityAliasOrigin::Rename,
+            });
+        }
+    }
     entity.aliases.sort();
     (entity.aliases != before, statements, report)
+}
+
+/// The `entity_updated` event payload. A write that renames the entity names
+/// the previous name and the new one, so the record's history keeps the old
+/// name even when no alias is kept (ADR-221 section 3).
+pub(crate) fn entity_updated_payload(
+    entity: &Entity,
+    changed_fields: &[&str],
+    previous_name: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "id": entity.id,
+        "namespace": entity.namespace,
+        "changed_fields": changed_fields,
+    });
+    if let Some(previous) = previous_name.filter(|previous| *previous != entity.name) {
+        payload["previous_name"] = serde_json::Value::from(previous);
+        payload["name"] = serde_json::Value::from(entity.name.as_str());
+    }
+    payload
 }
 
 /// The statements as plan statements: an alias row affects one row or none,

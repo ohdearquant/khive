@@ -164,8 +164,9 @@ pub use curation::{
     entity_merge_guard_error, entity_merge_guard_refusal_message, note_embedding_text,
     note_fts_document, validate_entity_merge_floor, ContentMergeStrategy, EdgeListFilter,
     EdgePatch, EntityDedupMergePolicy, EntityMergeGuard, EntityPatch, GuardedNoteMerge,
-    MergeAssertion, MergeEdgeConflictPreimage, MergeEdgePreimage, MergeSummary,
-    MergeTxBudgetReport, MergeTxLimits, NoteMergeGuard, NotePatch, NoteUpdatePolicy,
+    MergeAssertion, MergeEdgeConflictPreimage, MergeEdgePreimage, MergeKey, MergeKeyConflict,
+    MergeKeyMove, MergeSummary, MergeTxBudgetReport, MergeTxLimits, NoteMergeGuard, NotePatch,
+    NoteUpdatePolicy,
 };
 #[cfg(unix)]
 pub use daemon::{acquire_recovery_lock, pid_path, run_daemon, socket_path, DaemonDispatch};

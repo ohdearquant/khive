@@ -383,6 +383,80 @@ pub struct MergeSummary {
     /// the entity or note merge committed but the reindex did not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_commit_reindex_error: Option<String>,
+    /// Names an entity merge added to the kept entity as `merge` aliases
+    /// (ADR-221 section 3): the merged-away entity's name and aliases, and the
+    /// kept entity's previous name when the merge takes the other name.
+    #[serde(default)]
+    pub aliases_added: Vec<String>,
+    /// Keys an entity merge moved from the merged-away entity to the kept one.
+    #[serde(default)]
+    pub keys_moved: Vec<MergeKeyMove>,
+    /// How many of `keys_moved` changed kind, which only a forced merge of
+    /// entities of different kinds does.
+    #[serde(default)]
+    pub keys_rewritten: usize,
+    /// Keys of the merged-away entity the kept entity already held; their
+    /// rows on the merged-away entity were dropped.
+    #[serde(default)]
+    pub keys_already_held: Vec<MergeKey>,
+    /// Keys another live entity holds under the kept entity's kind. A merge
+    /// refuses with `merge_key_conflict` on any; a dry run lists them here.
+    #[serde(default)]
+    pub key_conflicts: Vec<MergeKeyConflict>,
+}
+
+/// One key of an entity, by kind.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeKey {
+    pub kind: String,
+    pub key: String,
+}
+
+/// One key an entity merge moved to the kept entity, with the kind it was
+/// held under before the merge.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeKeyMove {
+    pub kind: String,
+    pub key: String,
+    pub from_kind: String,
+}
+
+/// A key of the merged-away entity that another live entity holds under the
+/// kept entity's kind. `existing_id` is named only when the caller may list
+/// that holder.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeKeyConflict {
+    pub kind: String,
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing_id: Option<Uuid>,
+}
+
+/// `merge_key_conflict`: the merge would hand the kept entity a key another
+/// live entity holds. Nothing is written.
+pub(super) fn merge_key_conflict_error(
+    into_id: Uuid,
+    from_id: Uuid,
+    conflicts: &[MergeKeyConflict],
+) -> RuntimeError {
+    let named: Vec<String> = conflicts
+        .iter()
+        .map(|conflict| match conflict.existing_id {
+            Some(holder) => format!("{}:{:?} held by {holder}", conflict.kind, conflict.key),
+            None => format!("{}:{:?}", conflict.kind, conflict.key),
+        })
+        .collect();
+    let listed = serde_json::to_string(conflicts).unwrap_or_else(|_| "[]".to_string());
+    KhiveError::conflict(format!(
+        "merge_key_conflict: merging {from_id} into {into_id} would take keys other live \
+         entities hold: {}",
+        named.join(", ")
+    ))
+    .with_details(Details::new_owned([
+        ("reason", "merge_key_conflict".to_string()),
+        ("conflicting_keys", listed),
+    ]))
+    .into()
 }
 
 /// Complete stored state of an edge removed during a merge.
@@ -793,6 +867,12 @@ pub(super) fn append_merge_event_in_transaction(
         "contract_drop_incident_edge_preimages": &summary.contract_drop_incident_edge_preimages,
         "edge_conflict_preimages": &summary.edge_conflict_preimages,
     });
+    if context.substrate == SubstrateKind::Entity {
+        payload["aliases_added"] = serde_json::json!(&summary.aliases_added);
+        payload["keys_moved"] = serde_json::json!(&summary.keys_moved);
+        payload["keys_rewritten"] = serde_json::json!(summary.keys_rewritten);
+        payload["keys_already_held"] = serde_json::json!(&summary.keys_already_held);
+    }
     if let Some(reason) = context.reason {
         payload["reason"] = serde_json::Value::String(reason);
     }

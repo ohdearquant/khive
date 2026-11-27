@@ -803,8 +803,12 @@ impl KhiveRuntime {
         // admission, so its text and vector bodies carry them, and they are
         // written in the transaction that writes the row.
         let created_at = entity.created_at;
-        let (_, alias_statements, _) =
-            super::entity_aliases::apply_entity_alias_change(&mut entity, aliases, created_at);
+        let (_, alias_statements, _) = super::entity_aliases::apply_entity_alias_change(
+            &mut entity,
+            aliases,
+            created_at,
+            None,
+        );
         // ADR-221 section 1: a keyed create claims its key in the transaction
         // that writes the row. The claim inserts nothing when a live entity
         // holds the key, and its exactly-one guard rolls the whole write back.

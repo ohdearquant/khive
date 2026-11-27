@@ -142,6 +142,7 @@ impl KhiveRuntime {
     /// share one source of truth for what a patched entity looks like.
     /// `remove_properties` names top-level property keys dropped after the
     /// patch's properties merge in; runtime-owned keys cannot be removed.
+    #[cfg(test)]
     pub(crate) async fn prepare_update_entity(
         &self,
         token: &NamespaceToken,
@@ -151,6 +152,38 @@ impl KhiveRuntime {
     ) -> RuntimeResult<(Entity, bool, Vec<&'static str>, i64, Option<i64>)> {
         self.prepare_guarded_entity_update(token, id, patch, None, remove_properties)
             .await
+    }
+
+    /// [`Self::prepare_update_entity`] that also returns the name the row had
+    /// when this update read it, so a rename can keep it (ADR-221 section 3).
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn prepare_update_entity_with_previous_name(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        patch: EntityPatch,
+        remove_properties: &[&str],
+    ) -> RuntimeResult<((Entity, bool, Vec<&'static str>, i64, Option<i64>), String)> {
+        let prepared = self
+            .prepare_entity_update_for_route(
+                token,
+                id,
+                patch,
+                None,
+                remove_properties,
+                EntityUpdateRoute::ReservationOnly,
+            )
+            .await?;
+        Ok((
+            (
+                prepared.entity,
+                prepared.reindex_required,
+                prepared.changed_fields,
+                prepared.expected_updated_at,
+                prepared.expected_deleted_at,
+            ),
+            prepared.original.name,
+        ))
     }
 
     async fn prepare_guarded_entity_update(
@@ -354,6 +387,12 @@ impl KhiveRuntime {
     }
 
     /// Apply an entity patch and report committed but unfinished index targets.
+    ///
+    /// A rename through this call keeps no `rename` alias: packs use it for
+    /// names they derive themselves, such as a placeholder replaced by the
+    /// real name. The `update` verb keeps the old name through
+    /// [`Self::update_entity_with_aliases_and_index_report`] (ADR-221
+    /// section 3).
     pub async fn update_entity_with_index_report(
         &self,
         token: &NamespaceToken,
@@ -367,7 +406,7 @@ impl KhiveRuntime {
             patch,
             &[],
             expected_version,
-            &crate::EntityAliasChange::default(),
+            &crate::EntityAliasChange::default().keeping_old_name(false),
         )
         .await
     }
@@ -431,8 +470,14 @@ impl KhiveRuntime {
         // ADR-221 section 2: the alias change lands on the row whose name is
         // final, before admission, so the indexed body carries it.
         let updated_at = entity.updated_at;
+        let previous_name = original.name.clone();
         let (aliases_changed, alias_statements, alias_report) =
-            crate::operations::apply_entity_alias_change(&mut entity, aliases, updated_at);
+            crate::operations::apply_entity_alias_change(
+                &mut entity,
+                aliases,
+                updated_at,
+                Some(&previous_name),
+            );
         if aliases_changed {
             reindex_required = true;
             changed_fields.push("aliases");
@@ -470,9 +515,17 @@ impl KhiveRuntime {
                     alias_statements,
                 ));
                 required.extend(crate::atomic_prepare::event_append_statements(
-                    token, &entity.namespace, "update", EventKind::EntityUpdated,
-                    SubstrateKind::Entity, entity.id,
-                    serde_json::json!({"id": entity.id, "namespace": entity.namespace, "changed_fields": changed_fields}),
+                    token,
+                    &entity.namespace,
+                    "update",
+                    EventKind::EntityUpdated,
+                    SubstrateKind::Entity,
+                    entity.id,
+                    crate::operations::entity_updated_payload(
+                        &entity,
+                        &changed_fields,
+                        Some(&previous_name),
+                    ),
                 )?);
                 let plan = prepared.into_plan(
                     EntityCandidateMutation::ReplaceIfUnchanged {
@@ -526,6 +579,7 @@ impl KhiveRuntime {
                 expected_deleted_at,
                 expected_version,
                 alias_statements,
+                Some(previous_name),
             )
             .await?;
         report.aliases = alias_report;
@@ -619,8 +673,14 @@ impl KhiveRuntime {
         remove_properties: &[&str],
         required_event: Option<khive_storage::Event>,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
-        let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
-            self.prepare_guarded_entity_update(
+        let (
+            mut entity,
+            mut reindex_required,
+            mut changed_fields,
+            expected_updated_at,
+            expected_deleted_at,
+        ) = self
+            .prepare_guarded_entity_update(
                 token,
                 expected.id,
                 patch,
@@ -628,6 +688,19 @@ impl KhiveRuntime {
                 remove_properties,
             )
             .await?;
+        // ADR-221 section 3 holds on this route too: a rename keeps the old
+        // name as a `rename` alias and drops an alias equal to the new name.
+        let updated_at = entity.updated_at;
+        let (aliases_changed, alias_statements, _) = crate::operations::apply_entity_alias_change(
+            &mut entity,
+            &crate::EntityAliasChange::default(),
+            updated_at,
+            Some(&expected.name),
+        );
+        if aliases_changed {
+            reindex_required = true;
+            changed_fields.push("aliases");
+        }
         if changed_fields.is_empty() {
             return Ok((
                 entity,
@@ -644,7 +717,8 @@ impl KhiveRuntime {
                 expected_deleted_at,
                 None,
                 required_event,
-                Vec::new(),
+                alias_statements,
+                Some(expected.name.clone()),
             )
             .await?;
         report.into_legacy(entity)
@@ -661,6 +735,7 @@ impl KhiveRuntime {
         expected_deleted_at: Option<i64>,
         expected_version: Option<i64>,
         alias_statements: Vec<khive_storage::types::SqlStatement>,
+        previous_name: Option<String>,
     ) -> RuntimeResult<(Entity, EntityUpdateReport)> {
         self.persist_prepared_entity_update_with_required_event(
             token,
@@ -672,6 +747,7 @@ impl KhiveRuntime {
             expected_version,
             None,
             alias_statements,
+            previous_name,
         )
         .await
     }
@@ -688,6 +764,7 @@ impl KhiveRuntime {
         expected_version: Option<i64>,
         required_event: Option<khive_storage::Event>,
         alias_statements: Vec<khive_storage::types::SqlStatement>,
+        previous_name: Option<String>,
     ) -> RuntimeResult<(Entity, EntityUpdateReport)> {
         // This final whole-object replacement must reserve the complete
         // candidate, even if a future caller bypasses the patch preparer.
@@ -826,11 +903,11 @@ impl KhiveRuntime {
                 "",
             )
             .with_target(entity.id)
-            .with_payload(serde_json::json!({
-                "id": entity.id,
-                "namespace": entity.namespace,
-                "changed_fields": changed_fields,
-            }));
+            .with_payload(crate::operations::entity_updated_payload(
+                &entity,
+                &changed_fields,
+                previous_name.as_deref(),
+            ));
             event_store
                 .append_event(event)
                 .await
@@ -918,6 +995,7 @@ impl KhiveRuntime {
             dry_run,
             reason,
             EntityMergeValidation::LegacyKind,
+            None,
         )
         .await
     }
@@ -942,10 +1020,47 @@ impl KhiveRuntime {
         reason: Option<String>,
         force: bool,
     ) -> RuntimeResult<MergeSummary> {
+        self.merge_entity_with_key_disclosure(
+            token,
+            into_id,
+            from_id,
+            strategy,
+            content_strategy,
+            dry_run,
+            reason,
+            force,
+            &|_: &str| false,
+        )
+        .await
+    }
+
+    /// [`Self::merge_entity_with_reason_and_force`], naming in a
+    /// `merge_key_conflict` (and in a dry run's `key_conflicts`) the live
+    /// entity holding each conflicting key when `disclose` admits the kept
+    /// entity's kind. The kind is read before the merge; if the merge reads a
+    /// different kind no holder is named.
+    // REASON: the merge verb's fields plus the disclosure rule restore uses.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn merge_entity_with_key_disclosure(
+        &self,
+        token: &NamespaceToken,
+        into_id: Uuid,
+        from_id: Uuid,
+        strategy: EntityDedupMergePolicy,
+        content_strategy: ContentMergeStrategy,
+        dry_run: bool,
+        reason: Option<String>,
+        force: bool,
+        disclose: &(dyn Fn(&str) -> bool + Sync),
+    ) -> RuntimeResult<MergeSummary> {
         let validation = if force {
             EntityMergeValidation::Forced
         } else {
             EntityMergeValidation::SafetyFloor
+        };
+        let disclosed_key_kind = match self.entities(token)?.get_entity(into_id).await? {
+            Some(into) if disclose(&into.kind) => Some(into.kind),
+            _ => None,
         };
         self.merge_entity_with_validation(
             token,
@@ -956,6 +1071,7 @@ impl KhiveRuntime {
             dry_run,
             reason,
             validation,
+            disclosed_key_kind,
         )
         .await
     }
@@ -971,6 +1087,7 @@ impl KhiveRuntime {
         dry_run: bool,
         reason: Option<String>,
         validation: EntityMergeValidation,
+        disclosed_key_kind: Option<String>,
     ) -> RuntimeResult<MergeSummary> {
         if let Some(reason) = reason.as_deref() {
             crate::secret_gate::check_at(reason, "merge", "reason")?;
@@ -1038,6 +1155,7 @@ impl KhiveRuntime {
                         MergeTxLimits::default(),
                         merge_event_id,
                         Some(event_context),
+                        disclosed_key_kind,
                     )
                     .map_err(|e| {
                         e.into_storage_error(
@@ -1069,6 +1187,7 @@ impl KhiveRuntime {
                         MergeTxLimits::default(),
                         merge_event_id,
                         Some(event_context),
+                        disclosed_key_kind,
                     )
                     .map_err(|error| match error {
                         MergeSqlError::Sqlite(error) => error,

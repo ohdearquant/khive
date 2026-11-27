@@ -331,7 +331,7 @@ pub(crate) fn legacy_post_commit_result_with_embedding<T>(
 mod attachments;
 mod entity_aliases;
 pub(crate) use entity_aliases::{
-    apply_entity_alias_change, unguarded as unguarded_alias_statements,
+    apply_entity_alias_change, entity_updated_payload, unguarded as unguarded_alias_statements,
 };
 pub use entity_aliases::{validate_entity_alias, EntityAliasChange, EntityAliasReport};
 mod entity_bulk;

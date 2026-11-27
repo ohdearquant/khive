@@ -117,7 +117,14 @@ An `update` that changes the name adds the old name as an alias with origin `ren
 transaction, unless the call passes `keep_old_name: false`. Today the `entity_updated` event
 payload names only the changed fields; when the name changes it gains `previous_name` and `name`,
 so the record's history keeps the old name even when no alias is kept. With an alias kept, the
-alias row and its `created_at` also say when the name changed.
+alias row and its `created_at` also say when the name changed. A keyed `create` with
+`on_key: "update"` that changes the held entity's name is such an update and keeps the old name;
+`create` takes no `keep_old_name`, so a loader that wants no alias renames the entity with
+`update(keep_old_name=false)` before the reload. The keep belongs to the `update` verb and to a
+keyed `create` with `on_key: "update"`. The runtime's plain entity update, which packs use for names
+they derive themselves (a placeholder replaced by the real name, a page title), keeps nothing unless
+the caller asks; every other runtime write that can rename an entity names its choice. An empty old
+name is never kept as an alias, on any route, a merge included.
 
 An alias never equals its entity's current name, so resolve never answers one entity twice for one
 string. `create` (including `on_key: "update"`) and `update(add_aliases=[...])` do not store an
