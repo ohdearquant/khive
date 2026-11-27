@@ -196,15 +196,25 @@ A key or alias that a carrier drops is row 1 failing one hop later, so each carr
   merged result would place on two different entities is a typed conflict, never a silent winner.
   Each member is judged against the base: one branch adding it keeps it, one branch removing it
   while the other leaves it alone removes it, so a released key stays released. An alias's origin
-  is a value merged the same way, and two different changes keep ours. Keys are compared under
+  is a value merged the same way. When both branches changed it differently the alias is kept,
+  with ours' origin, or with theirs when ours removed the alias: a removal does not silently win
+  over a change, and an alias is cheap to remove again. Keys are compared under
   each entity's merged kind. A merged entity that keeps a key some branch holds under another kind
   is reported as a kind conflict, since a store refuses that change; a kind change made after the
   keys were released merges. An input archive that already places one key on two entities is
   refused before the merge runs.
-- **Change sets.** `EntityCreateFields` gains `key` and `aliases`; `EntityPatch` and
-  `EntityPreimage` gain the alias changes they touch; the merge preimage covers the aliases and
-  keys a merge moves. These structs refuse unknown fields, so a reader older than this change
-  refuses a change set that carries them rather than applying it without them.
+- **Change sets.** `EntityCreateFields` gains `key` and `aliases`. A create whose key a live
+  entity holds, or an earlier create in the same change set took, refuses the whole change set as
+  `key_conflict` naming the key, unless an earlier operation in that change set deletes the
+  holder. `EntityPatch` and `EntityPreimage` carry the alias set as one absolute value, each alias
+  with its origin, and the apply writes the set as given: a change set is a trusted carrier of
+  origins, as an export archive is. A change that renames an entity onto an alias it holds must
+  carry the alias set, which may not name the new name; without it the change is refused, naming
+  the alias and the entity. A delete's record carries the entity's keys and aliases, compared as
+  sets with the live row, and the restore its inverse produces carries them too. The merge record
+  covers both entities' keys and aliases; applying a merge or a restore from a change set is not
+  implemented yet and is refused as such. These structs refuse unknown fields, so a reader older
+  than this change refuses a change set that carries them rather than applying it without them.
 
 ## Migration
 

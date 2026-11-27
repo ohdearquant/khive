@@ -412,6 +412,41 @@ async fn case_3_different_splits_the_field_under_a_general_one() {
     );
 }
 
+/// A field that already holds the split's existing name as an entity alias is
+/// still split: the rename carries the field's alias set without that name, so
+/// the alias never equals the name and the other aliases stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_split_renames_a_field_holding_the_existing_name_as_an_alias() {
+    let mut scenario = Scenario::loaded().await;
+    let id = {
+        let store = &scenario.store;
+        let field = store
+            .call(
+                "forms.neighbourhood",
+                json!({"node": "recipient account number"}),
+            )
+            .await;
+        let id = field["node"]["id"].clone();
+        assert!(id.is_string(), "{field}");
+        store
+            .call(
+                "update",
+                json!({"id": id, "add_aliases": ["recipient bank account number", "payee account"]}),
+            )
+            .await;
+        id
+    };
+    let split = scenario.split().await;
+    assert_eq!(split["status"], "split", "{split}");
+    let got = scenario.store.call("get", json!({"id": id})).await;
+    assert_eq!(got["name"], "recipient bank account number", "{got}");
+    assert_eq!(
+        got["aliases"],
+        json!([{"alias": "payee account", "origin": "caller"}]),
+        "{got}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn case_4_same_gives_one_field_two_aliases_two_items() {
     let scenario = Scenario::loaded().await;

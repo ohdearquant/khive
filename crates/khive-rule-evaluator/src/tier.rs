@@ -270,6 +270,7 @@ fn entity_fields(patch: &EntityPatch) -> Vec<&'static str> {
         properties,
         tags,
         entity_type,
+        aliases,
     } = patch;
     [
         ("name", name.is_some()),
@@ -277,6 +278,7 @@ fn entity_fields(patch: &EntityPatch) -> Vec<&'static str> {
         ("properties", properties.is_some()),
         ("tags", tags.is_some()),
         ("entity_type", entity_type.is_some()),
+        ("aliases", aliases.is_some()),
     ]
     .into_iter()
     .filter_map(|(field, touched)| touched.then_some(field))

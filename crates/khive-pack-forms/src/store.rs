@@ -521,6 +521,8 @@ impl Writes {
                 description: description.map(str::to_owned),
                 properties: property_map(properties)?,
                 tags: Vec::new(),
+                key: None,
+                aliases: vec![],
             }),
         }));
         Ok(())
@@ -569,12 +571,25 @@ impl Writes {
         description: Option<&str>,
         properties: Option<Map<String, Value>>,
     ) -> Result<(), RuntimeError> {
+        // An alias never equals its entity's name, so a rename onto a name the
+        // entity holds as an alias carries the alias set without that name.
+        let aliases = name
+            .filter(|name| before.aliases.iter().any(|held| held.alias == *name))
+            .map(|name| {
+                before
+                    .aliases
+                    .iter()
+                    .filter(|held| held.alias != name)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
         let patch = EntityPatch {
             name: name.map(str::to_owned),
             description: description.map(|d| Some(d.to_owned())),
             properties: properties.map(property_map).transpose()?,
             tags: None,
             entity_type: None,
+            aliases: aliases.clone(),
         };
         let preimage = EntityPreimage {
             name: name.map(|_| before.name.clone()),
@@ -585,6 +600,7 @@ impl Writes {
             },
             tags: None,
             entity_type: None,
+            aliases: aliases.map(|_| before.aliases.clone()),
         };
         let op = UpdateOp::new(
             id128(before.id),
