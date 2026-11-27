@@ -4,9 +4,10 @@
 //!
 //! See `crates/khive-merge/docs/api/entity-merge.md` for the decision table.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use khive_runtime::portability::{ExportedEntity, KgArchive};
+use khive_storage::entity::{EntityAlias, EntityAliasOrigin};
 use uuid::Uuid;
 
 use crate::diff_local::{diff_entities, properties_equal, EntityChange};
@@ -199,6 +200,11 @@ fn field_level_merge(
         result.tags = tags;
     }
 
+    // ADR-221 section 4: keys and aliases merge as sets against the base, so
+    // a key one branch released stays released.
+    result.keys = merge_set(&base.keys, &ours.keys, &theirs.keys);
+    result.aliases = merge_aliases(&base.aliases, &ours.aliases, &theirs.aliases, &result.name);
+
     let (merged_props, prop_conflicts) =
         merge_properties(id, &base.properties, &ours.properties, &theirs.properties);
     result.properties = merged_props;
@@ -328,7 +334,160 @@ fn detect_entity_diffs(ours: &ExportedEntity, theirs: &ExportedEntity) -> Vec<St
     if ours_tags != theirs_tags {
         diffs.push("tags".into());
     }
+    if merge_set(&[], &ours.keys, &[]) != merge_set(&[], &theirs.keys, &[]) {
+        diffs.push("keys".into());
+    }
+    if merge_set(&[], &ours.aliases, &[]) != merge_set(&[], &theirs.aliases, &[]) {
+        diffs.push("aliases".into());
+    }
     diffs
+}
+
+/// Three-way set merge against the base: a member stays when both branches
+/// hold it, or when one branch added it. A member one branch removed and the
+/// other left alone is removed. The result is sorted.
+fn merge_set<T: Ord + Clone>(base: &[T], ours: &[T], theirs: &[T]) -> Vec<T> {
+    let base: BTreeSet<&T> = base.iter().collect();
+    let ours: BTreeSet<&T> = ours.iter().collect();
+    let theirs: BTreeSet<&T> = theirs.iter().collect();
+    ours.union(&theirs)
+        .filter(|member| {
+            (ours.contains(*member) && theirs.contains(*member)) || !base.contains(*member)
+        })
+        .map(|member| (*member).clone())
+        .collect()
+}
+
+/// Merges aliases per alias string against the base, each alias's origin
+/// (or its absence) being one value: a one-sided change is taken, and when
+/// both branches changed it differently the alias is kept, with ours' origin
+/// unless ours removed it. Origin is an annotation, so this is no conflict.
+/// An alias equal to the merged name is not kept. The result is sorted by alias.
+fn merge_aliases(
+    base: &[EntityAlias],
+    ours: &[EntityAlias],
+    theirs: &[EntityAlias],
+    name: &str,
+) -> Vec<EntityAlias> {
+    fn by_alias(aliases: &[EntityAlias]) -> BTreeMap<&str, EntityAliasOrigin> {
+        aliases
+            .iter()
+            .map(|a| (a.alias.as_str(), a.origin))
+            .collect()
+    }
+    let base = by_alias(base);
+    let ours = by_alias(ours);
+    let theirs = by_alias(theirs);
+    let all: BTreeSet<&str> = base
+        .keys()
+        .chain(ours.keys())
+        .chain(theirs.keys())
+        .copied()
+        .collect();
+
+    let mut merged = Vec::new();
+    for alias in all {
+        if alias == name {
+            continue;
+        }
+        let base_origin = base.get(alias);
+        let ours_origin = ours.get(alias);
+        let theirs_origin = theirs.get(alias);
+        let selected = if ours_origin == base_origin {
+            theirs_origin
+        } else if theirs_origin == base_origin || ours_origin.is_some() {
+            ours_origin
+        } else {
+            theirs_origin
+        };
+        if let Some(origin) = selected {
+            merged.push(EntityAlias {
+                alias: alias.to_string(),
+                origin: *origin,
+            });
+        }
+    }
+    merged
+}
+
+/// Reports a merged entity that keeps a key some branch holds under a
+/// different kind, as a `KindConflict` naming each branch's kind. A key is
+/// held under its holder's kind (ADR-221 sections 1 and 4), so such a result
+/// moves that branch's key to another kind, which a store refuses: it does not
+/// change the kind of an entity while the entity holds keys. A kind change
+/// made after every key was released carries no key across and merges as
+/// before. An entity already named by a `KindConflict` in `reported` is not
+/// named twice.
+pub(crate) fn kind_change_conflicts(
+    base: &KgArchive,
+    ours: &KgArchive,
+    theirs: &KgArchive,
+    merged: &[ExportedEntity],
+    reported: &[MergeConflict],
+) -> Vec<MergeConflict> {
+    fn by_id(archive: &KgArchive) -> HashMap<Uuid, &ExportedEntity> {
+        archive.entities.iter().map(|e| (e.id, e)).collect()
+    }
+    let base_map = by_id(base);
+    let ours_map = by_id(ours);
+    let theirs_map = by_id(theirs);
+    let already: HashSet<Uuid> = reported
+        .iter()
+        .filter_map(|conflict| match conflict {
+            MergeConflict::KindConflict { entity_id, .. } => Some(*entity_id),
+            _ => None,
+        })
+        .collect();
+
+    let mut conflicts = Vec::new();
+    for entity in merged {
+        if already.contains(&entity.id) {
+            continue;
+        }
+        let ours_side = ours_map.get(&entity.id).copied();
+        let theirs_side = theirs_map.get(&entity.id).copied();
+        let carries_a_key_across_kinds =
+            [ours_side, theirs_side].into_iter().flatten().any(|side| {
+                side.kind != entity.kind && side.keys.iter().any(|key| entity.keys.contains(key))
+            });
+        if !carries_a_key_across_kinds {
+            continue;
+        }
+        let kind_of = |side: Option<&ExportedEntity>| {
+            side.or_else(|| base_map.get(&entity.id).copied())
+                .map_or(entity.kind.as_str(), |e| e.kind.as_str())
+                .to_string()
+        };
+        conflicts.push(MergeConflict::KindConflict {
+            entity_id: entity.id,
+            ours: kind_of(ours_side),
+            theirs: kind_of(theirs_side),
+        });
+    }
+    conflicts
+}
+
+/// Reports every key, under one kind, that more than one entity of `entities`
+/// holds, once per `(kind, key)` in sorted order (ADR-221 section 4).
+pub(crate) fn key_conflicts(entities: &[ExportedEntity]) -> Vec<MergeConflict> {
+    let mut holders: BTreeMap<(&str, &str), BTreeSet<Uuid>> = BTreeMap::new();
+    for entity in entities {
+        for key in &entity.keys {
+            holders
+                .entry((entity.kind.as_str(), key.as_str()))
+                .or_default()
+                .insert(entity.id);
+        }
+    }
+    holders
+        .into_iter()
+        .filter(|(_, ids)| ids.len() > 1)
+        .map(|((kind, key), ids)| MergeConflict::KeyConflict {
+            kind: kind.to_string(),
+            key: key.to_string(),
+            entities: ids.into_iter().collect(),
+        })
+        .collect()
 }
 
 #[cfg(test)]

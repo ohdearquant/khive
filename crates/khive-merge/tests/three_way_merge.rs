@@ -355,6 +355,8 @@ include!("three_way_merge_tests/strategy_and_diff_tests.rs");
 
 include!("three_way_merge_tests/identity_and_shortcut_tests.rs");
 
+include!("three_way_merge_tests/key_merge_tests.rs");
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn archive_with_entities(entities: Vec<ExportedEntity>) -> KgArchive {
