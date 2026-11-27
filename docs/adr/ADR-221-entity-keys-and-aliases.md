@@ -78,9 +78,10 @@ Inside one bulk create, items are judged in order in one transaction: a second i
 an earlier item of the same request assigned is judged against that earlier item, exactly as if it
 had already been stored.
 
-`get`, `update` and `delete` accept `(kind, key)` in place of an id. `delete` releases the key;
-`restore` takes it back when it is free and otherwise refuses with `restore_key_conflict`, as for
-notes.
+`get`, `update` and `delete` accept `(kind, key)` in place of an id. After merges one entity can
+hold several keys. `delete` releases every key the entity holds. `restore` is all or nothing: it
+takes every key back when all are free, and when another live entity holds any of them it refuses
+with `restore_key_conflict` naming each taken key, takes back no key and leaves the entity deleted.
 
 ### 2. Aliases
 
@@ -117,11 +118,37 @@ payload names only the changed fields; when the name changes it gains `previous_
 so the record's history keeps the old name even when no alias is kept. With an alias kept, the
 alias row and its `created_at` also say when the name changed.
 
+An alias never equals its entity's current name, so resolve never answers one entity twice for one
+string. `create` (including `on_key: "update"`) and `update(add_aliases=[...])` do not store an
+alias equal to the name and list it in the response as not stored. A rename to a name the entity
+holds as an alias deletes that alias row, whatever its origin, in the rename's transaction; the old
+name becomes a `rename` alias as usual. A merge compares against the kept entity's name after the
+merge: it stores no alias equal to that name, and when the merge strategy takes `from`'s name
+(`merge_sql.rs` line 264), `into`'s previous name becomes a `merge` alias in its place. Resolve
+counts matching entities, not matching strings, so a name and an alias of one entity that both
+match are one hit.
+
 `merge(into, from)` inside `merge_entity_sql`: `from`'s name and aliases become aliases of `into`
-with origin `merge`, and `from`'s `entity_keys` rows move to `into`. Key uniqueness is on the key,
-so moving rows cannot collide. A reload under a key `from` held then addresses the kept entity. A
-dry-run merge lists the aliases and keys it would move. A merge redirect (ADR-113 Amendment 1)
-is unchanged for ids; names and keys of the removed entity now reach the kept one directly.
+with origin `merge`, and `from`'s `entity_keys` rows move to `into`. Both entities are read under
+the caller's one namespace. A merge without `force` refuses two entities of different kinds
+(`crates/khive-runtime/src/curation/merge_sql.rs` lines 231-247, and `validate_entity_merge_floor`
+in `crates/khive-runtime/src/curation/types_and_guards.rs` line 140), so a moved row keeps its
+`(namespace, kind)`, and because uniqueness is on `(namespace, kind, key)` no key `into` holds can
+equal it: moving cannot collide.
+
+`force: true` skips that check (`merge_sql.rs` line 248), so a forced merge can join two kinds. A
+key row always carries its holder's kind, so a forced cross-kind merge rewrites each moved row to
+`into`'s kind. A rewritten key that `into` already holds is dropped as a duplicate. A rewritten key
+that another live entity holds under `into`'s kind refuses the whole merge with
+`merge_key_conflict`, naming the key and, when the caller may list it, that entity; nothing is
+written. After a forced cross-kind merge the key no longer answers under `from`'s old kind; the
+merge result lists each rewritten key, so a caller whose loader still names that kind can re-key
+it.
+
+A reload under a key `from` held, in `into`'s kind, then addresses the kept entity. A dry-run merge
+lists the aliases and keys it would move, the keys it would rewrite and any `merge_key_conflict`,
+and writes nothing. A merge redirect (ADR-113 Amendment 1) is unchanged for ids; names and keys of
+the removed entity now reach the kept one directly.
 
 A split that gives the old name to the parent renames the child with `keep_old_name: false`, so the
 old name is not left as an alias on both and resolve stays unambiguous.
@@ -160,8 +187,9 @@ or an alias. Existing full-text rows are unchanged until the entity is next writ
    transaction (identical: one entity; differing: `key_conflict` for the second item).
 4. The same key under two kinds in one namespace names two entities; the same key in two
    namespaces names two entities.
-5. Delete releases the key; restore takes it back when free and refuses with
-   `restore_key_conflict` when another entity took it.
+5. Delete releases every key the entity holds (two keys after a merge); restore takes both back
+   when free, and when another entity took one refuses with `restore_key_conflict` naming it,
+   takes back neither and leaves the entity deleted.
 6. A key or alias that the secret gate refuses is refused before any holder lookup.
 7. Resolve by alias returns the entity with `matched_alias`; an alias on two entities returns
    `Ambiguous` over those two; text search finds an entity by an alias it holds.
@@ -174,3 +202,10 @@ or an alias. Existing full-text rows are unchanged until the entity is next writ
 11. Export then import, and snapshot write then sync, round-trip keys and aliases; a snapshot with
     neither keeps the snapshot id it had before this change.
 12. A three-way merge that would place one key on two entities reports a conflict.
+13. A merge across kinds without `force` still refuses. A forced merge of two kinds rewrites
+    `from`'s keys to `into`'s kind and lists them; a rewritten key that another live entity holds
+    under `into`'s kind refuses the merge with `merge_key_conflict` and writes nothing, and the dry
+    run reports the same conflict.
+14. An alias equal to the entity's name is not stored on create, on `add_aliases`, on a rename back
+    to a name held as an alias (which deletes that alias), or on a merge, including one whose
+    strategy takes `from`'s name; resolve of that string returns the entity once.
