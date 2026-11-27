@@ -140,13 +140,16 @@ impl KhiveRuntime {
     /// Computes the patched `Entity`, `reindex_required`, and `changed_fields` without
     /// writing anything, so both the normal write path and the atomic-prepare path
     /// share one source of truth for what a patched entity looks like.
+    /// `remove_properties` names top-level property keys dropped after the
+    /// patch's properties merge in; runtime-owned keys cannot be removed.
     pub(crate) async fn prepare_update_entity(
         &self,
         token: &NamespaceToken,
         id: Uuid,
         patch: EntityPatch,
+        remove_properties: &[&str],
     ) -> RuntimeResult<(Entity, bool, Vec<&'static str>, i64, Option<i64>)> {
-        self.prepare_guarded_entity_update(token, id, patch, None, &[])
+        self.prepare_guarded_entity_update(token, id, patch, None, remove_properties)
             .await
     }
 

@@ -170,10 +170,11 @@ must parse into that shape (deny-unknown-fields), then each entry is classified 
 
 - An entity item requires a non-empty `name`, applies the same `kind`/`entity_kind` and
   `entity_type` reconciliation as the singleton path, and refuses the note-only fields
-  `content`, `note_kind` and `salience`.
+  `content`, `note_kind` and `salience`. Its `on_key` may only be `"update"`, and only
+  beside a `key`.
 - A note item requires non-empty `content`, reconciles `kind` against `note_kind` (a
-  bare `kind="note"` defaults to `observation`), refuses the entity-only fields
-  `entity_kind`, `entity_type` and `description`, and refuses `scheduled_event`, which
+  bare `kind="note"` defaults to `observation`), refuses `key` and `on_key`, refuses the
+  entity-only fields `entity_kind`, `entity_type` and `description`, and refuses `scheduled_event`, which
   bulk create never creates.
 
 `khive-pack-schedule` cannot import the KG pack's private struct, so the field set is a

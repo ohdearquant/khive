@@ -592,6 +592,9 @@ struct ScheduleBulkCreateEntryCheck {
     entity_kind: Option<String>,
     entity_type: Option<String>,
     description: Option<String>,
+    // entity-only: the item's caller key and `on_key`
+    key: Option<String>,
+    on_key: Option<String>,
     // note-only
     content: Option<String>,
     note_kind: Option<String>,
@@ -603,9 +606,10 @@ struct ScheduleBulkCreateEntryCheck {
 
 /// Validate a `create(items=[...])` bulk payload the way `handle_create`'s
 /// bulk path would: `items` must parse into the same shape as
-/// `BulkCreateEntry` (deny-unknown-fields), an entity item needs a `name`
-/// and takes no note-only field, and a note item needs `content` and takes no
-/// entity-only field.
+/// `BulkCreateEntry` (deny-unknown-fields), an entity item needs a `name`,
+/// takes no note-only field and sets `on_key` only to `"update"` beside a
+/// `key`, and a note item needs `content` and takes no entity-only field,
+/// `key` and `on_key` included.
 fn validate_create_bulk_items(
     items_value: &Value,
     registry: &VerbRegistry,
@@ -633,6 +637,22 @@ fn validate_create_bulk_items(
                         "schedule.action: verb \"create\": items[{idx}] content, note_kind and \
                          salience apply only to note items"
                     )));
+                }
+                match entry.on_key.as_deref() {
+                    None => {}
+                    Some("update") if entry.key.is_some() => {}
+                    Some("update") => {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "schedule.action: verb \"create\": items[{idx}] on_key applies only \
+                             to a keyed entity item"
+                        )));
+                    }
+                    Some(_) => {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "schedule.action: verb \"create\": items[{idx}] on_key accepts only \
+                             \"update\""
+                        )));
+                    }
                 }
                 let canonical = reconcile_specific_for_replay(
                     &format!("items[{idx}] "),
@@ -663,6 +683,12 @@ fn validate_create_bulk_items(
                 }
             }
             CreateKindClass::Note { specific } => {
+                if entry.key.is_some() || entry.on_key.is_some() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "schedule.action: verb \"create\": items[{idx}] key and on_key apply \
+                         only to entity items of a bulk create"
+                    )));
+                }
                 if entry.entity_kind.is_some()
                     || entry.entity_type.is_some()
                     || entry.description.is_some()
