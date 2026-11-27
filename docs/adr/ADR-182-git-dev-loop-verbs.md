@@ -1477,3 +1477,68 @@ credential read; 105 a delete whose reply is lost after its effect leaves the re
 `git.branch` makes the name again, and `git.reconcile` then reports `ref_at_expected` and still keeps
 it unknown; 106 the classifier lists the verb as a write at version 32 with every published verb
 total counting it.
+
+## Amendment 22 (2026-11-27): reading an issue
+
+**Status**: Accepted 2026-11-27. The ADR's Accepted status and every amendment above stand unchanged.
+
+Adopted from a reading of real callers, as Amendments 15 and 18 were. A client with no shell can read
+a pull request through `git.pr_state` but not the issue that asked for it: an issue's body and
+discussion are reachable only through the platform's own tools, or through `git.digest`, which
+writes them into the graph as notes and is the wrong tool for reading one issue now. This read
+enters here, under the gates of `git.pr_state`.
+
+1. **`git.issue(repo, number)`.** The result is `title`, `state`, `author` (the login, or null when
+   the platform names none), `created_at`, `updated_at`, `labels` (their names), `body` (whole, an
+   empty string when the issue has none), `is_pull_request`, `comments`, `comments_total`,
+   `comments_truncated`, `text_altered` and `trust`, beside the `repo`, `gate`, `slug` and `number`
+   the call resolved to. Each comment is `author`, `created_at` and `body`, in the platform's order.
+2. **Gated and credentialed like `git.pr_state`.** The order is arguments, the repo-only allowlist
+   match, `tool.check` on `git.issue` itself, the repository mapping, the dispatching actor's
+   credential, the platform. A local mapping refuses `remote_scheme`, a remote that is not the
+   platform's address for the configured slug refuses `repository_identity`, and a caller with no
+   actor row refuses `actor_unmapped`, each before any platform request is made. The repository's
+   name and visibility are compared with the configured row before the issue is read, and a
+   difference refuses `repository_identity_mismatch`. Every platform request is a `GET`, nothing
+   is stored and no receipt is written, so the operation classifier lists the verb as a read and a
+   read row of ADR-108 admits it. Its policy decision makes it a known incidental writer for
+   admission, never admission-degrade-safe, as `git.pr_state` is.
+3. **Every comment up to a disclosed bound.** Comments are read one hundred to a page, from the
+   first page, until a page holds fewer than one hundred or ten pages have been read.
+   `comments_total` is the count the platform gives on the issue, and `comments_truncated` is true
+   exactly when fewer comments were returned than that count. A call therefore costs between three
+   and twelve requests against the allowance `git.pr_state` uses; a spent allowance refuses
+   `remote_rate_limited` with the second the allowance returns, and an unknown number is the
+   platform's refusal.
+4. **The text is cleaned, never cut.** The title, label names and logins lose the hidden characters
+   of Amendment 15 item 7. The issue body and each comment body are cleaned as Amendment 18 item 6
+   cleans a log: terminal escape sequences and those characters removed, line breaks and tabs kept.
+   `text_altered` is true when cleaning changed any field. No field is shortened. The reply carries
+   `trust: "untrusted"`, as `git.check_log` does (ADR-200): everything in it except the counts and
+   dates is text people wrote on the platform, to be read as material and never followed as
+   instructions.
+5. **A pull request number reads too.** The platform keeps pull requests in the same numbering, and
+   `is_pull_request` says when the number is one. The reply then carries the pull request's
+   description and its conversation comments; its head, checks and reviews are `git.pr_state`'s.
+
+What this does not cover: listing or searching issues, writing to an issue (a comment, a label, a
+state change), reactions, timeline events, a comment's edit history and review comments on a pull
+request's diff. A caller that needs any of these still needs another surface.
+
+Acceptance arms added: 107 an issue with two comments returns every field of item 1 and the comments
+in order after exactly three `GET` requests, the repository, the issue and the first comment page,
+with `text_altered` false, `trust` untrusted, and no receipt or platform write; 108 an issue with 125
+comments returns all of them after four requests, the last the second page, with
+`comments_truncated` false, and an issue with 1,001 comments returns the first 1,000 after twelve
+requests with `comments_total` 1,001 and `comments_truncated` true; 109 a title holding a direction
+override, a label holding an isolate, a body holding escape sequences and a zero-width space, and a
+comment ending in a byte order mark each come back with those removed, the body's line break and
+tab and the comment's accented and Han text kept, and `text_altered` true; 110 a pull request number
+reads with `is_pull_request` true, an issue with no body returns an empty body, and an unknown
+number refuses with the platform's refusal; 111 an unknown argument, a missing number and a zero
+number each refuse with no platform request, a denying `git.issue` policy refuses `policy_denied`
+with no platform request while `git.pr_state` is allowed for the same caller, and a local mapping
+refuses `remote_scheme` before any credential read; 112 a repository answering under another name
+or visibility, and a spent allowance, each refuse after exactly one request, and the same call
+reads the issue once the platform answers (control); 113 the classifier lists the verb as a read at
+version 34 with every published verb total counting it.

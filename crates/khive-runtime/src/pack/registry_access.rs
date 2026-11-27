@@ -500,8 +500,8 @@ impl VerbRegistry {
     ///   receipt on every dispatch (checkout and diff also write a manifest
     ///   or diff blob), so their accounting row is not droppable.
     /// - `tool.check` persists a policy decision receipt. `git.receipts`,
-    ///   `git.gates`, `git.status`, `git.log`, `git.pr_state` and `git.check_log` dispatch
-    ///   that same check, so their read results also carry a required decision write;
+    ///   `git.gates`, `git.status`, `git.log`, `git.pr_state`, `git.issue` and `git.check_log`
+    ///   dispatch that same check, so their read results also carry a required decision write;
     ///   `git.check_log` also stores the log it read as a blob.
     /// - `exec.tree_diff` writes the full change list as a blob whenever its
     ///   reply cuts the list (ADR-181 Amendment 18), so a read result can

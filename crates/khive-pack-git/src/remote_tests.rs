@@ -75,6 +75,8 @@ struct State {
     fork: bool,
     mismatch: Option<&'static str>,
     prs: BTreeMap<u64, Value>,
+    issues: BTreeMap<u64, Value>,
+    issue_comments: BTreeMap<u64, Vec<Value>>,
     reviews: Vec<Value>,
     calls: Vec<Value>,
     push_calls: usize,
@@ -200,13 +202,76 @@ impl RemoteTransport for Recording {
                 json!({"full_name":if s.mismatch==Some("slug"){"wrong/repo"}else{SLUG},"visibility":if s.mismatch==Some("visibility"){"public"}else{"private"}}),
             );
         }
+        if let Some(rest) = path.strip_prefix(&format!("repos/{SLUG}/issues/")) {
+            // The platform pages one hundred comments at a time.
+            if let Some((number, page)) = rest.split_once("/comments?per_page=100&page=") {
+                let number = number
+                    .parse::<u64>()
+                    .map_err(|_| RemoteError::InvalidResponse)?;
+                let page = page
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|page| *page > 0)
+                    .ok_or(RemoteError::InvalidResponse)?;
+                if !s.issues.contains_key(&number) && !s.prs.contains_key(&number) {
+                    return Err(RemoteError::Refused);
+                }
+                let comments: Vec<Value> = s
+                    .issue_comments
+                    .get(&number)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .skip((page - 1) * 100)
+                    .take(100)
+                    .collect();
+                return Ok(json!(comments));
+            }
+            let number = rest
+                .parse::<u64>()
+                .map_err(|_| RemoteError::InvalidResponse)?;
+            if let Some(issue) = s.issues.get(&number) {
+                return Ok(issue.clone());
+            }
+            if let Some(pr) = s.prs.get(&number) {
+                let mut issue = pr.clone();
+                issue["pull_request"] = json!({
+                    "url":format!("https://api.github.com/repos/{SLUG}/pulls/{number}")
+                });
+                let fields = issue.as_object_mut().unwrap();
+                fields.entry("labels").or_insert(json!([]));
+                fields.entry("comments").or_insert(json!(0));
+                fields
+                    .entry("created_at")
+                    .or_insert(json!("2026-11-21T15:00:00Z"));
+                fields
+                    .entry("updated_at")
+                    .or_insert(json!("2026-11-21T15:00:00Z"));
+                return Ok(issue);
+            }
+            return Err(RemoteError::Refused);
+        }
         if path.contains("/git/ref/heads/") {
             return Ok(json!({"object":{"sha":s.head}}));
         }
         if path == format!("repos/{SLUG}/pulls") && request.method == "POST" {
             let n = s.prs.len() as u64 + 1;
             let opened = request.body.clone().unwrap_or(Value::Null);
-            let pr = json!({"number":n,"html_url":format!("https://github.com/{SLUG}/pull/{n}"),"state":"open","merged":false,"title":opened["title"],"body":opened["body"],"head":{"sha":s.head,"ref":"work","repo":{"full_name":if s.fork{"fork/project"}else{SLUG}}},"base":{"repo":{"full_name":SLUG}},"user":{"login":s.author}});
+            let pr = json!({
+                "number":n,
+                "html_url":format!("https://github.com/{SLUG}/pull/{n}"),
+                "state":"open",
+                "merged":false,
+                "title":opened["title"],
+                "body":opened["body"],
+                "labels":[],
+                "comments":0,
+                "created_at":"2026-11-21T15:00:00Z",
+                "updated_at":"2026-11-21T15:00:00Z",
+                "head":{"sha":s.head,"ref":"work","repo":{"full_name":if s.fork{"fork/project"}else{SLUG}}},
+                "base":{"repo":{"full_name":SLUG}},
+                "user":{"login":s.author}
+            });
             s.prs.insert(n, pr.clone());
             s.writes += 1;
             return Ok(pr);
@@ -516,6 +581,8 @@ impl Fixture {
                 fork: false,
                 mismatch: None,
                 prs: BTreeMap::new(),
+                issues: BTreeMap::new(),
+                issue_comments: BTreeMap::new(),
                 reviews: vec![],
                 calls: vec![],
                 push_calls: 0,
@@ -689,6 +756,8 @@ include!("remote_tests/push_admission_tests.rs");
 include!("remote_tests/pull_request_decisions_tests.rs");
 
 include!("remote_tests/pull_request_state_tests.rs");
+
+include!("remote_tests/issue_tests.rs");
 
 include!("remote_tests/outcome_reconciliation_tests.rs");
 

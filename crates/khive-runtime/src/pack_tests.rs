@@ -100,6 +100,7 @@ const KNOWN_ADMISSION_UNSAFE_VERBS: &[&str] = &[
     "git.checkout",
     "git.diff",
     "git.gates",
+    "git.issue",
     "git.log",
     "git.pr_state",
     "git.receipts",
@@ -689,12 +690,13 @@ fn policy_decision_receipts_are_admission_unsafe_under_trusted_owners() {
         }
     }
     static TOOL_HANDLERS: [HandlerDef; 2] = [handler("tool.check"), handler("tool.describe")];
-    static GIT_HANDLERS: [HandlerDef; 6] = [
+    static GIT_HANDLERS: [HandlerDef; 7] = [
         handler("git.receipts"),
         handler("git.gates"),
         handler("git.status"),
         handler("git.log"),
         handler("git.pr_state"),
+        handler("git.issue"),
         handler("git.check_log"),
     ];
 
@@ -721,6 +723,7 @@ fn policy_decision_receipts_are_admission_unsafe_under_trusted_owners() {
         "git.status",
         "git.log",
         "git.pr_state",
+        "git.issue",
         "git.check_log",
     ] {
         assert!(

@@ -123,6 +123,10 @@ are `Write`: each commits graph records in one transaction. `forms.resolve`,
 `forms.neighbourhood`, `forms.check`, `forms.lint` and `forms.export` are
 `Read`: they read the graph and write nothing.
 
+Revision `domain-effects-v34` classifies `git.issue` as `Read`: it reads one
+issue and its comments from the platform and writes no receipt and no blob, so
+it is admitted as a read like `git.pr_state`.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -235,6 +239,7 @@ are `Write`: each commits graph records in one transaction. `forms.resolve`,
 | `git.fetch`                       | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs)                       |
 | `git.gates`                       | Read   | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L57)                     |
 | `git.ingest_cursor`               | Read   | Verb       | [khive-pack-git/src/vocab.rs](../../../khive-pack-git/src/vocab.rs#L84)                                 |
+| `git.issue`                       | Read   | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs)                       |
 | `git.init`                        | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L96)                     |
 | `git.log`                         | Read   | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L83)                     |
 | `git.pr_close`                    | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs)                       |

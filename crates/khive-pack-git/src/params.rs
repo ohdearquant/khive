@@ -128,6 +128,7 @@ arguments!(PrMerge {
     session_id
 });
 arguments!(PrState { repo, number });
+arguments!(Issue { repo, number });
 arguments!(CheckLog { repo, check_run });
 arguments!(PrEdit {
     repo,
@@ -215,6 +216,7 @@ pub(crate) fn parse(verb: &str, params: Value) -> Result<Value, RuntimeError> {
         "git.pr_review" => decode::<PrReview>(verb, params),
         "git.pr_merge" => decode::<PrMerge>(verb, params),
         "git.pr_state" => decode::<PrState>(verb, params),
+        "git.issue" => decode::<Issue>(verb, params),
         "git.check_log" => decode::<CheckLog>(verb, params),
         "git.pr_edit" => decode::<PrEdit>(verb, params),
         "git.pr_close" => decode::<PrClose>(verb, params),

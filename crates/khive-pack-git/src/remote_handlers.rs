@@ -1216,6 +1216,9 @@ impl GitPack {
 #[path = "pr_state.rs"]
 mod pr_state;
 
+#[path = "issue.rs"]
+mod issue;
+
 #[path = "pr_edit.rs"]
 mod pr_edit;
 
