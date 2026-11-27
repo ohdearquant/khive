@@ -9,12 +9,12 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use super::params;
-use super::views::{field_reply, usage, value_reply};
+use super::views::{field_reply, usage};
 use super::write::{DECISION, FORMAT, LOG_KEYS};
 use super::Ctx;
 use crate::store::{
-    aliases, definition, invalid, is_general, label, pending_premises, prop, prop_text, props,
-    quoted_names, scalar, strings, type_of, wordings, Graph,
+    definition, invalid, is_general, label, pending_premises, prop, prop_text, props, quoted_names,
+    scalar, strings, type_of, wordings, Graph,
 };
 use crate::text::normalize;
 use crate::vocab::{
@@ -24,7 +24,7 @@ use crate::vocab::{
 const ANNOTATION_PAGE: u32 = 1000;
 
 /// A form as findings and replies cite it.
-fn cite(form: &Entity) -> Value {
+pub(super) fn cite(form: &Entity) -> Value {
     json!({
         "id": form.id.to_string(),
         "form_id": prop_text(form, "form_id"),
@@ -94,172 +94,6 @@ fn item_view(graph: &Graph, item: &Entity) -> Value {
 
 fn number_of(node: &Entity, key: &str) -> f64 {
     prop(node, key).and_then(Value::as_f64).unwrap_or(f64::MAX)
-}
-
-/// How a field was found: its rank, the kind of match, the general field it
-/// was reached through, and the wording that matched.
-type Found = (u8, &'static str, Option<String>, Option<String>);
-
-/// Keep the lowest rank a field was found at.
-fn offer(found: &mut BTreeMap<Uuid, Found>, id: Uuid, entry: Found) {
-    match found.get(&id) {
-        Some((known, ..)) if *known <= entry.0 => {}
-        _ => {
-            found.insert(id, entry);
-        }
-    }
-}
-
-/// The printed wording of `field` that folds to `folded`.
-fn wording_of(field: &Entity, folded: &str) -> Option<String> {
-    aliases(field)
-        .into_iter()
-        .chain(std::iter::once(field.name.clone()))
-        .find(|w| normalize(w) == folded)
-}
-
-/// forms.resolve: text to fields, values and forms.
-pub(crate) async fn resolve(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeError> {
-    let args = params::args(params)?;
-    let text = params::text(&args, "text")?;
-    let types = params::string_list(&args, "types")?;
-    for t in &types {
-        params::one_of(t.clone(), "types", &[FIELD, FIELD_VALUE, FORM])?;
-    }
-    let wants = |t: &str| types.is_empty() || types.iter().any(|x| x == t);
-    let folded = normalize(&text);
-    if folded.is_empty() {
-        return Err(invalid("text must contain a letter or a digit"));
-    }
-    let graph = Graph::load(ctx.runtime, ctx.token).await?;
-
-    let mut found = BTreeMap::new();
-    let mut general = Vec::new();
-    for field in graph.of_type(FIELD) {
-        let how = if normalize(&field.name) == folded {
-            Some((0, "name"))
-        } else if wordings(field).contains(&folded) {
-            Some((1, "alias"))
-        } else {
-            None
-        };
-        let Some((rank, how)) = how else { continue };
-        let wording = wording_of(field, &folded);
-        if is_general(field) {
-            general.push(json!({"id": field.id.to_string(), "name": field.name}));
-            for child in graph.children_of_field(field.id) {
-                offer(
-                    &mut found,
-                    child,
-                    (rank, how, Some(field.name.clone()), wording.clone()),
-                );
-            }
-        } else {
-            offer(&mut found, field.id, (rank, how, None, wording));
-        }
-    }
-    let labelled: Vec<&Entity> = graph
-        .of_type(FORM_ITEM)
-        .into_iter()
-        .filter(|item| normalize(&label(item)) == folded)
-        .collect();
-    for item in &labelled {
-        for field in graph.fields_of_item(item.id) {
-            offer(&mut found, field, (3, "label", None, Some(label(item))));
-        }
-    }
-    let ambiguous = found.len() > 1;
-
-    let fields: Vec<(&Entity, &Found)> = found
-        .iter()
-        .filter_map(|(id, entry)| graph.get(*id).map(|f| (f, entry)))
-        .collect();
-
-    // Every hit with its rank and the name and id it is ordered by, so fields,
-    // values and forms come back as one list in rank order.
-    let mut hits: Vec<(u8, String, Uuid, Value)> = Vec::new();
-    if wants(FIELD) {
-        for (field, (rank, how, via, wording)) in fields {
-            let rank = *rank;
-            let items: Vec<&Entity> = graph
-                .items_of_field(field.id)
-                .into_iter()
-                .filter_map(|i| graph.get(i))
-                .collect();
-            let printing: Vec<Value> = items
-                .iter()
-                .filter(|i| normalize(&label(i)) == folded)
-                .map(|i| usage(i))
-                .collect();
-            let mut hit = field_reply(&graph, field);
-            hit["type"] = json!(FIELD);
-            hit["rank"] = json!(rank);
-            hit["matched_by"] = json!(how);
-            hit["matched_wording"] = json!(wording);
-            hit["ambiguous"] = json!(ambiguous);
-            if let Some(via) = via {
-                hit["via"] = json!(via);
-            }
-            hit["forms"] = Value::Array(if printing.is_empty() {
-                items.iter().map(|i| usage(i)).collect()
-            } else {
-                printing
-            });
-            hits.push((rank, field.name.clone(), field.id, hit));
-        }
-    }
-    if wants(FIELD_VALUE) {
-        for value in graph.of_type(FIELD_VALUE) {
-            let by_name = normalize(&value.name) == folded;
-            let options: Vec<Value> = labelled
-                .iter()
-                .filter(|i| graph.out(i.id, EdgeRelation::VariantOf).contains(&value.id))
-                .map(|i| usage(i))
-                .collect();
-            if !by_name && options.is_empty() {
-                continue;
-            }
-            let rank = if by_name { 2 } else { 3 };
-            let mut hit = value_reply(value);
-            hit["type"] = json!(FIELD_VALUE);
-            hit["rank"] = json!(rank);
-            hit["matched_by"] = json!(if by_name { "name" } else { "label" });
-            hit["matched_wording"] = json!(if by_name {
-                value.name.clone()
-            } else {
-                text.clone()
-            });
-            hit["field"] = json!(graph
-                .parent_field(value.id)
-                .and_then(|f| graph.get(f))
-                .map(|f| f.name.clone()));
-            hit["forms"] = Value::Array(options);
-            hits.push((rank, value.name.clone(), value.id, hit));
-        }
-    }
-    if wants(FORM) {
-        for form in graph.of_type(FORM) {
-            let by_title = normalize(&form.name) == folded;
-            let by_id = prop_text(form, "form_id").is_some_and(|id| normalize(&id) == folded)
-                || graph.key(form.id).as_deref() == Some(text.as_str());
-            if !(by_title || by_id) {
-                continue;
-            }
-            let rank = if by_id { 2 } else { 4 };
-            let mut hit = cite(form);
-            hit["type"] = json!(FORM);
-            hit["rank"] = json!(rank);
-            hit["matched_by"] = json!(if by_id { "form_id" } else { "title" });
-            hits.push((rank, form.name.clone(), form.id, hit));
-        }
-    }
-    hits.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-    Ok(json!({
-        "text": text,
-        "ambiguous": ambiguous,
-        "general": general,
-        "hits": hits.into_iter().map(|(.., hit)| hit).collect::<Vec<_>>(),
-    }))
 }
 
 fn find_node<'g>(graph: &'g Graph, spec: &str) -> Result<&'g Entity, RuntimeError> {
