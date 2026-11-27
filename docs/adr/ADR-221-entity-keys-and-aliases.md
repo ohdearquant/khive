@@ -1,6 +1,6 @@
 # ADR-221: Entity Keys and Aliases
 
-- **Status:** Proposed
+- **Status:** Accepted 2026-11-26 (#6872)
 - **Date:** 2026-11-26
 - **Grounding commit:** `4821b079b30dc645bbf4c23dc568cf18c453a1c8`
 - **Amends:** [ADR-023](ADR-023-declarative-pack-format.md) (the keyed-note amendment's sentence on
