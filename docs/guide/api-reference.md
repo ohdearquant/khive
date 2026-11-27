@@ -1083,14 +1083,20 @@ Reuse the returned `full_id` as `parent_id` in a subsequent proposal request. Th
 field has nested objects and cannot be expressed in function-call DSL form; use JSON form (whose
 operations do not support `$prev`).
 
-| Param         | Type            | Required | Notes                                                                                                                                                                                                                                                                                                                                                                                  |
-| ------------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `title`       | string          | yes      | Non-empty short title.                                                                                                                                                                                                                                                                                                                                                                 |
-| `description` | string          | yes      | Non-empty full description.                                                                                                                                                                                                                                                                                                                                                            |
-| `changeset`   | object          | yes      | Discriminated by `kind`: `add_entity`, `update_entity`, `add_edge`, `add_note`, `merge_entities`, `supersede_entity`, `compound` (nested `steps`; one step only for now, and a compound with more than one step at any depth is refused). Every nested identifier is a full UUID; prefixes are rejected because resolution could miss, be ambiguous, or change stable proposal intent. |
-| `reviewers`   | array\<string\> | no       | Actor IDs requested as reviewers.                                                                                                                                                                                                                                                                                                                                                      |
-| `expiry`      | integer         | no       | Expiry timestamp, microseconds since epoch.                                                                                                                                                                                                                                                                                                                                            |
-| `parent_id`   | uuid            | no       | Full UUID of the parent proposal. Prefixes are rejected because ancestry is an explicit stable reference; responses preserve it canonically.                                                                                                                                                                                                                                           |
+| Param         | Type            | Required | Notes                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `title`       | string          | yes      | Non-empty short title.                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `description` | string          | yes      | Non-empty full description.                                                                                                                                                                                                                                                                                                                                                                                             |
+| `changeset`   | object          | yes      | Discriminated by `kind`: `add_entity`, `update_entity`, `add_edge`, `retire_edge`, `supersede_edge`, `add_note`, `merge_entities`, `supersede_entity`, `compound` (nested `steps`; one step only for now, and a compound with more than one step at any depth is refused). Every nested identifier is a full UUID; prefixes are rejected because resolution could miss, be ambiguous, or change stable proposal intent. |
+| `reviewers`   | array\<string\> | no       | Actor IDs requested as reviewers.                                                                                                                                                                                                                                                                                                                                                                                       |
+| `expiry`      | integer         | no       | Expiry timestamp, microseconds since epoch.                                                                                                                                                                                                                                                                                                                                                                             |
+| `parent_id`   | uuid            | no       | Full UUID of the parent proposal. Prefixes are rejected because ancestry is an explicit stable reference; responses preserve it canonically.                                                                                                                                                                                                                                                                            |
+
+`retire_edge` (`source`, `target`, `relation`) soft-deletes the live edge with that key when the
+proposal is applied; `restore` on the edge's id brings it back. For a symmetric relation either
+endpoint order names the edge, and an apply that finds no live edge fails without writing.
+`supersede_edge` (`old`: `{source, target, relation}`, `new`: the `add_edge` fields) retires `old`
+and adds `new` in one unit, both or neither; `new` must name a different edge than `old`.
 
 ```
 request(ops="[{\"tool\":\"propose\",\"args\":{\"title\":\"Add GQE\",\"description\":\"Register the GQE concept\",\"changeset\":{\"kind\":\"add_entity\",\"entity\":{\"kind\":\"concept\",\"name\":\"GQE\"}}}}]")
@@ -1728,6 +1734,7 @@ Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
 | `full_content`      | bool    | no       | Default true; false truncates content to 200 chars.                     |
 | `tags`              | array   | no       | Filter by `properties.tags`.                                            |
 | `tag_mode`          | string  | no       | `any` (default, OR) or `all` (AND).                                     |
+| `prefer_tags`       | array   | no       | Memories with any of these tags rank first; others fill the rest.       |
 | `namespace`         | string  | no       | Exact-match read scope; absent uses the caller's visible namespace set. |
 | `label`             | string  | no       | Caller tag stored on the `RecallExecuted` event; see below.             |
 
@@ -3838,7 +3845,10 @@ caller's `decision`.
 ### `tool.describe` / `tool.list` — Assertive
 
 `tool.describe(tool, actor)` returns the full object with `schema`, `capabilities` and `decision`;
-`tool.list(kind, limit=100, offset=0)` pages the registry.
+`tool.list(kind, limit=100, offset=0)` pages the registry. `source` keeps rows whose source equals the value
+and `source_prefix` rows whose source starts with it (case-sensitive, for example `mcp:`); the two do not
+combine. With `include_decision=true` each row carries `decision` for `actor` (default the caller), as
+`tool.describe` reports it, and the response names the `actor`.
 
 ### `tool.check` — Assertive
 

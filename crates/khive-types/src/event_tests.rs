@@ -308,6 +308,64 @@ fn proposal_changeset_accepts_null_edge_weight() {
 
 #[cfg(feature = "serde")]
 #[test]
+fn proposal_changeset_retire_and_supersede_edge_round_trip_and_validate() {
+    let a = "7426afd6-0234-4701-9045-83dfd39166e6";
+    let b = "abcdef01-2345-6789-abcd-ef0123456789";
+    let c = "0123abcd-4567-89ab-cdef-0123456789ab";
+
+    let retire = serde_json::json!({
+        "kind": "retire_edge", "source": a, "target": b, "relation": "extends"
+    });
+    let cs: ProposalChangeset = serde_json::from_value(retire.clone()).expect("retire_edge");
+    assert!(matches!(cs, ProposalChangeset::RetireEdge { .. }));
+    assert_eq!(serde_json::to_value(&cs).unwrap(), retire);
+
+    let supersede = serde_json::json!({
+        "kind": "supersede_edge",
+        "old": {"source": a, "target": b, "relation": "extends"},
+        "new": {"source": a, "target": c, "relation": "extends", "weight": 0.5}
+    });
+    let cs: ProposalChangeset = serde_json::from_value(supersede.clone()).expect("supersede_edge");
+    assert!(matches!(cs, ProposalChangeset::SupersedeEdge { .. }));
+    assert_eq!(serde_json::to_value(&cs).unwrap(), supersede);
+
+    let decode = |old: serde_json::Value, new: serde_json::Value| {
+        serde_json::from_value::<ProposalChangeset>(
+            serde_json::json!({"kind": "supersede_edge", "old": old, "new": new}),
+        )
+    };
+    // `new` naming the edge `old` names is refused, including a symmetric
+    // relation written with the endpoints swapped.
+    for (old, new) in [
+        (
+            serde_json::json!({"source": a, "target": b, "relation": "extends"}),
+            serde_json::json!({"source": a, "target": b, "relation": "extends"}),
+        ),
+        (
+            serde_json::json!({"source": a, "target": b, "relation": "competes_with"}),
+            serde_json::json!({"source": b, "target": a, "relation": "competes_with"}),
+        ),
+    ] {
+        let err = decode(old, new).unwrap_err().to_string();
+        assert!(err.contains("different edge"), "{err}");
+    }
+    // A directed relation reversed is a different edge.
+    decode(
+        serde_json::json!({"source": a, "target": b, "relation": "extends"}),
+        serde_json::json!({"source": b, "target": a, "relation": "extends"}),
+    )
+    .expect("a reversed directed edge is a new edge");
+    let err = decode(
+        serde_json::json!({"source": a, "target": b, "relation": "extends"}),
+        serde_json::json!({"source": a, "target": c, "relation": "extends", "weight": 2.0}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("[0.0, 1.0]"), "{err}");
+}
+
+#[cfg(feature = "serde")]
+#[test]
 fn rerank_payload_serde_rejects_non_finite_score() {
     let json = serde_json::json!({
         "served_by_profile_id": null,

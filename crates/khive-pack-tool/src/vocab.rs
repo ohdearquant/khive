@@ -170,7 +170,7 @@ pub static TOOL_HANDLERS: [HandlerDef; 15] = [
     },
     HandlerDef {
         name: "tool.unregister",
-        description: "Soft-delete one registry object in the selected write namespace and atomically retire its literal non-pattern exact-name policies and local pinned or exact-name unpinned grants. Shared rules and foreign grants stay stored; foreign pins become inactive. An already-retired row is unchanged. Returns retired, full_id, policies_retired, grants_revoked and post_commit_degradations; this does not uninstall an executable or deny every future request for the name.",
+        description: "Soft-delete one registry object in the selected write namespace and atomically retire its literal non-pattern exact-name policies and local pinned or exact-name unpinned grants. Shared rules and foreign grants stay stored; foreign pins become inactive. An already-retired row is unchanged. Returns retired, full_id, name_retired, policies_retired, grants_revoked and post_commit_degradations; this does not uninstall an executable or deny every future request for the name. The name is retired for good: registering it again in this namespace is refused, so a registration whose source needs correcting is registered under a new name (name_retired is always true).",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[P_TOOL, P_NAMESPACE],
@@ -210,7 +210,7 @@ pub static TOOL_HANDLERS: [HandlerDef; 15] = [
     },
     HandlerDef {
         name: "tool.list",
-        description: "List registry objects, optionally by kind. Supplying after starts or continues insertion-sequence cursor paging; otherwise offset pagination is used.",
+        description: "List registry objects, optionally by kind and by source. Supplying after starts or continues insertion-sequence cursor paging; otherwise offset pagination is used. With include_decision=true each row also carries the caller's policy decision, as tool.describe reports it.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -218,6 +218,10 @@ pub static TOOL_HANDLERS: [HandlerDef; 15] = [
             ParamDef { name: "limit", param_type: "integer", required: false, description: "Page size (default 100).", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "offset", param_type: "integer", required: false, description: "Page offset; used when after is omitted or null.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "after", param_type: "string", required: false, description: "Full UUID returned as next_after to continue cursor paging, or an empty string to start. When supplied, offset is ignored.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "source", param_type: "string", required: false, description: "Only rows whose source equals this value, for example mcp:example. Not together with source_prefix.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "source_prefix", param_type: "string", required: false, description: "Only rows whose source starts with this text, case-sensitive, for example mcp: for every MCP server. Not together with source.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "include_decision", param_type: "boolean", required: false, description: "When true, each row carries decision, the policy decision for actor (allow, deny or ask, with its source). Default false.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "actor", param_type: "string", required: false, description: "Actor label the decisions are evaluated for (defaults to the caller's actor). Only with include_decision=true.", resolution_mode: IdResolutionMode::NotApplicable },
             P_NAMESPACE,
         ],
     },

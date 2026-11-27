@@ -943,6 +943,294 @@ async fn apply_worker_applies_add_edge_changeset() {
     assert_eq!(row.status, "applied");
 }
 
+// ── retire_edge and supersede_edge ───────────────────────────────────────────
+
+fn id128(id: Uuid) -> Id128 {
+    Id128::from_u128(id.as_u128())
+}
+
+async fn concept(rt: &KhiveRuntime, tok: &NamespaceToken, name: &str) -> Uuid {
+    rt.create_entity_with_embedding_report(tok, "concept", None, name, None, None, vec![])
+        .await
+        .map(|(record, _report)| record.id)
+        .expect("create entity")
+}
+
+async fn live_edges(
+    rt: &KhiveRuntime,
+    tok: &NamespaceToken,
+    source: Uuid,
+    target: Uuid,
+) -> Vec<khive_storage::types::Edge> {
+    rt.list_edges(
+        tok,
+        EdgeListFilter {
+            source_id: Some(source),
+            target_id: Some(target),
+            ..Default::default()
+        },
+        100,
+        0,
+    )
+    .await
+    .expect("list edges")
+}
+
+async fn link(registry: &VerbRegistry, source: Uuid, target: Uuid, relation: &str) {
+    registry
+        .dispatch(
+            "link",
+            serde_json::json!({"source_id": source, "target_id": target, "relation": relation}),
+        )
+        .await
+        .expect("link");
+}
+
+/// Seed an approved proposal, run the apply worker once, and return every
+/// `ProposalApplied` result recorded for it.
+async fn approve_and_apply(
+    rt: &KhiveRuntime,
+    tok: &NamespaceToken,
+    registry: &VerbRegistry,
+    changeset: ProposalChangeset,
+) -> Vec<khive_types::ApplyResult> {
+    let proposal_id = Uuid::new_v4();
+    seed_proposal_created_event(rt, tok, proposal_id, changeset).await;
+    insert_projection_row(rt, tok, proposal_id, "approved").await;
+    ProposalApplyWorker::new(rt.clone())
+        .maybe_apply(tok, proposal_id, registry, None)
+        .await
+        .expect("maybe_apply");
+    rt.events(tok)
+        .expect("event store")
+        .query_events(
+            EventFilter {
+                kinds: vec![EventKind::ProposalApplied],
+                payload_proposal_id: Some(proposal_id),
+                ..Default::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query events")
+        .items
+        .into_iter()
+        .map(|event| {
+            serde_json::from_value::<khive_types::ProposalAppliedPayload>(event.payload)
+                .expect("applied payload")
+                .result
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn retire_edge_soft_deletes_the_live_edge_and_restore_brings_it_back() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+    let registry = build_registry(&rt);
+    let a = concept(&rt, &tok, "RetireSource").await;
+    let b = concept(&rt, &tok, "RetireTarget").await;
+    link(&registry, a, b, "extends").await;
+    let edge = live_edges(&rt, &tok, a, b)
+        .await
+        .pop()
+        .expect("edge exists");
+
+    let results = approve_and_apply(
+        &rt,
+        &tok,
+        &registry,
+        ProposalChangeset::RetireEdge {
+            source: id128(a),
+            target: id128(b),
+            relation: khive_types::EdgeRelation::Extends,
+        },
+    )
+    .await;
+    assert!(
+        matches!(results.as_slice(), [khive_types::ApplyResult::Success { created_records }] if created_records.is_empty()),
+        "{results:?}"
+    );
+    assert!(
+        live_edges(&rt, &tok, a, b).await.is_empty(),
+        "edge must no longer be live"
+    );
+    let tombstone = rt
+        .get_edge_including_deleted(&tok, edge.id.0)
+        .await
+        .unwrap()
+        .expect("a soft delete keeps the row");
+    assert!(tombstone.deleted_at.is_some());
+
+    let (restored, changed) = rt
+        .restore_edge(&tok, edge.id.0)
+        .await
+        .unwrap()
+        .expect("restore the retired edge");
+    assert!(changed);
+    assert!(restored.deleted_at.is_none());
+    assert_eq!(live_edges(&rt, &tok, a, b).await.len(), 1);
+}
+
+#[tokio::test]
+async fn retire_edge_matches_a_symmetric_edge_named_in_either_order() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+    let registry = build_registry(&rt);
+    let a = concept(&rt, &tok, "PeerOne").await;
+    let b = concept(&rt, &tok, "PeerTwo").await;
+    link(&registry, a, b, "competes_with").await;
+    assert_eq!(
+        live_edges(&rt, &tok, a, b).await.len() + live_edges(&rt, &tok, b, a).await.len(),
+        1
+    );
+
+    let results = approve_and_apply(
+        &rt,
+        &tok,
+        &registry,
+        ProposalChangeset::RetireEdge {
+            source: id128(b),
+            target: id128(a),
+            relation: khive_types::EdgeRelation::CompetesWith,
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            results.as_slice(),
+            [khive_types::ApplyResult::Success { .. }]
+        ),
+        "{results:?}"
+    );
+    assert!(live_edges(&rt, &tok, a, b).await.is_empty());
+    assert!(live_edges(&rt, &tok, b, a).await.is_empty());
+}
+
+#[tokio::test]
+async fn retire_edge_without_a_live_edge_fails_and_writes_nothing() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+    let registry = build_registry(&rt);
+    let a = concept(&rt, &tok, "KeepSource").await;
+    let b = concept(&rt, &tok, "KeepTarget").await;
+    link(&registry, a, b, "extends").await;
+
+    let results = approve_and_apply(
+        &rt,
+        &tok,
+        &registry,
+        ProposalChangeset::RetireEdge {
+            source: id128(a),
+            target: id128(b),
+            relation: khive_types::EdgeRelation::DependsOn,
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            results.as_slice(),
+            [khive_types::ApplyResult::Failed { .. }]
+        ),
+        "{results:?}"
+    );
+    assert_eq!(
+        live_edges(&rt, &tok, a, b).await.len(),
+        1,
+        "the extends edge is untouched"
+    );
+}
+
+#[tokio::test]
+async fn supersede_edge_retires_the_old_edge_and_adds_the_new_one() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+    let registry = build_registry(&rt);
+    let a = concept(&rt, &tok, "SupersedeSource").await;
+    let b = concept(&rt, &tok, "OldTarget").await;
+    let c = concept(&rt, &tok, "NewTarget").await;
+    link(&registry, a, b, "extends").await;
+
+    let results = approve_and_apply(
+        &rt,
+        &tok,
+        &registry,
+        ProposalChangeset::SupersedeEdge {
+            old: khive_types::ProposalEdgeKey {
+                source: id128(a),
+                target: id128(b),
+                relation: khive_types::EdgeRelation::Extends,
+            },
+            new: khive_types::ProposalEdgeDraft {
+                source: id128(a),
+                target: id128(c),
+                relation: khive_types::EdgeRelation::Extends,
+                weight: Some(0.5),
+                metadata: None,
+            },
+        },
+    )
+    .await;
+    assert!(
+        live_edges(&rt, &tok, a, b).await.is_empty(),
+        "old edge retired"
+    );
+    let new_edges = live_edges(&rt, &tok, a, c).await;
+    assert_eq!(new_edges.len(), 1, "new edge added");
+    assert_eq!(new_edges[0].weight, 0.5);
+    let [khive_types::ApplyResult::Success { created_records }] = results.as_slice() else {
+        panic!("expected one successful apply, got {results:?}");
+    };
+    assert_eq!(created_records, &vec![id128(new_edges[0].id.0)]);
+}
+
+#[tokio::test]
+async fn supersede_edge_whose_new_edge_cannot_be_added_keeps_the_old_edge() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+    let registry = build_registry(&rt);
+    let a = concept(&rt, &tok, "StaySource").await;
+    let b = concept(&rt, &tok, "StayTarget").await;
+    link(&registry, a, b, "extends").await;
+
+    let missing = Uuid::new_v4();
+    let results = approve_and_apply(
+        &rt,
+        &tok,
+        &registry,
+        ProposalChangeset::SupersedeEdge {
+            old: khive_types::ProposalEdgeKey {
+                source: id128(a),
+                target: id128(b),
+                relation: khive_types::EdgeRelation::Extends,
+            },
+            new: khive_types::ProposalEdgeDraft {
+                source: id128(a),
+                target: id128(missing),
+                relation: khive_types::EdgeRelation::Extends,
+                weight: None,
+                metadata: None,
+            },
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            results.as_slice(),
+            [khive_types::ApplyResult::Failed { .. }]
+        ),
+        "{results:?}"
+    );
+    assert_eq!(
+        live_edges(&rt, &tok, a, b).await.len(),
+        1,
+        "neither half lands when the new edge is refused"
+    );
+}
+
 #[tokio::test]
 async fn apply_worker_skips_non_approved_proposals() {
     let (rt, tok) = setup();

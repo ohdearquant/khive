@@ -1058,6 +1058,36 @@ pub(crate) async fn list(
         one_of(k, KINDS, "kind")?;
     }
     let limit = opt_u32(&params, "limit", 100, 1000)?;
+    let source = opt_str(&params, "source")?;
+    let source_prefix = opt_str(&params, "source_prefix")?;
+    if source.is_some() && source_prefix.is_some() {
+        return Err(RuntimeError::InvalidInput(
+            "pass source or source_prefix, not both".into(),
+        ));
+    }
+    let include_decision = match params.get("include_decision") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(RuntimeError::InvalidInput(
+                "include_decision must be a boolean".into(),
+            ))
+        }
+    };
+    let actor = opt_str(&params, "actor")?;
+    if actor.is_some() && !include_decision {
+        return Err(RuntimeError::InvalidInput(
+            "actor applies only with include_decision=true".into(),
+        ));
+    }
+    let actor = include_decision.then(|| actor.unwrap_or_else(|| actor_label(token)));
+    let mut filter = registry_filter(kind.as_deref());
+    if let Some(source) = source {
+        filter = filter.property_eq("$.source", SqlValue::Text(source));
+    }
+    if let Some(prefix) = source_prefix {
+        filter = filter.property_prefix("$.source", prefix);
+    }
     let (cursor_mode, after): (bool, Option<Uuid>) = match params.get("after") {
         None | Some(Value::Null) => (false, None),
         Some(Value::String(raw)) if raw.is_empty() => (true, None),
@@ -1077,16 +1107,20 @@ pub(crate) async fn list(
     };
     if cursor_mode {
         let (entities, next_after) = rt
-            .list_entities_after_filtered(token, registry_filter(kind.as_deref()), after, limit)
+            .list_entities_after_filtered(token, filter, after, limit)
             .await?;
-        let tools: Vec<Value> = entities.iter().map(summary).collect();
-        return Ok(json!({
+        let tools = list_rows(rt, token, &entities, actor.as_deref()).await?;
+        let mut out = json!({
             "ok": true,
             "count": tools.len(),
             "limit": limit,
             "tools": tools,
             "next_after": next_after,
-        }));
+        });
+        if let Some(actor) = actor {
+            out["actor"] = json!(actor);
+        }
+        return Ok(out);
     }
     let offset = match params.get("offset") {
         None | Some(Value::Null) => 0,
@@ -1098,16 +1132,50 @@ pub(crate) async fn list(
             })?,
     };
     let entities = rt
-        .list_entities_filtered(token, registry_filter(kind.as_deref()), limit, offset)
+        .list_entities_filtered(token, filter, limit, offset)
         .await?;
-    let tools: Vec<Value> = entities.iter().map(summary).collect();
-    Ok(json!({
+    let tools = list_rows(rt, token, &entities, actor.as_deref()).await?;
+    let mut out = json!({
         "ok": true,
         "count": tools.len(),
         "limit": limit,
         "offset": offset,
         "tools": tools,
-    }))
+    });
+    if let Some(actor) = actor {
+        out["actor"] = json!(actor);
+    }
+    Ok(out)
+}
+
+/// Summary rows for `tool.list`; with an actor, each row also carries the
+/// policy decision `tool.describe` reports for that actor (no receipt).
+async fn list_rows(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    entities: &[Entity],
+    actor: Option<&str>,
+) -> Result<Vec<Value>, RuntimeError> {
+    let ns = token.namespace().as_str().to_string();
+    let mut rows = Vec::with_capacity(entities.len());
+    for entity in entities {
+        let mut row = summary(entity);
+        if let Some(actor) = actor {
+            let registration = RegistryPin::from_entity(entity)?;
+            let decision = policy::decide(
+                rt,
+                &ns,
+                actor,
+                &entity.name,
+                side_effect_of(entity).as_deref(),
+                Some(&registration),
+            )
+            .await?;
+            row["decision"] = decision.to_json();
+        }
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 // ── policy and grants ────────────────────────────────────────────────────────

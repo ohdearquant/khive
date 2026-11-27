@@ -78,7 +78,7 @@ pub(crate) async fn unregister(
     let entity = resolve_owned(rt, token, &reference).await?;
     if entity.deleted_at.is_some() {
         return Ok(json!({
-            "id":entity.id, "full_id":entity.id, "retired":false,
+            "id":entity.id, "full_id":entity.id, "retired":false, "name_retired":true,
             "policies_retired":0, "grants_revoked":0, "post_commit_degradations":[],
         }));
     }
@@ -96,7 +96,7 @@ pub(crate) async fn unregister(
         .retire_tool_registry_entity_with_post_commit_report(token, &entity, retired_at, companions)
         .await?;
     Ok(json!({
-        "id":entity.id, "full_id":entity.id, "retired":true,
+        "id":entity.id, "full_id":entity.id, "retired":true, "name_retired":true,
         "policies_retired":policies_retired, "grants_revoked":grants_revoked,
         "post_commit_degradations":degradations,
     }))
