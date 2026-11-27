@@ -191,6 +191,9 @@ pub struct UpdateParams {
     /// entity. `remove_aliases` reaches caller-origin aliases only.
     pub(crate) add_aliases: Option<Vec<String>>,
     pub(crate) remove_aliases: Option<Vec<String>>,
+    /// ADR-221 section 3: whether a rename keeps the old name as an alias.
+    /// Absent means true.
+    pub(crate) keep_old_name: Option<bool>,
     #[serde(
         default,
         deserialize_with = "khive_runtime::note_write::deserialize_optional_fences"

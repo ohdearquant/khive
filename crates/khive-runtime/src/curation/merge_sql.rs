@@ -1,4 +1,5 @@
 use super::*;
+use khive_storage::entity::{EntityAlias, EntityAliasOrigin};
 
 // ---------------------------------------------------------------------------
 // Transactional merge SQL helpers
@@ -202,6 +203,7 @@ pub(super) fn merge_entity_sql(
     limits: MergeTxLimits,
     merge_event_id: Uuid,
     event_context: Option<MergeEventContext>,
+    disclosed_key_kind: Option<String>,
 ) -> Result<(MergeSummary, Entity), MergeSqlError> {
     let mut budget = MergeTxBudget::new(limits);
     // Config-scaled fanout (one FTS/vector delete per table, one contract rule
@@ -254,6 +256,27 @@ pub(super) fn merge_entity_sql(
         EntityMergeValidation::LegacyKind | EntityMergeValidation::Forced => {}
     }
 
+    // ADR-221 section 3: the merged-away entity's keys go to the kept entity
+    // under its kind. A key another live entity holds refuses the merge here,
+    // before any write; a dry run lists it instead. The holder is named only
+    // when the caller may list entities of the kept entity's kind.
+    let disclose_key_holders = disclosed_key_kind.as_deref() == Some(into_entity.kind.as_str());
+    let key_plan = plan_merge_keys(
+        conn,
+        &namespace,
+        &into_entity,
+        &from_entity,
+        disclose_key_holders,
+        &mut budget,
+    )?;
+    if !dry_run && !key_plan.conflicts.is_empty() {
+        return Err(MergeSqlError::Refusal(merge_key_conflict_error(
+            into_id,
+            from_id,
+            &key_plan.conflicts,
+        )));
+    }
+
     // --- Collect edges incident to from_id ---
     let from_str = from_id.to_string();
     let all_edges = collect_merge_incident_edges(conn, &from_str, &mut budget)?;
@@ -287,6 +310,17 @@ pub(super) fn merge_entity_sql(
         ContentMergeStrategy::PreferFrom => (from_entity.description.clone(), false),
     };
     let (merged_tags, tags_unioned) = union_tags(&into_entity.tags, &from_entity.tags);
+    let aliases_added = merge_alias_additions(&into_entity, &from_entity, &merged_name);
+    let mut merged_aliases: Vec<EntityAlias> = into_entity
+        .aliases
+        .iter()
+        .filter(|held| held.alias != merged_name)
+        .cloned()
+        .collect();
+    merged_aliases.extend(aliases_added.iter().map(|alias| EntityAlias {
+        alias: alias.clone(),
+        origin: EntityAliasOrigin::Merge,
+    }));
 
     let now = chrono::Utc::now().timestamp_micros();
     let into_str = into_id.to_string();
@@ -534,6 +568,19 @@ pub(super) fn merge_entity_sql(
             ],
         )?;
 
+        // ADR-221 section 3: names and keys move before the tombstone below,
+        // whose trigger releases every key the merged-away row still holds.
+        write_merge_aliases_and_keys(
+            conn,
+            &namespace,
+            &into_entity,
+            from_id,
+            &merged_name,
+            &aliases_added,
+            &key_plan,
+            now,
+        )?;
+
         // Derive the FTS row from the prepared merged fields without moving
         // the returned entity's version-overflow check ahead of these writes.
         let fts_merged = entity_fts_document(&Entity {
@@ -542,6 +589,7 @@ pub(super) fn merge_entity_sql(
             properties: merged_props.clone(),
             tags: merged_tags.clone(),
             updated_at: now,
+            aliases: merged_aliases.clone(),
             ..into_entity.clone()
         });
 
@@ -602,7 +650,7 @@ pub(super) fn merge_entity_sql(
         deleted_at: into_entity.deleted_at,
         merged_into: None,
         merge_event_id: None,
-        aliases: into_entity.aliases.clone(),
+        aliases: merged_aliases,
         version: if dry_run {
             into_entity.version
         } else {
@@ -632,6 +680,15 @@ pub(super) fn merge_entity_sql(
         tx_budget: budget.report(),
         embedding_truncation: Default::default(),
         post_commit_reindex_error: None,
+        aliases_added,
+        keys_rewritten: key_plan
+            .moves
+            .iter()
+            .filter(|moved| moved.from_kind != moved.kind)
+            .count(),
+        keys_moved: key_plan.moves,
+        keys_already_held: key_plan.already_held,
+        key_conflicts: key_plan.conflicts,
     };
     // The event is the only durable copy of destructive edge preimages. An
     // insertion failure must abort this transaction along with the merge.
@@ -641,6 +698,184 @@ pub(super) fn merge_entity_sql(
         }
     }
     Ok((summary, updated_entity))
+}
+
+/// Names an entity merge adds to the kept entity as `merge` aliases, in order:
+/// the merged-away entity's name, its aliases, then the kept entity's previous
+/// name when the merge takes the other name. A name equal to the merged name,
+/// already held by the kept entity, or already listed is skipped (ADR-221
+/// section 3).
+fn merge_alias_additions(into: &Entity, from: &Entity, merged_name: &str) -> Vec<String> {
+    let previous_into_name = (into.name != merged_name).then_some(into.name.as_str());
+    let candidates = std::iter::once(from.name.as_str())
+        .chain(from.aliases.iter().map(|held| held.alias.as_str()))
+        .chain(previous_into_name);
+    let mut added: Vec<String> = Vec::new();
+    for candidate in candidates {
+        if candidate == merged_name
+            || into.aliases.iter().any(|held| held.alias == candidate)
+            || added.iter().any(|listed| listed == candidate)
+        {
+            continue;
+        }
+        added.push(candidate.to_owned());
+    }
+    added
+}
+
+/// Where an entity merge puts each key the merged-away entity holds.
+struct MergeKeyPlan {
+    moves: Vec<MergeKeyMove>,
+    already_held: Vec<MergeKey>,
+    conflicts: Vec<MergeKeyConflict>,
+}
+
+/// Read the merged-away entity's held keys and place each under the kept
+/// entity's kind: moved when no one else holds it there, dropped when the kept
+/// entity already does, a conflict when another live entity does. A soft
+/// delete releases every key, so a held row always belongs to a live entity.
+fn plan_merge_keys(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+    into: &Entity,
+    from: &Entity,
+    disclose_key_holders: bool,
+    budget: &mut MergeTxBudget,
+) -> Result<MergeKeyPlan, MergeSqlError> {
+    let from_str = from.id.to_string();
+    let into_str = into.id.to_string();
+    let mut stmt = conn.prepare(khive_db::stores::entity::ENTITY_HELD_KEYS_SQL)?;
+    let held = stmt
+        .query_map(rusqlite::params![namespace, from_str], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut plan = MergeKeyPlan {
+        moves: Vec::new(),
+        already_held: Vec::new(),
+        conflicts: Vec::new(),
+    };
+    for (from_kind, key) in held {
+        budget.charge(1, from_kind.len() + key.len(), "reading merge keys")?;
+        let holder: Option<String> = conn
+            .query_row(
+                khive_db::stores::entity::ENTITY_KEY_HOLDER_SQL,
+                rusqlite::params![namespace, into.kind, key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match holder {
+            // The merged-away entity holds the key under the kept kind
+            // already: this row is that key, unchanged in kind.
+            Some(holder) if holder == from_str && from_kind == into.kind => {
+                plan.moves.push(MergeKeyMove {
+                    kind: into.kind.clone(),
+                    key,
+                    from_kind,
+                });
+            }
+            // The kept entity holds it, or the merged-away entity holds it
+            // under the kept kind in another row that moves on its own.
+            Some(holder) if holder == into_str || holder == from_str => {
+                plan.already_held.push(MergeKey {
+                    kind: from_kind,
+                    key,
+                });
+            }
+            Some(holder) => {
+                let existing_id = if disclose_key_holders {
+                    Some(
+                        Uuid::parse_str(&holder)
+                            .map_err(|error| SqliteError::InvalidData(error.to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                plan.conflicts.push(MergeKeyConflict {
+                    kind: into.kind.clone(),
+                    key,
+                    existing_id,
+                });
+            }
+            None => plan.moves.push(MergeKeyMove {
+                kind: into.kind.clone(),
+                key,
+                from_kind,
+            }),
+        }
+    }
+    Ok(plan)
+}
+
+/// Write an entity merge's alias and key changes: drop the kept entity's alias
+/// equal to the merged name, add the `merge` aliases, drop the merged-away
+/// entity's alias rows, then drop and move its keys. Each key statement must
+/// touch its one held row; a key released before it moved is an error.
+// REASON: every argument is a distinct input of the one write this performs.
+#[allow(clippy::too_many_arguments)]
+fn write_merge_aliases_and_keys(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+    into: &Entity,
+    from_id: Uuid,
+    merged_name: &str,
+    aliases_added: &[String],
+    key_plan: &MergeKeyPlan,
+    now: i64,
+) -> Result<(), MergeSqlError> {
+    use khive_db::stores::entity::{
+        entity_alias_insert_statement, entity_aliases_delete_all_statement,
+        entity_key_drop_statement, entity_key_move_statement, entity_name_alias_delete_statement,
+    };
+    let mut statements = Vec::new();
+    if merged_name != into.name {
+        statements.push(entity_name_alias_delete_statement(
+            namespace,
+            into.id,
+            merged_name,
+        ));
+    }
+    statements.extend(aliases_added.iter().map(|alias| {
+        entity_alias_insert_statement(namespace, into.id, alias, EntityAliasOrigin::Merge, now)
+    }));
+    statements.push(entity_aliases_delete_all_statement(namespace, from_id));
+    khive_db::sql_bridge::execute_statements(conn, &statements)?;
+
+    let key_statements = key_plan
+        .already_held
+        .iter()
+        .map(|dropped| {
+            (
+                &dropped.kind,
+                &dropped.key,
+                entity_key_drop_statement(namespace, from_id, &dropped.kind, &dropped.key),
+            )
+        })
+        .chain(key_plan.moves.iter().map(|moved| {
+            (
+                &moved.from_kind,
+                &moved.key,
+                entity_key_move_statement(
+                    namespace,
+                    from_id,
+                    &moved.from_kind,
+                    &moved.key,
+                    into.id,
+                    &moved.kind,
+                ),
+            )
+        }));
+    for (kind, key, statement) in key_statements {
+        let changed = khive_db::sql_bridge::execute_statements(conn, &[statement])?;
+        if changed != 1 {
+            return Err(SqliteError::InvalidData(format!(
+                "merge key {kind}:{key:?} of entity {from_id} was not held when the merge \
+                 moved it ({changed} rows)"
+            ))
+            .into());
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1237,6 +1472,11 @@ pub(super) fn merge_note_sql(
         tx_budget: budget.report(),
         embedding_truncation: Default::default(),
         post_commit_reindex_error: None,
+        aliases_added: Vec::new(),
+        keys_moved: Vec::new(),
+        keys_rewritten: 0,
+        keys_already_held: Vec::new(),
+        key_conflicts: Vec::new(),
     };
     if !dry_run {
         if let Some(context) = event_context {

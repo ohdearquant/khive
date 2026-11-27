@@ -811,7 +811,11 @@ async fn a_bulk_reload_reindexes_the_holder_text() {
         )
         .await
         .expect("search by the old name");
-    assert!(found(&old_name).is_empty(), "{old_name}");
+    assert_eq!(
+        found(&old_name),
+        vec![created["id"].clone()],
+        "a keyed reload that renames keeps the old name as an alias: {old_name}"
+    );
 }
 
 #[tokio::test]
@@ -1049,4 +1053,430 @@ async fn a_reload_reindex_error_reaches_every_answer_that_names_the_row() {
         .await
         .expect("holder");
     assert_eq!(holder["name"], json!("Smith and Jones 2024"), "{holder}");
+}
+
+#[tokio::test]
+async fn a_reload_reindex_error_names_only_the_row_whose_reindex_failed() {
+    let (rt, token, _pack, registry) = configured().await;
+    let failing = create_id(
+        &registry,
+        keyed_entity("concept", "Alpha source", "k:alpha"),
+    )
+    .await;
+    let passing = create_id(
+        &registry,
+        keyed_entity("concept", "Omega source", "k:omega"),
+    )
+    .await;
+    uuid::Uuid::parse_str(&failing).expect("the create answers the full id");
+    rt.text(&token).unwrap();
+    let mut writer = rt.sql().writer().await.unwrap();
+    writer
+        .execute_script(format!(
+            "CREATE TRIGGER fail_one_reload_fts BEFORE INSERT ON fts_entities_rowids \
+             WHEN NEW.subject_id = '{failing}' \
+             BEGIN SELECT RAISE(ABORT, 'forced FTS map failure'); END;"
+        ))
+        .await
+        .unwrap();
+    drop(writer);
+    let response = registry
+        .dispatch(
+            "create",
+            bulk(
+                vec![
+                    on_key_item("Alpha renamed", "k:alpha"),
+                    on_key_item("Omega renamed", "k:omega"),
+                    keyed_item("Alpha renamed", "k:alpha"),
+                ],
+                true,
+            ),
+        )
+        .await
+        .expect("the unit commits before its reindex");
+    for (index, id, failed) in [
+        (0, &failing, true),
+        (1, &passing, false),
+        (2, &failing, true),
+    ] {
+        let result = &response["results"][index]["result"];
+        assert_eq!(result["id"], json!(id), "{response}");
+        assert_eq!(
+            result["reindex_error"].is_string(),
+            failed,
+            "items[{index}]: {response}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_bulk_replay_whose_holder_moves_before_the_unit_is_judged_again() {
+    use super::create::KEYED_BULK_UNIT_TEST_BARRIER;
+    use tokio::sync::oneshot;
+
+    let (_rt, _token, _pack, registry) = configured().await;
+    let id = create_id(&registry, keyed_entity("concept", "Gamma", "k:gamma")).await;
+    let request = bulk(vec![on_key_item("Gamma", "k:gamma")], true);
+    // Control: unraced, the item is an identical replay and rewrites nothing.
+    let unraced = registry
+        .dispatch("create", request.clone())
+        .await
+        .expect("unraced replay");
+    let result = &unraced["results"][0]["result"];
+    assert_eq!(result["id"], json!(id), "{unraced}");
+    assert!(result.get("updated").is_none(), "{unraced}");
+
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (proceed_tx, proceed_rx) = oneshot::channel();
+    let replay = KEYED_BULK_UNIT_TEST_BARRIER.scope(
+        std::cell::RefCell::new(Some((reached_tx, proceed_rx))),
+        registry.dispatch("create", request),
+    );
+    let writer = async {
+        reached_rx.await.expect("the request reached its unit");
+        registry
+            .dispatch("update", json!({"id": id, "name": "Gamma moved"}))
+            .await
+            .expect("a writer moves the holder");
+        proceed_tx.send(()).expect("release the unit");
+    };
+    let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(replay, writer)
+    })
+    .await
+    .expect("the barrier and the writer complete");
+    let response = response.expect("the request is judged again and commits");
+    let result = &response["results"][0]["result"];
+    assert_eq!(result["id"], json!(id), "{response}");
+    assert_eq!(result["updated"], json!(true), "{response}");
+    let holder = key_holder(&registry, "k:gamma").await.expect("holder");
+    assert_eq!(holder["name"], json!("Gamma"), "{holder}");
+}
+
+fn keyed_entity(kind: &str, name: &str, key: &str) -> Value {
+    json!({"kind": kind, "name": name, "key": key, "skip_dedup_check": true})
+}
+
+async fn create_id(registry: &khive_runtime::VerbRegistry, args: Value) -> String {
+    let created = registry.dispatch("create", args).await.expect("create");
+    created["id"].as_str().expect("id").to_owned()
+}
+
+/// The id of the live entity holding `key` under `kind`, or `None` when the
+/// read answers not-found; any other failure fails the test.
+async fn holder_of(
+    registry: &khive_runtime::VerbRegistry,
+    kind: &str,
+    key: &str,
+) -> Option<String> {
+    match registry
+        .dispatch("get", json!({"kind": kind, "key": key}))
+        .await
+    {
+        Ok(holder) => Some(holder["id"].as_str().expect("holder id").to_owned()),
+        Err(RuntimeError::Khive(error)) if error.kind() == khive_types::ErrorKind::NotFound => None,
+        Err(error) => panic!("get {kind} by key {key:?} failed: {error:?}"),
+    }
+}
+
+fn forced_merge(into: &str, from: &str) -> Value {
+    json!({"kind": "entity", "into_id": into, "from_id": from, "force": true})
+}
+
+/// ADR-221 acceptance 10: the merged-away entity's keys move to the kept
+/// entity before the tombstone, whose trigger would release them, and a
+/// reload under such a key then updates the kept entity.
+#[tokio::test]
+async fn a_merge_moves_the_keys_before_the_tombstone_releases_them() {
+    use khive_storage::{event::EventFilter, PageRequest};
+    use khive_types::EventKind;
+
+    let (rt, token, _pack, registry) = configured().await;
+    let into = create_id(&registry, keyed_entity("concept", "Into", "k:into")).await;
+    let from = create_id(&registry, keyed_entity("concept", "From", "k:from")).await;
+
+    let preview = registry
+        .dispatch("merge", {
+            let mut args = forced_merge(&into, &from);
+            args["dry_run"] = json!(true);
+            args
+        })
+        .await
+        .expect("dry run");
+    let moved = json!([{"kind": "concept", "key": "k:from", "from_kind": "concept"}]);
+    assert_eq!(preview["keys_moved"], moved, "{preview}");
+    assert_eq!(preview["would_merge"], json!(true), "{preview}");
+    assert_eq!(
+        holder_of(&registry, "concept", "k:from").await.as_deref(),
+        Some(from.as_str()),
+        "a dry run moves nothing"
+    );
+
+    let merged = registry
+        .dispatch("merge", forced_merge(&into, &from))
+        .await
+        .expect("merge");
+    assert_eq!(merged["keys_moved"], moved, "{merged}");
+    assert_eq!(merged["keys_rewritten"], json!(0), "{merged}");
+    assert_eq!(merged["keys_already_held"], json!([]), "{merged}");
+    for key in ["k:into", "k:from"] {
+        assert_eq!(
+            holder_of(&registry, "concept", key).await.as_deref(),
+            Some(into.as_str()),
+            "{key}"
+        );
+    }
+
+    let events = rt
+        .events(&token)
+        .unwrap()
+        .query_events(
+            EventFilter {
+                kinds: vec![EventKind::EntityMerged],
+                ..Default::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.items.len(), 1);
+    assert_eq!(events.items[0].payload["keys_moved"], moved);
+    assert_eq!(events.items[0].payload["keys_rewritten"], json!(0));
+
+    let reload = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "concept",
+                "name": "Into",
+                "key": "k:from",
+                "description": "reloaded",
+                "on_key": "update",
+                "skip_dedup_check": true
+            }),
+        )
+        .await
+        .expect("reload under the moved key");
+    assert_eq!(reload["id"], json!(into), "{reload}");
+    let kept = registry
+        .dispatch("get", json!({"id": into}))
+        .await
+        .expect("kept entity");
+    assert_eq!(kept["description"], json!("reloaded"), "{kept}");
+}
+
+/// ADR-221 acceptance 5: after a merge the kept entity holds two keys; a
+/// delete releases both, and a restore takes both back or, when another
+/// entity took one, neither.
+#[tokio::test]
+async fn two_keys_after_a_merge_are_released_and_taken_back_together() {
+    let (_rt, token, pack, registry) = configured().await;
+    let into = create_id(&registry, keyed_entity("concept", "Into", "k:a")).await;
+    let from = create_id(&registry, keyed_entity("concept", "From", "k:b")).await;
+    registry
+        .dispatch("merge", forced_merge(&into, &from))
+        .await
+        .expect("merge");
+
+    registry
+        .dispatch("delete", json!({"id": into}))
+        .await
+        .expect("delete the kept entity");
+    for key in ["k:a", "k:b"] {
+        assert_eq!(holder_of(&registry, "concept", key).await, None, "{key}");
+    }
+
+    let taker = create_id(&registry, keyed_entity("concept", "Taker", "k:b")).await;
+    let conflict = pack
+        .handle_restore(&token, json!({"id": into}), &registry)
+        .await
+        .expect_err("restore refuses a taken key");
+    assert!(
+        format!("{conflict}").contains("restore_key_conflict"),
+        "{conflict}"
+    );
+    assert_eq!(
+        holder_of(&registry, "concept", "k:a").await,
+        None,
+        "a refused restore takes back neither key"
+    );
+    assert_eq!(
+        holder_of(&registry, "concept", "k:b").await.as_deref(),
+        Some(taker.as_str())
+    );
+
+    registry
+        .dispatch("delete", json!({"id": taker}))
+        .await
+        .expect("delete the taker");
+    pack.handle_restore(&token, json!({"id": into}), &registry)
+        .await
+        .expect("restore with both keys free");
+    for key in ["k:a", "k:b"] {
+        assert_eq!(
+            holder_of(&registry, "concept", key).await.as_deref(),
+            Some(into.as_str()),
+            "{key}"
+        );
+    }
+}
+
+/// ADR-221 acceptance 13: a forced merge of two kinds rewrites the moved
+/// key to the kept entity's kind and drops a key the kept entity already
+/// holds; without `force` the merge still refuses.
+#[tokio::test]
+async fn a_forced_cross_kind_merge_rewrites_the_keys_to_the_kept_kind() {
+    let (_rt, _token, _pack, registry) = configured().await;
+    let into = create_id(&registry, keyed_entity("concept", "Into", "k:same")).await;
+    let from = create_id(&registry, keyed_entity("person", "From", "k:same")).await;
+    let other = create_id(&registry, keyed_entity("person", "Other", "k:p")).await;
+
+    let mut unforced = forced_merge(&into, &other);
+    unforced["force"] = json!(false);
+    registry
+        .dispatch("merge", unforced)
+        .await
+        .expect_err("a merge across kinds without force refuses");
+
+    let merged = registry
+        .dispatch("merge", forced_merge(&into, &from))
+        .await
+        .expect("forced merge");
+    assert_eq!(merged["keys_moved"], json!([]), "{merged}");
+    assert_eq!(
+        merged["keys_already_held"],
+        json!([{"kind": "person", "key": "k:same"}]),
+        "{merged}"
+    );
+    assert_eq!(
+        holder_of(&registry, "concept", "k:same").await.as_deref(),
+        Some(into.as_str())
+    );
+    assert_eq!(holder_of(&registry, "person", "k:same").await, None);
+
+    let merged = registry
+        .dispatch("merge", forced_merge(&into, &other))
+        .await
+        .expect("forced merge");
+    assert_eq!(
+        merged["keys_moved"],
+        json!([{"kind": "concept", "key": "k:p", "from_kind": "person"}]),
+        "{merged}"
+    );
+    assert_eq!(merged["keys_rewritten"], json!(1), "{merged}");
+    assert_eq!(
+        holder_of(&registry, "concept", "k:p").await.as_deref(),
+        Some(into.as_str())
+    );
+    assert_eq!(holder_of(&registry, "person", "k:p").await, None);
+}
+
+/// Two concepts and a person keyed so that a forced merge of the person into
+/// `into` would hand it a key `holder` holds. Returns (into, holder, from).
+async fn conflicting_merge_operands(
+    registry: &khive_runtime::VerbRegistry,
+) -> (String, String, String) {
+    let into = create_id(registry, keyed_entity("concept", "Into", "k:into")).await;
+    let holder = create_id(registry, keyed_entity("concept", "Holder", "k:x")).await;
+    let from = create_id(registry, keyed_entity("person", "From", "k:x")).await;
+    (into, holder, from)
+}
+
+fn conflicting_keys(error: &RuntimeError) -> Value {
+    let RuntimeError::Khive(error) = error else {
+        panic!("expected a domain error, got {error:?}");
+    };
+    let details = error.details().expect("details");
+    assert_eq!(details.get("reason"), Some("merge_key_conflict"));
+    serde_json::from_str(details.get("conflicting_keys").expect("conflicting keys")).unwrap()
+}
+
+/// The merge left every operand as it was: `from` is live and keeps its
+/// key, `holder` keeps its key, `into` gained no alias.
+async fn assert_merge_wrote_nothing(
+    registry: &khive_runtime::VerbRegistry,
+    into: &str,
+    holder: &str,
+    from: &str,
+) {
+    let from_row = registry
+        .dispatch("get", json!({"id": from}))
+        .await
+        .expect("the merged-away entity is still live");
+    assert!(from_row["deleted_at"].is_null(), "{from_row}");
+    assert_eq!(
+        holder_of(registry, "person", "k:x").await.as_deref(),
+        Some(from)
+    );
+    assert_eq!(
+        holder_of(registry, "concept", "k:x").await.as_deref(),
+        Some(holder)
+    );
+    let into_row = registry
+        .dispatch("get", json!({"id": into}))
+        .await
+        .expect("kept entity");
+    assert!(
+        into_row
+            .get("aliases")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty),
+        "{into_row}"
+    );
+}
+
+/// ADR-221 acceptance 13: a moved key another live entity holds under the
+/// kept kind refuses the merge with `merge_key_conflict`, naming the holder
+/// to a caller that may list it, and writes nothing; the dry run reports the
+/// same conflict.
+#[tokio::test]
+async fn merge_key_conflict_refuses_the_merge_and_writes_nothing() {
+    let (_rt, _token, _pack, registry) = configured().await;
+    let (into, holder, from) = conflicting_merge_operands(&registry).await;
+    let conflict = json!([{"kind": "concept", "key": "k:x", "existing_id": holder}]);
+
+    let mut dry = forced_merge(&into, &from);
+    dry["dry_run"] = json!(true);
+    let preview = registry.dispatch("merge", dry).await.expect("dry run");
+    assert_eq!(preview["key_conflicts"], conflict, "{preview}");
+    assert_eq!(preview["would_merge"], json!(false), "{preview}");
+    assert_eq!(
+        preview["refused_by"],
+        json!("merge_key_conflict"),
+        "{preview}"
+    );
+
+    let error = registry
+        .dispatch("merge", forced_merge(&into, &from))
+        .await
+        .expect_err("a key another live entity holds refuses the merge");
+    assert_eq!(conflicting_keys(&error), conflict);
+    assert!(format!("{error}").contains(&holder), "{error}");
+    assert_merge_wrote_nothing(&registry, &into, &holder, &from).await;
+}
+
+/// `merge_key_conflict` names no holder to a caller that may not list
+/// entities, in the error and in the dry run.
+#[tokio::test]
+async fn merge_key_conflict_names_no_holder_the_caller_may_not_list() {
+    let (_rt, _token, _pack, registry) = gated(std::sync::Arc::new(DenyList));
+    let (into, holder, from) = conflicting_merge_operands(&registry).await;
+    let conflict = json!([{"kind": "concept", "key": "k:x"}]);
+
+    let mut dry = forced_merge(&into, &from);
+    dry["dry_run"] = json!(true);
+    let preview = registry.dispatch("merge", dry).await.expect("dry run");
+    assert_eq!(preview["key_conflicts"], conflict, "{preview}");
+    assert!(!preview.to_string().contains(&holder), "{preview}");
+
+    let error = registry
+        .dispatch("merge", forced_merge(&into, &from))
+        .await
+        .expect_err("a key another live entity holds refuses the merge");
+    assert_eq!(conflicting_keys(&error), conflict);
+    assert!(!format!("{error}").contains(&holder), "{error}");
+    assert_merge_wrote_nothing(&registry, &into, &holder, &from).await;
 }

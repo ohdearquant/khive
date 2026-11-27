@@ -390,7 +390,7 @@ pub(super) fn reject_inapplicable_update_fields(
             };
             (
                 bad,
-                "name, description, tags, properties, entity_type, add_aliases, remove_aliases",
+                "name, description, tags, properties, entity_type, add_aliases, remove_aliases, keep_old_name",
             )
         }
         "note" => {
@@ -400,6 +400,8 @@ pub(super) fn reject_inapplicable_update_fields(
                 Some("add_aliases")
             } else if present("remove_aliases") {
                 Some("remove_aliases")
+            } else if present("keep_old_name") {
+                Some("keep_old_name")
             } else if present("relation") {
                 Some("relation")
             } else if present("weight") {
@@ -434,6 +436,8 @@ pub(super) fn reject_inapplicable_update_fields(
                 Some("add_aliases")
             } else if present("remove_aliases") {
                 Some("remove_aliases")
+            } else if present("keep_old_name") {
+                Some("keep_old_name")
             } else if o.contains_key("salience") {
                 Some("salience")
             } else if o.contains_key("decay_factor") {
@@ -779,10 +783,20 @@ pub async fn prepare_update(
 
     // ADR-221 section 2: every alias is validated and secret-gated before
     // the target is read, as the kg update handler does.
+    let keep_old_name = match obj(args)?.get("keep_old_name") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(keep)) => *keep,
+        Some(_) => {
+            return Err(RuntimeError::InvalidInput(
+                "keep_old_name must be a boolean".into(),
+            ))
+        }
+    };
     let aliases = crate::EntityAliasChange::update(
         &optional_alias_list(args, "add_aliases")?,
         &optional_alias_list(args, "remove_aliases")?,
-    )?;
+    )?
+    .keeping_old_name(keep_old_name);
 
     match runtime.resolve_by_id(token, id).await? {
         Some(Resolved::Entity(entity)) => {
@@ -816,7 +830,7 @@ pub async fn prepare_update(
                 }
             }
             refuse_pack_registry_tags(&entity.tags, "update")?;
-            // Decide step lives in curation.rs's `prepare_update_entity` —
+            // Decide step lives in curation.rs's `prepare_update_entity_with_previous_name` —
             // the SAME function canonical `update_entity` calls. Only the
             // arg-extraction (raw JSON -> `EntityPatch`) and the plan-shape
             // wiring are atomic-path-specific: the domain object becomes a
@@ -1021,13 +1035,16 @@ async fn prepare_update_entity_record_with_version_and_type(
     let alias_only = patch.is_empty() && remove_properties.is_empty() && !aliases.is_empty();
     let explicit_entity_type_patch = patch.entity_type.is_some();
     let (
-        mut entity,
-        mut reindex_required,
-        mut changed_fields,
-        expected_updated_at,
-        expected_deleted_at,
+        (
+            mut entity,
+            mut reindex_required,
+            mut changed_fields,
+            expected_updated_at,
+            expected_deleted_at,
+        ),
+        previous_name,
     ) = runtime
-        .prepare_update_entity(token, id, patch, remove_properties)
+        .prepare_update_entity_with_previous_name(token, id, patch, remove_properties)
         .await?;
     if required_entity_type.is_some_and(|expected| {
         (explicit_entity_type_patch || entity.entity_type.is_some())
@@ -1040,8 +1057,12 @@ async fn prepare_update_entity_record_with_version_and_type(
     // ADR-221 section 2: the alias change lands on the row whose name is
     // final, and reindexes the entity as a name change does.
     let updated_at = entity.updated_at;
-    let (aliases_changed, alias_statements, _) =
-        crate::operations::apply_entity_alias_change(&mut entity, aliases, updated_at);
+    let (aliases_changed, alias_statements, _) = crate::operations::apply_entity_alias_change(
+        &mut entity,
+        aliases,
+        updated_at,
+        Some(&previous_name),
+    );
     if aliases_changed {
         reindex_required = true;
         changed_fields.push("aliases");
@@ -1078,11 +1099,7 @@ async fn prepare_update_entity_record_with_version_and_type(
         EventKind::EntityUpdated,
         SubstrateKind::Entity,
         id,
-        serde_json::json!({
-            "id": id,
-            "namespace": &entity.namespace,
-            "changed_fields": changed_fields,
-        }),
+        crate::operations::entity_updated_payload(&entity, &changed_fields, Some(&previous_name)),
     )?);
     let post_commit = if reindex_required {
         PostCommitEffect::ReindexEntity { entity_id: id }

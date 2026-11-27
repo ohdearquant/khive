@@ -265,8 +265,11 @@ async fn an_alias_equal_to_the_name_is_not_stored() {
     assert!(renamed.get("aliases_not_stored").is_none(), "{renamed}");
     assert_eq!(
         aliases_of(&registry, &id).await,
-        caller(&["y"]),
-        "a caller alias equal to the new name is removed"
+        json!([
+            {"alias": "N", "origin": "rename"},
+            {"alias": "y", "origin": "caller"}
+        ]),
+        "a caller alias equal to the new name is removed and the old name is kept"
     );
 
     for atomic in [true, false] {
@@ -365,7 +368,11 @@ async fn a_rename_onto_an_alias_of_any_origin_removes_that_row() {
     seed_alias(&rt, &registry, &id, "r", EntityAliasOrigin::Rename).await;
     seed_alias(&rt, &registry, &id, "m", EntityAliasOrigin::Merge).await;
 
-    let renamed = update(&registry, json!({"id": id, "name": "r"})).await;
+    let renamed = update(
+        &registry,
+        json!({"id": id, "name": "r", "keep_old_name": false}),
+    )
+    .await;
     assert_eq!(renamed["name"], json!("r"), "{renamed}");
     assert_eq!(
         aliases_of(&registry, &id).await,
@@ -376,7 +383,11 @@ async fn a_rename_onto_an_alias_of_any_origin_removes_that_row() {
         "a rename-origin alias equal to the new name is removed"
     );
 
-    update(&registry, json!({"id": id, "name": "m"})).await;
+    update(
+        &registry,
+        json!({"id": id, "name": "m", "keep_old_name": false}),
+    )
+    .await;
     assert_eq!(
         aliases_of(&registry, &id).await,
         caller(&["c"]),
@@ -387,11 +398,116 @@ async fn a_rename_onto_an_alias_of_any_origin_removes_that_row() {
     seed_alias(&rt, &registry, &id, "s", EntityAliasOrigin::Merge).await;
     let renamed = update(
         &registry,
-        json!({"id": id, "name": "s", "remove_aliases": ["s"]}),
+        json!({"id": id, "name": "s", "remove_aliases": ["s"], "keep_old_name": false}),
     )
     .await;
     assert!(renamed.get("aliases_not_removed").is_none(), "{renamed}");
     assert_eq!(aliases_of(&registry, &id).await, caller(&["c"]));
+}
+
+async fn resolve_one(registry: &VerbRegistry, name: &str) -> Value {
+    let resolved = registry
+        .dispatch("resolve", json!({"refs": [name]}))
+        .await
+        .expect("resolve");
+    resolved["results"][0].clone()
+}
+
+/// ADR-221 acceptance 8: a rename keeps the old name as a `rename` alias
+/// and resolve finds the entity by it.
+#[tokio::test]
+async fn a_rename_keeps_the_old_name_and_resolve_finds_it() {
+    let registry = configured().await;
+    let created = create(&registry, concept("Old Name", &[])).await;
+    let id = created["id"].clone();
+    update(&registry, json!({"id": id, "name": "New Name"})).await;
+    assert_eq!(
+        aliases_of(&registry, &id).await,
+        json!([{"alias": "Old Name", "origin": "rename"}])
+    );
+    let by_old = resolve_one(&registry, "Old Name").await;
+    assert_eq!(by_old["status"], json!("resolved"), "{by_old}");
+    assert_eq!(by_old["id"], id, "{by_old}");
+    assert_eq!(by_old["matched_alias"], json!("Old Name"), "{by_old}");
+
+    // A caller cannot remove a rename alias.
+    let answer = update(&registry, json!({"id": id, "remove_aliases": ["Old Name"]})).await;
+    assert_eq!(
+        answer["aliases_not_removed"],
+        json!(["Old Name"]),
+        "{answer}"
+    );
+}
+
+/// ADR-221 acceptance 9: a split that hands the old name to the parent
+/// renames the child with `keep_old_name: false`, so the old name resolves
+/// to the parent only.
+#[tokio::test]
+async fn keep_old_name_false_leaves_the_old_name_to_another_entity() {
+    let registry = configured().await;
+    let child = create(&registry, concept("Shared Name", &[])).await;
+    let child_id = child["id"].clone();
+    update(
+        &registry,
+        json!({"id": child_id, "name": "Child Name", "keep_old_name": false}),
+    )
+    .await;
+    assert_eq!(aliases_of(&registry, &child_id).await, Value::Null);
+    let parent = create(&registry, concept("Shared Name", &[])).await;
+    let by_old = resolve_one(&registry, "Shared Name").await;
+    assert_eq!(by_old["status"], json!("resolved"), "{by_old}");
+    assert_eq!(by_old["id"], parent["id"], "{by_old}");
+}
+
+#[tokio::test]
+async fn keep_old_name_is_refused_off_entities_and_must_be_a_boolean() {
+    let registry = configured().await;
+    let note = registry
+        .dispatch(
+            "create",
+            json!({"kind": "observation", "name": "n", "content": "c"}),
+        )
+        .await
+        .expect("create note");
+    let error = registry
+        .dispatch(
+            "update",
+            json!({"id": note["id"], "name": "m", "keep_old_name": false}),
+        )
+        .await
+        .expect_err("keep_old_name on a note");
+    assert!(error.to_string().contains("keep_old_name"), "{error}");
+
+    let entity = create(&registry, concept("E", &[])).await;
+    registry
+        .dispatch(
+            "update",
+            json!({"id": entity["id"], "name": "F", "keep_old_name": "no"}),
+        )
+        .await
+        .expect_err("a string keep_old_name");
+}
+
+/// A keyed `on_key: update` reload that changes the holder's name is an
+/// update of the held entity, so it keeps the old name as an alias.
+#[tokio::test]
+async fn a_keyed_reload_that_renames_keeps_the_old_name() {
+    let registry = configured().await;
+    let created = create(&registry, keyed(concept("Before", &["c"]), "k")).await;
+    let id = created["id"].clone();
+    let mut reload = keyed(concept("After", &["c"]), "k");
+    reload["on_key"] = json!("update");
+    let reloaded = create(&registry, reload).await;
+    assert_eq!(reloaded["id"], id, "{reloaded}");
+    assert_eq!(
+        aliases_of(&registry, &id).await,
+        json!([
+            {"alias": "Before", "origin": "rename"},
+            {"alias": "c", "origin": "caller"}
+        ])
+    );
+    let by_old = resolve_one(&registry, "Before").await;
+    assert_eq!(by_old["id"], id, "{by_old}");
 }
 
 #[tokio::test]
@@ -514,4 +630,135 @@ async fn aliases_on_a_note_are_refused() {
             .expect_err("aliases on a note update");
         assert!(format!("{error}").contains(field), "{field}: {error}");
     }
+}
+
+fn forced_merge(into: &Value, from: &Value, strategy: &str) -> Value {
+    json!({
+        "kind": "entity",
+        "into_id": into,
+        "from_id": from,
+        "strategy": strategy,
+        "force": true
+    })
+}
+
+/// `aliases` sorted by alias, so a comparison does not depend on row order.
+fn sorted(aliases: Value) -> Value {
+    let mut rows = aliases.as_array().cloned().unwrap_or_default();
+    rows.sort_by(|a, b| a["alias"].as_str().cmp(&b["alias"].as_str()));
+    Value::Array(rows)
+}
+
+/// ADR-221 acceptance 10 and 14: a merge gives the kept entity the
+/// merged-away entity's name and aliases as `merge` aliases, skips a name
+/// the kept entity already holds or bears, and leaves the merged-away
+/// entity no alias rows.
+#[tokio::test]
+async fn a_merge_moves_the_names_and_stores_none_equal_to_the_kept_name() {
+    let registry = configured().await;
+    let into = create(&registry, concept("Alpha", &["a1", "shared"])).await["id"].clone();
+    let from = create(&registry, concept("Beta", &["bee1", "shared", "Alpha"])).await["id"].clone();
+
+    let mut dry = forced_merge(&into, &from, "prefer_into");
+    dry["dry_run"] = json!(true);
+    let preview = registry.dispatch("merge", dry).await.expect("dry run");
+    assert_eq!(
+        preview["aliases_added"],
+        json!(["Beta", "bee1"]),
+        "{preview}"
+    );
+    assert_eq!(
+        aliases_of(&registry, &into).await,
+        caller(&["a1", "shared"]),
+        "a dry run writes nothing"
+    );
+
+    let merged = registry
+        .dispatch("merge", forced_merge(&into, &from, "prefer_into"))
+        .await
+        .expect("merge");
+    assert_eq!(merged["aliases_added"], json!(["Beta", "bee1"]), "{merged}");
+    assert_eq!(
+        sorted(aliases_of(&registry, &into).await),
+        json!([
+            {"alias": "Beta", "origin": "merge"},
+            {"alias": "a1", "origin": "caller"},
+            {"alias": "bee1", "origin": "merge"},
+            {"alias": "shared", "origin": "caller"}
+        ])
+    );
+    let tombstone = registry
+        .dispatch("get", json!({"id": from, "include_deleted": true}))
+        .await
+        .expect("tombstone");
+    assert!(
+        tombstone
+            .get("aliases")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty),
+        "the merged-away entity keeps no alias rows: {tombstone}"
+    );
+
+    let by_old = resolve_one(&registry, "Beta").await;
+    assert_eq!(by_old["status"], json!("resolved"), "{by_old}");
+    assert_eq!(by_old["id"], into, "{by_old}");
+    let by_moved = resolve_one(&registry, "bee1").await;
+    assert_eq!(by_moved["status"], json!("resolved"), "{by_moved}");
+    assert_eq!(by_moved["id"], into, "{by_moved}");
+    assert_eq!(by_moved["matched_alias"], json!("bee1"), "{by_moved}");
+    let by_name = resolve_one(&registry, "Alpha").await;
+    assert_eq!(by_name["status"], json!("resolved"), "{by_name}");
+    assert_eq!(by_name["id"], into, "{by_name}");
+    let found = registry
+        .dispatch(
+            "search",
+            json!({"kind": "entity", "query": "bee1", "limit": 10}),
+        )
+        .await
+        .expect("search by a moved alias");
+    let ids: Vec<Value> = found
+        .as_array()
+        .expect("search rows")
+        .iter()
+        .map(|row| row["id"].clone())
+        .collect();
+    assert_eq!(ids, vec![into.clone()], "{found}");
+}
+
+/// ADR-221 acceptance 14: a merge whose strategy takes the merged-away
+/// entity's name drops the kept entity's alias equal to that name and keeps
+/// the kept entity's previous name as a `merge` alias.
+#[tokio::test]
+async fn a_merge_that_takes_the_other_name_keeps_the_previous_name() {
+    let registry = configured().await;
+    let into = create(&registry, concept("Gamma", &["Delta"])).await["id"].clone();
+    let from = create(&registry, concept("Delta", &["d1"])).await["id"].clone();
+
+    let merged = registry
+        .dispatch("merge", forced_merge(&into, &from, "prefer_from"))
+        .await
+        .expect("merge");
+    assert_eq!(merged["aliases_added"], json!(["d1", "Gamma"]), "{merged}");
+    let kept = registry
+        .dispatch("get", json!({"id": into}))
+        .await
+        .expect("kept entity");
+    assert_eq!(kept["name"], json!("Delta"), "{kept}");
+    assert_eq!(
+        sorted(aliases_of(&registry, &into).await),
+        json!([
+            {"alias": "Gamma", "origin": "merge"},
+            {"alias": "d1", "origin": "merge"}
+        ])
+    );
+    let by_name = resolve_one(&registry, "Delta").await;
+    assert_eq!(by_name["status"], json!("resolved"), "{by_name}");
+    assert_eq!(by_name["id"], into, "{by_name}");
+    let by_previous = resolve_one(&registry, "Gamma").await;
+    assert_eq!(by_previous["id"], into, "{by_previous}");
+    assert_eq!(
+        by_previous["matched_alias"],
+        json!("Gamma"),
+        "{by_previous}"
+    );
 }

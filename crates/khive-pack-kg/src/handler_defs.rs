@@ -774,7 +774,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
     HandlerDef {
         name: "update",
         description: "Patch entity, note, or edge fields. Accepted fields depend on substrate: \
-                       entities accept name/description/properties/tags/entity_type/add_aliases/remove_aliases; notes accept \
+                       entities accept name/description/properties/tags/entity_type/add_aliases/remove_aliases/keep_old_name; notes accept \
                        name/content/salience/decay_factor/properties/tags; edges accept relation/weight/properties.",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
@@ -785,6 +785,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
             ParamDef { name: "key", param_type: "string", required: false, description: "Entities only: patch the live entity holding this key in the caller's primary namespace, in place of id. Needs kind set to the base entity kind the key is scoped to; id and key are mutually exclusive. A deleted entity holds no key.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "add_aliases", param_type: "array of string", required: false, description: "Entities only: aliases to add, taken as a set, under the rules of create's aliases. An alias the entity already holds, of any origin, is left as it is. An alias equal to the entity's name after the update is not stored and is listed in aliases_not_stored. A change to the aliases reindexes the entity.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "remove_aliases", param_type: "array of string", required: false, description: "Entities only: caller aliases to remove. An alias the entity does not hold as a caller alias, a rename or merge alias included, is not an error and is listed in aliases_not_removed. One alias in both add_aliases and remove_aliases is invalid.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "keep_old_name", param_type: "boolean", required: false, description: "Entities only, default true: an update that changes the name keeps the old name as an alias of origin rename, so resolve still finds the entity by it; the entity_updated event names previous_name and name either way. False keeps no alias, as a split that hands the old name to another entity needs. An alias the entity holds equal to the new name is removed whatever its origin.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "id",
                 param_type: "uuid",

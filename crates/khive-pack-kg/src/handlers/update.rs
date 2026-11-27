@@ -70,7 +70,7 @@ fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), R
             };
             (
                 bad,
-                "name, description, tags, properties, entity_type, add_aliases, remove_aliases",
+                "name, description, tags, properties, entity_type, add_aliases, remove_aliases, keep_old_name",
             )
         }
         KindSpec::Note { .. } => {
@@ -80,6 +80,8 @@ fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), R
                 Some("add_aliases")
             } else if p.remove_aliases.is_some() {
                 Some("remove_aliases")
+            } else if p.keep_old_name.is_some() {
+                Some("keep_old_name")
             } else if p.relation.is_some() {
                 Some("relation")
             } else if p.weight.is_some() {
@@ -107,6 +109,8 @@ fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), R
                 Some("add_aliases")
             } else if p.remove_aliases.is_some() {
                 Some("remove_aliases")
+            } else if p.keep_old_name.is_some() {
+                Some("keep_old_name")
             } else if p.salience.is_some() {
                 Some("salience")
             } else if p.decay_factor.is_some() {
@@ -261,7 +265,8 @@ impl KgPack {
         let aliases = EntityAliasChange::update(
             p.add_aliases.as_deref().unwrap_or_default(),
             p.remove_aliases.as_deref().unwrap_or_default(),
-        )?;
+        )?
+        .keeping_old_name(p.keep_old_name.unwrap_or(true));
         if p.entity_kind.is_some() {
             return Err(RuntimeError::InvalidInput(
                 "entity_kind is immutable; to change kind, delete then re-create the entity, or use merge() if this is a deduplication correction".into(),

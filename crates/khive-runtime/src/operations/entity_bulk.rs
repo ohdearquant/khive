@@ -265,7 +265,7 @@ impl KhiveRuntime {
 /// that write them, under the id and creation time the row carries now.
 fn project_bulk_aliases(entity: &mut Entity, aliases: &EntityAliasChange) -> Vec<SqlStatement> {
     let created_at = entity.created_at;
-    super::entity_aliases::apply_entity_alias_change(entity, aliases, created_at).1
+    super::entity_aliases::apply_entity_alias_change(entity, aliases, created_at, None).1
 }
 
 fn bulk_entity_plan(entity: &Entity) -> RuntimeResult<AddEntityPlan> {

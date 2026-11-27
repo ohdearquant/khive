@@ -182,7 +182,7 @@ pub(super) fn materialize(
     let previous_updated_at = live.updated_at;
     let previous_deleted_at = live.deleted_at;
     let before = live.clone();
-    let (patched, reindex, changed_fields) = apply_canonical_patch(&before, &prepared.patch)
+    let (patched, reindex, mut changed_fields) = apply_canonical_patch(&before, &prepared.patch)
         .map_err(|error| failure(error.to_string()))?;
     live = patched;
     crate::secret_gate::check_reserved_carry_forward(
@@ -217,6 +217,23 @@ pub(super) fn materialize(
         ),
         guard: Some(AffectedRowGuard::exactly(1)),
     }];
+    // ADR-221 section 2: an alias never equals its entity's name, so a
+    // replayed rename onto a name the entity holds as an alias deletes that
+    // row, as the update verb does. The change set's hash covers its ops, not
+    // this plan, so the delete leaves the hash unchanged.
+    if live.name != before.name {
+        statements.push(PlanStatement {
+            statement: khive_db::stores::entity::entity_name_alias_delete_statement(
+                &live.namespace,
+                id,
+                &live.name,
+            ),
+            guard: None,
+        });
+        if before.aliases.iter().any(|held| held.alias == live.name) {
+            changed_fields.push("aliases");
+        }
+    }
     statements.extend(
         crate::atomic_prepare::event_append_statements(
             token,

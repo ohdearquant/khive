@@ -51,7 +51,8 @@ fn replace_keeps_other_origins_and_drops_the_name() {
         },
     ];
     let change = EntityAliasChange::replace(&aliases(&["new", "kept", "Name"])).unwrap();
-    let (changed, statements, report) = apply_entity_alias_change(&mut entity, &change, 7);
+    let (changed, statements, report) =
+        apply_entity_alias_change(&mut entity, &change, 7, Some("Name"));
     assert!(changed);
     assert_eq!(report.not_stored, aliases(&["Name"]));
     assert_eq!(
@@ -86,7 +87,8 @@ fn update_lists_removals_it_cannot_make() {
         },
     ];
     let change = EntityAliasChange::update(&[], &aliases(&["mine", "merged", "absent"])).unwrap();
-    let (changed, statements, report) = apply_entity_alias_change(&mut entity, &change, 7);
+    let (changed, statements, report) =
+        apply_entity_alias_change(&mut entity, &change, 7, Some("Name"));
     assert!(changed);
     assert_eq!(statements.len(), 1);
     assert_eq!(report.not_removed, aliases(&["absent", "merged"]));
@@ -115,8 +117,12 @@ fn a_rename_onto_a_held_alias_removes_it_whatever_wrote_it() {
             },
         ];
         entity.name = "new".into();
-        let (changed, statements, report) =
-            apply_entity_alias_change(&mut entity, &EntityAliasChange::default(), 7);
+        let (changed, statements, report) = apply_entity_alias_change(
+            &mut entity,
+            &EntityAliasChange::default().keeping_old_name(false),
+            7,
+            Some("old"),
+        );
         assert!(changed, "{origin:?}");
         assert!(report.is_empty(), "{origin:?}");
         assert_eq!(
@@ -132,6 +138,66 @@ fn a_rename_onto_a_held_alias_removes_it_whatever_wrote_it() {
     }
 }
 
+fn labels(statements: &[SqlStatement]) -> Vec<&str> {
+    statements
+        .iter()
+        .map(|statement| statement.label.as_deref().unwrap())
+        .collect()
+}
+
+#[test]
+fn a_rename_keeps_the_old_name_as_a_rename_alias() {
+    let mut entity = Entity::new("ns", "concept", "New");
+    entity.aliases = vec![EntityAlias {
+        alias: "New".into(),
+        origin: EntityAliasOrigin::Caller,
+    }];
+    let (changed, statements, report) =
+        apply_entity_alias_change(&mut entity, &EntityAliasChange::default(), 7, Some("Old"));
+    assert!(changed);
+    assert!(report.is_empty());
+    assert_eq!(
+        held(&entity),
+        vec![("Old".to_owned(), EntityAliasOrigin::Rename)]
+    );
+    assert_eq!(
+        labels(&statements),
+        ["entity-name-alias-delete", "entity-alias-insert"]
+    );
+}
+
+#[test]
+fn keep_old_name_false_keeps_no_alias() {
+    let mut entity = Entity::new("ns", "concept", "New");
+    let change = EntityAliasChange::default().keeping_old_name(false);
+    let (changed, statements, _) = apply_entity_alias_change(&mut entity, &change, 7, Some("Old"));
+    assert!(!changed);
+    assert!(statements.is_empty());
+    assert!(entity.aliases.is_empty());
+}
+
+#[test]
+fn the_old_name_named_as_a_caller_alias_by_the_same_change_stays_caller() {
+    let mut entity = Entity::new("ns", "concept", "New");
+    let change = EntityAliasChange::update(&aliases(&["Old"]), &[]).unwrap();
+    let (changed, statements, _) = apply_entity_alias_change(&mut entity, &change, 7, Some("Old"));
+    assert!(changed);
+    assert_eq!(
+        held(&entity),
+        vec![("Old".to_owned(), EntityAliasOrigin::Caller)]
+    );
+    assert_eq!(labels(&statements), ["entity-alias-insert"]);
+}
+
+#[test]
+fn an_unchanged_name_keeps_no_alias() {
+    let mut entity = Entity::new("ns", "concept", "Same");
+    let (changed, statements, _) =
+        apply_entity_alias_change(&mut entity, &EntityAliasChange::default(), 7, Some("Same"));
+    assert!(!changed);
+    assert!(statements.is_empty());
+}
+
 #[test]
 fn adding_a_held_alias_changes_nothing() {
     let mut entity = Entity::new("ns", "concept", "Name");
@@ -140,7 +206,8 @@ fn adding_a_held_alias_changes_nothing() {
         origin: EntityAliasOrigin::Rename,
     }];
     let change = EntityAliasChange::update(&aliases(&["former"]), &[]).unwrap();
-    let (changed, statements, report) = apply_entity_alias_change(&mut entity, &change, 7);
+    let (changed, statements, report) =
+        apply_entity_alias_change(&mut entity, &change, 7, Some("Name"));
     assert!(!changed);
     assert!(statements.is_empty());
     assert!(report.is_empty());

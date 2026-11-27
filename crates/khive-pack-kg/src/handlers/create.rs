@@ -95,6 +95,8 @@ fn optional_singleton_kind_alias(
 mod keyed_bulk;
 
 use keyed_bulk::ItemAnswer;
+#[cfg(test)]
+pub(super) use keyed_bulk::KEYED_BULK_UNIT_TEST_BARRIER;
 
 #[derive(Clone)]
 struct PreparedBulkEntity {

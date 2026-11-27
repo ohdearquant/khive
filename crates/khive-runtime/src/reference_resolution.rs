@@ -230,6 +230,7 @@ pub async fn resolve_reference_with_entity_type(
             score: RING_EXACT_CONFIDENCE,
         })
         .collect();
+    let exact = collapse_merged_candidates(runtime, token, exact).await?;
     if let Some(resolution) = resolve_from_candidates(exact) {
         return Ok(resolution);
     }
@@ -248,6 +249,7 @@ pub async fn resolve_reference_with_entity_type(
             score: RING_SUBSTRING_CONFIDENCE,
         })
         .collect();
+    let substring = collapse_merged_candidates(runtime, token, substring).await?;
     if let Some(resolution) = resolve_from_candidates(substring) {
         return Ok(resolution);
     }
@@ -326,6 +328,47 @@ pub async fn resolve_reference_with_entity_type(
             }
         }
     }
+}
+
+/// Merge hops a ring candidate is followed through before it is left as is.
+const MAX_MERGE_HOPS: usize = 32;
+
+/// Count ring candidates by the entity they name now (ADR-221 section 3): a
+/// merged-away entity the ring still holds by its old name and the live entity
+/// it was merged into are one entity, so they collapse onto the live id. A
+/// candidate whose chain ends at a deleted entity or runs past
+/// [`MAX_MERGE_HOPS`] stays as it is. One candidate or none is returned
+/// unread.
+async fn collapse_merged_candidates(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    candidates: Vec<ReferenceCandidate>,
+) -> RuntimeResult<Vec<ReferenceCandidate>> {
+    if candidates.len() < 2 {
+        return Ok(candidates);
+    }
+    let store = runtime.entities(token)?;
+    let mut collapsed: Vec<ReferenceCandidate> = Vec::with_capacity(candidates.len());
+    for mut candidate in candidates {
+        let mut current = candidate.id;
+        for _ in 0..MAX_MERGE_HOPS {
+            let Some(entity) = store.get_entity_including_deleted(current).await? else {
+                break;
+            };
+            match (entity.deleted_at, entity.merged_into) {
+                (Some(_), Some(next)) => current = next,
+                (None, _) => {
+                    candidate.id = current;
+                    break;
+                }
+                (Some(_), None) => break,
+            }
+        }
+        if !collapsed.iter().any(|held| held.id == candidate.id) {
+            collapsed.push(candidate);
+        }
+    }
+    Ok(collapsed)
 }
 
 /// Apply the shared "single-above-bar resolves, multiple is ambiguous"
