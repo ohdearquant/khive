@@ -52,24 +52,24 @@ pub fn merge_entities(
 
             (Some(EntityChange::Added(e)), None)
             | (Some(EntityChange::Added(e)), Some(EntityChange::Unchanged)) => {
-                merged.push(e.clone());
+                merged.push((**e).clone());
             }
 
             (None, Some(EntityChange::Added(e)))
             | (Some(EntityChange::Unchanged), Some(EntityChange::Added(e))) => {
-                merged.push(e.clone());
+                merged.push((**e).clone());
             }
 
             (Some(EntityChange::Added(e_ours)), Some(EntityChange::Added(e_theirs))) => {
                 let diffs = detect_entity_diffs(e_ours, e_theirs);
                 if diffs.is_empty() {
-                    merged.push(e_ours.clone());
+                    merged.push((**e_ours).clone());
                 } else {
                     conflicts.push(MergeConflict::DuplicateAddition {
                         entity_id: *id,
                         differing_fields: diffs,
                     });
-                    merged.push(e_ours.clone());
+                    merged.push((**e_ours).clone());
                 }
             }
 
@@ -86,7 +86,7 @@ pub fn merge_entities(
                 Some(EntityChange::Unchanged),
             )
             | (Some(EntityChange::Modified { branch: e_ours, .. }), None) => {
-                merged.push(e_ours.clone());
+                merged.push((**e_ours).clone());
             }
 
             (
@@ -101,7 +101,7 @@ pub fn merge_entities(
                     branch: e_theirs, ..
                 }),
             ) => {
-                merged.push(e_theirs.clone());
+                merged.push((**e_theirs).clone());
             }
 
             (
@@ -121,7 +121,7 @@ pub fn merge_entities(
                 } else {
                     conflicts.extend(field_conflicts);
                     // Preserve a deterministic provisional value for resolution UX.
-                    merged.push(e_ours.clone());
+                    merged.push((**e_ours).clone());
                 }
             }
 

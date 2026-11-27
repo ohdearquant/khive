@@ -337,6 +337,7 @@ pub use entity_aliases::{validate_entity_alias, EntityAliasChange, EntityAliasRe
 mod entity_bulk;
 mod entity_create;
 mod entity_keys;
+pub(crate) use entity_keys::validate_entity_key;
 pub use entity_keys::{
     entity_carries_create_payload, entity_key_conflict, keyed_replay_assertion_plan,
     same_create_payload, KeyedEntityCreate, KeyedEntityReload, PendingEntityId,
