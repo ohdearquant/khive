@@ -193,6 +193,19 @@ fn entities_equal(a: &ExportedEntity, b: &ExportedEntity) -> bool {
         && a.description == b.description
         && a.tags == b.tags
         && properties_equal(&a.properties, &b.properties)
+        && names_equal(a, b)
+}
+
+/// Compares an entity's keys and aliases as sets, ignoring order.
+pub(crate) fn names_equal(a: &ExportedEntity, b: &ExportedEntity) -> bool {
+    sorted_set(&a.keys) == sorted_set(&b.keys) && sorted_set(&a.aliases) == sorted_set(&b.aliases)
+}
+
+fn sorted_set<T: Ord + Clone>(items: &[T]) -> Vec<T> {
+    let mut items = items.to_vec();
+    items.sort();
+    items.dedup();
+    items
 }
 
 /// Compares optional property payloads exactly.

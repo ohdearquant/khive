@@ -206,3 +206,146 @@ fn one_sided_property_removal_survives_other_side_tag_edit() {
     assert_eq!(merged[0].properties, Some(serde_json::json!({})));
     assert_eq!(merged[0].tags, vec!["t"]);
 }
+
+fn alias(
+    name: &str,
+    origin: khive_storage::entity::EntityAliasOrigin,
+) -> khive_storage::entity::EntityAlias {
+    khive_storage::entity::EntityAlias {
+        alias: name.into(),
+        origin,
+    }
+}
+
+#[test]
+fn a_key_or_alias_added_on_one_side_is_not_an_unchanged_entity() {
+    use khive_storage::entity::EntityAliasOrigin::Caller;
+    let id = Uuid::new_v4();
+    let common = entity(id, "E");
+    let mut keyed = common.clone();
+    keyed.keys = vec!["k".into()];
+    let mut aliased = common.clone();
+    aliased.aliases = vec![alias("X", Caller)];
+
+    for branch in [keyed, aliased] {
+        let (merged, conflicts) = merge_entities(
+            &archive_with(vec![common.clone()]),
+            &archive_with(vec![branch.clone()]),
+            &archive_with(vec![common.clone()]),
+        );
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert_eq!(merged[0].keys, branch.keys);
+        assert_eq!(merged[0].aliases, branch.aliases);
+    }
+}
+
+#[test]
+fn keys_merge_as_sets_against_the_base_beside_an_edit_on_the_other_side() {
+    let id = Uuid::new_v4();
+    let mut common = entity(id, "E");
+    common.keys = vec!["kept".into(), "released".into()];
+    let mut ours_entity = common.clone();
+    ours_entity.keys = vec!["added".into(), "kept".into()];
+    let mut theirs_entity = common.clone();
+    theirs_entity.tags = vec!["t".into()];
+
+    let (merged, conflicts) = merge_entities(
+        &archive_with(vec![common]),
+        &archive_with(vec![ours_entity]),
+        &archive_with(vec![theirs_entity]),
+    );
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert_eq!(
+        merged[0].keys,
+        vec!["added".to_string(), "kept".to_string()]
+    );
+    assert_eq!(merged[0].tags, vec!["t"]);
+}
+
+#[test]
+fn aliases_merge_against_the_base_and_a_divergent_origin_resolves_to_ours() {
+    use khive_storage::entity::EntityAliasOrigin::{Caller, Merge, Rename};
+    let id = Uuid::new_v4();
+    let mut common = entity(id, "E");
+    common.aliases = vec![alias("dropped", Caller), alias("shared", Caller)];
+    let mut ours_entity = common.clone();
+    ours_entity.aliases = vec![alias("ours_new", Caller), alias("shared", Rename)];
+    let mut theirs_entity = common.clone();
+    theirs_entity.aliases = vec![
+        alias("dropped", Caller),
+        alias("shared", Merge),
+        alias("theirs_new", Merge),
+    ];
+
+    let (merged, conflicts) = merge_entities(
+        &archive_with(vec![common]),
+        &archive_with(vec![ours_entity]),
+        &archive_with(vec![theirs_entity]),
+    );
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert_eq!(
+        merged[0].aliases,
+        vec![
+            alias("ours_new", Caller),
+            alias("shared", Rename),
+            alias("theirs_new", Merge),
+        ]
+    );
+}
+
+#[test]
+fn an_alias_equal_to_the_merged_name_is_not_kept() {
+    use khive_storage::entity::EntityAliasOrigin::Caller;
+    let id = Uuid::new_v4();
+    let common = entity(id, "E");
+    let mut ours_entity = common.clone();
+    ours_entity.tags = vec!["t".into()];
+    let mut theirs_entity = common.clone();
+    theirs_entity.aliases = vec![alias("E", Caller), alias("F", Caller)];
+
+    let (merged, conflicts) = merge_entities(
+        &archive_with(vec![common]),
+        &archive_with(vec![ours_entity]),
+        &archive_with(vec![theirs_entity]),
+    );
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert_eq!(merged[0].aliases, vec![alias("F", Caller)]);
+}
+
+#[test]
+fn key_conflicts_report_each_shared_key_once_in_sorted_order() {
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4();
+    let mut ea = entity(a, "A");
+    ea.keys = vec!["k2".into(), "k1".into()];
+    let mut eb = entity(b, "B");
+    eb.keys = vec!["k1".into()];
+    let mut ec = entity(c, "C");
+    ec.keys = vec!["k1".into(), "k2".into(), "solo".into()];
+    ec.kind = "concept".into();
+
+    let conflicts = key_conflicts(&[ec, eb, ea]);
+    let mut k1 = vec![a, b, c];
+    k1.sort();
+    let mut k2 = vec![a, c];
+    k2.sort();
+    let rendered: Vec<_> = conflicts
+        .into_iter()
+        .map(|conflict| match conflict {
+            MergeConflict::KeyConflict {
+                kind,
+                key,
+                entities,
+            } => (kind, key, entities),
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        rendered,
+        vec![
+            ("concept".to_string(), "k1".to_string(), k1),
+            ("concept".to_string(), "k2".to_string(), k2),
+        ]
+    );
+}
