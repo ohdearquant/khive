@@ -211,6 +211,7 @@ fn every_git_verb_is_classified_for_repository_access() {
         ("git.gates", Some(Read)),
         ("git.ingest_cursor", None),
         ("git.init", Some(Write)),
+        ("git.issue", Some(Read)),
         ("git.log", Some(Read)),
         ("git.pr_close", Some(Write)),
         ("git.pr_edit", Some(Write)),

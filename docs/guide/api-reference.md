@@ -36,14 +36,14 @@ An always-machine-readable copy of this page is at
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
-`kkernel git-ingest` CLI drive. Its 23 verbs are `git.digest` (read/ingest), `git.ingest_cursor` (a read of the
+`kkernel git-ingest` CLI drive. Its 24 verbs are `git.digest` (read/ingest), `git.ingest_cursor` (a read of the
 stored ingest cursor and checkpoint for one project and source kind), the four
 write verbs `git.commit` / `git.branch` / `git.update_ref` / `git.push` (ADR-108) that shell to system git
 with hardened, allowlisted argv construction, the three read verbs `git.status` /
 `git.log` / `git.init`, and the dev-loop verbs `git.checkout` /
 `git.diff` / `git.gates` / `git.receipts` / `git.reconcile` / `git.pr_open` / `git.pr_review` /
-`git.pr_merge` / `git.pr_state` / `git.fetch` / `git.pr_edit` / `git.pr_close` / `git.check_log` /
-`git.branch_delete` (ADR-182). Initial remote cache setup failures and terminal refetch/reclone
+`git.pr_merge` / `git.pr_state` / `git.issue` / `git.fetch` / `git.pr_edit` / `git.pr_close` /
+`git.check_log` / `git.branch_delete` (ADR-182). Initial remote cache setup failures and terminal refetch/reclone
 cache failures in `git.digest` return `RemoteFetchError` in-process. On the MCP `request`
 wire, the failed `tool: "git.digest"` result carries
 `error: {kind: "remote_fetch_error", remote, message, domain_disposition}`. `remote`
@@ -3363,11 +3363,11 @@ This does not change the separate `git.checkout` symlink-refusal contract.
 
 ---
 
-## `git` pack — 23 verbs
+## `git` pack — 24 verbs
 
 The entries below cover the ingest and write surface; the dev-loop verbs
 (`git.checkout`, `git.diff`, `git.gates`, `git.receipts`, `git.reconcile`, `git.status`,
-`git.log`, `git.init`, `git.pr_open`, `git.pr_review`, `git.pr_merge`, `git.pr_state`, `git.fetch`, `git.pr_edit`, `git.pr_close`, `git.check_log`, `git.branch_delete`) are specified in
+`git.log`, `git.init`, `git.pr_open`, `git.pr_review`, `git.pr_merge`, `git.pr_state`, `git.issue`, `git.fetch`, `git.pr_edit`, `git.pr_close`, `git.check_log`, `git.branch_delete`) are specified in
 ADR-182 and its amendments.
 
 Git-history ingester plus a hardened write surface (ADR-088,
@@ -3522,7 +3522,8 @@ access = "read"
 
 A row with `access = "read"` names a repository and no branches (ADR-108 Amendment 2). It
 admits the verbs that change neither the repository nor its remote: `git.checkout`,
-`git.diff`, `git.status`, `git.log`, `git.gates`, `git.pr_state` and `git.reconcile`. Every
+`git.diff`, `git.status`, `git.log`, `git.gates`, `git.pr_state`, `git.issue`, `git.check_log`
+and `git.reconcile`. Every
 other verb refuses on it with `repo_read_only`. A row without `access` is a write row, which
 also admits every read.
 

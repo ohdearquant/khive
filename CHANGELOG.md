@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `git.issue` reads one issue of a configured repository: its title, state, author, dates, label
+  names, whole body and comments in platform order, one hundred to a page for at most ten pages,
+  with the platform's comment count and whether fewer were returned. It says whether the number is
+  a pull request. Terminal escapes and control and format characters are removed from the text and
+  `text_altered` says when that changed anything; the text is returned as untrusted data. It is a
+  read: a `[[git_write.allowed]]` row with `access = "read"` admits it, and it writes no receipt.
+
 ## [0.23.0] - 2026-11-26
 
 ### Added

@@ -620,6 +620,25 @@ async fn local_pr_state_refuses_remote_scheme_before_credentials() {
 }
 
 #[tokio::test]
+async fn local_issue_refuses_remote_scheme_before_credentials() {
+    let f = Fixture::file().await;
+    f.registry
+        .dispatch(
+            "tool.policy",
+            json!({"actor":f.actor,"tool":"git.issue","decision":"allow"}),
+        )
+        .await
+        .unwrap();
+    let error = f
+        .call(&f.actor, "git.issue", json!({"number":1}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("remote_scheme"), "{error}");
+    f.no_credential_read();
+}
+
+#[tokio::test]
 async fn local_check_log_refuses_remote_scheme_before_credentials() {
     let f = Fixture::file().await;
     f.registry

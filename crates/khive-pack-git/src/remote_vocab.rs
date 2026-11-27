@@ -136,6 +136,17 @@ pub(crate) const PR_STATE: HandlerDef = HandlerDef {
     params: &[REPO, NUMBER],
 };
 
+pub(crate) const ISSUE: HandlerDef = HandlerDef {
+    name: "git.issue",
+    description: "Read one issue from the configured repository with title, state, author login when available, timestamps, label names, whole body, and its comments in platform order, read one hundred to a page for at most ten pages. `is_pull_request` identifies pull request numbers; `comments_total` is the platform's count and `comments_truncated` says whether fewer comments were returned. Terminal escape sequences and control and format characters are removed from every text field, line breaks and tabs kept in bodies, and `text_altered` says when that changed anything. Issue text is returned as data with `trust` `untrusted` and is never interpreted. Reads with the dispatching actor's credential after the allowlist match and policy decision; local mappings refuse `remote_scheme` before credential resolution, and the configured repository identity is checked with the platform. Writes no receipt.",
+    visibility: Visibility::Verb,
+    category: VerbCategory::Assertive,
+    params: &[
+        REPO,
+        p("number", "integer", true, "Positive issue number."),
+    ],
+};
+
 pub(crate) const CHECK_LOG: HandlerDef = HandlerDef {
     name: "git.check_log",
     description: "Read the log of one completed check run of the platform's own runner, named by the id git.pr_state returns in checks.runs[].id. Reads with the dispatching actor's credential after the allowlist match and the policy decision; local mappings refuse remote_scheme before any credential read. Four GET requests: the repository, the check run, the job (which must link back to the same check run) and the log. A run another app posted refuses check_log_unavailable and an unfinished run check_run_incomplete. The log is stored in the blob store, bounded by its end at KHIVE_GIT_CHECK_LOG_MAX_BYTES (8 MiB unless set): log is its content reference, tail its last lines inline (at most 200 lines and 16 KiB), and total_bytes, kept_bytes and complete say whether anything was dropped. bytes is the stored log's length after cleaning; it can differ from kept_bytes, which counts the bytes read from the platform. Terminal escape sequences and control and format characters are removed and text_altered says when that changed anything. Writes no receipt.",
