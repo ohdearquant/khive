@@ -332,7 +332,10 @@ mod attachments;
 mod entity_bulk;
 mod entity_create;
 mod entity_keys;
-pub use entity_keys::{entity_key_conflict, KeyedEntityCreate, KeyedEntityReload};
+pub use entity_keys::{
+    entity_carries_create_payload, entity_key_conflict, same_create_payload, KeyedEntityCreate,
+    KeyedEntityReload, PendingEntityId,
+};
 mod entity_indexes;
 #[cfg(any(test, feature = "fault-injection"))]
 mod fault_injection;

@@ -53,6 +53,85 @@ pub enum KeyedEntityReload {
     Moved,
 }
 
+/// A fresh id for the row a keyed bulk create will write (ADR-221 section 1).
+///
+/// The bulk create names the id before it builds the row, so the update gate
+/// can judge a later item of the same request against that row. Only
+/// [`PendingEntityId::mint`] makes one and building the plan spends it, so one
+/// id names one new row.
+#[derive(Debug)]
+pub struct PendingEntityId(pub(super) Uuid);
+
+impl PendingEntityId {
+    /// A new random id.
+    pub fn mint() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// The id the row will carry.
+    pub fn id(&self) -> Uuid {
+        self.0
+    }
+}
+
+/// Whether `holder` carries the payload `spec` asks for, as a keyed create
+/// compares them.
+pub fn entity_carries_create_payload(holder: &Entity, spec: &EntityCreateSpec) -> bool {
+    same_entity_payload(
+        holder,
+        spec.entity_type.as_deref(),
+        &spec.name,
+        spec.description.as_deref(),
+        spec.properties.as_ref(),
+        &spec.tags,
+    )
+}
+
+/// Whether two keyed create payloads are the same, as
+/// [`entity_carries_create_payload`] compares a holder with a request.
+pub fn same_create_payload(first: &EntityCreateSpec, second: &EntityCreateSpec) -> bool {
+    let mut held =
+        Entity::new("", &first.kind, &first.name).with_entity_type(first.entity_type.as_deref());
+    held.description = first.description.clone();
+    held.properties = first.properties.clone();
+    held.tags = first.tags.clone();
+    entity_carries_create_payload(&held, second)
+}
+
+/// The caller property keys `holder` has and `wanted` leaves out: what a
+/// reload removes so the holder's caller properties become `wanted`.
+fn properties_to_remove(holder: &Entity, wanted: Option<&serde_json::Value>) -> Vec<String> {
+    match caller_properties(holder.properties.as_ref()) {
+        Some(serde_json::Value::Object(held)) => held
+            .keys()
+            .filter(|held_key| {
+                !wanted
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|asked| asked.contains_key(*held_key))
+            })
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The patch a reload writes: every caller field becomes the request's.
+fn reload_patch(
+    entity_type: Option<&str>,
+    name: &str,
+    description: Option<&str>,
+    wanted: Option<serde_json::Value>,
+    tags: &[String],
+) -> crate::EntityPatch {
+    crate::EntityPatch {
+        name: Some(name.to_owned()),
+        description: Some(description.map(str::to_owned)),
+        properties: wanted,
+        tags: Some(tags.to_vec()),
+        entity_type: Some(entity_type.map(str::to_owned)),
+    }
+}
+
 fn is_version_conflict(error: &RuntimeError) -> bool {
     matches!(
         error,
@@ -325,28 +404,9 @@ impl KhiveRuntime {
             ) {
                 return Ok(KeyedEntityReload::Replayed { entity: holder });
             }
-            // The caller keys the holder has and the request leaves out.
-            let removed: Vec<String> = match caller_properties(holder.properties.as_ref()) {
-                Some(serde_json::Value::Object(held)) => held
-                    .keys()
-                    .filter(|held_key| {
-                        !wanted
-                            .as_ref()
-                            .and_then(serde_json::Value::as_object)
-                            .is_some_and(|asked| asked.contains_key(*held_key))
-                    })
-                    .cloned()
-                    .collect(),
-                _ => Vec::new(),
-            };
+            let removed = properties_to_remove(&holder, wanted.as_ref());
             let removed: Vec<&str> = removed.iter().map(String::as_str).collect();
-            let patch = crate::EntityPatch {
-                name: Some(name.to_owned()),
-                description: Some(description.map(str::to_owned)),
-                properties: wanted.clone(),
-                tags: Some(tags.clone()),
-                entity_type: Some(entity_type.map(str::to_owned)),
-            };
+            let patch = reload_patch(entity_type, name, description, wanted.clone(), &tags);
             match self
                 .update_entity_with_removals_and_index_report(
                     token,
@@ -368,6 +428,43 @@ impl KhiveRuntime {
             "keyed entity reload: the holder of key {key:?} changed during \
              {KEYED_CREATE_ATTEMPTS} attempts"
         )))
+    }
+
+    /// The update plan for a bulk item under `on_key: "update"` whose key
+    /// `holder` holds with a different payload (ADR-221 section 1).
+    ///
+    /// The holder's caller fields become `spec`'s, as
+    /// [`Self::reload_keyed_entity`] writes them, and the plan is bound to the
+    /// version `holder` carries, so a holder that changed after the caller
+    /// read it rolls the unit back. A holder carrying a runtime-owned
+    /// property key is refused as the ordinary update refuses it. The
+    /// returned record is the projection; its version is the one read.
+    pub async fn prepare_keyed_entity_reload_plan(
+        &self,
+        token: &NamespaceToken,
+        holder: &Entity,
+        spec: &EntityCreateSpec,
+    ) -> RuntimeResult<(Entity, AtomicOpPlan)> {
+        crate::secret_gate::reject_reserved_secret_gate_property(spec.properties.as_ref())?;
+        let wanted = caller_properties(spec.properties.as_ref());
+        let removed = properties_to_remove(holder, wanted.as_ref());
+        let removed: Vec<&str> = removed.iter().map(String::as_str).collect();
+        let patch = reload_patch(
+            spec.entity_type.as_deref(),
+            &spec.name,
+            spec.description.as_deref(),
+            wanted,
+            &spec.tags,
+        );
+        crate::atomic_prepare::prepare_keyed_reload_entity_record(
+            self,
+            token,
+            holder.id,
+            patch,
+            &removed,
+            holder.version,
+        )
+        .await
     }
 
     /// The live entity holding `key` for `kind` in the caller's primary

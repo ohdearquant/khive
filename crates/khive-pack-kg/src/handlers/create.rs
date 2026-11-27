@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use khive_runtime::operations::dependency_kind_inference_hint;
 use khive_runtime::{
-    entity_key_conflict, run_atomic_unit, runtime_error_value, AtomicOpPlan, AtomicRunOutcome,
-    DomainDisposition, EntityCreateSpec, KeyedEntityCreate, KeyedEntityReload, KhiveRuntime,
-    KindHook, NamespaceToken, NoteCreateSpec, RuntimeError, VerbRegistry,
+    entity_key_conflict, run_atomic_unit, runtime_error_value, AtomicRunOutcome, DomainDisposition,
+    EntityCreateSpec, KeyedEntityCreate, KeyedEntityReload, KhiveRuntime, KindHook, NamespaceToken,
+    NoteCreateSpec, RuntimeError, VerbRegistry,
 };
 use khive_storage::note::Note;
 use khive_storage::Entity;
@@ -91,12 +91,23 @@ fn optional_singleton_kind_alias(
     }
 }
 
+#[path = "create_keyed_bulk.rs"]
+mod keyed_bulk;
+
+use keyed_bulk::ItemAnswer;
+
+#[derive(Clone)]
 struct PreparedBulkEntity {
     spec: EntityCreateSpec,
     args: Value,
     hook: Option<Arc<dyn KindHook>>,
+    /// ADR-221 section 1: the item's caller key and whether it carries
+    /// `on_key: "update"`.
+    key: Option<String>,
+    on_key: bool,
 }
 
+#[derive(Clone)]
 struct PreparedBulkNote {
     spec: NoteCreateSpec,
     args: Value,
@@ -107,6 +118,7 @@ struct PreparedBulkNote {
 /// normalization and shared-field validation, still awaiting the
 /// runtime-owned admission checks (kind, secret gate, owned-identity
 /// derivation) each substrate's own prepare-plan call applies.
+#[derive(Clone)]
 enum PreparedBulkItem {
     Entity {
         prepared: PreparedBulkEntity,
@@ -115,6 +127,12 @@ enum PreparedBulkItem {
         normalized: Option<Value>,
     },
     Note(PreparedBulkNote),
+}
+
+impl PreparedBulkItem {
+    fn is_keyed(&self) -> bool {
+        matches!(self, Self::Entity { prepared, .. } if prepared.key.is_some())
+    }
 }
 
 /// One entity or note item, already committed, paired with what its own
@@ -189,6 +207,30 @@ impl BulkWrite {
     }
 }
 
+/// Append one item's committed answer to a bulk response's lists.
+fn push_bulk_answer(
+    idx: usize,
+    answer: ItemAnswer,
+    results: &mut Vec<Value>,
+    entity_type_normalized: &mut Vec<Value>,
+    entities: &mut Vec<Value>,
+) {
+    results.push(json!({
+        "index": idx,
+        "ok": true,
+        "result": answer.result,
+    }));
+    if let Some(mut applied) = answer.normalized {
+        if let Some(obj) = applied.as_object_mut() {
+            obj.insert("index".to_string(), json!(idx));
+        }
+        entity_type_normalized.push(applied);
+    }
+    if let Some(record) = answer.record {
+        entities.push(record);
+    }
+}
+
 impl KgPack {
     /// `create` under `on_key: "update"` when the key's holder carries a
     /// different payload (ADR-221 section 1). The update gate is asked for
@@ -221,19 +263,15 @@ impl KgPack {
             "properties": properties,
             "tags": tags,
         });
-        match registry
-            .authorize_effective_kg_read(token, "update", update_args, holder_id)
-            .await
-        {
-            Ok(()) => {}
-            Err(RuntimeError::PermissionDenied { .. }) => {
-                let disclosed = registry
-                    .allows_entity_key_disclosure(token, kind)
-                    .then_some(holder_id);
-                return Err(entity_key_conflict(key, disclosed));
-            }
-            Err(error) => return Err(error),
-        }
+        keyed_bulk::authorize_key_reload(
+            registry,
+            token,
+            kind,
+            key,
+            (holder_id, true),
+            update_args,
+        )
+        .await?;
         let reload = self
             .runtime
             .reload_keyed_entity(
@@ -445,6 +483,8 @@ impl KgPack {
                 },
                 args,
                 hook,
+                key: None,
+                on_key: false,
             },
             normalized,
         ))
@@ -566,6 +606,23 @@ impl KgPack {
                         "items[{idx}]: content, note_kind and salience apply only to note items"
                     )));
                 }
+                // ADR-221 section 1: judged on the item's shape alone, as
+                // the singleton create judges it.
+                let key = entry.key.take();
+                let on_key = match entry.on_key.take().as_deref() {
+                    None => false,
+                    Some("update") if key.is_some() => true,
+                    Some("update") => {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "items[{idx}]: on_key applies only to a keyed entity item"
+                        )));
+                    }
+                    Some(_) => {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "items[{idx}]: on_key accepts only \"update\""
+                        )));
+                    }
+                };
                 let canonical = reconcile_specific(
                     specific,
                     entry.entity_kind.as_deref(),
@@ -586,7 +643,7 @@ impl KgPack {
                     )
                     .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}]: {e}")))?;
                 }
-                let (prepared, normalized) = self
+                let (mut prepared, normalized) = self
                     .prepare_bulk_entity(
                         canonical,
                         entity_type.as_deref(),
@@ -599,12 +656,19 @@ impl KgPack {
                     .map_err(|error| {
                         RuntimeError::InvalidInput(format!("items[{idx}]: {error}"))
                     })?;
+                prepared.key = key;
+                prepared.on_key = on_key;
                 Ok(PreparedBulkItem::Entity {
                     prepared,
                     normalized,
                 })
             }
             KindSpec::Note { specific } => {
+                if entry.key.is_some() || entry.on_key.is_some() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "items[{idx}]: key and on_key apply only to entity items of a bulk create"
+                    )));
+                }
                 if entry.entity_kind.is_some()
                     || entry.entity_type.is_some()
                     || entry.description.is_some()
@@ -653,55 +717,23 @@ impl KgPack {
     /// item's row, FTS document, or edge is written; a confirmed rollback
     /// likewise leaves no successful item receipt: the whole call becomes
     /// this method's single `Err`, never a partial `results` array.
+    ///
+    /// Keyed entity items are judged in item order inside the same unit
+    /// (ADR-221 section 1): a key an earlier item used is judged against that
+    /// item's payload, and a unit that rolls back because a key's holder
+    /// moved is judged again from a fresh read.
     async fn commit_bulk_atomic(
         &self,
         token: &NamespaceToken,
+        registry: &VerbRegistry,
         attempted: usize,
         verbose: bool,
         prepared: Vec<Result<PreparedBulkItem, RuntimeError>>,
     ) -> Result<Value, RuntimeError> {
-        let mut plans: Vec<AtomicOpPlan> = Vec::with_capacity(attempted);
-        let mut writes: Vec<BulkWrite> = Vec::with_capacity(attempted);
-        for item in prepared {
-            match item? {
-                PreparedBulkItem::Entity {
-                    prepared,
-                    normalized,
-                } => {
-                    let PreparedBulkEntity { spec, args, hook } = prepared;
-                    let idx = writes.len();
-                    let (entity, plan) = self
-                        .runtime
-                        .prepare_bulk_entity_plan(token, spec)
-                        .await
-                        .map_err(|error| {
-                        RuntimeError::InvalidInput(format!("items[{idx}]: {error}"))
-                    })?;
-                    plans.push(plan);
-                    writes.push(BulkWrite::Entity {
-                        hook,
-                        args,
-                        entity,
-                        normalized,
-                    });
-                }
-                PreparedBulkItem::Note(prepared) => {
-                    let PreparedBulkNote { spec, args, hook } = prepared;
-                    let idx = writes.len();
-                    let (note, plan) = self
-                        .runtime
-                        .prepare_bulk_note_plan(token, spec)
-                        .await
-                        .map_err(|error| {
-                            RuntimeError::InvalidInput(format!("items[{idx}]: {error}"))
-                        })?;
-                    plans.push(plan);
-                    writes.push(BulkWrite::Note { hook, args, note });
-                }
-            }
-        }
-
-        if plans.is_empty() {
+        let items = prepared
+            .into_iter()
+            .collect::<Result<Vec<PreparedBulkItem>, RuntimeError>>()?;
+        if items.is_empty() {
             return to_json(&json!({
                 "attempted": 0,
                 "created": 0,
@@ -710,66 +742,42 @@ impl KgPack {
                 "results": Value::Array(vec![]),
             }));
         }
-
-        match run_atomic_unit(self.runtime.sql().as_ref(), plans).await {
-            Ok(AtomicRunOutcome::Committed { .. }) => {
-                for write in &writes {
-                    write.after_create(&self.runtime).await;
-                }
-                let mut results = Vec::with_capacity(writes.len());
-                let mut entity_type_normalized: Vec<Value> = Vec::new();
-                let mut entities: Vec<Value> = Vec::new();
-                for (idx, write) in writes.into_iter().enumerate() {
-                    results.push(json!({
-                        "index": idx,
-                        "ok": true,
-                        "result": write.ok_result(verbose)?,
-                    }));
-                    if let BulkWrite::Entity {
-                        entity, normalized, ..
-                    } = write
-                    {
-                        if let Some(mut applied) = normalized {
-                            if let Some(obj) = applied.as_object_mut() {
-                                obj.insert("index".to_string(), json!(idx));
-                            }
-                            entity_type_normalized.push(applied);
-                        }
-                        if verbose {
-                            entities.push(
-                                serde_json::to_value(&entity)
-                                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?,
-                            );
-                        }
-                    }
-                }
-                let created = results.len();
-                let mut resp = json!({
-                    "attempted": attempted,
-                    "created": created,
-                    "skipped": 0,
-                    "failed": 0,
-                    "results": results,
-                });
-                if !entity_type_normalized.is_empty() {
-                    resp["entity_type_normalized"] = Value::Array(entity_type_normalized);
-                }
-                if verbose && !entities.is_empty() {
-                    resp["entities"] = Value::Array(entities);
-                }
-                to_json(&resp)
-            }
-            Ok(AtomicRunOutcome::RolledBack {
-                failed_op_index,
-                failure,
-            }) => Err(RuntimeError::Internal(format!(
-                "create: atomic bulk batch rolled back at item index {failed_op_index}: {failure:?}"
-            ))),
-            Err(e) => Err(RuntimeError::Internal(format!(
-                "create: atomic bulk batch failed: {}",
-                e.0
-            ))),
+        let answers = self
+            .commit_keyed_bulk(token, registry, verbose, &items)
+            .await
+            .map_err(keyed_bulk::KeyedBulkFailure::into_atomic_error)?;
+        let mut results = Vec::with_capacity(answers.len());
+        let mut entity_type_normalized: Vec<Value> = Vec::new();
+        let mut entities: Vec<Value> = Vec::new();
+        let (mut created, mut updated) = (0usize, 0usize);
+        for (idx, answer) in answers.into_iter().enumerate() {
+            created += usize::from(answer.created);
+            updated += usize::from(answer.updated);
+            push_bulk_answer(
+                idx,
+                answer,
+                &mut results,
+                &mut entity_type_normalized,
+                &mut entities,
+            );
         }
+        let mut resp = json!({
+            "attempted": attempted,
+            "created": created,
+            "skipped": 0,
+            "failed": 0,
+            "results": results,
+        });
+        if updated > 0 {
+            resp["updated"] = json!(updated);
+        }
+        if !entity_type_normalized.is_empty() {
+            resp["entity_type_normalized"] = Value::Array(entity_type_normalized);
+        }
+        if verbose && !entities.is_empty() {
+            resp["entities"] = Value::Array(entities);
+        }
+        to_json(&resp)
     }
 
     /// One `atomic: false` item's own commit: admission (kind, secret gate,
@@ -790,7 +798,9 @@ impl KgPack {
                 prepared,
                 normalized,
             } => {
-                let PreparedBulkEntity { spec, args, hook } = prepared;
+                let PreparedBulkEntity {
+                    spec, args, hook, ..
+                } = prepared;
                 let (entity, plan) = self
                     .runtime
                     .prepare_bulk_entity_plan(token, spec)
@@ -840,9 +850,13 @@ impl KgPack {
     /// admitted and committed independently, in index order. A failure at
     /// any stage is that item's own indexed `results` entry and never
     /// blocks a valid sibling item.
+    ///
+    /// A keyed entity item is judged alone against the store, after every
+    /// earlier item committed, so the request is judged in item order.
     async fn commit_bulk_best_effort(
         &self,
         token: &NamespaceToken,
+        registry: &VerbRegistry,
         attempted: usize,
         verbose: bool,
         prepared: Vec<Result<PreparedBulkItem, RuntimeError>>,
@@ -852,34 +866,42 @@ impl KgPack {
         let mut entity_type_normalized: Vec<Value> = Vec::new();
         let mut entities: Vec<Value> = Vec::new();
         let mut created = 0usize;
+        let mut updated = 0usize;
 
         for (idx, item) in prepared.into_iter().enumerate() {
-            match self.commit_bulk_item(token, item).await {
-                Ok(write) => {
-                    created += 1;
-                    results.push(json!({
-                        "index": idx,
-                        "ok": true,
-                        "result": write.ok_result(verbose)?,
-                    }));
-                    if let BulkWrite::Entity {
-                        entity, normalized, ..
-                    } = &write
+            let outcome = match item {
+                Ok(item) if item.is_keyed() => {
+                    match self
+                        .commit_keyed_bulk(token, registry, verbose, std::slice::from_ref(&item))
+                        .await
                     {
-                        if let Some(applied) = normalized {
-                            let mut applied = applied.clone();
-                            if let Some(obj) = applied.as_object_mut() {
-                                obj.insert("index".to_string(), json!(idx));
-                            }
-                            entity_type_normalized.push(applied);
-                        }
-                        if verbose {
-                            entities.push(
-                                serde_json::to_value(entity)
-                                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?,
-                            );
-                        }
+                        Ok(mut answers) => answers.pop().ok_or_else(|| {
+                            (
+                                RuntimeError::Internal(
+                                    "create: keyed bulk item answered nothing".into(),
+                                ),
+                                DomainDisposition::Unknown,
+                            )
+                        }),
+                        Err(failure) => Err(failure.into_item_error()),
                     }
+                }
+                item => match self.commit_bulk_item(token, item).await {
+                    Ok(write) => Ok(ItemAnswer::of_write(&write, verbose)?),
+                    Err(failure) => Err(failure),
+                },
+            };
+            match outcome {
+                Ok(answer) => {
+                    created += usize::from(answer.created);
+                    updated += usize::from(answer.updated);
+                    push_bulk_answer(
+                        idx,
+                        answer,
+                        &mut results,
+                        &mut entity_type_normalized,
+                        &mut entities,
+                    );
                 }
                 Err((error, disposition)) => {
                     // `errors[].error` keeps its existing string form; the
@@ -906,6 +928,9 @@ impl KgPack {
             "errors": error_list,
             "results": results,
         });
+        if updated > 0 {
+            resp["updated"] = json!(updated);
+        }
         if !entity_type_normalized.is_empty() {
             resp["entity_type_normalized"] = Value::Array(entity_type_normalized);
         }
@@ -977,12 +1002,12 @@ impl KgPack {
                 .any(|field| params.get(*field).is_some())
             {
                 return Err(RuntimeError::InvalidInput(
-                    "key, embed and fence apply only to singleton notes".into(),
+                    "a top-level key, embed or fence does not apply to a bulk create; an entity item carries its own key".into(),
                 ));
             }
             if params.get("on_key").is_some() {
                 return Err(RuntimeError::InvalidInput(
-                    "on_key applies only to a singleton keyed entity create".into(),
+                    "a top-level on_key does not apply to a bulk create; set it on each entity item".into(),
                 ));
             }
             if params.get("embedding_content").is_some() {
@@ -1046,10 +1071,10 @@ impl KgPack {
             }
 
             return if atomic {
-                self.commit_bulk_atomic(token, attempted, verbose, prepared)
+                self.commit_bulk_atomic(token, registry, attempted, verbose, prepared)
                     .await
             } else {
-                self.commit_bulk_best_effort(token, attempted, verbose, prepared)
+                self.commit_bulk_best_effort(token, registry, attempted, verbose, prepared)
                     .await
             };
         }

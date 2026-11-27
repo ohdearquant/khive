@@ -910,6 +910,7 @@ pub(super) async fn prepare_update_entity_plan_with_version_and_type(
         token,
         id,
         patch,
+        &[],
         expected_version,
         required_entity_type,
     )
@@ -934,7 +935,33 @@ pub(crate) async fn prepare_update_entity_record(
         token,
         id,
         patch,
+        &[],
         expected_version,
+        None,
+    )
+    .await
+}
+
+/// The update a keyed reload joins to a bulk create's unit (ADR-221
+/// section 1): `patch` applied, then the caller property keys in
+/// `remove_properties` dropped, bound to `expected_version` so a holder that
+/// changed since it was read rolls the unit back. The returned record's
+/// version is the captured one; applying the plan advances it once.
+pub(crate) async fn prepare_keyed_reload_entity_record(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    patch: crate::curation::EntityPatch,
+    remove_properties: &[&str],
+    expected_version: i64,
+) -> RuntimeResult<(khive_storage::Entity, AtomicOpPlan)> {
+    prepare_update_entity_record_with_version_and_type(
+        runtime,
+        token,
+        id,
+        patch,
+        remove_properties,
+        Some(expected_version),
         None,
     )
     .await
@@ -945,13 +972,16 @@ async fn prepare_update_entity_record_with_version_and_type(
     token: &NamespaceToken,
     id: Uuid,
     patch: crate::curation::EntityPatch,
+    remove_properties: &[&str],
     expected_version: Option<i64>,
     required_entity_type: Option<&str>,
 ) -> RuntimeResult<(khive_storage::Entity, AtomicOpPlan)> {
     crate::entity_write::validate_expected_version(expected_version)?;
     let explicit_entity_type_patch = patch.entity_type.is_some();
     let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
-        runtime.prepare_update_entity(token, id, patch).await?;
+        runtime
+            .prepare_update_entity(token, id, patch, remove_properties)
+            .await?;
     if required_entity_type.is_some_and(|expected| {
         (explicit_entity_type_patch || entity.entity_type.is_some())
             && entity.entity_type.as_deref() != Some(expected)

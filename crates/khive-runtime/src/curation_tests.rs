@@ -1948,6 +1948,7 @@ async fn update_entity_type_patch_validates_preserves_fields_and_requires_reinde
                 entity_type: Some(Some(" Algorithm ".to_string())),
                 ..Default::default()
             },
+            &[],
         )
         .await
         .expect("registered entity_type must validate");
@@ -1974,6 +1975,7 @@ async fn update_entity_type_patch_validates_preserves_fields_and_requires_reinde
                 entity_type: Some(Some("not_registered".to_string())),
                 ..Default::default()
             },
+            &[],
         )
         .await
         .expect_err("unregistered entity_type must be rejected");
@@ -2055,6 +2057,7 @@ async fn concurrent_entity_property_patches_from_one_revision_only_one_survives(
                     properties: Some(serde_json::json!({"a": 1})),
                     ..Default::default()
                 },
+                &[],
             )
             .await
         })
@@ -2072,6 +2075,7 @@ async fn concurrent_entity_property_patches_from_one_revision_only_one_survives(
                     properties: Some(serde_json::json!({"b": 1})),
                     ..Default::default()
                 },
+                &[],
             )
             .await
         })
@@ -2258,6 +2262,7 @@ async fn entity_cas_refuses_a_replacement_revision_that_does_not_advance() {
                 properties: Some(serde_json::json!({"a": 1})),
                 ..Default::default()
             },
+            &[],
         )
         .await
         .expect("prepare update");
@@ -2343,6 +2348,7 @@ async fn entity_cas_refuses_a_stale_replacement_that_would_resurrect_a_tombstone
                 properties: Some(serde_json::json!({"a": 1})),
                 ..Default::default()
             },
+            &[],
         )
         .await
         .expect("prepare update");

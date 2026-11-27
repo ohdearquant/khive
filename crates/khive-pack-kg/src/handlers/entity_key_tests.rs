@@ -561,7 +561,7 @@ async fn on_key_shape_refusals_hold_whether_or_not_the_key_is_held() {
             (on_key_create("N", json!({"embed": true})), "embed"),
             (
                 json!({"items": [{"kind": "concept", "name": "N"}], "on_key": "update"}),
-                "singleton keyed entity create",
+                "set it on each entity item",
             ),
         ];
         for (args, expected) in cases {
@@ -587,4 +587,375 @@ async fn on_key_shape_refusals_hold_whether_or_not_the_key_is_held() {
             assert_eq!(holder["name"], json!("Smith 2024"), "{holder}");
         }
     }
+}
+
+fn bulk(items: Vec<Value>, atomic: bool) -> Value {
+    json!({"items": items, "atomic": atomic})
+}
+
+fn keyed_item(name: &str, key: &str) -> Value {
+    json!({"kind": "concept", "name": name, "key": key})
+}
+
+fn on_key_item(name: &str, key: &str) -> Value {
+    let mut item = keyed_item(name, key);
+    item["on_key"] = json!("update");
+    item
+}
+
+async fn key_holder(registry: &khive_runtime::VerbRegistry, key: &str) -> Option<Value> {
+    registry
+        .dispatch("get", json!({"kind": "concept", "key": key}))
+        .await
+        .ok()
+}
+
+#[tokio::test]
+async fn bulk_items_under_one_key_are_judged_against_the_earlier_item() {
+    let (_rt, _token, _pack, registry) = configured().await;
+    let same = registry
+        .dispatch(
+            "create",
+            bulk(
+                vec![keyed_item("Smith 2024", "k"), keyed_item("Smith 2024", "k")],
+                true,
+            ),
+        )
+        .await
+        .expect("two identical keyed items");
+    let (first, second) = (&same["results"][0]["result"], &same["results"][1]["result"]);
+    assert_eq!(first["created"], json!(true), "{same}");
+    assert_eq!(second["created"], json!(false), "{same}");
+    assert_eq!(second["id"], first["id"], "{same}");
+    assert_eq!(same["created"], json!(1), "{same}");
+    assert!(same.get("updated").is_none(), "{same}");
+    assert_eq!(concept_count(&registry).await, 1);
+
+    let error = registry
+        .dispatch(
+            "create",
+            bulk(
+                vec![
+                    keyed_item("Jones 2025", "j"),
+                    keyed_item("Someone else", "j"),
+                ],
+                true,
+            ),
+        )
+        .await
+        .expect_err("a differing second item under the same key");
+    assert_eq!(
+        details(&error),
+        (Some("key_conflict".to_owned()), None),
+        "the earlier item's row is never written, so no id is named"
+    );
+    assert_eq!(concept_count(&registry).await, 1);
+    assert!(key_holder(&registry, "j").await.is_none());
+}
+
+#[tokio::test]
+async fn bulk_on_key_rewrites_the_row_an_earlier_item_creates() {
+    let (_rt, _token, _pack, registry) = configured().await;
+    let mut first = keyed_item("Smith 2024", "k");
+    first["properties"] = json!({"a": 1});
+    let mut second = on_key_item("Smith et al. 2024", "k");
+    second["properties"] = json!({"b": 2});
+    let response = registry
+        .dispatch("create", bulk(vec![first, second], true))
+        .await
+        .expect("a later item rewrites the earlier item's row");
+    let (a, b) = (
+        &response["results"][0]["result"],
+        &response["results"][1]["result"],
+    );
+    assert_eq!(a["created"], json!(true), "{response}");
+    assert_eq!(b["created"], json!(false), "{response}");
+    assert_eq!(b["updated"], json!(true), "{response}");
+    assert_eq!(
+        a["id"], b["id"],
+        "both items answer for one row: {response}"
+    );
+    assert_eq!(response["created"], json!(1), "{response}");
+    assert_eq!(response["updated"], json!(1), "{response}");
+    let holder = key_holder(&registry, "k")
+        .await
+        .expect("the key names the row");
+    assert_eq!(holder["id"], a["id"], "{holder}");
+    assert_eq!(holder["name"], json!("Smith et al. 2024"), "{holder}");
+    assert_eq!(holder["properties"], json!({"b": 2}), "{holder}");
+    assert_eq!(concept_count(&registry).await, 1);
+}
+
+#[tokio::test]
+async fn bulk_on_key_updates_a_stored_holder_in_the_unit() {
+    let (_rt, _token, _pack, registry) = configured().await;
+    let mut stored = keyed_create("Smith 2024");
+    stored["properties"] = json!({"a": 1});
+    stored["tags"] = json!(["x"]);
+    let created = registry
+        .dispatch("create", stored)
+        .await
+        .expect("keyed create");
+    let before = key_holder(&registry, "paper:smith2024")
+        .await
+        .expect("holder");
+
+    let response = registry
+        .dispatch(
+            "create",
+            bulk(
+                vec![
+                    on_key_item("Smith et al. 2024", "paper:smith2024"),
+                    json!({"kind": "concept", "name": "Unkeyed"}),
+                ],
+                true,
+            ),
+        )
+        .await
+        .expect("the stored holder is reloaded in the unit");
+    let reload = &response["results"][0]["result"];
+    assert_eq!(reload["id"], created["id"], "{response}");
+    assert_eq!(reload["created"], json!(false), "{response}");
+    assert_eq!(reload["updated"], json!(true), "{response}");
+    assert!(reload.get("reindex_error").is_none(), "{response}");
+    assert_eq!(response["created"], json!(1), "{response}");
+    assert_eq!(response["updated"], json!(1), "{response}");
+    let after = key_holder(&registry, "paper:smith2024")
+        .await
+        .expect("holder");
+    assert_eq!(after["name"], json!("Smith et al. 2024"), "{after}");
+    assert!(
+        after["properties"].get("a").is_none(),
+        "an omitted property is cleared: {after}"
+    );
+    assert!(
+        after["tags"].as_array().is_none_or(Vec::is_empty),
+        "omitted tags are cleared: {after}"
+    );
+    assert_eq!(
+        after["version"].as_i64(),
+        before["version"].as_i64().map(|version| version + 1),
+        "{after}"
+    );
+    assert_eq!(concept_count(&registry).await, 2);
+
+    let replay = registry
+        .dispatch(
+            "create",
+            bulk(
+                vec![on_key_item("Smith et al. 2024", "paper:smith2024")],
+                true,
+            ),
+        )
+        .await
+        .expect("an identical reload writes nothing");
+    let replayed = &replay["results"][0]["result"];
+    assert_eq!(replayed["created"], json!(false), "{replay}");
+    assert!(replayed.get("updated").is_none(), "{replay}");
+    assert!(replay.get("updated").is_none(), "{replay}");
+    let again = key_holder(&registry, "paper:smith2024")
+        .await
+        .expect("holder");
+    assert_eq!(again["version"], after["version"], "{again}");
+}
+
+#[tokio::test]
+async fn a_bulk_reload_reindexes_the_holder_text() {
+    let (_rt, _token, _pack, registry) = configured().await;
+    let created = registry
+        .dispatch("create", keyed_create("Smith 2024"))
+        .await
+        .expect("keyed create");
+    registry
+        .dispatch(
+            "create",
+            bulk(
+                vec![on_key_item("Zebrafish atlas", "paper:smith2024")],
+                true,
+            ),
+        )
+        .await
+        .expect("bulk reload");
+    let found = |hits: &Value| -> Vec<Value> {
+        hits.as_array()
+            .expect("search rows")
+            .iter()
+            .map(|row| row["id"].clone())
+            .collect()
+    };
+    let new_name = registry
+        .dispatch(
+            "search",
+            json!({"kind": "entity", "query": "zebrafish", "limit": 10}),
+        )
+        .await
+        .expect("search by the new name");
+    assert_eq!(found(&new_name), vec![created["id"].clone()], "{new_name}");
+    let old_name = registry
+        .dispatch(
+            "search",
+            json!({"kind": "entity", "query": "smith", "limit": 10}),
+        )
+        .await
+        .expect("search by the old name");
+    assert!(found(&old_name).is_empty(), "{old_name}");
+}
+
+#[tokio::test]
+async fn bulk_on_key_needs_update_permission_for_a_stored_or_earlier_holder() {
+    let (_rt, _token, _pack, registry) = gated(std::sync::Arc::new(DenyUpdate));
+    let created = registry
+        .dispatch("create", keyed_create("Smith 2024"))
+        .await
+        .expect("keyed create");
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let error = registry
+        .dispatch(
+            "create",
+            bulk(vec![on_key_item("Someone else", "paper:smith2024")], true),
+        )
+        .await
+        .expect_err("a stored holder the caller may not update");
+    assert_eq!(
+        details(&error),
+        (Some("key_conflict".to_owned()), Some(id.clone()))
+    );
+    let holder = key_holder(&registry, "paper:smith2024")
+        .await
+        .expect("holder");
+    assert_eq!(holder["name"], json!("Smith 2024"), "{holder}");
+
+    let replay = registry
+        .dispatch(
+            "create",
+            bulk(vec![on_key_item("Smith 2024", "paper:smith2024")], true),
+        )
+        .await
+        .expect("an identical item needs no update permission");
+    assert_eq!(replay["results"][0]["result"]["id"], json!(id), "{replay}");
+
+    let error = registry
+        .dispatch(
+            "create",
+            bulk(
+                vec![
+                    keyed_item("Jones 2025", "j"),
+                    on_key_item("Jones et al. 2025", "j"),
+                ],
+                true,
+            ),
+        )
+        .await
+        .expect_err("an earlier item's row the caller may not update");
+    assert_eq!(details(&error), (Some("key_conflict".to_owned()), None));
+    assert!(key_holder(&registry, "j").await.is_none());
+    assert_eq!(concept_count(&registry).await, 1);
+}
+
+#[tokio::test]
+async fn an_atomic_bulk_whose_later_item_fails_leaves_no_key_row() {
+    let (_rt, _token, _pack, registry) = configured().await;
+    registry
+        .dispatch("create", keyed_create("Smith 2024"))
+        .await
+        .expect("keyed create");
+    let error = registry
+        .dispatch(
+            "create",
+            bulk(
+                vec![
+                    keyed_item("Fresh", "fresh"),
+                    keyed_item("Someone else", "paper:smith2024"),
+                ],
+                true,
+            ),
+        )
+        .await
+        .expect_err("the later item conflicts");
+    assert_eq!(details(&error).0, Some("key_conflict".to_owned()));
+    assert!(key_holder(&registry, "fresh").await.is_none());
+    let retaken = registry
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Other", "key": "fresh", "skip_dedup_check": true}),
+        )
+        .await
+        .expect("the earlier item never claimed the key");
+    assert_eq!(retaken["created"], json!(true), "{retaken}");
+    assert_eq!(concept_count(&registry).await, 2);
+}
+
+#[tokio::test]
+async fn best_effort_bulk_judges_each_keyed_item_after_the_one_before() {
+    let (_rt, _token, _pack, registry) = configured().await;
+    let response = registry
+        .dispatch(
+            "create",
+            bulk(
+                vec![
+                    keyed_item("Smith 2024", "k"),
+                    keyed_item("Someone else", "k"),
+                    keyed_item("Smith 2024", "k"),
+                    on_key_item("Smith et al. 2024", "k"),
+                    json!({"kind": "note", "content": "c", "key": "k"}),
+                ],
+                false,
+            ),
+        )
+        .await
+        .expect("best-effort bulk");
+    let result = |index: usize| response["results"][index].clone();
+    let id = result(0)["result"]["id"].clone();
+    assert_eq!(result(0)["result"]["created"], json!(true), "{response}");
+    assert_eq!(result(1)["ok"], json!(false), "{response}");
+    assert!(
+        result(1)["error"].to_string().contains("key_conflict"),
+        "{response}"
+    );
+    assert_eq!(result(2)["result"]["created"], json!(false), "{response}");
+    assert_eq!(result(2)["result"]["id"], id, "{response}");
+    assert_eq!(result(3)["result"]["updated"], json!(true), "{response}");
+    assert_eq!(result(3)["result"]["id"], id, "{response}");
+    assert_eq!(result(4)["ok"], json!(false), "{response}");
+    assert!(
+        result(4)["error"].to_string().contains("entity items"),
+        "{response}"
+    );
+    assert_eq!(response["created"], json!(1), "{response}");
+    assert_eq!(response["updated"], json!(1), "{response}");
+    assert_eq!(response["failed"], json!(2), "{response}");
+    let holder = key_holder(&registry, "k").await.expect("holder");
+    assert_eq!(holder["name"], json!("Smith et al. 2024"), "{holder}");
+}
+
+#[tokio::test]
+async fn bulk_item_key_shape_refusals_write_nothing() {
+    let (_rt, _token, _pack, registry) = configured().await;
+    let mut no_key = json!({"kind": "concept", "name": "N", "on_key": "update"});
+    let mut replace = on_key_item("N", "k");
+    replace["on_key"] = json!("replace");
+    for (item, expected) in [
+        (
+            json!({"kind": "note", "content": "c", "key": "k"}),
+            "entity items",
+        ),
+        (no_key.take(), "keyed entity item"),
+        (replace, "accepts only"),
+    ] {
+        let error = registry
+            .dispatch(
+                "create",
+                bulk(vec![keyed_item("Fresh", "fresh"), item.clone()], true),
+            )
+            .await
+            .expect_err("a malformed keyed item");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(_)),
+            "{item}: {error:?}"
+        );
+        assert!(format!("{error}").contains(expected), "{item}: {error}");
+    }
+    assert_eq!(concept_count(&registry).await, 0);
+    assert!(key_holder(&registry, "fresh").await.is_none());
 }

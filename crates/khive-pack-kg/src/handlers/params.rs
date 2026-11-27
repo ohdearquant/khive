@@ -31,6 +31,9 @@ pub(crate) struct BulkCreateEntry {
     pub(crate) entity_kind: Option<String>,
     pub(crate) entity_type: Option<String>,
     pub(crate) description: Option<String>,
+    // entity-only: the item's caller key and `on_key` (ADR-221 section 1)
+    pub(crate) key: Option<String>,
+    pub(crate) on_key: Option<String>,
     // note-only
     pub(crate) content: Option<String>,
     pub(crate) note_kind: Option<String>,

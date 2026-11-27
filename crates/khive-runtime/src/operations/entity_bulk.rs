@@ -1,10 +1,12 @@
 //! Prepared entity bulk construction.
 
+use super::entity_keys::{validate_entity_key, PendingEntityId};
 use super::*;
 use crate::secret_gate_finalizer::entity_admission::{
     prepare_entity_admission_at, EntityAdmission, EntityEntryPoint,
 };
 use crate::EntityCandidateMutation;
+use khive_db::stores::entity::entity_key_claim_statement;
 
 impl KhiveRuntime {
     /// Create a batch of entities atomically.
@@ -68,7 +70,12 @@ impl KhiveRuntime {
         for (index, admission) in admissions.into_iter().enumerate() {
             has_finalizer |= matches!(&admission, EntityAdmission::Exempt(_));
             let (entity, plan) = self
-                .finish_bulk_entity_plan(token, admission, injected_failure_index == Some(index))
+                .finish_bulk_entity_plan(
+                    token,
+                    admission,
+                    injected_failure_index == Some(index),
+                    None,
+                )
                 .await?;
             entities.push(entity);
             plans.push(plan);
@@ -138,7 +145,42 @@ impl KhiveRuntime {
             prepare_entity_admission_at(token, EntityEntryPoint::Bulk, entity, "entity")?;
         let _ = self.entities(token)?;
         let _ = self.text(token)?;
-        self.finish_bulk_entity_plan(token, admission, false).await
+        self.finish_bulk_entity_plan(token, admission, false, None)
+            .await
+    }
+
+    /// [`Self::prepare_bulk_entity_plan`] for a bulk item under caller key
+    /// `key` (ADR-221 section 1). The row takes the id `id` names, and the
+    /// plan claims the key for it first under an exactly-one guard, so a key
+    /// another writer took after the caller read it rolls the whole unit
+    /// back. The key is validated and secret-gated before anything else.
+    pub async fn prepare_keyed_bulk_entity_plan(
+        &self,
+        token: &NamespaceToken,
+        spec: EntityCreateSpec,
+        key: &str,
+        id: PendingEntityId,
+    ) -> RuntimeResult<(Entity, AtomicOpPlan)> {
+        validate_entity_key(key)?;
+        let ns = token.namespace().as_str();
+        let mut entity = self.validate_bulk_entity(ns, &spec)?;
+        entity.id = id.0;
+        let claim = PlanStatement {
+            statement: entity_key_claim_statement(
+                ns,
+                &entity.kind,
+                key,
+                entity.id,
+                entity.created_at,
+            ),
+            guard: Some(AffectedRowGuard::exactly(1)),
+        };
+        let admission =
+            prepare_entity_admission_at(token, EntityEntryPoint::Bulk, entity, "entity")?;
+        let _ = self.entities(token)?;
+        let _ = self.text(token)?;
+        self.finish_bulk_entity_plan(token, admission, false, Some(claim))
+            .await
     }
 
     async fn finish_bulk_entity_plan(
@@ -146,6 +188,7 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         admission: EntityAdmission,
         inject_fts_failure: bool,
+        key_claim: Option<PlanStatement>,
     ) -> RuntimeResult<(Entity, AtomicOpPlan)> {
         match admission {
             EntityAdmission::Legacy(entity) => {
@@ -153,6 +196,9 @@ impl KhiveRuntime {
                 if inject_fts_failure {
                     plan.statements.truncate(1);
                     plan.statements.push(bulk_fts_failure());
+                }
+                if let Some(claim) = key_claim {
+                    plan.statements.insert(0, claim);
                 }
                 Ok((entity, AtomicOpPlan::AddEntity(plan)))
             }
@@ -163,6 +209,9 @@ impl KhiveRuntime {
                     .await?;
                 if inject_fts_failure {
                     required = vec![bulk_fts_failure()];
+                }
+                if let Some(claim) = key_claim {
+                    required.insert(0, claim);
                 }
                 let plan = prepared.into_plan(
                     EntityCandidateMutation::CreateIfAbsent,
