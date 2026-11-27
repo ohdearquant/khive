@@ -118,6 +118,12 @@ effect of listing backends.
 metadata and data live in one file, unlike `kg fetch`'s cache (which writes a separate `meta.json`
 sidecar; see below). Export always includes edges; there is no entities-only mode.
 
+Each entity record carries `keys`, the keys it holds as plain strings under its own kind, and
+`aliases`, each with its `origin`; both are omitted when empty (ADR-221 section 4). Import adds them
+to an entity that is already stored and removes none. A key that another live entity holds refuses
+the import with `import_key_conflict`; under `--on-conflict skip` that entity is skipped instead
+and counted in `entities_key_conflict_skipped`.
+
 ```bash
 kkernel kg export /tmp/my-namespace.khive-kg.json --db ~/.khive/khive.db --namespace my-project
 kkernel kg import /tmp/my-namespace.khive-kg.json --db /path/to/target.db --namespace my-project

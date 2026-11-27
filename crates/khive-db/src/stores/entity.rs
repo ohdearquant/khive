@@ -270,6 +270,12 @@ pub const ENTITY_HELD_KEYS_SQL: &str = "SELECT kind, key FROM entity_keys \
 pub const ENTITY_KEY_HOLDER_SQL: &str = "SELECT entity_id FROM entity_keys \
      WHERE namespace = ?1 AND kind = ?2 AND key = ?3 AND released_at IS NULL";
 
+/// Every key row of one namespace, held or released, as
+/// `(entity_id, kind, key, released_at)` rows ordered by entity, kind and key.
+/// Parameter: `?1` namespace.
+pub const NAMESPACE_KEY_ROWS_SQL: &str = "SELECT entity_id, kind, key, released_at \
+     FROM entity_keys WHERE namespace = ?1 ORDER BY entity_id, kind, key";
+
 /// Hand a held key of `from_id` to `into_id` under `into_kind`, as a merge does
 /// before it tombstones `from_id`: the tombstone releases every key its row
 /// still holds (ADR-221 section 3). Affects one row while the key is held.

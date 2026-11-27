@@ -1235,6 +1235,8 @@ async fn run_sync_remote_cannot_be_constructed_with_invalid_name() {
 
 fn sample_entity(id: &str, name: &str) -> NdjsonEntity {
     NdjsonEntity {
+        keys: Vec::new(),
+        aliases: Vec::new(),
         id: id.parse().unwrap(),
         kind: "concept".to_string(),
         entity_type: None,

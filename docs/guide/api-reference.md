@@ -575,7 +575,7 @@ request(ops="stats()")
 ### `update` — Declaration
 
 Patch entity, note, or edge fields. Field set depends on substrate: entities accept
-`name`/`description`/`properties`/`tags`/`add_aliases`/`remove_aliases`; notes accept
+`name`/`description`/`properties`/`tags`/`add_aliases`/`remove_aliases`/`keep_old_name`; notes accept
 `name`/`content`/`salience`/`decay_factor`/`properties`/`tags`; edges accept
 `relation`/`weight`/`properties`.
 
@@ -597,6 +597,7 @@ singleton `create`; a successful response includes `warnings` when embedding act
 | `tags`           | array\<string\> | no       | Entities and notes: replaces the tag list; omission preserves it, `[]` clears it. |
 | `add_aliases`    | array\<string\> | no       | Entities only: aliases to add, as a set.                                          |
 | `remove_aliases` | array\<string\> | no       | Entities only: caller aliases to remove.                                          |
+| `keep_old_name`  | bool            | no       | Entities only, default true: keep the old name as a `rename` alias.               |
 
 Note tags remain stored and returned in `properties.tags`. Updating that property directly
 also replaces the list. When a request supplies both `tags` and `properties.tags`, top-level
@@ -609,6 +610,12 @@ listed in `aliases_not_stored`. `remove_aliases` removes caller aliases only: an
 remove, a rename or merge alias included, is listed in `aliases_not_removed`, which is not an
 error. One alias in both lists is refused. An update that renames an entity to one of its caller
 aliases removes that alias. A change to the aliases reindexes the entity.
+
+An entity update that changes the name keeps the old name as an alias of origin `rename`, so
+`resolve` still finds the entity by it. `keep_old_name=false` stores no alias, as a split that
+hands the old name to another entity needs. Either way an alias the entity holds equal to the new
+name is removed whatever its origin, and the `entity_updated` event names `previous_name` and
+`name`.
 
 An unfenced note update whose normalized patch equals the stored value is a no-op: the stored row
 comes back with `unchanged: true`, and `version` and `updated_at` do not move. A note update that
@@ -644,7 +651,8 @@ stale search entry; use the returned id to reconcile it instead of repeating the
 
 Deduplicate two entities or notes. Returns `{kept_id, removed_id, edges_rewired,
 edges_contract_skipped, edge_conflict_preimages, properties_merged,
-tags_unioned, content_appended, dry_run}` — chain with `$prev.kept_id`, **not**
+tags_unioned, content_appended, dry_run, aliases_added, keys_moved, keys_rewritten,
+keys_already_held, key_conflicts}` — chain with `$prev.kept_id`, **not**
 `$prev.id` (merge has no top-level `id` field). When rewiring collides with an
 existing edge natural key, `edge_conflict_preimages` records the surviving edge
 id, the complete dropped edge, and any incident annotation edges removed by the
@@ -660,6 +668,18 @@ that fails it is refused with a conflict error naming the check in
 `{dry_run: true, would_merge: false, refused_by, compared, into_value,
 from_value, detail}` — so a dry run predicts the floor rather than failing on
 it. Every `dry_run` response carries `would_merge`.
+
+An entity merge also carries names and keys to the kept entity; on a note merge these fields are
+empty. `aliases_added` lists the names added as `merge` aliases: the merged-away entity's name and
+aliases, and the kept entity's previous name when the merge takes the other name. No alias equal
+to the kept name is stored. `keys_moved` lists each key moved to the kept entity as
+`{kind, key, from_kind}`, and `keys_rewritten` counts those whose kind changed, which only a forced
+merge of two kinds does. `keys_already_held` lists the `{kind, key}` pairs the kept entity already
+held; their rows on the merged-away entity are dropped. A key that another live entity holds under
+the kept entity's kind refuses the merge with a conflict error naming `merge_key_conflict` in
+`details.reason` and the keys in `details.conflicting_keys`, each with `existing_id` only when the
+caller may list that entity, and nothing is written. Under `dry_run=true` the same keys come back
+in `key_conflicts`, with `would_merge: false` and `refused_by: "merge_key_conflict"`.
 
 | Param     | Type | Required | Notes                                                                        |
 | --------- | ---- | -------- | ---------------------------------------------------------------------------- |

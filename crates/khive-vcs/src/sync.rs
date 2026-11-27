@@ -16,6 +16,7 @@ use chrono::Utc;
 use khive_runtime::pack::{PackRegistry, VerbRegistryBuilder};
 use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
 use khive_runtime::{entity_fts_document, KhiveRuntime, RuntimeConfig};
+use khive_storage::entity::EntityAlias;
 use khive_storage::types::Edge;
 use khive_storage::LinkId;
 use khive_types::{EdgeRelation, Pack};
@@ -41,6 +42,10 @@ mod remote_snapshot_identity_tests;
 #[path = "ndjson_export_tests.rs"]
 mod ndjson_export_tests;
 
+#[cfg(test)]
+#[path = "sync_names_tests.rs"]
+mod sync_names_tests;
+
 /// Per-record entity shape in NDJSON sources.
 #[derive(Debug, Serialize, Deserialize)]
 struct NdjsonEntity {
@@ -55,6 +60,10 @@ struct NdjsonEntity {
     properties: Option<serde_json::Value>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    aliases: Vec<EntityAlias>,
     #[serde(default)]
     created_at: Option<String>,
     #[serde(default)]
@@ -155,8 +164,17 @@ impl Serialize for ExportNdjsonEntity<'_> {
         let record = self.0;
         let mut tags: Vec<_> = record.tags.iter().map(String::as_str).collect();
         tags.sort_unstable();
-        let mut map =
-            serializer.serialize_map(Some(if record.entity_type.is_some() { 9 } else { 8 }))?;
+        // ADR-221 section 4: keys and aliases follow tags, sorted, and are
+        // omitted when empty so a record without them is unchanged.
+        let mut keys: Vec<_> = record.keys.iter().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut aliases: Vec<_> = record.aliases.iter().collect();
+        aliases.sort_unstable();
+        let len = 8
+            + usize::from(record.entity_type.is_some())
+            + usize::from(!keys.is_empty())
+            + usize::from(!aliases.is_empty());
+        let mut map = serializer.serialize_map(Some(len))?;
         map.serialize_entry("id", &record.id)?;
         map.serialize_entry("kind", &record.kind)?;
         if let Some(entity_type) = &record.entity_type {
@@ -169,6 +187,12 @@ impl Serialize for ExportNdjsonEntity<'_> {
             &record.properties.as_ref().map(crate::hash::SortedValue),
         )?;
         map.serialize_entry("tags", &tags)?;
+        if !keys.is_empty() {
+            map.serialize_entry("keys", &keys)?;
+        }
+        if !aliases.is_empty() {
+            map.serialize_entry("aliases", &aliases)?;
+        }
         map.serialize_entry("created_at", &record.created_at.to_rfc3339())?;
         map.serialize_entry("updated_at", &record.updated_at.to_rfc3339())?;
         map.end()
@@ -1061,6 +1085,8 @@ fn build_kg_archive(
                 description: e.description.clone(),
                 properties: e.properties.clone(),
                 tags: e.tags.clone(),
+                keys: e.keys.clone(),
+                aliases: e.aliases.clone(),
                 created_at: parse_timestamp(e.created_at.as_deref(), now)
                     .with_context(|| format!("entity {} invalid created_at", e.id))?,
                 updated_at: parse_timestamp(e.updated_at.as_deref(), now)
@@ -1176,6 +1202,8 @@ fn validate_ndjson_records(entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> R
         if e.name.trim().is_empty() {
             bail!("entity {i} ({}): name must be a non-blank name", e.id);
         }
+        khive_runtime::portability::validate_entity_names(e.id, &e.name, &e.keys, &e.aliases)
+            .map_err(|error| anyhow!("entity {i} ({}): {error}", e.id))?;
 
         if !entity_ids.insert(e.id) {
             bail!("entity {i}: duplicate entity id {}", e.id);
@@ -1199,6 +1227,13 @@ fn validate_ndjson_records(entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> R
         }
         prev_entity_key = Some(key);
     }
+    // ADR-221 section 4: one key names one entity of its kind.
+    khive_runtime::portability::validate_archive_key_uniqueness(
+        entities
+            .iter()
+            .map(|e| (e.id, e.kind.as_str(), e.keys.as_slice())),
+    )
+    .map_err(|error| anyhow!("{error}"))?;
 
     let mut edge_ids: HashSet<Uuid> = HashSet::with_capacity(edges.len());
     let mut triples: HashSet<(Uuid, Uuid, EdgeRelation)> = HashSet::with_capacity(edges.len());
@@ -1796,17 +1831,23 @@ async fn upsert_entities(
     for chunk in records.chunks(SYNC_CHUNK_SIZE) {
         let mut entities_chunk = Vec::with_capacity(chunk.len());
         let mut docs_chunk = Vec::with_capacity(chunk.len());
+        let mut names_chunk = Vec::new();
         for r in chunk {
             let fallback = Utc::now();
             let created_at = parse_ts_micros(r.created_at.as_deref(), fallback)
                 .with_context(|| format!("entity {} invalid created_at", r.id))?;
             let updated_at = parse_ts_micros(r.updated_at.as_deref(), fallback)
                 .with_context(|| format!("entity {} invalid updated_at", r.id))?;
+            let mut aliases = r.aliases.clone();
+            aliases.sort();
             let entity = khive_storage::entity::Entity {
                 entity_type: r.entity_type.clone(),
                 description: r.description.clone(),
                 properties: r.properties.clone(),
                 tags: r.tags.clone(),
+                // The text document indexes the aliases the rebuilt store
+                // holds: exactly the snapshot's (ADR-221 section 4).
+                aliases,
                 ..khive_storage::entity::Entity::minimal(
                     r.id,
                     namespace,
@@ -1816,6 +1857,9 @@ async fn upsert_entities(
                     updated_at,
                 )
             };
+            if !r.keys.is_empty() || !r.aliases.is_empty() {
+                names_chunk.push((r.id, r.kind.clone(), r.keys.clone(), r.aliases.clone()));
+            }
             khive_runtime::secret_gate::reject_reserved_secret_gate_property(
                 entity.properties.as_ref(),
             )
@@ -1841,6 +1885,13 @@ async fn upsert_entities(
             ));
         }
         count += summary.affected as usize;
+
+        // Keys and aliases of the chunk's rows, in one transaction. The
+        // rebuilt store holds none before, so they end as the snapshot's.
+        runtime
+            .write_snapshot_entity_names(&token, names_chunk)
+            .await
+            .context("write entity keys and aliases")?;
 
         // FTS docs — one BEGIN IMMEDIATE / COMMIT per chunk.
         // Vectors are intentionally skipped: they are local-only derived state
@@ -2028,6 +2079,8 @@ async fn issue2673_sync_upserts_advance_destination_entity_version() {
     let id = Uuid::new_v4();
     for version in 1..=3 {
         let record = NdjsonEntity {
+            keys: Vec::new(),
+            aliases: Vec::new(),
             id,
             kind: "concept".into(),
             entity_type: None,
@@ -2058,6 +2111,8 @@ async fn direct_entity_upsert_refuses_reserved_properties_before_storage() {
     let token = runtime.authorize(khive_types::Namespace::local()).unwrap();
     let id = Uuid::new_v4();
     let record = NdjsonEntity {
+        keys: Vec::new(),
+        aliases: Vec::new(),
         id,
         kind: "concept".into(),
         entity_type: None,

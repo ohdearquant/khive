@@ -166,12 +166,30 @@ old name is not left as an alias on both and resolve stays unambiguous.
 A key or alias that a carrier drops is row 1 failing one hop later, so each carrier carries both:
 
 - **Portable archive.** `ExportedEntity` gains `keys` and `aliases` (with origin), omitted when
-  empty. Import writes them in the entity's transaction and applies the same key-conflict rules as
-  `create`.
+  empty. Keys are plain strings under the entity's own kind, sorted; aliases are sorted by alias.
+  Export refuses a store in which an entity holds a key under a kind other than its own. Import
+  writes them in the entity's transaction. A key another live entity holds refuses the import with
+  `import_key_conflict`, naming the key and the archive entity but not the holder; `skip` mode
+  skips that entity instead. Two entities of one archive that carry the same key under the same
+  kind refuse the archive before any write. A key whose only holder is deleted is free.
+  Importing an archive entity whose id is already stored, in `update` mode and in the plain import,
+  adds its keys and aliases: none is released or removed, and an alias equal to the resulting name
+  is not stored. An archive written before this change carries neither field, so an import that
+  replaced them would release every key and drop every alias of each entity it is imported over.
+  The plain import refuses an archive entity that would change the kind of a stored entity whose
+  rows hold keys.
 - **NDJSON snapshot and hash.** The NDJSON entity record gains the same two fields, omitted when
   empty, and both readers (`khive-vcs` sync and the `kkernel` archive reader) read them. The
   canonical hash serializes them only when non-empty, so a snapshot without keys or aliases keeps
-  its snapshot id.
+  its snapshot id. The snapshot is the whole hashed state, so snapshot sync sets keys and aliases
+  to exactly the snapshot's.
+- **Older binaries, a stated limit.** A binary built before this change reads a snapshot that
+  carries keys or aliases, drops both, and computes the snapshot id the record would have without
+  them. A pinned remote pull on that binary therefore refuses the snapshot as a hash mismatch, while
+  a local sync or an unpinned pull accepts it without its keys and aliases; a pin that binary
+  recorded for such a snapshot does not match on this one until it is re-pinned. The same binary
+  reads a portable archive that carries them and imports it without them. Nothing refuses these
+  cases.
 - **Three-way merge between stores.** Keys and aliases merge as sets per entity. A key that the
   merged result would place on two different entities is a typed conflict, never a silent winner.
 - **Change sets.** `EntityCreateFields` gains `key` and `aliases`; `EntityPatch` and
