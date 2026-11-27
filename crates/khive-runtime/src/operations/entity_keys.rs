@@ -38,6 +38,30 @@ pub enum KeyedEntityCreate {
     Conflict { existing_id: Uuid },
 }
 
+/// Outcome of [`KhiveRuntime::reload_keyed_entity`].
+#[derive(Debug)]
+pub enum KeyedEntityReload {
+    /// The holder now carries the request's payload.
+    Updated {
+        entity: Entity,
+        report: crate::curation::EntityUpdateReport,
+    },
+    /// The holder already carried the request's payload. Nothing was written.
+    Replayed { entity: Entity },
+    /// The key no longer names the entity the caller was cleared to update:
+    /// it was released, or another entity holds it now. Nothing was written.
+    Moved,
+}
+
+fn is_version_conflict(error: &RuntimeError) -> bool {
+    matches!(
+        error,
+        RuntimeError::Khive(error)
+            if error.details().and_then(|details| details.get("reason"))
+                == Some("version_conflict")
+    )
+}
+
 /// Validate a caller key and scan its exact bytes with the secret gate.
 ///
 /// Runs before any holder lookup, so a refused key never reaches a read.
@@ -251,6 +275,99 @@ impl KhiveRuntime {
                  {KEYED_CREATE_ATTEMPTS} claims"
             ))),
         }
+    }
+
+    /// A keyed create under `on_key: "update"` whose key `holder_id` holds
+    /// with a different payload (ADR-221 section 1).
+    ///
+    /// The holder's name, description, `entity_type`, tags and caller
+    /// properties become the request's: a field the request leaves out is
+    /// cleared, as the payload comparison reads it. The write is the
+    /// ordinary entity update, bound to the version this call compared, so a
+    /// holder that changed in between is read and compared again, and a
+    /// holder carrying a runtime-owned property key is refused as that
+    /// update refuses it: the key vouches for bytes this write would change.
+    /// The caller has already been cleared to update `holder_id`; if the key
+    /// no longer names it, nothing is written and the answer is
+    /// [`KeyedEntityReload::Moved`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reload_keyed_entity(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        key: &str,
+        holder_id: Uuid,
+        entity_type: Option<&str>,
+        name: &str,
+        description: Option<&str>,
+        properties: Option<serde_json::Value>,
+        tags: Vec<String>,
+    ) -> RuntimeResult<KeyedEntityReload> {
+        validate_entity_key(key)?;
+        crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
+        let namespace = token.namespace().as_str();
+        let wanted = caller_properties(properties.as_ref());
+        for _ in 0..KEYED_CREATE_ATTEMPTS {
+            let holder = self
+                .entities(token)?
+                .get_entity_by_key(namespace, kind, key)
+                .await?;
+            let Some(holder) = holder.filter(|holder| holder.id == holder_id) else {
+                return Ok(KeyedEntityReload::Moved);
+            };
+            if same_entity_payload(
+                &holder,
+                entity_type,
+                name,
+                description,
+                wanted.as_ref(),
+                &tags,
+            ) {
+                return Ok(KeyedEntityReload::Replayed { entity: holder });
+            }
+            // The caller keys the holder has and the request leaves out.
+            let removed: Vec<String> = match caller_properties(holder.properties.as_ref()) {
+                Some(serde_json::Value::Object(held)) => held
+                    .keys()
+                    .filter(|held_key| {
+                        !wanted
+                            .as_ref()
+                            .and_then(serde_json::Value::as_object)
+                            .is_some_and(|asked| asked.contains_key(*held_key))
+                    })
+                    .cloned()
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let removed: Vec<&str> = removed.iter().map(String::as_str).collect();
+            let patch = crate::EntityPatch {
+                name: Some(name.to_owned()),
+                description: Some(description.map(str::to_owned)),
+                properties: wanted.clone(),
+                tags: Some(tags.clone()),
+                entity_type: Some(entity_type.map(str::to_owned)),
+            };
+            match self
+                .update_entity_with_removals_and_index_report(
+                    token,
+                    holder.id,
+                    patch,
+                    &removed,
+                    Some(holder.version),
+                )
+                .await
+            {
+                Ok((entity, report)) => {
+                    return Ok(KeyedEntityReload::Updated { entity, report });
+                }
+                Err(error) if is_version_conflict(&error) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(RuntimeError::Internal(format!(
+            "keyed entity reload: the holder of key {key:?} changed during \
+             {KEYED_CREATE_ATTEMPTS} attempts"
+        )))
     }
 
     /// The live entity holding `key` for `kind` in the caller's primary

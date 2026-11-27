@@ -6,8 +6,8 @@ use std::sync::Arc;
 use khive_runtime::operations::dependency_kind_inference_hint;
 use khive_runtime::{
     entity_key_conflict, run_atomic_unit, runtime_error_value, AtomicOpPlan, AtomicRunOutcome,
-    DomainDisposition, EntityCreateSpec, KeyedEntityCreate, KhiveRuntime, KindHook, NamespaceToken,
-    NoteCreateSpec, RuntimeError, VerbRegistry,
+    DomainDisposition, EntityCreateSpec, KeyedEntityCreate, KeyedEntityReload, KhiveRuntime,
+    KindHook, NamespaceToken, NoteCreateSpec, RuntimeError, VerbRegistry,
 };
 use khive_storage::note::Note;
 use khive_storage::Entity;
@@ -21,6 +21,29 @@ use super::common::{
     BulkKindContext, CreateParams, KindSpec,
 };
 use crate::KgPack;
+
+/// Rounds of a keyed create under `on_key: "update"` whose holder moves
+/// between the create's read and the reload's before the create gives up.
+const KEYED_RELOAD_ATTEMPTS: usize = 3;
+
+/// A keyed entity create whose holder already carries the payload: the
+/// holder's id with `created: false` where the caller may list the kind,
+/// otherwise `key_conflict` naming no holder.
+fn keyed_replay(
+    registry: &VerbRegistry,
+    token: &NamespaceToken,
+    kind: &str,
+    key: &str,
+    entity: &khive_storage::Entity,
+) -> Result<Value, RuntimeError> {
+    if registry.allows_entity_key_disclosure(token, kind) {
+        return Ok(json!({
+            "id": entity.id.to_string(),
+            "created": false,
+        }));
+    }
+    Err(entity_key_conflict(key, None))
+}
 
 pub(super) fn add_embedding_truncation_warning(response: &mut Value, truncated: bool) {
     if !truncated {
@@ -167,6 +190,84 @@ impl BulkWrite {
 }
 
 impl KgPack {
+    /// `create` under `on_key: "update"` when the key's holder carries a
+    /// different payload (ADR-221 section 1). The update gate is asked for
+    /// the holder only now that the payloads differ; a caller who may not
+    /// update it gets `key_conflict`, under the same disclosure rule as a
+    /// create without `on_key`. `None` when the key no longer names
+    /// `holder_id`, so the caller judges the create again.
+    #[allow(clippy::too_many_arguments)]
+    async fn reload_held_key(
+        &self,
+        token: &NamespaceToken,
+        registry: &VerbRegistry,
+        kind: &str,
+        key: &str,
+        holder_id: uuid::Uuid,
+        entity_type: Option<&str>,
+        name: &str,
+        description: Option<&str>,
+        properties: Option<Value>,
+        tags: Vec<String>,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let holder = self.runtime.get_entity(token, holder_id).await?;
+        super::update::refuse_pack_registry_row(&holder, "create")?;
+        let update_args = json!({
+            "id": holder_id.to_string(),
+            "kind": kind,
+            "name": name,
+            "description": description,
+            "entity_type": entity_type,
+            "properties": properties,
+            "tags": tags,
+        });
+        match registry
+            .authorize_effective_kg_read(token, "update", update_args, holder_id)
+            .await
+        {
+            Ok(()) => {}
+            Err(RuntimeError::PermissionDenied { .. }) => {
+                let disclosed = registry
+                    .allows_entity_key_disclosure(token, kind)
+                    .then_some(holder_id);
+                return Err(entity_key_conflict(key, disclosed));
+            }
+            Err(error) => return Err(error),
+        }
+        let reload = self
+            .runtime
+            .reload_keyed_entity(
+                token,
+                kind,
+                key,
+                holder_id,
+                entity_type,
+                name,
+                description,
+                properties,
+                tags,
+            )
+            .await?;
+        match reload {
+            KeyedEntityReload::Updated { entity, report } => {
+                let mut response = normalize_entity_timestamps(to_json(&entity)?);
+                response["created"] = json!(false);
+                response["updated"] = json!(true);
+                add_embedding_truncation_warning(&mut response, report.embedding.any_truncated());
+                response["indexing"] = to_json(&report.indexing)?;
+                if !report.post_commit_degradations.is_empty() {
+                    response["post_commit_degradations"] =
+                        to_json(&report.post_commit_degradations)?;
+                }
+                Ok(Some(response))
+            }
+            KeyedEntityReload::Replayed { entity } => {
+                keyed_replay(registry, token, kind, key, &entity).map(Some)
+            }
+            KeyedEntityReload::Moved => Ok(None),
+        }
+    }
+
     async fn prepare_create_fields(
         &self,
         kind: &str,
@@ -207,6 +308,25 @@ impl KgPack {
             return Err(RuntimeError::InvalidInput(
                 "key applies only to notes and entities".into(),
             ));
+        }
+        // ADR-221 section 1: judged on the request's shape alone, so one
+        // request is valid or invalid whether or not its key is held.
+        if let Some(on_key) = fields.on_key.as_deref() {
+            if on_key != "update" {
+                return Err(RuntimeError::InvalidInput(
+                    "on_key accepts only \"update\"".into(),
+                ));
+            }
+            if fields.kind != "entity" || fields.key.is_none() {
+                return Err(RuntimeError::InvalidInput(
+                    "on_key applies only to a keyed entity create".into(),
+                ));
+            }
+            if fields.edges.is_some() {
+                return Err(RuntimeError::InvalidInput(
+                    "on_key cannot be combined with edges, embed or fence".into(),
+                ));
+            }
         }
         let normalized = if fields.kind == "entity" {
             if fields.embedding_content.is_some() {
@@ -291,6 +411,7 @@ impl KgPack {
             edges: None,
             embedding_content: None,
             key: None,
+            on_key: None,
             embed: None,
             fence: None,
         };
@@ -378,6 +499,7 @@ impl KgPack {
             edges: None,
             embedding_content: None,
             key: None,
+            on_key: None,
             embed: None,
             fence: None,
         };
@@ -813,6 +935,7 @@ impl KgPack {
             "annotates",
             "embedding_content",
             "key",
+            "on_key",
             "embed",
             "fence",
             "skip_dedup_check",
@@ -855,6 +978,11 @@ impl KgPack {
             {
                 return Err(RuntimeError::InvalidInput(
                     "key, embed and fence apply only to singleton notes".into(),
+                ));
+            }
+            if params.get("on_key").is_some() {
+                return Err(RuntimeError::InvalidInput(
+                    "on_key applies only to a singleton keyed entity create".into(),
                 ));
             }
             if params.get("embedding_content").is_some() {
@@ -1086,41 +1214,70 @@ impl KgPack {
                     // ADR-221 section 1: a keyed entity create answers as a
                     // keyed note create does. A replay writes nothing and
                     // returns before hooks, dedup and requested edges run.
-                    Some(key) => match self
-                        .runtime
-                        .create_keyed_entity_with_post_commit_report(
-                            token,
-                            &canonical,
-                            key,
-                            p.entity_type.as_deref(),
-                            &name,
-                            p.description.as_deref(),
-                            p.properties,
-                            tags,
-                        )
-                        .await?
-                    {
-                        KeyedEntityCreate::Created {
-                            entity,
-                            embedding,
-                            degradations,
-                        } => (entity, embedding, degradations),
-                        KeyedEntityCreate::Replayed { entity } => {
-                            if registry.allows_entity_key_disclosure(token, &canonical) {
-                                return Ok(json!({
-                                    "id": entity.id.to_string(),
-                                    "created": false,
-                                }));
+                    Some(key) => {
+                        let mut attempts = 0;
+                        loop {
+                            attempts += 1;
+                            match self
+                                .runtime
+                                .create_keyed_entity_with_post_commit_report(
+                                    token,
+                                    &canonical,
+                                    key,
+                                    p.entity_type.as_deref(),
+                                    &name,
+                                    p.description.as_deref(),
+                                    p.properties.clone(),
+                                    tags.clone(),
+                                )
+                                .await?
+                            {
+                                KeyedEntityCreate::Created {
+                                    entity,
+                                    embedding,
+                                    degradations,
+                                } => break (entity, embedding, degradations),
+                                KeyedEntityCreate::Replayed { entity } => {
+                                    return keyed_replay(registry, token, &canonical, key, &entity);
+                                }
+                                KeyedEntityCreate::Conflict { existing_id }
+                                    if p.on_key.is_some() =>
+                                {
+                                    if let Some(response) = self
+                                        .reload_held_key(
+                                            token,
+                                            registry,
+                                            &canonical,
+                                            key,
+                                            existing_id,
+                                            p.entity_type.as_deref(),
+                                            &name,
+                                            p.description.as_deref(),
+                                            p.properties.clone(),
+                                            tags.clone(),
+                                        )
+                                        .await?
+                                    {
+                                        return Ok(response);
+                                    }
+                                    // The key moved between the two reads:
+                                    // judge the create again from the top.
+                                    if attempts >= KEYED_RELOAD_ATTEMPTS {
+                                        return Err(RuntimeError::Internal(format!(
+                                            "keyed entity reload: the holder of key {key:?} \
+                                             changed during {KEYED_RELOAD_ATTEMPTS} attempts"
+                                        )));
+                                    }
+                                }
+                                KeyedEntityCreate::Conflict { existing_id } => {
+                                    let disclosed = registry
+                                        .allows_entity_key_disclosure(token, &canonical)
+                                        .then_some(existing_id);
+                                    return Err(entity_key_conflict(key, disclosed));
+                                }
                             }
-                            return Err(entity_key_conflict(key, None));
                         }
-                        KeyedEntityCreate::Conflict { existing_id } => {
-                            let disclosed = registry
-                                .allows_entity_key_disclosure(token, &canonical)
-                                .then_some(existing_id);
-                            return Err(entity_key_conflict(key, disclosed));
-                        }
-                    },
+                    }
                 };
                 let id = entity.id;
                 let mut entity_json = normalize_entity_timestamps(to_json(&entity)?);

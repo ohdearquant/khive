@@ -558,3 +558,142 @@ fn holder_payload_ignores_runtime_owned_properties() {
         &[]
     ));
 }
+
+#[tokio::test]
+async fn reload_replaces_the_caller_fields_of_the_holder() {
+    let rt = rt();
+    let tok = tok("entity-keys-reload");
+    let first = created(
+        keyed(
+            &rt,
+            &tok,
+            "concept",
+            "k",
+            "Name",
+            Some(json!({"a": 1, "b": 2})),
+            vec!["t"],
+        )
+        .await
+        .unwrap(),
+    );
+    let reload = |holder: Uuid| {
+        rt.reload_keyed_entity(
+            &tok,
+            "concept",
+            "k",
+            holder,
+            None,
+            "Renamed",
+            None,
+            Some(json!({"a": 3})),
+            Vec::new(),
+        )
+    };
+    let entity = match reload(first.id).await.unwrap() {
+        KeyedEntityReload::Updated { entity, .. } => entity,
+        other => panic!("expected an update, got {other:?}"),
+    };
+    assert_eq!(entity.id, first.id);
+    assert_eq!(entity.name, "Renamed");
+    assert_eq!(entity.properties, Some(json!({"a": 3})));
+    assert!(entity.tags.is_empty(), "{:?}", entity.tags);
+    let stored = rt
+        .get_entity_by_key(&tok, "concept", "k")
+        .await
+        .unwrap()
+        .expect("the holder keeps its key");
+    assert_eq!(stored.id, first.id);
+    assert_eq!(stored.properties, Some(json!({"a": 3})));
+    assert_eq!(stored.version, entity.version);
+
+    let replayed = reload(first.id).await.unwrap();
+    assert!(
+        matches!(&replayed, KeyedEntityReload::Replayed { entity } if entity.version == stored.version),
+        "{replayed:?}"
+    );
+    let moved = reload(Uuid::new_v4()).await.unwrap();
+    assert!(matches!(moved, KeyedEntityReload::Moved), "{moved:?}");
+    assert_eq!(live_count(&rt, &tok, "concept").await, 1);
+}
+
+#[tokio::test]
+async fn reload_refuses_a_differing_payload_on_a_stamped_holder() {
+    let rt = rt();
+    let tok = tok("entity-keys-reload-stamped");
+    let first = created(
+        keyed(
+            &rt,
+            &tok,
+            "concept",
+            "k",
+            "Name",
+            Some(json!({"a": 1})),
+            vec![],
+        )
+        .await
+        .unwrap(),
+    );
+    // The runtime's own stamp, as the secret-gate finalizer leaves it.
+    let mut writer = rt.sql().writer().await.unwrap();
+    writer
+        .execute_script(format!(
+            "UPDATE entities SET properties = '{{\"a\":1,\"khive:secret_gate\":\"exempted:content-sha256-manifest-v1\"}}', \
+             version = version + 1 WHERE id = '{}'",
+            first.id
+        ))
+        .await
+        .unwrap();
+    drop(writer);
+    let before = rt
+        .get_entity_by_key(&tok, "concept", "k")
+        .await
+        .unwrap()
+        .expect("holder");
+
+    // A stamp vouches for the bytes it was given, so the ordinary update
+    // refuses to carry it into a changed row; the reload does the same.
+    let error = rt
+        .reload_keyed_entity(
+            &tok,
+            "concept",
+            "k",
+            first.id,
+            None,
+            "Renamed",
+            None,
+            Some(json!({"a": 1})),
+            Vec::new(),
+        )
+        .await
+        .expect_err("a stamped holder is not rewritten");
+    assert!(
+        matches!(&error, RuntimeError::InvalidInput(message) if message.contains("khive:secret_gate")),
+        "{error:?}"
+    );
+    let after = rt
+        .get_entity_by_key(&tok, "concept", "k")
+        .await
+        .unwrap()
+        .expect("holder");
+    assert_eq!(after.version, before.version);
+    assert_eq!(after.properties, before.properties);
+
+    let replayed = rt
+        .reload_keyed_entity(
+            &tok,
+            "concept",
+            "k",
+            first.id,
+            None,
+            "Name",
+            None,
+            Some(json!({"a": 1})),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(&replayed, KeyedEntityReload::Replayed { entity } if entity.id == first.id),
+        "{replayed:?}"
+    );
+}

@@ -358,6 +358,21 @@ impl KhiveRuntime {
         patch: EntityPatch,
         expected_version: Option<i64>,
     ) -> RuntimeResult<(Entity, EntityUpdateReport)> {
+        self.update_entity_with_removals_and_index_report(token, id, patch, &[], expected_version)
+            .await
+    }
+
+    /// [`Self::update_entity_with_index_report`] that also removes the named
+    /// top-level property keys after the patch's properties merge in.
+    /// Runtime-owned keys cannot be removed.
+    pub(crate) async fn update_entity_with_removals_and_index_report(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        patch: EntityPatch,
+        remove_properties: &[&str],
+        expected_version: Option<i64>,
+    ) -> RuntimeResult<(Entity, EntityUpdateReport)> {
         crate::entity_write::validate_expected_version(expected_version)?;
         let admission = OrdinaryEntityUpdateContext::capture(token);
         let PreparedEntityUpdate {
@@ -373,7 +388,7 @@ impl KhiveRuntime {
                 id,
                 patch,
                 None,
-                &[],
+                remove_properties,
                 EntityUpdateRoute::OrdinaryConstructor(&admission),
             )
             .await?;

@@ -58,6 +58,9 @@ pub(crate) struct CreateParams {
     /// sent to the embedder is replaced with this value.
     pub(crate) embedding_content: Option<String>,
     pub(crate) key: Option<String>,
+    /// ADR-221 section 1: `"update"` turns a keyed entity create whose
+    /// held key carries a different payload into an update of the holder.
+    pub(crate) on_key: Option<String>,
     pub(crate) embed: Option<bool>,
     #[serde(
         default,
