@@ -462,6 +462,75 @@ async fn a_rename_onto_a_held_alias_needs_the_alias_set_in_the_change() {
     assert_eq!(sorted_aliases(&row), vec![alias("old", Rename)]);
 }
 
+fn secret_shaped_alias() -> String {
+    const ALPHANUMERIC: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let candidate: String = (0..48)
+        .map(|index| char::from(ALPHANUMERIC[(index * 17 + 11) % ALPHANUMERIC.len()]))
+        .collect();
+    format!("secret value: {candidate}")
+}
+
+async fn secret_refusal(rt: &KhiveRuntime, token: &NamespaceToken, ops: Vec<Op>) -> usize {
+    match prepare_canonical_changeset(rt, &registry(), token, &changeset(ops)).await {
+        Err(RuntimeError::CanonicalAdmission { op_index, source }) => {
+            assert!(
+                matches!(
+                    source.as_ref(),
+                    RuntimeError::SecretDetected(found)
+                        if found.location.as_deref() == Some("entity.aliases")
+                ),
+                "{source:?}"
+            );
+            op_index
+        }
+        Err(other) => panic!("expected an admission refusal, got {other:?}"),
+        Ok(_) => panic!("expected an admission refusal, the change set was prepared"),
+    }
+}
+
+/// ADR-221 section 2: every alias in a change is scanned by the secret gate
+/// before any write. A secret-shaped alias in an update's alias set, or in a
+/// create's aliases, refuses the change set at the alias field and leaves the
+/// stored aliases as they were.
+#[tokio::test]
+async fn a_secret_shaped_alias_is_refused_before_any_write() {
+    use EntityAliasOrigin::Caller;
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let secret = secret_shaped_alias();
+    assert!(
+        matches!(
+            crate::secret_gate::check(&secret),
+            Err(RuntimeError::SecretDetected(_))
+        ),
+        "fixture alias must trip the detector on its own"
+    );
+    let a = Uuid::new_v4();
+    assert!(matches!(
+        apply(rt, &token, vec![keyed_create(a, "name", None, &["nick"])]).await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+
+    let op = alias_update(
+        a,
+        "name",
+        "name",
+        vec![alias("nick", Caller)],
+        vec![alias("nick", Caller), alias(&secret, Caller)],
+    );
+    assert_eq!(secret_refusal(rt, &token, vec![op]).await, 0);
+    assert_eq!(
+        sorted_aliases(&entity_row(rt, &token, a).await.unwrap()),
+        vec![alias("nick", Caller)]
+    );
+
+    let b = Uuid::new_v4();
+    let create = keyed_create(b, "other", None, &["fine", &secret]);
+    assert_eq!(secret_refusal(rt, &token, vec![create]).await, 0);
+    assert!(entity_row(rt, &token, b).await.is_none());
+}
+
 /// The writer checks the rename again: an alias equal to the new name that
 /// appeared after preparation rolls the change set back.
 #[tokio::test]
