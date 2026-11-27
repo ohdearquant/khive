@@ -521,6 +521,8 @@ impl Writes {
                 description: description.map(str::to_owned),
                 properties: property_map(properties)?,
                 tags: Vec::new(),
+                key: None,
+                aliases: vec![],
             }),
         }));
         Ok(())
@@ -575,6 +577,7 @@ impl Writes {
             properties: properties.map(property_map).transpose()?,
             tags: None,
             entity_type: None,
+            aliases: None,
         };
         let preimage = EntityPreimage {
             name: name.map(|_| before.name.clone()),
@@ -585,6 +588,7 @@ impl Writes {
             },
             tags: None,
             entity_type: None,
+            aliases: None,
         };
         let op = UpdateOp::new(
             id128(before.id),

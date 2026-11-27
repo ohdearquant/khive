@@ -136,47 +136,10 @@ pub struct EntityKeyHolder {
     pub holder_id: Uuid,
 }
 
-/// Who wrote an entity alias (ADR-221 section 2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EntityAliasOrigin {
-    /// A caller named it on `create` or `update(add_aliases=...)`.
-    Caller,
-    /// A rename kept the entity's previous name.
-    Rename,
-    /// A merge carried the removed entity's name or aliases.
-    Merge,
-}
-
-impl EntityAliasOrigin {
-    /// The stored spelling of this origin.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Caller => "caller",
-            Self::Rename => "rename",
-            Self::Merge => "merge",
-        }
-    }
-
-    /// Parse a stored origin; `None` for any other spelling.
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "caller" => Some(Self::Caller),
-            "rename" => Some(Self::Rename),
-            "merge" => Some(Self::Merge),
-            _ => None,
-        }
-    }
-}
-
-/// Another exact name of an entity, with the origin that wrote it.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct EntityAlias {
-    /// The alias, exactly as stored.
-    pub alias: String,
-    /// Who wrote it.
-    pub origin: EntityAliasOrigin,
-}
+/// Entity aliases and their origins (ADR-221 section 2). Defined in
+/// `khive-types` so a change set can carry them; re-exported here at the path
+/// storage callers already use.
+pub use khive_types::{EntityAlias, EntityAliasOrigin};
 
 /// Entity liveness selected by an [`EntityFilter`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

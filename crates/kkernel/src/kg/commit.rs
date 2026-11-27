@@ -164,7 +164,7 @@ fn project_changeset(changeset: &ChangeSet) -> ProjectedNdjson {
                         // not just `id`/`kind`/`name`/`properties`/`tags`.
                         // Projecting a narrower record than the staged op
                         // causes false rejections and vacuous rule passes.
-                        let rec = serde_json::json!({
+                        let mut rec = serde_json::json!({
                             "id": id_str,
                             "kind": serde_json::to_value(fields.entity_kind)
                                 .expect("EntityKind serializes"),
@@ -175,6 +175,14 @@ fn project_changeset(changeset: &ChangeSet) -> ProjectedNdjson {
                                 .expect("properties serialize"),
                             "tags": fields.tags,
                         });
+                        // `key` and `aliases` are projected only when the
+                        // create names them, as the op omits them otherwise.
+                        if let Some(key) = &fields.key {
+                            rec["key"] = serde_json::json!(key);
+                        }
+                        if !fields.aliases.is_empty() {
+                            rec["aliases"] = serde_json::json!(fields.aliases);
+                        }
                         entities.push_str(&serde_json::to_string(&rec).expect("json line"));
                         entities.push('\n');
                     }
@@ -529,6 +537,8 @@ mod tests {
                 description: None,
                 properties: Default::default(),
                 tags: vec![],
+                key: None,
+                aliases: vec![],
             }),
         });
         ChangeSet::new(envelope, vec![create])
@@ -558,6 +568,8 @@ mod tests {
                     description: None,
                     properties: Default::default(),
                     tags: vec![],
+                    key: None,
+                    aliases: vec![],
                 }),
             }),
             Op::Create(CreateOp {
@@ -570,6 +582,8 @@ mod tests {
                     description: None,
                     properties: Default::default(),
                     tags: vec![],
+                    key: Some("b-key".into()),
+                    aliases: vec!["bee".into()],
                 }),
             }),
             Op::Link(LinkOp {
@@ -588,6 +602,15 @@ mod tests {
         assert_eq!(projected.edges.lines().count(), 1);
         assert!(projected.duplicate_ids.is_empty());
         assert!(projected.edges.contains("extends"));
+        let records: Vec<serde_json::Value> = projected
+            .entities
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(records[0].get("key").is_none());
+        assert!(records[0].get("aliases").is_none());
+        assert_eq!(records[1]["key"], "b-key");
+        assert_eq!(records[1]["aliases"], serde_json::json!(["bee"]));
     }
 
     #[test]
@@ -605,6 +628,8 @@ mod tests {
                     description: None,
                     properties: Default::default(),
                     tags: vec![],
+                    key: None,
+                    aliases: vec![],
                 }),
             })
         };
