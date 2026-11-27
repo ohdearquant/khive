@@ -220,8 +220,9 @@ pub(super) fn validate_entity_type_filter_with_context(
         valid.sort_unstable();
         valid.dedup();
         return Err(RuntimeError::InvalidInput(format!(
-            "unknown entity_type {raw:?}; valid: {}",
-            valid.join(" | ")
+            "unknown entity_type {raw:?}; valid: {}. {}",
+            valid.join(" | "),
+            khive_types::entity_type::UNKNOWN_ENTITY_TYPE_HINT
         )));
     };
     if matches.iter().any(|(_, candidate)| candidate != canonical) {

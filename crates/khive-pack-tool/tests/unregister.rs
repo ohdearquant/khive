@@ -210,6 +210,7 @@ fn assert_retired(receipt: &Value, target: Uuid, policies: u64, grants: u64) {
     assert_eq!(receipt["id"], target.to_string());
     assert_eq!(receipt["full_id"], target.to_string());
     assert_eq!(receipt["retired"], true);
+    assert_eq!(receipt["name_retired"], true);
     assert_eq!(receipt["policies_retired"], policies);
     assert_eq!(receipt["grants_revoked"], grants);
 }
@@ -634,7 +635,7 @@ async fn unregister_is_own_namespace_only_and_idempotent() {
         let retry = f.call("tool.unregister", json!({"tool":reference})).await;
         assert_eq!(
             retry,
-            json!({"id":own,"full_id":own,"retired":false,"policies_retired":0,"grants_revoked":0,"post_commit_degradations":[]})
+            json!({"id":own,"full_id":own,"retired":false,"name_retired":true,"policies_retired":0,"grants_revoked":0,"post_commit_degradations":[]})
         );
         assert_eq!(f.snapshot().await, settled);
     }
