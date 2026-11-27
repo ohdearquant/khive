@@ -96,7 +96,33 @@ struct State {
     logs: BTreeMap<u64, Vec<u8>>,
     log_failure: Option<RemoteError>,
     open_pulls_reply: Option<Value>,
+    pull_request_list_reply: Option<Value>,
+    issue_list_reply: Option<Value>,
 }
+/// One page of a listing reply as the platform pages it: `per_page` rows starting after
+/// `(page - 1) * per_page`. A reply that is not an array is returned as it stands.
+fn listing_page(reply: Option<Value>, query: &str) -> Value {
+    let field = |name: &str| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(name))
+            .and_then(|value| value.parse::<usize>().ok())
+    };
+    match reply {
+        Some(Value::Array(rows)) => {
+            let per_page = field("per_page=").unwrap_or(30);
+            let page = field("page=").unwrap_or(1).max(1);
+            json!(rows
+                .into_iter()
+                .skip((page - 1) * per_page)
+                .take(per_page)
+                .collect::<Vec<_>>())
+        }
+        Some(other) => other,
+        None => json!([]),
+    }
+}
+
 impl Recording {
     fn login(token: &str) -> &str {
         if token.contains("third") {
@@ -201,6 +227,11 @@ impl RemoteTransport for Recording {
             return Ok(
                 json!({"full_name":if s.mismatch==Some("slug"){"wrong/repo"}else{SLUG},"visibility":if s.mismatch==Some("visibility"){"public"}else{"private"}}),
             );
+        }
+        if let Some(query) = path.strip_prefix(&format!("repos/{SLUG}/issues?")) {
+            if query.starts_with("state=") {
+                return Ok(listing_page(s.issue_list_reply.clone(), query));
+            }
         }
         if let Some(rest) = path.strip_prefix(&format!("repos/{SLUG}/issues/")) {
             // The platform pages one hundred comments at a time.
@@ -316,6 +347,9 @@ impl RemoteTransport for Recording {
             return s.jobs.get(&id).cloned().ok_or(RemoteError::Refused);
         }
         if let Some(query) = path.strip_prefix(&format!("repos/{SLUG}/pulls?")) {
+            if query.starts_with("state=") {
+                return Ok(listing_page(s.pull_request_list_reply.clone(), query));
+            }
             if let Some(reply) = s.open_pulls_reply.clone() {
                 return Ok(reply);
             }
@@ -602,6 +636,8 @@ impl Fixture {
                 logs: BTreeMap::new(),
                 log_failure: None,
                 open_pulls_reply: None,
+                pull_request_list_reply: None,
+                issue_list_reply: None,
             }),
         });
         let mut builder = VerbRegistryBuilder::new();
@@ -758,6 +794,8 @@ include!("remote_tests/pull_request_decisions_tests.rs");
 include!("remote_tests/pull_request_state_tests.rs");
 
 include!("remote_tests/issue_tests.rs");
+
+include!("remote_tests/listing_tests.rs");
 
 include!("remote_tests/outcome_reconciliation_tests.rs");
 

@@ -1343,13 +1343,15 @@ async fn policy_decision_receipts_stay_strict_under_audit_admission_exhaustion()
         }
     }
     static TOOL_HANDLERS: [HandlerDef; 2] = [handler("tool.check"), handler("tool.describe")];
-    static GIT_HANDLERS: [HandlerDef; 6] = [
+    static GIT_HANDLERS: [HandlerDef; 8] = [
         handler("git.receipts"),
         handler("git.gates"),
         handler("git.status"),
         handler("git.log"),
         handler("git.pr_state"),
+        handler("git.pr_list"),
         handler("git.issue"),
+        handler("git.issue_list"),
     ];
 
     let store = Arc::new(MemoryEventStore::default());
@@ -1409,7 +1411,9 @@ async fn policy_decision_receipts_stay_strict_under_audit_admission_exhaustion()
         ("git", "git.status"),
         ("git", "git.log"),
         ("git", "git.pr_state"),
+        ("git", "git.pr_list"),
         ("git", "git.issue"),
+        ("git", "git.issue_list"),
     ] {
         assert_eq!(audit_batch.test_snapshot().pending_rows, 1);
         let error = registry

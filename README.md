@@ -179,7 +179,7 @@ records what's connected, in which direction, and why.
 │  khive-pack-schedule:  reminders + scheduled ops (4 verbs)    │
 │  khive-pack-knowledge: atom KB + embedding rerank (21 verbs)  │
 │  khive-pack-session:   session records, search, stats, vacuum (7 verbs)    │
-│  khive-pack-git:       provenance ingest + writes (24 verbs)  │
+│  khive-pack-git:       provenance ingest + writes (26 verbs)  │
 │  khive-pack-code:      source ingest (L1 manifest + L1.5      │
 │                        import-scan) + map reads (4 verbs)                   │
 │  khive-pack-workspace: workspace entity + contains endpoint   │
