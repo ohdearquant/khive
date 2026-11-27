@@ -185,6 +185,11 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("moodboard.serve", OperationAccess::Write),
     ("moodboard.train_preference", OperationAccess::Write),
     ("neighbors", OperationAccess::Read),
+    ("operation.bind", OperationAccess::Write),
+    ("operation.define", OperationAccess::Write),
+    ("operation.frontier", OperationAccess::Read),
+    ("operation.open", OperationAccess::Write),
+    ("operation.record", OperationAccess::Write),
     ("propose", OperationAccess::Write),
     ("query", OperationAccess::Read),
     ("resolve", OperationAccess::Read),
@@ -243,7 +248,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
 
 #[test]
 fn proposal_cleanup_revision_preserves_every_existing_classification() {
-    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v34");
+    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v35");
     assert_eq!(CLASSIFIED_OPERATIONS, EXPECTED);
     for &(name, access) in EXPECTED {
         assert_eq!(classify_operation(name), Some(access), "{name}");
