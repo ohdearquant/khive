@@ -114,6 +114,7 @@ impl Fixture {
             description: description.map(str::to_owned),
             properties: Some(json!({"purpose": "fixture"})),
             tags: vec![],
+            aliases: Vec::new(),
         }
     }
 
@@ -132,6 +133,7 @@ impl Fixture {
                 description,
                 properties,
                 vec![],
+                &crate::EntityAliasChange::default(),
             )
             .await
             .map(|(entity, _, _)| entity)
@@ -741,6 +743,7 @@ async fn structured_properties_and_tags_use_their_exact_field_scope() {
                 None,
                 Some(properties.clone()),
                 tags,
+                &crate::EntityAliasChange::default(),
             )
             .await
             .unwrap();
@@ -1527,6 +1530,7 @@ async fn invoke_declared_route(
                 spec.description.as_deref(),
                 spec.properties,
                 spec.tags,
+                &crate::EntityAliasChange::default(),
             )
             .await
             .map(|(entity, _, _)| entity),
@@ -2567,6 +2571,7 @@ async fn property_manifest_counts_one_atom_once_but_refuses_two_distinct_identit
                 None,
                 Some(properties),
                 tags,
+                &crate::EntityAliasChange::default(),
             )
             .await
             .unwrap_err();
@@ -2646,6 +2651,7 @@ async fn legacy_property_entries_are_inert_for_keys_roots_arrays_and_match_count
             None,
             Some(json!({"purpose":"fixture"})),
             vec![f.value.clone()],
+            &crate::EntityAliasChange::default(),
         )
         .await
         .unwrap();
@@ -2661,6 +2667,7 @@ async fn legacy_property_entries_are_inert_for_keys_roots_arrays_and_match_count
             None,
             Some(json!({"purpose":"fixture", "credential":f.value})),
             vec![f.value.clone()],
+            &crate::EntityAliasChange::default(),
         )
         .await
         .unwrap_err();

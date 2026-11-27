@@ -115,6 +115,8 @@ pub(super) async fn entity(
         merged_into: optional_id(&row, "merged_into")?,
         merge_event_id: optional_id(&row, "merge_event_id")?,
         content_ref: optional_text(&row, "content_ref")?,
+        aliases: khive_db::stores::entity::parse_entity_aliases(&text(&row, "aliases")?)
+            .map_err(|_| invalid("aliases"))?,
     }))
 }
 

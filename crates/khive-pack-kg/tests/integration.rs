@@ -11835,6 +11835,7 @@ async fn create_many_runtime_validator_installed_via_pack_registration() {
         description: None,
         properties: None,
         tags: vec![],
+        aliases: Vec::new(),
     }];
 
     let result = rt.create_many(&tok, bad_specs).await;
@@ -11909,6 +11910,7 @@ async fn create_many_runtime_validator_installed_on_per_pack_runtime_multi_backe
         description: None,
         properties: None,
         tags: vec![],
+        aliases: Vec::new(),
     }];
 
     let result = kg_runtime.create_many(&tok, bad_specs).await;

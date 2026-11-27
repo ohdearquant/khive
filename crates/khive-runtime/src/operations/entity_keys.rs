@@ -95,7 +95,18 @@ pub fn entity_carries_create_payload(holder: &Entity, spec: &EntityCreateSpec) -
         spec.description.as_deref(),
         spec.properties.as_ref(),
         &spec.tags,
+        &spec_aliases(spec),
     )
+}
+
+/// The caller aliases a row written from `spec` holds: the requested ones
+/// other than its name.
+fn spec_aliases(spec: &EntityCreateSpec) -> BTreeSet<&str> {
+    spec.aliases
+        .iter()
+        .map(String::as_str)
+        .filter(|alias| *alias != spec.name)
+        .collect()
 }
 
 /// Whether two keyed create payloads are the same, as
@@ -106,6 +117,13 @@ pub fn same_create_payload(first: &EntityCreateSpec, second: &EntityCreateSpec) 
     held.description = first.description.clone();
     held.properties = first.properties.clone();
     held.tags = first.tags.clone();
+    held.aliases = spec_aliases(first)
+        .into_iter()
+        .map(|alias| khive_storage::entity::EntityAlias {
+            alias: alias.to_owned(),
+            origin: khive_storage::entity::EntityAliasOrigin::Caller,
+        })
+        .collect();
     entity_carries_create_payload(&held, second)
 }
 
@@ -177,7 +195,11 @@ fn caller_properties(properties: Option<&serde_json::Value>) -> Option<serde_jso
 }
 
 /// Whether `holder` carries the payload a keyed create asked for: name,
-/// description, `entity_type`, typed-equal properties and tags as a set.
+/// description, `entity_type`, typed-equal properties, tags as a set and
+/// caller-origin aliases as a set (ADR-221 section 1). `aliases` is the
+/// set the request asks for, its name already left out. A requested alias
+/// the holder holds under a rename or merge origin is left out of it too:
+/// the write keeps that row as it is, so the request would not store it.
 ///
 /// Both sides' properties are read through [`caller_properties`]: the
 /// runtime-owned top-level keys are left out, because no caller can send
@@ -191,7 +213,21 @@ fn same_entity_payload(
     description: Option<&str>,
     properties: Option<&serde_json::Value>,
     tags: &[String],
+    aliases: &BTreeSet<&str>,
 ) -> bool {
+    let stored: BTreeSet<&str> = aliases
+        .iter()
+        .copied()
+        .filter(|alias| {
+            !holder.aliases.iter().any(|held| {
+                held.alias == *alias
+                    && held.origin != khive_storage::entity::EntityAliasOrigin::Caller
+            })
+        })
+        .collect();
+    if super::entity_aliases::caller_alias_set(holder) != stored {
+        return false;
+    }
     if holder.name != name
         || holder.description.as_deref() != description
         || holder.entity_type.as_deref() != entity_type
@@ -275,7 +311,8 @@ impl KhiveRuntime {
     /// claimed in the transaction that writes the entity. A held key answers
     /// [`KeyedEntityCreate::Replayed`] when the holder carries the same
     /// payload and [`KeyedEntityCreate::Conflict`] when it does not; neither
-    /// writes anything.
+    /// writes anything. `aliases` is part of the payload, compared as the set
+    /// of the holder's caller-origin aliases.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_keyed_entity_with_post_commit_report(
         &self,
@@ -287,11 +324,13 @@ impl KhiveRuntime {
         description: Option<&str>,
         properties: Option<serde_json::Value>,
         tags: Vec<String>,
+        aliases: &EntityAliasChange,
     ) -> RuntimeResult<KeyedEntityCreate> {
         validate_entity_key(key)?;
         self.validate_entity_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
         let namespace = token.namespace().as_str();
+        let wanted_aliases = aliases.wanted(name);
         for _ in 0..KEYED_CREATE_ATTEMPTS {
             let holder = self
                 .entities(token)?
@@ -306,6 +345,7 @@ impl KhiveRuntime {
                         description,
                         properties.as_ref(),
                         &tags,
+                        &wanted_aliases,
                     ) {
                         KeyedEntityCreate::Replayed { entity: holder }
                     } else {
@@ -326,6 +366,7 @@ impl KhiveRuntime {
                     tags.clone(),
                     Vec::new(),
                     Some(key),
+                    aliases,
                 )
                 .await?
             {
@@ -353,6 +394,7 @@ impl KhiveRuntime {
                     description,
                     properties.as_ref(),
                     &tags,
+                    &wanted_aliases,
                 ) =>
             {
                 Ok(KeyedEntityCreate::Replayed { entity: holder })
@@ -379,7 +421,8 @@ impl KhiveRuntime {
     /// update refuses it: the key vouches for bytes this write would change.
     /// The caller has already been cleared to update `holder_id`; if the key
     /// no longer names it, nothing is written and the answer is
-    /// [`KeyedEntityReload::Moved`].
+    /// [`KeyedEntityReload::Moved`]. The holder's caller-origin aliases
+    /// become `aliases`; aliases a rename or a merge wrote stay.
     #[allow(clippy::too_many_arguments)]
     pub async fn reload_keyed_entity(
         &self,
@@ -392,11 +435,13 @@ impl KhiveRuntime {
         description: Option<&str>,
         properties: Option<serde_json::Value>,
         tags: Vec<String>,
+        aliases: &EntityAliasChange,
     ) -> RuntimeResult<KeyedEntityReload> {
         validate_entity_key(key)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
         let namespace = token.namespace().as_str();
         let wanted = caller_properties(properties.as_ref());
+        let wanted_aliases = aliases.wanted(name);
         for _ in 0..KEYED_CREATE_ATTEMPTS {
             let holder = self
                 .entities(token)?
@@ -412,6 +457,7 @@ impl KhiveRuntime {
                 description,
                 wanted.as_ref(),
                 &tags,
+                &wanted_aliases,
             ) {
                 return Ok(KeyedEntityReload::Replayed { entity: holder });
             }
@@ -425,6 +471,7 @@ impl KhiveRuntime {
                     patch,
                     &removed,
                     Some(holder.version),
+                    aliases,
                 )
                 .await
             {
@@ -457,6 +504,7 @@ impl KhiveRuntime {
         spec: &EntityCreateSpec,
     ) -> RuntimeResult<(Entity, AtomicOpPlan)> {
         crate::secret_gate::reject_reserved_secret_gate_property(spec.properties.as_ref())?;
+        let aliases = EntityAliasChange::replace(&spec.aliases)?;
         let wanted = caller_properties(spec.properties.as_ref());
         let removed = properties_to_remove(holder, wanted.as_ref());
         let removed: Vec<&str> = removed.iter().map(String::as_str).collect();
@@ -474,6 +522,7 @@ impl KhiveRuntime {
             patch,
             &removed,
             holder.version,
+            &aliases,
         )
         .await
     }

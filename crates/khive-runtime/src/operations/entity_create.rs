@@ -539,6 +539,7 @@ impl KhiveRuntime {
                 tags,
                 Vec::new(),
                 None,
+                &EntityAliasChange::default(),
             )
             .await?
             .into_written()?;
@@ -678,6 +679,7 @@ impl KhiveRuntime {
                 tags,
                 attachments,
                 None,
+                &EntityAliasChange::default(),
             )
             .await?
             .into_written()?;
@@ -706,6 +708,7 @@ impl KhiveRuntime {
                 tags,
                 Vec::new(),
                 None,
+                &EntityAliasChange::default(),
             )
             .await?
             .into_written()?;
@@ -718,6 +721,9 @@ impl KhiveRuntime {
     }
 
     /// The committed entity and its non-retryable post-commit diagnostics.
+    ///
+    /// `aliases` become the entity's caller aliases (ADR-221 section 2),
+    /// written in the transaction that writes the row.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_entity_with_post_commit_report(
         &self,
@@ -728,6 +734,7 @@ impl KhiveRuntime {
         description: Option<&str>,
         properties: Option<serde_json::Value>,
         tags: Vec<String>,
+        aliases: &EntityAliasChange,
     ) -> RuntimeResult<(
         Entity,
         crate::retrieval::EmbeddingTruncationReport,
@@ -743,6 +750,7 @@ impl KhiveRuntime {
             tags,
             Vec::new(),
             None,
+            aliases,
         )
         .await?
         .into_written()
@@ -760,6 +768,7 @@ impl KhiveRuntime {
         tags: Vec<String>,
         attachments: Vec<NewAttachment>,
         key: Option<&str>,
+        aliases: &EntityAliasChange,
     ) -> RuntimeResult<EntityCreateWrite> {
         self.validate_entity_kind(kind)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
@@ -790,6 +799,12 @@ impl KhiveRuntime {
             })
             .collect();
         entity.content_ref = projected_content_ref.clone();
+        // ADR-221 section 2: the aliases are projected onto the row before
+        // admission, so its text and vector bodies carry them, and they are
+        // written in the transaction that writes the row.
+        let created_at = entity.created_at;
+        let (_, alias_statements, _) =
+            super::entity_aliases::apply_entity_alias_change(&mut entity, aliases, created_at);
         // ADR-221 section 1: a keyed create claims its key in the transaction
         // that writes the row. The claim inserts nothing when a live entity
         // holds the key, and its exactly-one guard rolls the whole write back.
@@ -811,6 +826,7 @@ impl KhiveRuntime {
                         },
                     );
                 }
+                required.extend(super::entity_aliases::unguarded(alias_statements));
                 let plan = prepared.into_plan(
                     EntityCandidateMutation::CreateIfAbsent,
                     required,
@@ -851,56 +867,53 @@ impl KhiveRuntime {
                 }
             }
         };
-        match key_claim {
-            None => {
-                self.entities(token)?
-                    .upsert_entity_with_attachments(entity.clone(), attachment_rows)
-                    .await?;
+        if key_claim.is_none() && alias_statements.is_empty() {
+            self.entities(token)?
+                .upsert_entity_with_attachments(entity.clone(), attachment_rows)
+                .await?;
+        } else {
+            drop(self.entities(token)?);
+            let mut statements: Vec<PlanStatement> = key_claim
+                .into_iter()
+                .map(|claim| PlanStatement {
+                    statement: claim,
+                    guard: Some(AffectedRowGuard::exactly(1)),
+                })
+                .collect();
+            statements.push(PlanStatement {
+                statement: entity_upsert_statement(&entity),
+                guard: Some(AffectedRowGuard::exactly(1)),
+            });
+            for attachment in &attachment_rows {
+                statements.push(PlanStatement {
+                    statement: attachment_upsert_statement(attachment)?,
+                    guard: None,
+                });
             }
-            Some(claim) => {
-                drop(self.entities(token)?);
-                let mut statements = vec![
-                    PlanStatement {
-                        statement: claim,
-                        guard: Some(AffectedRowGuard::exactly(1)),
-                    },
-                    PlanStatement {
-                        statement: entity_upsert_statement(&entity),
-                        guard: Some(AffectedRowGuard::exactly(1)),
-                    },
-                ];
-                for attachment in &attachment_rows {
-                    statements.push(PlanStatement {
-                        statement: attachment_upsert_statement(attachment)?,
-                        guard: None,
-                    });
+            statements.extend(super::entity_aliases::unguarded(alias_statements));
+            let plan = AddEntityPlan {
+                entity_id: entity.id,
+                statements,
+                post_commit: PostCommitEffect::None,
+            };
+            match run_atomic_unit(self.sql().as_ref(), vec![AtomicOpPlan::AddEntity(plan)]).await {
+                Ok(AtomicRunOutcome::Committed { .. }) => {}
+                Ok(AtomicRunOutcome::RolledBack {
+                    failure:
+                        AtomicOpFailure::GuardFailed {
+                            statement_label: Some(label),
+                            ..
+                        },
+                    ..
+                }) if label == ENTITY_KEY_CLAIM_LABEL => {
+                    return Ok(EntityCreateWrite::KeyHeld);
                 }
-                let plan = AddEntityPlan {
-                    entity_id: entity.id,
-                    statements,
-                    post_commit: PostCommitEffect::None,
-                };
-                match run_atomic_unit(self.sql().as_ref(), vec![AtomicOpPlan::AddEntity(plan)])
-                    .await
-                {
-                    Ok(AtomicRunOutcome::Committed { .. }) => {}
-                    Ok(AtomicRunOutcome::RolledBack {
-                        failure:
-                            AtomicOpFailure::GuardFailed {
-                                statement_label: Some(label),
-                                ..
-                            },
-                        ..
-                    }) if label == ENTITY_KEY_CLAIM_LABEL => {
-                        return Ok(EntityCreateWrite::KeyHeld);
-                    }
-                    Ok(AtomicRunOutcome::RolledBack { failure, .. }) => {
-                        return Err(RuntimeError::Internal(format!(
-                            "keyed entity create rolled back: {failure:?}"
-                        )));
-                    }
-                    Err(error) => return Err(RuntimeError::Storage(error.0)),
+                Ok(AtomicRunOutcome::RolledBack { failure, .. }) => {
+                    return Err(RuntimeError::Internal(format!(
+                        "entity create rolled back: {failure:?}"
+                    )));
                 }
+                Err(error) => return Err(RuntimeError::Storage(error.0)),
             }
         }
         entity.content_ref = projected_content_ref;

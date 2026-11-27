@@ -3,7 +3,9 @@
 use serde_json::Value;
 use uuid::Uuid;
 
-use khive_runtime::{EdgePatch, EntityPatch, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    EdgePatch, EntityAliasChange, EntityPatch, NamespaceToken, RuntimeError, VerbRegistry,
+};
 
 use khive_storage::Entity;
 use khive_types::pack::pack_registry_tag;
@@ -66,11 +68,18 @@ fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), R
             } else {
                 None
             };
-            (bad, "name, description, tags, properties, entity_type")
+            (
+                bad,
+                "name, description, tags, properties, entity_type, add_aliases, remove_aliases",
+            )
         }
         KindSpec::Note { .. } => {
             let bad = if p.description.is_some() {
                 Some("description")
+            } else if p.add_aliases.is_some() {
+                Some("add_aliases")
+            } else if p.remove_aliases.is_some() {
+                Some("remove_aliases")
             } else if p.relation.is_some() {
                 Some("relation")
             } else if p.weight.is_some() {
@@ -94,6 +103,10 @@ fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), R
                 Some("content")
             } else if p.tags.is_some() {
                 Some("tags")
+            } else if p.add_aliases.is_some() {
+                Some("add_aliases")
+            } else if p.remove_aliases.is_some() {
+                Some("remove_aliases")
             } else if p.salience.is_some() {
                 Some("salience")
             } else if p.decay_factor.is_some() {
@@ -243,6 +256,12 @@ impl KgPack {
             .await?;
         let p: UpdateParams = deser(params.clone())?;
         super::common::require_object_param(p.properties.as_ref(), "properties")?;
+        // ADR-221 section 2: every alias is validated and secret-gated before
+        // the target is read.
+        let aliases = EntityAliasChange::update(
+            p.add_aliases.as_deref().unwrap_or_default(),
+            p.remove_aliases.as_deref().unwrap_or_default(),
+        )?;
         if p.entity_kind.is_some() {
             return Err(RuntimeError::InvalidInput(
                 "entity_kind is immutable; to change kind, delete then re-create the entity, or use merge() if this is a deduplication correction".into(),
@@ -341,9 +360,22 @@ impl KgPack {
                 };
                 let (entity, report) = self
                     .runtime
-                    .update_entity_with_index_report(token, id, patch, p.expected_version)
+                    .update_entity_with_aliases_and_index_report(
+                        token,
+                        id,
+                        patch,
+                        &aliases,
+                        p.expected_version,
+                    )
                     .await?;
                 let mut response = normalize_entity_timestamps(to_json(&entity)?);
+                super::create::add_aliases_not_stored(
+                    &mut response,
+                    report.aliases.not_stored.clone(),
+                );
+                if !report.aliases.not_removed.is_empty() {
+                    response["aliases_not_removed"] = to_json(&report.aliases.not_removed)?;
+                }
                 super::create::add_embedding_truncation_warning(
                     &mut response,
                     report.embedding.any_truncated(),
