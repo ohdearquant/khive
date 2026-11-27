@@ -46,12 +46,30 @@ pub(crate) fn validate_entity_key(key: &str) -> RuntimeResult<()> {
     crate::secret_gate::check_at(key, "entity", "key")
 }
 
+/// The caller-visible part of a properties value: the runtime-owned
+/// top-level keys removed, and `None` for an object left empty.
+fn caller_properties(properties: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let value = properties?;
+    let serde_json::Value::Object(map) = value else {
+        return Some(value.clone());
+    };
+    let reserved = crate::secret_gate::RESERVED_PROPERTY_KEYS;
+    let kept: serde_json::Map<String, serde_json::Value> = map
+        .iter()
+        .filter(|(key, _)| !reserved.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    (!kept.is_empty()).then_some(serde_json::Value::Object(kept))
+}
+
 /// Whether `holder` carries the payload a keyed create asked for: name,
 /// description, `entity_type`, typed-equal properties and tags as a set.
 ///
-/// The runtime-owned top-level property keys are left out of the holder's
-/// side, because no caller can send them. A holder whose properties held
-/// only those keys compares as having none.
+/// Both sides' properties are read through [`caller_properties`]: the
+/// runtime-owned top-level keys are left out, because no caller can send
+/// them, and absent properties and `{}` compare equal on either side, so a
+/// holder created with `{}` and later stamped replays a request with `{}` or
+/// with none.
 fn same_entity_payload(
     holder: &Entity,
     entity_type: Option<&str>,
@@ -66,22 +84,7 @@ fn same_entity_payload(
     {
         return false;
     }
-    let holder_properties = holder.properties.as_ref().and_then(|value| {
-        let serde_json::Value::Object(map) = value else {
-            return Some(value.clone());
-        };
-        let reserved = crate::secret_gate::RESERVED_PROPERTY_KEYS;
-        if !reserved.iter().any(|key| map.contains_key(*key)) {
-            return Some(value.clone());
-        }
-        let kept: serde_json::Map<String, serde_json::Value> = map
-            .iter()
-            .filter(|(key, _)| !reserved.contains(&key.as_str()))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        (!kept.is_empty()).then_some(serde_json::Value::Object(kept))
-    });
-    if holder_properties.as_ref() != properties {
+    if caller_properties(holder.properties.as_ref()) != caller_properties(properties) {
         return false;
     }
     let held: BTreeSet<&str> = holder.tags.iter().map(String::as_str).collect();
@@ -110,19 +113,33 @@ pub fn entity_key_conflict(key: &str, existing_id: Option<Uuid>) -> RuntimeError
 
 /// `restore_key_conflict` naming every key another live entity took while
 /// entity `id` was deleted. The entity stays deleted.
-fn restore_entity_key_conflict(id: Uuid, taken: &[EntityKeyHolder]) -> RuntimeError {
+///
+/// A holder's id is named, in the message and in `taken_keys`, only for a
+/// kind `disclose` admits, as `key_conflict` names `existing_id` only where
+/// the caller may list the holder. The kind and key are always named.
+fn restore_entity_key_conflict(
+    id: Uuid,
+    taken: &[EntityKeyHolder],
+    disclose: &(dyn Fn(&str) -> bool + Sync),
+) -> RuntimeError {
     let named: Vec<String> = taken
         .iter()
-        .map(|taken| format!("{}:{:?} held by {}", taken.kind, taken.key, taken.holder_id))
+        .map(|taken| {
+            if disclose(&taken.kind) {
+                format!("{}:{:?} held by {}", taken.kind, taken.key, taken.holder_id)
+            } else {
+                format!("{}:{:?}", taken.kind, taken.key)
+            }
+        })
         .collect();
     let listed: Vec<serde_json::Value> = taken
         .iter()
         .map(|taken| {
-            serde_json::json!({
-                "kind": taken.kind,
-                "key": taken.key,
-                "existing_id": taken.holder_id.to_string(),
-            })
+            let mut entry = serde_json::json!({"kind": taken.kind, "key": taken.key});
+            if disclose(&taken.kind) {
+                entry["existing_id"] = serde_json::json!(taken.holder_id.to_string());
+            }
+            entry
         })
         .collect();
     KhiveError::conflict(format!(
@@ -208,10 +225,32 @@ impl KhiveRuntime {
                 EntityCreateWrite::KeyHeld => continue,
             }
         }
-        Err(RuntimeError::Internal(format!(
-            "keyed entity create: the holder of key {key:?} changed during {KEYED_CREATE_ATTEMPTS} \
-             claims"
-        )))
+        // Every claim lost to a concurrent writer: answer from the winner.
+        let holder = self
+            .entities(token)?
+            .get_entity_by_key(namespace, kind, key)
+            .await?;
+        match holder {
+            Some(holder)
+                if same_entity_payload(
+                    &holder,
+                    entity_type,
+                    name,
+                    description,
+                    properties.as_ref(),
+                    &tags,
+                ) =>
+            {
+                Ok(KeyedEntityCreate::Replayed { entity: holder })
+            }
+            Some(holder) => Ok(KeyedEntityCreate::Conflict {
+                existing_id: holder.id,
+            }),
+            None => Err(RuntimeError::Internal(format!(
+                "keyed entity create: key {key:?} was claimed and released again during \
+                 {KEYED_CREATE_ATTEMPTS} claims"
+            ))),
+        }
     }
 
     /// The live entity holding `key` for `kind` in the caller's primary
@@ -230,17 +269,19 @@ impl KhiveRuntime {
     }
 
     /// Refuse a restore of entity `id` while another live entity holds any
-    /// key `id` released.
+    /// key `id` released. `disclose` says, per kind, whether the refusal may
+    /// name the holder's id.
     pub(super) async fn refuse_restore_over_taken_keys(
         &self,
         token: &NamespaceToken,
         id: Uuid,
+        disclose: &(dyn Fn(&str) -> bool + Sync),
     ) -> RuntimeResult<()> {
         let taken = self.entities(token)?.taken_entity_keys(id).await?;
         if taken.is_empty() {
             Ok(())
         } else {
-            Err(restore_entity_key_conflict(id, &taken))
+            Err(restore_entity_key_conflict(id, &taken, disclose))
         }
     }
 }

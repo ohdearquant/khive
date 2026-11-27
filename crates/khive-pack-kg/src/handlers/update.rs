@@ -622,7 +622,14 @@ impl KgPack {
                     }
                 }
                 ensure_entity_subtype(id, existing.entity_type.as_deref(), entity_type.as_deref())?;
-                let Some((entity, restored)) = self.runtime.restore_entity(token, id).await? else {
+                // A taken key names its holder only where the caller may
+                // list that kind, as a keyed create's key_conflict does.
+                let disclose = |kind: &str| registry.allows_entity_key_disclosure(token, kind);
+                let Some((entity, restored)) = self
+                    .runtime
+                    .restore_entity_with_key_disclosure(token, id, &disclose)
+                    .await?
+                else {
                     return Err(foreign_restore_target(&p.id));
                 };
                 let mut response = normalize_entity_timestamps(to_json(&entity)?);

@@ -22,6 +22,24 @@ async fn configured() -> (
     (rt, token, pack, registry)
 }
 
+/// Permits every verb except `list`, so a caller may restore but may not
+/// learn who holds a key.
+#[derive(Debug)]
+struct DenyList;
+
+impl khive_runtime::Gate for DenyList {
+    fn check(
+        &self,
+        request: &khive_runtime::GateRequest,
+    ) -> Result<khive_runtime::GateDecision, khive_runtime::GateError> {
+        Ok(if request.verb == "list" {
+            khive_runtime::GateDecision::deny("listing denied")
+        } else {
+            khive_runtime::GateDecision::allow()
+        })
+    }
+}
+
 fn details(error: &RuntimeError) -> (Option<String>, Option<String>) {
     let RuntimeError::Khive(error) = error else {
         panic!("expected a domain error, got {error:?}");
@@ -180,4 +198,55 @@ async fn delete_releases_and_restore_refuses_a_taken_entity_key() {
         .await
         .expect("the second entity still holds the key");
     assert_eq!(holder["id"], json!(second_id));
+}
+
+#[tokio::test]
+async fn restore_key_conflict_names_no_holder_the_caller_may_not_list() {
+    use crate::KgPack;
+    use khive_runtime::VerbRegistryBuilder;
+
+    let rt = khive_runtime::KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_gate(std::sync::Arc::new(DenyList));
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("kg registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+    let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+    let pack = KgPack::new(rt.clone());
+
+    let first = registry
+        .dispatch("create", keyed_create("First"))
+        .await
+        .expect("keyed create");
+    let first_id = first["id"].as_str().unwrap().to_owned();
+    registry
+        .dispatch("delete", json!({"id": first_id}))
+        .await
+        .expect("soft delete");
+    let second = registry
+        .dispatch("create", keyed_create("Second"))
+        .await
+        .expect("the released key is free");
+    let second_id = second["id"].as_str().unwrap().to_owned();
+
+    let conflict = pack
+        .handle_restore(&token, json!({"id": first_id}), &registry)
+        .await
+        .expect_err("restore must refuse a taken key");
+    let text = format!("{conflict}");
+    assert!(text.contains("restore_key_conflict"), "{text}");
+    assert!(text.contains("paper:smith2024"), "{text}");
+    assert!(!text.contains(&second_id), "{text}");
+    let RuntimeError::Khive(error) = &conflict else {
+        panic!("expected a domain error, got {conflict:?}");
+    };
+    let details = error.details().expect("details");
+    assert_eq!(details.get("reason"), Some("restore_key_conflict"));
+    let taken: Value =
+        serde_json::from_str(details.get("taken_keys").expect("taken keys")).unwrap();
+    assert_eq!(
+        taken,
+        json!([{"kind": "concept", "key": "paper:smith2024"}]),
+        "{taken}"
+    );
 }

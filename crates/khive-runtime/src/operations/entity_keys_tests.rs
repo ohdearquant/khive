@@ -60,6 +60,33 @@ fn reason(error: &RuntimeError) -> Option<&str> {
     }
 }
 
+fn taken_keys(error: &RuntimeError) -> serde_json::Value {
+    let RuntimeError::Khive(khive) = error else {
+        panic!("restore_key_conflict is a domain error: {error:?}");
+    };
+    serde_json::from_str(
+        khive
+            .details()
+            .and_then(|details| details.get("taken_keys"))
+            .expect("taken keys named"),
+    )
+    .unwrap()
+}
+
+/// Rows in `entity_keys` for entity `id`, released or held, read directly.
+async fn key_rows(rt: &KhiveRuntime, id: Uuid) -> u64 {
+    rt.sql()
+        .reader()
+        .await
+        .unwrap()
+        .count(khive_storage::SqlStatement::new(
+            "SELECT COUNT(*) FROM entity_keys WHERE entity_id = ?1",
+            vec![khive_storage::SqlValue::Text(id.to_string())],
+        ))
+        .await
+        .unwrap()
+}
+
 fn secret_shaped_key() -> String {
     const ALPHANUMERIC: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let candidate: String = (0..48)
@@ -271,24 +298,29 @@ async fn restore_refuses_while_another_entity_holds_the_key() {
             .unwrap(),
     );
 
+    // Without a disclosure rule the refusal names the kind and key only.
     let error = rt
         .restore_entity(&tok, first.id)
         .await
         .expect_err("a taken key refuses the restore");
     assert_eq!(reason(&error), Some("restore_key_conflict"), "{error:?}");
-    let RuntimeError::Khive(khive) = &error else {
-        panic!("restore_key_conflict is a domain error: {error:?}");
-    };
-    let taken: serde_json::Value = serde_json::from_str(
-        khive
-            .details()
-            .and_then(|details| details.get("taken_keys"))
-            .expect("taken keys named"),
-    )
-    .unwrap();
+    assert_eq!(taken_keys(&error), json!([{"kind": "concept", "key": "k"}]));
+    assert!(
+        !error.to_string().contains(&second.id.to_string()),
+        "{error}"
+    );
+    // A caller who may list the kind is told the holder.
+    let error = rt
+        .restore_entity_with_key_disclosure(&tok, first.id, &|kind: &str| kind == "concept")
+        .await
+        .expect_err("a taken key refuses the restore");
     assert_eq!(
-        taken,
+        taken_keys(&error),
         json!([{"kind": "concept", "key": "k", "existing_id": second.id.to_string()}])
+    );
+    assert!(
+        error.to_string().contains(&second.id.to_string()),
+        "{error}"
     );
 
     let tombstone = rt
@@ -326,7 +358,9 @@ async fn hard_delete_removes_the_key_rows() {
             .await
             .unwrap(),
     );
+    assert_eq!(key_rows(&rt, first.id).await, 1);
     assert!(rt.delete_entity(&tok, first.id, true).await.unwrap());
+    assert_eq!(key_rows(&rt, first.id).await, 0, "live hard delete");
     assert_eq!(holder_id(&rt, &tok, "concept", "k").await, None);
     let second = created(
         keyed(&rt, &tok, "concept", "k", "Second", None, vec![])
@@ -334,16 +368,53 @@ async fn hard_delete_removes_the_key_rows() {
             .unwrap(),
     );
     assert_ne!(second.id, first.id);
-    let taken = rt
-        .entities(&tok)
-        .unwrap()
-        .taken_entity_keys(first.id)
+
+    // A soft delete keeps the released row for a restore; hard-deleting the
+    // tombstone drops it.
+    assert!(rt.delete_entity(&tok, second.id, false).await.unwrap());
+    assert_eq!(key_rows(&rt, second.id).await, 1, "released row kept");
+    assert!(rt.delete_entity(&tok, second.id, true).await.unwrap());
+    assert_eq!(key_rows(&rt, second.id).await, 0, "tombstone hard delete");
+}
+
+#[tokio::test]
+async fn a_stamped_holder_created_with_empty_properties_replays() {
+    let rt = rt();
+    let tok = tok("entity-keys-empty-properties");
+    let first = created(
+        keyed(&rt, &tok, "concept", "k", "Empty", Some(json!({})), vec![])
+            .await
+            .unwrap(),
+    );
+    // The runtime's own stamp, as the secret-gate finalizer leaves it.
+    let mut writer = rt.sql().writer().await.unwrap();
+    writer
+        .execute_script(format!(
+            "UPDATE entities SET properties = '{{\"khive:secret_gate\":\"exempted:content-sha256-manifest-v1\"}}', \
+             version = version + 1 WHERE id = '{}'",
+            first.id
+        ))
         .await
         .unwrap();
-    assert!(
-        taken.is_empty(),
-        "a hard-deleted entity keeps no key rows: {taken:?}"
-    );
+    drop(writer);
+    for properties in [Some(json!({})), None] {
+        let outcome = keyed(
+            &rt,
+            &tok,
+            "concept",
+            "k",
+            "Empty",
+            properties.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&outcome, KeyedEntityCreate::Replayed { entity } if entity.id == first.id),
+            "{properties:?}: {outcome:?}"
+        );
+    }
+    assert_eq!(live_count(&rt, &tok, "concept").await, 1);
 }
 
 #[tokio::test]
@@ -458,9 +529,32 @@ fn holder_payload_ignores_runtime_owned_properties() {
         &[]
     ));
     assert!(!same_entity_payload(&holder, None, "Name", None, None, &[]));
+    // Absent and `{}` compare equal on both sides.
     holder.properties = Some(json!({}));
-    assert!(
-        !same_entity_payload(&holder, None, "Name", None, None, &[]),
-        "an empty object the caller stored differs from no properties"
-    );
+    assert!(same_entity_payload(&holder, None, "Name", None, None, &[]));
+    assert!(same_entity_payload(
+        &holder,
+        None,
+        "Name",
+        None,
+        Some(&json!({})),
+        &[]
+    ));
+    holder.properties = None;
+    assert!(same_entity_payload(
+        &holder,
+        None,
+        "Name",
+        None,
+        Some(&json!({})),
+        &[]
+    ));
+    assert!(!same_entity_payload(
+        &holder,
+        None,
+        "Name",
+        None,
+        Some(&json!({"a": 1})),
+        &[]
+    ));
 }
