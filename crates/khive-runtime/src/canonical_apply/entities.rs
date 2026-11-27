@@ -128,6 +128,38 @@ impl PreparedEntityUpdate {
     }
 }
 
+/// A plan that writes nothing and holds only while `row` is still the live row
+/// it was read as: same id, `updated_at`, `deleted_at` and version.
+pub(crate) fn unchanged_entity_assertion_plan(row: &Entity, label: &str) -> AtomicOpPlan {
+    let assertion = SqlStatement {
+        sql: include_str!("../../sql/canonical_entity_noop_assertion.sql").into(),
+        params: vec![
+            SqlValue::Text(row.id.to_string()),
+            SqlValue::Integer(row.updated_at),
+            row.deleted_at
+                .map(SqlValue::Integer)
+                .unwrap_or(SqlValue::Null),
+            SqlValue::Integer(row.version),
+        ],
+        label: Some(label.into()),
+    };
+    AtomicOpPlan::Update(Box::new(UpdatePlan {
+        target_id: row.id,
+        statements: vec![PlanStatement {
+            statement: assertion,
+            guard: Some(AffectedRowGuard::exactly(1)),
+        }],
+        post_commit: PostCommitEffect::None,
+        edge_natural_key: None,
+        idempotent_noop: true,
+        entity_guard: None,
+        note_guard: None,
+        note_vector_purge: None,
+        note_embedding_inheritance: None,
+        graph_effects: Vec::new(),
+    }))
+}
+
 pub(super) fn materialize(
     token: &NamespaceToken,
     mut live: Entity,
@@ -149,7 +181,6 @@ pub(super) fn materialize(
     }
     let previous_updated_at = live.updated_at;
     let previous_deleted_at = live.deleted_at;
-    let previous_version = live.version;
     let before = live.clone();
     let (patched, reindex, changed_fields) = apply_canonical_patch(&before, &prepared.patch)
         .map_err(|error| failure(error.to_string()))?;
@@ -168,33 +199,10 @@ pub(super) fn materialize(
         // A canonical update whose values already hold lands as a no-op: no write,
         // no event, no new revision. Its preimage still matches on replay, so this is
         // what keeps a landed change-set from writing a second time.
-        let assertion = SqlStatement {
-            sql: include_str!("../../sql/canonical_entity_noop_assertion.sql").into(),
-            params: vec![
-                SqlValue::Text(id.to_string()),
-                SqlValue::Integer(previous_updated_at),
-                previous_deleted_at
-                    .map(SqlValue::Integer)
-                    .unwrap_or(SqlValue::Null),
-                SqlValue::Integer(previous_version),
-            ],
-            label: Some("canonical-entity-noop-assertion".into()),
-        };
-        return Ok(AtomicOpPlan::Update(Box::new(UpdatePlan {
-            target_id: id,
-            statements: vec![PlanStatement {
-                statement: assertion,
-                guard: Some(AffectedRowGuard::exactly(1)),
-            }],
-            post_commit: PostCommitEffect::None,
-            edge_natural_key: None,
-            idempotent_noop: true,
-            entity_guard: None,
-            note_guard: None,
-            note_vector_purge: None,
-            note_embedding_inheritance: None,
-            graph_effects: Vec::new(),
-        })));
+        return Ok(unchanged_entity_assertion_plan(
+            &before,
+            "canonical-entity-noop-assertion",
+        ));
     }
     live.updated_at = now.max(
         previous_updated_at

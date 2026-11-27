@@ -9,9 +9,9 @@ use std::collections::HashMap;
 
 use khive_runtime::atomic_prepare::apply_post_commit_effects_with_report;
 use khive_runtime::{
-    entity_carries_create_payload, entity_key_conflict, run_atomic_unit, same_create_payload,
-    AtomicOpPlan, AtomicRunOutcome, DomainDisposition, EntityCreateSpec, NamespaceToken,
-    PendingEntityId, RuntimeError, VerbRegistry,
+    entity_carries_create_payload, entity_key_conflict, keyed_replay_assertion_plan,
+    run_atomic_unit, same_create_payload, AtomicOpPlan, AtomicRunOutcome, DomainDisposition,
+    EntityCreateSpec, NamespaceToken, PendingEntityId, RuntimeError, VerbRegistry,
 };
 use khive_storage::Entity;
 use serde_json::{json, Value};
@@ -38,20 +38,27 @@ enum KeyHolder {
     Slot(usize),
 }
 
-/// One judged item.
+/// One judged item, planned with the payload it carries now. Each plan is
+/// built when its item is judged, so the runtime admits every item's own
+/// payload in item order, as the same items sent one by one would be
+/// admitted, and a payload a later item replaces is admitted all the same.
 enum Slot {
     /// A new entity row; its key, when it has one, is claimed for it.
     Create {
         prepared: PreparedBulkEntity,
         normalized: Option<Value>,
-        pending: Option<PendingEntityId>,
+        planned: Box<(Entity, AtomicOpPlan)>,
     },
-    Note(PreparedBulkNote),
+    Note {
+        write: Box<BulkWrite>,
+        plan: AtomicOpPlan,
+    },
     /// The stored holder of the item's key, rewritten to the slot's payload.
     Reload {
         holder: Box<Entity>,
         prepared: PreparedBulkEntity,
         normalized: Option<Value>,
+        plan: AtomicOpPlan,
     },
     /// Writes nothing and answers as the row it names.
     Same {
@@ -186,10 +193,8 @@ impl KeyedBulkFailure {
 fn slot_payload(slots: &[Slot], slot: usize) -> Option<(&EntityCreateSpec, Uuid, bool)> {
     match slots.get(slot)? {
         Slot::Create {
-            prepared,
-            pending: Some(pending),
-            ..
-        } => Some((&prepared.spec, pending.id(), false)),
+            prepared, planned, ..
+        } if prepared.key.is_some() => Some((&prepared.spec, planned.0.id, false)),
         Slot::Reload {
             holder, prepared, ..
         } => Some((&prepared.spec, holder.id, true)),
@@ -246,9 +251,19 @@ impl KgPack {
         let mut read: HolderReads = Vec::new();
         for (index, item) in items.iter().enumerate() {
             let judged = |error| KeyedBulkFailure::Judged { index, error };
+            let planned = |error| KeyedBulkFailure::Plan { index, error };
             let (prepared, normalized) = match item {
                 PreparedBulkItem::Note(note) => {
-                    slots.push(Slot::Note(note.clone()));
+                    let PreparedBulkNote { spec, args, hook } = note.clone();
+                    let (note, plan) = self
+                        .runtime
+                        .prepare_bulk_note_plan(token, spec)
+                        .await
+                        .map_err(planned)?;
+                    slots.push(Slot::Note {
+                        write: Box::new(BulkWrite::Note { hook, args, note }),
+                        plan,
+                    });
                     continue;
                 }
                 PreparedBulkItem::Entity {
@@ -257,10 +272,15 @@ impl KgPack {
                 } => (prepared.clone(), normalized.clone()),
             };
             let Some(key) = prepared.key.clone() else {
+                let entity_plan = self
+                    .runtime
+                    .prepare_bulk_entity_plan(token, prepared.spec.clone())
+                    .await
+                    .map_err(planned)?;
                 slots.push(Slot::Create {
                     prepared,
                     normalized,
-                    pending: None,
+                    planned: Box::new(entity_plan),
                 });
                 continue;
             };
@@ -279,11 +299,21 @@ impl KgPack {
                 }
             };
             let Some(holder) = holder else {
+                let entity_plan = self
+                    .runtime
+                    .prepare_keyed_bulk_entity_plan(
+                        token,
+                        prepared.spec.clone(),
+                        &key,
+                        PendingEntityId::mint(),
+                    )
+                    .await
+                    .map_err(planned)?;
                 holders.insert(group, KeyHolder::Slot(index));
                 slots.push(Slot::Create {
                     prepared,
                     normalized,
-                    pending: Some(PendingEntityId::mint()),
+                    planned: Box::new(entity_plan),
                 });
                 continue;
             };
@@ -342,23 +372,54 @@ impl KgPack {
             .map_err(judged)?;
             match holder {
                 KeyHolder::Stored(stored) => {
+                    let (_, plan) = self
+                        .runtime
+                        .prepare_keyed_entity_reload_plan(token, &stored, &prepared.spec)
+                        .await
+                        .map_err(planned)?;
                     holders.insert(group, KeyHolder::Slot(index));
                     slots.push(Slot::Reload {
                         holder: stored,
                         prepared,
                         normalized,
+                        plan,
                     });
                 }
                 KeyHolder::Slot(slot) => {
                     // ADR-221 section 1: the earlier item's row takes this
-                    // payload, and both items answer for that one row.
+                    // payload, and both items answer for that one row. The
+                    // earlier payload was admitted when its item was
+                    // judged; the row is planned again with this one.
                     match slots.get_mut(slot) {
                         Some(Slot::Create {
-                            prepared: earlier, ..
-                        })
-                        | Some(Slot::Reload {
-                            prepared: earlier, ..
+                            prepared: earlier,
+                            planned: entity_plan,
+                            ..
                         }) => {
+                            self.runtime
+                                .replan_keyed_bulk_entity(
+                                    token,
+                                    prepared.spec.clone(),
+                                    &key,
+                                    entity_plan,
+                                )
+                                .await
+                                .map_err(planned)?;
+                            earlier.spec = prepared.spec;
+                            earlier.args = prepared.args;
+                        }
+                        Some(Slot::Reload {
+                            holder: reloaded,
+                            prepared: earlier,
+                            plan,
+                            ..
+                        }) => {
+                            let (_, replanned) = self
+                                .runtime
+                                .prepare_keyed_entity_reload_plan(token, reloaded, &prepared.spec)
+                                .await
+                                .map_err(planned)?;
+                            *plan = replanned;
                             earlier.spec = prepared.spec;
                             earlier.args = prepared.args;
                         }
@@ -375,9 +436,8 @@ impl KgPack {
         Ok((slots, read))
     }
 
-    /// Build every judged item's plan, run them as one unit, and answer each
-    /// item. `Ok(None)` when the unit rolled back, with the failure kept in
-    /// `rolled_back`.
+    /// Run every judged item's plan as one unit and answer each item.
+    /// `Ok(Err(..))` names the item at which the unit rolled back.
     async fn run_keyed_bulk_unit(
         &self,
         token: &NamespaceToken,
@@ -388,29 +448,14 @@ impl KgPack {
         let mut plan_items: Vec<usize> = Vec::new();
         let mut rows: Vec<Row> = Vec::with_capacity(slots.len());
         for (index, slot) in slots.into_iter().enumerate() {
-            let planned = |error| KeyedBulkFailure::Plan { index, error };
             match slot {
                 Slot::Create {
                     prepared,
                     normalized,
-                    pending,
+                    planned,
                 } => {
-                    let PreparedBulkEntity {
-                        spec,
-                        args,
-                        hook,
-                        key,
-                        ..
-                    } = prepared;
-                    let (entity, plan) = match (key, pending) {
-                        (Some(key), Some(pending)) => {
-                            self.runtime
-                                .prepare_keyed_bulk_entity_plan(token, spec, &key, pending)
-                                .await
-                        }
-                        _ => self.runtime.prepare_bulk_entity_plan(token, spec).await,
-                    }
-                    .map_err(planned)?;
+                    let PreparedBulkEntity { args, hook, .. } = prepared;
+                    let (entity, plan) = *planned;
                     plans.push(plan);
                     plan_items.push(index);
                     rows.push(Row::Created(Box::new(BulkWrite::Entity {
@@ -420,26 +465,17 @@ impl KgPack {
                         normalized,
                     })));
                 }
-                Slot::Note(PreparedBulkNote { spec, args, hook }) => {
-                    let (note, plan) = self
-                        .runtime
-                        .prepare_bulk_note_plan(token, spec)
-                        .await
-                        .map_err(planned)?;
+                Slot::Note { write, plan } => {
                     plans.push(plan);
                     plan_items.push(index);
-                    rows.push(Row::Created(Box::new(BulkWrite::Note { hook, args, note })));
+                    rows.push(Row::Created(write));
                 }
                 Slot::Reload {
                     holder,
-                    prepared,
                     normalized,
+                    plan,
+                    ..
                 } => {
-                    let (_, plan) = self
-                        .runtime
-                        .prepare_keyed_entity_reload_plan(token, &holder, &prepared.spec)
-                        .await
-                        .map_err(planned)?;
                     plans.push(plan);
                     plan_items.push(index);
                     rows.push(Row::Updated {
@@ -452,11 +488,20 @@ impl KgPack {
                     target,
                     updated,
                     normalized,
-                } => rows.push(Row::Same {
-                    target,
-                    updated,
-                    normalized,
-                }),
+                } => {
+                    // An identical replay of a stored holder writes
+                    // nothing; the unit asserts the holder is still the
+                    // row the item was judged against.
+                    if let KeyHolder::Stored(stored) = &target {
+                        plans.push(keyed_replay_assertion_plan(stored));
+                        plan_items.push(index);
+                    }
+                    rows.push(Row::Same {
+                        target,
+                        updated,
+                        normalized,
+                    });
+                }
             }
         }
 
@@ -492,15 +537,20 @@ impl KgPack {
                 write.after_create(&self.runtime).await;
             }
         }
-        let committed_row = |target: &KeyHolder| -> Option<(Uuid, String)> {
+        // The row a target names, and whether the unit reloaded it: a
+        // reloaded row's post-commit reindex error belongs to every answer
+        // that names it.
+        let committed_row = |target: &KeyHolder| -> Option<(Uuid, String, bool)> {
             match target {
-                KeyHolder::Stored(stored) => Some((stored.id, stored.kind.clone())),
+                KeyHolder::Stored(stored) => Some((stored.id, stored.kind.clone(), false)),
                 KeyHolder::Slot(slot) => match rows.get(*slot)? {
                     Row::Created(write) => match write.as_ref() {
-                        BulkWrite::Entity { entity, .. } => Some((entity.id, entity.kind.clone())),
+                        BulkWrite::Entity { entity, .. } => {
+                            Some((entity.id, entity.kind.clone(), false))
+                        }
                         BulkWrite::Note { .. } => None,
                     },
-                    Row::Updated { id, kind, .. } => Some((*id, kind.clone())),
+                    Row::Updated { id, kind, .. } => Some((*id, kind.clone(), true)),
                     _ => None,
                 },
             }
@@ -533,14 +583,17 @@ impl KgPack {
                     updated,
                     normalized,
                 } => {
-                    let (id, kind) = committed_row(target).ok_or_else(|| {
+                    let (id, kind, reloaded) = committed_row(target).ok_or_else(|| {
                         RuntimeError::Internal(format!(
                             "keyed bulk create: items[{index}] names no committed row"
                         ))
                     })?;
-                    let (result, _) = self
+                    let (mut result, _) = self
                         .keyed_row_answer(token, id, &kind, *updated, verbose)
                         .await?;
+                    if let (true, Some(error)) = (reloaded, &reindex_error) {
+                        result["reindex_error"] = json!(error);
+                    }
                     ItemAnswer {
                         result,
                         normalized: normalized.clone(),

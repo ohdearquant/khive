@@ -144,6 +144,26 @@ async fn schedule_schedule_rejects_create_bulk_items_the_kg_handler_rejects() {
             "requires content",
         ),
         (
+            serde_json::json!({"kind": "observation", "content": "c", "key": "k"}),
+            "key and on_key apply only to entity items",
+            "key and on_key apply only to entity items",
+        ),
+        (
+            serde_json::json!({"kind": "observation", "content": "c", "on_key": "update"}),
+            "key and on_key apply only to entity items",
+            "key and on_key apply only to entity items",
+        ),
+        (
+            serde_json::json!({"kind": "concept", "name": "x", "on_key": "update"}),
+            "on_key applies only to a keyed entity item",
+            "on_key applies only to a keyed entity item",
+        ),
+        (
+            serde_json::json!({"kind": "concept", "name": "x", "key": "k", "on_key": "replace"}),
+            "on_key accepts only",
+            "on_key accepts only",
+        ),
+        (
             serde_json::json!({"kind": "note", "note_kind": "nope", "content": "c"}),
             "unknown note_kind",
             "unknown note_kind",
@@ -190,4 +210,5 @@ const KG_BULK_ENTRY_ITEMS: &[&str] = &[
     r#"{"kind":"document","entity_type":"paper","name":"drift-typed","description":"d"}"#,
     r#"{"kind":"note","note_kind":"insight","name":"drift-note","content":"c","salience":0.5}"#,
     r#"{"kind":"observation","content":"drift-props","properties":{"k":"v"},"tags":["t"]}"#,
+    r#"{"kind":"concept","name":"drift-keyed","key":"drift-key","on_key":"update"}"#,
 ];

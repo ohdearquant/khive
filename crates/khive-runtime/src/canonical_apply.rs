@@ -28,6 +28,7 @@ fn id128(id: Uuid) -> khive_types::Id128 {
 }
 
 mod entities;
+pub(crate) use entities::unchanged_entity_assertion_plan;
 mod links;
 mod notes;
 mod projection;

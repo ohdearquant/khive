@@ -248,10 +248,10 @@ pub use operations::{
 pub use operations::{
     base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,
     entity_carries_create_payload, entity_key_conflict, hex_prefix_to_uuid_pattern,
-    merge_entry_metadata, same_create_payload, uuid_prefix_bounds, ConditionalInsertStage,
-    EdgeEndpointKind, EntityCreateSpec, KeyedEntityCreate, KeyedEntityReload, LinkSpec,
-    NoteCreateSpec, NoteSearchHit, NoteSearchOutcome, PendingEntityId, PostCommitDegradation,
-    PrefixScope, QueryResult, Resolved,
+    keyed_replay_assertion_plan, merge_entry_metadata, same_create_payload, uuid_prefix_bounds,
+    ConditionalInsertStage, EdgeEndpointKind, EntityCreateSpec, KeyedEntityCreate,
+    KeyedEntityReload, LinkSpec, NoteCreateSpec, NoteSearchHit, NoteSearchOutcome, PendingEntityId,
+    PostCommitDegradation, PrefixScope, QueryResult, Resolved,
 };
 pub use pack::{
     resolve_explicit_namespace, ChannelIngestCapability, DispatchHook, HandlerDef,

@@ -183,6 +183,25 @@ impl KhiveRuntime {
             .await
     }
 
+    /// [`Self::prepare_keyed_bulk_entity_plan`] again for the row `planned`
+    /// holds, with `spec` as its payload: a later item of the same request
+    /// replaced the payload under `on_key: "update"` (ADR-221 section 1).
+    /// The row keeps its id and the new plan replaces the old one, so one id
+    /// still names one new row. On a refusal `planned` is left as it was.
+    pub async fn replan_keyed_bulk_entity(
+        &self,
+        token: &NamespaceToken,
+        spec: EntityCreateSpec,
+        key: &str,
+        planned: &mut (Entity, AtomicOpPlan),
+    ) -> RuntimeResult<()> {
+        let id = PendingEntityId(planned.0.id);
+        *planned = self
+            .prepare_keyed_bulk_entity_plan(token, spec, key, id)
+            .await?;
+        Ok(())
+    }
+
     async fn finish_bulk_entity_plan(
         &self,
         token: &NamespaceToken,

@@ -74,6 +74,17 @@ impl PendingEntityId {
     }
 }
 
+/// A plan that writes nothing and holds only while `holder` is still the
+/// live row it was read as: same id, `updated_at`, `deleted_at` and version.
+///
+/// A keyed bulk create that answers an item as an identical replay of a
+/// stored holder joins this to its unit (ADR-221 section 1), so the replay
+/// is judged inside the unit's transaction: a holder that changed after it
+/// was read rolls the unit back and the request is judged again.
+pub fn keyed_replay_assertion_plan(holder: &Entity) -> AtomicOpPlan {
+    crate::canonical_apply::unchanged_entity_assertion_plan(holder, "keyed-replay-assertion")
+}
+
 /// Whether `holder` carries the payload `spec` asks for, as a keyed create
 /// compares them.
 pub fn entity_carries_create_payload(holder: &Entity, spec: &EntityCreateSpec) -> bool {

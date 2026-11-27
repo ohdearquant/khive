@@ -824,3 +824,88 @@ async fn a_bulk_reload_plan_is_bound_to_the_version_it_read() {
     assert_eq!(after.name, "Renamed");
     assert_eq!(after.version, stored.version);
 }
+
+#[tokio::test]
+async fn a_replay_assertion_holds_only_while_the_holder_is_unchanged() {
+    let rt = rt();
+    let tok = tok("entity-keys-replay-assertion");
+    created(
+        keyed(&rt, &tok, "concept", "k", "Name", None, vec![])
+            .await
+            .unwrap(),
+    );
+    let read = rt
+        .get_entity_by_key(&tok, "concept", "k")
+        .await
+        .unwrap()
+        .expect("holder");
+    let outcome = run_atomic_unit(rt.sql().as_ref(), vec![keyed_replay_assertion_plan(&read)])
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, AtomicRunOutcome::Committed { .. }),
+        "{outcome:?}"
+    );
+    let unchanged = rt
+        .get_entity_by_key(&tok, "concept", "k")
+        .await
+        .unwrap()
+        .expect("holder");
+    assert_eq!(unchanged.version, read.version);
+    assert_eq!(unchanged.updated_at, read.updated_at);
+
+    let (_, plan) = rt
+        .prepare_keyed_entity_reload_plan(&tok, &read, &bulk_spec("Renamed", None))
+        .await
+        .unwrap();
+    let outcome = run_atomic_unit(rt.sql().as_ref(), vec![plan])
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, AtomicRunOutcome::Committed { .. }),
+        "{outcome:?}"
+    );
+    let outcome = run_atomic_unit(rt.sql().as_ref(), vec![keyed_replay_assertion_plan(&read)])
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, AtomicRunOutcome::RolledBack { .. }),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_replanned_bulk_row_keeps_its_id_and_takes_the_new_payload() {
+    let rt = rt();
+    let tok = tok("entity-keys-replan");
+    let mut planned = rt
+        .prepare_keyed_bulk_entity_plan(
+            &tok,
+            bulk_spec("First", None),
+            "k",
+            PendingEntityId::mint(),
+        )
+        .await
+        .unwrap();
+    let id = planned.0.id;
+    rt.replan_keyed_bulk_entity(&tok, bulk_spec("Second", None), "k", &mut planned)
+        .await
+        .unwrap();
+    assert_eq!(planned.0.id, id);
+    assert_eq!(planned.0.name, "Second");
+    let outcome = run_atomic_unit(rt.sql().as_ref(), vec![planned.1])
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, AtomicRunOutcome::Committed { .. }),
+        "{outcome:?}"
+    );
+    let stored = rt
+        .get_entity_by_key(&tok, "concept", "k")
+        .await
+        .unwrap()
+        .expect("holder");
+    assert_eq!(stored.id, id);
+    assert_eq!(stored.name, "Second");
+    assert_eq!(live_count(&rt, &tok, "concept").await, 1);
+}

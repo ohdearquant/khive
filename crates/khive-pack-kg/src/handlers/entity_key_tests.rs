@@ -603,11 +603,24 @@ fn on_key_item(name: &str, key: &str) -> Value {
     item
 }
 
+/// The live holder of `key`, or `None` when the read answers not-found.
+/// Any other failure fails the test, so a read that breaks for another
+/// reason cannot pass for an absent key.
 async fn key_holder(registry: &khive_runtime::VerbRegistry, key: &str) -> Option<Value> {
-    registry
+    match registry
         .dispatch("get", json!({"kind": "concept", "key": key}))
         .await
-        .ok()
+    {
+        Ok(holder) => Some(holder),
+        Err(RuntimeError::Khive(error)) if error.kind() == khive_types::ErrorKind::NotFound => None,
+        Err(error) => panic!("get by key {key:?} failed: {error:?}"),
+    }
+}
+
+/// A credential-shaped value the runtime secret gate refuses, built at run
+/// time so the source holds no such literal.
+fn credential() -> String {
+    format!("ghp_{}", "A".repeat(36))
 }
 
 #[tokio::test]
@@ -958,4 +971,82 @@ async fn bulk_item_key_shape_refusals_write_nothing() {
     }
     assert_eq!(concept_count(&registry).await, 0);
     assert!(key_holder(&registry, "fresh").await.is_none());
+}
+
+#[tokio::test]
+async fn a_bulk_item_whose_payload_a_later_item_replaces_is_still_admitted() {
+    let (_rt, _token, _pack, registry) = configured().await;
+    let mut refused = keyed_item("Smith 2024", "k");
+    refused["description"] = json!(credential());
+    let items = || vec![refused.clone(), on_key_item("Smith et al. 2024", "k")];
+
+    let error = registry
+        .dispatch("create", bulk(items(), true))
+        .await
+        .expect_err("the first item's own payload is refused");
+    assert!(format!("{error}").contains("items[0]"), "{error}");
+    assert!(key_holder(&registry, "k").await.is_none());
+    assert_eq!(concept_count(&registry).await, 0);
+
+    // Sent one by one in order, the first is refused and the second then
+    // finds the key free.
+    let response = registry
+        .dispatch("create", bulk(items(), false))
+        .await
+        .expect("best-effort bulk");
+    assert_eq!(response["results"][0]["ok"], json!(false), "{response}");
+    assert_eq!(
+        response["results"][1]["result"]["created"],
+        json!(true),
+        "{response}"
+    );
+    let holder = key_holder(&registry, "k").await.expect("holder");
+    assert_eq!(holder["name"], json!("Smith et al. 2024"), "{holder}");
+    assert_eq!(concept_count(&registry).await, 1);
+}
+
+#[tokio::test]
+async fn a_reload_reindex_error_reaches_every_answer_that_names_the_row() {
+    let (rt, token, _pack, registry) = configured().await;
+    let created = registry
+        .dispatch("create", keyed_create("Smith 2024"))
+        .await
+        .expect("keyed create");
+    rt.text(&token).unwrap();
+    let mut writer = rt.sql().writer().await.unwrap();
+    writer
+        .execute_script(
+            "CREATE TRIGGER fail_reload_fts BEFORE INSERT ON fts_entities_rowids \
+             BEGIN SELECT RAISE(ABORT, 'forced FTS map failure'); END;"
+                .into(),
+        )
+        .await
+        .unwrap();
+    drop(writer);
+    let response = registry
+        .dispatch(
+            "create",
+            bulk(
+                vec![
+                    on_key_item("Smith et al. 2024", "paper:smith2024"),
+                    on_key_item("Smith and Jones 2024", "paper:smith2024"),
+                    keyed_item("Smith and Jones 2024", "paper:smith2024"),
+                ],
+                true,
+            ),
+        )
+        .await
+        .expect("the unit commits before its reindex");
+    for index in 0..3 {
+        let result = &response["results"][index]["result"];
+        assert_eq!(result["id"], created["id"], "{response}");
+        assert!(
+            result["reindex_error"].is_string(),
+            "items[{index}]: {response}"
+        );
+    }
+    let holder = key_holder(&registry, "paper:smith2024")
+        .await
+        .expect("holder");
+    assert_eq!(holder["name"], json!("Smith and Jones 2024"), "{holder}");
 }
