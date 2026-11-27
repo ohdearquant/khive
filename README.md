@@ -57,7 +57,7 @@ To build from a source checkout instead, see [Quick start](#quick-start).
 
 | Capability                  | How                                                                                                                                                      |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **170 verbs, 14 packs**     | KG, GTD, memory, brain, comm, schedule, knowledge, session, tool, exec, git, code, workspace, blob: all load by default                                  |
+| **171 verbs, 14 packs**     | KG, GTD, memory, brain, comm, schedule, knowledge, session, tool, exec, git, code, workspace, blob: all load by default                                  |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
 | **Typed edges**             | 20 closed relations in 10 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic, ownership)          |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
@@ -95,26 +95,26 @@ request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
-All 14 packs load by default, giving **170 verbs** out of the box (updated from the
+All 14 packs load by default, giving **171 verbs** out of the box (updated from the
 current handler declarations; verify again with `request(ops="verbs()")`
 before editing this table):
 
-| Pack          | Prefix       | Verbs | What it does                                                                                                                                                                                               |
-| ------------- | ------------ | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **kg**        | _(bare)_     | 31    | Entities, edges, notes, graph queries, reference resolution, caller identity, WAL diagnostics                                                                                                              |
-| **gtd**       | `gtd.`       | 8     | Task lifecycle, per-assignee counts, timestamp census, and explicit historical repair                                                                                                                      |
-| **memory**    | `memory.`    | 6     | Salience-weighted remember / decay-ranked recall                                                                                                                                                           |
-| **brain**     | `brain.`     | 17    | Bayesian user profiles + feedback loop                                                                                                                                                                     |
-| **comm**      | `comm.`      | 16    | Threaded messaging with sender-side internal delivery confirmation                                                                                                                                         |
-| **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution                                                                                                                                                                     |
-| **knowledge** | `knowledge.` | 21    | Atom-based KB with embedding rerank search                                                                                                                                                                 |
-| **session**   | `session.`   | 7     | Session records, dependency-gated mirror search, store stats, and compaction (store/list/resume/export/search/stats/vacuum)                                                                                |
-| **tool**      | `tool.`      | 15    | Capability registry, discovery by capability, and use policy: check/request/grant (ADR-180)                                                                                                                |
-| **exec**      | `exec.`      | 9     | One declared command in a sandbox over a materialized tree, receipts for every run (ADR-181)                                                                                                               |
-| **git**       | `git.`       | 23    | Ingest, branch/commit/update_ref/push (ADR-108), dev loop: checkout, fetch, diff, gates, receipts, reconcile, status, log, init, PR open/review/merge/state/edit/close, check log, branch delete (ADR-182) |
-| **code**      | `code.`      | 4     | Source ingest and registered-map list, search, dependency reads (ADR-085, ADR-139)                                                                                                                         |
-| **workspace** | _(none)_     | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873)                                                                                                               |
-| **blob**      | `blob.`      | 9     | Content-addressed `put`/`get`/`stat`, staged `begin`/`put_part`/`commit`/`abort`, and opt-in `blob.import`/`blob.export` file transfers over `BlobStore` (ADR-111, ADR-173)                                |
+| Pack          | Prefix       | Verbs | What it does                                                                                                                                                                                                           |
+| ------------- | ------------ | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **kg**        | _(bare)_     | 31    | Entities, edges, notes, graph queries, reference resolution, caller identity, WAL diagnostics                                                                                                                          |
+| **gtd**       | `gtd.`       | 8     | Task lifecycle, per-assignee counts, timestamp census, and explicit historical repair                                                                                                                                  |
+| **memory**    | `memory.`    | 6     | Salience-weighted remember / decay-ranked recall                                                                                                                                                                       |
+| **brain**     | `brain.`     | 17    | Bayesian user profiles + feedback loop                                                                                                                                                                                 |
+| **comm**      | `comm.`      | 16    | Threaded messaging with sender-side internal delivery confirmation                                                                                                                                                     |
+| **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution                                                                                                                                                                                 |
+| **knowledge** | `knowledge.` | 21    | Atom-based KB with embedding rerank search                                                                                                                                                                             |
+| **session**   | `session.`   | 7     | Session records, dependency-gated mirror search, store stats, and compaction (store/list/resume/export/search/stats/vacuum)                                                                                            |
+| **tool**      | `tool.`      | 15    | Capability registry, discovery by capability, and use policy: check/request/grant (ADR-180)                                                                                                                            |
+| **exec**      | `exec.`      | 9     | One declared command in a sandbox over a materialized tree, receipts for every run (ADR-181)                                                                                                                           |
+| **git**       | `git.`       | 24    | Ingest, branch/commit/update_ref/push (ADR-108), dev loop: checkout, fetch, diff, gates, receipts, reconcile, status, log, init, PR open/review/merge/state/edit/close, issue read, check log, branch delete (ADR-182) |
+| **code**      | `code.`      | 4     | Source ingest and registered-map list, search, dependency reads (ADR-085, ADR-139)                                                                                                                                     |
+| **workspace** | _(none)_     | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873)                                                                                                                           |
+| **blob**      | `blob.`      | 9     | Content-addressed `put`/`get`/`stat`, staged `begin`/`put_part`/`commit`/`abort`, and opt-in `blob.import`/`blob.export` file transfers over `BlobStore` (ADR-111, ADR-173)                                            |
 
 `create`, `list`, `search` take `kind=entity|note` (or `kind=edge` for `list`).
 `get`, `update`, `delete`, `merge` are UUID-only: they auto-detect the record type.
@@ -310,7 +310,7 @@ kkernel --version   # confirms the binary and version you just installed
 ```
 
 All 14 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
-MCP client discovers the `request` tool with the full 170-verb catalog.
+MCP client discovers the `request` tool with the full 171-verb catalog.
 
 ### Usage
 
@@ -419,7 +419,7 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Status
 
-170 verbs across 14 packs, 9 entity kinds, 20 edge relations, daemon warm startup
+171 verbs across 14 packs, 9 entity kinds, 20 edge relations, daemon warm startup
 (ADR-049), knowledge search with embedding rerank, Bayesian brain profiles, threaded messaging,
 scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.
