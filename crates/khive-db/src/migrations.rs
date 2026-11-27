@@ -438,6 +438,15 @@ const V68_UP: &str = include_str!("../sql/068-entity-aliases.sql");
 /// [`ENTITY_KEYS_DDL`] is.
 pub const ENTITY_ALIASES_DDL: &str = V68_UP;
 
+const V69_UP: &str = include_str!("../sql/069-entity-key-kind-guard.sql");
+
+/// DDL for the trigger on `entities` that refuses a kind change of a live
+/// entity holding keys, and a restore under a kind other than the one its keys
+/// were released under (ADR-221 section 1). Shared between migration V69 and
+/// the entity store's idempotent schema setup, as [`ENTITY_KEYS_DDL`] is; it
+/// names `entity_keys`, so it runs after that DDL.
+pub const ENTITY_KEY_KIND_GUARD_DDL: &str = V69_UP;
+
 /// Retained V66 schema needs only its ledger restored, not an index rebuild.
 fn migrate_undelivered_due_index(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
     let installed: Option<String> = tx
@@ -924,6 +933,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 68,
         name: "entity_aliases",
         up: V68_UP,
+    },
+    VersionedMigration {
+        version: 69,
+        name: "entity_key_kind_guard",
+        up: V69_UP,
     },
 ];
 
