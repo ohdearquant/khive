@@ -573,6 +573,12 @@ impl VerbRegistry {
         ("charter", "charter.list"),
         ("charter", "charter.runs"),
         ("charter", "charter.waiting"),
+        // forms (graph reads only; the five writers commit one changeset each)
+        ("forms", "forms.resolve"),
+        ("forms", "forms.neighbourhood"),
+        ("forms", "forms.check"),
+        ("forms", "forms.lint"),
+        ("forms", "forms.export"),
         // Registered rollback-mode map reads: no domain or maintenance writes.
         ("code", "code.deps"),
         ("code", "code.list"),

@@ -68,6 +68,7 @@ mod _pack_links {
     use khive_pack_exec::ExecPack as _;
     #[cfg(feature = "pack-formal")]
     use khive_pack_formal::FormalPack as _;
+    use khive_pack_forms::FormsPack as _;
     use khive_pack_git::GitPack as _;
     use khive_pack_gtd::GtdPack as _;
     use khive_pack_kg::KgPack as _;

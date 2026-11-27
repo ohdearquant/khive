@@ -5,7 +5,7 @@
 
 /// Revision of the reviewed classification contract, included in policy identity.
 /// Bump whenever a classification or the allowed-read contract changes.
-pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v32";
+pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v33";
 
 /// Strongest caller-requested effect of a reviewed operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +111,16 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("exec.tree_diff", OperationAccess::Read),
     ("exec.tree_get", OperationAccess::Read),
     ("exec.tree_put", OperationAccess::Write),
+    ("forms.add_item", OperationAccess::Write),
+    ("forms.check", OperationAccess::Read),
+    ("forms.export", OperationAccess::Read),
+    ("forms.lint", OperationAccess::Read),
+    ("forms.load", OperationAccess::Write),
+    ("forms.neighbourhood", OperationAccess::Read),
+    ("forms.replay", OperationAccess::Write),
+    ("forms.resolve", OperationAccess::Read),
+    ("forms.same", OperationAccess::Write),
+    ("forms.split", OperationAccess::Write),
     ("get", OperationAccess::Read),
     ("git.branch", OperationAccess::Write),
     ("git.branch_delete", OperationAccess::Write),
