@@ -552,6 +552,11 @@ impl KhiveRuntime {
                     token,
                     record.id,
                     archive_patch(record),
+                    // ADR-221 section 3: an archive that renames a stored
+                    // entity keeps the destination's old name as a `rename`
+                    // alias, as the `update` verb does, so a lookup by that
+                    // name still finds the entity.
+                    &crate::EntityAliasChange::default().keeping_old_name(true),
                     Some(current.version),
                 )
                 .await?;

@@ -702,9 +702,9 @@ pub(super) fn merge_entity_sql(
 
 /// Names an entity merge adds to the kept entity as `merge` aliases, in order:
 /// the merged-away entity's name, its aliases, then the kept entity's previous
-/// name when the merge takes the other name. A name equal to the merged name,
-/// already held by the kept entity, or already listed is skipped (ADR-221
-/// section 3).
+/// name when the merge takes the other name. An empty name, a name equal to the
+/// merged name, one already held by the kept entity, or one already listed is
+/// skipped (ADR-221 section 3).
 fn merge_alias_additions(into: &Entity, from: &Entity, merged_name: &str) -> Vec<String> {
     let previous_into_name = (into.name != merged_name).then_some(into.name.as_str());
     let candidates = std::iter::once(from.name.as_str())
@@ -712,7 +712,8 @@ fn merge_alias_additions(into: &Entity, from: &Entity, merged_name: &str) -> Vec
         .chain(previous_into_name);
     let mut added: Vec<String> = Vec::new();
     for candidate in candidates {
-        if candidate == merged_name
+        if candidate.is_empty()
+            || candidate == merged_name
             || into.aliases.iter().any(|held| held.alias == candidate)
             || added.iter().any(|listed| listed == candidate)
         {

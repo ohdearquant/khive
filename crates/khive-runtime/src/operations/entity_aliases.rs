@@ -144,8 +144,8 @@ pub(crate) fn caller_alias_set(entity: &Entity) -> BTreeSet<&str> {
 ///
 /// `previous_name` is the name the stored row had before this write, `None`
 /// for a row this write creates. When the write renames the entity, the old
-/// name becomes a `rename` alias unless the change drops it or the entity
-/// already holds it.
+/// name becomes a `rename` alias unless the change drops it, the entity
+/// already holds it, or the old name is empty.
 ///
 /// The projection is what the statements leave in `entity_aliases`, so the
 /// text and vector bodies built from `entity` index the aliases the stored
@@ -218,7 +218,9 @@ pub(crate) fn apply_entity_alias_change(
     // ADR-221 section 3: a rename keeps the old name as a `rename` alias in
     // the same transaction. A caller alias of that string named by this same
     // change was written above and is left as it is.
-    if let Some(previous) = previous_name.filter(|previous| *previous != name) {
+    if let Some(previous) =
+        previous_name.filter(|previous| *previous != name && !previous.is_empty())
+    {
         if !change.drop_old_name && !entity.aliases.iter().any(|held| held.alias == previous) {
             statements.push(entity_alias_insert_statement(
                 &namespace,

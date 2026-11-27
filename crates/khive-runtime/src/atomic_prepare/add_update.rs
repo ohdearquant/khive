@@ -922,14 +922,16 @@ pub async fn prepare_update(
 
 /// Build an entity update plan from a typed patch. Proposal changesets use
 /// this entry point to preserve the typed patch directly, without translating
-/// it through raw verb parameters.
+/// it through raw verb parameters. `aliases` carries the caller's choice of
+/// whether a rename keeps the old name (ADR-221 section 3).
 pub async fn prepare_update_entity_plan(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     id: Uuid,
     patch: crate::curation::EntityPatch,
+    aliases: &crate::EntityAliasChange,
 ) -> RuntimeResult<AtomicOpPlan> {
-    prepare_update_entity_plan_with_version(runtime, token, id, patch, None).await
+    prepare_update_entity_plan_with_version(runtime, token, id, patch, aliases, None).await
 }
 
 pub(super) async fn prepare_update_entity_plan_with_version_and_type(
@@ -937,6 +939,7 @@ pub(super) async fn prepare_update_entity_plan_with_version_and_type(
     token: &NamespaceToken,
     id: Uuid,
     patch: crate::curation::EntityPatch,
+    aliases: &crate::EntityAliasChange,
     expected_version: Option<i64>,
     required_entity_type: Option<&str>,
 ) -> RuntimeResult<AtomicOpPlan> {
@@ -946,7 +949,7 @@ pub(super) async fn prepare_update_entity_plan_with_version_and_type(
         id,
         patch,
         &[],
-        &crate::EntityAliasChange::default(),
+        aliases,
         expected_version,
         required_entity_type,
     )
@@ -972,11 +975,14 @@ fn optional_alias_list(args: &Value, field: &str) -> RuntimeResult<Vec<String>> 
 /// Import uses this projection for endpoint validation without applying the
 /// patch or invoking kind hooks again. Its version remains the captured row
 /// revision; applying the plan advances the persisted revision once.
+/// `aliases` carries the caller's choice of whether a rename keeps the old
+/// name (ADR-221 section 3).
 pub(crate) async fn prepare_update_entity_record(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     id: Uuid,
     patch: crate::curation::EntityPatch,
+    aliases: &crate::EntityAliasChange,
     expected_version: Option<i64>,
 ) -> RuntimeResult<(khive_storage::Entity, AtomicOpPlan)> {
     prepare_update_entity_record_with_version_and_type(
@@ -985,7 +991,7 @@ pub(crate) async fn prepare_update_entity_record(
         id,
         patch,
         &[],
-        &crate::EntityAliasChange::default(),
+        aliases,
         expected_version,
         None,
     )

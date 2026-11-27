@@ -387,6 +387,12 @@ impl KhiveRuntime {
     }
 
     /// Apply an entity patch and report committed but unfinished index targets.
+    ///
+    /// A rename through this call keeps no `rename` alias: packs use it for
+    /// names they derive themselves, such as a placeholder replaced by the
+    /// real name. The `update` verb keeps the old name through
+    /// [`Self::update_entity_with_aliases_and_index_report`] (ADR-221
+    /// section 3).
     pub async fn update_entity_with_index_report(
         &self,
         token: &NamespaceToken,
@@ -400,7 +406,7 @@ impl KhiveRuntime {
             patch,
             &[],
             expected_version,
-            &crate::EntityAliasChange::default(),
+            &crate::EntityAliasChange::default().keeping_old_name(false),
         )
         .await
     }

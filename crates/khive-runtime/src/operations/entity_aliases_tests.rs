@@ -177,6 +177,16 @@ fn keep_old_name_false_keeps_no_alias() {
 }
 
 #[test]
+fn an_empty_old_name_keeps_no_alias() {
+    let mut entity = Entity::new("ns", "concept", "Named");
+    let (changed, statements, _) =
+        apply_entity_alias_change(&mut entity, &EntityAliasChange::default(), 7, Some(""));
+    assert!(!changed);
+    assert!(statements.is_empty());
+    assert!(entity.aliases.is_empty());
+}
+
+#[test]
 fn the_old_name_named_as_a_caller_alias_by_the_same_change_stays_caller() {
     let mut entity = Entity::new("ns", "concept", "New");
     let change = EntityAliasChange::update(&aliases(&["Old"]), &[]).unwrap();

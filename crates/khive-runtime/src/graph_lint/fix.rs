@@ -257,6 +257,9 @@ impl LintCapture {
                         properties: Some(json!({"status":"deprecated"})),
                         ..Default::default()
                     },
+                    // The patch sets a property and never a name, so no
+                    // rename alias can follow; the choice matches `update`.
+                    &crate::EntityAliasChange::default().keeping_old_name(true),
                     Some(self.all_entities[&id].version),
                 )
                 .await?

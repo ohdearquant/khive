@@ -2558,8 +2558,8 @@ async fn update_entity_reindexes_when_name_changes() {
     let hits_new = fts_hit(&rt, &tok, "NewName").await;
 
     assert!(
-        hits_old.contains(&entity.id),
-        "the old name stays findable through its rename alias"
+        !hits_old.contains(&entity.id),
+        "the plain runtime update keeps no rename alias, so the old name no longer matches"
     );
     assert!(
         hits_new.contains(&entity.id),
@@ -11202,6 +11202,33 @@ async fn keep_old_name_false_keeps_no_alias_and_the_event_names_both() {
     assert_eq!(events[0].payload["name"], "New Name");
 }
 
+/// A rename through the plain runtime update keeps no alias: packs use it
+/// for names they derive themselves. The event still names both names.
+#[tokio::test]
+async fn a_rename_through_the_plain_runtime_update_keeps_no_alias() {
+    let rt = rt();
+    let tok = NamespaceToken::local();
+    let entity = rt
+        .create_entity(&tok, "concept", None, "Old Name", None, None, vec![])
+        .await
+        .unwrap();
+    let (renamed, _) = rt
+        .update_entity_with_embedding_report(&tok, entity.id, rename_to("New Name"))
+        .await
+        .unwrap();
+    assert!(renamed.aliases.is_empty());
+    assert!(rt
+        .get_entity(&tok, entity.id)
+        .await
+        .unwrap()
+        .aliases
+        .is_empty());
+    let events = entity_update_events(&rt, &tok).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].payload["previous_name"], "Old Name");
+    assert_eq!(events[0].payload["name"], "New Name");
+}
+
 /// An update that leaves the name alone names no previous name.
 #[tokio::test]
 async fn an_update_that_keeps_the_name_names_no_previous_name() {
@@ -11271,4 +11298,37 @@ async fn the_admin_route_renames_onto_a_held_alias_and_keeps_the_old_name() {
         serde_json::json!(["name", "aliases"])
     );
     assert_eq!(events[0].payload["previous_name"], "A");
+}
+
+/// An entity with an empty name, such as a pack's placeholder row before its
+/// first update, can be merged; its empty name never becomes an alias.
+#[tokio::test]
+async fn a_merge_keeps_no_empty_name_as_an_alias() {
+    let rt = rt();
+    let tok = NamespaceToken::local();
+    let kept = rt
+        .create_entity(&tok, "concept", None, "Kept", None, None, vec![])
+        .await
+        .unwrap();
+    let placeholder = khive_storage::Entity::new(tok.namespace().as_str(), "concept", "");
+    rt.entities(&tok)
+        .unwrap()
+        .upsert_entity(placeholder.clone())
+        .await
+        .unwrap();
+    rt.merge_entity_with_reason_and_force(
+        &tok,
+        kept.id,
+        placeholder.id,
+        EntityDedupMergePolicy::PreferInto,
+        ContentMergeStrategy::Append,
+        false,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    let merged = rt.get_entity(&tok, kept.id).await.unwrap();
+    assert_eq!(merged.name, "Kept");
+    assert!(merged.aliases.is_empty(), "{:?}", merged.aliases);
 }

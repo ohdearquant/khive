@@ -678,7 +678,8 @@ async fn excluded_atomic_prepare_and_admin_update_keep_legacy_refusal() {
         EntityPatch {
             description: Some(Some(f.value.clone())),
             ..Default::default()
-        }
+        },
+        &crate::EntityAliasChange::default(),
     )
     .await
     .is_err());

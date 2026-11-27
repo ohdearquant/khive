@@ -550,6 +550,10 @@ impl ProposalApplyWorker {
                             tags: patch.tags.clone(),
                             entity_type,
                         },
+                        // ADR-221 section 3: an approved change set renames
+                        // as the `update` verb does by default, keeping the
+                        // old name as a `rename` alias.
+                        &khive_runtime::EntityAliasChange::default().keeping_old_name(true),
                     )
                     .await?;
                     Ok(PreparedApply::Atomic {

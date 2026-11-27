@@ -97,6 +97,7 @@ pub(crate) async fn prepare_update_entity_plan_with_version(
     token: &NamespaceToken,
     id: Uuid,
     patch: crate::curation::EntityPatch,
+    aliases: &crate::EntityAliasChange,
     expected_version: Option<i64>,
 ) -> RuntimeResult<AtomicOpPlan> {
     prepare_update_entity_plan_with_version_and_type(
@@ -104,6 +105,7 @@ pub(crate) async fn prepare_update_entity_plan_with_version(
         token,
         id,
         patch,
+        aliases,
         expected_version,
         None,
     )
