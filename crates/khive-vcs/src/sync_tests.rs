@@ -2278,6 +2278,7 @@ fn sync_fts_document_matches_entity_fts_document() {
         merged_into: None,
         version: 1,
         content_ref: None,
+        aliases: Vec::new(),
     };
 
     let doc = entity_fts_document(&entity);

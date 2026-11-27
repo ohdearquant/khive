@@ -9,7 +9,8 @@ use uuid::Uuid;
 
 use khive_storage::attachment::{Attachment, AttachmentSubstrate};
 use khive_storage::entity::{
-    Entity, EntityFilter, EntityKeyHolder, EntityTombstones, EntityTypeCounts,
+    Entity, EntityAlias, EntityAliasOrigin, EntityFilter, EntityKeyHolder, EntityTombstones,
+    EntityTypeCounts,
 };
 use khive_storage::error::StorageError;
 use khive_storage::types::{
@@ -36,13 +37,34 @@ const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
 
 const ENTITIES_COUNT_BY_TYPE_SQL: &str = include_str!("../../sql/entities-count-by-type.sql");
 
-const ENTITY_SELECT_COLUMNS: &str =
+/// The `aliases` column of an entity read (ADR-221 section 2): a JSON array
+/// of `[alias, origin]` pairs for the entity's alias rows, `[]` when it has
+/// none. The query must read the entity from a table named `entities`.
+/// [`parse_entity_aliases`] reads the value. The store's own entity reads end
+/// with the same subquery, and a test holds the two texts equal.
+pub const ENTITY_ALIASES_COLUMN: &str =
+    "(SELECT json_group_array(json_array(entity_alias.alias, entity_alias.origin)) \
+     FROM entity_aliases AS entity_alias \
+     WHERE entity_alias.entity_id = entities.id \
+     AND entity_alias.namespace = entities.namespace)";
+
+// Every part is a string literal, so a source scan of the statements that
+// use these columns reads the whole text. The aliases subquery repeats
+// `ENTITY_ALIASES_COLUMN`.
+const ENTITY_SELECT_COLUMNS: &str = concat!(
     "entities.id, entities.namespace, entities.kind, entities.entity_type, entities.name, \
      entities.description, entities.properties, entities.tags, entities.created_at, \
      entities.updated_at, entities.deleted_at, entities.merged_into, entities.merge_event_id, \
      (SELECT attachment.content_ref FROM attachments AS attachment \
       WHERE attachment.record_uuid = entities.id \
-        AND attachment.substrate = 'entity' AND attachment.role = 'content') AS content_ref, entities.version";
+        AND attachment.substrate = 'entity' AND attachment.role = 'content') AS content_ref, \
+     entities.version, ",
+    "(SELECT json_group_array(json_array(entity_alias.alias, entity_alias.origin)) \
+     FROM entity_aliases AS entity_alias \
+     WHERE entity_alias.entity_id = entities.id \
+     AND entity_alias.namespace = entities.namespace)",
+    " AS aliases"
+);
 
 // ---------------------------------------------------------------------------
 // Pure statement builders (ADR-099 B3 r6 structural cut)
@@ -154,6 +176,53 @@ pub fn entity_key_claim_statement(
 /// Statement label of [`entity_key_claim_statement`], matched by callers that
 /// read a failed claim guard as a held key.
 pub const ENTITY_KEY_CLAIM_LABEL: &str = "entity-key-claim";
+
+/// Store `alias` for `entity_id` with `origin` (ADR-221 section 2).
+///
+/// An alias the entity already holds keeps its row and origin, so the
+/// statement affects one row or none; callers do not guard it.
+pub fn entity_alias_insert_statement(
+    namespace: &str,
+    entity_id: Uuid,
+    alias: &str,
+    origin: EntityAliasOrigin,
+    created_at: i64,
+) -> SqlStatement {
+    SqlStatement {
+        sql: "INSERT OR IGNORE INTO entity_aliases \
+              (namespace, entity_id, alias, origin, created_at) \
+              VALUES (?1, ?2, ?3, ?4, ?5)"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(entity_id.to_string()),
+            SqlValue::Text(alias.to_string()),
+            SqlValue::Text(origin.as_str().to_string()),
+            SqlValue::Integer(created_at),
+        ],
+        label: Some("entity-alias-insert".to_string()),
+    }
+}
+
+/// Remove caller-origin `alias` from `entity_id`. Aliases written by a
+/// rename or a merge are never removed by it (ADR-221 section 2).
+pub fn entity_caller_alias_delete_statement(
+    namespace: &str,
+    entity_id: Uuid,
+    alias: &str,
+) -> SqlStatement {
+    SqlStatement {
+        sql: "DELETE FROM entity_aliases \
+              WHERE namespace = ?1 AND entity_id = ?2 AND alias = ?3 AND origin = 'caller'"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(entity_id.to_string()),
+            SqlValue::Text(alias.to_string()),
+        ],
+        label: Some("entity-caller-alias-delete".to_string()),
+    }
+}
 
 /// Conditional-insert companion to [`entity_upsert_statement`]. Every
 /// conflict leaves the existing row untouched so a caller can read the
@@ -655,6 +724,7 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
     let merge_event_id_str: Option<String> = row.get(12)?;
     let content_ref: Option<String> = row.get(13)?;
     let version: i64 = row.get(14)?;
+    let aliases_str: String = row.get(15)?;
 
     let id = parse_uuid(&id_str)?;
 
@@ -690,6 +760,8 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
             rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(e))
         })?;
 
+    let aliases = read_entity_aliases(&aliases_str)?;
+
     Ok(Entity {
         id,
         namespace,
@@ -706,7 +778,32 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
         merged_into,
         merge_event_id,
         content_ref,
+        aliases,
     })
+}
+
+fn read_entity_aliases(text: &str) -> Result<Vec<EntityAlias>, rusqlite::Error> {
+    parse_entity_aliases(text).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(15, rusqlite::types::Type::Text, error.into())
+    })
+}
+
+/// Parse a value of [`ENTITY_ALIASES_COLUMN`]: a JSON array of
+/// `[alias, origin]` pairs, returned sorted by alias. An origin other than
+/// `caller`, `rename` or `merge` is an error.
+pub fn parse_entity_aliases(text: &str) -> Result<Vec<EntityAlias>, String> {
+    let pairs: Vec<(String, String)> =
+        serde_json::from_str(text).map_err(|error| format!("entity aliases: {error}"))?;
+    let mut aliases = pairs
+        .into_iter()
+        .map(|(alias, origin)| {
+            EntityAliasOrigin::parse(&origin)
+                .map(|origin| EntityAlias { alias, origin })
+                .ok_or_else(|| format!("unknown entity alias origin {origin:?}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    aliases.sort();
+    Ok(aliases)
 }
 
 /// DML-only batch upsert loop shared by both the legacy (flag-off) and
@@ -931,6 +1028,17 @@ fn build_entity_where_with_mode(
         conditions.push(format!("name = ?{} COLLATE BINARY", params.len()));
     }
 
+    if let Some(ref exact) = filter.name_or_alias_exact {
+        params.push(Box::new(exact.clone()));
+        let index = params.len();
+        conditions.push(format!(
+            "(name = ?{index} COLLATE BINARY OR EXISTS (SELECT 1 FROM entity_aliases AS entity_alias \
+             WHERE entity_alias.namespace = entities.namespace \
+               AND entity_alias.entity_id = entities.id \
+               AND entity_alias.alias = ?{index} COLLATE BINARY))"
+        ));
+    }
+
     if !filter.names_ci.is_empty() {
         // ADR-104 Stage C, R1: one batched `LOWER(name) IN (...)` predicate,
         // served by `idx_entities_namespace_name_ci (namespace, LOWER(name))`.
@@ -1046,6 +1154,7 @@ fn entity_list_source(filter: &EntityFilter) -> &'static str {
         || filter.legacy_entity_type_fallback
         || filter.name_prefix.is_some()
         || filter.name_exact.is_some()
+        || filter.name_or_alias_exact.is_some()
         || !filter.names_ci.is_empty()
         || !filter.tags_any.is_empty()
     {
@@ -1071,6 +1180,7 @@ fn is_entity_streaming_page(filter: &EntityFilter) -> bool {
     filter.ids.is_empty()
         && filter.name_prefix.is_none()
         && filter.name_exact.is_none()
+        && filter.name_or_alias_exact.is_none()
         && filter.names_ci.is_empty()
 }
 
@@ -1235,6 +1345,7 @@ fn is_complete_id_lookup(filter: &EntityFilter, page: &PageRequest) -> bool {
         && filter.entity_types_by_kind.is_empty()
         && filter.name_prefix.is_none()
         && filter.name_exact.is_none()
+        && filter.name_or_alias_exact.is_none()
         && filter.tags_any.is_empty()
         && filter.names_ci.is_empty()
         && page.offset == 0
@@ -1508,7 +1619,7 @@ impl EntityStore for SqlEntityStore {
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                 params.iter().map(|param| param.as_ref()).collect();
             let rows = stmt.query_map(param_refs.as_slice(), |row| {
-                Ok((read_entity(row)?, row.get::<_, i64>(15)?))
+                Ok((read_entity(row)?, row.get::<_, i64>(16)?))
             })?;
             let mut entries = rows.collect::<Result<Vec<_>, _>>()?;
             let has_more = entries.len() > limit_usize;
@@ -1704,7 +1815,8 @@ const ENTITIES_DDL: &str = include_str!("../../sql/entities-ddl.sql");
 
 pub(crate) fn ensure_entities_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(ENTITIES_DDL)?;
-    conn.execute_batch(crate::migrations::ENTITY_KEYS_DDL)
+    conn.execute_batch(crate::migrations::ENTITY_KEYS_DDL)?;
+    conn.execute_batch(crate::migrations::ENTITY_ALIASES_DDL)
 }
 
 #[cfg(test)]

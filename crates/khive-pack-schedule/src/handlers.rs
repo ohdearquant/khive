@@ -595,6 +595,8 @@ struct ScheduleBulkCreateEntryCheck {
     // entity-only: the item's caller key and `on_key`
     key: Option<String>,
     on_key: Option<String>,
+    // entity-only: caller aliases
+    aliases: Option<Vec<String>>,
     // note-only
     content: Option<String>,
     note_kind: Option<String>,
@@ -609,7 +611,7 @@ struct ScheduleBulkCreateEntryCheck {
 /// `BulkCreateEntry` (deny-unknown-fields), an entity item needs a `name`,
 /// takes no note-only field and sets `on_key` only to `"update"` beside a
 /// `key`, and a note item needs `content` and takes no entity-only field,
-/// `key` and `on_key` included.
+/// `key`, `on_key` and `aliases` included.
 fn validate_create_bulk_items(
     items_value: &Value,
     registry: &VerbRegistry,
@@ -696,6 +698,12 @@ fn validate_create_bulk_items(
                     return Err(RuntimeError::InvalidInput(format!(
                         "schedule.action: verb \"create\": items[{idx}] entity_kind, \
                          entity_type and description apply only to entity items"
+                    )));
+                }
+                if entry.aliases.is_some() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "schedule.action: verb \"create\": items[{idx}] aliases apply only to \
+                         entity items"
                     )));
                 }
                 let canonical = reconcile_specific_for_replay(

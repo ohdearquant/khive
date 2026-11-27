@@ -280,9 +280,18 @@ fresh insert under a supplied key returns the full note object with `created: tr
 so the two outcomes are distinguishable without a second round trip. A create without `key` keeps
 its existing response shape and carries no `created` field.
 
+An entity create may carry `aliases`, other exact names the entity answers to in `resolve` and
+text search. Aliases are a set: order and repeats do not matter. Each is non-empty, at most 512
+UTF-8 bytes, without U+0000, and passes the secret gate before any key lookup. An alias equal to
+the entity's name is not stored; the response, or the bulk item's result, lists it in
+`aliases_not_stored`. Aliases on a note, or a top-level `aliases` beside `items`, are refused.
+Entity reads return `aliases`, each `{alias, origin}` with origin `caller`, `rename` or `merge`,
+and omit the field when the entity has none.
+
 | Param               | Type            | Required    | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ------------------- | --------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `key`               | string          | no          | Singleton notes only. At most 512 UTF-8 bytes, no U+0000. See the exact-replay behavior described above.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `aliases`           | array\<string\> | no          | Entities only, singleton or as a bulk entity item's own field: other exact names of the entity, described above.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `kind`              | string          | conditional | Substrate (`entity`\|`note`) or granular kind (`concept`, `document`, `observation`, …). Required for the singleton path; not required when `items` is present.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `name`              | string          | no          | Entity name (singleton).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `entity_kind`       | string          | no          | concept\|document\|dataset\|project\|person\|org\|artifact\|service\|resource (when `kind="entity"`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
@@ -565,31 +574,40 @@ request(ops="stats()")
 ### `update` — Declaration
 
 Patch entity, note, or edge fields. Field set depends on substrate: entities accept
-`name`/`description`/`properties`/`tags`; notes accept
+`name`/`description`/`properties`/`tags`/`add_aliases`/`remove_aliases`; notes accept
 `name`/`content`/`salience`/`decay_factor`/`properties`/`tags`; edges accept
 `relation`/`weight`/`properties`.
 
 Entity/note text updates use the same full-source storage and bounded embedding contract as
 singleton `create`; a successful response includes `warnings` when embedding actually truncated.
 
-| Param          | Type            | Required | Notes                                                                             |
-| -------------- | --------------- | -------- | --------------------------------------------------------------------------------- |
-| `id`           | uuid            | yes      | Record to patch.                                                                  |
-| `kind`         | string          | no       | Substrate hint (`entity`\|`note`\|`edge`); omit to resolve from the UUID.         |
-| `name`         | string          | no       | Entities and notes.                                                               |
-| `description`  | string          | no       | Entities only.                                                                    |
-| `content`      | string          | no       | Notes only (body text).                                                           |
-| `salience`     | number          | no       | Notes only, 0.0–1.0.                                                              |
-| `decay_factor` | number          | no       | Notes only, >= 0.                                                                 |
-| `relation`     | string          | no       | Edges only, one of the 20 canonical relations.                                    |
-| `weight`       | number          | no       | Edges only, 0.0–1.0.                                                              |
-| `properties`   | object          | no       | Shallow-merged in.                                                                |
-| `tags`         | array\<string\> | no       | Entities and notes: replaces the tag list; omission preserves it, `[]` clears it. |
+| Param            | Type            | Required | Notes                                                                             |
+| ---------------- | --------------- | -------- | --------------------------------------------------------------------------------- |
+| `id`             | uuid            | yes      | Record to patch.                                                                  |
+| `kind`           | string          | no       | Substrate hint (`entity`\|`note`\|`edge`); omit to resolve from the UUID.         |
+| `name`           | string          | no       | Entities and notes.                                                               |
+| `description`    | string          | no       | Entities only.                                                                    |
+| `content`        | string          | no       | Notes only (body text).                                                           |
+| `salience`       | number          | no       | Notes only, 0.0–1.0.                                                              |
+| `decay_factor`   | number          | no       | Notes only, >= 0.                                                                 |
+| `relation`       | string          | no       | Edges only, one of the 20 canonical relations.                                    |
+| `weight`         | number          | no       | Edges only, 0.0–1.0.                                                              |
+| `properties`     | object          | no       | Shallow-merged in.                                                                |
+| `tags`           | array\<string\> | no       | Entities and notes: replaces the tag list; omission preserves it, `[]` clears it. |
+| `add_aliases`    | array\<string\> | no       | Entities only: aliases to add, as a set.                                          |
+| `remove_aliases` | array\<string\> | no       | Entities only: caller aliases to remove.                                          |
 
 Note tags remain stored and returned in `properties.tags`. Updating that property directly
 also replaces the list. When a request supplies both `tags` and `properties.tags`, top-level
 `tags` wins, including `tags=[]`; tags are never unioned. Other properties are shallow-merged
 as usual.
+
+`add_aliases` and `remove_aliases` apply to entities. An alias the entity already holds, of any
+origin, is left as it is; one equal to the entity's name after the update is not stored and is
+listed in `aliases_not_stored`. `remove_aliases` removes caller aliases only: anything it did not
+remove, a rename or merge alias included, is listed in `aliases_not_removed`, which is not an
+error. One alias in both lists is refused. An update that renames an entity to one of its caller
+aliases removes that alias. A change to the aliases reindexes the entity.
 
 An unfenced note update whose normalized patch equals the stored value is a no-op: the stored row
 comes back with `unchanged: true`, and `version` and `updated_at` do not move. A note update that
@@ -1150,10 +1168,15 @@ preparation. Canonical properties replace the whole map. See
 
 Resolve natural-language references to ids. Each ref in `refs` is resolved through:
 (1) id-string passthrough (UUID or 8+ hex prefix) via the existing by-ID path; (2) this
-actor's recently-referenced ring; (3) a case-sensitive exact match on `entities.name`;
+actor's recently-referenced ring; (3) a case-sensitive exact match on an entity's name or on
+an alias it holds;
 (4) hybrid search over the namespace. Returns one of
 `Resolved{id,confidence}` | `Ambiguous{candidates}` | `NotFound` per ref — never a
 silent pick among close candidates. Read-only: performs no mutation.
+
+A single stage-3 match through an alias adds `matched_alias` to the `Resolved` result. An entity
+that matches by name and by alias counts once, and several matching entities return `Ambiguous`
+over exactly that set.
 
 A resolved id consumed by an entity merge follows the transitive `merged_into`
 chain. Its result contains the live kept `id` and `redirected_from: [old_id, ...]`;
@@ -1163,7 +1186,7 @@ Cycles and overlong chains fail with `redirect cycle detected` and
 
 | Param   | Type            | Required | Notes                                                                                                           |
 | ------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------- |
-| `refs`  | array\<string\> | yes      | Natural-language references to resolve (UUID, hex prefix, exact entity name, or free text).                     |
+| `refs`  | array\<string\> | yes      | Natural-language references to resolve (UUID, hex prefix, exact entity name or alias, or free text).            |
 | `kind`  | string          | no       | Restricts the exact-name and hybrid-search stages to an entity kind. No effect on the id-string or ring stages. |
 | `limit` | integer         | no       | Max candidates returned per ref from the stage 4 hybrid-search fallback. Default 5, max 20.                     |
 

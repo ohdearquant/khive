@@ -6,8 +6,8 @@ use std::sync::Arc;
 use khive_runtime::operations::dependency_kind_inference_hint;
 use khive_runtime::{
     entity_key_conflict, run_atomic_unit, runtime_error_value, AtomicRunOutcome, DomainDisposition,
-    EntityCreateSpec, KeyedEntityCreate, KeyedEntityReload, KhiveRuntime, KindHook, NamespaceToken,
-    NoteCreateSpec, RuntimeError, VerbRegistry,
+    EntityAliasChange, EntityCreateSpec, KeyedEntityCreate, KeyedEntityReload, KhiveRuntime,
+    KindHook, NamespaceToken, NoteCreateSpec, RuntimeError, VerbRegistry,
 };
 use khive_storage::note::Note;
 use khive_storage::Entity;
@@ -133,6 +133,19 @@ impl PreparedBulkItem {
     fn is_keyed(&self) -> bool {
         matches!(self, Self::Entity { prepared, .. } if prepared.key.is_some())
     }
+
+    /// ADR-221 section 3: the requested aliases this entity item does not
+    /// store because they equal its name.
+    fn aliases_not_stored(&self) -> Vec<String> {
+        match self {
+            Self::Entity { prepared, .. }
+                if prepared.spec.aliases.contains(&prepared.spec.name) =>
+            {
+                vec![prepared.spec.name.clone()]
+            }
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// One entity or note item, already committed, paired with what its own
@@ -207,14 +220,24 @@ impl BulkWrite {
     }
 }
 
+/// List the requested aliases a create did not store because they equal the
+/// entity's name (ADR-221 section 3). Absent when every alias was stored.
+pub(super) fn add_aliases_not_stored(response: &mut Value, not_stored: Vec<String>) {
+    if !not_stored.is_empty() {
+        response["aliases_not_stored"] = json!(not_stored);
+    }
+}
+
 /// Append one item's committed answer to a bulk response's lists.
 fn push_bulk_answer(
     idx: usize,
-    answer: ItemAnswer,
+    mut answer: ItemAnswer,
+    aliases_not_stored: Vec<String>,
     results: &mut Vec<Value>,
     entity_type_normalized: &mut Vec<Value>,
     entities: &mut Vec<Value>,
 ) {
+    add_aliases_not_stored(&mut answer.result, aliases_not_stored);
     results.push(json!({
         "index": idx,
         "ok": true,
@@ -251,7 +274,9 @@ impl KgPack {
         description: Option<&str>,
         properties: Option<Value>,
         tags: Vec<String>,
+        aliases: &[String],
     ) -> Result<Option<Value>, RuntimeError> {
+        let alias_change = EntityAliasChange::replace(aliases)?;
         let holder = self.runtime.get_entity(token, holder_id).await?;
         super::update::refuse_pack_registry_row(&holder, "create")?;
         let update_args = json!({
@@ -262,6 +287,7 @@ impl KgPack {
             "entity_type": entity_type,
             "properties": properties,
             "tags": tags,
+            "aliases": aliases,
         });
         keyed_bulk::authorize_key_reload(
             registry,
@@ -284,6 +310,7 @@ impl KgPack {
                 description,
                 properties,
                 tags,
+                &alias_change,
             )
             .await?;
         match reload {
@@ -291,6 +318,7 @@ impl KgPack {
                 let mut response = normalize_entity_timestamps(to_json(&entity)?);
                 response["created"] = json!(false);
                 response["updated"] = json!(true);
+                add_aliases_not_stored(&mut response, alias_change.not_stored(name));
                 add_embedding_truncation_warning(&mut response, report.embedding.any_truncated());
                 response["indexing"] = to_json(&report.indexing)?;
                 if !report.post_commit_degradations.is_empty() {
@@ -316,6 +344,18 @@ impl KgPack {
         kind_resolution: (&VerbRegistry, Option<&BulkKindContext>),
     ) -> Result<(CreateParams, Option<Value>), RuntimeError> {
         let (registry, context) = kind_resolution;
+        // ADR-221 section 2: aliases name entities only, and each one is
+        // validated and secret-gated before any record is read.
+        if let Some(aliases) = &fields.aliases {
+            if fields.kind != "entity" {
+                return Err(RuntimeError::InvalidInput(
+                    "aliases apply only to entities".into(),
+                ));
+            }
+            for alias in aliases {
+                khive_runtime::validate_entity_alias(alias)?;
+            }
+        }
         // Callers establish the shared field types and canonical kind first.
         // Owners may then normalize values before semantic validation; both
         // singleton and bulk creation pass through this same boundary.
@@ -431,6 +471,9 @@ impl KgPack {
             if let Some(value) = &entry.tags {
                 args["tags"] = json!(value);
             }
+            if let Some(value) = &entry.aliases {
+                args["aliases"] = json!(value);
+            }
             args
         } else {
             Value::Null
@@ -450,6 +493,7 @@ impl KgPack {
             embedding_content: None,
             key: None,
             on_key: None,
+            aliases: entry.aliases,
             embed: None,
             fence: None,
         };
@@ -480,6 +524,7 @@ impl KgPack {
                     description: fields.description,
                     properties: fields.properties,
                     tags: fields.tags.unwrap_or_default(),
+                    aliases: fields.aliases.unwrap_or_default(),
                 },
                 args,
                 hook,
@@ -540,6 +585,7 @@ impl KgPack {
             embedding_content: None,
             key: None,
             on_key: None,
+            aliases: None,
             embed: None,
             fence: None,
         };
@@ -677,6 +723,11 @@ impl KgPack {
                         "items[{idx}]: entity_kind, entity_type and description apply only to entity items"
                     )));
                 }
+                if entry.aliases.is_some() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "items[{idx}]: aliases apply only to entity items"
+                    )));
+                }
                 let canonical = reconcile_specific(
                     specific,
                     entry.note_kind.as_deref(),
@@ -750,12 +801,13 @@ impl KgPack {
         let mut entity_type_normalized: Vec<Value> = Vec::new();
         let mut entities: Vec<Value> = Vec::new();
         let (mut created, mut updated) = (0usize, 0usize);
-        for (idx, answer) in answers.into_iter().enumerate() {
+        for ((idx, answer), item) in answers.into_iter().enumerate().zip(&items) {
             created += usize::from(answer.created);
             updated += usize::from(answer.updated);
             push_bulk_answer(
                 idx,
                 answer,
+                item.aliases_not_stored(),
                 &mut results,
                 &mut entity_type_normalized,
                 &mut entities,
@@ -869,6 +921,10 @@ impl KgPack {
         let mut updated = 0usize;
 
         for (idx, item) in prepared.into_iter().enumerate() {
+            let not_stored = item
+                .as_ref()
+                .map(PreparedBulkItem::aliases_not_stored)
+                .unwrap_or_default();
             let outcome = match item {
                 Ok(item) if item.is_keyed() => {
                     match self
@@ -898,6 +954,7 @@ impl KgPack {
                     push_bulk_answer(
                         idx,
                         answer,
+                        not_stored,
                         &mut results,
                         &mut entity_type_normalized,
                         &mut entities,
@@ -961,6 +1018,7 @@ impl KgPack {
             "embedding_content",
             "key",
             "on_key",
+            "aliases",
             "embed",
             "fence",
             "skip_dedup_check",
@@ -997,12 +1055,12 @@ impl KgPack {
         // `atomic: false` is that item's own indexed failure rather than a
         // failure of the entire call; see `prepare_bulk_item`.
         if params.get("items").is_some() {
-            if ["key", "embed", "fence"]
+            if ["key", "aliases", "embed", "fence"]
                 .iter()
                 .any(|field| params.get(*field).is_some())
             {
                 return Err(RuntimeError::InvalidInput(
-                    "a top-level key, embed or fence does not apply to a bulk create; an entity item carries its own key".into(),
+                    "a top-level key, aliases, embed or fence does not apply to a bulk create; an entity item carries its own key and aliases".into(),
                 ));
             }
             if params.get("on_key").is_some() {
@@ -1222,6 +1280,8 @@ impl KgPack {
                 let canonical = sub_kind.clone().expect("entity_kind canonicalized above");
                 let name = p.name.expect("entity fields validated during preparation");
                 let tags = p.tags.unwrap_or_default();
+                let alias_list = p.aliases.unwrap_or_default();
+                let aliases = EntityAliasChange::replace(&alias_list)?;
                 let (entity, embedding_report, degradations) = match p.key.as_deref() {
                     None => {
                         self.runtime
@@ -1233,6 +1293,7 @@ impl KgPack {
                                 p.description.as_deref(),
                                 p.properties,
                                 tags,
+                                &aliases,
                             )
                             .await?
                     }
@@ -1254,6 +1315,7 @@ impl KgPack {
                                     p.description.as_deref(),
                                     p.properties.clone(),
                                     tags.clone(),
+                                    &aliases,
                                 )
                                 .await?
                             {
@@ -1280,6 +1342,7 @@ impl KgPack {
                                             p.description.as_deref(),
                                             p.properties.clone(),
                                             tags.clone(),
+                                            &alias_list,
                                         )
                                         .await?
                                     {
@@ -1317,6 +1380,7 @@ impl KgPack {
                         obj.insert("created".to_string(), json!(true));
                     }
                 }
+                add_aliases_not_stored(&mut entity_json, aliases.not_stored(&name));
                 (
                     entity_json,
                     id,

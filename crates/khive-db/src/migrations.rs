@@ -430,6 +430,14 @@ const V67_UP: &str = include_str!("../sql/067-entity-keys.sql");
 /// opened without the migration chain still has the table its triggers name.
 pub const ENTITY_KEYS_DDL: &str = V67_UP;
 
+const V68_UP: &str = include_str!("../sql/068-entity-aliases.sql");
+
+/// DDL for entity aliases (ADR-221): the `entity_aliases` table, its indexes
+/// and the trigger on `entities` that drops its rows on a hard delete. Shared
+/// between migration V68 and the entity store's idempotent schema setup, as
+/// [`ENTITY_KEYS_DDL`] is.
+pub const ENTITY_ALIASES_DDL: &str = V68_UP;
+
 /// Retained V66 schema needs only its ledger restored, not an index rebuild.
 fn migrate_undelivered_due_index(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
     let installed: Option<String> = tx
@@ -911,6 +919,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 67,
         name: "entity_keys",
         up: V67_UP,
+    },
+    VersionedMigration {
+        version: 68,
+        name: "entity_aliases",
+        up: V68_UP,
     },
 ];
 

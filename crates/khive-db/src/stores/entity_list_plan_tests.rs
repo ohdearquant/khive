@@ -1,5 +1,6 @@
 use super::*;
 use crate::backend::StorageBackend;
+use crate::migrations::ENTITY_ALIASES_DDL;
 use rusqlite::{Connection, StatementStatus};
 use std::time::Duration;
 
@@ -10,7 +11,8 @@ const INDEXES: [&str; 2] = [
 
 fn fixture(rows: usize) -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(ENTITIES_DDL).unwrap();
+    conn.execute_batch(&format!("{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}"))
+        .unwrap();
     conn.execute_batch(include_str!("../../sql/021-attachments-a-stage.sql"))
         .unwrap();
     for i in 1..=rows {
@@ -332,7 +334,7 @@ fn candidates_cursor_and_id_plans_keep_their_existing_sources() {
         );
         assert!(rows
             .windows(2)
-            .all(|pair| matches!((&pair[0][15], &pair[1][15]), (rusqlite::types::Value::Integer(a), rusqlite::types::Value::Integer(b)) if a < b)));
+            .all(|pair| matches!((&pair[0][16], &pair[1][16]), (rusqlite::types::Value::Integer(a), rusqlite::types::Value::Integer(b)) if a < b)));
         if !filter.ids.is_empty() {
             for sql in [
                 sql,
@@ -584,7 +586,7 @@ async fn standalone_entity_reads_fallback_without_repair() {
     pool.writer()
         .unwrap()
         .conn()
-        .execute_batch(ENTITIES_DDL)
+        .execute_batch(&format!("{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}"))
         .unwrap();
     let external = Connection::open(&path).unwrap();
     seed_fallback_rows(&external);
@@ -601,7 +603,7 @@ async fn list_fallback_retries_once_and_preserves_unrecognized_sqlite_errors() {
     pool.writer()
         .unwrap()
         .conn()
-        .execute_batch(ENTITIES_DDL)
+        .execute_batch(&format!("{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}"))
         .unwrap();
     pool.writer()
         .unwrap()
@@ -1072,7 +1074,8 @@ fn seed_kind_cursor_rows(
     prefix: usize,
     matching_prefix: bool,
 ) -> (SeekCursor, Vec<Uuid>) {
-    conn.execute_batch(ENTITIES_DDL).unwrap();
+    conn.execute_batch(&format!("{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}"))
+        .unwrap();
     conn.execute_batch(include_str!("../../sql/021-attachments-a-stage.sql"))
         .unwrap();
     for i in 1..=prefix {
@@ -1422,7 +1425,7 @@ async fn count_free_kind_fallback_preserves_unrelated_errors_and_retries_once() 
     pool.writer()
         .unwrap()
         .conn()
-        .execute_batch(ENTITIES_DDL)
+        .execute_batch(&format!("{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}"))
         .unwrap();
     pool.writer()
         .unwrap()
@@ -1489,7 +1492,8 @@ async fn count_free_kind_fallback_preserves_unrelated_errors_and_retries_once() 
 }
 
 fn seed_type_group_rows(conn: &Connection) {
-    conn.execute_batch(ENTITIES_DDL).unwrap();
+    conn.execute_batch(&format!("{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}"))
+        .unwrap();
     conn.execute_batch(include_str!("../../sql/021-attachments-a-stage.sql"))
         .unwrap();
     // Rows 3, 6 and 9 are concepts; row 6 carries the column type, rows 3 and 9

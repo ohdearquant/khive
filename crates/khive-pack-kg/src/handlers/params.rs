@@ -34,6 +34,8 @@ pub(crate) struct BulkCreateEntry {
     // entity-only: the item's caller key and `on_key` (ADR-221 section 1)
     pub(crate) key: Option<String>,
     pub(crate) on_key: Option<String>,
+    // entity-only: caller aliases (ADR-221 section 2)
+    pub(crate) aliases: Option<Vec<String>>,
     // note-only
     pub(crate) content: Option<String>,
     pub(crate) note_kind: Option<String>,
@@ -64,6 +66,8 @@ pub(crate) struct CreateParams {
     /// ADR-221 section 1: `"update"` turns a keyed entity create whose
     /// held key carries a different payload into an update of the holder.
     pub(crate) on_key: Option<String>,
+    /// ADR-221 section 2: other exact names of the entity. Entities only.
+    pub(crate) aliases: Option<Vec<String>>,
     pub(crate) embed: Option<bool>,
     #[serde(
         default,
@@ -183,6 +187,10 @@ pub struct UpdateParams {
     pub(crate) weight: Option<f64>,
     pub(crate) entity_kind: Option<Value>,
     pub(crate) expected_version: Option<i64>,
+    /// ADR-221 section 2: caller aliases to add to and remove from an
+    /// entity. `remove_aliases` reaches caller-origin aliases only.
+    pub(crate) add_aliases: Option<Vec<String>>,
+    pub(crate) remove_aliases: Option<Vec<String>>,
     #[serde(
         default,
         deserialize_with = "khive_runtime::note_write::deserialize_optional_fences"

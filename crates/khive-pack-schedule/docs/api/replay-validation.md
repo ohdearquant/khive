@@ -174,8 +174,8 @@ must parse into that shape (deny-unknown-fields), then each entry is classified 
   beside a `key`.
 - A note item requires non-empty `content`, reconciles `kind` against `note_kind` (a
   bare `kind="note"` defaults to `observation`), refuses `key` and `on_key`, refuses the
-  entity-only fields `entity_kind`, `entity_type` and `description`, and refuses `scheduled_event`, which
-  bulk create never creates.
+  entity-only fields `entity_kind`, `entity_type`, `description` and `aliases`, and refuses
+  `scheduled_event`, which bulk create never creates.
 
 `khive-pack-schedule` cannot import the KG pack's private struct, so the field set is a
 local copy. `schedule_bulk_create_check_accepts_every_field_of_the_kg_bulk_entry` in

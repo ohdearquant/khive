@@ -28,6 +28,7 @@ async fn keyed(
         None,
         properties,
         tags.into_iter().map(str::to_owned).collect(),
+        &EntityAliasChange::default(),
     )
     .await
 }
@@ -506,6 +507,7 @@ async fn a_claim_on_a_held_key_writes_nothing() {
             Vec::new(),
             Vec::new(),
             Some("k"),
+            &EntityAliasChange::default(),
         )
         .await
         .unwrap();
@@ -518,7 +520,15 @@ async fn a_claim_on_a_held_key_writes_nothing() {
 fn holder_payload_ignores_runtime_owned_properties() {
     let mut holder = Entity::new("ns", "concept", "Name");
     holder.properties = Some(json!({"khive:secret_gate": "exempted:content-sha256-manifest-v1"}));
-    assert!(same_entity_payload(&holder, None, "Name", None, None, &[]));
+    assert!(same_entity_payload(
+        &holder,
+        None,
+        "Name",
+        None,
+        None,
+        &[],
+        &BTreeSet::new()
+    ));
     holder.properties = Some(json!({"a": 1, "khive:secret_gate": "exempted"}));
     assert!(same_entity_payload(
         &holder,
@@ -526,19 +536,37 @@ fn holder_payload_ignores_runtime_owned_properties() {
         "Name",
         None,
         Some(&json!({"a": 1})),
-        &[]
+        &[],
+        &BTreeSet::new()
     ));
-    assert!(!same_entity_payload(&holder, None, "Name", None, None, &[]));
+    assert!(!same_entity_payload(
+        &holder,
+        None,
+        "Name",
+        None,
+        None,
+        &[],
+        &BTreeSet::new()
+    ));
     // Absent and `{}` compare equal on both sides.
     holder.properties = Some(json!({}));
-    assert!(same_entity_payload(&holder, None, "Name", None, None, &[]));
+    assert!(same_entity_payload(
+        &holder,
+        None,
+        "Name",
+        None,
+        None,
+        &[],
+        &BTreeSet::new()
+    ));
     assert!(same_entity_payload(
         &holder,
         None,
         "Name",
         None,
         Some(&json!({})),
-        &[]
+        &[],
+        &BTreeSet::new()
     ));
     holder.properties = None;
     assert!(same_entity_payload(
@@ -547,7 +575,8 @@ fn holder_payload_ignores_runtime_owned_properties() {
         "Name",
         None,
         Some(&json!({})),
-        &[]
+        &[],
+        &BTreeSet::new()
     ));
     assert!(!same_entity_payload(
         &holder,
@@ -555,7 +584,8 @@ fn holder_payload_ignores_runtime_owned_properties() {
         "Name",
         None,
         Some(&json!({"a": 1})),
-        &[]
+        &[],
+        &BTreeSet::new()
     ));
 }
 
@@ -576,6 +606,7 @@ async fn reload_replaces_the_caller_fields_of_the_holder() {
         .await
         .unwrap(),
     );
+    let no_aliases = EntityAliasChange::default();
     let reload = |holder: Uuid| {
         rt.reload_keyed_entity(
             &tok,
@@ -587,6 +618,7 @@ async fn reload_replaces_the_caller_fields_of_the_holder() {
             None,
             Some(json!({"a": 3})),
             Vec::new(),
+            &no_aliases,
         )
     };
     let entity = match reload(first.id).await.unwrap() {
@@ -663,6 +695,7 @@ async fn reload_refuses_a_differing_payload_on_a_stamped_holder() {
             None,
             Some(json!({"a": 1})),
             Vec::new(),
+            &EntityAliasChange::default(),
         )
         .await
         .expect_err("a stamped holder is not rewritten");
@@ -689,6 +722,7 @@ async fn reload_refuses_a_differing_payload_on_a_stamped_holder() {
             None,
             Some(json!({"a": 1})),
             Vec::new(),
+            &EntityAliasChange::default(),
         )
         .await
         .unwrap();
@@ -706,6 +740,7 @@ fn bulk_spec(name: &str, properties: Option<serde_json::Value>) -> EntityCreateS
         description: None,
         properties,
         tags: Vec::new(),
+        aliases: Vec::new(),
     }
 }
 

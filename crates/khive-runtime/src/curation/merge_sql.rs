@@ -42,14 +42,16 @@ fn read_merge_entity(
     namespace: &str,
 ) -> Result<Entity, SqliteError> {
     let id_str = id.to_string();
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
          created_at, updated_at, deleted_at, merged_into, merge_event_id, \
          (SELECT a.content_ref FROM attachments AS a \
           WHERE a.record_uuid = entities.id AND a.substrate = 'entity' \
-            AND a.role = 'content') AS content_ref, entities.version \
+            AND a.role = 'content') AS content_ref, entities.version, \
+         {aliases} AS aliases \
          FROM entities WHERE id = ?1 AND deleted_at IS NULL",
-    )?;
+        aliases = khive_db::stores::entity::ENTITY_ALIASES_COLUMN,
+    ))?;
     let mut rows = stmt.query(rusqlite::params![id_str])?;
     let row = rows
         .next()?
@@ -70,6 +72,7 @@ fn read_merge_entity(
     let merge_event_id_str: Option<String> = row.get(12)?;
     let content_ref: Option<String> = row.get(13)?;
     let version: i64 = row.get(14)?;
+    let aliases_str: String = row.get(15)?;
 
     if ns != namespace {
         return Err(SqliteError::InvalidData(format!(
@@ -95,6 +98,8 @@ fn read_merge_entity(
         .map(Uuid::parse_str)
         .transpose()
         .map_err(|e| SqliteError::InvalidData(e.to_string()))?;
+    let aliases = khive_db::stores::entity::parse_entity_aliases(&aliases_str)
+        .map_err(SqliteError::InvalidData)?;
 
     Ok(Entity {
         id: entity_id,
@@ -112,6 +117,7 @@ fn read_merge_entity(
         merged_into,
         merge_event_id,
         content_ref,
+        aliases,
     })
 }
 
@@ -596,6 +602,7 @@ pub(super) fn merge_entity_sql(
         deleted_at: into_entity.deleted_at,
         merged_into: None,
         merge_event_id: None,
+        aliases: into_entity.aliases.clone(),
         version: if dry_run {
             into_entity.version
         } else {

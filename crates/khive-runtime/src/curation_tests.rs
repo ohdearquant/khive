@@ -9947,6 +9947,7 @@ async fn persist_prepared_entity_update_rejects_reserved_final_object() {
             entity.updated_at,
             entity.deleted_at,
             None,
+            Vec::new(),
         )
         .await
         .expect_err("the persistence boundary must reject a reserved final property");
