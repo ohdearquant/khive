@@ -120,10 +120,25 @@ impl KhiveRuntime {
     /// The restore is guarded by both the tombstone's id/namespace and the
     /// current uniqueness state, so a caller cannot resurrect over a newer
     /// live record. Indexes are rebuilt only after the row restore commits.
+    /// A `restore_key_conflict` names each taken key's kind and key and no
+    /// holder id; [`Self::restore_entity_with_key_disclosure`] names the
+    /// holders a caller may see.
     pub async fn restore_entity(
         &self,
         token: &NamespaceToken,
         id: Uuid,
+    ) -> RuntimeResult<Option<(Entity, bool)>> {
+        self.restore_entity_with_key_disclosure(token, id, &|_: &str| false)
+            .await
+    }
+
+    /// [`Self::restore_entity`], naming in a `restore_key_conflict` the
+    /// holder of each taken key whose kind `disclose` admits.
+    pub async fn restore_entity_with_key_disclosure(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        disclose: &(dyn Fn(&str) -> bool + Sync),
     ) -> RuntimeResult<Option<(Entity, bool)>> {
         let Some(entity) = self
             .entities(token)?
@@ -155,6 +170,12 @@ impl KhiveRuntime {
         if entity.deleted_at.is_none() {
             return Ok(Some((entity, false)));
         }
+        // ADR-221 section 1: restore takes back every key the delete
+        // released, or none. The restoring UPDATE's trigger reclaims them, and
+        // the held-key index aborts it when one is taken; this read names the
+        // taken keys before any write.
+        self.refuse_restore_over_taken_keys(token, id, disclose)
+            .await?;
         let updated_at =
             Utc::now()
                 .timestamp_micros()
@@ -233,9 +254,15 @@ impl KhiveRuntime {
                     .map_err(|e| restore_reindex_failed("entity", id, e))?;
                 Ok(Some((restored, true)))
             }
-            Ok(AtomicRunOutcome::RolledBack { failure, .. }) => Err(RuntimeError::Internal(
-                format!("entity restore rolled back: {failure:?}"),
-            )),
+            Ok(AtomicRunOutcome::RolledBack { failure, .. }) => {
+                // A key taken between the read above and the UPDATE aborts
+                // the restore inside the transaction; name it the same way.
+                self.refuse_restore_over_taken_keys(token, id, disclose)
+                    .await?;
+                Err(RuntimeError::Internal(format!(
+                    "entity restore rolled back: {failure:?}"
+                )))
+            }
             Err(error) => Err(RuntimeError::Storage(error.0)),
         }
     }
@@ -584,6 +611,77 @@ impl KhiveRuntime {
         legacy_post_commit_result("delete_entity", id, deleted, degradations)
     }
 
+    /// Retire one captured Tool registry entity and its prepared authorization rows.
+    ///
+    /// This trusted Rust entry accepts exactly the pack's policy and grant statements;
+    /// their scopes and bindings must be prepared before admission. A stale entity or
+    /// any companion failure rolls back the entire unit. Cleanup errors are reported
+    /// only after confirmed commit and never turn the retirement into a rollback.
+    pub async fn retire_tool_registry_entity_with_post_commit_report(
+        &self,
+        token: &NamespaceToken,
+        expected: &Entity,
+        retired_at: i64,
+        companions: [SqlStatement; 2],
+    ) -> RuntimeResult<([u64; 2], Vec<PostCommitDegradation>)> {
+        if expected.namespace != token.namespace().as_str()
+            || expected.kind != "project"
+            || expected.deleted_at.is_some()
+            || !expected
+                .tags
+                .iter()
+                .any(|tag| khive_types::pack::pack_registry_tag(tag) == Some("tool-registry"))
+        {
+            return Err(RuntimeError::InvalidInput(
+                "retirement requires a live Tool registry row in the write namespace".into(),
+            ));
+        }
+        if retired_at <= expected.updated_at {
+            return Err(RuntimeError::InvalidInput(
+                "registry retirement timestamp must advance the captured row".into(),
+            ));
+        }
+        expected.version.checked_add(1).ok_or_else(|| {
+            RuntimeError::InvalidInput("registry entity version is exhausted".into())
+        })?;
+        let mut retired = expected.clone();
+        retired.deleted_at = Some(retired_at);
+        retired.updated_at = retired_at;
+        crate::secret_gate::reject_reserved_secret_gate_property(retired.properties.as_ref())?;
+        let statement = khive_db::stores::entity::entity_replace_if_unchanged_statement(
+            &retired,
+            expected.updated_at,
+            expected.deleted_at,
+        );
+        let id = expected.id;
+        let result = self
+            .sql()
+            .atomic_unit(Box::new(move |writer| {
+                Box::pin(async move {
+                    if writer.execute(statement).await? != 1 {
+                        return Err(khive_storage::StorageError::Conflict {
+                            capability: khive_storage::StorageCapability::Sql,
+                            operation: "retire_tool_registry_entity".into(),
+                            message: format!(
+                                "entity {id} changed concurrently; retry with fresh state"
+                            ),
+                        });
+                    }
+                    let [policy, grants] = companions;
+                    let counts = [writer.execute(policy).await?, writer.execute(grants).await?];
+                    Ok(Box::new(counts) as Box<dyn std::any::Any + Send>)
+                })
+            }))
+            .await?;
+        let counts = *result
+            .downcast::<[u64; 2]>()
+            .map_err(|_| RuntimeError::Internal("invalid registry retirement result".into()))?;
+        let degradations = self
+            .cleanup_deleted_entity_indexes_and_event(token, &retired, false)
+            .await;
+        Ok((counts, degradations))
+    }
+
     /// The committed delete together with non-retryable index/telemetry errors.
     pub async fn delete_entity_with_post_commit_report(
         &self,
@@ -636,64 +734,78 @@ impl KhiveRuntime {
         } else {
             self.entities(token)?.delete_entity(id, mode).await?
         };
+        let degradations = if deleted {
+            self.cleanup_deleted_entity_indexes_and_event(&record_tok, &entity, hard)
+                .await
+        } else {
+            Vec::new()
+        };
+        Ok((deleted, degradations))
+    }
+
+    async fn cleanup_deleted_entity_indexes_and_event(
+        &self,
+        record_tok: &NamespaceToken,
+        entity: &Entity,
+        hard: bool,
+    ) -> Vec<PostCommitDegradation> {
+        let id = entity.id;
         let mut degradations = Vec::new();
-        if deleted {
-            let ns = entity.namespace.clone();
-            let fts_result = match self.text(&record_tok) {
-                Ok(store) => store
-                    .delete_document(&ns, id)
-                    .await
-                    .map_err(RuntimeError::from),
+        let ns = entity.namespace.clone();
+        let fts_result = match self.text(record_tok) {
+            Ok(store) => store
+                .delete_document(&ns, id)
+                .await
+                .map_err(RuntimeError::from),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = fts_result {
+            record_post_commit_degradation(
+                &mut degradations,
+                "delete_entity",
+                id,
+                "fts_cleanup",
+                error,
+            );
+        }
+        for model_name in self.registered_embedding_model_names() {
+            let vector_result = match self.vectors_for_model(record_tok, &model_name) {
+                Ok(store) => store.delete(id).await.map_err(RuntimeError::from),
                 Err(error) => Err(error),
             };
-            if let Err(error) = fts_result {
+            if let Err(error) = vector_result {
                 record_post_commit_degradation(
                     &mut degradations,
                     "delete_entity",
                     id,
-                    "fts_cleanup",
-                    error,
-                );
-            }
-            for model_name in self.registered_embedding_model_names() {
-                let vector_result = match self.vectors_for_model(&record_tok, &model_name) {
-                    Ok(store) => store.delete(id).await.map_err(RuntimeError::from),
-                    Err(error) => Err(error),
-                };
-                if let Err(error) = vector_result {
-                    record_post_commit_degradation(
-                        &mut degradations,
-                        "delete_entity",
-                        id,
-                        "vector_cleanup",
-                        format!("{model_name}: {error}"),
-                    );
-                }
-            }
-            let event = khive_storage::event::Event::new(
-                ns.clone(),
-                "delete",
-                EventKind::EntityDeleted,
-                SubstrateKind::Entity,
-                "",
-            )
-            .with_target(id)
-            .with_payload(serde_json::json!({"id": id, "namespace": ns, "hard": hard}));
-            let event_result = match self.events(&record_tok) {
-                Ok(store) => store.append_event(event).await.map_err(RuntimeError::from),
-                Err(error) => Err(error),
-            };
-            if let Err(error) = event_result {
-                record_post_commit_degradation(
-                    &mut degradations,
-                    "delete_entity",
-                    id,
-                    "event_append",
-                    error,
+                    "vector_cleanup",
+                    format!("{model_name}: {error}"),
                 );
             }
         }
-        Ok((deleted, degradations))
+        let event = khive_storage::event::Event::new(
+            ns.clone(),
+            "delete",
+            EventKind::EntityDeleted,
+            SubstrateKind::Entity,
+            "",
+        )
+        .with_target(id)
+        .with_payload(serde_json::json!({"id": id, "namespace": ns, "hard": hard}));
+        let event_result = match self.events(record_tok) {
+            Ok(store) => store.append_event(event).await.map_err(RuntimeError::from),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = event_result {
+            record_post_commit_degradation(
+                &mut degradations,
+                "delete_entity",
+                id,
+                "event_append",
+                error,
+            );
+        }
+        degradations
     }
 
     pub(crate) async fn delete_entity_attachments_on_core(&self, id: Uuid) -> RuntimeResult<bool> {

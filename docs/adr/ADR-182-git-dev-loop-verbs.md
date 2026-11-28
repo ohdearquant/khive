@@ -187,7 +187,10 @@ item 1 is amended again in item 3.
    receipt, error or table row carries a credential value.
 8. **Trees and diffs.** `git.checkout(repo, ref)` returns `{commit, tree}` from `rev-parse`,
    `ls-tree -r` and bounded `cat-file --batch` blob reads, falling back to `cat-file blob` for
-   exceptional object responses; symlink and submodule entries refuse. `git.diff(repo, input_kind,
+   exceptional object responses; symlink and submodule entries refuse. Each blob is hashed first and
+   written only when the store does not already hold it (2026-11-23), so a checkout does not refresh
+   the publish grace ([ADR-111](ADR-111-blob-store.md) §8) of an object the store already held.
+   `git.diff(repo, input_kind,
    base, head)` with `input_kind` `commits` or `trees` runs `git diff-tree -p
    --no-ext-diff --no-textconv --no-color --no-renames <base> <head>` and `--numstat` for
    `summary: {files, additions, deletions}`; tree inputs are written to a scratch repository with
@@ -908,3 +911,634 @@ This amendment adds one ledger table with its trigger and backfill, and introduc
 receipt mutation, operator-wide read, snapshot ownership,
 new backend opener or change to the git write/reconciliation protocol. Implementation and native
 validation remain pending while this amendment is Proposed.
+
+## Amendment 14 (2026-11-22): a tree commit with a second parent
+
+**Status**: Accepted (2026-11-22, implemented by `git.commit`'s `merge_parent`).
+
+### The gap
+
+A caller that works only through trees takes its base branch in by computing the merged tree
+elsewhere and committing it with `git.commit`. That commit has one parent, the branch head, so git
+still records the branch as forked from the old base. When the base later gains the same content
+through a squash merge, a platform three-way merge of the branch against the base starts from that
+old merge base, sees both sides add the same files and edit neighbouring lines, and reports a
+conflict that the branch's own tree does not contain. The only remedy today is a new branch from the
+current base carrying one commit of the merged tree, which also means a new pull request.
+
+"Known rough edges" keeps local merge out of scope, as ADR-108 does. That stands for computing a
+merge: khive still runs no merge, rebase or conflict resolution. This amendment adds recording one:
+the caller supplies the resolved tree and names the commit it merged.
+
+### A14.1 `merge_parent`
+
+```
+git.commit(repo, branch, tree, message, expected_head, merge_parent?, session_id?)
+    -> {repo, sha, parent, merge_parent?, tree, ref, receipt_id}
+```
+
+- Tree form only. The paths form refuses `merge_parent` with `invalid_params`, as it refuses every
+  key outside its list.
+- 40 hex, normalized to lowercase like `expected_head`. An explicit null, a short or non-hex value and
+  the zero object id refuse `invalid_params`.
+- It must name an existing commit object in the repository; an unknown id or a tree id refuses
+  `invalid_params`.
+- It must be the current tip of a remote-tracking ref: `for-each-ref --points-at <merge_parent>
+  refs/remotes` lists at least one ref, or the call refuses `merge_parent_unpublished`. A commit that
+  is only reachable from a remote-tracking ref, or only the tip of a local branch, refuses. The second
+  side of the merge is then exactly what a remote already holds, so a push of the merge publishes no
+  commit beyond the ones made on the branch through this verb, and every check that reads what a push
+  publishes (commit dates, commit text, added lines) keeps its meaning. A commit made through khive
+  and not yet pushed cannot enter as a second parent.
+- It must not already be in the history of `expected_head` (`merge-base --is-ancestor`), or the call
+  refuses `merge_parent_already_merged`. That covers `merge_parent` equal to `expected_head`.
+- `expected_head` stays the first parent, as `git merge` records it, so first-parent history and a
+  diff against `<sha>^1` show the branch's own line, including what the caller resolved by hand. A
+  reader that scans what a merge commit changed diffs it against its first parent; a combined diff
+  omits every hunk that took one side whole.
+- The checks run after the expected-head compare and before the actor's credential is resolved or
+  any tree object or commit is written. A refusal leaves every ref unchanged and is receipted like the
+  expected-head refusal.
+- The result and the receipt's inputs carry `merge_parent` only on a two-parent commit. A one-parent
+  commit's result is unchanged.
+- The tree is not checked against the two parents. Whether it is a correct merge is the caller's
+  claim, as the tree of a one-parent commit already is.
+- `git.reconcile` is unchanged: it settles the commit by its marker and its reachability, neither of
+  which depends on the parent count.
+
+### Acceptance
+
+1. **The commit.** With the second parent the tip of `refs/remotes/origin/main`, the new commit's
+   parents read `expected_head` then `merge_parent`, the branch moves to it, its tree equals the
+   manifest, and the result and the receipt carry `merge_parent`. A following one-parent commit's
+   result has no `merge_parent` field.
+2. **Published tips only.** The same commit as the tip of a local branch only refuses
+   `merge_parent_unpublished`; reachable from a remote-tracking ref without being its tip refuses the
+   same. In both, every ref is unchanged and no credential is resolved. Control: once the commit is a
+   remote-tracking tip, the identical call commits.
+3. **Shape.** Null, short, zero, unknown and tree-id values refuse `invalid_params`; `expected_head`
+   itself refuses `merge_parent_already_merged`; the paths form with `merge_parent` refuses
+   `invalid_params`.
+
+Mutation expectation: removing the remote-tracking tip check makes both refusals in arm 2 fail,
+because those calls then commit, while arms 1 and 3 stay green. That pair is what shows the check is
+load-bearing.
+
+## Amendment 15 (2026-11-21): reading a pull request's state
+
+**Status**: Accepted 2026-11-22. The ADR's Accepted status and every amendment above stand unchanged.
+
+Adopted from a reading of a real caller, as Amendment 8 was. A client with no shell can commit,
+push and open a pull request through this pack, and then cannot see what became of it: whether its
+checks ran, whether anyone reviewed the head, whether the platform will merge it. `git.pr_merge`
+answers only by refusing, and `git.reconcile` reads a pull request only to settle an unknown merge
+receipt. The one remaining reason such a client reaches for the platform's own command line is this
+read, so it enters here.
+
+1. **`git.pr_state(repo, number)`.** Returns `state`, `merged`, `draft`, `opened_by`, `head`
+   (`ref`, `sha`, `fork`), `base` (`ref`, `sha`), `mergeable`, `mergeable_state`, `merged_sha`,
+   `checks`, `statuses`, `reviews` and `text_altered`, beside the `repo`, `gate`, `slug` and
+   `number` the call resolved to.
+2. **Gated like a read, credentialed like a pull request verb.** The order is arguments, the
+   repo-only allowlist match, `tool.check`, the repository mapping, the dispatching actor's
+   credential, the platform. A local mapping refuses `remote_scheme` and a caller with no actor row
+   refuses `actor_unmapped`, each before any credential is resolved or any platform request is
+   made. The repository's name and visibility are compared with the configured row before the pull
+   request is read, because a renamed or transferred repository answers under its new name with
+   success; a difference refuses `repository_identity_mismatch`. The verb takes no `expected_head`:
+   it reports the head it found, and a caller that needs a pinned head compares.
+3. **No receipt, no write, no verdict.** Every platform request is a `GET`. Nothing is stored
+   except the policy decision row `tool.check` writes for every gated read, which is why the verb
+   is listed with `git.gates`, `git.status` and `git.log` among the reads whose accounting row is
+   not droppable. The result carries no field that says "passing" or "ready". `mergeable` and
+   `mergeable_state` are the platform's own values, null while it has not computed them, and each
+   check row carries the platform's `status` and `conclusion`. Which checks a branch requires is
+   repository configuration this verb does not read, so a required-check ruling is the caller's
+   reading of the rows by name.
+4. **Checks are the rows at the head, with the count the platform gave.** `checks.runs` holds the
+   check runs for `head.sha`, the platform's latest per name, each with `id`, `name`, `status`,
+   `conclusion`, `app`, `suite_id`, `started_at` and `completed_at`. At most 500 are read;
+   `checks.total` is the platform's count and `checks.truncated` is true when it exceeds the rows
+   returned, so a capped page never reads as the whole set. `checks.counts` groups the returned
+   rows by conclusion, and a run that has not completed is counted under its status, so a queued
+   run is a counted row and never an absent one. `statuses` holds the combined commit status for
+   the same sha with its `total`: the platform reports `pending` when no status exists at all, and
+   `total` zero beside it is how a caller tells that from a status still running.
+5. **Reviews are each account's latest decisive review.** Comment-only and pending reviews do not
+   replace an earlier approval or change request, the rule `git.pr_merge` already applies. Each
+   row carries `login`, `state`, `commit_id` and `at_head`, so an approval of an older head is
+   visibly not an approval of this one. The list is read to its end or the call refuses
+   `review_evidence_limit`; a partial list could omit the review that withdrew an approval.
+6. **`merged_sha` is null until the pull request is merged.** Before a merge the platform keeps a
+   trial merge commit in the same field of its reply; returning it would let a caller read an
+   unmerged pull request as merged.
+7. **Names are returned without hidden characters.** A branch name or a check name is written by
+   whoever opened the pull request, and the reader of this result may be a terminal or a language
+   model. Control characters, format characters and the line and paragraph separators are removed
+   by Unicode category (the Unicode 15.0 sets), never by an allow-list, so accented and CJK names
+   are returned whole; each string is bounded in length. `text_altered` is true when either changed
+   a returned string, so a caller knows a name is not the platform's exact one.
+
+What this does not cover: the event that triggered a check run (a run on the bare branch and a run
+on the merge ref carry the same name), required-check and ruleset configuration, review comments
+and their text, and the pull request's title and body. A caller that needs any of these still needs
+another surface; none of them is implied by a field here.
+
+Acceptance arms added: 51 a pull request with a passing, a failing and an unfinished check, one
+commit status, an approval at the head, an approval at an older head by a second account and a
+later comment returns each of those rows with its platform value, `counts` of one each, the
+comment not replacing the approval, `at_head` true and false, and `merged_sha` null beside a trial
+merge commit, while the platform write count, the caller's receipt count and the repository's refs
+are unchanged and every request is a `GET` under the caller's credential; 52 with nothing posted,
+`checks.total` and `statuses.total` are zero beside the platform's `pending`; 53 a missing policy
+row, a zero, a text and an absent `number`, an unknown argument and a caller with no actor row
+each refuse with no platform request and no credential read; 54 a repository outside the allowlist
+refuses before the policy check runs; 55 a repository answering under another name or visibility
+refuses after exactly one request, the same call answers once it matches (control), an unknown
+number is the platform's refusal and a transport failure is `remote_unavailable`; 56 a check name
+holding a direction override, an escape and a zero-width space, and a 400-character branch name,
+return cleaned and bounded with `text_altered` true, and a CJK name returns exactly with it false
+(control); 57 250 check runs are read in three pages and all returned, and 620 return 500 with
+`truncated` true; 58 a merged pull request reports `merged` and its `merged_sha`, and a review list
+that never ends refuses `review_evidence_limit`; 59 a local mapping refuses `remote_scheme` with no
+credential read and no receipt; 60 a platform refusal that reports a spent request allowance is
+`remote_rate_limited` with the second the allowance returns, after exactly one request, an effect
+verb refuses the same way as not committed with no write, and both answer once the allowance is back
+(control).
+
+## Amendment 16 (2026-11-23): fetching one ref
+
+**Status**: Accepted 2026-11-23. The ADR's Accepted status and every amendment above stand unchanged.
+
+Adopted from a reading of a real caller, as Amendments 8 and 15 were. A clone served to a client with
+no shell moves only when its operator fetches: `git.checkout` can read only what the clone already
+holds, and Amendment 14's `merge_parent` must be the tip of a remote-tracking ref, so a base that moved
+after the last fetch cannot be checked out or merged until someone else acts. A pull request opened
+from a fork has no remote-tracking ref at all. This amendment lets the caller bring in one ref itself.
+
+1. **`git.fetch(repo, ref, expected_remote?)`.** `ref` is a branch name or `pull/<N>`. A branch is
+   read from the remote's `refs/heads/<ref>` and written to `refs/remotes/origin/<ref>`; `pull/<N>`
+   is read from `refs/pull/<N>/head` and written to `refs/fetched/pull/<N>`. `pull/<N>` always means
+   the pull request, so a branch with that literal name is not fetchable by this verb. `N` is digits
+   with no leading zero. The result is `ref`, `sha`, `previous_sha`, `remote` and `receipt_id`.
+2. **The transfer runs in a scratch repository.** A fresh bare repository whose configuration the pack
+   writes fetches by the mapped URL with an explicit refspec, `--refmap=`, no tags and no submodules, so the clone's configuration, hooks and
+   remotes are never read: a `url.<base>.insteadOf` in the clone cannot redirect the fetch. The clone's
+   tips are offered as haves so only missing objects are sent. Objects are checked as they arrive,
+   because a pull request's head carries objects from whoever opened it; a failed check refuses
+   `objects_refused`. The only ref the transfer writes is the scratch's own, removed with it, and the
+   whole process group is bounded at 300 seconds.
+
+   Received objects are quarantined, as `receive-pack` does for a push. Each git child of the
+   transfer has a fresh directory inside the clone's object directory as its object store and the
+   clone's store as an alternate, so it reads the clone's objects and writes none of them. Only when
+   the transfer completed and the fetched commit equals `expected_remote` (when given) are the loose
+   objects, then the packs with each index last, linked into the clone's store; a name already present
+   is kept. The directory is removed when the call returns, so a refused, failed or timed-out transfer
+   and a mismatch leave the clone's object store exactly as it was.
+3. **One compare-and-swap moves one ref.** The destination's value is read before the transfer and
+   the destination is moved from that value (or from absent) to the fetched commit with `update-ref
+   --no-deref`, its reflog message the receipt marker. A ref another writer moved in between refuses
+   `ref_moved`; a ref whose lock another writer holds refuses `ref_locked`. Neither changes the ref and
+   both are safe to retry, since the retry reads the new value. When git gives no answer the
+   destination is read back: holding the fetched commit is success, anything else refuses. A fetch
+   that finds the ref already at the remote's commit writes nothing.
+4. **`expected_remote` pins what is accepted.** When given, the fetched commit must equal it or the
+   call refuses `expected_remote_mismatch` with the commit found in the receipt and no ref moved.
+   `null` is not a value for it. A ref the remote does not hold refuses `remote_ref_absent`.
+5. **Gated and credentialed like `git.push`.** The order is arguments, the repo-only allowlist match,
+   `tool.check`, the repository mapping, then the credential: a local mapping uses none, an HTTPS
+   mapping the dispatching actor's, and a caller with no actor row refuses `actor_unmapped` before
+   any transfer. It is a write: it writes a receipt and an audit row, and the operation classifier
+   lists it with `git.update_ref` (version 29).
+6. **A fetched pull request head is not published.** It is never written under `refs/remotes/`, so it
+   is not a `merge_parent` (`merge_parent_unpublished`) and still lists as unpublished in
+   `rev-list <sha> --not --remotes`. A branch fetched at the same commit is published.
+7. **Other verbs name the remedy.** `git.checkout` of `origin/<x>`, `refs/remotes/origin/<x>` or
+   `refs/fetched/pull/<N>` that the clone does not hold refuses `not_fetched`, naming `git.fetch`;
+   every other unresolved ref keeps its own refusal. A ref under `refs/khive/` refuses
+   `invalid_params` wherever a ref is taken, present or not, because that namespace belongs to the
+   transfer.
+8. **`git.reconcile` returns a fetch receipt unchanged.** A fetch is settled by reading its
+   destination, and rerunning it is safe.
+
+What this does not cover: fetching tags, many refs in one call, pruning remote-tracking refs the
+remote deleted, and fetching from any remote other than the mapped one. A shallow or partial clone is
+not made whole by this verb. A process that ends without returning (the daemon killed mid-call)
+leaves its quarantine directory behind; it holds no ref and git never reads it, and nothing removes
+it yet. A failure while linking objects into place leaves the objects already linked, which no ref
+names.
+
+Acceptance arms added: 61 a branch fetch over a local mapping, with an `insteadOf` rewrite and three
+hooks planted in the clone, moves `refs/remotes/origin/<ref>` to the remote's commit with
+`previous_sha` null, the object present, the reflog message the receipt marker, a committed receipt
+without a credential, no ref under `refs/khive/`, no hook run and the clone's configuration
+byte-identical; a second fetch after the remote moves reports the first commit as `previous_sha`, and
+a third reports both equal; 62 `pull/7` fetches `refs/pull/7/head` and not a branch named `pull/7`
+into `refs/fetched/pull/7`, no remote-tracking ref points at it and it lists as unpublished, and the
+same commit fetched as a branch is published (control); 63 a wrong `expected_remote` refuses
+`expected_remote_mismatch` with the found commit in the receipt, a missing remote ref refuses
+`remote_ref_absent`, and a null or short `expected_remote`, `pull/07`, `pull/0`, `pull/`, `-feature`
+and `feature..x` each refuse, every clone ref unchanged throughout, and the right `expected_remote`
+moves the ref (control); 64 a remote commit with a malformed author date refuses `objects_refused`
+with no destination ref; 65 a writer that creates the destination during the transfer makes the call
+refuse `ref_moved` with the writer's value kept, a held lock refuses `ref_locked` with the ref
+unchanged, and each retry succeeds from the value then present (controls); 66 over an HTTPS mapping
+the transfer carries the actor's credential and nothing at the platform's API is called, and a
+caller with no actor row refuses `actor_unmapped` with no transfer; 67 `git.checkout` of an absent
+`origin/feature`, `refs/remotes/origin/feature` and `refs/fetched/pull/7` refuses `not_fetched`, each
+checks out once the ref exists (control), and an absent ordinary branch does not say `not_fetched`;
+68 `refs/khive/fetch/staged` refuses `invalid_params` while it exists, and the same commit under
+another name checks out (control); 69 a commit held only at `refs/fetched/pull/7` refuses
+`merge_parent_unpublished` as a `merge_parent` with no ref changed, and commits once it is a
+remote-tracking tip (control); 70 the classifier lists `git.fetch` as a write at version 29 and every
+published verb total counts it; 71 the clone's object directory, listed file by file, is identical
+before and after a mismatch on a transfer large enough to arrive as a pack and on one small enough to
+arrive as loose objects, after `objects_refused`, and after a transfer that completes and then reports
+failure, and in each case `cat-file -e` of the commit it named fails in the clone; the expected commit
+then lands with every object it reaches and a new pack in the clone (control); 72 the linking step,
+on a constructed directory, moves loose objects and pack files, keeps an object the store already
+holds, orders each pack index after the other pack files, and leaves temporary, `.keep` and non-object
+files behind.
+
+## Amendment 17 (2026-11-23): editing and closing a pull request
+
+**Status**: Accepted 2026-11-23. The ADR's Accepted status and every amendment above stand unchanged.
+
+Adopted from a reading of a real caller, as Amendments 8, 15 and 16 were. A client with no shell opens
+a pull request through `git.pr_open` and then cannot correct its description or withdraw it: the title
+and body are fixed at the moment of opening, and a pull request that a later one supersedes stays open
+until someone with the platform's own tools closes it. These two acts enter here, under the same gates
+as the other pull request writes.
+
+1. **`git.pr_edit(repo, number, expected_head, title?, body?)`.** At least one of `title` and `body`
+   is required; a title may not be empty, a body may. Only the fields given are sent, so an omitted one
+   keeps its current text. The pull request may be open, closed or merged: a description is corrected
+   after the fact as often as before. The result is `number`, `head_sha`, `state`, `edited` (the field
+   names sent), `authority` and `receipt_id`. A title also may not start or end with whitespace or
+   hold a control character such as a line break (2026-11-23): item 5 compares the reply with the
+   title as sent, so a title the platform stored altered would leave an edit that landed unknown.
+2. **`git.pr_close(repo, number, expected_head)`.** Closes an open pull request without merging it. A
+   closed or merged one refuses `pull_request_closed`. The head branch is left in place; deleting a
+   branch is not part of this verb. The result is `number`, `head_sha`, `state`, `authority` and
+   `receipt_id`.
+3. **Gated and credentialed like `git.pr_review`.** The order is arguments, the repo-only allowlist
+   match, `tool.check` for the verb, the repository mapping, the dispatching actor's credential, the
+   platform account, the repository's name and visibility, then the pull request read. A local mapping
+   refuses `remote_scheme` before any credential is resolved. The head the platform reports must equal
+   `expected_head` or the call refuses `expected_head_mismatch` before any write, the same binding the
+   other pull request writes carry.
+4. **Only the opener changes a pull request, unless policy says otherwise.** The caller is the opener
+   when its platform login is the pull request's author, or when a `git.pr_open` receipt for this
+   repository and number belongs to this actor or this credential reference (the evidence the review
+   and merge refusals already use). Anyone else needs the `<verb>.others` policy row
+   (`git.pr_edit.others`, `git.pr_close.others`), checked as the fork rows of Amendment 3 are; without
+   it the call refuses `not_opener` before any write, with the decision on the receipt. `authority` in
+   the result says which of the three admitted the call: `platform_login`, `pr_open_receipt` or
+   `policy` with the policy decision. The `.others` rows also cover a pull request opened from a fork
+   (2026-11-23). There is no separate fork row like the ones that guard an approval or a merge
+   (Amendment 1 item 3), because neither an edit nor a close brings a fork's code into the repository.
+5. **The reply must show the change.** Each verb is one `PATCH` of the pull request. For an edit the
+   reply must carry every sent field as sent (the platform answers an empty body as null, read as
+   empty); for a close it must say closed and not merged; for both it must name the same number. A
+   reply that does not leaves the receipt unknown with `remote_response`, because the change may or may
+   not have landed. A reply whose head differs from `expected_head` (the head moved between the read
+   and the write) leaves it unknown with `changed_head_mismatch`: the change landed on a head the caller
+   did not name.
+6. **`git.reconcile` leaves both unknown.** As with `git.pr_open` and `git.pr_review`, a title, a body
+   or a closed state can be the work of anyone, so reading the pull request cannot show that this
+   receipt caused it. Reconcile returns the receipt unchanged without resolving a credential or
+   touching the platform.
+7. **Both are writes.** Each writes a receipt and an audit row, and the operation classifier lists
+   them with `git.pr_review` (version 30).
+
+What this does not cover: reopening a closed pull request, changing its base branch, draft state,
+labels, reviewers or assignees, and deleting the head branch. Comments are not edited or written by
+these verbs.
+
+Acceptance arms added: 73 the opener's edit of title and body is one `PATCH` of `pulls/<N>` carrying
+exactly those two fields, the platform then holds both, `edited` names them, `authority` is
+`platform_login` and the receipt is committed; 74 an edit of the body alone sends only `body`, an empty
+body reads back from the platform's null, and the title is unchanged; 75 an edit naming neither field,
+an empty title, a non-string title, and (2026-11-23) a title with leading or trailing whitespace or a
+line break each refuse `invalid_params` with no platform request; 76 a
+caller that did not open the pull request refuses `not_opener` for each verb with the policy decision
+on the receipt and no write, and the same call succeeds once `<verb>.others` allows it, naming that
+policy row (control); 77 an opener whose platform login is not the pull request's author is admitted
+by its `git.pr_open` receipt, and the account the platform names refuses `not_opener` (control); 78 a
+close leaves the pull request closed and unmerged, a second close and a close of a merged pull request
+refuse `pull_request_closed`, and an edit of the closed pull request succeeds (control); 79 a stale
+`expected_head` refuses `expected_head_mismatch` for each verb with nothing changed; 80 a head that
+moves between the read and the write leaves the receipt unknown with `changed_head_mismatch` and the
+head the platform reported, and a lost reply leaves a close unknown; 81 a reply carrying another title,
+a non-string body, an open state, a merged flag or another number each leave the receipt unknown with
+`remote_response`; 82 `git.reconcile` returns an unknown edit or close receipt unchanged with no
+platform request and no credential read; 83 a local mapping refuses each verb `remote_scheme` with no
+credential read, and the classifier lists both as writes at version 30 with every published verb
+total counting them.
+
+## Amendment 18 (2026-11-24): reading a hosted check's log
+
+**Status**: Accepted 2026-11-24 (#6851). The ADR's Accepted status and every amendment above stand unchanged.
+
+Adopted from a reading of real callers, as Amendments 8 and 15 to 17 were. `git.pr_state` names each
+check run at a pull request's head and its conclusion, and a client with no shell then cannot read why
+a run failed: the job's log is reachable only through the platform's own tools. Such a client today
+reproduces the failure in a run of its own, which a suite that needs the network or a second operating
+system cannot do, or asks someone else to read the log. This read enters here, under the gates of
+`git.pr_state`.
+
+1. **`git.check_log(repo, check_run)`.** `check_run` is a check run id as `git.pr_state` returns it in
+   `checks.runs[].id`. The result is `check_run` (`id`, `name`, `head_sha`, `status`, `conclusion`,
+   `started_at`, `completed_at`, and the run's own `title` and `summary`), `log`, `bytes`,
+   `kept_bytes`, `total_bytes`, `complete`, `tail` and `text_altered`, beside the `repo`, `gate` and
+   `slug` the call resolved to. `log` is the content reference of the stored log in the blob store, as `git.diff`
+   returns its diff, and `tail` is the log's last lines inline, at most 200 lines and 16 KiB, so the
+   failing step is visible without a second call.
+2. **Gated and credentialed like `git.pr_state`.** The order is arguments, the repo-only allowlist
+   match, `tool.check`, the repository mapping, the blob store, the dispatching actor's credential,
+   the platform. A local mapping refuses `remote_scheme`, an installation with no blob store refuses
+   as every blob verb does, and a caller with no actor row refuses `actor_unmapped`, each before any
+   credential is resolved or any platform request is made. The repository's name and
+   visibility are compared with the configured row before anything else is read from it, and a
+   difference refuses `repository_identity_mismatch`. Every platform request is a `GET`, and no
+   receipt is written. Storing the log is the verb's one effect, so the operation classifier lists it
+   as a write, as it lists `git.diff`; for the repository rows of ADR-108 it reads the repository and
+   changes nothing there, so a read row admits it. The policy decision and the stored log also make
+   it a known incidental writer for admission, never admission-degrade-safe.
+3. **Only a completed job of the platform's own runner has a log here.** The check run is read first,
+   under the repository. A run another app posted refuses `check_log_unavailable`, since the platform
+   keeps no job log for it. A run that has not completed refuses `check_run_incomplete`, so a partial
+   log never reads as the whole. The job is then read under the same id, and its check run link must
+   name this check run or the call refuses `remote_response`: that the two ids are equal is checked on
+   every call, never assumed.
+4. **The log comes from a download location the platform names, and the credential stays with the
+   platform.** The platform answers the log request with a redirect to a short-lived location on
+   another host. The credential goes to the platform's API host only, never to that location: the
+   request that carries it does not follow the redirect but reads the location, which must be
+   `https`, and a second request that is given no credential fetches it. Neither the credential nor
+   the location is passed in a process's arguments. A reply that is not a redirect refuses
+   `remote_response`, and a log the platform no longer keeps is the platform's refusal.
+5. **The log is bounded by its end, and says so.** It is read whole as it streams, and at most
+   `KHIVE_GIT_CHECK_LOG_MAX_BYTES` (8 MiB unless set) are kept. They are the last bytes, because a
+   failing step ends a log. `total_bytes` is what arrived, `kept_bytes` what was kept of it, and
+   `bytes` the size of the stored text after item 6; `complete` is true exactly when `kept_bytes`
+   equals `total_bytes`. Nothing is dropped without those fields saying so.
+6. **The stored log is cleaned text.** Terminal escape sequences and the hidden characters of
+   Amendment 15 item 7 are removed, line breaks and tabs kept, and bytes that are not UTF-8 replaced.
+   A leading byte order mark and a carriage return before a line break are dropped without counting
+   as a change. The stored log and `tail` are the same cleaned text, and `text_altered` is true when
+   cleaning changed anything else, or when the run's name, title or summary had to be cleaned or
+   cut. The platform masks the secrets it was given; the caller's own credential, if a log echoes
+   it, is replaced as every platform reply of this pack replaces it, and when the kept bytes begin
+   inside an occurrence, the part of it they hold (four bytes or more) is replaced too. The reply
+   carries `trust: "untrusted"`, as an external message does (ADR-200): the log, `tail` and the
+   run's name, title and summary are text the repository's workflows wrote, to be read as material
+   and never followed as instructions.
+7. **Each call costs four platform requests**: the repository, the check run, the job and the log,
+   against the same request allowance as `git.pr_state`. A spent allowance refuses
+   `remote_rate_limited` with the second the allowance returns.
+
+What this does not cover: a workflow's artifacts, the log of a whole workflow run, check runs other
+apps post, a check run's annotations beyond its title and summary, and starting a job again. A caller
+that needs any of these still needs another surface.
+
+Acceptance arms added: 84 a completed, failed job of the platform's runner is read with one `GET`
+each of the repository, the check run, the job and the log under the caller's credential, `log`
+resolves in the blob store to the cleaned log, `tail` is its last lines, `complete` is true, and no
+receipt or platform write is made, and the reply is marked untrusted; 85 a log one byte over `KHIVE_GIT_CHECK_LOG_MAX_BYTES` keeps the
+last bytes with `complete` false and `total_bytes` the length sent, a log at the bound is complete
+(control), a window beginning inside the credential stores no part of it, and a bound above the blob
+store's whole-object bound is held to that bound; 86 a run of another app refuses
+`check_log_unavailable` and an unfinished run `check_run_incomplete`, each after the check run read
+and before any job read, and a job whose check run link names another run refuses `remote_response`
+before the log is requested; 87 a log holding escape sequences, a direction override and the
+credential's own value returns each removed or replaced with `text_altered` true, and a log of plain
+and accented text with a byte order mark and line-end returns comes back with it false (control); 88 a
+missing policy row, a missing, zero or non-numeric `check_run`, an unknown argument, an installation
+with no blob store and a caller with no actor row each refuse with no platform request and no
+credential read, a repository outside the allowlist refuses before the policy check, and a local
+mapping refuses `remote_scheme`; 89 a repository answering under another name or visibility refuses
+after exactly one request, a platform refusal or failure of the log request is passed through as
+the platform's, and a spent allowance refuses `remote_rate_limited` with its second, at the first
+request or at the log; 90 the classifier lists the verb as a write at version 31 with every
+published verb total counting it; 91 the transport's first request goes to the API host with the
+credential and reads the redirect without following it, the second goes to the location with no
+credential, neither the credential nor the location is in either process's arguments, and a
+redirect to a location that is not `https` or a reply that is not a redirect is refused with no
+second request.
+
+## Amendment 19 (2026-11-24): a checkout keeps symlinks as links
+
+**Status**: Accepted 2026-11-24 (#6854). The ADR's Accepted status stands; this amendment supersedes only the checkout refusal of Amendment 2 item 8 and of the note under its item 2.
+
+Amendment 2 item 8 has `git.checkout` refuse a tree holding a symlink, and the 2026-09-10 note under
+its item 2 kept that refusal when `git.commit` began to accept mode `120000`. Every other user of a
+tree manifest already takes a link: the manifest itself (ADR-181), `exec.tree_put`, a run's
+materialization and its captured output, `git.diff` and `git.commit`. Only the read that brings a
+repository in refused it, so a client with no filesystem of its own could not read any repository
+that tracks a link anywhere, however far the link was from its change, and had to rebuild the files
+it needed from a diff. This amendment changes `git.checkout` alone and supersedes that refusal.
+
+1. **A symlink entry is a link entry.** An `ls-tree` entry of mode `120000` and kind `blob` becomes a
+   manifest entry of mode `120000` whose blob is the object's bytes as `cat-file` returns them, which
+   for a link are its literal target. The target is not read, resolved or checked: a link to a path
+   outside the repository, an absolute target, a dangling one and one whose bytes are not UTF-8 are
+   stored alike, and nothing they name is opened. The bounds, blob reuse and manifest limit of item 8
+   apply unchanged.
+2. **Submodules and every other entry still refuse.** Mode `160000`, and any mode and kind other than
+   `100644`, `100755` or `120000` with `blob`, refuse `unsupported_entry` before any blob is read.
+3. **What a link may reach is its consumer's question.** A tree from a checkout is a tree
+   `exec.tree_put` could already make with the same entry. A run's materialization, its working
+   directory check and its sandbox decide what a link may reach (ADR-181), and `git.commit` writes the
+   link back unchanged, so a checkout followed by a commit of the same tree gives back the same git
+   tree.
+
+Acceptance arms added: 92 a commit tracking a link to `../outside`, beside a file at that path outside
+the repository, checks out to a manifest whose link entry has mode `120000` and the literal target as
+its blob, never that file's content, with `git status` and the index unchanged; 93 a commit holding a
+submodule entry still refuses `unsupported_entry` with a refusal receipt, and the listing parser
+refuses mode `120000` with any kind but `blob` (control); 94 a commit made from a manifest holding a
+link checks out to that same manifest.
+
+## Amendment 20 (2026-11-24): a repository's own commit identity
+
+**Status**: Accepted 2026-11-24 (#6855).
+
+Amendment 2 item 3 takes the author name and email of a tree commit only from the calling actor's
+`[git_write.actors]` row. One installation can hold repositories whose commits must carry different
+identities: a repository whose hosting or deployment checks the commit author, beside others whose
+commits carry the actor's own. With one identity per actor, such an installation has no way to say
+so. This amendment adds the identity to the repository row and leaves authorization and credentials
+with the actor.
+
+1. **`author` on the repository row.** `[git_write.repositories."<path>"]` may carry
+   `author = { name, email }`. Unknown keys inside it refuse at load, and a name or email that is
+   empty, blank, or holds a control character or an angle bracket refuses at load with key
+   `repositories.<path>.author`, the rule a commit already applies to an actor's identity.
+2. **It replaces the actor's identity for that repository's tree commits.** `git.commit` with a
+   `tree` resolves the actor row first, as today: an actor without a row still refuses
+   `actor_unmapped`, and the receipt's `credential` still names the actor. It then reads the
+   repository row matched as the pull-request verbs match it; when that row has an `author`, the
+   commit's author and committer are that name and email, and the result and receipt carry
+   `author_source: {table: "git_write.repositories", key}`. With no row, or a row with no `author`,
+   the actor's identity applies and `author_source` is absent, so such a commit reads as before. Two
+   rows matching one repository refuse `repository_ambiguous` before anything is written.
+3. **Nothing else moves.** `git.push`, the pull-request verbs and their checks present and compare
+   the actor's credential and platform login, never the repository's identity. The paths form of
+   `git.commit` keeps the rules of ADR-108.
+
+Acceptance arms added: 95 a tree commit in a repository whose row names an author carries that name
+and email as author and committer, returns `author_source` naming the row's key, and its receipt's
+`credential` names the actor's reference; 96 the same commit with a row that has no `author` carries
+the actor's identity and no `author_source` (control); 97 a row whose author name or email is empty,
+blank, holds an angle bracket or a line break refuses at load naming `repositories.<path>.author`, an
+unknown key inside `author` refuses at parse, and a row without `author` writes none back.
+
+## Amendment 21 (2026-11-25): deleting a local branch
+
+**Status**: Accepted 2026-11-25 (#6856). The ADR's Accepted status and every amendment above stand unchanged.
+
+`git.branch` makes a branch and `git.update_ref` moves one, and nothing removes one. A client with no
+shell that finishes its work on a branch leaves the branch behind, and each later inventory of the
+clone reads it again. This amendment adds the delete, for a local branch only, and only when nothing
+still uses it.
+
+1. **`git.branch_delete(repo, name, expected)`.** `expected` is the commit the caller believes the
+   branch holds, as 40 lowercase hexadecimal characters; the zero object id is refused
+   `invalid_params`, because `update-ref -d` reads it as no compare at all. The result is `repo`,
+   `ref`, `from` (the commit the branch held) and `receipt_id`. The name goes at once. The branch's
+   reflog goes with it, so commits that no other ref reaches stay only until git's own collection
+   prunes them once they pass `gc.pruneExpire` (a `HEAD` reflog entry in some worktree only delays
+   it); until then `git.branch` with the receipt's `from` makes the name again. The verb deletes a
+   branch at `expected` whether or not it was pushed, so work meant to be kept is pushed first.
+2. **Order.** Arguments, `tool.check`, the allowlist row with the branch (a write row whose branch
+   patterns admit `name`), the repository mapping, the dispatching actor's credential, and then,
+   under the repository write lock: the branch's tip, the worktrees, the platform, and last one
+   compare-and-delete: one `update-ref --no-deref --stdin` transaction, `start`, `delete <ref>
+   <expected>`, `prepare`, `commit`. A branch outside the row refuses
+   `branch_not_allowed` before any git process or credential read. A local mapping refuses
+   `remote_scheme`, since it names no platform to ask, before any credential is read.
+3. **Refusals before the delete.** A branch that does not exist refuses `branch_absent`; one at a
+   commit other than `expected` refuses `expected_head_mismatch`; a symbolic ref refuses
+   `ref_symbolic` before its existence is asked, so a dangling one never reads as absent. A branch
+   that the main worktree or any linked worktree has checked out refuses `branch_checked_out`.
+   Every refusal leaves a receipt that was not committed and the branch as it was.
+4. **The platform is asked, and an unanswered question refuses.** Two `GET` requests under the
+   caller's credential: the repository, whose name and visibility must match the configured row or
+   the call refuses `repository_identity_mismatch`, and its open pull requests whose head is this
+   branch of this repository. One such pull request refuses `pull_request_open`, naming its number.
+   A failed, refused or rate-limited request, or a reply that is not a list, refuses with the
+   platform's reason: it is never read as no pull request. A pull request is named only when its
+   head is this branch of this repository; a platform that cannot parse the head filter answers
+   with every open pull request, so a row with another head refuses `remote_response`. Nothing is
+   written to the platform.
+5. **The delete is one compare.** The commit being deleted is recorded in the receipt before the
+   delete can have an effect. A transaction that stops before git prints `prepare: ok` changed no
+   ref, since the prepare takes the lock and compares the value, and the branch is read again: one
+   that moved after the checks refuses `expected_head_mismatch`, one removed meanwhile
+   `branch_absent`, and one still at `expected` `not_committed`. All three settle as not committed.
+   A transaction that prepared and then failed, or any other reply, leaves the receipt unknown.
+   The outcome is read from git's status lines and the branch, never from git's error text, which
+   differs between git versions.
+6. **`git.reconcile` reports and settles nothing.** Git drops a branch's reflog with the branch, so
+   no receipt marker survives a delete. The reply carries `observed`: `ref_absent`,
+   `ref_at_expected` or `ref_moved`. An absent branch shows the goal state and not who removed it,
+   and a branch at the receipt's `from` may have been made again at that commit afterwards, so an
+   unknown receipt stays unknown. An unknown receipt blocks no later call on the name: a second
+   delete answers `branch_absent`, and `git.branch` can make the name again.
+7. **Classified and audited as a write.** The operation classifier lists the verb as a write, and
+   each call emits the write audit event the other local write verbs emit.
+
+What this does not cover: deleting a branch on the remote, deleting a remote-tracking ref or a
+fetched pull request head, and deleting several branches in one call. A worktree whose branch is in
+the middle of a rebase lists as detached, so this check does not see it.
+
+Acceptance arms added: 98 a branch at `expected` with no worktree on it and no open pull request is
+deleted after exactly two `GET` requests under the caller's credential, the receipt is committed, its
+commit is still readable, nothing is written to the platform and the remote's branch is unchanged;
+99 a branch the main worktree has checked out, and one a linked worktree has, each refuse
+`branch_checked_out` with no platform request, and the same call deletes it once the worktree is
+detached (control); 100 an open pull request from the branch refuses `pull_request_open` naming its
+number, and once it is closed the same call deletes the branch (control); 101 an unavailable
+platform, a spent allowance, a repository answering under another name or visibility, and a pull
+request reply that is not a list, and one whose pull request has another head, each refuse with
+the branch intact, and the same call succeeds once
+the platform answers (control); 102 a branch moved to another commit after the checks, with the
+repository write lock held, refuses `expected_head_mismatch` from the compare with the branch at the
+new commit and the receipt not committed, and a branch removed at that point refuses `branch_absent`;
+103 a stale `expected` refuses `expected_head_mismatch` with no platform request, a branch already
+deleted refuses `branch_absent` with no platform request, and the zero object id refuses
+`invalid_params`; 104 a branch outside the allowlist row refuses `branch_not_allowed` with no git
+process, platform request or credential read, while a delete the row admits runs git (control), a
+denying policy refuses `policy_denied`, and a local mapping refuses `remote_scheme` before any
+credential read; 105 a delete whose reply is lost after its effect leaves the receipt unknown,
+`git.reconcile` reports `ref_absent` and keeps it unknown, a second delete refuses `branch_absent`,
+`git.branch` makes the name again, and `git.reconcile` then reports `ref_at_expected` and still keeps
+it unknown; 106 the classifier lists the verb as a write at version 32 with every published verb
+total counting it.
+
+## Amendment 22 (2026-11-27): reading an issue
+
+**Status**: Accepted 2026-11-27. The ADR's Accepted status and every amendment above stand unchanged.
+
+Adopted from a reading of real callers, as Amendments 15 and 18 were. A client with no shell can read
+a pull request through `git.pr_state` but not the issue that asked for it: an issue's body and
+discussion are reachable only through the platform's own tools, or through `git.digest`, which
+writes them into the graph as notes and is the wrong tool for reading one issue now. This read
+enters here, under the gates of `git.pr_state`.
+
+1. **`git.issue(repo, number)`.** The result is `title`, `state`, `author` (the login, or null when
+   the platform names none), `created_at`, `updated_at`, `labels` (their names), `body` (whole, an
+   empty string when the issue has none), `is_pull_request`, `comments`, `comments_total`,
+   `comments_truncated`, `text_altered` and `trust`, beside the `repo`, `gate`, `slug` and `number`
+   the call resolved to. Each comment is `author`, `created_at` and `body`, in the platform's order.
+2. **Gated and credentialed like `git.pr_state`.** The order is arguments, the repo-only allowlist
+   match, `tool.check` on `git.issue` itself, the repository mapping, the dispatching actor's
+   credential, the platform. A local mapping refuses `remote_scheme`, a remote that is not the
+   platform's address for the configured slug refuses `repository_identity`, and a caller with no
+   actor row refuses `actor_unmapped`, each before any platform request is made. The repository's
+   name and visibility are compared with the configured row before the issue is read, and a
+   difference refuses `repository_identity_mismatch`. Every platform request is a `GET`, nothing
+   is stored and no receipt is written, so the operation classifier lists the verb as a read and a
+   read row of ADR-108 admits it. Its policy decision makes it a known incidental writer for
+   admission, never admission-degrade-safe, as `git.pr_state` is.
+3. **Every comment up to a disclosed bound.** Comments are read one hundred to a page, from the
+   first page, until a page holds fewer than one hundred or ten pages have been read.
+   `comments_total` is the count the platform gives on the issue, and `comments_truncated` is true
+   exactly when fewer comments were returned than that count. A call therefore costs between three
+   and twelve requests against the allowance `git.pr_state` uses; a spent allowance refuses
+   `remote_rate_limited` with the second the allowance returns, and an unknown number is the
+   platform's refusal.
+4. **The text is cleaned, never cut.** The title, label names and logins lose the hidden characters
+   of Amendment 15 item 7. The issue body and each comment body are cleaned as Amendment 18 item 6
+   cleans a log: terminal escape sequences and those characters removed, line breaks and tabs kept.
+   `text_altered` is true when cleaning changed any field. No field is shortened. The reply carries
+   `trust: "untrusted"`, as `git.check_log` does (ADR-200): everything in it except the counts and
+   dates is text people wrote on the platform, to be read as material and never followed as
+   instructions.
+5. **A pull request number reads too.** The platform keeps pull requests in the same numbering, and
+   `is_pull_request` says when the number is one. The reply then carries the pull request's
+   description and its conversation comments; its head, checks and reviews are `git.pr_state`'s.
+
+What this does not cover: listing or searching issues, writing to an issue (a comment, a label, a
+state change), reactions, timeline events, a comment's edit history and review comments on a pull
+request's diff. A caller that needs any of these still needs another surface.
+
+Acceptance arms added: 107 an issue with two comments returns every field of item 1 and the comments
+in order after exactly three `GET` requests, the repository, the issue and the first comment page,
+with `text_altered` false, `trust` untrusted, and no receipt or platform write; 108 an issue with 125
+comments returns all of them after four requests, the last the second page, with
+`comments_truncated` false, and an issue with 1,001 comments returns the first 1,000 after twelve
+requests with `comments_total` 1,001 and `comments_truncated` true; 109 a title holding a direction
+override, a label holding an isolate, a body holding escape sequences and a zero-width space, and a
+comment ending in a byte order mark each come back with those removed, the body's line break and
+tab and the comment's accented and Han text kept, and `text_altered` true; 110 a pull request number
+reads with `is_pull_request` true, an issue with no body returns an empty body, and an unknown
+number refuses with the platform's refusal; 111 an unknown argument, a missing number and a zero
+number each refuse with no platform request, a denying `git.issue` policy refuses `policy_denied`
+with no platform request while `git.pr_state` is allowed for the same caller, and a local mapping
+refuses `remote_scheme` before any credential read; 112 a repository answering under another name
+or visibility, and a spent allowance, each refuse after exactly one request, and the same call
+reads the issue once the platform answers (control); 113 the classifier lists the verb as a read at
+version 34 with every published verb total counting it.

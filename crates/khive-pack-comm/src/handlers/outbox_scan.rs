@@ -1,15 +1,17 @@
 use chrono::{DateTime, Utc};
+use khive_runtime::curation::OutboundHealthSummary;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use serde_json::{json, Value};
 
 use crate::params::HeartbeatParams;
 
-/// Result of the bounded pending-row query, before any delivery is attempted.
+/// Due-page and uncapped backlog observations, before any delivery is attempted.
 pub enum OutboxScanOutcome {
     Success {
         pending_rows_seen: u64,
         pending_rows_limit: u32,
         oldest_pending_created_at: Option<DateTime<Utc>>,
+        backlog: OutboundHealthSummary,
     },
     Failure {
         error_message: String,
@@ -75,6 +77,7 @@ pub(super) fn update_properties(props: &mut Value, scan: OutboxScan) -> Result<(
             pending_rows_seen,
             pending_rows_limit,
             oldest_pending_created_at,
+            backlog,
         } => {
             if pending_rows_limit == 0 || pending_rows_seen > u64::from(pending_rows_limit) {
                 return Err(RuntimeError::InvalidInput(
@@ -93,6 +96,19 @@ pub(super) fn update_properties(props: &mut Value, scan: OutboxScan) -> Result<(
             outbox["pending_rows_limit"] = json!(pending_rows_limit);
             outbox["oldest_pending_created_at"] =
                 json!(oldest_pending_created_at.map(|time| time.to_rfc3339()));
+            outbox["backlog_observed_at"] = json!(backlog.observed_at.to_rfc3339());
+            outbox["undelivered_rows"] = json!(backlog.undelivered_rows);
+            outbox["backoff_rows"] = json!(backlog.backoff_rows);
+            outbox["oldest_undelivered_created_at"] = json!(backlog
+                .oldest_undelivered_created_at
+                .map(|time| time.to_rfc3339()));
+            outbox["oldest_backoff_created_at"] = json!(backlog
+                .oldest_backoff_created_at
+                .map(|time| time.to_rfc3339()));
+            outbox["earliest_backoff_next_attempt_at"] = json!(backlog
+                .earliest_backoff_next_attempt_at
+                .map(|time| time.to_rfc3339()));
+            outbox["max_backoff_delivery_attempts"] = json!(backlog.max_backoff_delivery_attempts);
         }
         OutboxScanOutcome::Failure { error_message } => {
             outbox["last_scan_succeeded"] = json!(false);
@@ -103,7 +119,7 @@ pub(super) fn update_properties(props: &mut Value, scan: OutboxScan) -> Result<(
                 .unwrap_or(0);
             outbox["consecutive_failures"] = json!(failures.saturating_add(1));
             outbox["last_error"] = json!({"class": "storage", "message": error_message, "at": at});
-            // Last successful page observations remain explicitly dated by last_success_at.
+            // Keep the last successful page and backlog observations with their original dates.
         }
     }
     props["outbox"] = outbox;

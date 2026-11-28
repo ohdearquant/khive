@@ -287,6 +287,7 @@ async fn exercise() -> Result<()> {
     let root = tempfile::Builder::new()
         .prefix("recall-stack-")
         .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("recall-stack-").tempdir())
         .context("short private daemon directory")?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))?;

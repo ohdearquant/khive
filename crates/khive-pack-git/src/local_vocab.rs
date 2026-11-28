@@ -15,6 +15,7 @@ const fn param(name: &'static str, required: bool, description: &'static str) ->
 pub(crate) const BRANCH: ParamDef = param("branch", false, "Target branch; required for a tree commit. Its head must equal expected_head at the atomic ref update.");
 pub(crate) const TREE: ParamDef = param("tree", false, "Complete khive-tree/v1 manifest reference. Mutually exclusive with paths; author, actor and credential overrides are refused.");
 pub(crate) const EXPECTED_HEAD: ParamDef = param("expected_head", false, "Required 40-hex parent SHA for a tree commit. Null is refused. Ref update compares the current head atomically against this value.");
+pub(crate) const MERGE_PARENT: ParamDef = param("merge_parent", false, "Optional 40-hex second parent for a tree commit that takes in another line of history; the tree is the caller's resolved result. It must be an existing commit, the current tip of a remote-tracking ref (refs/remotes/*), and not already in expected_head's history. expected_head stays the first parent. Null is refused.");
 pub(crate) const SESSION: ParamDef = param(
     "session_id",
     false,
@@ -42,6 +43,18 @@ pub(crate) const UPDATE_REF: HandlerDef = HandlerDef {
         SESSION,
     ],
 };
+pub(crate) const BRANCH_DELETE: HandlerDef = HandlerDef {
+    name: "git.branch_delete",
+    description: "Delete one local branch whose tip equals expected, in one compare-and-delete. Refuses branch_absent when the branch does not exist, expected_head_mismatch when its tip differs, branch_checked_out when any worktree has it checked out, and pull_request_open when an open pull request on the mapped platform has it as its head; a failed platform read refuses with the platform's reason. The configured git-write branch allowlist applies, a local mapping refuses remote_scheme, and the remote branch is never deleted. Two GET requests per call; a pull request with another head than this branch refuses remote_response. The name goes at once: commits no other ref reaches stay only until git's garbage collection prunes them, and git.branch with the returned from makes the name again before that, so push work meant to be kept first. Returns ref, from and receipt_id.",
+    visibility: Visibility::Verb,
+    category: VerbCategory::Commissive,
+    params: &[
+        REPO,
+        param("name", true, "Existing local branch to delete; the configured git-write branch allowlist applies."),
+        param("expected", true, "Required exact 40-hex lowercase current tip of the branch. Omission, null and the zero object id refuse."),
+        SESSION,
+    ],
+};
 const REPO: ParamDef = param(
     "repo",
     true,
@@ -50,7 +63,7 @@ const REPO: ParamDef = param(
 
 pub(crate) const CHECKOUT: HandlerDef = HandlerDef {
     name: "git.checkout",
-    description: "Read one resolved commit into an immutable khive tree manifest without changing refs, index or working files. Symlinks and submodules refuse. Returns commit, tree and receipt_id.",
+    description: "Read one resolved commit into an immutable khive tree manifest without changing refs, index or working files. A symlink becomes a mode 120000 entry whose blob is its literal target; submodules refuse. Returns commit, tree and receipt_id.",
     visibility: Visibility::Verb,
     category: VerbCategory::Assertive,
     params: &[REPO, param("ref", true, "Commit SHA or ref resolved exactly once before reading its objects."), SESSION],
@@ -77,14 +90,14 @@ pub(crate) const RECEIPTS: HandlerDef = HandlerDef {
 };
 pub(crate) const GATES: HandlerDef = HandlerDef {
     name: "git.gates",
-    description: "Read effective repository allowlist rows, preserving their configured entry indices and branch patterns. target names the configured remote, slug, visibility and kind (local or platform); absent mappings return null and invalid mappings return kind=unavailable with a reason.",
+    description: "Read effective repository allowlist rows, preserving their configured entry indices, branch patterns and access (read or write). target names the configured remote, slug, visibility and kind (local or platform); absent mappings return null and invalid mappings return kind=unavailable with a reason.",
     visibility: Visibility::Verb,
     category: VerbCategory::Assertive,
     params: &[REPO],
 };
 pub(crate) const RECONCILE: HandlerDef = HandlerDef {
     name: "git.reconcile",
-    description: "Reconcile a caller-owned receipt without repeating its write. Local ref receipts require the receipt marker and SHA in the reflog, with that SHA at the current head or an ancestor. Push receipts require an acknowledged local marker and exact remote SHA; explicitly local remote mappings read that SHA without resolving credentials. PR merge receipts read platform merged state and SHA. Unknown PR open and review receipts remain unknown because they have no receipt-specific platform marker; no credential or platform read is attempted for them. Missing evidence leaves unknown.",
+    description: "Reconcile a caller-owned receipt without repeating its write. Local ref receipts require the receipt marker and SHA in the reflog, with that SHA at the current head or an ancestor. Push receipts require an acknowledged local marker and exact remote SHA; explicitly local remote mappings read that SHA without resolving credentials. PR merge receipts read platform merged state and SHA. Unknown PR open and review receipts remain unknown because they have no receipt-specific platform marker; no credential or platform read is attempted for them. Branch delete receipts report observed (ref_absent, ref_at_expected or ref_moved) and stay unknown, since a deleted ref keeps no marker. Missing evidence leaves unknown.",
     visibility: Visibility::Verb,
     category: VerbCategory::Assertive,
     params: &[param("receipt", true, "Caller-owned receipt UUID of a branch, tree commit, push, PR open, review or merge operation.")],

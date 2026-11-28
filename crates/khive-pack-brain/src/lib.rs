@@ -8,8 +8,8 @@ pub mod serve_ledger;
 pub mod tunable;
 
 mod event;
-mod event_counts_grouping;
-mod event_read_scope;
+#[cfg(test)]
+use khive_runtime::event_plane_read_test_support as event_counts_grouping;
 mod pack;
 mod section_feedback;
 mod sql;
@@ -157,9 +157,6 @@ mod retired_section_tests;
 
 #[cfg(test)]
 mod event_counts_group_tests;
-
-#[cfg(test)]
-mod event_counts_fold_tests;
 
 #[cfg(test)]
 mod event_counts_error_tests;

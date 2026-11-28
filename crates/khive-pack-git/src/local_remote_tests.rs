@@ -127,6 +127,7 @@ impl Fixture {
                     .map(|repo| GitWriteEntryConfig {
                         repo: repo.display().to_string(),
                         branches: vec!["work".into(), "new".into()],
+                        access: Default::default(),
                     })
                     .collect(),
                 actors: BTreeMap::from([(
@@ -146,6 +147,7 @@ impl Fixture {
                             slug: slug.into(),
                             visibility: "private".into(),
                             merge_refusals: vec![],
+                            author: None,
                         },
                     ),
                     (
@@ -155,6 +157,7 @@ impl Fixture {
                             slug: "fixture/project".into(),
                             visibility: "private".into(),
                             merge_refusals: vec![],
+                            author: None,
                         },
                     ),
                 ]),
@@ -179,6 +182,8 @@ impl Fixture {
                 "git.pr_open",
                 "git.pr_review",
                 "git.pr_merge",
+                "git.pr_edit",
+                "git.pr_close",
                 "git.gates",
                 "git.reconcile",
             ] {
@@ -571,10 +576,114 @@ async fn local_pr_verbs_refuse_remote_scheme_before_credentials() {
             "git.pr_merge",
             json!({"number":1,"method":"merge","subject":"Fixture","body":"","expected_head":f.head}),
         ),
+        (
+            "git.pr_edit",
+            json!({"number":1,"title":"Fixture","expected_head":f.head}),
+        ),
+        ("git.pr_close", json!({"number":1,"expected_head":f.head})),
     ] {
         let receipt = f.refusal(verb, params, "remote_scheme").await;
         assert_eq!(receipt.credential, json!({"source":"none"}));
     }
+}
+
+#[tokio::test]
+async fn local_pr_state_refuses_remote_scheme_before_credentials() {
+    let f = Fixture::file().await;
+    f.registry
+        .dispatch(
+            "tool.policy",
+            json!({"actor":f.actor,"tool":"git.pr_state","decision":"allow"}),
+        )
+        .await
+        .unwrap();
+    let before = receipts::list_owned(&f.rt, "local", &f.actor, None, None, 500, 0)
+        .await
+        .unwrap()
+        .receipts
+        .len();
+    let error = f
+        .call(&f.actor, "git.pr_state", json!({"number":1}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("remote_scheme"), "{error}");
+    assert_eq!(
+        receipts::list_owned(&f.rt, "local", &f.actor, None, None, 500, 0)
+            .await
+            .unwrap()
+            .receipts
+            .len(),
+        before
+    );
+    f.no_credential_read();
+}
+
+#[tokio::test]
+async fn local_issue_refuses_remote_scheme_before_credentials() {
+    let f = Fixture::file().await;
+    f.registry
+        .dispatch(
+            "tool.policy",
+            json!({"actor":f.actor,"tool":"git.issue","decision":"allow"}),
+        )
+        .await
+        .unwrap();
+    let error = f
+        .call(&f.actor, "git.issue", json!({"number":1}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("remote_scheme"), "{error}");
+    f.no_credential_read();
+}
+
+#[tokio::test]
+async fn local_check_log_refuses_remote_scheme_before_credentials() {
+    let f = Fixture::file().await;
+    f.registry
+        .dispatch(
+            "tool.policy",
+            json!({"actor":f.actor,"tool":"git.check_log","decision":"allow"}),
+        )
+        .await
+        .unwrap();
+    let error = f
+        .call(&f.actor, "git.check_log", json!({"check_run":1}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("remote_scheme"), "{error}");
+    f.no_credential_read();
+}
+
+#[tokio::test]
+async fn local_branch_delete_refuses_remote_scheme_before_credentials() {
+    let f = Fixture::file().await;
+    f.registry
+        .dispatch(
+            "tool.policy",
+            json!({"actor":f.actor,"tool":"git.branch_delete","decision":"allow"}),
+        )
+        .await
+        .unwrap();
+    git(&f.repo, &["checkout", "-q", "--detach"]);
+    // A local mapping names no platform, so whether a pull request is open cannot be asked.
+    let error = f
+        .call(
+            &f.actor,
+            "git.branch_delete",
+            json!({"name":"work","expected":f.head}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("remote_scheme"), "{error}");
+    let receipt = f.last(&f.actor).await;
+    assert_eq!(receipt.disposition, Disposition::NotCommitted);
+    assert_eq!(receipt.credential, json!({"source":"none"}));
+    assert_eq!(git(&f.repo, &["rev-parse", "refs/heads/work"]), f.head);
+    f.no_credential_read();
 }
 
 #[tokio::test]
@@ -756,6 +865,8 @@ async fn local_push_reconcile_requires_marker_and_exact_remote_without_credentia
     );
     f.no_credential_read();
 }
+
+include!("local_remote_fetch_tests.rs");
 
 #[tokio::test]
 async fn local_file_url_rejects_decoded_controls_slashes_and_invalid_encoding() {

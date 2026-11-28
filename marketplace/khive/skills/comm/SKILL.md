@@ -4,10 +4,10 @@ description: Coordinate with other agents and lambdas over khive comm — be att
 
 # Coordinate over comm
 
-khive comm is how agents and lambdas message each other. The surface is fifteen verbs —
+khive comm is how agents and lambdas message each other. The surface is sixteen verbs —
 `comm.send`, `comm.delivered`, `comm.transport_status`, `comm.inbox`, `comm.unread`,
 `comm.read`, `comm.mark_read`, `comm.reply`,
-`comm.thread`, `comm.health`, `comm.probe`, `comm.suppression_add`,
+`comm.thread`, `comm.health`, `comm.probe`, `comm.quiet`, `comm.suppression_add`,
 `comm.suppression_list`, `comm.suppression_remove`, and `comm.withheld_body` —
 but the thing worth learning is the _coordination pattern_, not the verbs. Per-verb param
 detail is one call away: `request(ops="comm.send(help=true)")`.
@@ -123,6 +123,22 @@ failure/backoff episode. Treat `stalled` as an advisory, not proof that the task
 sequential or slow in-flight polls can also make a row overdue. Inspect
 `consecutive_failures`, `last_error`, and `last_poll_attempt_at` together, and use the daemon
 component supervisor for authoritative task-liveness/restart decisions.
+
+### 6. Request a bounded background quiet window
+
+```
+request(ops="comm.quiet(ttl_secs=30)")
+request(ops="comm.health()")
+```
+
+Use an integer `ttl_secs` from 1 through 300. The response supplies `quiet_until`,
+and health always includes `resource.quiet_until` (null after expiry). Repeated
+requests keep the later deadline; a shorter request does not revoke another
+caller's window. The window belongs to the executing process across namespaces.
+It defers warm and maintenance work at cooperative checkpoints; foreground
+requests, in-flight work, finalization, shutdown and channel delivery continue.
+Ordinary write policy applies. The window is not durable and does not coordinate
+other daemons.
 
 ## Anti-patterns
 

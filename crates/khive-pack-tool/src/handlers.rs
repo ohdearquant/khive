@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{
-    micros_to_iso, operations::EntityClaimSpec, KhiveRuntime, NamespaceToken, RequestIdentity,
-    RuntimeError, VerbRegistry,
+    micros_to_iso, operations::EntityClaimSpec, EntityPatch, KhiveRuntime, NamespaceToken,
+    RequestIdentity, RuntimeError, VerbRegistry,
 };
 use khive_storage::types::Direction;
 use khive_storage::{
@@ -25,9 +25,21 @@ use crate::vocab::{
 };
 use crate::RegistryPin;
 
+mod unregister;
+pub(crate) use unregister::unregister;
+
 #[cfg(test)]
 tokio::task_local! {
     static BEFORE_CLAIM: std::sync::Arc<tokio::sync::Barrier>;
+    static AFTER_CLAIM: std::sync::Arc<tokio::sync::Barrier>;
+    static BEFORE_REGISTRATION_UPDATE: (
+        std::sync::Arc<tokio::sync::Barrier>,
+        std::sync::Arc<tokio::sync::Notify>,
+    );
+    static BEFORE_REGISTRATION_REINDEX: (
+        std::sync::Arc<tokio::sync::Barrier>,
+        std::sync::Arc<tokio::sync::Notify>,
+    );
 }
 
 #[cfg(test)]
@@ -161,23 +173,15 @@ fn side_effect_of(e: &Entity) -> Option<String> {
     prop_str(&props_json(e), "side_effect")
 }
 
-async fn registry_entities(
-    rt: &KhiveRuntime,
-    token: &NamespaceToken,
-    kind: Option<&str>,
-    limit: u32,
-    offset: u32,
-) -> Result<Vec<Entity>, RuntimeError> {
-    let filter = EntityFilter {
+fn registry_filter(kind: Option<&str>) -> EntityFilter {
+    EntityFilter {
         kinds: vec![REGISTRY_ENTITY_KIND.into()],
         entity_types: kind
             .map(|value| vec![value.to_string()])
             .unwrap_or_default(),
         tags_any: vec![REGISTRY_TAG.into()],
         ..Default::default()
-    };
-    rt.list_entities_filtered(token, filter, limit, offset)
-        .await
+    }
 }
 
 async fn find_by_name(
@@ -427,17 +431,206 @@ struct RegisterSpec {
     tags: Vec<String>,
 }
 
+fn registration_changed_event(
+    token: &NamespaceToken,
+    existing: &Entity,
+    patch: &EntityPatch,
+) -> Result<Option<khive_storage::Event>, RuntimeError> {
+    let before = RegistryPin::from_entity(existing)?;
+    let mut inputs = crate::pin::registry_policy_inputs(existing);
+    for key in ["source", "side_effect", "trust", "schema"] {
+        if let Some(value) = patch
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get(key))
+        {
+            inputs[key] = value.clone();
+        }
+    }
+    let bytes = khive_types::canonical_json_bytes(&inputs)
+        .map_err(|error| RuntimeError::InvalidInput(format!("tool definition: {error}")))?;
+    let after = RegistryPin::from_canonical_bytes(existing.id, bytes);
+    if before.canonical_bytes() == after.canonical_bytes() {
+        return Ok(None);
+    }
+    let event = khive_runtime::EventAttribution::from_token(token).stamp(
+        khive_storage::Event::new(
+            token.namespace().as_str(),
+            "tool.register",
+            khive_types::EventKind::ToolRegistrationChanged,
+            khive_types::SubstrateKind::Event,
+            "",
+        )
+        .with_target(existing.id),
+    );
+    khive_runtime::secret_gate::check_at(&event.actor, "tool.register", "actor")?;
+    let payload = khive_types::ToolRegistrationChangedPayload {
+        actor: event.actor.clone(),
+        id: existing.id.to_string(),
+        digest_before: before.definition_digest().to_string(),
+        digest_after: after.definition_digest().to_string(),
+    };
+    Ok(Some(event.with_payload(json!(payload))))
+}
+
+fn validate_registration_correction(
+    existing: &Entity,
+    patch: &EntityPatch,
+) -> Result<(), RuntimeError> {
+    let mut corrected = existing
+        .properties
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(Value::Object(properties)) = &patch.properties {
+        for (key, value) in properties {
+            corrected.insert(key.clone(), value.clone());
+        }
+    }
+    let stored = |key| {
+        existing
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get(key))
+    };
+    let source_changed = corrected.get("source") != stored("source");
+    let kind_changed = patch
+        .entity_type
+        .as_ref()
+        .is_some_and(|kind| kind != &existing.entity_type);
+    if source_changed || kind_changed {
+        let changed = match (source_changed, kind_changed) {
+            (true, true) => "source and kind",
+            (true, false) => "source",
+            _ => "kind",
+        };
+        return Err(RuntimeError::InvalidInput(format!(
+            "cannot change {changed} on an existing registration; register a different source or kind under a new name"
+        )));
+    }
+    for (field, order) in [("side_effect", SIDE_EFFECTS), ("trust", TRUST_ORIGINS)] {
+        let Some(passed) = patch
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get(field))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let previous = stored(field);
+        if let (Some(before), Some(after)) = (
+            previous
+                .and_then(Value::as_str)
+                .and_then(|previous| order.iter().position(|value| *value == previous)),
+            order.iter().position(|value| *value == passed),
+        ) {
+            if after < before {
+                let previous = order[before];
+                return Err(RuntimeError::InvalidInput(format!(
+                    "cannot loosen {field}: stored {previous:?}, passed {passed:?}"
+                )));
+            }
+        } else if (field == "side_effect" && passed == "read")
+            || (field == "trust" && passed != "external")
+        {
+            let state = match previous {
+                None => "absent",
+                Some(Value::Null) => "null",
+                Some(Value::String(_)) => "unrecognized",
+                Some(_) => "non-string",
+            };
+            let remedy = if field == "side_effect" {
+                "use write, egress or irreversible"
+            } else {
+                "use external"
+            };
+            return Err(RuntimeError::InvalidInput(format!(
+                "cannot set {field} to {passed:?}: stored {field} is {state}; {remedy}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn registration_patch(existing: &Entity, spec: &RegisterSpec, supplied: &Value) -> EntityPatch {
+    let present = |field| supplied.get(field).is_some_and(|value| !value.is_null());
+    let mut patch = EntityPatch::default();
+    if present("description") && existing.description != spec.description {
+        patch.description = Some(spec.description.clone());
+    }
+    let kind_changed =
+        present("kind") && existing.entity_type.as_deref() != Some(spec.kind.as_str());
+    if kind_changed {
+        patch.entity_type = Some(Some(spec.kind.clone()));
+    }
+    let mut properties = serde_json::Map::new();
+    for (key, value) in [
+        ("schema", spec.schema.clone()),
+        ("source", spec.source.as_ref().map(|value| json!(value))),
+        ("side_effect", Some(json!(spec.side_effect))),
+        ("trust", Some(json!(spec.trust))),
+    ] {
+        if present(key) {
+            if let Some(value) = value {
+                if existing
+                    .properties
+                    .as_ref()
+                    .and_then(|props| props.get(key))
+                    != Some(&value)
+                {
+                    properties.insert(key.into(), value);
+                }
+            }
+        }
+    }
+    if !properties.is_empty() {
+        patch.properties = Some(Value::Object(properties));
+    }
+    let mut tags = existing.tags.clone();
+    for tag in &spec.tags {
+        if !tags.contains(tag) {
+            tags.push(tag.clone());
+        }
+    }
+    if kind_changed {
+        tags.retain(|tag| !KINDS.contains(&tag.as_str()) || tag == &spec.kind);
+        if !tags.contains(&spec.kind) {
+            tags.push(spec.kind.clone());
+        }
+    }
+    if tags != existing.tags {
+        patch.tags = Some(tags);
+    }
+    patch
+}
+
 async fn register_one(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     spec: RegisterSpec,
 ) -> Result<(Entity, bool, Vec<Value>), RuntimeError> {
+    let (entity, created, _, capabilities) = register_with_updates(rt, token, spec, None).await?;
+    Ok((entity, created, capabilities))
+}
+
+async fn register_with_updates(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    spec: RegisterSpec,
+    supplied: Option<&Value>,
+) -> Result<(Entity, bool, bool, Vec<Value>), RuntimeError> {
     one_of(&spec.kind, KINDS, "kind")?;
     one_of(&spec.side_effect, SIDE_EFFECTS, "side_effect")?;
     one_of(&spec.trust, TRUST_ORIGINS, "trust")?;
 
-    let (entity, created) = match find_by_name(rt, token, &spec.name).await? {
+    let (mut entity, created) = match find_by_name(rt, token, &spec.name).await? {
         Some(existing) => {
+            #[cfg(test)]
+            if let Ok((ready, resume)) = BEFORE_REGISTRATION_REINDEX.try_with(Clone::clone) {
+                ready.wait().await;
+                resume.notified().await;
+            }
             rt.ensure_claimed_entity_create_event(token, &existing)
                 .await?;
             rt.reindex_claimed_entity(token, &existing).await?;
@@ -493,9 +686,50 @@ async fn register_one(
                     },
                 )
                 .await?;
+            #[cfg(test)]
+            if let Ok(barrier) = AFTER_CLAIM.try_with(std::sync::Arc::clone) {
+                barrier.wait().await;
+            }
             (entity, created)
         }
     };
+
+    let mut updated = false;
+    if !created {
+        if let Some(supplied) = supplied {
+            let patch = registration_patch(&entity, &spec, supplied);
+            if patch.description.is_some()
+                || patch.entity_type.is_some()
+                || patch.properties.is_some()
+                || patch.tags.is_some()
+            {
+                validate_registration_correction(&entity, &patch)?;
+                let required_event = registration_changed_event(token, &entity, &patch)?;
+                #[cfg(test)]
+                if let Ok((ready, resume)) = BEFORE_REGISTRATION_UPDATE.try_with(Clone::clone) {
+                    ready.wait().await;
+                    resume.notified().await;
+                }
+                entity = match required_event {
+                    Some(event) => {
+                        rt.update_entity_if_unchanged_with_required_event(
+                            token,
+                            &entity,
+                            patch,
+                            &[],
+                            event,
+                        )
+                        .await?
+                    }
+                    None => {
+                        rt.update_entity_if_unchanged(token, &entity, patch, &[])
+                            .await?
+                    }
+                };
+                updated = true;
+            }
+        }
+    }
 
     let tool_id = entity_uuid(&entity);
     let mut caps = Vec::new();
@@ -505,7 +739,7 @@ async fn register_one(
         link_implements(rt, token, tool_id, cap_id).await?;
         caps.push(json!({ "id": cap_id.to_string(), "name": cap.name }));
     }
-    Ok((entity, created, caps))
+    Ok((entity, created, updated, caps))
 }
 
 pub(crate) async fn register(
@@ -533,10 +767,13 @@ pub(crate) async fn register(
         capabilities: opt_str_list(&params, "capabilities")?,
         tags: opt_str_list(&params, "tags")?,
     };
-    let (entity, created, capabilities) = register_one(rt, token, spec).await?;
+    let (entity, created, updated, capabilities) =
+        register_with_updates(rt, token, spec, Some(&params)).await?;
     Ok(json!({
         "ok": true,
         "created": created,
+        "updated": updated,
+        "unchanged": !created && !updated,
         "tool": summary(&entity),
         "capabilities": capabilities,
     }))
@@ -821,6 +1058,70 @@ pub(crate) async fn list(
         one_of(k, KINDS, "kind")?;
     }
     let limit = opt_u32(&params, "limit", 100, 1000)?;
+    let source = opt_str(&params, "source")?;
+    let source_prefix = opt_str(&params, "source_prefix")?;
+    if source.is_some() && source_prefix.is_some() {
+        return Err(RuntimeError::InvalidInput(
+            "pass source or source_prefix, not both".into(),
+        ));
+    }
+    let include_decision = match params.get("include_decision") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(RuntimeError::InvalidInput(
+                "include_decision must be a boolean".into(),
+            ))
+        }
+    };
+    let actor = opt_str(&params, "actor")?;
+    if actor.is_some() && !include_decision {
+        return Err(RuntimeError::InvalidInput(
+            "actor applies only with include_decision=true".into(),
+        ));
+    }
+    let actor = include_decision.then(|| actor.unwrap_or_else(|| actor_label(token)));
+    let mut filter = registry_filter(kind.as_deref());
+    if let Some(source) = source {
+        filter = filter.property_eq("$.source", SqlValue::Text(source));
+    }
+    if let Some(prefix) = source_prefix {
+        filter = filter.property_prefix("$.source", prefix);
+    }
+    let (cursor_mode, after): (bool, Option<Uuid>) = match params.get("after") {
+        None | Some(Value::Null) => (false, None),
+        Some(Value::String(raw)) if raw.is_empty() => (true, None),
+        Some(Value::String(raw)) => {
+            let after = Uuid::parse_str(raw).map_err(|error| {
+                RuntimeError::InvalidInput(format!(
+                    "after must be the full UUID returned by next_after: {error}"
+                ))
+            })?;
+            (true, Some(after))
+        }
+        Some(_) => {
+            return Err(RuntimeError::InvalidInput(
+                "after must be a UUID string or an empty string to start".into(),
+            ));
+        }
+    };
+    if cursor_mode {
+        let (entities, next_after) = rt
+            .list_entities_after_filtered(token, filter, after, limit)
+            .await?;
+        let tools = list_rows(rt, token, &entities, actor.as_deref()).await?;
+        let mut out = json!({
+            "ok": true,
+            "count": tools.len(),
+            "limit": limit,
+            "tools": tools,
+            "next_after": next_after,
+        });
+        if let Some(actor) = actor {
+            out["actor"] = json!(actor);
+        }
+        return Ok(out);
+    }
     let offset = match params.get("offset") {
         None | Some(Value::Null) => 0,
         Some(v) => v
@@ -830,15 +1131,51 @@ pub(crate) async fn list(
                 RuntimeError::InvalidInput("offset must be a non-negative integer".into())
             })?,
     };
-    let entities = registry_entities(rt, token, kind.as_deref(), limit, offset).await?;
-    let tools: Vec<Value> = entities.iter().map(summary).collect();
-    Ok(json!({
+    let entities = rt
+        .list_entities_filtered(token, filter, limit, offset)
+        .await?;
+    let tools = list_rows(rt, token, &entities, actor.as_deref()).await?;
+    let mut out = json!({
         "ok": true,
         "count": tools.len(),
         "limit": limit,
         "offset": offset,
         "tools": tools,
-    }))
+    });
+    if let Some(actor) = actor {
+        out["actor"] = json!(actor);
+    }
+    Ok(out)
+}
+
+/// Summary rows for `tool.list`; with an actor, each row also carries the
+/// policy decision `tool.describe` reports for that actor (no receipt).
+async fn list_rows(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    entities: &[Entity],
+    actor: Option<&str>,
+) -> Result<Vec<Value>, RuntimeError> {
+    let ns = token.namespace().as_str().to_string();
+    let mut rows = Vec::with_capacity(entities.len());
+    for entity in entities {
+        let mut row = summary(entity);
+        if let Some(actor) = actor {
+            let registration = RegistryPin::from_entity(entity)?;
+            let decision = policy::decide(
+                rt,
+                &ns,
+                actor,
+                &entity.name,
+                side_effect_of(entity).as_deref(),
+                Some(&registration),
+            )
+            .await?;
+            row["decision"] = decision.to_json();
+        }
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 // ── policy and grants ────────────────────────────────────────────────────────
@@ -1118,9 +1455,11 @@ pub(crate) async fn policies(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let actor = opt_str(&params, "actor")?;
+    let policy_id = opt_str(&params, "policy_id")?;
     let limit = opt_u32(&params, "limit", 100, 1000)?;
     let ns = token.namespace().as_str().to_string();
-    let rows = policy::list_policies(rt, &ns, actor.as_deref(), limit).await?;
+    let rows =
+        policy::list_policies(rt, &ns, actor.as_deref(), policy_id.as_deref(), limit).await?;
     Ok(json!({
         "ok": true,
         "count": rows.len(),

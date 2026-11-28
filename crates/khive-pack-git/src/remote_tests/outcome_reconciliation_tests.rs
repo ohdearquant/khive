@@ -30,6 +30,16 @@ async fn pr_open_and_review_reconcile_return_unknown_without_platform_evidence()
             "git.pr_review",
             json!({"number":1,"verdict":"approve","expected_head":f.head}),
         ),
+        (
+            &f.actor,
+            "git.pr_edit",
+            json!({"number":1,"title":"Fixture","expected_head":f.head}),
+        ),
+        (
+            &f.actor,
+            "git.pr_close",
+            json!({"number":1,"expected_head":f.head}),
+        ),
     ] {
         let mut prior = Receipt::new(
             "local",

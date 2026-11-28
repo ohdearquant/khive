@@ -773,11 +773,18 @@ mod acknowledgement {
         Terminated(WriterTaskRequestState),
         EvidenceRequest(WriterTaskRequestState),
         EvidenceTerminated(WriterTaskRequestState),
+        CommitReplyLost,
+        EvidenceCommitReplyLost,
     }
 
     impl Fault {
         fn error(self) -> StorageError {
             let error = match self {
+                Self::CommitReplyLost | Self::EvidenceCommitReplyLost => {
+                    StorageError::WriteOutcomeUnknown {
+                        source: Box::new(std::io::Error::other("lost COMMIT reply")),
+                    }
+                }
                 Self::Request(request_state) | Self::EvidenceRequest(request_state) => {
                     StorageError::WriterTaskRequestFailed {
                         request_state,
@@ -790,7 +797,12 @@ mod acknowledgement {
                     StorageError::writer_task_terminated(request_state)
                 }
             };
-            if matches!(self, Self::EvidenceRequest(_) | Self::EvidenceTerminated(_)) {
+            if matches!(
+                self,
+                Self::EvidenceRequest(_)
+                    | Self::EvidenceTerminated(_)
+                    | Self::EvidenceCommitReplyLost
+            ) {
                 error.with_sqlite_write_failure(khive_storage::error::SqliteWriteFailure {
                     stage: khive_storage::error::SqliteWriteStage::Commit,
                     primary_code: rusqlite::ffi::SQLITE_IOERR,
@@ -805,9 +817,20 @@ mod acknowledgement {
         fn assert_preserved(self, error: StorageError) {
             assert_eq!(
                 error.sqlite_write_failure().is_some(),
-                matches!(self, Self::EvidenceRequest(_) | Self::EvidenceTerminated(_))
+                matches!(
+                    self,
+                    Self::EvidenceRequest(_)
+                        | Self::EvidenceTerminated(_)
+                        | Self::EvidenceCommitReplyLost
+                )
             );
             match (self, error.without_sqlite_write_stage()) {
+                (
+                    Self::CommitReplyLost | Self::EvidenceCommitReplyLost,
+                    StorageError::WriteOutcomeUnknown { source },
+                ) => {
+                    assert_eq!(source.to_string(), "lost COMMIT reply");
+                }
                 (
                     Self::Request(expected) | Self::EvidenceRequest(expected),
                     StorageError::WriterTaskRequestFailed {
@@ -929,6 +952,8 @@ mod acknowledgement {
             Fault::Terminated(WriterTaskRequestState::SideEffectsUnknown),
             Fault::EvidenceRequest(WriterTaskRequestState::SideEffectsUnknown),
             Fault::EvidenceTerminated(WriterTaskRequestState::SideEffectsUnknown),
+            Fault::CommitReplyLost,
+            Fault::EvidenceCommitReplyLost,
             Fault::Terminated(WriterTaskRequestState::TransactionRolledBack),
         ] {
             let pool = scratch_pool("recorded_uncertain");
@@ -981,6 +1006,8 @@ mod acknowledgement {
             Fault::Terminated(WriterTaskRequestState::SideEffectsUnknown),
             Fault::EvidenceRequest(WriterTaskRequestState::SideEffectsUnknown),
             Fault::EvidenceTerminated(WriterTaskRequestState::SideEffectsUnknown),
+            Fault::CommitReplyLost,
+            Fault::EvidenceCommitReplyLost,
         ] {
             let pool = scratch_pool("committed_ack_lost");
             seed_schema(&pool);
@@ -1006,6 +1033,26 @@ mod acknowledgement {
                 name, "changed",
                 "the lost acknowledgement does not imply rollback"
             );
+        }
+    }
+    #[tokio::test]
+    async fn prepared_refusal_cannot_replace_commit_reply_loss() {
+        for fault in [Fault::CommitReplyLost, Fault::EvidenceCommitReplyLost] {
+            let pool = scratch_pool("prepared_reply_lost");
+            let access = fault_access(&pool, fault, true);
+            let prepared: PreparedAtomicOp<(), &'static str> = Box::new(|_| {
+                Box::pin(async {
+                    Err(PreparedAtomicError::Refused {
+                        failure: "recorded refusal",
+                        message: "recorded refusal".into(),
+                    })
+                })
+            });
+            match run_prepared_atomic_unit(&access, prepared).await {
+                Err(error) => fault.assert_preserved(error),
+                Ok(_) => panic!("lost COMMIT reply must not become a recorded rollback"),
+            }
+            assert_eq!(*access.callback_result.lock().unwrap(), Some(false));
         }
     }
 }

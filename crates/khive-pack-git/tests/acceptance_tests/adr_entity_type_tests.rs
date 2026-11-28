@@ -107,6 +107,7 @@ async fn git_pack_adr_entity_type_validates_through_runtime_create_many() {
                 description: None,
                 properties: None,
                 tags: vec![],
+                aliases: Vec::new(),
             }],
         )
         .await
@@ -135,6 +136,7 @@ async fn git_pack_adr_entity_type_validates_through_runtime_create_many() {
                 description: None,
                 properties: None,
                 tags: vec![],
+                aliases: Vec::new(),
             }],
         )
         .await

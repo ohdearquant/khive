@@ -1,12 +1,13 @@
 //! Public event declaration contract; no event-store routing is exercised here.
 use khive_types::{EventKind, EventSink};
 
-const EXISTING_KIND_NAMES: [&str; 43] = [
+const EXISTING_KIND_NAMES: [&str; 44] = [
     "audit",
     "recall_executed",
     "rerank_executed",
     "search_executed",
     "tool_check_decided",
+    "tool_registration_changed",
     "link_created",
     "entity_created",
     "entity_updated",
@@ -102,4 +103,38 @@ fn existing_kind_wire_names_remain_unchanged() {
         assert_eq!(value, serde_json::json!(expected_name));
         assert_eq!(serde_json::from_value::<EventKind>(value).unwrap(), kind);
     }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn registration_change_payload_has_only_identity_and_digests() {
+    let payload = khive_types::ToolRegistrationChangedPayload {
+        actor: "actor:registration-corrector".into(),
+        id: "00000000-0000-0000-0000-000000000001".into(),
+        digest_before: "1".repeat(64),
+        digest_after: "2".repeat(64),
+    };
+    let value = serde_json::to_value(&payload).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "actor": "actor:registration-corrector",
+            "id": "00000000-0000-0000-0000-000000000001",
+            "digest_before": "1".repeat(64),
+            "digest_after": "2".repeat(64),
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<khive_types::ToolRegistrationChangedPayload>(value).unwrap(),
+        payload
+    );
+    let typed = khive_types::EventPayload::ToolRegistrationChanged(payload);
+    let wire = serde_json::to_value(&typed).unwrap();
+    assert_eq!(wire["kind"], "tool_registration_changed");
+    assert_eq!(
+        serde_json::from_value::<khive_types::EventPayload>(wire).unwrap(),
+        typed
+    );
+    let error = "unknown".parse::<EventKind>().unwrap_err();
+    assert!(error.valid.contains(&"tool_registration_changed"));
 }

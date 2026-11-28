@@ -36,6 +36,9 @@ impl Fixture {
             blob: Default::default(),
             mounts: Vec::new(),
             events_split: None,
+            knowledge: khive_runtime::KnowledgeSectionConfig {
+                import_roots: vec![std::env::temp_dir()],
+            },
             ..RuntimeConfig::no_embeddings()
         })
         .expect("private memory runtime");

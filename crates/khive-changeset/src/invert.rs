@@ -2,12 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use khive_types::{Entity, Id128, Link, Note, NoteStatus};
+use khive_types::{EntityAlias, EntityAliasOrigin, Id128, Link, Note, NoteStatus};
 
+use crate::record::same_set;
 use crate::{
     ChangeSet, CreateOp, CreateTarget, DeleteOp, DeletePreimage, EdgePatch, EdgePreimage,
-    EntityPatch, EntityPreimage, Envelope, LinkOp, NotePatch, NotePreimage, Op, RestoreOp,
-    UpdateOp, UpdatePatch, UpdatePreimage,
+    EntityPatch, EntityPreimage, EntityRecord, Envelope, LinkOp, NotePatch, NotePreimage, Op,
+    RestoreOp, UpdateOp, UpdatePatch, UpdatePreimage,
 };
 
 /// Current records, including soft-deleted records, read when staging a revert.
@@ -20,8 +21,9 @@ use crate::{
 /// See `crates/khive-changeset/docs/api/invert.md` for caller responsibilities.
 #[derive(Clone, Debug, Default)]
 pub struct CurrentState {
-    /// Current entity records, keyed by their header identifiers.
-    pub entities: BTreeMap<Id128, Entity>,
+    /// Current entity records with their keys and aliases, keyed by their
+    /// header identifiers.
+    pub entities: BTreeMap<Id128, EntityRecord>,
     /// Current note records, keyed by their header identifiers.
     pub notes: BTreeMap<Id128, Note>,
     /// Current edge records, keyed by their edge identifiers.
@@ -167,7 +169,7 @@ type RecordKey = (u8, Id128);
 
 fn record_key(record: &DeletePreimage) -> RecordKey {
     match record {
-        DeletePreimage::Entity(row) => (0, row.header.id),
+        DeletePreimage::Entity(row) => (0, row.entity.header.id),
         DeletePreimage::Note(row) => (1, row.header.id),
         DeletePreimage::Edge(row) => (2, row.id),
     }
@@ -175,7 +177,7 @@ fn record_key(record: &DeletePreimage) -> RecordKey {
 
 fn is_deleted(record: &DeletePreimage) -> bool {
     match record {
-        DeletePreimage::Entity(row) => row.deleted_at.is_some(),
+        DeletePreimage::Entity(row) => row.entity.deleted_at.is_some(),
         DeletePreimage::Note(row) => row.deleted_at.is_some(),
         DeletePreimage::Edge(row) => row.deleted_at.is_some(),
     }
@@ -215,7 +217,7 @@ fn current_record(
 fn rewind_record(record: &DeletePreimage, working: &mut CurrentState) {
     match record {
         DeletePreimage::Entity(row) => {
-            working.entities.insert(row.header.id, *row.clone());
+            working.entities.insert(row.entity.header.id, *row.clone());
         }
         DeletePreimage::Note(row) => {
             working.notes.insert(row.header.id, *row.clone());
@@ -238,7 +240,8 @@ fn check_record_content(
         };
     }
     match (current, expected) {
-        (DeletePreimage::Entity(row), DeletePreimage::Entity(prior)) => {
+        (DeletePreimage::Entity(record), DeletePreimage::Entity(prior_record)) => {
+            let (row, prior) = (&record.entity, &prior_record.entity);
             fields!(
                 row,
                 prior,
@@ -260,6 +263,18 @@ fn check_record_content(
                 id,
                 "created_at",
                 row.header.created_at == prior.header.created_at,
+            )?;
+            check(
+                index,
+                id,
+                "keys",
+                same_set(&record.keys, &prior_record.keys),
+            )?;
+            check(
+                index,
+                id,
+                "aliases",
+                same_set(&record.aliases, &prior_record.aliases),
             )?;
         }
         (DeletePreimage::Note(row), DeletePreimage::Note(prior)) => {
@@ -322,7 +337,7 @@ fn invert_delete(
                     index,
                     id,
                     "updated_at",
-                    row.header.updated_at == prior.header.updated_at,
+                    row.entity.header.updated_at == prior.entity.header.updated_at,
                 )?;
             }
             (DeletePreimage::Note(row), DeletePreimage::Note(prior)) => {
@@ -376,10 +391,11 @@ fn invert_create(
     let id = create.id;
     let preimage = match &create.target {
         CreateTarget::Entity(fields) => {
-            let row = working
+            let record = working
                 .entities
                 .get(&id)
                 .ok_or(InvertError::MissingCurrent { index, id })?;
+            let row = &record.entity;
             check(index, id, "id", row.header.id == id)?;
             check(
                 index,
@@ -404,7 +420,15 @@ fn invert_create(
             )?;
             check(index, id, "properties", row.properties == fields.properties)?;
             check(index, id, "tags", row.tags == fields.tags)?;
-            let captured = row.clone();
+            let keys: Vec<String> = fields.key.iter().cloned().collect();
+            check(index, id, "keys", same_set(&record.keys, &keys))?;
+            check(
+                index,
+                id,
+                "aliases",
+                same_set(&record.aliases, &created_aliases(fields)),
+            )?;
+            let captured = record.clone();
             working.entities.remove(&id);
             DeletePreimage::Entity(Box::new(captured))
         }
@@ -446,6 +470,22 @@ fn invert_create(
     }))
 }
 
+/// The aliases a staged create leaves on its entity: the requested ones other
+/// than its name, each once, with the `caller` origin.
+fn created_aliases(fields: &crate::EntityCreateFields) -> Vec<EntityAlias> {
+    fields
+        .aliases
+        .iter()
+        .filter(|alias| **alias != fields.name)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|alias| EntityAlias {
+            alias: alias.clone(),
+            origin: EntityAliasOrigin::Caller,
+        })
+        .collect()
+}
+
 fn invert_link(index: usize, link: &LinkOp, working: &mut CurrentState) -> Result<Op, InvertError> {
     let id = link.id;
     let row = working
@@ -482,10 +522,17 @@ fn invert_update(
     let id = update.target_id();
     match (update.patch(), update.preimage()) {
         (UpdatePatch::Entity(patch), UpdatePreimage::Entity(prior)) => {
-            let row = working
+            let record = working
                 .entities
                 .get_mut(&id)
                 .ok_or(InvertError::MissingCurrent { index, id })?;
+            if let Some(value) = &patch.aliases {
+                check(index, id, "aliases", same_set(&record.aliases, value))?;
+            }
+            if let Some(value) = &prior.aliases {
+                record.aliases.clone_from(value);
+            }
+            let row = &mut record.entity;
             check(index, id, "id", row.header.id == id)?;
             if let Some(value) = &patch.name {
                 check(index, id, "name", &row.name == value)?;
@@ -604,6 +651,7 @@ fn swapped_update(index: usize, update: &UpdateOp) -> Result<UpdateOp, InvertErr
             properties: prior.properties.clone(),
             tags: prior.tags.clone(),
             entity_type: prior.entity_type.clone(),
+            aliases: prior.aliases.clone(),
         }),
         UpdatePreimage::Note(prior) => UpdatePatch::Note(NotePatch {
             content: prior.content.clone(),
@@ -624,6 +672,7 @@ fn swapped_update(index: usize, update: &UpdateOp) -> Result<UpdateOp, InvertErr
             properties: patch.properties.clone(),
             tags: patch.tags.clone(),
             entity_type: patch.entity_type.clone(),
+            aliases: patch.aliases.clone(),
         }),
         UpdatePatch::Note(patch) => UpdatePreimage::Note(NotePreimage {
             content: patch.content.clone(),

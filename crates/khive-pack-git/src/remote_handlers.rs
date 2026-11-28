@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use khive_runtime::engine_config::GitWriteRepositoryConfig;
+use khive_runtime::engine_config::{GitWriteAuthorConfig, GitWriteRepositoryConfig};
 use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::types::{SqlStatement, SqlValue};
 use serde_json::{json, Value};
@@ -10,7 +10,7 @@ use crate::local_handlers::{
     checked_policy, denied, gate_reason, oid, optional, required, validate_keys, Failure,
 };
 use crate::receipts::{self, Disposition, Receipt};
-use crate::remote_transport::{ApiRequest, PushRequest, RemoteError};
+use crate::remote_transport::{ApiRequest, FetchRequest, Fetched, PushRequest, RemoteError};
 use crate::sql::sql;
 use crate::write_argv::{reject_force, validate_ref_name, validate_repo_path};
 use crate::{credentials, local_git, GitPack};
@@ -29,6 +29,11 @@ impl From<RemoteError> for Failure {
     fn from(error: RemoteError) -> Self {
         match error {
             RemoteError::Refused => Self::refused("remote_refused"),
+            RemoteError::RateLimited { reset } => Self {
+                reason: "remote_rate_limited",
+                ambiguous: false,
+                detail: reset.map(|at| format!("the allowance returns at epoch second {at}")),
+            },
             RemoteError::Unavailable => Self::refused("remote_unavailable"),
             RemoteError::InvalidResponse => Self::refused("remote_response"),
             RemoteError::Unknown => Self::unknown("remote_unknown"),
@@ -46,6 +51,7 @@ fn keys(verb: &str) -> &'static [&'static str] {
             "force",
             "session_id",
         ],
+        "git.fetch" => &["repo", "ref", "expected_remote", "session_id"],
         "git.pr_open" => &[
             "repo",
             "head",
@@ -72,6 +78,15 @@ fn keys(verb: &str) -> &'static [&'static str] {
             "expected_head",
             "session_id",
         ],
+        "git.pr_edit" => &[
+            "repo",
+            "number",
+            "title",
+            "body",
+            "expected_head",
+            "session_id",
+        ],
+        "git.pr_close" => &["repo", "number", "expected_head", "session_id"],
         _ => &[],
     }
 }
@@ -132,6 +147,21 @@ fn validate(verb: &str, params: &Value) -> Result<(), Failure> {
                 ))
             }
         }
+    } else if verb == "git.fetch" {
+        local_git::fetch_refs(required(params, "ref")?)
+            .ok_or_else(|| Failure::invalid("ref must be a branch name or pull/<N>"))?;
+        match params.get("expected_remote") {
+            None => {}
+            Some(Value::String(sha)) => oid(sha)?,
+            _ => {
+                return Err(Failure::invalid(
+                    "expected_remote must be a 40-hex SHA when given",
+                ))
+            }
+        }
+    } else if matches!(verb, "git.pr_edit" | "git.pr_close") {
+        oid(required(params, "expected_head")?)?;
+        pr_edit::validate(verb, params)?;
     } else {
         oid(required(params, "expected_head")?)?;
         text(params, "body")?;
@@ -238,6 +268,26 @@ fn repository_refusal(path: &str) -> Value {
 }
 
 impl GitPack {
+    /// The commit identity the `[git_write.repositories]` row for `repo` names, with the row's
+    /// key, matched as `remote_repository` matches (ADR-182 Amendment 20). No row, or a row with
+    /// no `author`, answers `None` and the actor's own identity applies.
+    pub(crate) fn repository_author(
+        &self,
+        repo: &Path,
+    ) -> Result<Option<(String, GitWriteAuthorConfig)>, Failure> {
+        let configured = &self.runtime().config().git_write.repositories;
+        let mut matches = configured
+            .iter()
+            .filter(|(path, _)| std::fs::canonicalize(path).ok().as_deref() == Some(repo));
+        let Some((path, row)) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(Failure::refused("repository_ambiguous"));
+        }
+        Ok(row.author.clone().map(|author| (path.clone(), author)))
+    }
+
     pub(crate) fn remote_repository(
         &self,
         repo: &Path,
@@ -371,7 +421,11 @@ impl GitPack {
         let policy =
             crate::write_policy::GitWritePolicy::from_config(&self.runtime().config().git_write);
         let (canonical, index) = policy
-            .match_entry(Path::new(&receipt.repo), branch)
+            .match_entry(
+                Path::new(&receipt.repo),
+                crate::write_policy::repo_access(verb),
+                branch,
+            )
             .map_err(|error| {
                 let reason = gate_reason(&error);
                 receipt.gate = denied(reason);
@@ -437,7 +491,7 @@ impl GitPack {
         })?;
         if target.slug.is_empty() {
             receipt.credential = json!({"source":"none"});
-            if verb != "git.push" {
+            if verb != "git.push" && verb != "git.fetch" {
                 return Err(Failure::refused("remote_scheme"));
             }
         }
@@ -464,6 +518,9 @@ impl GitPack {
             }
         }
         if target.slug.is_empty() {
+            if verb == "git.fetch" {
+                return self.fetch_exact(None, &target, params, receipt).await;
+            }
             return self.push_exact(None, &target, params, receipt).await;
         }
         let config = &self.runtime().config().git_write;
@@ -477,6 +534,11 @@ impl GitPack {
         receipt.credential = json!({"source":"actor", "ref":identity.credential_ref, "platform_identity":identity.platform_identity});
         receipts::persist(self.runtime(), receipt).await?;
         let secret = secret.value();
+        if verb == "git.fetch" {
+            return self
+                .fetch_exact(Some(secret), &target, params, receipt)
+                .await;
+        }
         if verb == "git.push" {
             return self
                 .push_exact(Some(secret), &target, params, receipt)
@@ -516,13 +578,28 @@ impl GitPack {
         if head != expected {
             return Err(Failure::refused("expected_head_mismatch"));
         }
-        if pr.get("merged").and_then(Value::as_bool) == Some(true)
-            || pr.get("state").and_then(Value::as_str) != Some("open")
+        // A title or body may be corrected after a pull request closes; every other write
+        // needs it open.
+        if verb != "git.pr_edit"
+            && (pr.get("merged").and_then(Value::as_bool) == Some(true)
+                || pr.get("state").and_then(Value::as_str) != Some("open"))
         {
             return Err(Failure::refused("pull_request_closed"));
         }
         if observed_string(&pr, "/base/repo/full_name")? != target.slug {
             return Err(Failure::refused("repository_identity_mismatch"));
+        }
+        if matches!(verb, "git.pr_edit" | "git.pr_close") {
+            let opened = pr_edit::Opened {
+                secret,
+                target: &target,
+                pr: &pr,
+                login,
+                credential_ref: &identity.credential_ref,
+            };
+            return self
+                .change_pr(token, registry, verb, params, receipt, opened)
+                .await;
         }
         let author = observed_string(&pr, "/user/login")?;
         let fork = observed_string(&pr, "/head/repo/full_name")? != target.slug;
@@ -730,6 +807,85 @@ impl GitPack {
         .await
         .map_err(|_| Failure::unknown("marker_unavailable"))?;
         Ok(result)
+    }
+
+    /// Fetch into the clone's object store, then move the destination from the value read before
+    /// the transfer and only from it.
+    async fn fetch_exact(
+        &self,
+        secret: Option<&str>,
+        target: &GitWriteRepositoryConfig,
+        params: &Value,
+        receipt: &mut Receipt,
+    ) -> Result<Value, Failure> {
+        let (source, destination) = local_git::fetch_refs(required(params, "ref")?)
+            .ok_or_else(|| Failure::invalid("ref must be a branch name or pull/<N>"))?;
+        let expected = params
+            .get("expected_remote")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase);
+        let config = &self.runtime().config().git_write;
+        let program = config.git_program();
+        let repo = std::path::PathBuf::from(&receipt.repo);
+        let previous = local_git::exact_ref(program, &repo, &destination).await?;
+        let haves = local_git::fetch_haves(program, &repo).await?;
+        receipt.result = json!({"ref":destination, "source":source, "remote":target.remote,
+            "previous_sha":previous});
+        receipts::persist(self.runtime(), receipt).await?;
+        let fetched = self
+            .remote_transport()
+            .fetch(
+                secret,
+                FetchRequest {
+                    repo: repo.clone(),
+                    remote: target.remote.clone(),
+                    source,
+                    haves,
+                    expected: expected.clone(),
+                },
+            )
+            .await?;
+        let sha = match fetched {
+            Fetched::Commit(sha) => sha,
+            Fetched::Mismatch(sha) => {
+                receipt.result["sha"] = json!(sha);
+                return Err(Failure::refused("expected_remote_mismatch"));
+            }
+            Fetched::Absent => return Err(Failure::refused("remote_ref_absent")),
+            Fetched::ObjectsRefused => return Err(Failure::refused("objects_refused")),
+        };
+        receipt.result["sha"] = json!(sha);
+        if expected.as_deref().is_some_and(|expected| expected != sha) {
+            return Err(Failure::refused("expected_remote_mismatch"));
+        }
+        let result = json!({"ref":destination, "sha":sha, "previous_sha":previous,
+            "remote":target.remote});
+        if previous.as_deref() == Some(sha.as_str()) {
+            return Ok(result);
+        }
+        receipts::persist(self.runtime(), receipt).await?;
+        match local_git::update_fetched_ref(
+            program,
+            &repo,
+            &destination,
+            &sha,
+            previous.as_deref(),
+            &receipt.id,
+        )
+        .await?
+        {
+            local_git::FetchedRefUpdate::Moved => Ok(result),
+            local_git::FetchedRefUpdate::RefMoved => Err(Failure::refused("ref_moved")),
+            local_git::FetchedRefUpdate::RefLocked => Err(Failure::refused("ref_locked")),
+            // Git gave no answer: the destination itself says whether the move happened.
+            local_git::FetchedRefUpdate::Unknown => {
+                match local_git::exact_ref(program, &repo, &destination).await {
+                    Ok(Some(now)) if now == sha => Ok(result),
+                    Ok(_) => Err(Failure::refused("ref_update_failed")),
+                    Err(_) => Err(Failure::unknown("ref_update_unknown")),
+                }
+            }
+        }
     }
 
     async fn open_pr(
@@ -1056,3 +1212,18 @@ impl GitPack {
         Err(Failure::refused("actor_unmapped"))
     }
 }
+
+#[path = "pr_state.rs"]
+mod pr_state;
+
+#[path = "issue.rs"]
+mod issue;
+
+#[path = "pr_edit.rs"]
+mod pr_edit;
+
+#[path = "check_log.rs"]
+mod check_log;
+
+#[path = "branch_delete.rs"]
+pub(crate) mod branch_delete;

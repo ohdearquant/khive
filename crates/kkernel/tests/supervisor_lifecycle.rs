@@ -177,6 +177,7 @@ impl Fixture {
         let root = tempfile::Builder::new()
             .prefix("k-sup-")
             .tempdir_in("/tmp")
+            .or_else(|_| tempfile::Builder::new().prefix("k-sup-").tempdir())
             .unwrap();
         let home = root.path().join("home");
         std::fs::create_dir_all(home.join(".khive")).unwrap();

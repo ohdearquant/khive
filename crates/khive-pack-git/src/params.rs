@@ -68,6 +68,7 @@ arguments!(Commit {
     tree,
     branch,
     expected_head,
+    merge_parent,
     session_id
 });
 arguments!(Branch {
@@ -84,6 +85,12 @@ arguments!(UpdateRef {
     expected,
     require_fast_forward,
     reason,
+    session_id
+});
+arguments!(BranchDelete {
+    repo,
+    name,
+    expected,
     session_id
 });
 arguments!(Push {
@@ -118,6 +125,29 @@ arguments!(PrMerge {
     subject,
     body,
     expected_head,
+    session_id
+});
+arguments!(PrState { repo, number });
+arguments!(Issue { repo, number });
+arguments!(CheckLog { repo, check_run });
+arguments!(PrEdit {
+    repo,
+    number,
+    title,
+    body,
+    expected_head,
+    session_id
+});
+arguments!(PrClose {
+    repo,
+    number,
+    expected_head,
+    session_id
+});
+arguments!(Fetch {
+    repo,
+    r#ref,
+    expected_remote,
     session_id
 });
 arguments!(Init {
@@ -180,10 +210,17 @@ pub(crate) fn parse(verb: &str, params: Value) -> Result<Value, RuntimeError> {
         "git.commit" => decode::<Commit>(verb, params),
         "git.branch" => decode::<Branch>(verb, params),
         "git.update_ref" => decode::<UpdateRef>(verb, params),
+        "git.branch_delete" => decode::<BranchDelete>(verb, params),
         "git.push" => decode::<Push>(verb, params),
         "git.pr_open" => decode::<PrOpen>(verb, params),
         "git.pr_review" => decode::<PrReview>(verb, params),
         "git.pr_merge" => decode::<PrMerge>(verb, params),
+        "git.pr_state" => decode::<PrState>(verb, params),
+        "git.issue" => decode::<Issue>(verb, params),
+        "git.check_log" => decode::<CheckLog>(verb, params),
+        "git.pr_edit" => decode::<PrEdit>(verb, params),
+        "git.pr_close" => decode::<PrClose>(verb, params),
+        "git.fetch" => decode::<Fetch>(verb, params),
         "git.init" => decode::<Init>(verb, params),
         "git.checkout" => decode::<Checkout>(verb, params),
         "git.diff" => decode::<Diff>(verb, params),

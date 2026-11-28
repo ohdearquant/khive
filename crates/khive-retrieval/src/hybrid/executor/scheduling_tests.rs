@@ -188,6 +188,49 @@ impl CandidateHydrator for Identity {
     }
 }
 
+#[async_trait]
+impl PlanOperators for Identity {
+    type Id = usize;
+    type Label = usize;
+    type Error = TestError;
+    type Fusion = ();
+    type Reranker = ();
+    fn resolve_fusion(&self, strategy: &crate::FusionStrategy) -> Result<(), TestError> {
+        assert!(
+            matches!(strategy, crate::FusionStrategy::Custom { name, params } if name == "scheduling-concat" && params.is_null())
+        );
+        Ok(())
+    }
+    fn resolve_rerank(&self, _: &crate::RerankMethod) -> Result<(), TestError> {
+        Err("unexpected reranker")
+    }
+    fn metadata_equals(
+        &self,
+        _: &usize,
+        _: &usize,
+        _: &str,
+        _: &serde_json::Value,
+    ) -> Result<bool, TestError> {
+        Err("unexpected metadata")
+    }
+    async fn fuse(
+        &self,
+        _: (),
+        children: Vec<Vec<Scored<usize, usize>>>,
+        _: usize,
+    ) -> Result<Vec<Scored<usize, usize>>, TestError> {
+        Ok(children.into_iter().flatten().collect())
+    }
+    async fn rerank(
+        &self,
+        _: (),
+        _: &crate::RerankMethod,
+        _: Vec<Scored<usize, usize>>,
+    ) -> Result<Vec<Scored<usize, usize>>, TestError> {
+        Err("unexpected reranker")
+    }
+}
+
 fn specs<'a>(arms: &'a [FakeArm], vector_slots: &[usize]) -> Vec<ArmSpec<'a, FakeArm>> {
     const KEYS: [&str; 5] = ["zero", "one", "two", "three", "four"];
     arms.iter()
@@ -204,7 +247,7 @@ fn specs<'a>(arms: &'a [FakeArm], vector_slots: &[usize]) -> Vec<ArmSpec<'a, Fak
                     engine: KEYS[slot],
                     model_id: "physical-model",
                     space_id: None,
-                    input: VectorInput::Text("query"),
+                    input: VectorInput::Embedding(&[0.25]),
                 }
             } else {
                 ArmInput::Text {
@@ -239,15 +282,23 @@ async fn execute(
         max_candidates: arms.len(),
         final_limit: arms.len(),
     };
-    let resolve = || {
-        Ok(|arms: Vec<Vec<Scored<usize, usize>>>| async move {
-            Ok::<_, TestError>(arms.into_iter().flatten().collect())
-        })
+    let program = PlanProgram {
+        template: PlanTemplate::Fuse {
+            children: (0..arms.len())
+                .map(|slot| PlanTemplate::Leaf(LeafSlot(slot)))
+                .collect(),
+            strategy: crate::FuseStrategy::Custom {
+                name: "scheduling-concat".into(),
+                params: serde_json::Value::Null,
+            },
+            top_k: arms.len(),
+        },
+        operators: &Identity,
     };
     if memory {
-        execute_memory_hybrid(request, &Identity, resolve).await
+        execute_memory_hybrid(request, &Identity, program).await
     } else {
-        execute_hybrid(request, &Identity, resolve).await
+        execute_hybrid(request, &Identity, program).await
     }
 }
 

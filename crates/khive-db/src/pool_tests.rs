@@ -2659,7 +2659,7 @@ fn strict_writer_task_for_write_preserves_missing_runtime_error() {
     let result = pool.writer_task_for_write(None, "strict_test_write");
 
     assert!(
-        matches!(result, Err(StorageError::WriterTaskNoRuntime)),
+        matches!(result, Err(StorageError::WriterOwnerUnavailable { ref source, .. }) if matches!(source.as_ref(), StorageError::WriterTaskNoRuntime)),
         "strict routing must preserve WriterTaskNoRuntime, got {result:?}"
     );
     assert_eq!(pool.writer_task_spawn_count(), 0);

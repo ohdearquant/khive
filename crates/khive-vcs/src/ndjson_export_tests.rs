@@ -21,6 +21,8 @@ fn timestamp(raw: &str) -> DateTime<Utc> {
 
 fn entity(id: u128) -> ExportedEntity {
     ExportedEntity {
+        keys: Vec::new(),
+        aliases: Vec::new(),
         id: Uuid::from_u128(id),
         kind: "concept".into(),
         entity_type: if id == 1 { Some("paper".into()) } else { None },
