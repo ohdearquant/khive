@@ -114,7 +114,6 @@ pub(crate) fn name_key(
     }
 }
 
-/// Refuse a key longer than ADR-221 allows, naming what it would key.
 /// Refuse a `produces` edge that says its value is about nothing: `about_operation` false and
 /// no slot. A reader takes the operation from `about_operation`, never from an empty `slots`.
 pub(crate) fn check_products(graph: &TypeGraph) -> Result<(), Refusal> {
@@ -144,6 +143,7 @@ pub(crate) fn check_products(graph: &TypeGraph) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// Refuse a key longer than ADR-221 allows, naming what it would key.
 pub(crate) fn check_key_length(key: &str, what: &str) -> Result<(), Refusal> {
     if key.len() > MAX_KEY_BYTES {
         return Err(Refusal::new(

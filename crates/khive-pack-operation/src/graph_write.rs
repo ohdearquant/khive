@@ -522,8 +522,10 @@ async fn live(
             let Some(relation) = relation_name(&edge.relation) else {
                 continue;
             };
-            let Ok(target) = runtime.get_entity(token, edge.target_id).await else {
-                continue;
+            let target = match runtime.get_entity(token, edge.target_id).await {
+                Ok(target) => target,
+                Err(RuntimeError::NotFound(_)) => continue,
+                Err(error) => return Err(reason(error)),
             };
             let Some(target_key) = target_of(&target) else {
                 continue;

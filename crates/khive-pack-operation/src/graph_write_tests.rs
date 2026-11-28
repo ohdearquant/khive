@@ -958,3 +958,25 @@ async fn a_node_whose_edge_was_lost_is_found_by_its_key() {
         fresh.graph(OPERATION_TYPE, "filing").await
     );
 }
+
+/// A slot an earlier version dropped and a later version names again gets its node back, and
+/// the graph is the one a store that only ever saw the later version holds.
+#[tokio::test]
+async fn a_slot_named_again_after_a_version_dropped_it_is_written_again() {
+    let witness = slot_key("filing", "witness");
+    let store = Store::new().await;
+    store.define(filing(1, &["clerk", "witness"])).await;
+    let two = store.define(filing(2, &["clerk"])).await;
+    assert_eq!(status_of(&two, "filing"), written(2), "{two}");
+    assert!(store.node(&witness).await.is_none());
+    let three = store.define(filing(3, &["clerk", "witness"])).await;
+    assert_eq!(status_of(&three, "filing"), written(3), "{three}");
+    assert!(store.node(&witness).await.is_some(), "the slot is back");
+
+    let fresh = Store::new().await;
+    fresh.define(filing(3, &["clerk", "witness"])).await;
+    assert_eq!(
+        store.graph(OPERATION_TYPE, "filing").await,
+        fresh.graph(OPERATION_TYPE, "filing").await
+    );
+}
