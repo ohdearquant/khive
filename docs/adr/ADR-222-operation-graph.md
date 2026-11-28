@@ -798,6 +798,9 @@ the forms pack has not loaded in the namespace (`unknown_field`), as it refuses 
 (A1.1). A requirement's `value_type` must equal the field's (`value_type_mismatch`), because a
 second value type for one field would be a second source of truth for what the field holds. The
 check runs at `define`, and the published bytes keep the value type it passed with (section 2).
+`define` reads a field's value type through `forms.neighbourhood`, whose view of a field node gains
+`value_type`, one read per distinct field the document names; a field the forms pack does not hold
+is `unknown_field`.
 
 ### A2.3 Order derived from values
 
@@ -888,14 +891,15 @@ and joins `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` and ADR-103 Amendment 3's
 `operation.decide` writes and does not. `forms.terms` and `forms.subjects` (A2.8) are reads and join
 both lists. All three land with the A1.1 to A1.3 pull request.
 
-Item 3 lands as three pull requests, after ADR-221 Amendment 1:
+Item 3 lands as four pull requests, after ADR-221 Amendment 1:
 
 - 3a: forms, `known_as` on fields (A2.5) and the system mark of ADR-223.
-- 3b: operation, A2.1 to A2.4 and A2.6, with A1.4's places and `stated_in_part`.
+- 3b-1: operation at `define`, A2.1 to A2.3, with the field view's `value_type` in forms.
+- 3b-2: operation at the frontier, A2.4 and A2.6, with A1.4's places and `stated_in_part`.
 - 3c: operation, the working type graph with section 2's canonical keys and section 7's names.
 
-Each refusal code this amendment adds has an arm; the refusal arms of one section may be rows of one
-table test.
+Each refusal code this amendment adds has an arm, in the pull request that adds the code; the
+refusal arms of one section may be rows of one table test.
 
 - A2.1: a pinned step type shared by two operation types. Refused: a pin neither the document nor
   the namespace holds (`unknown_step_type`); a pinned step that gives `by` (`pinned_step_shape`); a
