@@ -22,10 +22,15 @@ use khive_storage::types::{PageRequest, TextQueryMode};
 use khive_storage::EntityFilter;
 
 use super::common::{
-    canonical_entity_kind, canonical_note_kind, deser, missing_kind_error, props_match,
-    reconcile_entity_type, reconcile_specific, resolve_kind_spec, tags_match_any, to_json,
-    validate_graph_read_kind, KindSpec, SearchParams,
+    canonical_entity_kind, canonical_note_kind, deser, missing_kind_error, parse_relation,
+    props_match, reconcile_entity_type, reconcile_specific, resolve_kind_spec, tags_match_any,
+    to_json, validate_graph_read_kind, KindSpec, SearchParams,
 };
+use khive_storage::EdgeRelation;
+
+/// Most targets one search hit carries over a followed relation. A hit with
+/// more reports `followed_truncated: true`.
+const FOLLOW_TARGET_CAP: u32 = 100;
 use crate::handler_defs::SEARCH_PARAMS;
 use crate::KgPack;
 
@@ -155,6 +160,7 @@ pub struct ValidatedSearchRequest {
     order_by: SearchOrder,
     created_after: Option<DateTime<Utc>>,
     created_before: Option<DateTime<Utc>>,
+    follow: Option<EdgeRelation>,
 }
 
 fn parse_created_bound(
@@ -274,6 +280,7 @@ impl ValidatedSearchRequest {
                 )));
             }
         };
+        let follow = p.follow.as_deref().map(parse_relation).transpose()?;
 
         match resolve_kind_spec(kind_raw, registry)? {
             KindSpec::Entity {
@@ -327,6 +334,7 @@ impl ValidatedSearchRequest {
                     order_by,
                     created_after,
                     created_before,
+                    follow,
                 })
             }
             KindSpec::Note { specific } => {
@@ -363,6 +371,7 @@ impl ValidatedSearchRequest {
                     order_by,
                     created_after,
                     created_before,
+                    follow,
                 })
             }
             KindSpec::Edge => Err(RuntimeError::InvalidInput(
@@ -383,6 +392,11 @@ impl ValidatedSearchRequest {
     /// Free-text query supplied by the caller.
     pub fn query(&self) -> &str {
         &self.query
+    }
+
+    /// Relation followed outward from each hit, when the caller named one.
+    pub fn follow(&self) -> Option<EdgeRelation> {
+        self.follow
     }
 
     /// Lexical matching mode for the text arm.
@@ -652,7 +666,7 @@ impl KgPack {
                     });
                 }
 
-                let result: Vec<Value> = filtered_hits
+                let mut result: Vec<Value> = filtered_hits
                     .iter()
                     .map(|h| {
                         let meta = entity_meta.get(&h.entity_id);
@@ -684,6 +698,10 @@ impl KgPack {
                         row
                     })
                     .collect();
+                if let Some(relation) = request.follow() {
+                    self.attach_followed(token, registry, relation, &mut result)
+                        .await?;
+                }
                 self.track_search_serve(
                     token,
                     request.query(),
@@ -801,7 +819,7 @@ impl KgPack {
                     });
                 }
 
-                let result: Vec<Value> = filtered_hits
+                let mut result: Vec<Value> = filtered_hits
                     .iter()
                     .filter_map(|h| {
                         let note = note_meta.get(&h.note_id)?;
@@ -834,6 +852,10 @@ impl KgPack {
                         Some(row)
                     })
                     .collect();
+                if let Some(relation) = request.follow() {
+                    self.attach_followed(token, registry, relation, &mut result)
+                        .await?;
+                }
                 self.track_search_serve(
                     token,
                     request.query(),
@@ -849,6 +871,48 @@ impl KgPack {
                 })
             }
         }
+    }
+
+    /// Attach to each search row the targets its outgoing edges of `relation`
+    /// reach, read through the `neighbors` verb so the same visibility and
+    /// mailbox rules decide which targets appear. Each target is the summary
+    /// neighbor row; `followed_truncated` is true when the hit has more than
+    /// [`FOLLOW_TARGET_CAP`] targets or the neighbor scan stopped early.
+    async fn attach_followed(
+        &self,
+        token: &NamespaceToken,
+        registry: &VerbRegistry,
+        relation: EdgeRelation,
+        rows: &mut [Value],
+    ) -> Result<(), RuntimeError> {
+        for row in rows.iter_mut() {
+            let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_owned) else {
+                continue;
+            };
+            let params = json!({
+                "id": id,
+                "direction": "outgoing",
+                "relations": [relation.as_str()],
+                "limit": FOLLOW_TARGET_CAP,
+                "projection": "summary",
+            });
+            let (targets, truncated) = match self.handle_neighbors(token, params, registry).await {
+                Ok(page) => {
+                    let truncated = !page["next_after"].is_null()
+                        || page["scan_incomplete"].as_bool() == Some(true);
+                    (page["neighbors"].clone(), truncated)
+                }
+                // A hit deleted after the search pass has no edges left to follow.
+                Err(RuntimeError::NotFound(_)) => (json!([]), false),
+                Err(error) => return Err(error),
+            };
+            let fields = row
+                .as_object_mut()
+                .ok_or_else(|| RuntimeError::Internal("search row is not an object".into()))?;
+            fields.insert("followed".into(), targets);
+            fields.insert("followed_truncated".into(), Value::Bool(truncated));
+        }
+        Ok(())
     }
 
     /// Fire-and-forget `search_executed` telemetry (ADR-103 event plane),
