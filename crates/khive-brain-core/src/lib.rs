@@ -20,7 +20,7 @@ pub use evidence::{EvidenceHalfLifeDays, EvidencePolarity, EvidencePosterior, Ev
 pub use posterior::{BetaPosterior, EntityPosteriors};
 pub use profile::{
     resolve_consumer_profile, BalancedRecallSnapshot, BalancedRecallState, ConsumerKind,
-    ProfileBinding, ProfileLifecycle, ProfileRecord,
+    ProfileBinding, ProfileLifecycle, ProfileRecord, LOCAL_FACTOR_MAX, LOCAL_FACTOR_MIN,
 };
 pub use query_class::compute_query_class;
 pub use section_state::{
