@@ -229,7 +229,7 @@ impl VerbRegistry {
         mut args: Value,
         target_id: uuid::Uuid,
     ) -> Result<NamespaceToken, RuntimeError> {
-        if !matches!(verb, "create" | "link" | "update" | "delete") {
+        if !matches!(verb, "create" | "link" | "update" | "delete" | "restore") {
             return Err(RuntimeError::InvalidInput(
                 "unsupported canonical constituent verb".into(),
             ));

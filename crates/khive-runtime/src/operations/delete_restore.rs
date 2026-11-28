@@ -100,11 +100,12 @@ impl KhiveRuntime {
             }) => Err(RuntimeError::Internal(format!(
                 "hard delete + edge purge for {node_id} failed: {message}"
             ))),
-            // Only canonical change-set plans compare preimages or owner snapshots.
+            // These failures only come from canonical change-set plans.
             Ok(AtomicRunOutcome::RolledBack {
                 failure:
                     failure @ (AtomicOpFailure::PreimageMismatch { .. }
-                    | AtomicOpFailure::OwnerSnapshotConflict { .. }),
+                    | AtomicOpFailure::OwnerSnapshotConflict { .. }
+                    | AtomicOpFailure::RestoreKeyConflict(_)),
                 ..
             }) => Err(RuntimeError::Internal(format!(
                 "hard delete + edge purge for {node_id}: unexpected canonical failure {failure:?}"
@@ -177,67 +178,9 @@ impl KhiveRuntime {
         // taken keys before any write.
         self.refuse_restore_over_taken_keys(token, id, disclose)
             .await?;
-        let updated_at =
-            Utc::now()
-                .timestamp_micros()
-                .max(entity.updated_at.checked_add(1).ok_or_else(|| {
-                    RuntimeError::Internal(format!(
-                        "entity {id} updated_at is already at i64::MAX and cannot advance"
-                    ))
-                })?);
-        let mut restored = entity;
-        restored.deleted_at = None;
-        restored.updated_at = updated_at;
-        restored.version = restored
-            .version
-            .checked_add(1)
-            .ok_or_else(|| RuntimeError::InvalidInput("entity version overflow".into()))?;
-        let mut statements = vec![PlanStatement {
-            statement: SqlStatement {
-                sql: "UPDATE entities SET deleted_at=NULL, updated_at=?1, version=version+1 \
-                      WHERE id=?2 AND namespace=?3 AND deleted_at IS NOT NULL AND version=?4"
-                    .into(),
-                params: vec![
-                    SqlValue::Integer(updated_at),
-                    SqlValue::Text(id.to_string()),
-                    SqlValue::Text(token.namespace().as_str().to_owned()),
-                    SqlValue::Integer(restored.version - 1),
-                ],
-                label: Some("entity-restore".into()),
-            },
-            guard: Some(AffectedRowGuard::exactly(1)),
-        }];
-        // The soft delete removed the FTS row, so the text index is published
-        // in the same unit as the row: a live row that search cannot find is
-        // not a state this verb can leave behind. Order-sensitive pair — see
-        // `insert_document_statements`'s adjacency contract.
-        for statement in khive_db::stores::text::delete_document_statements(
-            "fts_entities",
-            &restored.namespace,
-            id,
-        )
-        .into_iter()
-        .chain(insert_document_statements(
-            "fts_entities",
-            &entity_fts_document(&restored),
-        )) {
-            statements.push(PlanStatement {
-                statement,
-                guard: None,
-            });
-        }
-        let plan = AtomicOpPlan::Update(Box::new(UpdatePlan {
-            graph_effects: Vec::new(),
-            target_id: id,
-            statements,
-            post_commit: PostCommitEffect::None,
-            edge_natural_key: None,
-            idempotent_noop: false,
-            entity_guard: None,
-            note_guard: None,
-            note_vector_purge: None,
-            note_embedding_inheritance: None,
-        }));
+        let (restored, plan) =
+            Self::prepare_entity_restore_plan(entity, Utc::now().timestamp_micros())?;
+        let plan = AtomicOpPlan::Update(Box::new(plan));
         match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
             Ok(AtomicRunOutcome::Committed { .. }) => {
                 // Embeddings are rebuilt after the commit; the row and its
@@ -266,6 +209,78 @@ impl KhiveRuntime {
             }
             Err(error) => Err(RuntimeError::Storage(error.0)),
         }
+    }
+
+    pub(crate) fn project_entity_restore(entity: &mut Entity, now: i64) -> RuntimeResult<()> {
+        let updated_at = now.max(entity.updated_at.checked_add(1).ok_or_else(|| {
+            RuntimeError::Internal(format!(
+                "entity {} updated_at is already at i64::MAX and cannot advance",
+                entity.id
+            ))
+        })?);
+        let version = entity
+            .version
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::InvalidInput("entity version overflow".into()))?;
+        entity.deleted_at = None;
+        entity.updated_at = updated_at;
+        entity.version = version;
+        Ok(())
+    }
+
+    /// The guarded restore and its text-index writes shared by both apply paths.
+    pub(crate) fn prepare_entity_restore_plan(
+        mut restored: Entity,
+        now: i64,
+    ) -> RuntimeResult<(Entity, UpdatePlan)> {
+        let id = restored.id;
+        let previous_version = restored.version;
+        Self::project_entity_restore(&mut restored, now)?;
+        let mut statements = vec![PlanStatement {
+            statement: SqlStatement {
+                sql: "UPDATE entities SET deleted_at=NULL, updated_at=?1, version=version+1 \
+                      WHERE id=?2 AND namespace=?3 AND deleted_at IS NOT NULL AND version=?4"
+                    .into(),
+                params: vec![
+                    SqlValue::Integer(restored.updated_at),
+                    SqlValue::Text(id.to_string()),
+                    SqlValue::Text(restored.namespace.clone()),
+                    SqlValue::Integer(previous_version),
+                ],
+                label: Some("entity-restore".into()),
+            },
+            guard: Some(AffectedRowGuard::exactly(1)),
+        }];
+        // The soft delete removed the FTS row, so the text index is published
+        // in the same unit as the row. Keep the delete and insert adjacent.
+        for statement in khive_db::stores::text::delete_document_statements(
+            "fts_entities",
+            &restored.namespace,
+            id,
+        )
+        .into_iter()
+        .chain(insert_document_statements(
+            "fts_entities",
+            &entity_fts_document(&restored),
+        )) {
+            statements.push(PlanStatement {
+                statement,
+                guard: None,
+            });
+        }
+        let plan = UpdatePlan {
+            graph_effects: Vec::new(),
+            target_id: id,
+            statements,
+            post_commit: PostCommitEffect::None,
+            edge_natural_key: None,
+            idempotent_noop: false,
+            entity_guard: None,
+            note_guard: None,
+            note_vector_purge: None,
+            note_embedding_inheritance: None,
+        };
+        Ok((restored, plan))
     }
 
     /// Restore an edge tombstone owned by the caller's primary namespace.

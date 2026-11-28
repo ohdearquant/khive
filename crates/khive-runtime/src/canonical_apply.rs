@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use khive_changeset::{
-    CanonicalRecordRef, ChangeSet, CreateTarget, DeleteOp, Op, UpdateOp, UpdatePatch,
+    CanonicalRecordRef, ChangeSet, CreateTarget, DeleteOp, DeletePreimage, Op, UpdateOp,
+    UpdatePatch,
 };
 use khive_storage::{Edge, Entity, Note, SqlStatement, SqlValue, SqlWriter};
 use khive_types::EdgeEndpointRule;
@@ -32,6 +33,7 @@ pub(crate) use entities::unchanged_entity_assertion_plan;
 mod links;
 mod notes;
 mod projection;
+mod restores;
 mod rows;
 
 /// An opaque, admitted operation. Only this module can construct its captured state.
@@ -80,6 +82,7 @@ enum Mutation {
         op: DeleteOp,
         plan: Box<AtomicOpPlan>,
     },
+    Restore(DeleteOp),
     Unresolved(Op),
 }
 
@@ -194,8 +197,13 @@ async fn live_keys(
 /// entities its earlier operations delete, whose keys those deletes release.
 #[derive(Default)]
 struct KeyLedger {
-    claimed: HashMap<(String, String), Uuid>,
-    released_by: std::collections::HashSet<Uuid>,
+    claimed: HashMap<(String, String, String), Uuid>,
+    released_by: HashMap<Uuid, Option<PlannedRelease>>,
+}
+
+struct PlannedRelease {
+    entity: Entity,
+    keys: Vec<String>,
 }
 
 impl KeyLedger {
@@ -211,12 +219,16 @@ impl KeyLedger {
         key: &str,
         id: Uuid,
     ) -> RuntimeResult<()> {
-        let slot = (kind.to_owned(), key.to_owned());
+        let slot = (
+            token.namespace().as_str().to_owned(),
+            kind.to_owned(),
+            key.to_owned(),
+        );
         if self.claimed.contains_key(&slot) {
             return Err(crate::operations::entity_key_conflict(key, None));
         }
         if let Some(holder) = runtime.get_entity_by_key(token, kind, key).await? {
-            if !self.released_by.contains(&holder.id) {
+            if !self.released_by.contains_key(&holder.id) {
                 return Err(crate::operations::entity_key_conflict(key, None));
             }
         }
@@ -226,9 +238,26 @@ impl KeyLedger {
 
     /// An entity deleted by an earlier operation gives up its keys, those
     /// held in the store and those a create earlier in the change set took.
-    fn release(&mut self, id: Uuid) {
-        self.released_by.insert(id);
+    fn release(&mut self, row: &Entity, op: &DeleteOp) {
+        let id = row.id;
+        let restorable = match &op.preimage {
+            DeletePreimage::Entity(expected) if !op.hard => Some(PlannedRelease {
+                entity: row.clone(),
+                keys: expected.keys.clone(),
+            }),
+            _ => None,
+        };
+        self.released_by.insert(id, restorable);
         self.claimed.retain(|_, holder| *holder != id);
+    }
+
+    fn restore(&mut self, row: &Entity, keys: &[String]) {
+        self.released_by.remove(&row.id);
+        for key in keys {
+            self.claimed
+                .entry((row.namespace.clone(), row.kind.clone(), key.clone()))
+                .or_insert(row.id);
+        }
     }
 }
 
@@ -447,7 +476,7 @@ pub async fn prepare_canonical_changeset(
                     reject_delete_alias(delete)?;
                     let current = read_prepare(runtime, &op_token, id, &mut shadow).await?;
                     if let Some(Record::Entity(row)) = &current {
-                        keys.release(row.id);
+                        keys.release(row, delete);
                     }
                     let plan = match current {
                         Some(Record::Entity(row)) => Some(
@@ -491,7 +520,45 @@ pub async fn prepare_canonical_changeset(
                         None => Mutation::Unresolved(op.clone()),
                     }
                 }
-                Op::Merge(_) | Op::Restore(_) => unreachable!("validated before prepare"),
+                Op::Restore(restore) => {
+                    let DeletePreimage::Entity(expected) = restore.record() else {
+                        unreachable!("validated before prepare");
+                    };
+                    let captured = DeleteOp {
+                        target_id: restore.target_id(),
+                        hard: false,
+                        preimage: restore.record().clone(),
+                    };
+                    let projected_release = keys.released_by.get(&id).and_then(Option::as_ref);
+                    let tombstone = if let Some(release) = projected_release {
+                        let mut row = release.entity.clone();
+                        row.deleted_at = Some(now);
+                        row.version = row.version.checked_add(1).ok_or_else(|| {
+                            RuntimeError::InvalidInput("entity version overflow".into())
+                        })?;
+                        row
+                    } else {
+                        let Some(Record::Entity(row)) =
+                            read_prepare(runtime, &op_token, id, &mut shadow).await?
+                        else {
+                            return Err(RuntimeError::NotFound(id.to_string()));
+                        };
+                        row
+                    };
+                    let row = restores::prepare(
+                        runtime,
+                        &op_token,
+                        tombstone,
+                        &captured,
+                        projected_release.map(|release| release.keys.as_slice()),
+                        now,
+                    )
+                    .await?;
+                    keys.restore(&row, &expected.keys);
+                    shadow.insert(id, Some(Record::Entity(row)));
+                    Mutation::Restore(captured)
+                }
+                Op::Merge(_) => unreachable!("validated before prepare"),
             };
             Ok(AtomicOpPlan::Canonical(Box::new(CanonicalMutationPlan {
                 token: op_token,
@@ -536,7 +603,7 @@ fn validate(changeset: &ChangeSet) -> RuntimeResult<()> {
     }
     for (op_index, op) in changeset.ops.iter().enumerate() {
         match op {
-            Op::Restore(_) => {
+            Op::Restore(restore) if !matches!(restore.record(), DeletePreimage::Entity(_)) => {
                 return Err(RuntimeError::CanonicalUnsupportedOperation {
                     op_index,
                     operation: "restore",
@@ -642,7 +709,11 @@ fn gate_args(op: &Op) -> RuntimeResult<(&'static str, Uuid, Value)> {
             uuid(x.target_id),
             json!({"id":x.target_id,"hard":x.hard}),
         ),
-        Op::Restore(_) => unreachable!("validated before gate arguments"),
+        Op::Restore(op) => (
+            "restore",
+            uuid(op.target_id()),
+            json!({"id":op.target_id()}),
+        ),
         Op::Merge(_) => {
             return Err(RuntimeError::InvalidInput(
                 "KnownUnimplemented: canonical merge".into(),
@@ -789,6 +860,12 @@ pub(crate) async fn materialize(
                     let keys = live_keys(writer, &live).await?;
                     live.check_delete(op, keys)?;
                     Ok((**ordinary).clone())
+                }
+                Mutation::Restore(expected) => {
+                    let Record::Entity(row) = live else {
+                        return Err(mismatch(id, "substrate"));
+                    };
+                    restores::materialize(writer, &plan.token, row, expected, plan.now).await
                 }
                 Mutation::Unresolved(Op::Update(op)) => {
                     live.check_update(op)?;
