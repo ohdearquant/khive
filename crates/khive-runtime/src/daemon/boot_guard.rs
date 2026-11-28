@@ -123,6 +123,20 @@ where
     // resolved so a split rendezvous never reaches cleanup/bind/pid-write.
     ensure_rendezvous_overrides_paired()?;
 
+    if super::lifecycle::path_override(PID_PATH_ENV).is_none()
+        && super::lifecycle::path_override(SOCKET_PATH_ENV).is_none()
+    {
+        super::run_daemon::prepare_default_rendezvous_directory()?;
+        #[cfg(test)]
+        if let Some(hook) = super::run_daemon::DEFAULT_RENDEZVOUS_PREBIND_HOOK
+            .lock()
+            .expect("default rendezvous test hook")
+            .take()
+        {
+            hook();
+        }
+    }
+
     let sock = socket_path();
     let pid_file = pid_path();
     let socket_parent = sock.parent();
@@ -186,6 +200,13 @@ where
                 "refusing to start: pid {incumbent_pid} owns the daemon PID file and is alive, \
                  but nothing answered the khived protocol on {}. It may be draining. Nothing \
                  was removed; stop that process first if you intend to replace it.",
+                sock.display()
+            );
+        }
+        Incumbent::Unknown => {
+            anyhow::bail!(
+                "refusing to start: daemon rendezvous at {} could be live or could not be \
+                 inspected safely. Nothing was removed after the uncertainty was detected.",
                 sock.display()
             );
         }

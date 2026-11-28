@@ -3,6 +3,10 @@
 import contextlib
 import io
 import json
+import os
+import pathlib
+import re
+import tempfile
 import unittest
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -81,12 +85,15 @@ class ImmediatePool:
 
 
 class OpenLoopArrivalTests(unittest.TestCase):
-    def drive(self, delays, operations, workers=1, drain_timeout=1.0, failures=()):
+    def drive(self, delays, operations, workers=1, drain_timeout=1.0, failures=(), request_id_prefix=None,
+              schedule=None):
         clock = VirtualClock()
         pool = SlowServicePool(clock, delays)
         connections = [(None, harness.WorkerResult(0, idx)) for idx in range(workers)]
+        self.served_request_ids = []
 
-        def service(proc, tenant, sequence):
+        def service(proc, tenant, sequence, request_id=None):
+            self.served_request_ids.append((sequence, request_id))
             return harness.OpOutcome("memory.recall", sequence not in failures, 40,
                                      "fake service failure" if sequence in failures else None)
 
@@ -94,8 +101,51 @@ class OpenLoopArrivalTests(unittest.TestCase):
             report = harness._drive_open_loop(
                 connections, pool, 10.0, operations, drain_timeout,
                 pick_op=lambda: service, clock=clock, sleep=clock.sleep,
+                request_id_prefix=request_id_prefix, schedule=schedule,
             )
         return report
+
+    def test_burst_schedule_sets_each_arrival_time_and_labels_its_burst(self):
+        schedule = harness.arrival_schedule(5, 10.0, burst_size=2, burst_every_s=0.15)
+        self.assertEqual(schedule, [(0.0, None), (0.1, None), (0.15, 1), (0.15, 1), (0.2, None)])
+        report = self.drive([0.01] * 5, 5, workers=3, schedule=schedule)
+        self.assertEqual([(round(r["scheduled_s"], 6), r["burst"]) for r in report["records"]],
+                         [(0.0, None), (0.1, None), (0.15, 1), (0.15, 1), (0.2, None)])
+        self.assertAlmostEqual(report["offered_duration_s"], 0.3)
+        plain = self.drive([0.01] * 2, 2)
+        self.assertEqual([r["burst"] for r in plain["records"]], [None, None])
+        with self.assertRaisesRegex(ValueError, "one entry per operation"):
+            self.drive([0.01] * 2, 2, schedule=schedule)
+
+    def test_arrival_schedule_caps_the_last_burst_and_refuses_a_burst_without_an_interval(self):
+        self.assertEqual(harness.arrival_schedule(3, 1.0, burst_size=5, burst_every_s=0.5),
+                         [(0.0, None), (0.5, 1), (0.5, 1)])
+        self.assertEqual(harness.arrival_schedule(2, 4.0), [(0.0, None), (0.25, None)])
+        for size, every in ((3, 0.0), (3, float("nan")), (-1, 1.0)):
+            with self.assertRaisesRegex(ValueError, "positive size"):
+                harness.arrival_schedule(4, 1.0, burst_size=size, burst_every_s=every)
+
+    def test_each_arrival_carries_its_run_unique_request_id_to_the_service(self):
+        report = self.drive([0.01] * 3, 3, request_id_prefix=0xABC)
+        expected = [(0xABC << 20) | sequence for sequence in range(3)]
+        self.assertEqual([row["request_id"] for row in report["records"]], expected)
+        self.assertEqual(self.served_request_ids, list(zip(range(3), expected)))
+        self.assertEqual(report["request_id_prefix"], 0xABC)
+
+    def test_refused_arrival_keeps_its_request_id_and_no_prefix_means_no_ids(self):
+        refused = self.drive([0.4] * 2, 2, request_id_prefix=7)
+        self.assertEqual([row["state"] for row in refused["records"]], ["completed", "refused"])
+        self.assertEqual(refused["records"][1]["request_id"], (7 << 20) | 1)
+        plain = self.drive([0.01], 1)
+        self.assertIsNone(plain["records"][0]["request_id"])
+        self.assertEqual(self.served_request_ids, [(0, None)])
+
+    def test_request_id_sequence_must_fit_its_bits(self):
+        self.assertEqual(harness.arrival_request_id(1, (1 << 20) - 1), (1 << 21) - 1)
+        with self.assertRaisesRegex(ValueError, "does not fit"):
+            harness.arrival_request_id(1, 1 << 20)
+        with self.assertRaisesRegex(ValueError, "carry request ids"):
+            harness._drive_open_loop([], None, 1.0, (1 << 20) + 1, 0, request_id_prefix=1)
 
     def test_slow_completions_do_not_move_arrivals(self):
         report = self.drive([0.4] * 4, 4)
@@ -145,7 +195,12 @@ class OpenLoopLifecycleTests(unittest.TestCase):
             events.append("attribution")
             return {"status": "consistent", "attributed_actor": "tenant_0"}
 
-        def drive(workers, selected_pool, rate, operations, timeout):
+        def drive(workers, selected_pool, rate, operations, timeout, request_id_prefix=None, pick_op=None, menu=None,
+                  schedule=None):
+            self.assertIs(menu, harness._OP_MENU)
+            self.assertEqual(len([pick_op() for _ in range(operations)]), operations)
+            self.assertIsInstance(request_id_prefix, int)
+            self.assertTrue(0 < request_id_prefix < (1 << 32))
             self.assertEqual(events, ["handshake", "attribution", "handshake"])
             self.assertIs(selected_pool, pool)
             self.assertEqual(len(workers), 2)
@@ -157,13 +212,81 @@ class OpenLoopLifecycleTests(unittest.TestCase):
                 patch.object(harness.bpd, "_handshake", side_effect=handshake), \
                 patch.object(harness, "_attribution_probe", side_effect=attribution), \
                 patch.object(harness, "_drive_open_loop", side_effect=drive):
-            results, _ = harness._run_open_workers("fake", [(0, 0), (0, 1)], {}, "warn", "/fake", registry, 4, 10.0, 1.0)
+            results, _ = harness._run_open_workers(
+                "fake", [(0, 0), (0, 1)], {}, "warn", "/fake", registry, 4, 10.0, 1.0,
+                daemon_pid=321,
+            )
         self.assertEqual(events[-1], "arrivals")
         self.assertEqual(len(results), 2)
         for proc in processes:
             proc.kill.assert_called_once()
             proc.wait.assert_called_once_with(timeout=5)
         self.assertEqual(pool.shutdowns, [{"wait": False, "cancel_futures": True}, {"wait": True, "cancel_futures": True}])
+
+    def test_drain_timeout_requires_live_worker_and_original_daemon(self):
+        def drive(*args, **kwargs):
+            records = [
+                {"tenant": 0, "worker": 0, "state": "outstanding"},
+                {"tenant": 0, "worker": 1, "state": "outstanding"},
+            ]
+            return {"counts": {"outstanding": 2}, "records": records}
+
+        daemon_pid = 321
+        pid_file = "/fake/daemon.pid"
+        daemon_failure = "scratch daemon (pid 321) could not be verified alive at the drain timeout"
+        cases = [
+            (daemon_pid, True, True, harness.DRAIN_TIMEOUT_CRASH),
+            (daemon_pid, False, False, daemon_failure),
+            (daemon_pid, True, False, daemon_failure),
+            (432, True, True, daemon_failure),
+            (None, False, False, daemon_failure),
+        ]
+        for current_pid, pid_alive, daemon_argv, expected in cases:
+            with self.subTest(current_pid=current_pid, pid_alive=pid_alive, daemon_argv=daemon_argv):
+                alive, exited = Mock(), Mock()
+                alive.poll.return_value = None
+                exited.poll.return_value = 1
+
+                def read_pid_file(path, process=alive, pid=current_pid):
+                    self.assertEqual(path, pid_file)
+                    process.kill.assert_not_called()
+                    return pid, str(pid) if pid is not None else None
+
+                with (
+                    patch.object(harness, "ThreadPoolExecutor", return_value=ImmediatePool()),
+                    patch.object(harness, "_spawn_worker_proc", side_effect=[alive, exited]),
+                    patch.object(harness.bpd, "_handshake"),
+                    patch.object(harness, "_attribution_probe", return_value={}),
+                    patch.object(harness, "_drive_open_loop", side_effect=drive),
+                    patch.object(harness, "_read_pid_file", side_effect=read_pid_file) as read_pid,
+                    patch.object(harness, "_pid_alive", return_value=pid_alive) as check_pid,
+                    patch.object(harness, "_argv_is_khive_daemon", return_value=daemon_argv) as check_argv,
+                ):
+                    results, _ = harness._run_open_workers(
+                        "fake",
+                        [(0, 0), (0, 1)],
+                        {"KHIVE_PID": pid_file},
+                        "warn",
+                        "/fake",
+                        {},
+                        4,
+                        10.0,
+                        1.0,
+                        daemon_pid=daemon_pid,
+                    )
+                read_pid.assert_called_once_with(pid_file)
+                if current_pid == daemon_pid:
+                    check_pid.assert_called_once_with(daemon_pid)
+                else:
+                    check_pid.assert_not_called()
+                if current_pid == daemon_pid and pid_alive:
+                    check_argv.assert_called_once_with(daemon_pid)
+                else:
+                    check_argv.assert_not_called()
+                alive.kill.assert_called_once()
+                crashed = {result.idx: result.crashed for result in results}
+                self.assertEqual(crashed[0], expected)
+                self.assertEqual(crashed[1], "worker process exited (1) with arrivals outstanding")
 
     def test_setup_failure_kills_registered_process_before_pool_join(self):
         failed, blocked = Mock(), Mock()
@@ -204,7 +327,10 @@ class OpenLoopLifecycleTests(unittest.TestCase):
                     patch.object(harness.bpd, "_handshake", side_effect=handshake), \
                     patch.object(harness, "_drive_open_loop") as drive:
                 with self.assertRaisesRegex(RuntimeError, "fake handshake failed"):
-                    harness._run_open_workers("fake", [(0, 0), (0, 1)], {}, "warn", "/fake", registry, 4, 10.0, 1.0)
+                    harness._run_open_workers(
+                        "fake", [(0, 0), (0, 1)], {}, "warn", "/fake", registry, 4, 10.0, 1.0,
+                        daemon_pid=321,
+                    )
         finally:
             release.set()
             shutdown(wait=True, cancel_futures=True)
@@ -213,6 +339,146 @@ class OpenLoopLifecycleTests(unittest.TestCase):
         blocked.kill.assert_called_once()
         self.assertEqual(order, ["kill", "join"])
         self.assertEqual(registry, {(0, 0): failed, (0, 1): blocked})
+
+
+class NamedMixTests(unittest.TestCase):
+    def test_mix_names_its_classes_write_set_and_wall_clock_window(self):
+        clock = VirtualClock()
+        pool = SlowServicePool(clock, [0.01] * 4)
+        connections = [(None, harness.WorkerResult(0, 0))]
+        menu = harness.MIXES["f7"]
+        plan = [harness._op_audit_append, harness._op_bulk_ingest, harness._op_audit_append, harness._op_comm_send]
+        calls = []
+
+        def served(fn):
+            def service(proc, tenant, sequence, request_id=None):
+                calls.append(harness._OP_NAMES[fn])
+                return harness.OpOutcome(harness._OP_NAMES[fn], True, 40)
+            return service
+
+        fakes = {fn: served(fn) for fn, _ in menu}
+        with patch.dict(harness._OP_NAMES, {fakes[fn]: harness._OP_NAMES[fn] for fn in fakes}):
+            report = harness._drive_open_loop(
+                connections, pool, 10.0, 4, 1.0, pick_op=iter([fakes[fn] for fn in plan]).__next__,
+                clock=clock, sleep=clock.sleep, menu=menu, wall_clock=lambda: 1_763_424_000.25 + clock(),
+            )
+        self.assertEqual(calls, ["stream.append", "stream.batch", "stream.append", "comm.send"])
+        self.assertEqual(sorted(report["classes"]),
+                         ["comm.mark_read", "comm.send", "stream.append", "stream.batch", "update"])
+        self.assertEqual(report["classes"]["stream.append"]["submitted"], 2)
+        self.assertAlmostEqual(report["classes"]["update"]["configured_offered_rate_per_s"], 2.0)
+        self.assertEqual(report["write_workload"]["classes"],
+                         ["stream.append", "comm.mark_read", "update", "comm.send", "stream.batch"])
+        self.assertEqual(report["write_workload"]["bulk_ingest_members"], harness.BULK_INGEST_MEMBERS)
+        self.assertEqual(report["window_utc"]["start"], "2025-11-18T00:00:00.250Z")
+        self.assertEqual(report["window_utc"]["end"], "2025-11-18T00:00:00.650Z")
+
+    def test_plan_draws_one_op_per_arrival_from_the_menu(self):
+        plan = harness.plan_arrivals(harness.MIXES["read-receipt"], 5)
+        self.assertEqual(plan, [harness._op_read_receipt] * 5)
+        self.assertEqual(harness.plan_arrivals(harness.MIXES["f7"], 0), [])
+
+    def test_mix_without_arrival_rate_is_refused(self):
+        argv = ["bench_load_harness.py", "--mix", "comm-send"]
+        with patch.object(harness.sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit):
+                harness.main()
+        self.assertIn("needs --arrival-rate", err.getvalue())
+
+
+class FixtureTests(unittest.TestCase):
+    def fake_server(self, inbox_ids, page=2):
+        calls = []
+
+        def call(proc, verb, args, request_id=None):
+            calls.append((proc, verb, args))
+            if verb == "create":
+                return {"id": f"entity-{proc}"}
+            if verb == "comm.send":
+                return {"id": "outbound"}
+            if verb == "comm.inbox":
+                offset = args["offset"]
+                chunk = inbox_ids[offset:offset + page]
+                more = offset + page < len(inbox_ids)
+                return {"messages": [{"id": i} for i in chunk], "has_more": more,
+                        "next_offset": offset + page if more else None}
+            if verb == "comm.mark_read":
+                return {"marked_count": 1 if args["ids"][0] != "bad" else 0}
+            raise AssertionError(verb)
+        return calls, call
+
+    def test_first_worker_fills_the_tenant_pool_and_siblings_share_it(self):
+        calls, call = self.fake_server(["m1", "m2", "m3"])
+        pool = harness.deque()
+        planned = {"update": 2, "comm.mark_read": 3}
+        with patch.object(harness.bpd, "_call_verb", side_effect=call):
+            first = harness._prepare_fixtures("w0", 4, 0, planned, pool)
+            second = harness._prepare_fixtures("w1", 4, 1, planned, pool)
+        sends = [args for _, verb, args in calls if verb == "comm.send"]
+        self.assertEqual(len(sends), 3)
+        self.assertTrue(all(a["to"] == "tenant_4_actor" and a["self_send"] for a in sends))
+        self.assertEqual([proc for proc, verb, _ in calls if verb == "comm.inbox"], ["w0", "w0"])
+        self.assertEqual(list(pool), ["m1", "m2", "m3"])
+        self.assertIs(first["receipts"], second["receipts"])
+        self.assertEqual((first["entity_id"], second["entity_id"]), ("entity-w0", "entity-w1"))
+
+    def test_inbox_count_unlike_the_plan_stops_setup(self):
+        _, call = self.fake_server(["m1"])
+        with patch.object(harness.bpd, "_call_verb", side_effect=call):
+            with self.assertRaisesRegex(RuntimeError, "sent 2 messages to tenant 0, its inbox lists 1 unread"):
+                harness._prepare_fixtures("w0", 0, 0, {"comm.mark_read": 2}, harness.deque())
+
+    def test_no_fixture_shape_means_no_fixture_call(self):
+        calls, call = self.fake_server([])
+        with patch.object(harness.bpd, "_call_verb", side_effect=call):
+            self.assertEqual(harness._prepare_fixtures("w0", 0, 0, {"stream.append": 9}, harness.deque()), {})
+        self.assertEqual(calls, [])
+
+    def test_receipt_marks_each_message_once_and_reports_exhaustion_and_misses(self):
+        calls, call = self.fake_server([])
+        fixtures = {"receipts": harness.deque(["m1", "bad"])}
+        with patch.object(harness.bpd, "_call_verb", side_effect=call):
+            first = harness._op_read_receipt("w0", 0, 0, fixtures=fixtures)
+            missed = harness._op_read_receipt("w0", 0, 1, fixtures=fixtures)
+            empty = harness._op_read_receipt("w0", 0, 2, fixtures=fixtures)
+        self.assertEqual([args["ids"] for _, _, args in calls], [["m1"], ["bad"]])
+        self.assertTrue(first.ok)
+        self.assertFalse(missed.ok)
+        self.assertIn("unexpected result", missed.error)
+        self.assertEqual((empty.ok, empty.error), (False, "read-receipt fixture pool exhausted"))
+
+    def test_arrival_hands_fixtures_only_to_a_worker_that_has_them(self):
+        seen = []
+
+        def op(proc, tenant, sequence, request_id=None, **kwargs):
+            seen.append(kwargs)
+            return harness.OpOutcome("update", True, 1)
+
+        plain, fitted = harness.WorkerResult(0, 0), harness.WorkerResult(0, 1)
+        fitted.fixtures = {"entity_id": "e"}
+        clock = VirtualClock()
+        harness._execute_arrival((None, plain), op, 0, clock, request_id=5)
+        harness._execute_arrival((None, fitted), op, 1, clock, request_id=6)
+        self.assertEqual(seen, [{}, {"fixtures": {"entity_id": "e"}}])
+
+    def test_every_registered_op_runs_on_a_worker_that_holds_fixtures(self):
+        mixed = {fn for menu in harness.MIXES.values() for fn, _ in menu}
+        self.assertLessEqual(mixed, set(harness._OP_NAMES), "an op in a mix has no registered name")
+        verbs = []
+
+        def call(proc, verb, args, request_id=None):
+            verbs.append(verb)
+            return {"id": "x", "marked_count": 1}
+
+        fitted = harness.WorkerResult(0, 0)
+        fitted.fixtures = {"entity_id": "e", "receipts": harness.deque(["m%d" % i for i in range(9)])}
+        clock = VirtualClock()
+        with patch.object(harness.bpd, "_call_verb", side_effect=call):
+            for fn in harness._OP_NAMES:
+                before = len(verbs)
+                outcome, _, _ = harness._execute_arrival((None, fitted), fn, 0, clock, request_id=1)
+                self.assertNotIn("unexpected keyword", outcome.error or "", fn.__name__)
+                self.assertGreater(len(verbs), before, f"{fn.__name__} sent no verb")
 
 
 # Fixed synthetic values, with the complete legacy report shape and field order.
@@ -311,7 +577,7 @@ class ClosedLoopCompatibilityTests(unittest.TestCase):
 
 
 class AuditSuccessRowsLoadPreflightTests(unittest.TestCase):
-    def run_to_worker_boundary(self, arrival_rate=None, refuse=False):
+    def run_to_worker_boundary(self, arrival_rate=None, refuse=False, extra_argv=()):
         events, worker_envs, process = [], [], Mock()
         def preflight(proc):
             self.assertIs(proc, process)
@@ -321,18 +587,22 @@ class AuditSuccessRowsLoadPreflightTests(unittest.TestCase):
         def oracle(*args):
             events.append("oracle")
             return {"oracle": "PENDING", "detail": "fixture"}
-        def worker(*args):
+        def worker(*args, **kwargs):
             events.append("worker")
+            if arrival_rate is not None:
+                self.assertEqual(kwargs["daemon_pid"], 321)
             worker_envs.append(dict(args[2] if arrival_rate else args[3]))
             raise RuntimeError("worker boundary")
         argv = ["bench_load_harness.py", "--mode", "bench", "--workers", "1",
                 "--tenants", "1", "--ops-per-worker", "1"]
         if arrival_rate:
             argv.extend(["--arrival-rate", str(arrival_rate)])
+        argv.extend(extra_argv)
         output = io.StringIO()
         with contextlib.ExitStack() as stack:
             stack.enter_context(contextlib.redirect_stdout(output))
-            stack.enter_context(patch.dict(harness.os.environ, {"KHIVE_AUDIT_SUCCESS_ROWS": "reduced"}))
+            stack.enter_context(patch.dict(harness.os.environ, {"KHIVE_AUDIT_SUCCESS_ROWS": "reduced",
+                                                                "KHIVE_WRITER_ATTEMPT_LOG": "1"}))
             patches = [patch.object(harness.sys, "argv", argv),
                        patch.object(harness, "_resolve_binary", return_value="fixture-binary"),
                        patch.object(harness.tempfile, "mkdtemp", return_value="/fixture"),
@@ -350,7 +620,8 @@ class AuditSuccessRowsLoadPreflightTests(unittest.TestCase):
                        patch.object(harness, "probe_oracle_channel", side_effect=oracle),
                        patch.object(harness, "_run_worker", side_effect=worker),
                        patch.object(harness, "_run_open_workers", side_effect=worker),
-                       patch.object(harness, "ThreadPoolExecutor", ImmediatePool)]
+                       patch.object(harness, "ThreadPoolExecutor", ImmediatePool),
+                       patch.object(harness, "_read_pid_file", return_value=(321, "321"))]
             mocks = [stack.enter_context(selected) for selected in patches]
             self.assertEqual(harness.main(), 1)
         process.stdin.close.assert_called_once()
@@ -378,6 +649,40 @@ class AuditSuccessRowsLoadPreflightTests(unittest.TestCase):
                 self.assertEqual(bootstrap_env["KHIVE_AUDIT_SUCCESS_ROWS"], "all")
                 self.assertEqual(len(worker_envs), 1)
                 self.assertEqual(worker_envs[0]["KHIVE_AUDIT_SUCCESS_ROWS"], "all")
+
+    def test_attempt_log_reaches_the_daemon_only_when_asked_and_lands_in_the_sink_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sink = os.path.join(tmp, "sink")
+            _, off_env, _ = self.run_to_worker_boundary(10, extra_argv=["--sink-dir", sink])
+            self.assertNotIn("KHIVE_WRITER_ATTEMPT_LOG", off_env)
+            self.assertEqual(off_env["KHIVE_WRITER_TIMEOUT_SINK_DIR"], os.path.realpath(sink))
+            self.assertEqual(off_env["KHIVE_WRITER_TIMEOUT_SINK_HEARTBEAT_MS"], str(harness.SINK_HEARTBEAT_MS))
+            self.assertTrue(os.path.isdir(sink))
+            _, on_env, worker_envs = self.run_to_worker_boundary(10, extra_argv=["--sink-dir", sink, "--writer-attempt-log"])
+            self.assertEqual(on_env["KHIVE_WRITER_ATTEMPT_LOG"], "1")
+            self.assertEqual(worker_envs[0]["KHIVE_WRITER_ATTEMPT_LOG"], "1")
+
+    def test_the_sweep_reads_the_drain_timeout_error_the_harness_writes(self):
+        from scripts.perf import f7_sweep
+
+        error = harness.format_worker_error(12, 34, harness.DRAIN_TIMEOUT_CRASH)
+        self.assertEqual(error, "tenant=12 worker=34: open-loop drain exceeded --worker-timeout")
+        report = {"smoke_errors": [error], "arrival": {"counts": {"outstanding": 1}}}
+        self.assertTrue(f7_sweep.drain_timeout_only(report, 1))
+
+    def test_daemon_env_names_match_the_constants_the_sink_reads(self):
+        source = pathlib.Path(__file__).resolve().parents[2] / "crates/khive-db/src/timeout_sink.rs"
+        consts = dict(re.findall(r'^const (\w+): &str = "([^"]+)";', source.read_text(), re.MULTILINE))
+        self.assertEqual((harness.ATTEMPT_LOG_ENV, harness.SINK_DIR_ENV, harness.SINK_HEARTBEAT_ENV),
+                         (consts.get("WRITER_ATTEMPT_LOG_ENV"), consts.get("SINK_DIR_OVERRIDE_ENV"),
+                          consts.get("HEARTBEAT_MS_OVERRIDE_ENV")))
+
+    def test_attempt_log_without_sink_dir_is_refused(self):
+        argv = ["bench_load_harness.py", "--arrival-rate", "10", "--writer-attempt-log"]
+        with patch.object(harness.sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit):
+                harness.main()
+        self.assertIn("needs --sink-dir", err.getvalue())
 
 
 if __name__ == "__main__":

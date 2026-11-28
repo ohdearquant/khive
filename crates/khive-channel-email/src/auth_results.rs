@@ -497,6 +497,37 @@ fn raw_header_present(raw_bytes: &[u8], expected: &[u8]) -> bool {
     false
 }
 
+/// Return values of matching raw headers after RFC 5322 continuation unfolding.
+pub(crate) fn raw_header_values(raw_bytes: &[u8], expected: &[u8]) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut current: Option<Vec<u8>> = None;
+    for line in raw_bytes.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            break;
+        }
+        if line.first().is_some_and(u8::is_ascii_whitespace) {
+            if let Some(value) = current.as_mut() {
+                value.push(b' ');
+                value.extend_from_slice(line.trim_ascii());
+            }
+            continue;
+        }
+        if let Some(value) = current.take() {
+            values.push(String::from_utf8_lossy(&value).into_owned());
+        }
+        if let Some(colon) = line.iter().position(|byte| *byte == b':') {
+            if line[..colon].eq_ignore_ascii_case(expected) {
+                current = Some(line[colon + 1..].trim_ascii().to_vec());
+            }
+        }
+    }
+    if let Some(value) = current {
+        values.push(String::from_utf8_lossy(&value).into_owned());
+    }
+    values
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ObservedAuthservId {
     Present { value: String, truncated: bool },

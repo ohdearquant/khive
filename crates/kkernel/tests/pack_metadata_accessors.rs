@@ -23,6 +23,7 @@ use khive_pack_comm::CommPack;
 use khive_pack_exec::ExecPack;
 #[cfg(feature = "pack-formal")]
 use khive_pack_formal::FormalPack;
+use khive_pack_forms::FormsPack;
 use khive_pack_git::GitPack;
 use khive_pack_gtd::GtdPack;
 use khive_pack_kg::KgPack;
@@ -30,6 +31,7 @@ use khive_pack_knowledge::KnowledgePack;
 use khive_pack_memory::MemoryPack;
 #[cfg(feature = "pack-moodboard")]
 use khive_pack_moodboard::MoodboardPack;
+use khive_pack_operation::OperationPack;
 use khive_pack_schedule::SchedulePack;
 use khive_pack_session::SessionPack;
 #[cfg(feature = "pack-telemetry")]
@@ -204,6 +206,7 @@ fn linked_packs() -> Vec<Checked> {
         checked(&CodePack::new(rt.clone())),
         checked(&CommPack::new(rt.clone())),
         checked(&ExecPack::new(rt.clone())),
+        checked(&FormsPack::new(rt.clone())),
         checked(&GitPack::new(rt.clone())),
         checked(&GtdPack::new(rt.clone())),
         checked(&KgPack::new(rt.clone())),
@@ -211,6 +214,7 @@ fn linked_packs() -> Vec<Checked> {
         // serves the persisted index and builds nothing from the corpus.
         checked(&KnowledgePack::new_with_index_role(rt.clone(), false)),
         checked(&MemoryPack::new_with_index_role(rt.clone(), false)),
+        checked(&OperationPack::new(rt.clone())),
         checked(&SchedulePack::new(rt.clone())),
         checked(&SessionPack::new(rt.clone())),
         checked(&ToolPack::new(rt.clone())),

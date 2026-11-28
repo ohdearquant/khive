@@ -74,6 +74,11 @@ fn second_signal_terminates_blocked_drain_and_cleanup() {
                 let dir = crate::test_process::private_tempdir_builder()
                     .prefix("kh-signal-")
                     .tempdir_in("/tmp")
+                    .or_else(|_| {
+                        crate::test_process::private_tempdir_builder()
+                            .prefix("kh-signal-")
+                            .tempdir()
+                    })
                     .expect("isolated short socket directory");
                 let sock = dir.path().join("s");
                 let pid_path = dir.path().join("p");
@@ -246,6 +251,7 @@ fn unlistened_socket() -> (tempfile::TempDir, std::path::PathBuf, tokio::net::Un
     let dir = tempfile::Builder::new()
         .prefix("kh-signal-")
         .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("kh-signal-").tempdir())
         .expect("isolated short socket directory");
     let path = dir.path().join("s");
     let socket = tokio::net::UnixSocket::new_stream().expect("create stream socket");

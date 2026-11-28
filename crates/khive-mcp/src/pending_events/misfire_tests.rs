@@ -381,9 +381,16 @@ async fn durable_success_recovers_same_selected_occurrence_without_second_action
             .await
             .unwrap()
     );
-    dispatch_action(&action, "local", None, &server, false)
-        .await
-        .expect("actual action");
+    dispatch_action(
+        &action,
+        "local",
+        None,
+        &server,
+        false,
+        super::dispatch::NamespaceInjection::EventNamespace,
+    )
+    .await
+    .expect("actual action");
     let receipt =
         persist_dispatch_outcome(&rt, "local", id, &claim, &DispatchCompletion::Succeeded)
             .await

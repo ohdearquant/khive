@@ -89,7 +89,7 @@ impl Pack for MemoryPack {
 // Illocutionary classification (Searle 1976):
 //   Commissive — commits caller to a persistent change
 //   Assertive  — retrieves/presents state of affairs
-static MEMORY_HANDLERS: [HandlerDef; 10] = [
+static MEMORY_HANDLERS: [HandlerDef; 11] = [
     // Commissive: commits a memory to the namespace
     HandlerDef {
         name: "memory.remember",
@@ -161,10 +161,17 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "properties",
+                param_type: "object",
+                required: false,
+                description: "Structured fields stored beside memory_type and tags and returned on recall hits. Keep the memory text to the fact and put who, when, where, kind and source ids here. Rules: a JSON object; at most 32 keys; each key 1-64 chars, a lowercase ASCII letter first, then lowercase letters, digits or _; memory_type, tags, attribution and supersedes are reserved: use the top-level memory_type and tags parameters, omit attribution (the runtime sets it for anonymous callers), and record a replacement with a memory.apply_batch row with action=\"supersede\", or link(relation=\"supersedes\") from the new memory to the old memory; each value is a string, a finite number, a boolean or an array of strings (null and nested objects are refused); the serialized object is at most 8192 bytes, and an object over the limit is refused, never truncated.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "Write namespace override. When absent: episodic memories land in the actor's namespace; semantic memories land in \"local\". When present, overrides both routing rules.",
+                description: "Write namespace override. When absent, both episodic and semantic memories land in the caller's actor namespace; an anonymous caller (no actor configured) writes to \"local\" and the memory is flagged with attribution \"unresolved\". When present, the explicit namespace wins, \"local\" included; an anonymous caller's memory is flagged either way.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -195,7 +202,7 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
     // Assertive: retrieves memory notes via decay-aware ranking
     HandlerDef {
         name: "memory.recall",
-        description: "Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved (read-model) values: memory_type defaults to \"episodic\" when not stored, salience and decay_factor reflect the effective defaults used for ranking. Default responses are arrays; budget-capped hits carry truncated: true per result. When the budget removes every ranked candidate, the response is {results: [], truncated: true} so the cutoff stays distinguishable from a genuine no-match. Degraded serving is a third state and never changes ok: it stays true, and the degradation is reported in-band. A non-empty degraded response keeps the array shape and stamps each hit with degraded: \"ann_unavailable\" plus a degraded_reason naming the failure site; when degradation leaves no hits the response is {results: [], degraded: true, degraded_reason} for the same reason the capped-empty response changes shape. A caller that reads only ok cannot tell a degraded serve from a healthy one, so read degraded. One more shape supersedes all of these: a verbose request whose vector recall ran against more than one model returns {results, candidates.vector_candidates_per_model, budget_capped, truncated_for_budget}, which reports the budget as a COUNT rather than a flag and carries no top-level degraded marker, though the per-hit stamps are still on the results. include_timings=true adds a timings field to whichever shape applies, wrapping an array as {results, timings}.",
+        description: "Recall memory notes with decay-aware hybrid ranking. Server-side caps clamp config.scoring.max_recall_candidates to 500, config.scoring.default_token_budget to 16000 tokens, and the result limit (limit or top_k) to 200. Each hit carries resolved (read-model) values: memory_type defaults to \"episodic\" when not stored, salience and decay_factor reflect the effective defaults used for ranking. Each hit also carries hidden_incoming_edges, {total, by_relation: {supersedes: n}}, the number of incoming supersedes edges from memory rows in namespaces the caller cannot read (0 when none); it discloses no id, namespace or content of those rows. Default responses are arrays; budget-capped hits carry truncated: true per result. When the budget removes every ranked candidate, the response is {results: [], truncated: true} so the cutoff stays distinguishable from a genuine no-match. Degraded serving is a third state and never changes ok: it stays true, and the degradation is reported in-band. A non-empty degraded response keeps the array shape and stamps each hit with degraded: \"ann_unavailable\" plus a degraded_reason naming the failure site; when degradation leaves no hits the response is {results: [], degraded: true, degraded_reason} for the same reason the capped-empty response changes shape. A caller that reads only ok cannot tell a degraded serve from a healthy one, so read degraded. One more shape supersedes all of these: a verbose request whose vector recall ran against more than one model returns {results, candidates.vector_candidates_per_model, budget_capped, truncated_for_budget}, which reports the budget as a COUNT rather than a flag and carries no top-level degraded marker, though the per-hit stamps are still on the results. include_timings=true adds a timings field to whichever shape applies, wrapping an array as {results, timings}.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -210,28 +217,28 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Maximum memories to return (default 10, max 100); 0 returns no hits.",
+                description: "Maximum memories to return (default 10, max 200); 0 returns no hits.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "top_k",
                 param_type: "integer",
                 required: false,
-                description: "Override result limit (max 100); 0 returns no hits. Takes priority over limit.",
+                description: "Override result limit (max 200); 0 returns no hits. Takes priority over limit.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "min_score",
                 param_type: "number",
                 required: false,
-                description: "Minimum rank_score to include (default 0.0). This filters `rank_score`, not `score`: `score` (absolute/raw relevance in each result) stays in [0,1] regardless of fusion strategy, but `rank_score` (the composite used for ranking and this filter) is the weighted relevance/salience/temporal composite — nominally [0,1] — further adjusted by posterior terms whenever a brain profile serves the request: a weight-reprojection component, and a per-entity term bounded to clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15). So a served, positively-reinforced memory's rank_score can exceed 1.0 by up to 15%. Typical production floor: 0.3–0.7.",
+                description: "Minimum rank_score to include (default 0.0). This filters `rank_score`, not `score`: `score` (absolute/raw relevance in each result) stays in [0,1] regardless of fusion strategy, but `rank_score` (the composite used for ranking and this filter) is the weighted relevance/salience/temporal composite under the configured default weights — nominally [0,1] — further adjusted whenever a brain profile serves the request: a per-entity term t0 = clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15) scaled toward 1 by the posterior's evidence mass n, 1 + (t0 - 1) * n / (n + 16), so it stays within [0.85, 1.15] and is exactly 1 at n = 0, and, when the serving profile carries a `local_factor` (a number in [0.5, 1]), a multiplication of `local` rows' rank_score by that factor; rows of every other namespace are not scaled. So a served, positively-reinforced memory's rank_score can exceed 1.0 by up to 15%, and under a profile with a factor a `local` row's rank_score is scaled down. Typical production floor: 0.3–0.7.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "score_floor",
                 param_type: "number",
                 required: false,
-                description: "Alias for min_score. Filters by `rank_score`, not `score` — see min_score for the [0,1]-plus-up-to-15% range of rank_score when a profile serves the request. `score` (absolute/raw relevance) stays in [0,1] regardless of fusion strategy or served profile.",
+                description: "Alias for min_score. Filters by `rank_score`, not `score` — see min_score for the [0,1]-plus-up-to-15% range of rank_score when a profile serves the request, and for the scaling of `local` rows' rank_score under a profile with a `local_factor`. `score` (absolute/raw relevance) stays in [0,1] regardless of fusion strategy or served profile.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -305,7 +312,7 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 name: "include_breakdown",
                 param_type: "boolean",
                 required: false,
-                description: "Include per-component score breakdowns in results.",
+                description: "Include per-component score breakdowns in results. Each breakdown reports `relevance` (the value the ranking composite received, with no further scaling), `fused_score` (the fused score before normalization), `composite` (`relevance_term`, `temporal_boost`, `salience_boost` and `adjustment_factor`: the factors of the multiplicative composite that ranks the hit, whose product is `pre_entity_score` when no reranker weights are configured, `adjustment_factor` null when the other three do not multiply to a positive number, `composite` absent when the composite arithmetic fell back to a zero score; the additive `weighted` contributions are not that composite), `weights_served` (always \"default\": a served profile scores with the configured default weights), `profile_component` (diagnostic only: the hit's composite under the weights the serving profile's posteriors project to, divided by its composite under the default weights; it never enters rank_score), `entity_posterior_mean` and `entity_evidence_mass` (the serving profile's posterior mean and evidence mass n for the hit, present together, absent when no profile served the request or it holds no posterior for the hit; entity_term recomputes from them), and `namespace`, `pre_entity_score`, `entity_term`, `local_factor` (1 when no factor applies) and `duplicate_penalty` (the amount subtracted, 0 when none), each the 32-bit value used, so that rank_score = pre_entity_score * entity_term * local_factor - duplicate_penalty.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -320,6 +327,13 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 param_type: "array",
                 required: false,
                 description: "Entity names to boost in scoring. Memories mentioning these entities receive a 1.3× score multiplier.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "label",
+                param_type: "string",
+                required: false,
+                description: "Call-site label, up to 128 characters, with no control characters and no leading or trailing whitespace. It does not change the results: it is kept on this recall's recall_executed event, and brain.event_counts counts those events by it in counts_by_label.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -356,6 +370,13 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 param_type: "array",
                 required: false,
                 description: "Drop memories whose stored tags include any of these values. Applied after tags/tag_mode and before ranking and limit, so a run can recall everything except its own writes.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "prefer_tags",
+                param_type: "array",
+                required: false,
+                description: "Rank memories whose stored tags include any of these values ahead of the rest. Unlike tags, nothing is dropped: other matches fill the remaining slots, and each group keeps its score order.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -471,6 +492,36 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[],
+    },
+    // Commissive: apply a chunk of memory rewrites, dry run by default
+    HandlerDef {
+        name: "memory.apply_batch",
+        description: "Apply a chunk of memory rewrites: each row supersedes an existing memory with a new one, creates a memory, skips a row, or lists a row as a deletion candidate. Dry run by default. Every row is checked before anything is written, and re-running a chunk writes only what is missing.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            ParamDef {
+                name: "batch",
+                param_type: "string",
+                required: true,
+                description: "Name of the batch, at most 128 characters. It is stored on every written row as properties.batch and forms the idempotency key: <batch>:<old id>:<part> for supersede rows and <batch>:create:<part> for create rows. Re-running a chunk under the same name writes only what is missing; a corrected row needs a new part or a new batch name.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "rows",
+                param_type: "array",
+                required: true,
+                description: "1 to 200 rows, each an object {id?, part = 1, action, content?, memory_type?, salience?, properties?, tags?}; unknown fields are refused. Each create row without id needs a distinct part within the call. Omitted part defaults to 1, so multiple creates that omit it share a key and all rows with that key are refused as duplicate-key, even if their content differs. action is one of: supersede (id is the full id of the old row; writes a new memory and a supersedes edge from it to the old row, and leaves the old row unchanged), create (no id; writes a new memory with no edge), skip (id; writes nothing), delete-candidate (id; writes nothing and lists the row). Rows are written in the caller's own namespace through the memory.remember path. supersede and create rows need content and properties.who; a stored salience above 0.4 needs properties.verified (true, or a non-empty string naming what was checked), and a semantic row that gives no salience is stored at its default 0.5; a supersede row whose old row is in the shared namespace needs properties.source_ids; properties may not contain batch, supersedes or batch_row, which the verb adds (batch_row is the SHA-256 of the row's canonical JSON). The old row must be a memory in the caller's namespace or the shared one. The result has one entry per row in input order, {id, part, action, outcome, old_namespace, new_id, reason}, with outcome one of planned, written, deduped, skipped, listed, refused, failed, and counts per outcome. A refused row carries reason {code, message} and never stops the others; codes: invalid-row, id-missing, id-not-allowed, old-unresolved, old-not-memory, old-namespace, content-invalid, salience-range, salience-unverified, who-missing, source-ids-missing, reserved-property, duplicate-key (all rows sharing a key in this call are refused), duplicate-payload (a new supersede row matches another row's complete typed payload apart from part; existing keyed replays are preserved, otherwise the earliest matching new row is kept; the reason names the matched row's zero-based index and part), secret-detected (the key, content, properties or tags hold credential-shaped text; the same scans the write runs), dedupe-name-taken (the key is taken by a row with a different batch_row). A row whose write was refused by the store after passing every check is failed with code write-failed or link-failed and can be re-run. A key already taken by an identical row is deduped and its supersedes edge is asserted again.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "dry_run",
+                param_type: "boolean",
+                required: false,
+                description: "When true (the default), check every row and report what a real run would do (planned or deduped for writing rows) without writing anything. Pass false to write. An anonymous caller is refused either way.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
     },
 ];
 
@@ -589,6 +640,7 @@ impl PackRuntime for MemoryPack {
             "memory.recall_score" => self.handle_recall_score(params).await,
             "memory.prune" => self.handle_prune(token, params).await,
             "memory.vacuum" => self.handle_vacuum(params).await,
+            "memory.apply_batch" => self.handle_apply_batch(token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "memory pack does not handle verb {verb:?}"
             ))),

@@ -2,13 +2,15 @@
 
 use std::collections::HashMap;
 
-/// Return whether `c` is in a supported CJK, Hiragana, Katakana, or Hangul block.
+/// Return whether `c` is in a supported CJK, Hiragana, Katakana, or Hangul block, or is one of
+/// the three ideographic letters of the CJK Symbols and Punctuation block.
 ///
 /// See `crates/khive-text/docs/api/identifier-and-script.md`.
 #[inline]
 pub fn is_cjk_char(c: char) -> bool {
     matches!(c,
-        '\u{3040}'..='\u{309F}'     // Hiragana
+        '\u{3005}'..='\u{3007}'     // 々 iteration mark, 〆 closing mark, 〇 ideographic zero
+        | '\u{3040}'..='\u{309F}'   // Hiragana
         | '\u{30A0}'..='\u{30FF}'   // Katakana
         | '\u{3400}'..='\u{4DBF}'   // CJK Extension A
         | '\u{4E00}'..='\u{9FFF}'   // CJK Unified Ideographs

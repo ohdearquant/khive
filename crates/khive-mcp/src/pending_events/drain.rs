@@ -48,6 +48,7 @@ pub async fn run_pending_events_with_config(
         namespace: None,
         no_embed: false,
         pack: Vec::new(),
+        catalog_verbosity: crate::args::CatalogVerbosity::Full,
         config: config.map(std::path::Path::to_path_buf),
         daemon: false,
         lifetime: None,
@@ -866,6 +867,11 @@ pub(super) async fn run_pending_events_on_with_lease(
                     },
                     lease,
                     dsl,
+                    if event_type == "remind" {
+                        super::dispatch::NamespaceInjection::DefaultPath
+                    } else {
+                        super::dispatch::NamespaceInjection::EventNamespace
+                    },
                     dispatch_actor,
                     server,
                     verbose,

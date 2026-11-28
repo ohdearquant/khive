@@ -444,8 +444,9 @@ async fn brain_feedback_accepts_foreign_namespace_target_id() {
 ///     path fires on a *real* hit, not a miss);
 ///   - `balanced_recall.temporal` moved off its `BetaPosterior::new(1.0, 9.0)`
 ///     prior;
-///   - `balanced_recall.entity_posteriors` gained an entry for the hit's id,
-///     and that entry moved off the `BetaPosterior::new(1.0, 1.0)` default.
+///   - `balanced_recall.entity_posteriors` did not gain an entry for the hit's
+///     id: a recall hit is exposure, not a judgment, so per-entity evidence is
+///     untouched.
 #[tokio::test]
 async fn memory_recall_through_real_registry_updates_brain_posteriors() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -523,18 +524,12 @@ async fn memory_recall_through_real_registry_updates_brain_posteriors() {
     );
 
     let hit_uuid: uuid::Uuid = hit_id.parse().expect("hit id is a valid uuid");
-    let entity_posterior = after
-        .entity_posteriors
-        .get(&hit_uuid)
-        .expect("hit entity must have a posterior entry after a real recall hit");
-    assert_ne!(
-        (entity_posterior.alpha(), entity_posterior.beta()),
-        (1.0, 1.0),
-        "hit entity posterior must move off the BetaPosterior::new(1.0, 1.0) default; got {:?}",
-        (entity_posterior.alpha(), entity_posterior.beta())
-    );
     assert!(
-        !before.entity_posteriors.contains_key(&hit_uuid),
-        "sanity: the hit entity must not have had a posterior before this recall"
+        !after.entity_posteriors.contains_key(&hit_uuid),
+        "a recall hit is not a judgment and must not create a per-entity posterior"
+    );
+    assert_eq!(
+        after.entity_posteriors, before.entity_posteriors,
+        "no per-entity posterior may change on a recall hit"
     );
 }

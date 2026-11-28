@@ -84,7 +84,8 @@ the two verbs no longer diverge.
    edge that discovered them and `via` set to the id of their hop-1 parent (hop-1 records
    carry `hop: 1`, `via: null`). Under visited-set dedup, a node reachable from multiple
    anchors or parents appears exactly once: under the first anchor in selection order,
-   via the first discovering parent in the deterministic order below.
+   via the first discovering parent in the deterministic order below. (Superseded for
+   nodes shared between anchors by the Amendment "one visited set per anchor" below.)
 4. **Assembly.** The response groups by anchor: anchor record (name, kind, description,
    properties), then its neighbor list (name, kind, relation, direction, weight, hop,
    via, one-line description). Deterministic order: anchors in selection order; within an
@@ -248,3 +249,28 @@ view, independently of the assembly's `truncated` flag. `context` supplies no co
 cursor, so repeating the same request does not promise progress beyond the cap. The limited
 `neighbors` surface separately supplies its normal `next_after` only when an additional
 admitted result proves another page exists; `scan_incomplete` alone is not such a proof.
+
+## Amendment (2026-11-26): one visited set per anchor (#6802)
+
+Issue #6802, from the repository owner, asks that a neighbour shared by several anchors be
+listed under each of them, and that a matching neighbour the response leaves out be counted as
+dropped. This amendment does the first, which makes the second moot for this case.
+
+§Semantics item 3 listed a node reachable from several anchors once, under the first anchor in
+selection order. A request for two anchors that share a neighbour therefore showed the neighbour
+under the first anchor only, with every `dropped` count at zero, and reversing the anchors moved
+it. Nothing in the response said that the second anchor's edge to that neighbour exists.
+
+Each anchor now keeps its own visited set, seeded with every selected anchor:
+
+- A node reachable from several anchors is listed under each anchor that reaches it, with that
+  anchor's edge in `edges`. Within one anchor the first discovering parent, in the deterministic
+  order above, still owns the node, so a node appears at most once per anchor.
+- Anchors stay out of every neighbour list and are never hop-2 parents; edges between anchors
+  stay in `anchor_edges` only.
+- The work bound is unchanged. Expansion already runs per anchor, and
+  `anchors × (V × F + (V × F)²)` counts per anchor. A hop-1 node that two anchors share is now
+  expanded at hop 2 once for each of them, which that bound already allows.
+- The output grows by the repeated neighbour records. `budget` still bounds it, and a repeated
+  pair that does not fit counts in `dropped.neighbors` like any other pair.
+- Record hydration still reads each id once, however many anchors list it.

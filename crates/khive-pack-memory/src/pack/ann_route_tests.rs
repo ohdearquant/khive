@@ -95,3 +95,7 @@ async fn recall_second_call_uses_warm_ann_route() {
         "second recall must route through warm ANN, not exact sqlite-vec fallback"
     );
 }
+
+#[cfg(all(test, unix))]
+#[path = "ann_shutdown_tests.rs"]
+mod ann_shutdown_tests;

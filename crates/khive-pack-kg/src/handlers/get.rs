@@ -14,7 +14,7 @@ use khive_runtime::{
 };
 use khive_storage::event::Event;
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
-use khive_types::EventKind;
+use khive_types::{EventKind, KhiveError};
 
 use super::common::{
     deser, flatten_get_result, normalize_entity_timestamps, normalize_event_timestamps,
@@ -36,6 +36,56 @@ fn reject_nonrecord_hydration(roles: &[String]) -> Result<(), RuntimeError> {
 }
 
 impl KgPack {
+    /// `get(kind=<entity kind>, key=...)`: the live entity holding the key
+    /// in the caller's primary namespace (ADR-221 section 1).
+    #[allow(clippy::too_many_arguments)]
+    async fn get_entity_by_key(
+        &self,
+        graph_token: &NamespaceToken,
+        registry: &VerbRegistry,
+        params: &Value,
+        p: &GetParams,
+        key: &str,
+        specific: Option<String>,
+        entity_type: Option<String>,
+    ) -> Result<Value, RuntimeError> {
+        if p.note_kind.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "note_kind applies only to a note key lookup".into(),
+            ));
+        }
+        if entity_type.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "an entity key is scoped to its base kind, not its entity_type: pass the base kind"
+                    .into(),
+            ));
+        }
+        let Some(kind) = specific else {
+            return Err(RuntimeError::InvalidInput(
+                "an entity key lookup needs a specific entity kind".into(),
+            ));
+        };
+        let entity = self
+            .runtime
+            .get_entity_by_key(graph_token, &kind, key)
+            .await?
+            .ok_or_else(|| RuntimeError::from(KhiveError::not_found("entity key", key)))?;
+        // The request named a key; the gate judges the read by the id it
+        // resolved to, as a redirected read is judged by its target.
+        let mut effective_args = params.clone();
+        if let Some(args) = effective_args.as_object_mut() {
+            args.remove("key");
+            args.remove("kind");
+            args.insert("id".into(), Value::String(entity.id.to_string()));
+        }
+        registry
+            .authorize_effective_kg_read(graph_token, "get", effective_args, entity.id)
+            .await?;
+        let record = flatten_get_result("entity", normalize_entity_timestamps(to_json(&entity)?))?;
+        self.get_with_attachments(entity.id, record, &p.hydrate)
+            .await
+    }
+
     pub(crate) async fn handle_get(
         &self,
         token: &NamespaceToken,
@@ -57,9 +107,25 @@ impl KgPack {
                 None => None,
                 Some(kind) => match super::common::resolve_kind_spec(kind, registry)? {
                     super::common::KindSpec::Note { specific } => specific,
+                    super::common::KindSpec::Entity {
+                        specific,
+                        entity_type,
+                    } => {
+                        return self
+                            .get_entity_by_key(
+                                graph_token,
+                                registry,
+                                &params,
+                                &p,
+                                key,
+                                specific,
+                                entity_type,
+                            )
+                            .await;
+                    }
                     _ => {
                         return Err(RuntimeError::InvalidInput(
-                            "key lookup applies only to notes".into(),
+                            "key lookup applies only to notes and entities".into(),
                         ))
                     }
                 },

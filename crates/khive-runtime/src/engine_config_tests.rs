@@ -695,6 +695,118 @@ id = "lambda:"
     );
 }
 
+// ADR-021 Delta 1: `[actor] owned_namespaces` is declared by name and checked
+// exactly at load.
+#[test]
+fn test_owned_namespaces_accepted_list_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_toml(
+        &dir,
+        r#"
+[actor]
+id = "agent:alpha"
+owned_namespaces = ["project:data", "agent:legacy"]
+"#,
+    );
+    let cfg = KhiveConfig::load(Some(&path))
+        .expect("a well-formed owned_namespaces list loads")
+        .expect("file should be present");
+    assert_eq!(
+        cfg.actor.owned_namespaces,
+        vec!["project:data".to_string(), "agent:legacy".to_string()]
+    );
+}
+
+#[test]
+fn test_owned_namespaces_defaults_to_empty_when_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_toml(
+        &dir,
+        r#"
+[actor]
+id = "agent:alpha"
+"#,
+    );
+    let cfg = KhiveConfig::load(Some(&path))
+        .expect("an actor without a declaration loads")
+        .expect("file should be present");
+    assert!(
+        cfg.actor.owned_namespaces.is_empty(),
+        "no declaration means no owned namespaces"
+    );
+}
+
+#[test]
+fn test_owned_namespaces_refusals_at_load() {
+    let cases: [(&str, &str, &str); 6] = [
+        (
+            "no actor id",
+            r#"
+[actor]
+owned_namespaces = ["project:data"]
+"#,
+            "requires an explicit [actor] id",
+        ),
+        (
+            "empty entry",
+            r#"
+[actor]
+id = "agent:alpha"
+owned_namespaces = [""]
+"#,
+            "must not be empty",
+        ),
+        (
+            "entry that does not parse as a namespace",
+            r#"
+[actor]
+id = "agent:alpha"
+owned_namespaces = ["bad namespace"]
+"#,
+            "invalid owned namespace",
+        ),
+        (
+            "the shared namespace",
+            r#"
+[actor]
+id = "agent:alpha"
+owned_namespaces = ["local"]
+"#,
+            "shared namespace `local`",
+        ),
+        (
+            "the actor's own id",
+            r#"
+[actor]
+id = "agent:alpha"
+owned_namespaces = ["agent:alpha"]
+"#,
+            "actor's own id",
+        ),
+        (
+            "a duplicate entry",
+            r#"
+[actor]
+id = "agent:alpha"
+owned_namespaces = ["project:data", "project:data"]
+"#,
+            "must be unique",
+        ),
+    ];
+    for (label, toml, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(&dir, toml);
+        let err = KhiveConfig::load(Some(&path)).expect_err(label);
+        match config_error_root(&err) {
+            ConfigError::InvalidActorId { reason, .. } => assert!(
+                reason.contains(expected),
+                "{label}: unexpected refusal reason {reason:?}"
+            ),
+            other => panic!("{label}: expected InvalidActorId, got {other:?}"),
+        }
+    }
+}
+
 // actor.id must not become default_namespace: writes stay pinned to `local`
 // even though a non-local actor.id widens the default read visible-set.
 #[test]
@@ -2265,6 +2377,84 @@ branches = []
     );
 }
 
+// ADR-108 Amendment 2: a read entry names a repository and no branches, and a
+// row with no `access` key keeps its write meaning.
+#[test]
+fn test_git_write_read_entry_parses_and_access_defaults_to_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_toml(
+        &dir,
+        r#"
+[[git_write.allowed]]
+repo = "/abs/read"
+access = "read"
+
+[[git_write.allowed]]
+repo = "/abs/write"
+branches = ["main"]
+"#,
+    );
+    let cfg = KhiveConfig::load(Some(&path))
+        .expect("no error")
+        .expect("file found");
+    assert_eq!(cfg.git_write.allowed[0].access, GitRepoAccess::Read);
+    assert!(cfg.git_write.allowed[0].branches.is_empty());
+    assert_eq!(cfg.git_write.allowed[1].access, GitRepoAccess::Write);
+}
+
+#[test]
+fn test_git_write_read_entry_with_branches_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_toml(
+        &dir,
+        r#"
+[[git_write.allowed]]
+repo = "/abs/path"
+access = "read"
+branches = ["main"]
+"#,
+    );
+    let err = KhiveConfig::load(Some(&path)).expect_err("a read entry names no branches");
+    assert!(
+        matches!(config_error_root(&err), ConfigError::InvalidGitWriteEntry { ref reason, .. } if reason == "a read entry names no branches"),
+        "expected InvalidGitWriteEntry, got {err:?}"
+    );
+}
+
+// Omitting `branches` on a write entry is the empty list, refused as before.
+#[test]
+fn test_git_write_write_entry_without_branches_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_toml(
+        &dir,
+        r#"
+[[git_write.allowed]]
+repo = "/abs/path"
+access = "write"
+"#,
+    );
+    let err = KhiveConfig::load(Some(&path)).expect_err("a write entry needs branches");
+    assert!(
+        matches!(config_error_root(&err), ConfigError::InvalidGitWriteEntry { ref reason, .. } if reason == "branches must not be empty"),
+        "expected InvalidGitWriteEntry, got {err:?}"
+    );
+}
+
+#[test]
+fn test_git_write_unknown_access_rejected() {
+    let parsed: Result<KhiveConfig, _> = toml::from_str(
+        r#"
+[[git_write.allowed]]
+repo = "/abs/path"
+access = "admin"
+"#,
+    );
+    assert!(
+        parsed.is_err(),
+        "an access other than read or write must not parse"
+    );
+}
+
 #[test]
 fn git_actor_mapping_and_resolver_defaults_parse_without_resolution() {
     let cfg: KhiveConfig = toml::from_str(
@@ -2360,6 +2550,74 @@ credential = "not-an-accepted-field""#
 }
 
 #[test]
+fn git_repository_author_is_optional_and_refuses_an_invalid_identity_at_load() {
+    let row = |author: Option<(&str, &str)>| GitWriteSectionConfig {
+        repositories: BTreeMap::from([(
+            "/repo".to_string(),
+            GitWriteRepositoryConfig {
+                remote: "https://github.com/example/repo".to_string(),
+                slug: "example/repo".to_string(),
+                visibility: "private".to_string(),
+                merge_refusals: vec![],
+                author: author.map(|(name, email)| GitWriteAuthorConfig {
+                    name: name.to_string(),
+                    email: email.to_string(),
+                }),
+            },
+        )]),
+        ..Default::default()
+    };
+    row(None).validate_dev_loop().unwrap();
+    row(Some(("Example Author", "author@example.invalid")))
+        .validate_dev_loop()
+        .unwrap();
+    for (name, email) in [
+        ("", "author@example.invalid"),
+        ("Example Author", "  "),
+        ("Example <Author>", "author@example.invalid"),
+        ("Example Author", "author@example.invalid\n"),
+    ] {
+        assert!(matches!(
+            row(Some((name, email))).validate_dev_loop(),
+            Err(ConfigError::InvalidGitWriteConfig { key, .. })
+                if key == "repositories./repo.author"
+        ));
+    }
+    let parsed: GitWriteRepositoryConfig = toml::from_str(
+        r#"remote = "https://github.com/example/repo"
+slug = "example/repo"
+visibility = "private"
+author = { name = "Example Author", email = "author@example.invalid" }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        parsed.author,
+        Some(GitWriteAuthorConfig {
+            name: "Example Author".to_string(),
+            email: "author@example.invalid".to_string(),
+        })
+    );
+    let absent: GitWriteRepositoryConfig = toml::from_str(
+        r#"remote = "https://github.com/example/repo"
+slug = "example/repo"
+visibility = "private""#,
+    )
+    .unwrap();
+    assert_eq!(absent.author, None);
+    assert!(
+        !toml::to_string(&absent).unwrap().contains("author"),
+        "an absent author writes nothing back"
+    );
+    assert!(toml::from_str::<GitWriteRepositoryConfig>(
+        r#"remote = "https://github.com/example/repo"
+slug = "example/repo"
+visibility = "private"
+author = { name = "Example Author", email = "author@example.invalid", credential_ref = "ref" }"#
+    )
+    .is_err());
+}
+
+#[test]
 fn git_repository_merge_refusals_accept_only_the_two_named_entries() {
     let row = |refusals: &[&str]| GitWriteSectionConfig {
         repositories: BTreeMap::from([(
@@ -2369,6 +2627,7 @@ fn git_repository_merge_refusals_accept_only_the_two_named_entries() {
                 slug: "example/repo".to_string(),
                 visibility: "private".to_string(),
                 merge_refusals: refusals.iter().map(|entry| entry.to_string()).collect(),
+                author: None,
             },
         )]),
         ..Default::default()
@@ -2600,4 +2859,393 @@ fn code_map_values_of_the_wrong_type_fail_configuration_load() {
             .to_string();
         assert!(error.contains(key), "{error}");
     }
+}
+
+fn write_config(root: &std::path::Path, rel: &str, body: &str) {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, body).unwrap();
+}
+
+#[test]
+fn require_attributed_in_a_home_config_holds_beside_a_project_khive_toml_without_it() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        "khive.toml",
+        "[actor]\nid = \"lambda:project\"\n",
+    );
+    write_config(
+        home_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nrequire_attributed = true\n",
+    );
+    let first = KhiveConfig::load_with_roots(project_dir.path(), Some(home_dir.path()), None)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !first.actor.require_attributed,
+        "the first-found file lacks the key"
+    );
+    let any =
+        KhiveConfig::require_attributed_in_tiers(project_dir.path(), Some(home_dir.path()), None);
+    assert!(any.unwrap(), "the home file's key is not shadowed");
+}
+
+#[test]
+fn require_attributed_in_a_home_config_holds_beside_a_project_dot_khive_config_without_it() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nid = \"lambda:project\"\n",
+    );
+    write_config(
+        home_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nrequire_attributed = true\n",
+    );
+    let any =
+        KhiveConfig::require_attributed_in_tiers(project_dir.path(), Some(home_dir.path()), None);
+    assert!(any.unwrap());
+}
+
+#[test]
+fn require_attributed_is_off_when_no_tier_sets_it() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        "khive.toml",
+        "[actor]\nid = \"lambda:project\"\n",
+    );
+    write_config(
+        home_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nid = \"lambda:home\"\n",
+    );
+    let any =
+        KhiveConfig::require_attributed_in_tiers(project_dir.path(), Some(home_dir.path()), None);
+    assert!(!any.unwrap());
+}
+
+#[test]
+fn an_explicit_config_is_the_only_file_read_for_require_attributed() {
+    let dir = tempfile::tempdir().unwrap();
+    write_config(
+        dir.path(),
+        "explicit.toml",
+        "[actor]\nid = \"lambda:explicit\"\n",
+    );
+    let explicit = dir.path().join("explicit.toml");
+    assert!(!KhiveConfig::require_attributed_in_any_tier(Some(&explicit), None).unwrap());
+    write_config(
+        dir.path(),
+        "strict.toml",
+        "[actor]\nrequire_attributed = true\n",
+    );
+    let strict = dir.path().join("strict.toml");
+    assert!(KhiveConfig::require_attributed_in_any_tier(Some(&strict), None).unwrap());
+}
+
+#[test]
+fn require_attributed_in_a_database_anchored_config_holds_beside_a_cwd_khive_toml_without_it() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let db_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        "khive.toml",
+        "[actor]\nid = \"lambda:project\"\n",
+    );
+    write_config(
+        db_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nrequire_attributed = true\n",
+    );
+    let db = db_dir.path().join(".khive/khive.db");
+    let first = KhiveConfig::load_with_roots(project_dir.path(), None, Some(&db))
+        .unwrap()
+        .unwrap();
+    assert!(
+        !first.actor.require_attributed,
+        "the cwd khive.toml shadows the database-anchored file"
+    );
+    let any = KhiveConfig::require_attributed_in_tiers(project_dir.path(), None, Some(&db));
+    assert!(
+        any.unwrap(),
+        "the database-anchored file's key is not shadowed"
+    );
+}
+
+/// The refusal a shadowed tier's load failure produces, with its display text.
+fn shadowed_tier_refusal(result: Result<bool, ConfigError>) -> (PathBuf, Option<PathBuf>, String) {
+    match result {
+        Err(error @ ConfigError::ShadowedTier { .. }) => {
+            let text = error.to_string();
+            let ConfigError::ShadowedTier { path, in_use, .. } = error else {
+                unreachable!()
+            };
+            (path, in_use, text)
+        }
+        other => panic!("expected a shadowed-tier refusal, got {other:?}"),
+    }
+}
+
+fn canonical(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap()
+}
+
+#[test]
+fn a_malformed_shadowed_tier_is_refused_naming_the_file_and_the_file_in_use() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        "khive.toml",
+        "[actor]\nid = \"agent:proj\"\n",
+    );
+    write_config(home_dir.path(), ".khive/config.toml", "[actor\n");
+    let shadowed = canonical(&home_dir.path().join(".khive/config.toml"));
+    let used = canonical(&project_dir.path().join("khive.toml"));
+    let (path, in_use, text) = shadowed_tier_refusal(KhiveConfig::require_attributed_in_tiers(
+        project_dir.path(),
+        Some(home_dir.path()),
+        None,
+    ));
+    assert_eq!(path, shadowed);
+    assert_eq!(in_use.as_deref(), Some(used.as_path()));
+    assert_eq!(
+        text.split(": TOML parse error").next().unwrap(),
+        format!(
+            "config file {} is not the file in use (in use: {}); it was read only to look for \
+             `[actor] require_attributed`, which could not be read from it: config TOML parse \
+             error in {}",
+            shadowed.display(),
+            used.display(),
+            shadowed.display()
+        ),
+        "{text}"
+    );
+    assert!(text.contains("invalid table header"), "{text}");
+}
+
+#[test]
+fn a_shadowed_tier_with_an_unknown_key_is_refused_naming_the_key() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(
+        project_dir.path(),
+        "khive.toml",
+        "[actor]\nid = \"agent:proj\"\n",
+    );
+    write_config(
+        home_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nid = \"agent:home\"\nrequire_attributes = true\n",
+    );
+    let (path, in_use, text) = shadowed_tier_refusal(KhiveConfig::require_attributed_in_tiers(
+        project_dir.path(),
+        Some(home_dir.path()),
+        None,
+    ));
+    assert_eq!(path, canonical(&home_dir.path().join(".khive/config.toml")));
+    assert_eq!(
+        in_use,
+        Some(canonical(&project_dir.path().join("khive.toml")))
+    );
+    assert!(
+        text.contains("was read only to look for `[actor] require_attributed`"),
+        "{text}"
+    );
+    assert!(text.contains("require_attributes"), "{text}");
+}
+
+#[test]
+fn a_malformed_file_in_use_keeps_its_own_parse_error() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    write_config(project_dir.path(), "khive.toml", "[actor\n");
+    write_config(
+        home_dir.path(),
+        ".khive/config.toml",
+        "[actor]\nid = \"agent:home\"\n",
+    );
+    let result =
+        KhiveConfig::require_attributed_in_tiers(project_dir.path(), Some(home_dir.path()), None);
+    assert!(
+        matches!(&result, Err(ConfigError::Parse { path, .. }) if path.ends_with("khive.toml")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_malformed_cwd_config_beside_a_database_anchored_tier_names_no_file_in_use() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let db_dir = tempfile::tempdir().unwrap();
+    write_config(project_dir.path(), ".khive/config.toml", "[actor\n");
+    let db = db_dir.path().join(".khive/khive.db");
+    let (path, in_use, text) = shadowed_tier_refusal(KhiveConfig::require_attributed_in_tiers(
+        project_dir.path(),
+        None,
+        Some(&db),
+    ));
+    assert_eq!(
+        path,
+        canonical(&project_dir.path().join(".khive/config.toml"))
+    );
+    assert_eq!(in_use, None);
+    assert!(text.contains("(in use: none)"), "{text}");
+}
+
+#[test]
+fn knowledge_import_roots_parse_closed_and_absolute() {
+    let parsed: KhiveConfig =
+        toml::from_str("[knowledge]\nimport_roots = [\"/srv/atlas\"]\n").unwrap();
+    assert_eq!(
+        parsed.knowledge.import_roots,
+        vec![PathBuf::from("/srv/atlas")]
+    );
+    parsed.validate().expect("an absolute root validates");
+    assert!(KhiveConfig::default().knowledge.import_roots.is_empty());
+
+    let unknown = toml::from_str::<KhiveConfig>("[knowledge]\nimport_root = [\"/srv\"]\n");
+    assert!(unknown.is_err(), "a misspelled key fails to parse");
+
+    let relative: KhiveConfig =
+        toml::from_str("[knowledge]\nimport_roots = [\"atlas\"]\n").unwrap();
+    let error = relative.validate().expect_err("a relative root is refused");
+    assert!(
+        error.to_string().contains("knowledge.import_roots"),
+        "{error}"
+    );
+}
+
+#[test]
+fn git_digest_sources_parse_closed_and_checked() {
+    let parsed: KhiveConfig = toml::from_str(
+        "[git_digest]\nlocal_roots = [\"/srv/repos\"]\nremotes = [\"https://example.com/org/a\"]\n",
+    )
+    .unwrap();
+    parsed
+        .validate()
+        .expect("absolute roots and https remotes validate");
+    assert_eq!(
+        parsed.git_digest.local_roots,
+        vec![PathBuf::from("/srv/repos")]
+    );
+    assert!(KhiveConfig::default().git_digest == GitDigestSectionConfig::default());
+
+    assert!(toml::from_str::<KhiveConfig>("[git_digest]\nroots = []\n").is_err());
+
+    let relative: KhiveConfig =
+        toml::from_str("[git_digest]\nlocal_roots = [\"repos\"]\n").unwrap();
+    let error = relative.validate().expect_err("a relative root is refused");
+    assert!(
+        error.to_string().contains("git_digest.local_roots"),
+        "{error}"
+    );
+
+    let ssh: KhiveConfig =
+        toml::from_str("[git_digest]\nremotes = [\"ssh://example.com/a\"]\n").unwrap();
+    let error = ssh.validate().expect_err("a non-https remote is refused");
+    assert!(
+        error.to_string().contains("git_digest.remotes")
+            && error.to_string().contains("is not an https:// URL"),
+        "{error}"
+    );
+
+    for broad in [
+        "https://github.com/ohdearquant",
+        "https://github.com/ohdearquant/",
+        "https://github.com",
+        "https://github.com/ohdearquant/*",
+        "https://github.com/*/khive",
+        "https://github.com//khive",
+        "https://github.com/ohdearquant/khive?all",
+    ] {
+        let parsed: KhiveConfig =
+            toml::from_str(&format!("[git_digest]\nremotes = [{broad:?}]\n")).unwrap();
+        let error = parsed
+            .validate()
+            .expect_err("an entry naming more or less than one repository is refused");
+        assert!(
+            error.to_string().contains("does not name one repository"),
+            "{broad}: {error}"
+        );
+    }
+    for exact in [
+        "https://github.com/ohdearquant/khive",
+        "https://github.com/ohdearquant/khive.git",
+        "https://github.com/ohdearquant/khive/",
+        "https://gitlab.example/group/subgroup/repo",
+    ] {
+        let parsed: KhiveConfig =
+            toml::from_str(&format!("[git_digest]\nremotes = [{exact:?}]\n")).unwrap();
+        parsed
+            .validate()
+            .unwrap_or_else(|error| panic!("{exact} names one repository: {error}"));
+    }
+}
+
+#[test]
+fn git_digest_remote_with_userinfo_is_refused_without_echoing_it() {
+    let user = "digest-reader";
+    let password = ["pw", "7Kq2", "xZ9m"].concat();
+    let refuse_without_echo = |remote: &str| {
+        let parsed: KhiveConfig =
+            toml::from_str(&format!("[git_digest]\nremotes = [{remote:?}]\n")).unwrap();
+        let error = parsed
+            .validate()
+            .expect_err("an entry carrying userinfo is refused")
+            .to_string();
+        assert!(error.contains("git_digest.remotes"), "{error}");
+        assert!(!error.contains(user), "the refusal echoes the user name");
+        assert!(
+            !error.contains(&password),
+            "the refusal echoes the password"
+        );
+        error
+    };
+    for remote in [
+        format!("https://{user}@github.com/ohdearquant/khive"),
+        format!("https://{user}:{password}@github.com/ohdearquant/khive"),
+        format!("ssh://{user}:{password}@example.com/org/a"),
+        // No scheme, a one-slash scheme, and a password holding `#` or `?`:
+        // each still carries userinfo before its host.
+        format!("{user}:{password}@github.com/ohdearquant/khive"),
+        format!("https:/{user}:{password}@github.com/ohdearquant/khive"),
+        format!("https://{user}:{password}#1@github.com/ohdearquant/khive"),
+        format!("https://{user}:{password}?1@github.com/ohdearquant/khive"),
+        format!(" https://{user}:{password}@github.com/ohdearquant/khive"),
+        "git@github.com:ohdearquant/khive".to_owned(),
+    ] {
+        let error = refuse_without_echo(&remote);
+        assert!(
+            error.contains("user name or password"),
+            "{remote:?} is refused as carrying userinfo: {error}"
+        );
+    }
+    // A password holding `/` ends the authority before the `@`, so the userinfo
+    // reading misses it; the refusal still never quotes an entry holding an `@`.
+    refuse_without_echo(&format!("https://{user}:{password}/x@github.com"));
+    // An `@` past the host belongs to the path and does not count as userinfo.
+    let parsed: KhiveConfig =
+        toml::from_str("[git_digest]\nremotes = [\"https://example.com/org/a@b\"]\n").unwrap();
+    parsed.validate().expect("an @ in the path is not userinfo");
+}
+
+#[test]
+fn code_ingest_roots_parse_closed_and_absolute() {
+    let parsed: KhiveConfig = toml::from_str("[code_ingest]\nroots = [\"/srv/code\"]\n").unwrap();
+    parsed.validate().expect("absolute roots validate");
+    assert_eq!(parsed.code_ingest.roots, vec![PathBuf::from("/srv/code")]);
+    assert!(KhiveConfig::default().code_ingest == CodeIngestSectionConfig::default());
+
+    assert!(toml::from_str::<KhiveConfig>("[code_ingest]\nimport_roots = []\n").is_err());
+
+    let relative: KhiveConfig = toml::from_str("[code_ingest]\nroots = [\"code\"]\n").unwrap();
+    let error = relative.validate().expect_err("a relative root is refused");
+    assert!(error.to_string().contains("code_ingest.roots"), "{error}");
 }

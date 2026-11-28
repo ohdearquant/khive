@@ -3,6 +3,11 @@
 mod sql;
 
 #[cfg(test)]
+mod daemon_recall_stack_tests;
+#[cfg(test)]
+#[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
+mod receipt_credentials;
+#[cfg(test)]
 mod test_process;
 
 mod atomic_apply;
@@ -20,7 +25,9 @@ pub mod exec;
 pub mod git_annotation_repair;
 pub mod git_dedup;
 pub mod git_ingest;
+pub mod import_notes;
 pub mod kg;
+pub mod memory_edge_namespace_move;
 pub mod mount;
 pub mod pack_introspect;
 pub mod reindex;
@@ -61,6 +68,7 @@ mod _pack_links {
     use khive_pack_exec::ExecPack as _;
     #[cfg(feature = "pack-formal")]
     use khive_pack_formal::FormalPack as _;
+    use khive_pack_forms::FormsPack as _;
     use khive_pack_git::GitPack as _;
     use khive_pack_gtd::GtdPack as _;
     use khive_pack_kg::KgPack as _;
@@ -68,6 +76,7 @@ mod _pack_links {
     use khive_pack_memory::MemoryPack as _;
     #[cfg(feature = "pack-moodboard")]
     use khive_pack_moodboard::MoodboardPack as _;
+    use khive_pack_operation::OperationPack as _;
     use khive_pack_schedule::SchedulePack as _;
     use khive_pack_session::SessionPack as _;
     #[cfg(feature = "pack-telemetry")]

@@ -68,11 +68,9 @@ pub use hybrid::{
 };
 #[cfg(feature = "checkpoint")]
 pub use khive_hnsw::{HnswCheckpoint, HnswCheckpointStore};
-// Native cross-encoder scaffold (ADR-042): the scorer trait and reranker are generic
-// and carry no khive-inference dependency, so this seam ships behind `native-rerank`
-// ahead of the model port. TODO(port-rerank): khive-inference model impl still deferred.
+// The native model and its inference dependency are opt-in (ADR-042).
 #[cfg(feature = "native-rerank")]
-pub use hybrid::{CrossEncoderScorer, NativeCrossEncoderReranker, RerankDocumentResolver};
+pub use hybrid::native_rerank::*;
 pub use materialization::{
     materialize_ranked_prefix, DropCounts, DropDiagnostic, DropReason, MaterializationDecision,
     MaterializationError, MaterializationLimitError, MaterializationLimits, MaterializedItem,
@@ -87,7 +85,9 @@ pub use persist::{
     ShadowValidationResult,
 };
 pub use policy::{filter_by_policy, filter_by_predicate, ClearanceLevel, SearchPolicy};
-pub use query_ir::{FilterPredicate, FuseStrategy, QueryNode, RerankMethod};
+pub use query_ir::{
+    FilterPredicate, FuseStrategy, QueryNode, RerankMethod, HYBRID_CANDIDATE_MULTIPLIER,
+};
 pub use query_variants::{
     merge_query_variants, normalize_query_variants, AdmittedVariantHit, QueryVariant,
     QueryVariantLimits, QueryVariantOrigin, QueryVariantRejection, QueryVariants,

@@ -211,7 +211,7 @@ fn open_warmed_default_reader(path: &Path, case: &str) -> Connection {
         .into_owned();
     assert_eq!(actual, default, "the client must use the default VFS");
     assert_eq!(actual, "unix", "the probe requires the stock Unix VFS");
-    assert_eq!(rusqlite::version(), "3.53.2", "bundled SQLite pin changed");
+    assert_eq!(rusqlite::version(), "3.54.1", "bundled SQLite pin changed");
     println!(
         "sqlite-client case={case} pid={} sqlite={} default_vfs={default} actual_vfs={actual} journal_mode={mode} schema_warmed=true",
         std::process::id(),

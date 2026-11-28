@@ -11,6 +11,10 @@ use serde_json::{json, Value};
 use super::batch_types::UnitBudget;
 use super::batch_types::{failure_entry, BatchTask, UnitOutcome, UnitTask};
 
+#[cfg(all(test, debug_assertions))]
+#[path = "../batch_task_size_tests.rs"]
+mod batch_task_size_tests;
+
 /// Response-envelope `status` for a batch of `failed`/`aborted` counts
 /// (#1220): `"partial"` when either is non-zero, `"success"` otherwise. A
 /// caller that only checks for the absence of a top-level RPC error has
@@ -57,7 +61,10 @@ pub(super) fn batch_budget_error(tool: &str, response_budget: usize) -> Value {
     failure_entry(
         tool,
         json!({"kind":"response_budget_exceeded", "code":"response_budget_exceeded",
-        "message":format!("batch response budget of {response_budget} serialized bytes exceeded")}),
+        "message":format!(
+            "per-request batch response budget of {response_budget} serialized result bytes exceeded; \
+             the budget is shared across all ops in this batch request and resets for the next request"
+        )}),
         DomainDisposition::NotCommitted,
     )
 }

@@ -68,9 +68,11 @@ fn effective_config_uses_defaults() {
         tags: None,
         tag_mode: TagMode::Any,
         exclude_tags: None,
+        prefer_tags: None,
         include_source_id: None,
         include_timings: None,
         entity_names: None,
+        label: None,
         full_content: None,
         profile_id: None,
         created_after: None,
@@ -103,9 +105,11 @@ fn effective_config_legacy_overrides() {
         tags: None,
         tag_mode: TagMode::Any,
         exclude_tags: None,
+        prefer_tags: None,
         include_source_id: None,
         include_timings: None,
         entity_names: None,
+        label: None,
         full_content: None,
         profile_id: None,
         created_after: None,
@@ -140,9 +144,11 @@ fn effective_config_explicit_config_wins() {
         tags: None,
         tag_mode: TagMode::Any,
         exclude_tags: None,
+        prefer_tags: None,
         include_source_id: None,
         include_timings: None,
         entity_names: None,
+        label: None,
         full_content: None,
         profile_id: None,
         created_after: None,
@@ -181,9 +187,11 @@ fn test_weighted_strategy_preserves_pack_weights() {
         tags: None,
         tag_mode: TagMode::Any,
         exclude_tags: None,
+        prefer_tags: None,
         include_source_id: None,
         include_timings: None,
         entity_names: None,
+        label: None,
         full_content: None,
         profile_id: None,
         created_after: None,
@@ -245,9 +253,11 @@ fn test_weighted_strategy_from_rrf_config_uses_vector_heavy_defaults() {
         tags: None,
         tag_mode: TagMode::Any,
         exclude_tags: None,
+        prefer_tags: None,
         include_source_id: None,
         include_timings: None,
         entity_names: None,
+        label: None,
         full_content: None,
         profile_id: None,
         created_after: None,
@@ -1191,6 +1201,70 @@ fn recall_handler_schema_params_are_all_accepted_by_recall_params() {
 }
 
 #[test]
+fn recall_help_states_the_server_side_caps_it_enforces() {
+    use crate::scoring::{MAX_RECALL_CANDIDATES, MAX_RECALL_LIMIT, MAX_TOKEN_BUDGET};
+    use khive_types::Pack;
+
+    let recall_def = <crate::MemoryPack as Pack>::HANDLERS
+        .iter()
+        .find(|h| h.name == "memory.recall")
+        .expect("memory.recall HandlerDef exists");
+    let caps = format!(
+        "clamp config.scoring.max_recall_candidates to {MAX_RECALL_CANDIDATES}, \
+         config.scoring.default_token_budget to {MAX_TOKEN_BUDGET} tokens, \
+         and the result limit (limit or top_k) to {MAX_RECALL_LIMIT}."
+    );
+    assert!(
+        recall_def.description.contains(&caps),
+        "memory.recall help must state the enforced caps: {caps}"
+    );
+    for name in ["limit", "top_k"] {
+        let param = recall_def
+            .params
+            .iter()
+            .find(|p| p.name == name)
+            .expect("memory.recall advertises the param");
+        assert!(
+            param
+                .description
+                .contains(&format!("max {MAX_RECALL_LIMIT})")),
+            "{name} help must state the enforced maximum {MAX_RECALL_LIMIT}: {}",
+            param.description
+        );
+    }
+}
+
+#[test]
+fn recall_help_states_the_scaled_entity_term_and_its_breakdown_fields() {
+    use khive_types::Pack;
+
+    let recall_def = <crate::MemoryPack as Pack>::HANDLERS
+        .iter()
+        .find(|h| h.name == "memory.recall")
+        .expect("memory.recall HandlerDef exists");
+    let param = |name: &str| {
+        recall_def
+            .params
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("memory.recall advertises {name}"))
+            .description
+    };
+    let min_score = param("min_score");
+    assert!(
+        min_score.contains("1 + (t0 - 1) * n / (n + 16)"),
+        "min_score help must state the evidence-scaled entity term: {min_score}"
+    );
+    let breakdown = param("include_breakdown");
+    for field in ["`entity_posterior_mean`", "`entity_evidence_mass`"] {
+        assert!(
+            breakdown.contains(field),
+            "include_breakdown help must list {field}: {breakdown}"
+        );
+    }
+}
+
+#[test]
 fn recall_params_distinguish_missing_session_fields_from_explicit_null() {
     let missing: RecallParams = serde_json::from_value(serde_json::json!({"query": "x"}))
         .expect("missing session controls are optional");
@@ -1435,4 +1509,30 @@ fn request_naming_weighted_keeps_the_configured_weights() {
         },
         "a request naming weighted must keep the configured weights"
     );
+}
+
+// ── local_factor_from_profile_response ───────────────────────────────────
+
+#[test]
+fn local_factor_is_read_from_the_profile_response_as_an_f32() {
+    for stored in [0.5_f64, 0.7, 1.0] {
+        let resp = serde_json::json!({ "local_factor": stored });
+        assert_eq!(local_factor_from_profile_response(&resp), stored as f32);
+    }
+    let integer = serde_json::json!({ "local_factor": 1 });
+    assert_eq!(local_factor_from_profile_response(&integer), 1.0_f32);
+}
+
+#[test]
+fn local_factor_is_one_when_the_profile_response_has_no_usable_value() {
+    for resp in [
+        serde_json::json!({}),
+        serde_json::json!({ "local_factor": null }),
+        serde_json::json!({ "local_factor": "0.7" }),
+        serde_json::json!({ "local_factor": 0.49 }),
+        serde_json::json!({ "local_factor": 1.01 }),
+        serde_json::json!({ "local_factor": -0.7 }),
+    ] {
+        assert_eq!(local_factor_from_profile_response(&resp), 1.0_f32, "{resp}");
+    }
 }

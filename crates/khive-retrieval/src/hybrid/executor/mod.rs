@@ -3,9 +3,16 @@
 //! Adapters retain authorization, physical binding, local timeout and fallback policy.
 //! The executor preserves the inherited absolute request context and raw arm evidence.
 
+mod plan;
 mod protocol;
 mod schedule;
 mod types;
+
+pub use plan::{
+    execute_collect_leaf, execute_leaf, finish_collect, CollectedPlanOutcome, CollectionPlan,
+    CollectionSlot, ExecutedLeaf, LeafExecutionContext, LeafKind, LeafSlot, PlanOperators,
+    PlanProgram, PlanTemplate, PreparedLeaf,
+};
 
 pub use types::{
     ArmCompletion, ArmFailure, ArmInput, ArmReport, ArmRequest, ArmRoute, ArmSpec, ArmState,
@@ -14,25 +21,27 @@ pub use types::{
     VectorGroupPreparer, VectorInput, VectorPreparation,
 };
 
-use std::future::Future;
-
 use khive_storage::{
     await_request_read_phase, ensure_request_read_active, inherit_request_read_context,
 };
 use schedule::ArmErrorPolicy;
 
 #[cfg(test)]
+mod plan_tests;
+#[cfg(test)]
 mod scheduling_tests;
 
 /// Execute a runtime-style plan: collect all arms, then select text errors before vector errors.
 ///
-/// The fusion resolver runs once before providers, including at a zero final limit.
+/// Operators resolve in template preorder before validation/providers, even at zero limits.
+/// This 0.21 API deliberately replaces the former opaque fusion closure with [`PlanProgram`].
+/// Raw `Collect` templates are refused here; use [`execute_collect_leaf`] and [`finish_collect`].
 /// Vector models always collect before selecting an error in original plan order.
 /// Request cancellation and the inherited absolute deadline refuse every phase.
-pub async fn execute_hybrid<A, H, Resolve, Fuse, FuseFuture>(
+pub async fn execute_hybrid<A, H, O>(
     request: ExecutorRequest<'_, A>,
     hydrator: &H,
-    resolve_fusion: Resolve,
+    program: PlanProgram<'_, O>,
 ) -> Result<
     ExecutorOutcome<A::Id, A::Label, A::Evidence, H::Item, A::Error>,
     ExecutorError<A::Error, A::Evidence>,
@@ -46,14 +55,12 @@ where
             Filter = A::Filter,
             Error = A::Error,
         > + ?Sized,
-    Resolve: FnOnce() -> Result<Fuse, A::Error> + Send,
-    Fuse: FnOnce(Vec<Vec<Scored<A::Id, A::Label>>>) -> FuseFuture + Send,
-    FuseFuture: Future<Output = Result<Vec<Scored<A::Id, A::Label>>, A::Error>> + Send,
+    O: PlanOperators<Id = A::Id, Label = A::Label, Error = A::Error> + ?Sized,
 {
     execute(
         request,
         hydrator,
-        resolve_fusion,
+        program,
         ArmErrorPolicy::CollectThenSelect,
     )
     .await
@@ -64,10 +71,10 @@ where
 /// The vector group still collects every selected model before choosing its first error
 /// in original plan order. Dropping an outer group drops its unfinished borrowed work.
 /// All bounds, request context, preparation and hydration rules match [`execute_hybrid`].
-pub async fn execute_memory_hybrid<A, H, Resolve, Fuse, FuseFuture>(
+pub async fn execute_memory_hybrid<A, H, O>(
     request: ExecutorRequest<'_, A>,
     hydrator: &H,
-    resolve_fusion: Resolve,
+    program: PlanProgram<'_, O>,
 ) -> Result<
     ExecutorOutcome<A::Id, A::Label, A::Evidence, H::Item, A::Error>,
     ExecutorError<A::Error, A::Evidence>,
@@ -81,17 +88,15 @@ where
             Filter = A::Filter,
             Error = A::Error,
         > + ?Sized,
-    Resolve: FnOnce() -> Result<Fuse, A::Error> + Send,
-    Fuse: FnOnce(Vec<Vec<Scored<A::Id, A::Label>>>) -> FuseFuture + Send,
-    FuseFuture: Future<Output = Result<Vec<Scored<A::Id, A::Label>>, A::Error>> + Send,
+    O: PlanOperators<Id = A::Id, Label = A::Label, Error = A::Error> + ?Sized,
 {
-    execute(request, hydrator, resolve_fusion, ArmErrorPolicy::FailFast).await
+    execute(request, hydrator, program, ArmErrorPolicy::FailFast).await
 }
 
-async fn execute<A, H, Resolve, Fuse, FuseFuture>(
+async fn execute<A, H, O>(
     request: ExecutorRequest<'_, A>,
     hydrator: &H,
-    resolve_fusion: Resolve,
+    program: PlanProgram<'_, O>,
     policy: ArmErrorPolicy,
 ) -> Result<
     ExecutorOutcome<A::Id, A::Label, A::Evidence, H::Item, A::Error>,
@@ -106,20 +111,36 @@ where
             Filter = A::Filter,
             Error = A::Error,
         > + ?Sized,
-    Resolve: FnOnce() -> Result<Fuse, A::Error> + Send,
-    Fuse: FnOnce(Vec<Vec<Scored<A::Id, A::Label>>>) -> FuseFuture + Send,
-    FuseFuture: Future<Output = Result<Vec<Scored<A::Id, A::Label>>, A::Error>> + Send,
+    O: PlanOperators<Id = A::Id, Label = A::Label, Error = A::Error> + ?Sized,
 {
     let operation = request.operation;
     await_request_read_phase(
         operation,
         inherit_request_read_context(async move {
-            let resolved = resolve_fusion();
+            let resolved = plan::resolve(program.template, program.operators);
             ensure_request_read_active(operation).map_err(ExecutorError::RequestStopped)?;
-            let fuse = resolved.map_err(ExecutorError::FusionResolution)?;
+            let resolved = resolved?;
             protocol::validate(&request).map_err(ExecutorError::Invalid)?;
+            let active = plan::validate(&resolved, &request).map_err(ExecutorError::Invalid)?;
+            if request.vector_preparer.is_none() && !request.scope.namespaces.is_empty() {
+                for (slot, spec) in request.arms.iter().enumerate() {
+                    if active[slot]
+                        && !spec.scope.namespaces.is_empty()
+                        && matches!(
+                            &spec.input,
+                            Some(ArmInput::Vector {
+                                input: VectorInput::Text(_),
+                                ..
+                            })
+                        )
+                    {
+                        return Err(ExecutorError::MissingVectorPreparer { slot });
+                    }
+                }
+            }
             if request.scope.namespaces.is_empty() {
                 return Ok(ExecutorOutcome {
+                    plan: crate::QueryNode::Empty,
                     hits: Vec::new(),
                     arms: request
                         .arms
@@ -136,9 +157,17 @@ where
                 });
             }
             let collected =
-                await_request_read_phase(operation, schedule::collect(&request, policy))
+                await_request_read_phase(operation, schedule::collect(&request, policy, &active))
                     .await
                     .map_err(ExecutorError::RequestStopped)??;
+            let CollectedPlanOutcome {
+                plan: consumed,
+                collected,
+            } = collected;
+            let crate::QueryNode::Collect { children } = consumed else {
+                unreachable!("scheduler returns a collection")
+            };
+            let mut nodes: Vec<_> = children.into_iter().map(Some).collect();
             let original = protocol::identities(&collected.arms);
             let scores: Vec<Vec<_>> = collected
                 .arms
@@ -189,26 +218,16 @@ where
                         "preparation changed slots or added, duplicated, or reordered an identity",
                 });
             }
-            let mut available = protocol::counts(
-                prepared
-                    .arms
-                    .iter()
-                    .flat_map(|arm| arm.iter().map(|hit| hit.0.clone())),
-            );
-            let fused = await_request_read_phase(operation, fuse(prepared.arms))
-                .await
-                .map_err(ExecutorError::RequestStopped)?
-                .map_err(ExecutorError::Fusion)?;
-            if fused.len() > request.max_candidates
-                || fused
-                    .iter()
-                    .any(|hit| !protocol::consume(&mut available, &hit.0))
-            {
-                return Err(ExecutorError::Protocol {
-                    slot: None,
-                    message: "fusion exceeded candidate bounds or identity multiplicity",
-                });
-            }
+            let mut streams: Vec<_> = prepared.arms.into_iter().map(Some).collect();
+            let (fused, plan) = plan::evaluate(
+                operation,
+                resolved,
+                program.operators,
+                &mut streams,
+                &mut nodes,
+                request.max_candidates,
+            )
+            .await?;
             let mut available = protocol::counts(fused.iter().map(|hit| hit.0.clone()));
             let mut hits = await_request_read_phase(
                 operation,
@@ -236,6 +255,7 @@ where
             }
             hits.truncate(request.final_limit);
             Ok(ExecutorOutcome {
+                plan,
                 hits,
                 arms: reports,
                 vector_preparation,

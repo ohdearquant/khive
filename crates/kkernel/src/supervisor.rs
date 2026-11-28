@@ -53,9 +53,9 @@ pub(crate) async fn run(_command: SupervisorCommand, _log: &str) -> Result<()> {
 
 #[cfg(unix)]
 mod unix {
-    use std::fs::{self, File, OpenOptions};
+    use std::fs::{self, File};
     use std::io::Write;
-    use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -66,11 +66,6 @@ mod unix {
         probe_supervisor_socket, request_supervisor_handover, supervisor_effective_uid,
         supervisor_pid_is_alive, SupervisorSocketProbe,
     };
-    use khive_mcp::serve::{
-        config_discovery_db_anchor, reject_conflicting_db_override_with_source,
-        resolve_runtime_config_with_db_anchor, RuntimeConfigInputs,
-    };
-    use khive_runtime::KhiveConfig;
 
     use super::LaunchArgs;
 
@@ -110,14 +105,9 @@ mod unix {
             }
             let mut lock_path = path.as_os_str().to_os_string();
             lock_path.push(".lock");
-            let lock = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(PathBuf::from(lock_path))
-                .context("open supervisor marker ownership lock")?;
+            let lock =
+                khive_runtime::daemon::open_mutating_daemon_lock(&PathBuf::from(lock_path), true)
+                    .context("open supervisor marker ownership lock")?;
             lock.lock().context("lock supervisor marker ownership")?;
             Ok(Self {
                 path: path.to_path_buf(),
@@ -208,35 +198,10 @@ mod unix {
     }
 
     fn resolve_configuration(args: &khive_mcp::args::Args) -> Result<()> {
-        let discovery_anchor = config_discovery_db_anchor(args.db.as_deref());
-        let loaded = KhiveConfig::load_with_home_fallback_and_source(
-            args.config.as_deref(),
-            discovery_anchor.as_deref(),
-        )?;
-        if let Some((config, source)) = &loaded {
-            reject_conflicting_db_override_with_source(
-                args.db.as_deref(),
-                &config.backends,
-                Some(source),
-            )?;
-        }
-        let (explicit, namespace) =
-            khive_mcp::args::resolve_cli_namespace(args).map_err(anyhow::Error::msg)?;
-        let (resolved, _) = resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
-            db: args.db.as_deref(),
-            config: args.config.as_deref(),
-            namespace,
-            namespace_explicit: explicit,
-            actor_explicit: explicit,
-            no_embed: args.no_embed,
-            packs: (!args.pack.is_empty()).then(|| args.pack.clone()),
-            brain_profile: args.brain_profile.clone(),
-        })?;
-        khive_runtime::PackRegistry::validate_pack_selection(&resolved.packs)?;
         // Resolution itself opens no database, migration, model, transport,
         // or incumbent-daemon probe. The launcher's separate own-job probe
         // may already have run while holding the marker lock.
-        Ok(())
+        khive_mcp::serve::preflight_daemon_configuration(args)
     }
 
     pub(super) async fn launch(args: LaunchArgs, log: &str, marker: &Path) -> Result<()> {
@@ -400,6 +365,74 @@ mod unix {
 
         const CLAIM: &str = "00000000-0000-4000-8000-000000000001";
 
+        fn marker_test_dir() -> tempfile::TempDir {
+            let root = tempfile::Builder::new()
+                .prefix("khive-supervisor-marker-")
+                .tempdir_in("/tmp")
+                .or_else(|_| {
+                    tempfile::Builder::new()
+                        .prefix("khive-supervisor-marker-")
+                        .tempdir()
+                })
+                .expect("create marker test directory");
+            khive_runtime::daemon::open_mutating_daemon_lock(
+                &root.path().join("baseline.lock"),
+                true,
+            )
+            .expect("marker test directory must have trusted ancestry");
+            root
+        }
+
+        #[test]
+        fn ownership_lock_refuses_symlink_without_changing_target() {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+
+            let root = marker_test_dir();
+            let marker = root.path().join("khived.supervisor");
+            let target = root.path().join("target");
+            fs::write(&target, b"unchanged").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+            symlink(&target, root.path().join("khived.supervisor.lock")).unwrap();
+
+            assert!(MarkerGuard::acquire(&marker).is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+                0o644
+            );
+        }
+
+        #[test]
+        fn ownership_lock_tightens_permissions_without_replacing_inode() {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let root = marker_test_dir();
+            let marker = root.path().join("khived.supervisor");
+            let lock = root.path().join("khived.supervisor.lock");
+            fs::write(&lock, b"lock").unwrap();
+            fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+            let inode = fs::metadata(&lock).unwrap().ino();
+
+            let _guard = MarkerGuard::acquire(&marker).unwrap();
+            let metadata = fs::metadata(&lock).unwrap();
+            assert_eq!(metadata.ino(), inode);
+            assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        }
+
+        #[test]
+        fn ownership_lock_creation_uses_private_permissions() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let root = marker_test_dir();
+            let marker = root.path().join("khived.supervisor");
+            let _guard = MarkerGuard::acquire(&marker).unwrap();
+            let lock = marker.parent().unwrap().join("khived.supervisor.lock");
+            assert_eq!(
+                fs::metadata(lock).unwrap().permissions().mode() & 0o7777,
+                0o600
+            );
+        }
+
         #[test]
         fn marker_has_four_lines_and_same_label_can_restart() {
             let root = tempfile::tempdir().unwrap();
@@ -464,7 +497,7 @@ mod unix {
             let root = tempfile::tempdir().unwrap();
             let marker = root.path().join("khived.supervisor");
             let guard = MarkerGuard::acquire(&marker).unwrap();
-            let competing_lock = OpenOptions::new()
+            let competing_lock = std::fs::OpenOptions::new()
                 .write(true)
                 .open(root.path().join("khived.supervisor.lock"))
                 .unwrap();

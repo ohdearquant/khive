@@ -520,6 +520,8 @@ admission remains effective while ADR-195 is proposed.
 ### Decision 4 -- Node-channel obligations follow the hosted service
 
 D8's node-channel obligations, Amendment 1 item 3 and item 8(b) belong to the hosted service with `khive-channel-node`.
+(Note, 2026-10-31: the crate was restored to this repository on 2026-10-30 and removed again by pull request 6333;
+this decision stands.)
 The move is recorded by #4131, commit `f089845ad`, and `docs/adr/ADR-105-cross-node-comm-transport.md:8`. These
 obligations are removed from this repository's acceptance for #5598. This transfers responsibility; it does not assert
 that the hosted implementation satisfies the contract.

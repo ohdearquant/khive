@@ -109,7 +109,7 @@ fn feedback_primitive_preserves_full_snapshots_without_bookkeeping() {
 }
 
 #[test]
-fn core_feedback_delegates_once_and_keeps_recall_entity_updates() {
+fn core_feedback_delegates_once_and_recall_hit_leaves_entities_untouched() {
     let [a, b, c] = [1, 2, 3].map(Uuid::from_u128);
     let mut state = BalancedRecallState::new(2);
     state.exploration_epoch = 5;
@@ -129,7 +129,7 @@ fn core_feedback_delegates_once_and_keeps_recall_entity_updates() {
             salience: BetaPosterior::new(3.0, 11.0),
             temporal: BetaPosterior::new(2.0, 9.0),
             entity_posteriors: HashMap::from([
-                (a, BetaPosterior::new(2.0, 3.0)),
+                (a, BetaPosterior::new(1.0, 3.0)),
                 (c, BetaPosterior::new(1.0, 2.0)),
             ]),
             entity_posteriors_version: 1,

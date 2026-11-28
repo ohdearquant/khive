@@ -140,7 +140,7 @@ request(ops='resolve(refs=["RoPE"], kind="concept", limit=5)')
 request(ops='create(kind="concept", name="RoPE", description="...", skip_dedup_check=true)')
 ```
 
-### GTD pack — 7 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
+### GTD pack — 8 verbs (`gtd.` prefix, [ADR-019](docs/adr/ADR-019-gtd-pack.md))
 
 | Verb             | What it does                                                   | When to use                              |
 | ---------------- | -------------------------------------------------------------- | ---------------------------------------- |
@@ -150,6 +150,7 @@ request(ops='create(kind="concept", name="RoPE", description="...", skip_dedup_c
 | `gtd.tasks`      | Filtered task listing                                          | Browse tasks by status/assignee/priority |
 | `gtd.transition` | Explicit lifecycle change (inbox→next→active→done)             | Moving a task through its lifecycle      |
 | `gtd.census`     | Count raw task timestamp evidence; optionally page candidates  | Inspect historical task rows             |
+| `gtd.counts`     | Count one assignee's tasks by status; optional open tag rows   | Queue size without task bodies           |
 | `gtd.repair`     | Preview or explicitly apply exact-observation task corrections | Repair historical task rows              |
 
 `gtd.repair` is dry-run by default. `apply=true` commits each accepted row with its
@@ -179,15 +180,16 @@ mutation-free guarded assertion and does not persist that note. The assertion re
 prepare snapshot so an earlier op in the same atomic unit cannot make the no-op stale. Branch on
 `transitioned` before reading those fields.
 
-### Memory pack — 5 verbs (`memory.` prefix, [ADR-021](docs/adr/ADR-021-memory-pack.md))
+### Memory pack — 6 verbs (`memory.` prefix, [ADR-021](docs/adr/ADR-021-memory-pack.md))
 
-| Verb              | What it does                                                  | When to use                                         |
-| ----------------- | ------------------------------------------------------------- | --------------------------------------------------- |
-| `memory.remember` | Store a memory with salience and decay                        | Cross-session context, agent state                  |
-| `memory.recall`   | Hybrid FTS + vector recall with decay-weighted ranking        | Retrieve what you stored in prior sessions          |
-| `memory.feedback` | Emit explicit feedback on a recalled memory                   | Signal useful/not_useful to tune posteriors         |
-| `memory.prune`    | Soft-delete memories below a salience threshold               | Trim low-value memories to prevent unbounded growth |
-| `memory.vacuum`   | Run SQLite VACUUM to reclaim space freed by soft-deleted rows | Periodic maintenance after heavy prune runs         |
+| Verb                 | What it does                                                  | When to use                                         |
+| -------------------- | ------------------------------------------------------------- | --------------------------------------------------- |
+| `memory.remember`    | Store a memory with salience and decay                        | Cross-session context, agent state                  |
+| `memory.recall`      | Hybrid FTS + vector recall with decay-weighted ranking        | Retrieve what you stored in prior sessions          |
+| `memory.feedback`    | Emit explicit feedback on a recalled memory                   | Signal useful/not_useful to tune posteriors         |
+| `memory.prune`       | Soft-delete memories below a salience threshold               | Trim low-value memories to prevent unbounded growth |
+| `memory.vacuum`      | Run SQLite VACUUM to reclaim space freed by soft-deleted rows | Periodic maintenance after heavy prune runs         |
+| `memory.apply_batch` | Apply a checked chunk of memory rewrites, dry run by default  | Rewrite or consolidate stored memories in bulk      |
 
 `memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
 Its optional `namespace` is an exact-match read override; absent means the caller's normal
@@ -197,7 +199,9 @@ the strict `memory.feedback(id=...)` contract across requests. `full_id` is
 present under the default `json` output format in any presentation mode; the `auto`
 and `table` formats omit it unless the request sets `presentation=verbose`.
 The returned relevance score is normalized to [0,1]. The ranking `rank_score` is nominally
-[0,1] but can exceed 1.0 by up to 15% when a brain profile applies posterior terms. Typical
+[0,1] but can exceed 1.0 by up to 15% when a brain profile applies posterior terms. A served
+profile scores with the configured default weights, and a profile created with `local_factor`
+multiplies the `rank_score` of rows in the shared `local` namespace by that factor. Typical
 production floor: 0.3-0.7.
 
 `memory.feedback` requires the recalled record's full UUID. It rejects prefixes because feedback
@@ -242,7 +246,7 @@ and match the serve. Unjudged preserves their grade/dedup budget: a later eligib
 `useful`, `not_useful`, or `wrong` auto-feedback judgment using that pair commits
 exactly once. Manual `brain.feedback` keeps its existing provenance rules.
 
-### Comm pack — 15 verbs (`comm.` prefix)
+### Comm pack — 16 verbs (`comm.` prefix)
 
 | Verb                      | What it does                                                                                                                                         | When to use                                                 |
 | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
@@ -257,10 +261,18 @@ exactly once. Manual `brain.feedback` keeps its existing provenance rules.
 | `comm.thread`             | Retrieve full conversation thread                                                                                                                    | Read the whole conversation                                 |
 | `comm.health`             | Bounded heartbeat-first channel and quarantine-backlog snapshot with nominal cadence and advisory staleness (no args)                                | Check channel polls and parked messages                     |
 | `comm.probe`              | Read-only poll for new inbound message metadata and stale unread count                                                                               | Cheap wake-up check without a full inbox scan               |
+| `comm.quiet`              | Defer background warm and maintenance work cooperatively for `ttl_secs` (integer 1–300)                                                              | Request a bounded quiet window                              |
 | `comm.suppression_add`    | Add an email suppression entry (address, exact domain, or recipient key); requires `scope`, `kind`, `value`, `source`                                | Record an opt-out or operator block                         |
 | `comm.suppression_list`   | List live suppression entries, optionally filtered by `scope` and `kind`                                                                             | Audit what is currently suppressed                          |
 | `comm.suppression_remove` | Remove one suppression entry by full UUID; a non-empty `reason` is required, and opt-out sources also need later authenticated same-address evidence | Lift a block with an audit trail                            |
 | `comm.withheld_body`      | Read a delivered withheld external message's original bytes, base64-encoded; open to its recipient actor and the maintainer, every call audited      | Recover what a screening rule withheld                      |
+
+`comm.quiet(ttl_secs=30)` returns `{quiet_until: "<RFC3339 UTC>"}`. Requests
+combine by the later monotonic deadline, so a shorter request cannot shorten an
+active window. `comm.health.resource.quiet_until` is always present and becomes
+null on expiry. This is process-wide cooperative deferral; in-flight work,
+foreground requests, finalization and shutdown continue. See the
+[channel health and quiet reference](crates/khive-pack-comm/docs/api/channel-health.md#commquiet--bounded-background-deferral).
 
 **Inbox shape (ADR-057).** `comm.inbox` is scannable: each entry carries top-level `from`, `to`,
 `subject`, `read`, `direction`, and a derived `preview` (whitespace-collapsed, truncated to 80

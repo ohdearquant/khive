@@ -33,7 +33,7 @@ async fn checkout_preserves_status_index_and_raw_content() {
 
 #[tokio::test]
 #[serial_test::serial(git_dev_loop_env)]
-async fn checkout_refuses_symlinks_and_submodules_without_checkout() {
+async fn checkout_keeps_symlinks_as_links_and_refuses_submodules_without_checkout() {
     if crate::test_process::run_in_child() {
         return;
     }
@@ -41,7 +41,11 @@ async fn checkout_refuses_symlinks_and_submodules_without_checkout() {
     for entry_kind in ["symlink", "submodule"] {
         let f = Fixture::new(true, false).await;
         if entry_kind == "symlink" {
-            std::os::unix::fs::symlink("a.txt", f.repo.join("link")).expect("symlink fixture");
+            // The link names a real file outside the repository: the checkout must store the
+            // literal target and never that file's content.
+            let outside = f.repo.parent().expect("repository parent").join("outside");
+            std::fs::write(&outside, b"content outside the repository\n").expect("outside file");
+            std::os::unix::fs::symlink("../outside", f.repo.join("link")).expect("symlink fixture");
             f.git_bytes(&["add", "--", "link"]);
         } else {
             f.git_bytes(&[
@@ -54,10 +58,29 @@ async fn checkout_refuses_symlinks_and_submodules_without_checkout() {
         f.git_bytes(&["commit", "-q", "-m", "unsupported tree entry"]);
         let status = f.git_bytes(&["status", "--porcelain=v1", "-z"]);
         let index = std::fs::read(f.repo.join(".git/index")).expect("index");
-        let error = f
-            .err("git.checkout", json!({"repo":f.repo,"ref":"HEAD"}))
-            .await;
-        f.refusal_receipt(&error).await;
+        if entry_kind == "symlink" {
+            let result = f
+                .call("git.checkout", json!({"repo":f.repo,"ref":"HEAD"}))
+                .await;
+            let manifest = f
+                .call("exec.tree_get", json!({"tree":result["tree"]}))
+                .await;
+            let link = manifest["entries"]
+                .as_array()
+                .expect("manifest entries")
+                .iter()
+                .find(|entry| entry["path"] == "link")
+                .expect("the link is an entry");
+            assert_eq!(link["mode"], 120000, "{manifest}");
+            assert_eq!(f.blob(link["ref"].as_str().unwrap()).await, b"../outside");
+            f.success_receipt(&result).await;
+        } else {
+            let error = f
+                .err("git.checkout", json!({"repo":f.repo,"ref":"HEAD"}))
+                .await;
+            assert!(error.contains("unsupported_entry"), "{error}");
+            f.refusal_receipt(&error).await;
+        }
         assert_eq!(f.git_bytes(&["status", "--porcelain=v1", "-z"]), status);
         assert_eq!(
             std::fs::read(f.repo.join(".git/index")).expect("index after"),

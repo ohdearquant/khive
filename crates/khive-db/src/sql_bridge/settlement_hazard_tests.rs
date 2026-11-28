@@ -2,6 +2,7 @@
 //! settled behaviour, so it fails on the code as it stands and names the
 //! hazard in its failure message.
 
+use crate::test_hooks::TestHooks;
 use std::sync::Arc;
 
 use khive_storage::types::SqlStatement;
@@ -115,7 +116,7 @@ async fn standalone_begin_keeps_the_volume_lease_until_autocommit() {
     let second = tokio::task::spawn_blocking(move || {
         other
             .write_admission()
-            .acquire()
+            .acquire(crate::disk_guard::LeaseClass::Standalone)
             .map(|lease| lease.is_some())
     })
     .await
@@ -259,7 +260,7 @@ async fn pool_backed_failed_call_whose_rollback_fails_reports_side_effects_unkno
         let guard = pool.try_writer().unwrap();
         guard
             .conn()
-            .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            .test_authorizer(Some(|context: AuthContext<'_>| match context.action {
                 AuthAction::Transaction {
                     operation: TransactionOperation::Rollback,
                 } => Authorization::Deny,
@@ -390,7 +391,7 @@ async fn standalone_fault_writer(pool: &Arc<ConnectionPool>) -> SqliteWriter {
         observe_direct_errors: true,
         event_rows: None,
         handle: Some(StandaloneHandle {
-            conn,
+            conn: crate::ProgressConn::new(conn).unwrap(),
             _retained_slot: Some(writer_slot),
             read_transaction_slot: None,
         }),
@@ -460,7 +461,7 @@ async fn standalone_script_left_in_a_transaction_is_rolled_back_before_the_lease
     let second = tokio::task::spawn_blocking(move || {
         other
             .write_admission()
-            .acquire()
+            .acquire(crate::disk_guard::LeaseClass::Standalone)
             .map(|lease| lease.is_some())
     })
     .await
@@ -499,7 +500,7 @@ async fn standalone_script_whose_rollback_is_refused_closes_the_connection_under
         .as_ref()
         .unwrap()
         .conn
-        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+        .test_authorizer(Some(|context: AuthContext<'_>| match context.action {
             AuthAction::Transaction {
                 operation: TransactionOperation::Rollback,
             } => Authorization::Deny,

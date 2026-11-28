@@ -86,6 +86,13 @@ A write still refuses when the section is configured but cannot be used, when th
 configured key cannot be resolved, or when the database has not completed its
 memory visibility cutover.
 
+The receipt ring is part of a daemon's configuration identity. A forwarding client
+whose configuration has no `[visibility_receipts]` section is served by a daemon
+that has one, because only the daemon seals and opens receipts. A client that
+declares a ring must declare the daemon's ring exactly, and a daemon without a ring
+does not serve a client that declares one. A client without a ring does not see a
+ring rotation, so a rotated ring reaches a running daemon only when it restarts.
+
 ## Upgrading receipt issuance
 
 Stop all writers that use the older receipt implementation before upgrading a

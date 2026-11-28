@@ -1,9 +1,20 @@
+use std::collections::BTreeSet;
+
 use super::*;
 
 fn entry(repo: &Path, branches: &[&str]) -> GitWritePolicyEntry {
     GitWritePolicyEntry {
         repo_path: repo.to_path_buf(),
         branch_patterns: branches.iter().map(|s| s.to_string()).collect(),
+        access: GitRepoAccess::Write,
+    }
+}
+
+fn read_entry(repo: &Path) -> GitWritePolicyEntry {
+    GitWritePolicyEntry {
+        repo_path: repo.to_path_buf(),
+        branch_patterns: Vec::new(),
+        access: GitRepoAccess::Read,
     }
 }
 
@@ -93,16 +104,141 @@ fn check_returns_canonical_repo_path_on_success() {
 fn from_config_converts_section() {
     use khive_runtime::engine_config::GitWriteEntryConfig;
     let section = GitWriteSectionConfig {
-        allowed: vec![GitWriteEntryConfig {
-            repo: "/abs/path".to_string(),
-            branches: vec!["main".to_string()],
-        }],
+        allowed: vec![
+            GitWriteEntryConfig {
+                repo: "/abs/path".to_string(),
+                branches: vec!["main".to_string()],
+                access: GitRepoAccess::Write,
+            },
+            GitWriteEntryConfig {
+                repo: "/abs/other".to_string(),
+                branches: Vec::new(),
+                access: GitRepoAccess::Read,
+            },
+        ],
         ..GitWriteSectionConfig::default()
     };
     let policy = GitWritePolicy::from_config(&section);
-    assert_eq!(policy.allowed.len(), 1);
+    assert_eq!(policy.allowed.len(), 2);
     assert_eq!(policy.allowed[0].repo_path, PathBuf::from("/abs/path"));
     assert_eq!(policy.allowed[0].branch_patterns, vec!["main".to_string()]);
+    assert_eq!(policy.allowed[0].access, GitRepoAccess::Write);
+    assert_eq!(policy.allowed[1].access, GitRepoAccess::Read);
+}
+
+#[test]
+fn a_read_entry_admits_a_read_and_refuses_a_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = GitWritePolicy {
+        allowed: vec![read_entry(dir.path())],
+    };
+    let canonical = std::fs::canonicalize(dir.path()).unwrap();
+    assert_eq!(
+        policy.match_entry(dir.path(), GitRepoAccess::Read, None),
+        Ok((canonical, 0))
+    );
+    assert!(matches!(
+        policy.match_entry(dir.path(), GitRepoAccess::Write, None),
+        Err(GitWritePolicyError::RepoReadOnly(_))
+    ));
+    assert!(matches!(
+        policy.check(dir.path(), "main"),
+        Err(GitWritePolicyError::RepoReadOnly(_))
+    ));
+}
+
+#[test]
+fn a_write_entry_also_admits_a_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = GitWritePolicy {
+        allowed: vec![entry(dir.path(), &["main"])],
+    };
+    assert_eq!(
+        policy
+            .match_entry(dir.path(), GitRepoAccess::Read, None)
+            .map(|(_, index)| index),
+        Ok(0)
+    );
+}
+
+#[test]
+fn a_read_entry_listed_first_does_not_hide_a_write_entry_for_the_same_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = GitWritePolicy {
+        allowed: vec![read_entry(dir.path()), entry(dir.path(), &["main"])],
+    };
+    let index = |access, branch| {
+        policy
+            .match_entry(dir.path(), access, branch)
+            .map(|(_, index)| index)
+    };
+    assert_eq!(index(GitRepoAccess::Read, None), Ok(0));
+    assert_eq!(index(GitRepoAccess::Write, Some("main")), Ok(1));
+    assert!(matches!(
+        index(GitRepoAccess::Write, Some("feat/x")),
+        Err(GitWritePolicyError::BranchNotAllowed { .. })
+    ));
+}
+
+#[test]
+fn a_read_entry_for_another_repo_leaves_this_one_unlisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let policy = GitWritePolicy {
+        allowed: vec![read_entry(other.path())],
+    };
+    assert!(matches!(
+        policy.check(dir.path(), "main"),
+        Err(GitWritePolicyError::RepoNotAllowlisted(_))
+    ));
+}
+
+/// Every verb the pack declares is listed here with what it needs from the entry
+/// naming its repository, or `None` when it never consults the allowlist. A verb
+/// added to the pack fails this test until it is classified in [`repo_access`].
+#[test]
+fn every_git_verb_is_classified_for_repository_access() {
+    use GitRepoAccess::{Read, Write};
+    const EXPECTED: &[(&str, Option<GitRepoAccess>)] = &[
+        ("git.branch", Some(Write)),
+        ("git.branch_delete", Some(Write)),
+        ("git.check_log", Some(Read)),
+        ("git.checkout", Some(Read)),
+        ("git.commit", Some(Write)),
+        ("git.diff", Some(Read)),
+        ("git.digest", None),
+        ("git.fetch", Some(Write)),
+        ("git.gates", Some(Read)),
+        ("git.ingest_cursor", None),
+        ("git.init", Some(Write)),
+        ("git.issue", Some(Read)),
+        ("git.issue_list", Some(Read)),
+        ("git.log", Some(Read)),
+        ("git.pr_close", Some(Write)),
+        ("git.pr_edit", Some(Write)),
+        ("git.pr_list", Some(Read)),
+        ("git.pr_merge", Some(Write)),
+        ("git.pr_open", Some(Write)),
+        ("git.pr_review", Some(Write)),
+        ("git.pr_state", Some(Read)),
+        ("git.push", Some(Write)),
+        ("git.receipts", None),
+        ("git.reconcile", Some(Read)),
+        ("git.status", Some(Read)),
+        ("git.update_ref", Some(Write)),
+    ];
+    let declared: BTreeSet<&str> = crate::vocab::GIT_HANDLERS
+        .iter()
+        .map(|handler| handler.name)
+        .collect();
+    let listed: BTreeSet<&str> = EXPECTED.iter().map(|(verb, _)| *verb).collect();
+    assert_eq!(declared, listed, "classify every declared git verb here");
+    for (verb, access) in EXPECTED {
+        if let Some(access) = access {
+            assert_eq!(repo_access(verb), *access, "{verb}");
+        }
+    }
+    assert_eq!(repo_access("git.unknown"), Write);
 }
 
 #[cfg(unix)]
