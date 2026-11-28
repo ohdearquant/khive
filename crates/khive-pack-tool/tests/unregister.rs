@@ -14,6 +14,7 @@ use khive_runtime::{
     KhiveRuntime, Namespace, NamespaceToken, RuntimeError, VerbRegistry, VerbRegistryBuilder,
 };
 use khive_storage::{Entity, SqlRow, SqlStatement, SqlValue};
+use khive_types::pack::{TOOL_REGISTRY_ENTITY_KIND, TOOL_REGISTRY_TAG};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -213,6 +214,20 @@ fn assert_retired(receipt: &Value, target: Uuid, policies: u64, grants: u64) {
     assert_eq!(receipt["name_retired"], true);
     assert_eq!(receipt["policies_retired"], policies);
     assert_eq!(receipt["grants_revoked"], grants);
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn unregister_accepts_the_registered_kind_and_tag() {
+    let f = Fixture::new();
+    let target = id(&f.register("local", "registry-identity").await);
+    let registered = f.entity("local", target).await;
+    assert_eq!(registered.kind, TOOL_REGISTRY_ENTITY_KIND.name());
+    assert!(registered.tags.iter().any(|tag| tag == TOOL_REGISTRY_TAG));
+
+    let receipt = f.call("tool.unregister", json!({"tool":target})).await;
+    assert_retired(&receipt, target, 0, 0);
+    assert!(f.entity("local", target).await.deleted_at.is_some());
 }
 
 #[tokio::test]
