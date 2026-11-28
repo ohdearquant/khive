@@ -646,7 +646,8 @@ fn unbound_line(form: &Entity, item: &Entity) -> Value {
 }
 
 /// An answer as a constraint compares it under its field's comparison, or
-/// none when the field compares by key and the answer gives no key.
+/// none when the field compares by key and the answer gives no key, or by
+/// digits and the answer holds no digit.
 fn compared_value(comparison: &str, given: &(Vec<String>, Option<String>)) -> Option<String> {
     let (texts, key) = given;
     let each = |fold: fn(&str) -> String| {
@@ -664,7 +665,10 @@ fn compared_value(comparison: &str, given: &(Vec<String>, Option<String>)) -> Op
                 .collect::<Vec<_>>()
                 .join(" ")
         })),
-        "digits" => Some(each(|t| t.chars().filter(|c| c.is_ascii_digit()).collect())),
+        "digits" => {
+            let digits = each(|t| t.chars().filter(|c| c.is_ascii_digit()).collect());
+            digits.chars().any(|c| c.is_ascii_digit()).then_some(digits)
+        }
         _ => Some(each(|t| t.trim().to_owned())),
     }
 }
@@ -1183,16 +1187,15 @@ pub(crate) async fn check(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runtime
                     .map(|row| (*row, *row))
                     .collect(),
             };
+            // Row pairs an answer leaves nothing to compare in, reported once
+            // for the constraint.
+            let mut uncompared: Vec<(u64, u64)> = Vec::new();
             for (row_a, row_b) in pairs {
                 let (Some(value_a), Some(value_b)) = (
                     compared_value(&by_a, given_a[&row_a]),
                     compared_value(&by_b, given_b[&row_b]),
                 ) else {
-                    unchecked_because(format!(
-                        "\"{}\" and \"{}\" compare by key, and an answer to them gives no key",
-                        label(a.item),
-                        label(b.item)
-                    ));
+                    uncompared.push((row_a, row_b));
                     continue;
                 };
                 let differ = must == "differ";
@@ -1214,6 +1217,25 @@ pub(crate) async fn check(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runtime
                         label(b.item),
                         if differ { "are the same" } else { "differ" }
                     ),
+                }));
+            }
+            if !uncompared.is_empty() {
+                let lacking = if by_a == "key" {
+                    "compare by key, and an answer to them gives no key"
+                } else {
+                    "compare by digits, and an answer to them holds no digit"
+                };
+                let rows = (many_a || many_b).then(|| {
+                    uncompared
+                        .iter()
+                        .map(|(row_a, row_b)| json!([row_a, row_b]))
+                        .collect::<Vec<_>>()
+                });
+                constraints_unchecked.push(json!({
+                    "form": cite(form),
+                    "constraint": constraint,
+                    "reason": format!("\"{}\" and \"{}\" {lacking}", label(a.item), label(b.item)),
+                    "rows": rows,
                 }));
             }
         }

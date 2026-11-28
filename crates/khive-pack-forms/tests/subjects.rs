@@ -1260,6 +1260,103 @@ async fn purposes_known_to_and_comparisons_are_checked_at_load() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_field_loaded_with_no_comparison_compares_exactly_on_every_later_form() {
+    let store = Store::new();
+    let mut first = form_c();
+    first["fields"][0]
+        .as_object_mut()
+        .expect("field")
+        .remove("comparison");
+    store.load(first).await;
+
+    let later = |comparison: &str| {
+        let mut revision = form_c();
+        revision["revision"] = json!("2026-04");
+        revision["source"] = source(4);
+        revision.as_object_mut().expect("document").remove("terms");
+        revision["fields"][0]["comparison"] = json!(comparison);
+        revision
+    };
+    let message = store
+        .refused("forms.load", json!({"document": later("folded")}))
+        .await;
+    assert!(
+        message.contains(
+            "field \"holder name\" compares its answers by \"exact\"; the document says \"folded\""
+        ),
+        "{message}"
+    );
+
+    // Stating the comparison the field already has is accepted, and the
+    // first form's constraint still compares exactly: the two holder names
+    // differ in case.
+    store.load(later("exact")).await;
+    let first_revision = format!("{C}@2026-03");
+    let reply = store
+        .check(&[first_revision.as_str()], c_answers("12 345"))
+        .await;
+    let unmet = kinds(&reply["findings"], "constraint_unmet");
+    assert_eq!(unmet.len(), 1, "{reply}");
+    assert_eq!(
+        unmet[0]["text"],
+        "The name on the account is the holder's name"
+    );
+    assert_eq!(reply["constraints_unchecked"], json!([]), "{reply}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pair_with_nothing_to_compare_is_unchecked_once_per_constraint() {
+    let store = Store::new();
+    store.load(form_c()).await;
+
+    // Digits: two answers that hold no digit are not compared, so a must-differ
+    // pair answered "n/a" twice is neither met nor unmet.
+    let mut answers = c_answers("12 345");
+    answers[4] = json!({"subject": "owner", "field": "tax number", "value": "n/a"});
+    answers[5] = json!({"subject": "receiver", "field": "tax number", "value": "n/a"});
+    let reply = store.check(&[C], answers).await;
+    assert_eq!(
+        kinds(&reply["findings"], "constraint_unmet"),
+        Vec::<Value>::new(),
+        "{reply}"
+    );
+    let unchecked = reply["constraints_unchecked"].as_array().expect("list");
+    assert_eq!(unchecked.len(), 1, "{reply}");
+    assert!(
+        unchecked[0]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("compare by digits, and an answer to them holds no digit")),
+        "{reply}"
+    );
+    assert_eq!(reply["consistent"], false);
+
+    // Key, on a repeating line: every row without a key is named in one entry.
+    let store = Store::new();
+    let mut document = form_c();
+    document["subjects"][1]["repeats"] = json!(2);
+    store.load(document).await;
+    let mut answers = c_answers("12 345");
+    answers[6] = json!({"subject": "account", "field": "bank", "row": 1, "value": "First Bank"});
+    answers
+        .as_array_mut()
+        .expect("answers")
+        .push(json!({"subject": "account", "field": "bank", "row": 2, "value": "Second Bank"}));
+    let reply = store.check(&[C], answers).await;
+    let unchecked: Vec<&Value> = reply["constraints_unchecked"]
+        .as_array()
+        .expect("list")
+        .iter()
+        .filter(|u| {
+            u["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("compare by key"))
+        })
+        .collect();
+    assert_eq!(unchecked.len(), 1, "{reply}");
+    assert_eq!(unchecked[0]["rows"], json!([[1, 1], [2, 1]]), "{reply}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_purpose_lists_its_forms_and_a_line_names_who_already_holds_its_value() {
     let store = Store::new();
     store.load(form_c()).await;

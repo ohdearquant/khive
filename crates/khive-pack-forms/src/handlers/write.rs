@@ -557,10 +557,12 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                         == Some(spec.value_type.as_str()) =>
             {
                 counts.fields_reused += 1;
-                // A reused field compares one way for every form that prints it.
-                let compared = prop_text(existing, "comparison");
-                if let (Some(held), Some(stated)) = (&compared, &spec.comparison) {
-                    if held != stated {
+                // A reused field compares one way for every form that prints it,
+                // and a field loaded with no comparison compares exactly: a later
+                // document never changes what an earlier form's constraint means.
+                let held = prop_text(existing, "comparison").unwrap_or_else(|| "exact".to_owned());
+                if let Some(stated) = &spec.comparison {
+                    if *stated != held {
                         return Err(invalid(format!(
                             "field \"{}\" compares its answers by \"{held}\"; the document says \"{stated}\"",
                             spec.name
@@ -579,19 +581,10 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                     counts.aliases_added += added_aliases.len();
                     changed = true;
                 }
-                if let (None, Some(stated)) = (&compared, &spec.comparison) {
-                    properties.insert("comparison".to_owned(), json!(stated));
-                    changed = true;
-                }
                 if changed {
                     writes.update_entity(existing, None, None, Some(properties))?;
                 }
-                comparisons.insert(
-                    existing.id,
-                    compared
-                        .or_else(|| spec.comparison.clone())
-                        .unwrap_or_else(|| "exact".to_owned()),
-                );
+                comparisons.insert(existing.id, held);
                 let mut values = graph_values(&graph, existing.id);
                 let old: Vec<Uuid> = values.values().copied().collect();
                 let mut added = Vec::new();
