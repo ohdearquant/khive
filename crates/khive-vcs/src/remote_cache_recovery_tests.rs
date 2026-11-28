@@ -1,4 +1,5 @@
 use super::{publish_remote_cache, MetaJson, PublishFailAt, RemoteName, REMOTE_BACKUP_OWNER_FILE};
+use crate::{SnapshotId, KG_V1_COVERAGE};
 use std::path::{Path, PathBuf};
 
 fn fixture_meta(label: &str) -> MetaJson {
@@ -6,7 +7,8 @@ fn fixture_meta(label: &str) -> MetaJson {
         fetched_at: "2000-01-01T00:00:00Z".into(),
         git_ref: label.into(),
         commit_sha: "0".repeat(40),
-        content_hash: format!("sha256:{}", "0".repeat(64)),
+        content_hash: SnapshotId::from_hash(&"0".repeat(64)).unwrap(),
+        coverage: KG_V1_COVERAGE,
     }
 }
 

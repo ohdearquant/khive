@@ -51,6 +51,49 @@ mod storage_section {
     }
 
     #[test]
+    fn test_exec_tool_profiles_load_including_the_superseded_socket_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[exec]
+root = "/scratch/exec"
+[[exec.tool_profiles]]
+tool = "sh-dirs"
+unix_sockets = true
+list_dirs = ["/Volumes", "/Volumes/work"]
+[[exec.tool_profiles]]
+tool = "sh-gpu"
+metal = true
+files = ["/scratch/gpu.lock"]
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+        assert_eq!(
+            cfg.exec.tool_profiles,
+            vec![
+                ExecToolProfileConfig {
+                    tool: "sh-dirs".into(),
+                    unix_sockets: true,
+                    list_dirs: vec!["/Volumes".into(), "/Volumes/work".into()],
+                    ..Default::default()
+                },
+                ExecToolProfileConfig {
+                    tool: "sh-gpu".into(),
+                    metal: true,
+                    files: vec!["/scratch/gpu.lock".into()],
+                    ..Default::default()
+                },
+            ]
+        );
+        // A misspelled key in an entry is refused like any other exec key.
+        assert_unknown_destination_key(
+            "[[exec.tool_profiles]]\ntool = 'sh'\nmetla = true\n",
+            "metla",
+        );
+    }
+
+    #[test]
     fn test_valid_write_destinations_load_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let empty_storage = write_toml(&dir, "[storage]\n");

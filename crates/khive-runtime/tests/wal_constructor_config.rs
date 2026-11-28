@@ -8,6 +8,10 @@ const CHILD_ROOT: &str = "KHIVE_WAL_CONSTRUCTOR_TEST_ROOT";
 
 fn run_case(constructor: &str, raw: Option<&str>) {
     let root = tempfile::tempdir().expect("isolated constructor fixture");
+    // The child's environment is cleared, so it gets a temporary directory of
+    // its own; without one it falls back to /tmp, which a sandboxed run closes.
+    let temporary = root.path().join("tmp");
+    std::fs::create_dir(&temporary).expect("child temporary directory");
     let mut child = Command::new(std::env::current_exe().expect("test executable"));
     child
         .args([
@@ -18,6 +22,7 @@ fn run_case(constructor: &str, raw: Option<&str>) {
         ])
         .env_clear()
         .env("HOME", root.path().join("home"))
+        .env("TMPDIR", &temporary)
         .env("KHIVE_VOLUME_LOCK_DIR", root.path().join("volume-locks"))
         .env(CHILD_CASE, constructor)
         .env(CHILD_ROOT, root.path());

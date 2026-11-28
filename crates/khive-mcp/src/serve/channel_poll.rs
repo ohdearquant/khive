@@ -10,7 +10,7 @@ use super::{
 #[cfg(all(test, feature = "channel-email"))]
 use super::{poll_timing_tests, OutboundEmailPolicy};
 
-/// Background task that polls all registered channels every 5 seconds and
+/// Background task that polls the explicitly selected channel keys every 5 seconds and
 /// ingests new inbound messages via `comm.ingest`.
 ///
 /// #605: the 5s cadence is the happy-path default only. A connect/auth
@@ -26,8 +26,9 @@ use super::{poll_timing_tests, OutboundEmailPolicy};
 ///
 /// Only compiled when the `channel-email` feature is enabled.
 #[cfg(feature = "channel-email")]
-pub(super) async fn channel_poll_loop(
+pub(super) async fn channel_poll_loop_registered(
     channels: std::sync::Arc<khive_channel::ChannelRegistry>,
+    selected_keys: Vec<(String, String)>,
     registry: khive_runtime::VerbRegistry,
     ingest_namespace: String,
     default_inbound_actor: String,
@@ -89,7 +90,12 @@ pub(super) async fn channel_poll_loop(
 
         let now = Utc::now();
 
-        for (kind, slug, channel) in channels.iter() {
+        for (kind, slug) in &selected_keys {
+            let (kind, slug) = (kind.as_str(), slug.as_str());
+            let Some(channel) = channels.get_by_slug(kind, slug) else {
+                tracing::error!(target: "khive_mcp::serve", kind, slug, "selected email channel is not registered");
+                return;
+            };
             let backoff_key = (kind.to_string(), slug.to_string());
             let since = *bootstrap_since
                 .entry(backoff_key.clone())
@@ -910,8 +916,9 @@ pub(super) async fn record_outbound_claim_failure(
 ///
 /// Only compiled when the `channel-email` feature is enabled.
 #[cfg(feature = "channel-email")]
-pub(crate) async fn channel_outbox_loop(
+pub(super) async fn channel_outbox_loop_registered(
     email_channel: Arc<dyn khive_channel::Channel>,
+    channels: Arc<khive_channel::ChannelRegistry>,
     runtime: khive_runtime::KhiveRuntime,
     ingest_namespace: String,
     mailbox: String,
@@ -933,8 +940,7 @@ pub(crate) async fn channel_outbox_loop(
             .map_err(crate::components::ComponentError::Permanent)?;
     outbox::validate_loop_channel(email_channel.as_ref(), "email")?;
     let slug = email_channel.slug();
-    let mut channels = khive_channel::ChannelRegistry::new();
-    channels.register(email_channel);
+    super::channel_registration::selected_channel(&channels, &email_channel)?;
     let namespace = khive_runtime::Namespace::parse(&ingest_namespace)
         .map_err(|error| crate::components::ComponentError::Permanent(error.to_string()))?;
     let mut pause_until = None;
@@ -995,4 +1001,32 @@ pub(super) async fn channel_outbox_once(
         &mut pause_until,
     )
     .await
+}
+
+// Existing isolated fixtures exercise the same loop through this test-only adapter.
+#[cfg(all(test, feature = "channel-email"))]
+pub(super) async fn channel_poll_loop(
+    channels: Arc<khive_channel::ChannelRegistry>,
+    registry: khive_runtime::VerbRegistry,
+    namespace: String,
+    actor: String,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let keys = channels
+        .iter()
+        .map(|(kind, slug, _)| (kind.to_owned(), slug.to_owned()))
+        .collect();
+    channel_poll_loop_registered(channels, keys, registry, namespace, actor, shutdown).await;
+}
+
+#[cfg(all(test, feature = "channel-email"))]
+pub(crate) async fn channel_outbox_loop(
+    channel: Arc<dyn khive_channel::Channel>,
+    runtime: khive_runtime::KhiveRuntime,
+    namespace: String,
+    mailbox: String,
+    ctx: crate::components::HostContext,
+) -> Result<(), crate::components::ComponentError> {
+    let channels = super::channel_registration::isolated_test_registry(channel.clone());
+    channel_outbox_loop_registered(channel, channels, runtime, namespace, mailbox, ctx).await
 }

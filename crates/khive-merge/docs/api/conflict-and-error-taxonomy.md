@@ -15,10 +15,11 @@ The merge API separates valid semantic conflicts from invalid inputs and interna
 | Variant                 | Meaning                                                                        |
 | ----------------------- | ------------------------------------------------------------------------------ |
 | `NameConflict`          | both branches supply different entity names                                    |
-| `KindConflict`          | both branches supply different entity kinds                                    |
+| `KindConflict`          | both branches supply different entity kinds, or the merged entity keeps a key that a branch holds under a different kind |
 | `PropertyMismatch`      | both branches supply different values for one entity property or `entity_type` |
 | `ModifyDelete`          | one branch modifies an entity while the other deletes it                       |
 | `DuplicateAddition`     | both branches add the same UUID with different content                         |
+| `KeyConflict`           | the merged entity set places one key, under one kind, on more than one entity  |
 | `EdgeModifyDelete`      | one branch changes edge identity, weight, or properties while the other deletes it |
 | `EdgeIdentityMismatch`  | both branches replace one semantic edge's durable UUID differently             |
 | `EdgeIdentityCollision` | a branch-chosen edge UUID already belongs to a different semantic edge in the merged set; the edge falls back to its own unclaimed base UUID, or is dropped from the merged set if none is available |
@@ -34,6 +35,7 @@ The merge API separates valid semantic conflicts from invalid inputs and interna
 | `NamespaceMismatch` | base, ours, and theirs do not share a namespace                                    |
 | `InvalidEdgeWeight` | an input edge weight is NaN or infinite                                            |
 | `DuplicateEntityId` | one archive repeats an entity UUID                                                 |
+| `DuplicateEntityKey` | one archive places one key, under one kind, on more than one entity              |
 | `DuplicateEdgeKey`  | one archive repeats a semantic `(source, target, relation)` key                    |
 | `Internal`          | duplicate edge UUID or another invariant failure                                   |
 

@@ -197,7 +197,7 @@ impl KhiveMcpServer {
             serde_json::from_str(&self.plan_ops(ops)).expect("plan output is always JSON");
         if let Some(stages) = plan.get_mut("stages").and_then(Value::as_array_mut) {
             for stage in stages {
-                if stage["verb"] == "bridge.diagnostics" {
+                if stage["verb"] == "bridge.diagnostics" || stage["verb"] == "bridge.share" {
                     stage["known"] = Value::Bool(true);
                     stage["pack"] = json!("bridge-control");
                 }
@@ -268,6 +268,38 @@ impl KhiveMcpServer {
                 bridge_diagnostics_value()
             }
         };
+        #[cfg(unix)]
+        let result = match (&self.computer, is_help) {
+            (Some(computer), false) => {
+                let mut result = result;
+                result["computer"] = json!({
+                    "label": computer.label(),
+                    "routed_requests": computer.routed_requests(),
+                });
+                result
+            }
+            _ => result,
+        };
+        #[cfg(unix)]
+        let result = match (&self.share.bridge, is_help) {
+            (Some(share), false) => {
+                let mut result = result;
+                result["share"] = share.diagnostics();
+                result
+            }
+            _ => result,
+        };
+        self.bridge_result_envelope(p, "bridge.diagnostics", result)
+    }
+
+    /// The envelope of one bridge verb's result, presented and formatted as
+    /// the request asks.
+    pub(super) fn bridge_result_envelope(
+        &self,
+        p: &RequestParams,
+        tool: &str,
+        result: Value,
+    ) -> Result<String, McpError> {
         let presentation =
             parse_presentation_mode(p.presentation.as_deref()).map_err(invalid_request_error)?;
         let presentation_per_op: Option<Vec<Option<PresentationMode>>> =
@@ -325,7 +357,7 @@ impl KhiveMcpServer {
             ))
         };
         Ok(serialize_response_value(&json!({
-            "results": [{"ok": true, "tool": "bridge.diagnostics", "result": formatted}],
+            "results": [{"ok": true, "tool": tool, "result": formatted}],
             "summary": {"total": 1, "succeeded": 1, "failed": 0, "aborted": 0},
             "status": "success",
         })))
@@ -336,7 +368,13 @@ impl KhiveMcpServer {
             return Ok(None);
         }
         p.validate_plan_envelope()?;
-        Ok(Some(self.plan_ops(&p.ops)))
+        let plan = self.plan_ops(&p.ops);
+        #[cfg(unix)]
+        let plan = match &self.computer {
+            Some(computer) => computer.plan_with_homes(plan, &p.ops),
+            None => plan,
+        };
+        Ok(Some(plan))
     }
 
     pub(super) async fn request_with_cancellation(
@@ -345,6 +383,16 @@ impl KhiveMcpServer {
     ) -> Result<String, McpError> {
         let parsed = parse_request(&p.ops);
         if let Ok(ref parsed) = parsed {
+            #[cfg(unix)]
+            if super::bridge_share::parsed_contains_bridge_share(parsed) {
+                if p.plan == Some(true) && self.stdio_bridge {
+                    p.validate_plan_envelope()?;
+                    return Ok(self.plan_bridge_ops(&p.ops));
+                }
+                if p.plan != Some(true) {
+                    return self.bridge_share_response(&p, parsed).await;
+                }
+            }
             if parsed_contains_bridge_diagnostics(parsed) {
                 if p.plan == Some(true) && self.stdio_bridge {
                     p.validate_plan_envelope()?;
@@ -400,10 +448,49 @@ impl KhiveMcpServer {
         // the same RPC contract; valid requests are still parsed authoritatively
         // inside `dispatch_request_inner` at the dispatch seam.
         let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
+        #[cfg(unix)]
+        if super::bridge_share::parsed_contains_bridge_share(&parsed) {
+            return self.bridge_share_response(&p, &parsed).await;
+        }
         if parsed_contains_bridge_diagnostics(&parsed) {
             return self.bridge_diagnostics_response(&p, &parsed);
         }
         validate_request_overrides(&p, parsed.ops.len())?;
+        // A caller with a computer sees the computer's verbs for each routed
+        // pack (ADR-220 section 8).
+        #[cfg(unix)]
+        if let Some(computer) = self.computer.clone() {
+            if parsed
+                .ops
+                .iter()
+                .any(|op| op.tool == super::computer_catalog::VERBS_VERB)
+            {
+                return self
+                    .request_with_computer_catalog(&computer, p, &parsed, forward_fn)
+                    .await;
+            }
+        }
+        #[cfg(unix)]
+        if let Some((computer, plan)) = self.computer_route(&parsed) {
+            return self
+                .request_routed(&computer, &plan, &parsed, p, forward_fn)
+                .await;
+        }
+        #[cfg(unix)]
+        return self.request_on_store(p, &parsed, forward_fn).await;
+        #[cfg(not(unix))]
+        return self.request_on_store(p, &parsed).await;
+    }
+
+    /// The store's part of a request: forwarded to the warm daemon or
+    /// dispatched here, as every request was before ADR-220. A request with no
+    /// operation for the caller's computer comes here whole.
+    pub(super) async fn request_on_store(
+        &self,
+        p: RequestParams,
+        parsed: &ParsedRequest,
+        #[cfg(unix)] forward_fn: ForwardFnPtr,
+    ) -> Result<String, McpError> {
         #[cfg(unix)]
         let replay_read_only = !parsed.ops.is_empty()
             && parsed
@@ -686,6 +773,16 @@ fn bridge_diagnostics_help() -> Value {
                     "properties": {
                         "before_dispatch": counter,
                         "after_write": counter
+                    },
+                    "additionalProperties": false
+                },
+                "computer": {
+                    "type":"object",
+                    "description":"Present when this caller's configuration has a [computer] table (ADR-220): the computer as name (host:port), and how many requests with an operation for it this bridge has handled, refused ones included.",
+                    "required": ["label", "routed_requests"],
+                    "properties": {
+                        "label": {"type":"string"},
+                        "routed_requests": counter
                     },
                     "additionalProperties": false
                 }

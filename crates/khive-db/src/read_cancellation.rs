@@ -354,6 +354,12 @@ impl ReadControl {
         capability: StorageCapability,
         blocking_context: Option<RequestReadContext>,
     ) -> StorageResult<ActiveRead> {
+        if CURRENT_READ.with(|current| current.borrow().is_some()) {
+            return Err(StorageError::Internal(format!(
+                "{}: nested SQLite read registration on the same thread is not allowed",
+                self.operation
+            )));
+        }
         if !conn.armed() {
             return Err(StorageError::Internal(format!(
                 "{} ({capability:?}): connection has no read progress handler",
@@ -382,12 +388,12 @@ impl ReadControl {
             }
         }
 
-        let previous = CURRENT_READ.with(|current| {
-            current.replace(Some(Registered {
+        CURRENT_READ.with(|current| {
+            *current.borrow_mut() = Some(Registered {
                 conn: conn.id(),
                 control: Arc::clone(self),
                 blocking_context,
-            }))
+            });
         });
         if self.progress_should_stop() {
             if let RegistrationState::Running(interrupt) = &*self.state.lock() {
@@ -396,7 +402,6 @@ impl ReadControl {
         }
         Ok(ActiveRead {
             control: Arc::clone(self),
-            previous,
             finished: false,
         })
     }
@@ -517,7 +522,6 @@ pub(crate) fn with_traversal_stop<R>(
 
 struct ActiveRead {
     control: Arc<ReadControl>,
-    previous: Option<Registered>,
     finished: bool,
 }
 
@@ -526,7 +530,7 @@ impl ActiveRead {
     /// slot no longer names it, so only the injected test failure can make this fail.
     fn clear(&mut self) -> StorageResult<()> {
         CURRENT_READ.with(|current| {
-            current.replace(self.previous.take());
+            *current.borrow_mut() = None;
         });
         self.control.finish();
         self.finished = true;

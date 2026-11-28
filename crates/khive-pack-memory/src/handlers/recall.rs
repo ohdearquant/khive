@@ -379,6 +379,8 @@ impl MemoryPack {
             }
         }
 
+        let label = super::common::validate_recall_label(p.label.as_deref())?;
+
         let prof = super::common::recall_profile_enabled(&self.runtime);
         let call_id = PROF_CID.try_with(|id| *id).unwrap_or(0);
         let mut t_stage = if prof { Some(Instant::now()) } else { None };
@@ -776,6 +778,7 @@ impl MemoryPack {
                     latency_us: recall_start.elapsed().as_micros() as i64,
                     ann_degraded,
                     ann_degraded_reason: ann_degraded_reason.clone(),
+                    label: label.as_deref(),
                 },
             );
             if let Ok(mut state) = self.recall_state.lock() {
@@ -974,12 +977,17 @@ impl MemoryPack {
 
             // Read profile state once per recall. Apply the entity term LAST and exactly once
             // to whichever composite (default or weighted rerank) actually reaches ranking.
-            let entity_posterior_mean: Option<f64> = profile_state
+            let entity_posterior: Option<(f64, f64)> = profile_state
                 .as_ref()
                 .and_then(|s| s.entity_posteriors.get(&id))
-                .map(khive_brain_core::BetaPosterior::mean);
+                .map(|p| {
+                    (
+                        p.mean(),
+                        crate::scoring::entity_evidence_mass(p.alpha(), p.beta()),
+                    )
+                });
             let entity_term = crate::scoring::entity_posterior_term(
-                entity_posterior_mean,
+                entity_posterior,
                 crate::scoring::ENTITY_POSTERIOR_WEIGHT,
             );
 
@@ -1002,7 +1010,8 @@ impl MemoryPack {
                 adjustment_factor: score_factors.adjustment_factor(),
             });
             breakdown.profile_component = profile_component;
-            breakdown.entity_posterior_mean = entity_posterior_mean;
+            breakdown.entity_posterior_mean = entity_posterior.map(|(mean, _)| mean);
+            breakdown.entity_evidence_mass = entity_posterior.map(|(_, mass)| mass);
 
             let source = source_by_id.get(&id).copied().unwrap_or(SearchSource::Text);
             let pre_entity_term_score = if !cfg.reranker_weights.is_empty() {
@@ -1174,6 +1183,16 @@ impl MemoryPack {
         ranked.sort_by(|a, b| {
             compare_rank_scores_desc(a.rank_score, b.rank_score).then(a.id.cmp(&b.id))
         });
+        if let Some(preferred) = p.prefer_tags.as_deref().filter(|tags| !tags.is_empty()) {
+            // A soft preference, applied before `limit`: memories carrying a preferred
+            // tag move ahead of the rest, each group keeps its score order, and
+            // nothing is dropped.
+            let (mut first, rest): (Vec<_>, Vec<_>) = ranked
+                .into_iter()
+                .partition(|sn| note_has_any_tag(sn.note.properties.as_ref(), preferred));
+            first.extend(rest);
+            ranked = first;
+        }
         ranked.truncate(limit);
 
         let pre_budget_count = ranked.len();
@@ -1365,6 +1384,7 @@ impl MemoryPack {
                 latency_us: recall_start.elapsed().as_micros() as i64,
                 ann_degraded,
                 ann_degraded_reason: ann_degraded_reason.clone(),
+                label: label.as_deref(),
             },
         );
 
@@ -1527,7 +1547,9 @@ impl MemoryPack {
             latency_us,
             ann_degraded,
             ann_degraded_reason,
+            label,
         } = fields;
+        let label = label.map(str::to_string);
         let registry = registry.clone();
         let namespace = token.namespace().as_str().to_string();
         let query_raw = query_raw.to_string();
@@ -1583,6 +1605,7 @@ impl MemoryPack {
                     latency_us,
                     ann_degraded,
                     ann_degraded_reason,
+                    label,
                 },
             )
             .await;
@@ -1605,6 +1628,8 @@ struct RecallServeFields<'a> {
     /// Reason captured at the failure site, `None` when the recall was not
     /// degraded.
     ann_degraded_reason: Option<String>,
+    /// The caller's validated `label`, when one was supplied.
+    label: Option<&'a str>,
 }
 
 /// Fields for the best-effort `RecallExecuted` telemetry event. Grouped into a
@@ -1620,6 +1645,7 @@ struct RecallExecutedFields {
     latency_us: i64,
     ann_degraded: bool,
     ann_degraded_reason: Option<String>,
+    label: Option<String>,
 }
 
 /// Append best-effort recall telemetry without affecting the recall response.
@@ -1647,6 +1673,7 @@ async fn emit_recall_executed_event(
         latency_us,
         ann_degraded,
         ann_degraded_reason,
+        label,
     } = fields;
     let batch = registry.audit_batch_handle();
     // Only the legacy no-batch route obtains a token-decorated runtime store.
@@ -1690,6 +1717,11 @@ async fn emit_recall_executed_event(
         payload["degraded_reason"] =
             json!(ann_degraded_reason
                 .unwrap_or_else(|| super::common::ANN_DEGRADED_REASON.to_string()));
+    }
+    // The caller's call-site label: `brain.event_counts` counts recall_executed
+    // rows by it in counts_by_label. Absent when the caller gave none.
+    if let Some(label) = label {
+        payload["label"] = json!(label);
     }
     let event = khive_storage::Event::new(
         token.namespace().as_str(),

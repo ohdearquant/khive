@@ -41,8 +41,15 @@ async fn legacy_state_default_filter_excludes_unknown_strings_before_pagination(
             .dispatch("gtd.tasks", json!({"limit": 1, "offset": offset}))
             .await
             .unwrap();
-        assert_eq!(page.as_array().unwrap().len(), 1);
-        assert_eq!(page[0]["full_id"], expected.to_string());
+        let rows = if offset == 0 {
+            assert_eq!(page["has_more"], true);
+            page["tasks"].as_array().expect("continued open-task page")
+        } else {
+            page.as_array()
+                .expect("complete open-task page stays an array")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["full_id"], expected.to_string());
     }
     for status in ["done", "cancelled"] {
         let page = pack
@@ -419,7 +426,11 @@ async fn tasks_priority_filter_preserves_non_text_p2_fallback() {
             )
             .await
             .unwrap();
-        assert_eq!(page, json!([row]));
+        if offset + 1 < expected.len() {
+            assert_eq!(page, json!({"tasks": [row], "has_more": true}));
+        } else {
+            assert_eq!(page, json!([row]));
+        }
     }
     assert_eq!(
         pack.dispatch(

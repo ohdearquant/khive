@@ -59,6 +59,46 @@ fn expendable_dispatch_audit(kind: EventKind, verb: &str) -> bool {
         )
 }
 
+/// Longest client working directory an anonymous audit row keeps, in UTF-8 bytes.
+pub(crate) const CLIENT_CWD_MAX_BYTES: usize = 512;
+
+/// The `client_cwd` value of an anonymous audit row: the reported directory with every control,
+/// format, line-separator and paragraph-separator character removed, then cut at a character
+/// boundary to [`CLIENT_CWD_MAX_BYTES`]; `cut` says whether the cut removed anything.
+pub(crate) fn bounded_client_cwd(raw: &str) -> Value {
+    use unicode_general_category::{get_general_category, GeneralCategory};
+    let clean: String = raw
+        .chars()
+        .filter(|c| {
+            !matches!(
+                get_general_category(*c),
+                GeneralCategory::Control
+                    | GeneralCategory::Format
+                    | GeneralCategory::LineSeparator
+                    | GeneralCategory::ParagraphSeparator
+            )
+        })
+        .collect();
+    let mut end = clean.len().min(CLIENT_CWD_MAX_BYTES);
+    while !clean.is_char_boundary(end) {
+        end -= 1;
+    }
+    serde_json::json!({ "path": &clean[..end], "cut": end < clean.len() })
+}
+
+/// Add `client_cwd` to an anonymous caller's audit row when the request's client reported one.
+/// An attributed row never carries it: its actor already says who called.
+pub(super) fn stamp_client_cwd(event: &mut Event, gate_req: &GateRequest) {
+    if !gate_req.actor.is_anonymous() {
+        return;
+    }
+    if let Some(cwd) = khive_storage::current_request_client_cwd() {
+        if let Value::Object(ref mut payload) = event.payload {
+            payload.insert("client_cwd".into(), bounded_client_cwd(&cwd));
+        }
+    }
+}
+
 /// Build a v1-shape audit storage event from a gate check outcome.
 /// See `docs/api/pack.md#build_audit_storage_event` for the `resource` payload contract.
 pub(super) fn build_audit_storage_event(
@@ -97,6 +137,7 @@ pub(super) fn build_audit_storage_event(
             );
         }
     }
+    stamp_client_cwd(&mut storage_event, gate_req);
     storage_event.op_index = audit.op_index;
     storage_event.ref_resolution = audit.ref_resolution;
     if let Some(target_id) = target_id_from_args(&gate_req.verb, &gate_req.args) {
@@ -553,6 +594,7 @@ pub(super) async fn persist_git_digest_receipt(
     }
     payload_object.insert("result".to_string(), report.clone());
     event.payload = payload;
+    stamp_client_cwd(&mut event, gate_req);
 
     // Strict path (ADR-133): a git.digest success receipt must still commit
     // exactly once before the caller can see success, so this row waits on
@@ -890,3 +932,7 @@ mod stream_truncate_tests;
 #[cfg(test)]
 #[path = "audit_retention_tests.rs"]
 mod retention_tests;
+
+#[cfg(test)]
+#[path = "client_cwd_audit_tests.rs"]
+mod client_cwd_tests;

@@ -291,7 +291,8 @@ mod backend_batch_witnesses {
         let (_, control_hits, control_outcomes) =
             SubstrateCoordinator::single(Arc::clone(text_only))
                 .fan_out_search(&request, &namespace)
-                .await;
+                .await
+                .expect("active search succeeds");
         assert!(control_outcomes
             .iter()
             .all(|o| o.error.is_none() && o.vector_error.is_none()));
@@ -301,7 +302,8 @@ mod backend_batch_witnesses {
         );
         let (_, direct_hits, direct_outcomes) = SubstrateCoordinator::single(Arc::clone(embedded))
             .fan_out_search(&request, &namespace)
-            .await;
+            .await
+            .expect("active search succeeds");
         assert!(direct_outcomes
             .iter()
             .all(|o| o.error.is_none() && o.vector_error.is_none()));
@@ -324,7 +326,8 @@ mod backend_batch_witnesses {
         );
         let (_, hits, outcomes) = SubstrateCoordinator::new(registry)
             .fan_out_search(&request, &namespace)
-            .await;
+            .await
+            .expect("active search succeeds");
         assert!(outcomes
             .iter()
             .all(|o| o.error.is_none() && o.vector_error.is_none()));
@@ -409,7 +412,8 @@ mod backend_batch_witnesses {
         .unwrap();
         let (_, hits, outcomes) = SubstrateCoordinator::new(registry)
             .fan_out_search(&request, &namespace)
-            .await;
+            .await
+            .expect("active search succeeds");
         assert!(outcomes
             .iter()
             .all(|o| o.error.is_none() && o.vector_error.is_none()));

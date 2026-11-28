@@ -13,7 +13,7 @@ use crate::write_argv::{validate_message, validate_ref_name, validate_repo_path}
 #[cfg(test)]
 use crate::write_handlers::repo_write_lock;
 use crate::write_handlers::repo_write_lock_async;
-use crate::write_policy::{GitWritePolicy, GitWritePolicyError};
+use crate::write_policy::{repo_access, GitRepoAccess, GitWritePolicy, GitWritePolicyError};
 use crate::GitPack;
 
 pub(crate) struct Failure {
@@ -115,11 +115,85 @@ fn lowercase_oid(value: &str) -> Result<(), Failure> {
     }
 }
 
+fn path_refusal(reason: &'static str, detail: String) -> Failure {
+    Failure {
+        reason,
+        ambiguous: false,
+        detail: Some(detail),
+    }
+}
+
+/// A `git.checkout`'s `paths`, checked before git runs and returned in canonical order; `None`
+/// when the call names none (ADR-182 Amendment 24, item 1).
+fn checkout_paths(params: &Value) -> Result<Option<Vec<String>>, Failure> {
+    let Some(value) = params.get("paths") else {
+        return Ok(None);
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| Failure::invalid("paths must be an array of strings"))?;
+    let limit = khive_runtime::blob_tree::MAX_SCOPE_PATHS;
+    if items.is_empty() || items.len() > limit {
+        return Err(Failure::invalid(format!(
+            "paths names 1 to {limit} paths; this call names {}",
+            items.len()
+        )));
+    }
+    let mut paths = Vec::with_capacity(items.len());
+    for item in items {
+        let path = item
+            .as_str()
+            .ok_or_else(|| Failure::invalid("paths must be an array of strings"))?;
+        // A leading or trailing slash surfaces here as an empty component.
+        khive_runtime::blob_tree::validate_relative_path(path, "checkout").map_err(|error| {
+            path_refusal(
+                "invalid_path",
+                match error {
+                    RuntimeError::InvalidInput(message) => message,
+                    other => other.to_string(),
+                },
+            )
+        })?;
+        paths.push(path.to_owned());
+    }
+    paths.sort();
+    for (index, path) in paths.iter().enumerate() {
+        for other in &paths[index + 1..] {
+            // In sorted order a path inside another always comes after it.
+            let relation = if other == path {
+                "repeats"
+            } else if other
+                .strip_prefix(path.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+            {
+                "lies inside"
+            } else {
+                continue;
+            };
+            return Err(path_refusal(
+                "overlapping_paths",
+                format!("{other:?} {relation} {path:?}"),
+            ));
+        }
+    }
+    Ok(Some(paths))
+}
+
+/// A checkout refusal whose message the caller acts on carries it: which named path matched
+/// nothing, and that a checkout over the tree limit may name paths.
+fn checkout_failure(error: LocalGitError) -> Failure {
+    let detail = matches!(error.code(), "path_not_found" | "output_limit")
+        .then(|| error.message().to_owned());
+    let mut failure = Failure::from(error);
+    failure.detail = detail;
+    failure
+}
+
 fn validate_operation(verb: &str, params: &Value) -> Result<(), Failure> {
     crate::params::parse(verb, params.clone())
         .map_err(|error| Failure::invalid(error.to_string()))?;
     let keys: &[&str] = match verb {
-        "git.checkout" => &["repo", "ref", "session_id"],
+        "git.checkout" => &["repo", "ref", "paths", "session_id"],
         "git.diff" => &["repo", "input_kind", "base", "head", "session_id"],
         "git.branch" => &["repo", "name", "from", "expected", "session_id"],
         "git.update_ref" => &[
@@ -137,6 +211,7 @@ fn validate_operation(verb: &str, params: &Value) -> Result<(), Failure> {
             "tree",
             "message",
             "expected_head",
+            "merge_parent",
             "session_id",
         ],
         "git.reconcile" => &["receipt"],
@@ -188,6 +263,7 @@ fn validate_operation(verb: &str, params: &Value) -> Result<(), Failure> {
     match verb {
         "git.checkout" => {
             required(params, "ref")?;
+            checkout_paths(params)?;
         }
         "git.diff" => {
             if !matches!(required(params, "input_kind")?, "commits" | "trees") {
@@ -211,6 +287,9 @@ fn validate_operation(verb: &str, params: &Value) -> Result<(), Failure> {
             validate_message(required(params, "message")?)
                 .map_err(|_| Failure::refused("invalid_params"))?;
             oid(required(params, "expected_head")?)?;
+            if let Some(merge_parent) = optional(params, "merge_parent")? {
+                oid(merge_parent)?;
+            }
         }
         _ => {}
     }
@@ -223,7 +302,7 @@ fn safe_inputs(verb: &str, params: &Value) -> Value {
         "git.checkout" => &["ref"],
         "git.branch" => &["name", "from", "expected"],
         "git.update_ref" => &["branch", "to", "expected", "reason"],
-        "git.commit" => &["branch", "tree", "message", "expected_head"],
+        "git.commit" => &["branch", "tree", "message", "expected_head", "merge_parent"],
         "git.reconcile" => &["receipt"],
         "git.init" => &["branch"],
         _ => &[],
@@ -232,6 +311,11 @@ fn safe_inputs(verb: &str, params: &Value) -> Value {
     for key in keys {
         if let Some(value) = params.get(*key).and_then(Value::as_str) {
             inputs.insert((*key).into(), Value::String(value.into()));
+        }
+    }
+    if verb == "git.checkout" {
+        if let Ok(Some(paths)) = checkout_paths(params) {
+            inputs.insert("paths".into(), json!(paths));
         }
     }
     if let Some(value @ Value::Bool(_)) = params.get("require_fast_forward") {
@@ -251,6 +335,7 @@ pub(crate) fn gate_reason(error: &GitWritePolicyError) -> &'static str {
         GitWritePolicyError::NotConfigured => "not_configured",
         GitWritePolicyError::RepoNotAllowlisted(_) => "repo_not_allowlisted",
         GitWritePolicyError::BranchNotAllowed { .. } => "branch_not_allowed",
+        GitWritePolicyError::RepoReadOnly(_) => "repo_read_only",
     }
 }
 
@@ -456,27 +541,28 @@ impl GitPack {
         }
 
         let allowlist = GitWritePolicy::from_config(&self.runtime().config().git_write);
-        let canonical = match allowlist.match_entry(Path::new(&receipt.repo), branch) {
-            Ok((repo, index)) => {
-                receipt.repo = repo.display().to_string();
-                receipt.gate =
-                    json!({"decision":"allow", "source":"git_write.allowed", "id":index});
-                repo
-            }
-            Err(error) => {
-                let reason = gate_reason(&error);
-                receipt.gate = denied(reason);
-                self.require_receipt_storage(
-                    token,
-                    &receipt,
-                    receipts::insert(self.runtime(), &receipt).await,
-                )
-                .await?;
-                let mut failure = Failure::refused(reason);
-                failure.detail = Some(error.to_string());
-                return self.finish_local(token, receipt, Err(failure)).await;
-            }
-        };
+        let canonical =
+            match allowlist.match_entry(Path::new(&receipt.repo), repo_access(verb), branch) {
+                Ok((repo, index)) => {
+                    receipt.repo = repo.display().to_string();
+                    receipt.gate =
+                        json!({"decision":"allow", "source":"git_write.allowed", "id":index});
+                    repo
+                }
+                Err(error) => {
+                    let reason = gate_reason(&error);
+                    receipt.gate = denied(reason);
+                    self.require_receipt_storage(
+                        token,
+                        &receipt,
+                        receipts::insert(self.runtime(), &receipt).await,
+                    )
+                    .await?;
+                    let mut failure = Failure::refused(reason);
+                    failure.detail = Some(error.to_string());
+                    return self.finish_local(token, receipt, Err(failure)).await;
+                }
+            };
         if verb == "git.update_ref" {
             if let Err(error) = validate_repo_path(&canonical) {
                 self.require_receipt_storage(
@@ -544,7 +630,7 @@ impl GitPack {
         if stored.is_err()
             && matches!(
                 receipt.verb.as_str(),
-                "git.branch" | "git.commit" | "git.update_ref"
+                "git.branch" | "git.commit" | "git.update_ref" | "git.branch_delete"
             )
         {
             self.emit_write_audit(
@@ -594,9 +680,21 @@ impl GitPack {
                 Ok(result)
             }
             "git.checkout" => {
-                let result =
-                    local_git::checkout(self.runtime(), repo, required(params, "ref")?).await?;
-                Ok(json!({"commit":result.commit, "tree":result.tree}))
+                let paths = checkout_paths(params)?;
+                let result = local_git::checkout_reusing(
+                    self.runtime(),
+                    repo,
+                    required(params, "ref")?,
+                    Some(&receipt.namespace),
+                    paths.as_deref(),
+                )
+                .await
+                .map_err(checkout_failure)?;
+                let mut reply = json!({"commit":result.commit, "tree":result.tree});
+                if let Some(paths) = paths {
+                    reply["paths"] = json!(paths);
+                }
+                Ok(reply)
             }
             "git.diff" => {
                 let result = local_git::diff(
@@ -723,6 +821,23 @@ impl GitPack {
             "git.commit" => {
                 let branch = required(params, "branch")?;
                 let expected = required(params, "expected_head")?.to_ascii_lowercase();
+                let tree = required(params, "tree")?;
+                // A commit reads its manifest as the whole tree, and a path the manifest omits is a
+                // deletion, so a scoped tree would delete everything outside its scope. Refused
+                // before any git command runs (ADR-182 Amendment 24, item 3). A tree that does not
+                // load is left to the manifest write below, which reports it as before.
+                if let Ok(khive_runtime::blob_tree::Tree {
+                    scope: Some(scope), ..
+                }) = khive_runtime::blob_tree::load_tree(self.runtime(), tree).await
+                {
+                    receipt.result = json!({ "scope": scope });
+                    let mut failure = Failure::refused("scoped_tree");
+                    failure.detail = Some(format!(
+                        "tree {tree} is scoped to {}; a commit needs a whole tree",
+                        scope.join(", ")
+                    ));
+                    return Err(failure);
+                }
                 if local_git::branch_head(
                     self.runtime().config().git_write.git_program(),
                     repo,
@@ -733,6 +848,16 @@ impl GitPack {
                 {
                     return Err(Failure::refused("expected_head_mismatch"));
                 }
+                let merge_parent = optional(params, "merge_parent")?.map(str::to_ascii_lowercase);
+                if let Some(merge_parent) = merge_parent.as_deref() {
+                    local_git::verify_merge_parent(
+                        self.runtime().config().git_write.git_program(),
+                        repo,
+                        merge_parent,
+                        &expected,
+                    )
+                    .await?;
+                }
                 let config = &self.runtime().config().git_write;
                 let actor = match credentials::resolve_actor(config, &receipt.actor).await {
                     Ok(actor) => actor,
@@ -741,22 +866,39 @@ impl GitPack {
                         return Err(Failure::refused("actor_unmapped"));
                     }
                 };
+                // A repository row's own identity replaces the actor's name and email; the actor
+                // row has already authorized the call (ADR-182 Amendment 20).
+                let repository_author = self.repository_author(repo)?;
+                let (author_name, author_email) = match &repository_author {
+                    Some((_, author)) => (author.name.as_str(), author.email.as_str()),
+                    None => (actor.name.as_str(), actor.email.as_str()),
+                };
                 receipt.credential = json!({"source":"actor", "ref":actor.credential_ref, "platform_identity":actor.platform_identity});
                 receipts::persist(self.runtime(), receipt).await?;
-                let tree = required(params, "tree")?;
                 let git_tree = local_git::write_manifest_tree(self.runtime(), repo, tree).await?;
                 let sha = local_git::create_commit(
                     self.runtime().config().git_write.git_program(),
                     repo,
                     &git_tree,
                     &expected,
+                    merge_parent.as_deref(),
                     required(params, "message")?,
-                    &actor.name,
-                    &actor.email,
+                    author_name,
+                    author_email,
                 )
                 .await?;
-                let result = json!({"repo":repo.display().to_string(), "sha":sha, "parent":expected,
+                let mut result = json!({"repo":repo.display().to_string(), "sha":sha, "parent":expected,
                     "tree":tree, "ref":format!("refs/heads/{branch}"), "receipt_id":receipt.id});
+                // Present only on a two-parent commit, so a one-parent result is unchanged.
+                if let Some(merge_parent) = &merge_parent {
+                    result["merge_parent"] = json!(merge_parent);
+                }
+                // Present only when a repository row supplied the identity, so a commit under the
+                // actor's own identity reads as before.
+                if let Some((key, _)) = &repository_author {
+                    result["author_source"] =
+                        json!({"table": "git_write.repositories", "key": key});
+                }
                 receipt.result = result.clone();
                 // The candidate SHA is durable before update-ref can have an effect.
                 receipts::persist(self.runtime(), receipt).await?;
@@ -785,11 +927,23 @@ impl GitPack {
                     self.reconcile_remote(repo, &mut prior).await?;
                     return Ok(json!({"receipt":prior.to_value()}));
                 }
-                if matches!(prior.verb.as_str(), "git.pr_open" | "git.pr_review") {
-                    // Neither platform operation has receipt-specific evidence. An absent PR or
+                if matches!(
+                    prior.verb.as_str(),
+                    "git.pr_open" | "git.pr_review" | "git.pr_edit" | "git.pr_close"
+                ) {
+                    // No such platform operation has receipt-specific evidence. An absent PR or
                     // review cannot prove that the original write did not happen, and a later
                     // matching object cannot prove this receipt caused it. Preserve unknown
                     // without resolving a credential or touching the platform.
+                    return Ok(json!({"receipt":prior.to_value()}));
+                }
+                if prior.verb == "git.branch_delete" {
+                    let observed = self.reconcile_branch_delete(repo, &prior).await?;
+                    return Ok(json!({"receipt":prior.to_value(), "observed":observed}));
+                }
+                if prior.verb == "git.fetch" {
+                    // A fetch is settled by reading its destination ref, and it is safe to run
+                    // again; an unknown fetch receipt stays unknown here.
                     return Ok(json!({"receipt":prior.to_value()}));
                 }
                 if !matches!(
@@ -871,10 +1025,14 @@ impl GitPack {
             "git.branch"
                 | "git.commit"
                 | "git.update_ref"
+                | "git.branch_delete"
                 | "git.push"
+                | "git.fetch"
                 | "git.pr_open"
                 | "git.pr_review"
                 | "git.pr_merge"
+                | "git.pr_edit"
+                | "git.pr_close"
         ) {
             self.emit_write_audit(
                 token,
@@ -986,7 +1144,7 @@ impl GitPack {
     /// no credential and writes no receipt. `git.gates` established this shape (ADR-182
     /// Amendment 4 item 4): the match is repo-only, and `gate.id` is the lowest matching entry
     /// index, so removing a duplicate row never changes which id a caller already saw.
-    async fn read_gate(
+    pub(crate) async fn read_gate(
         &self,
         token: &NamespaceToken,
         registry: &VerbRegistry,
@@ -995,7 +1153,7 @@ impl GitPack {
     ) -> Result<(PathBuf, usize), RuntimeError> {
         let allowlist = GitWritePolicy::from_config(&self.runtime().config().git_write);
         let (canonical, index) = allowlist
-            .match_entry(Path::new(repo), None)
+            .match_entry(Path::new(repo), GitRepoAccess::Read, None)
             .map_err(|error| RuntimeError::InvalidInput(gate_reason(&error).into()))?;
         let decision = checked_policy(registry, token, verb).await?;
         if decision["decision"] != "allow" {
@@ -1104,7 +1262,7 @@ impl GitPack {
         let config = &self.runtime().config().git_write;
         let allowlist = GitWritePolicy::from_config(config);
         let (canonical, index) = allowlist
-            .match_entry(Path::new(repo), None)
+            .match_entry(Path::new(repo), GitRepoAccess::Read, None)
             .map_err(|error| RuntimeError::InvalidInput(gate_reason(&error).into()))?;
         let decision = checked_policy(registry, token, "git.gates").await?;
         if decision["decision"] != "allow" {
@@ -1112,7 +1270,7 @@ impl GitPack {
         }
         let rows: Vec<Value> = config.allowed.iter().enumerate().filter_map(|(id, row)| {
             std::fs::canonicalize(&row.repo).ok().filter(|path| *path == canonical)
-                .map(|_| json!({"id":id, "repo":canonical.display().to_string(), "branches":row.branches}))
+                .map(|_| json!({"id":id, "repo":canonical.display().to_string(), "branches":row.branches, "access":row.access}))
         }).collect();
         let target = match self.remote_repository(&canonical) {
             Ok(target) => json!({
@@ -1157,3 +1315,7 @@ pub(crate) fn policy_check_count(actor: &str) -> usize {
 #[cfg(test)]
 #[path = "local_handlers_update_ref_tests.rs"]
 mod update_ref_tests;
+
+#[cfg(test)]
+#[path = "local_handlers_checkout_paths_tests.rs"]
+mod checkout_paths_tests;

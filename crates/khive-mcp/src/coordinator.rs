@@ -215,12 +215,14 @@ pub trait CoordinatorService: Send + Sync {
     /// must authorize each backend's search token with this widened set
     /// rather than `namespace` alone, or a namespace visible only through
     /// `visible_namespaces` silently drops out of coordinator search results.
+    /// Caller cancellation or an elapsed request deadline returns the original
+    /// typed error; backend-local failures remain in a successful partial result.
     async fn fan_out_search(
         &self,
         request: &ValidatedSearchRequest,
         namespace: &Namespace,
         extra_visible: &[Namespace],
-    ) -> CoordSearchResult;
+    ) -> Result<CoordSearchResult, RuntimeError>;
 
     /// Search with the gate-authorized caller token and original arguments.
     /// Older coordinators can still serve entity searches. Note searches
@@ -238,9 +240,8 @@ pub trait CoordinatorService: Send + Sync {
                     .into(),
             ));
         }
-        Ok(self
-            .fan_out_search(request, token.gate_namespace(), extra_visible)
-            .await)
+        self.fan_out_search(request, token.gate_namespace(), extra_visible)
+            .await
     }
 
     /// Scoped note search with the number of otherwise eligible notes excluded

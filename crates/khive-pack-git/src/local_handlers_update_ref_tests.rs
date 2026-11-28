@@ -14,6 +14,7 @@ fn registry(repo: Option<&Path>, actor: &str) -> (KhiveRuntime, VerbRegistry) {
                 vec![GitWriteEntryConfig {
                     repo: repo.display().to_string(),
                     branches: vec!["*".into()],
+                    access: Default::default(),
                 }]
             })
             .unwrap_or_default(),

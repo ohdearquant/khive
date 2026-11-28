@@ -98,6 +98,7 @@ impl std::fmt::Display for SnapshotId {
 /// v1 covers entities and edges only. Notes are excluded until note packs
 /// define versioned export, import, privacy/redaction, and merge semantics.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotCoverage {
     pub entities: bool,
     pub edges: bool,
@@ -110,6 +111,20 @@ pub const KG_V1_COVERAGE: SnapshotCoverage = SnapshotCoverage {
     edges: true,
     notes: false,
 };
+
+/// Recorded content identity and the record classes the snapshot claims to cover.
+/// Coverage distinguishes completeness claims without changing the v1 content hash.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotIdentity {
+    pub content_hash: SnapshotId,
+    /// Metadata written before coverage was recorded describes a v1 snapshot.
+    #[serde(default = "legacy_snapshot_coverage")]
+    pub coverage: SnapshotCoverage,
+}
+
+pub(crate) fn legacy_snapshot_coverage() -> SnapshotCoverage {
+    KG_V1_COVERAGE
+}
 
 // ── VcsState ─────────────────────────────────────────────────────────────────
 

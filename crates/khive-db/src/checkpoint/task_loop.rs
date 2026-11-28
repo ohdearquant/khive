@@ -42,6 +42,46 @@ pub(super) async fn run_fts_maintenance_off_worker(
     ),
     tokio::task::JoinError,
 > {
+    if pool.config().write_routing_strict && state.is_due(&config, now) {
+        let writer = match pool.writer_task_for_write(None, "fts_maintenance") {
+            Ok(Some(writer)) => writer,
+            Ok(None) => unreachable!("strict routing requires an owner"),
+            Err(error) => return Ok((state, Err(error.to_string()))),
+        };
+        // The caller retains the scheduler state even if admission drops the queued closure.
+        let shared_state = Arc::new(parking_lot::Mutex::new(Some(state)));
+        let queued_state = Arc::clone(&shared_state);
+        let admission = pool.write_admission();
+        let class = {
+            let _scope =
+                crate::disk_guard::lease_class_scope(crate::disk_guard::LeaseClass::Maintenance);
+            crate::disk_guard::WriteClassContext::capture()
+        };
+        let result = class
+            .scope_future(writer.send_top_level_bounded(move |conn| {
+                let result = crate::fts_maintenance::run_if_due_with_admission(
+                    conn,
+                    &config,
+                    queued_state
+                        .lock()
+                        .as_mut()
+                        .expect("scheduler state remains owned until reply"),
+                    now,
+                    || {
+                        admission
+                            .check()
+                            .map_err(|error| format!("FTS maintenance admission: {error}"))
+                    },
+                );
+                Ok(result)
+            }))
+            .await;
+        let state = shared_state
+            .lock()
+            .take()
+            .expect("caller retains scheduler state across admission and execution");
+        return Ok((state, result.unwrap_or_else(|error| Err(error.to_string()))));
+    }
     tokio::task::spawn_blocking(move || {
         let result = pool.run_fts_maintenance(&config, &mut state, now);
         (state, result)
@@ -617,5 +657,127 @@ pub(super) fn observe_checkpoint_pressure_tick(
         *event_elevation_open = false;
         *pressure_episode = None;
         *pending_recovery = Some(payload);
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use crate::pool::PoolConfig;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn strict_fts_capacity_refusal_preserves_unstarted_scheduler_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fts-capacity.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE VIRTUAL TABLE fts_entities USING fts5(value); CREATE VIRTUAL TABLE fts_notes USING fts5(value)").unwrap();
+        drop(conn);
+        let mut pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_routing_strict: true,
+            write_queue_enabled: Some(true),
+            ..PoolConfig::for_test()
+        })
+        .unwrap();
+        let available = Arc::new(std::sync::atomic::AtomicU64::new(100));
+        let sampled = Arc::clone(&available);
+        pool.set_test_write_admission(100, move |_| Ok(sampled.load(Ordering::SeqCst)));
+        let pool = Arc::new(pool);
+        let initial = Instant::now();
+        let due = initial + Duration::from_secs(1);
+        let config = crate::fts_maintenance::FtsMaintenanceConfig {
+            enabled: true,
+            interval: Duration::from_secs(1),
+            merge_pages: 1,
+            minimum_segments: 0,
+        };
+        let state = crate::fts_maintenance::FtsMaintenanceState::new(initial);
+        let (state, result) =
+            run_fts_maintenance_off_worker(Arc::clone(&pool), config.clone(), state, due)
+                .await
+                .unwrap();
+        assert!(
+            result.is_err(),
+            "actual capacity admission must refuse before FTS execution"
+        );
+        assert!(
+            state.is_due(&config, due),
+            "pre-execution refusal must not consume the due step"
+        );
+        available.store(101, Ordering::SeqCst);
+        let (_, result) = run_fts_maintenance_off_worker(pool, config, state, due)
+            .await
+            .unwrap();
+        let step = result
+            .unwrap()
+            .expect("the same state must recover its due work");
+        assert_eq!(
+            step.table, "fts_entities",
+            "refusal must not advance the next-table cursor"
+        );
+        assert_ne!(step.requested_pages, 0);
+    }
+
+    #[tokio::test]
+    async fn fts_strict_queue_preserves_state_and_default_maintenance() {
+        for (strict, enabled) in [(true, true), (true, false), (false, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("fts-routing.db");
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE VIRTUAL TABLE fts_entities USING fts5(value); CREATE VIRTUAL TABLE fts_notes USING fts5(value)").unwrap();
+            drop(conn);
+            let pool = Arc::new(
+                ConnectionPool::new(PoolConfig {
+                    path: Some(path),
+                    write_routing_strict: strict,
+                    write_queue_enabled: Some(enabled),
+                    ..PoolConfig::for_test()
+                })
+                .unwrap(),
+            );
+            let now = Instant::now();
+            let config = crate::fts_maintenance::FtsMaintenanceConfig {
+                enabled: true,
+                interval: Duration::ZERO,
+                merge_pages: 1,
+                minimum_segments: 0,
+            };
+            let state = crate::fts_maintenance::FtsMaintenanceState::new(now);
+            let (state, result) =
+                run_fts_maintenance_off_worker(Arc::clone(&pool), config.clone(), state, now)
+                    .await
+                    .unwrap();
+            if strict && !enabled {
+                assert!(
+                    result.is_err(),
+                    "strict FTS work must refuse a missing writer owner"
+                );
+                assert!(
+                    state.is_due(&config, now),
+                    "queue refusal must preserve scheduler state"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "queued strict and default FTS work must both complete: {result:?}"
+                );
+                let step = result.unwrap().expect("due FTS work has a step");
+                assert_eq!(step.table, "fts_entities");
+                assert_ne!(
+                    step.requested_pages, 0,
+                    "fixture must execute the logical FTS merge path"
+                );
+            }
+            let raw = pool.writer().unwrap().autocommit(|conn| {
+                conn.execute_batch("CREATE TABLE unexpected(value)")?;
+                Ok(())
+            });
+            assert_eq!(
+                raw.is_err(),
+                strict,
+                "FTS scheduling must not grant raw-write authority"
+            );
+        }
     }
 }

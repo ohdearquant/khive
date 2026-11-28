@@ -237,6 +237,13 @@ successfully-resolved dispatch, or `crate::cost_unit::base_resource_payload` (`{
 case. `None` is reserved for a caller with no `work_class` to stamp at all (none exist today); it
 must never be used to omit `cost_unit` alone.
 
+### Client working directory
+
+`stamp_client_cwd` adds the top-level `client_cwd` field to an anonymous caller's row when the
+request scoped one (`khive_storage::scope_request_client_cwd`, set by the daemon from the frame).
+`build_audit_storage_event`, both link success rows and the `git.digest` receipt call it; the
+shape and who can read it are khive-gate `docs/api/audit-events.md` ("Client working directory").
+
 ### Record subjects
 
 A pack may declare `PackRuntime::audit_subject_arg(verb)` for a handler it owns. The

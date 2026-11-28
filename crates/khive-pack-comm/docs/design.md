@@ -4,8 +4,10 @@
 
 ### Communication Pack (ADR-040)
 
-This crate is the primary implementation of ADR-040. It provides fifteen public `comm.*` verbs over the
-standard `message` note kind stored in the notes table.
+This crate is the primary implementation of ADR-040. It provides sixteen public `comm.*` verbs
+for messaging, delivery observations and bounded background control. Messages use the standard
+`message` note kind stored in the notes table; `comm.quiet` keeps only process-local state
+under ADR-103 and does not create message records.
 
 Key design decisions from ADR-040:
 
@@ -32,6 +34,7 @@ Key design decisions from ADR-040:
   - `comm.thread` — Assertive (queries state)
   - `comm.health` — Assertive (queries channel-poll health)
   - `comm.probe` — Assertive (polls inbound metadata without message payloads)
+  - `comm.quiet` — Directive (requests bounded cooperative background deferral)
   - `comm.suppression_add` — Commissive (the caller commits to suppressing a recipient)
   - `comm.suppression_list` — Assertive (queries suppression state)
   - `comm.suppression_remove` — Commissive (the caller commits to lifting a suppression)
@@ -58,7 +61,7 @@ taxonomy from ADR-025. The mapping is enforced by the `verb_categories_match_spe
 - `NOTE_KINDS = ["message"]`
 - `ENTITY_KINDS = []`
 - `REQUIRES = ["kg"]`
-- `HANDLERS = COMM_HANDLERS` (15 public verb entries plus 5 internal subhandlers)
+- `HANDLERS = COMM_HANDLERS` (16 public verb entries plus 5 internal subhandlers)
 
 The pack self-registers via `inventory::submit!` so it is available when loaded by name.
 
