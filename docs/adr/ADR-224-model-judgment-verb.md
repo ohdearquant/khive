@@ -1,6 +1,6 @@
 # ADR-224: Model Judgment Verb
 
-- **Status:** Proposed
+- **Status:** Accepted 2026-11-27 (#6929)
 - **Date:** 2026-11-27
 - **Grounding commit:** `4a0af99babfdd3e8352692b2757cd00ccbc9ff39`
 - **Relates to:** [ADR-181](ADR-181-exec-verb-sandboxed-run.md) (a run has no network, so this verb is the
