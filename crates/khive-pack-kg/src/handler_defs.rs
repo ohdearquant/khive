@@ -1219,7 +1219,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                 name: "projection",
                 param_type: "string",
                 required: false,
-                description: "Neighbor response shape: edge (origin_id, source_id, target_id, edge_id, relation, weight), summary (origin_id, id, edge_id, relation, weight, name, kind, entity_type), or record (default: the summary fields plus the stored source_id and target_id of the edge). No projection carries the neighbor's properties or description or the edge's metadata; traverse with include_properties=true or get returns the node's properties.",
+                description: "Neighbor response shape: edge (origin_id, source_id, target_id, edge_id, relation, weight), summary (origin_id, id, edge_id, relation, weight, name, kind, entity_type), record (default: the summary fields plus the stored source_id and target_id of the edge), or full (the record fields plus the neighbor's properties and description and the edge's metadata as edge_metadata, each null when absent; a note neighbor has no description, and a note neighbor in another visible namespace has null properties, since notes are read in the caller's own namespace).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

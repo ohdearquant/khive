@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `neighbors` takes `projection="full"`: each neighbor carries the record fields plus its
+  `properties` and `description` and the edge's metadata as `edge_metadata`, so one call answers
+  what took a `get` per neighbor.
 - `gtd.tasks` accepts `compact=true` for smaller task pages with description lengths. Compact
   pages use the same filters, task order, and continuation as full pages (#6914).
 - `git.issue` reads one issue of a configured repository: its title, state, author, dates, label
