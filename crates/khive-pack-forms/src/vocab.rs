@@ -1,4 +1,4 @@
-//! The forms ontology: nine concept subtypes, the properties each must carry
+//! The forms ontology: ten concept subtypes, the properties each must carry
 //! and the typed edges between them.
 
 use khive_types::{EdgeEndpointRule, EdgeRelation, EndpointKind, EntityKind, EntityTypeDef};
@@ -23,9 +23,13 @@ pub(crate) const FORM_SUBJECT: &str = "form_subject";
 /// A term of a list the caller loads: a kind of subject, a role, or a
 /// relation between two subjects of one form.
 pub(crate) const FORM_TERM: &str = "form_term";
+/// A kind of document, such as a statement, a certificate or a form: what
+/// its revisions are, who issues one, and which side produces it. A form is
+/// the kind of document with lines to fill.
+pub(crate) const DOCUMENT_TYPE: &str = "document_type";
 
 /// Every type the pack declares.
-pub(crate) const ALL_TYPES: [&str; 9] = [
+pub(crate) const ALL_TYPES: [&str; 10] = [
     FORM_ISSUER,
     FORM,
     FORM_SECTION,
@@ -35,7 +39,17 @@ pub(crate) const ALL_TYPES: [&str; 9] = [
     FORM_RULE,
     FORM_SUBJECT,
     FORM_TERM,
+    DOCUMENT_TYPE,
 ];
+
+/// Who produces a document of a type: the side that applies, a third party
+/// that issues it, or the work itself.
+pub(crate) const ORIGINS: [&str; 3] = ["applicant", "third_party", "work"];
+
+/// What a line of a document does with its field: asks for it to be filled,
+/// states it as a value every document of the type carries, or requires a
+/// document of another type to be attached.
+pub(crate) const LINE_RELATIONS: [&str; 3] = ["asks", "states", "requires"];
 
 /// What an item asks for.
 pub(crate) const ITEM_KINDS: [&str; 4] = ["text", "choice", "signature", "attachment"];
@@ -106,6 +120,7 @@ pub(crate) fn required_properties(entity_type: &str) -> &'static [&'static str] 
         FORM_RULE => &["text", "source_page", "form_key"],
         FORM_SUBJECT => &["subject_id", "kind", "role", "form_key"],
         FORM_TERM => &["list"],
+        DOCUMENT_TYPE => &["document_type_id", "origin"],
         _ => &[],
     }
 }
@@ -118,8 +133,8 @@ const fn concept(type_name: &'static str) -> EntityTypeDef {
     }
 }
 
-/// The nine concept subtypes.
-pub(crate) static FORMS_ENTITY_TYPES: [EntityTypeDef; 9] = [
+/// The ten concept subtypes.
+pub(crate) static FORMS_ENTITY_TYPES: [EntityTypeDef; 10] = [
     concept(FORM_ISSUER),
     concept(FORM),
     concept(FORM_SECTION),
@@ -129,6 +144,7 @@ pub(crate) static FORMS_ENTITY_TYPES: [EntityTypeDef; 9] = [
     concept(FORM_RULE),
     concept(FORM_SUBJECT),
     concept(FORM_TERM),
+    concept(DOCUMENT_TYPE),
 ];
 
 const fn typed(entity_type: &'static str) -> EndpointKind {
@@ -156,7 +172,8 @@ const fn rule(
 /// `competes_with`, `composed_with` and `enables` between any two concepts;
 /// these rules name the pairs the forms graph uses. `links_to`, `precedes` and
 /// `depends_on` between concepts are open only for the pairs below.
-pub(crate) static FORMS_EDGE_RULES: [EdgeEndpointRule; 22] = [
+pub(crate) static FORMS_EDGE_RULES: [EdgeEndpointRule; 23] = [
+    rule(EdgeRelation::Contains, DOCUMENT_TYPE, FORM),
     rule(EdgeRelation::Contains, FORM_ISSUER, FORM),
     rule(EdgeRelation::Contains, FORM, FORM_SECTION),
     rule(EdgeRelation::Contains, FORM, FORM_ITEM),
@@ -217,6 +234,22 @@ mod tests {
             [(FORM, FORM), (FORM_RULE, FIELD), (FORM_RULE, FIELD_VALUE)]
         );
         assert!(!pairs.contains(&(FORM_ITEM, FORM)));
+    }
+
+    #[test]
+    fn a_document_type_contains_its_form_revisions_by_an_existing_relation() {
+        let parents: Vec<(EdgeRelation, &str)> = FORMS_EDGE_RULES
+            .iter()
+            .filter(|r| subtype(&r.target) == FORM && r.relation == EdgeRelation::Contains)
+            .map(|r| (r.relation, subtype(&r.source)))
+            .collect();
+        assert_eq!(
+            parents,
+            [
+                (EdgeRelation::Contains, DOCUMENT_TYPE),
+                (EdgeRelation::Contains, FORM_ISSUER)
+            ]
+        );
     }
 
     #[test]

@@ -381,11 +381,15 @@ async fn case_1_loading_a_into_an_empty_namespace() {
         "loading the same revision twice changes nothing: {again}"
     );
     assert_eq!(again["form"]["id"], reply["form"]["id"]);
+    assert_eq!(
+        reply["document_type"]["minted"], true,
+        "a form that declares no document type gets one minted from its own id: {reply}"
+    );
     let export = store.call("forms.export", json!({})).await;
     assert_eq!(
         export["nodes"].as_array().expect("nodes").len(),
-        1 + 1 + 7 + 7 + 3,
-        "one issuer, one form, seven items, seven fields, three values: {export}"
+        1 + 1 + 1 + 7 + 7 + 3,
+        "one issuer, one document type, one form, seven items, seven fields, three values: {export}"
     );
 }
 

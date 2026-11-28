@@ -306,11 +306,16 @@ pub(super) fn declared_on(subjects: &HashMap<String, &Entity>) -> Declared {
 /// is required unless it states another necessity. On a form that declares
 /// none, an item naming a subject is refused, and a necessity is kept only
 /// when the item states one.
+///
+/// A stating line names the subject it is about like any line, and has no
+/// writer and no necessity. A line that requires an attached document has a
+/// writer and a necessity as a line that asks for a field does.
 pub(super) fn line_props(
     obj: &Args,
     label: &str,
     item_kind: &str,
-    filled_by: &str,
+    relation: &str,
+    filled_by: Option<&str>,
     declared: &Declared,
 ) -> Result<Map<String, Value>, RuntimeError> {
     let about = params::opt_text(obj, "about")?;
@@ -322,6 +327,10 @@ pub(super) fn line_props(
     let group = params::opt_text(obj, "group")?;
     let selects = params::string_list(obj, "selects")?;
     let asks = vocab::item_needs_field(item_kind);
+    let requires = relation == "requires";
+    // A line someone writes: one that asks for a field, or one that takes an
+    // attached document.
+    let written = (asks && relation != "states") || requires;
     let with_subjects = !declared.is_empty();
 
     let subject = |id: &str, role: &str| -> Result<DeclaredSubject, RuntimeError> {
@@ -353,8 +362,13 @@ pub(super) fn line_props(
         }
         None => {}
     }
-    if asks && with_subjects {
-        let declared = subject(filled_by, "the subject who writes it (filled_by)")?;
+    if written && with_subjects {
+        let writer = filled_by.ok_or_else(|| {
+            invalid(format!(
+                "item \"{label}\" names no subject who writes it (filled_by)"
+            ))
+        })?;
+        let declared = subject(writer, "the subject who writes it (filled_by)")?;
         props.insert("filled_by".to_owned(), json!(declared.id));
     }
     match obj.get("known_to") {
@@ -421,13 +435,13 @@ pub(super) fn line_props(
     }
 
     let necessity = match necessity {
-        Some(_) if !asks => {
+        Some(_) if !asks && !requires => {
             return Err(invalid(format!(
                 "item \"{label}\" asks for no field, so it states no necessity"
             )));
         }
         Some(necessity) => Some(necessity),
-        None if asks && with_subjects => Some("required".to_owned()),
+        None if written && with_subjects => Some("required".to_owned()),
         None => None,
     };
     let rows = own_rows
