@@ -734,6 +734,23 @@ impl GitPack {
             "git.commit" => {
                 let branch = required(params, "branch")?;
                 let expected = required(params, "expected_head")?.to_ascii_lowercase();
+                let tree = required(params, "tree")?;
+                // A commit reads its manifest as the whole tree, and a path the manifest omits is a
+                // deletion, so a scoped tree would delete everything outside its scope. Refused
+                // before any git command runs (ADR-182 Amendment 24, item 3). A tree that does not
+                // load is left to the manifest write below, which reports it as before.
+                if let Ok(khive_runtime::blob_tree::Tree {
+                    scope: Some(scope), ..
+                }) = khive_runtime::blob_tree::load_tree(self.runtime(), tree).await
+                {
+                    receipt.result = json!({ "scope": scope });
+                    let mut failure = Failure::refused("scoped_tree");
+                    failure.detail = Some(format!(
+                        "tree {tree} is scoped to {}; a commit needs a whole tree",
+                        scope.join(", ")
+                    ));
+                    return Err(failure);
+                }
                 if local_git::branch_head(
                     self.runtime().config().git_write.git_program(),
                     repo,
@@ -771,7 +788,6 @@ impl GitPack {
                 };
                 receipt.credential = json!({"source":"actor", "ref":actor.credential_ref, "platform_identity":actor.platform_identity});
                 receipts::persist(self.runtime(), receipt).await?;
-                let tree = required(params, "tree")?;
                 let git_tree = local_git::write_manifest_tree(self.runtime(), repo, tree).await?;
                 let sha = local_git::create_commit(
                     self.runtime().config().git_write.git_program(),
