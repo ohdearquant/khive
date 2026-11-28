@@ -13,7 +13,9 @@ use tokio::task::JoinHandle;
 
 mod priority;
 mod quiet;
-pub use quiet::{quiet_until, request_quiet, wait_until_not_quiet, MAX_QUIET_TTL_SECS};
+pub use quiet::{
+    quiet_status, quiet_until, request_quiet, wait_until_not_quiet, QuietStatus, MAX_QUIET_TTL_SECS,
+};
 #[cfg(test)]
 mod tests;
 

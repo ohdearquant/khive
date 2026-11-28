@@ -710,6 +710,17 @@ impl VerbRegistry {
         params: Value,
         identity: Option<RequestIdentity>,
     ) -> Result<Value, DispatchError> {
+        self.dispatch_with_authority(verb, params, identity, false)
+            .await
+    }
+
+    async fn dispatch_with_authority(
+        &self,
+        verb: &str,
+        params: Value,
+        identity: Option<RequestIdentity>,
+        actor_verified: bool,
+    ) -> Result<Value, DispatchError> {
         // help=true interception: short-circuit before gate/pack.
         if params.get("help").and_then(Value::as_bool) == Some(true) {
             let result = match self.describe_verb(verb) {
@@ -945,6 +956,7 @@ impl VerbRegistry {
                 .map(str::to_owned),
         )
         .with_request_id(request_id)
+        .with_actor_verified(actor_verified)
         .with_owned_namespaces(self.owned_namespaces_for(identity.as_ref()))
         .with_process_ref(match identity.as_ref() {
             Some(id) => id.process_ref.clone(),
@@ -1389,10 +1401,9 @@ impl VerbRegistry {
     /// dispatch boundary mints, so `verified_actor` becomes exactly the principal
     /// those handlers observe.
     ///
-    /// Equivalent to `dispatch_with_identity(verb, params, Some(identity))` with
-    /// `identity.actor_id = Some(verified_actor)` and every other identity scalar
-    /// (namespace, visible namespaces) left at this registry's construction-baked
-    /// value. [`Self::dispatch`] and [`Self::dispatch_with_identity`] are unaffected.
+    /// Uses the registry's construction-baked namespace scope and records host
+    /// verification on the handler token. The ordinary Gate still decides
+    /// whether the call can proceed.
     /// See `docs/api/pack.md#dispatch_as` for the embedding-host use case and the
     /// blank-identifier safety rationale.
     pub async fn dispatch_as(
@@ -1417,7 +1428,8 @@ impl VerbRegistry {
             process_ref: crate::config::process_ref_from_env(),
             request_id: None,
         };
-        self.dispatch_with_identity(verb, params, Some(identity))
+        self.dispatch_with_authority(verb, params, Some(identity), true)
             .await
+            .map_err(DispatchError::into_source)
     }
 }

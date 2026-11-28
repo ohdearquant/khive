@@ -1,5 +1,5 @@
 use khive_runtime::resource_admission::{request_quiet, MAX_QUIET_TTL_SECS};
-use khive_runtime::RuntimeError;
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -9,7 +9,22 @@ struct QuietParams {
     ttl_secs: u64,
 }
 
-pub(crate) fn handle_quiet(params: Value) -> Result<Value, RuntimeError> {
+pub(crate) fn handle_quiet(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    if runtime
+        .config()
+        .quiet_operator
+        .as_ref()
+        .is_some_and(|operator| token.verified_actor() != Some(operator.as_str()))
+    {
+        return Err(RuntimeError::permission_denied(
+            "comm.quiet",
+            "process quiet on a shared host requires its verified operator",
+        ));
+    }
     if !params.is_object() {
         return Err(RuntimeError::InvalidInput(
             "comm.quiet parameters must be an object containing ttl_secs".into(),

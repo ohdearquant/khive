@@ -137,6 +137,7 @@ pub struct NamespaceToken {
     request_id: Option<u64>,
     visible: Vec<Namespace>,
     actor: ActorRef,
+    actor_verified: bool,
     process_ref: Option<String>,
     /// Namespaces the caller declared it owns (`[actor] owned_namespaces`).
     /// Read only through [`NamespaceToken::owns`]; it never widens visibility.
@@ -169,6 +170,7 @@ impl NamespaceToken {
             namespace,
             visible,
             actor,
+            actor_verified: false,
             process_ref: None,
             owned: Vec::new(),
             _sealed: private::Sealed,
@@ -261,6 +263,21 @@ impl NamespaceToken {
     /// Return the actor reference embedded in this token.
     pub fn actor(&self) -> &ActorRef {
         &self.actor
+    }
+
+    /// Return the authenticated actor for a direct host `VerbRegistry::dispatch_as` call.
+    /// Attribution supplied to ordinary dispatch does not establish this authority.
+    pub fn verified_actor(&self) -> Option<&str> {
+        if self.actor_verified {
+            self.actor.binding_id()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn with_actor_verified(mut self, actor_verified: bool) -> Self {
+        self.actor_verified = actor_verified;
+        self
     }
 
     /// Return the originating process's opaque attribution reference, when set.
@@ -440,6 +457,11 @@ pub struct RuntimeConfig {
     /// Default: `AllowAllGate` (permissive). For production policy enforcement,
     /// plug in a Rego- or capability-witness-backed impl.
     pub gate: GateRef,
+    /// Host-installed operator for process-wide quiet in a shared deployment.
+    /// Shared hosts set this on each runtime serving Comm and authenticate the
+    /// operator out of band before calling `VerbRegistry::dispatch_as`. A
+    /// single-operator runtime leaves this unset.
+    pub quiet_operator: Option<crate::VerifiedActor>,
     /// Names of packs the transport layer should register into the VerbRegistry.
     /// The transport layer (e.g. `khive-mcp`) reads this list and instantiates
     /// the matching concrete pack types. Unknown names are reported as errors
@@ -662,6 +684,7 @@ impl Default for RuntimeConfig {
             embedding_model,
             additional_embedding_models,
             gate: Arc::new(AllowAllGate),
+            quiet_operator: None,
             packs,
             blob_hydration_bytes: crate::blob::DEFAULT_BLOB_HYDRATION_BYTES,
             backend_id: BackendId::main(),

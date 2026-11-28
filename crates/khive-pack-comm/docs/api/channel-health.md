@@ -415,18 +415,26 @@ process and returns `{quiet_until: "<RFC3339 UTC deadline>"}`. The required
 normalizes whole-valued JSON numbers such as `1.0` to integers before validation;
 fractional values such as `1.5` are refused. Missing, null,
 non-integer, zero, negative, excessive and unknown parameters refuse before
-changing quiet state. Ordinary caller Gate policy applies; this control change
-is classified as `Write` and retains normal dispatch audit behavior.
+changing quiet state. In shared mode, the caller must be the configured process
+operator. Ordinary Gate policy still applies. The request is classified as
+`Write` and retains normal dispatch audit behavior.
 
 Concurrent or repeated requests keep the later of the current monotonic deadline
-and `now + ttl_secs`. A shorter request cannot shorten another caller's window.
-There is no revoke operation; a requester that stops renewing cannot leave quiet
-active permanently. A live requester may extend it with further valid requests.
-`comm.health.resource.quiet_until` is always present: it is the UTC deadline of
-the winning request while active and null as soon as the monotonic deadline
-expires. Wall-clock adjustments do not change expiry.
+and `now + ttl_secs` up to 15 minutes of continuous quiet. At the cap, quiet
+expires and background work has a 60-second interval before a new quiet window
+can start. An earlier expiry resets the 15-minute allowance after 60 seconds
+without quiet. Both intervals use a monotonic clock.
 
-The deadline is shared across runtime instances and namespaces in this process.
+The full `comm.health` response reports these process-wide fields under `resource`.
+
+| Field                  | Value                                                                                  |
+| ---------------------- | -------------------------------------------------------------------------------------- |
+| `quiet_until`          | The active window's RFC 3339 UTC deadline, or `null` when quiet is inactive.           |
+| `quiet_retry_at`       | The next eligible RFC 3339 UTC time when the continuous cap blocks renewal, or `null`. |
+| `quiet_refusal_reason` | `continuous_quiet_limit` when the continuous cap blocks renewal, or `null`.            |
+
+An explicit request controls the executing process across its runtime instances
+and namespaces. Namespace selection does not grant control of the quiet window.
 Normal forwarding applies it in the daemon; an in-process composition applies
 it in that process. It is not persisted and does not coordinate other daemons.
 The handler does not acquire a background-work permit or a database writer for

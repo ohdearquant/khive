@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use khive_runtime::pack::{AuditSuccessRowsMode, PackRuntime};
 use khive_runtime::{
     classify_operation, EmbedderProvider, EngineConfig, Gate, GateDecision, GateError, GateRequest,
-    OperationAccess, RuntimeError, RuntimeResult,
+    OperationAccess, RuntimeError, RuntimeResult, VerifiedActor,
 };
 use khive_storage::{Event, EventFilter, PageRequest};
 use khive_types::{EventKind, EventOutcome};
@@ -183,6 +183,74 @@ fn quiet_dispatch_reports_shared_state_and_preserves_it_on_refusal() {
             .await
             .unwrap();
         assert_eq!(shorter["quiet_until"], expected);
+    });
+}
+
+#[test]
+#[serial_test::serial(config_ledger)]
+fn shared_quiet_requires_the_verified_operator_and_respects_the_gate() {
+    if isolated() {
+        return;
+    }
+    run(async {
+        let operator = VerifiedActor::new("quiet-fixture").unwrap();
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            quiet_operator: Some(operator.clone()),
+            ..RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        let shared = registry(&runtime, "local", false, false);
+        let read_only = registry(&runtime, "local", true, false);
+        assert!(deadline(&shared).await.is_null());
+
+        let error = shared
+            .dispatch("comm.quiet", json!({"ttl_secs": 300}))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RuntimeError::PermissionDenied { .. }));
+        assert!(deadline(&shared).await.is_null());
+
+        let accepted = shared
+            .dispatch_as("comm.quiet", json!({"ttl_secs": 30}), operator.clone())
+            .await
+            .unwrap();
+        let expected = &accepted["quiet_until"];
+        assert_eq!(&deadline(&shared).await, expected);
+        assert!(chrono::DateTime::parse_from_rfc3339(expected.as_str().unwrap()).is_ok());
+
+        for actor_id in ["quiet-tenant", operator.as_str()] {
+            let identity = RequestIdentity {
+                namespace: "local".into(),
+                actor_id: Some(actor_id.into()),
+                ..Default::default()
+            };
+            let error = shared
+                .dispatch_with_identity("comm.quiet", json!({"ttl_secs": 300}), Some(identity))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, RuntimeError::PermissionDenied { .. }));
+            assert_eq!(&deadline(&shared).await, expected);
+        }
+
+        let tenant = VerifiedActor::new("quiet-tenant").unwrap();
+        let error = shared
+            .dispatch_as("comm.quiet", json!({"ttl_secs": 300}), tenant)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RuntimeError::PermissionDenied { .. }));
+        assert_eq!(&deadline(&shared).await, expected);
+
+        let error = read_only
+            .dispatch_as("comm.quiet", json!({"ttl_secs": 300}), operator)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::PermissionDenied { reason, .. }
+                if reason == "fixture permits only reviewed reads"
+        ));
+        assert_eq!(&deadline(&shared).await, expected);
     });
 }
 
