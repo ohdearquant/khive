@@ -14,8 +14,8 @@ use super::read::{cite, form_name, names};
 use super::views::usage;
 use super::Ctx;
 use crate::store::{
-    invalid, is_general, label, pending_premises, prop, prop_text, quoted_names, scalar, strings,
-    type_of, wordings, Graph,
+    invalid, is_general, is_stating, label, pending_premises, prop, prop_text, quoted_names,
+    scalar, strings, type_of, wordings, Graph,
 };
 use crate::text::normalize;
 use crate::vocab::{self, FIELD_VALUE, FORM, FORM_ITEM, FORM_RULE, FORM_SECTION};
@@ -53,7 +53,8 @@ fn number(node: &Entity, key: &str) -> f64 {
 type Unbound<'g> = Vec<(&'g Entity, &'g Entity)>;
 
 /// The lines of the checked forms that ask for a field, form by form in
-/// printed order, and the items that ask for one and are bound to none.
+/// printed order, and the items that ask for one and are bound to none. A
+/// line that states its field is never asked, so it is neither.
 fn lines_of<'g>(graph: &'g Graph, set: &[&'g Entity]) -> (Vec<Line<'g>>, Unbound<'g>) {
     let mut lines = Vec::new();
     let mut unbound = Vec::new();
@@ -64,6 +65,7 @@ fn lines_of<'g>(graph: &'g Graph, set: &[&'g Entity]) -> (Vec<Line<'g>>, Unbound
             .into_iter()
             .filter_map(|i| graph.get(i))
             .filter(|i| prop_text(i, "item_kind").is_some_and(|k| vocab::item_needs_field(&k)))
+            .filter(|i| !is_stating(i))
             .collect();
         items.sort_by(|a, b| {
             number(a, "page")
@@ -198,6 +200,40 @@ fn answers(args: &Args) -> Result<Vec<Answer>, RuntimeError> {
     }
 }
 
+/// A line of the checked forms that states `field` of the subject, on the
+/// named form or on any form of the set, with that form.
+fn stating_line<'g>(
+    graph: &'g Graph,
+    set: &[&'g Entity],
+    form: Option<Uuid>,
+    subject: Option<&str>,
+    field: Uuid,
+) -> Option<(&'g Entity, &'g Entity)> {
+    let bound = |item: Uuid| {
+        let target = graph.out(item, EdgeRelation::VariantOf).first().copied()?;
+        if graph.is(target, FIELD_VALUE) {
+            graph.parent_field(target)
+        } else {
+            Some(target)
+        }
+    };
+    set.iter()
+        .copied()
+        .filter(|f| form.is_none_or(|id| f.id == id))
+        .flat_map(|f| {
+            graph
+                .items_in(f.id)
+                .into_iter()
+                .filter_map(|i| graph.get(i))
+                .map(move |item| (f, item))
+        })
+        .find(|(_, item)| {
+            is_stating(item)
+                && prop_text(item, "about").map(|a| normalize(&a)).as_deref() == subject
+                && bound(item.id) == Some(field)
+        })
+}
+
 /// The slot and row an answer fills and the lines that print it, or why it
 /// fits none.
 fn place(
@@ -289,6 +325,16 @@ fn place(
         .map(|(i, _)| i)
         .collect();
     if asking.is_empty() {
+        if let Some((stating_form, line)) =
+            stating_line(graph, set, form, subject.as_deref(), field.id)
+        {
+            return Err(format!(
+                "the line \"{}\" of {} states \"{}\" {whose}, and a stating line is never asked, so no answer fills it",
+                label(line),
+                form_name(stating_form),
+                field.name
+            ));
+        }
         return Err(format!(
             "no line of the checked forms asks for \"{}\" {whose}",
             field.name

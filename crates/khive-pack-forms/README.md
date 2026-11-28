@@ -1,6 +1,6 @@
 # khive-pack-forms
 
-A typed graph of printed forms for khive. It stores who issues a form, the form's sections and items, the field each item means, the allowed values of a choice field and the rules printed on the form, and keeps one field per meaning however many forms print it and however they word it.
+A typed graph of printed forms for khive. It stores who issues a form, what kind of document each revision is, the form's sections and items, the field each item means, the allowed values of a choice field and the rules printed on the form, and keeps one field per meaning however many forms print it and however they word it.
 
 The pack is linked into the server and selected by name (`--pack forms`, beside `kg`).
 
@@ -23,7 +23,15 @@ The pack is linked into the server and selected by name (`--pack forms`, beside 
 
 ## Types and edges
 
-All nine types are `concept` entities: `form_issuer`, `form`, `form_section`, `form_item`, `field`, `field_value`, `form_rule`, `form_subject` and `form_term`. The pack adds typed endpoint rules for `contains`, `variant_of`, `links_to`, `competes_with`, `composed_with`, `precedes`, `depends_on` and `enables` between them; `depends_on`, `precedes` and `links_to` between concepts are open only for these pairs.
+All ten types are `concept` entities: `form_issuer`, `document_type`, `form`, `form_section`, `form_item`, `field`, `field_value`, `form_rule`, `form_subject` and `form_term`. The pack adds typed endpoint rules for `contains`, `variant_of`, `links_to`, `competes_with`, `composed_with`, `precedes`, `depends_on` and `enables` between them; `depends_on`, `precedes` and `links_to` between concepts are open only for these pairs.
+
+## Document types
+
+Every form revision belongs to a document type, which contains it. A document may declare its type (`document_type`: `id`, `name`, `origin` of `applicant`, `third_party` or `work`, and an optional `issuer_class`). A form that declares none gets a type minted from its form id and title, with origin `applicant` and marked `minted`; a later revision that declares the type under that id replaces the guess, and a declaration that disagrees with a declared type is refused. `forms.lint` lists minted types and forms that no type contains, and neither keeps the graph from being clean.
+
+An item says what it does with its field (`relation`): it `asks` for it (the default), `states` it, or `requires` an attached document. A stating line is a value every document of the type carries printed on it; it names its subject and field and nothing else, `forms.check` never asks it, and an answer keyed to it comes back unplaced. A requiring line is an `attachment` item naming the id of the type it takes (`document_type`), with a writer and a necessity like an asking line; the type must already be loaded and must not be the form's own, so two types that require each other cannot both load. `forms.check` does not yet report a requiring line, because no answer attaches a document. The decisions are recorded in [ADR-223](../../docs/adr/ADR-223-forms-document-types.md).
+
+An outside system that holds values about a subject, such as a permit portal, is declared the way a document type is, with `system: true` in place of an `origin`: its record is loaded once as a form whose subjects and stating lines say which fields it holds for whom. Every line of a system's record states its field; a document that gives one an asking or requiring line is refused at `forms.load` and at `forms.add_item`, a declaration with both `system` and `origin`, or with neither, is refused, and a type minted for a form already loaded is never declared a system. The mark comes from [ADR-222](../../docs/adr/ADR-222-operation-graph.md) Amendment 1, A1.4 point 2.
 
 ## Subjects and lines
 

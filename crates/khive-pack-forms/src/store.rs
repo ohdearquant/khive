@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::text::normalize;
 use crate::vocab::{
-    self, FIELD, FIELD_VALUE, FORM, FORM_ISSUER, FORM_ITEM, FORM_RULE, FORM_SECTION, FORM_SUBJECT,
-    FORM_TERM,
+    self, DOCUMENT_TYPE, FIELD, FIELD_VALUE, FORM, FORM_ISSUER, FORM_ITEM, FORM_RULE, FORM_SECTION,
+    FORM_SUBJECT, FORM_TERM,
 };
 
 const ENTITY_PAGE: u32 = 500;
@@ -145,6 +145,22 @@ pub(crate) fn pending_premise(field: &str, value: Option<&str>) -> Value {
 /// The content key of one form revision.
 pub(crate) fn form_key(form_id: &str, revision: &str) -> String {
     format!("form:{form_id}@{revision}")
+}
+
+/// The content key of one document type.
+pub(crate) fn document_type_key(document_type_id: &str) -> String {
+    format!("document_type:{document_type_id}")
+}
+
+/// What a line does with its field: `asks` (the default), `states` or
+/// `requires`.
+pub(crate) fn line_relation(item: &Entity) -> String {
+    prop_text(item, "relation").unwrap_or_else(|| "asks".to_owned())
+}
+
+/// Whether a line states its field rather than asking for it.
+pub(crate) fn is_stating(item: &Entity) -> bool {
+    line_relation(item) == "states"
 }
 
 pub(crate) fn quoted_names(entities: &[&Entity]) -> String {
@@ -315,6 +331,7 @@ impl Graph {
                 normalize(&prop_text(e, "subject_id")?)
             ),
             FORM_TERM => format!("term:{}:{}", prop_text(e, "list")?, normalize(&e.name)),
+            DOCUMENT_TYPE => document_type_key(&prop_text(e, "document_type_id")?),
             _ => return None,
         })
     }
@@ -323,6 +340,23 @@ impl Graph {
         self.of_type(FORM)
             .into_iter()
             .find(|f| self.key(f.id).as_deref() == Some(key))
+    }
+
+    /// A document type by the id its documents give it.
+    pub(crate) fn document_type_by_id(&self, document_type_id: &str) -> Option<&Entity> {
+        let key = document_type_key(document_type_id);
+        self.of_type(DOCUMENT_TYPE)
+            .into_iter()
+            .find(|t| self.key(t.id).as_deref() == Some(key.as_str()))
+    }
+
+    /// The document type a form revision belongs to; absent for a form
+    /// loaded before document types existed.
+    pub(crate) fn document_type_of(&self, form: Uuid) -> Option<&Entity> {
+        self.incoming(form, EdgeRelation::Contains)
+            .into_iter()
+            .filter_map(|t| self.get(t))
+            .find(|t| type_of(t) == DOCUMENT_TYPE)
     }
 
     /// The form a section, item or rule belongs to.

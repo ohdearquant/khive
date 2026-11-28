@@ -28,6 +28,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `forms.terms` lists the loaded terms with their aliases, and `forms.subjects` lists the subjects
   of one form revision. A term may carry aliases, and two more term lists, `counting_qualifiers`
   and `carrying_relations`, sit beside kinds, roles and relations.
+- The `forms` pack records what kind of document each form revision is. A `document_type` node
+  (`id`, `name`, `origin` of `applicant`, `third_party` or `work`, optional `issuer_class`)
+  contains its revisions; `forms.load` takes it as `document_type` and mints one, marked `minted`,
+  for a form that declares none, and a later declaration replaces the guess. An item's `relation`
+  says whether it asks for its field (the default), states it (a value printed on every document
+  of the type, which `forms.check` never asks and which an answer cannot fill) or requires an
+  attached document of a loaded type other than its own. `forms.lint` lists minted types and forms
+  no type contains, without counting them against `clean` (#6892, ADR-223).
+- `forms.load` declares an outside system the way it declares a document type:
+  `document_type` with `system: true` in place of an `origin`. Every line of a system's record
+  states its field; an asking or requiring line on one is refused at `forms.load` and
+  `forms.add_item` (#6904, ADR-222 Amendment 1).
 - `git.pr_list` and `git.issue_list` list the pull requests or issues of a configured repository
   in the requested state (`open` unless `closed` or `all` is named), newest created first, one
   hundred to a page for at most ten pages, and say in `truncated` whether more matched.

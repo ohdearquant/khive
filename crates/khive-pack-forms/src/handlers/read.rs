@@ -13,13 +13,13 @@ use super::views::{field_reply, usage};
 use super::write::{DECISION, FORMAT, LOG_KEYS};
 use super::Ctx;
 use crate::store::{
-    aliases, definition, invalid, is_general, label, prop, prop_text, props, scalar, strings,
-    type_of, wordings, Graph,
+    aliases, definition, invalid, is_general, is_stating, label, prop, prop_text, props, scalar,
+    strings, type_of, wordings, Graph,
 };
 use crate::text::normalize;
 use crate::vocab::{
-    self, ALL_TYPES, FIELD, FIELD_VALUE, FORM, FORM_ISSUER, FORM_ITEM, FORM_RULE, FORM_SECTION,
-    FORM_SUBJECT, FORM_TERM, TERM_LISTS,
+    self, ALL_TYPES, DOCUMENT_TYPE, FIELD, FIELD_VALUE, FORM, FORM_ISSUER, FORM_ITEM, FORM_RULE,
+    FORM_SECTION, FORM_SUBJECT, FORM_TERM, TERM_LISTS,
 };
 
 const ANNOTATION_PAGE: u32 = 1000;
@@ -92,6 +92,8 @@ fn item_view(graph: &Graph, item: &Entity) -> Value {
         view[slot] = json!(target.name);
     }
     for key in [
+        "relation",
+        "document_type",
         "about",
         "known_to",
         "known_to_via",
@@ -580,9 +582,11 @@ pub(crate) async fn lint(ctx: &Ctx<'_>, _params: Value) -> Result<Value, Runtime
     let mut missing_source = Vec::new();
     for entity_type in ALL_TYPES {
         for node in graph.of_type(entity_type) {
+            // A stating line has nobody who fills it in.
             let missing: Vec<&str> = vocab::required_properties(entity_type)
                 .iter()
                 .copied()
+                .filter(|key| !(*key == "filled_by" && is_stating(node)))
                 .filter(|key| !present(node, key))
                 .collect();
             if !missing.is_empty() {
@@ -604,7 +608,9 @@ pub(crate) async fn lint(ctx: &Ctx<'_>, _params: Value) -> Result<Value, Runtime
                             .any(|v| !graph.incoming(*v, EdgeRelation::VariantOf).is_empty())
                 }
                 FIELD_VALUE => graph.parent_field(node.id).is_some(),
-                FORM_ISSUER => !graph.out(node.id, EdgeRelation::Contains).is_empty(),
+                FORM_ISSUER | DOCUMENT_TYPE => {
+                    !graph.out(node.id, EdgeRelation::Contains).is_empty()
+                }
                 _ => true,
             };
             if !sourced {
@@ -612,6 +618,27 @@ pub(crate) async fn lint(ctx: &Ctx<'_>, _params: Value) -> Result<Value, Runtime
             }
         }
     }
+
+    // Two lists of what was guessed or not yet said, not of what is broken:
+    // a document type minted for a form that named none, and a form loaded
+    // before document types existed. Neither keeps the graph from being
+    // clean.
+    let minted_document_types: Vec<Value> = graph
+        .of_type(DOCUMENT_TYPE)
+        .into_iter()
+        .filter(|t| prop(t, "minted").and_then(Value::as_bool) == Some(true))
+        .map(|t| {
+            let mut entry = brief_of(t);
+            entry["document_type_id"] = json!(prop_text(t, "document_type_id"));
+            entry
+        })
+        .collect();
+    let forms_without_document_type: Vec<Value> = graph
+        .of_type(FORM)
+        .into_iter()
+        .filter(|f| graph.document_type_of(f.id).is_none())
+        .map(cite)
+        .collect();
 
     let report = json!({
         "unbound_items": unbound_items,
@@ -630,6 +657,8 @@ pub(crate) async fn lint(ctx: &Ctx<'_>, _params: Value) -> Result<Value, Runtime
         .is_some_and(|m| m.values().all(|v| v.as_array().is_some_and(Vec::is_empty)));
     let mut report = report;
     report["clean"] = json!(clean);
+    report["minted_document_types"] = json!(minted_document_types);
+    report["forms_without_document_type"] = json!(forms_without_document_type);
     Ok(report)
 }
 

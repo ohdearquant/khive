@@ -37,7 +37,7 @@ fn writes_are_commissive_and_reads_assertive() {
 #[test]
 fn the_pack_declares_its_types_and_edges_and_needs_kg() {
     assert_eq!(FormsPack::NAME, "forms");
-    assert_eq!(FormsPack::ENTITY_TYPES.len(), 9);
-    assert_eq!(FormsPack::EDGE_RULES.len(), 22);
+    assert_eq!(FormsPack::ENTITY_TYPES.len(), 10);
+    assert_eq!(FormsPack::EDGE_RULES.len(), 23);
     assert_eq!(FormsPack::REQUIRES, ["kg"]);
 }
