@@ -12,10 +12,10 @@ categories.workspace = true
 description = "Forms pack: a typed graph of printed forms, the fields their items mean, choice values and printed rules"
 
 [dependencies]
-khive-changeset = { version = "0.23.0", path = "../khive-changeset" }
-khive-types = { version = "0.23.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.23.0", path = "../khive-runtime" }
-khive-storage = { version = "0.23.0", path = "../khive-storage" }
+khive-changeset = { version = "0.24.0", path = "../khive-changeset" }
+khive-types = { version = "0.24.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.24.0", path = "../khive-runtime" }
+khive-storage = { version = "0.24.0", path = "../khive-storage" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }

@@ -323,4 +323,36 @@ mod search_ranking_tests {
             }
         }
     }
+
+    /// A coordinated search assembles its own rows and cannot follow edges
+    /// across backends, so it refuses `follow` instead of dropping it.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn coordinator_refuses_follow() {
+        let server = server(Some(RankingCoordinator {
+            kind: RankScoreKind::Rrf,
+            signals: SearchSignals::default(),
+            failed: false,
+        }));
+        for substrate in ["entity", "note"] {
+            let control = search(
+                &server,
+                json!({"kind": substrate, "query": "ranking"}),
+                "verbose",
+            )
+            .await;
+            assert_eq!(control["ok"], true, "{control}");
+            let entry = search(
+                &server,
+                json!({"kind": substrate, "query": "ranking", "follow": "extends"}),
+                "verbose",
+            )
+            .await;
+            assert_eq!(entry["ok"], false, "{entry}");
+            assert!(
+                entry.to_string().contains("not available on a multi-backend search"),
+                "{entry}"
+            );
+        }
+    }
 }
