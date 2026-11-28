@@ -47,6 +47,7 @@ fn run_in_pid_trust_child() -> bool {
     let fixture = tempfile::Builder::new()
         .prefix("kh-pid-trust-")
         .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("kh-pid-trust-").tempdir())
         .expect("short isolated socket directory");
     let home = fixture.path().join("home");
     std::fs::create_dir(&home).expect("private HOME");

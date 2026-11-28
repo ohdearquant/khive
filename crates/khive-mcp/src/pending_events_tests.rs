@@ -91,7 +91,7 @@ struct AsyncBlockingSideEffectPack {
 }
 
 impl khive_types::Pack for AsyncBlockingSideEffectPack {
-    const NAME: &'static str = "async-blocking-side-effect-test";
+    const NAME: &'static str = "test";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -192,7 +192,7 @@ impl Gate for DenyOrdinaryHandlerFailureGate {
 }
 
 impl khive_types::Pack for OrdinaryHandlerFailurePack {
-    const NAME: &'static str = "ordinary-handler-failure-test";
+    const NAME: &'static str = "test";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -239,7 +239,7 @@ impl khive_runtime::PackRuntime for OrdinaryHandlerFailurePack {
 }
 
 impl khive_types::Pack for AmbiguousSideEffectPack {
-    const NAME: &'static str = "ambiguous-side-effect-test";
+    const NAME: &'static str = "test";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -5571,6 +5571,7 @@ async fn wrapper_seam_falls_through_to_project_actor_instead_of_clearing_it() {
         namespace: None,
         no_embed: false,
         pack: Vec::new(),
+        catalog_verbosity: crate::args::CatalogVerbosity::Full,
         config: None,
         daemon: false,
         lifetime: None,
@@ -5628,6 +5629,7 @@ async fn build_server_cli_seam_clears_actor_for_explicit_local_namespace() {
         namespace: Some("local".to_string()),
         no_embed: false,
         pack: Vec::new(),
+        catalog_verbosity: crate::args::CatalogVerbosity::Full,
         config: None,
         daemon: false,
         lifetime: None,

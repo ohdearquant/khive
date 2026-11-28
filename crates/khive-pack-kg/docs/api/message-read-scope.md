@@ -41,6 +41,33 @@ now a tombstone. `context` still requires explicit anchors to be live visible en
 mailbox filtering does not make a note a valid explicit anchor. Entity and other non-message
 records retain their existing read rules.
 
+## Sender and recipient list filters
+
+For each stored message note, `list` compares `from` with the string in
+`properties.from_actor` and `to` with the string in `properties.to_actor`. If the
+corresponding actor field is absent, null or not a JSON string, the filter uses
+that note's legacy `properties.from` or `properties.to` string. If neither field
+contains a string, the comparison value is empty. An actor string, including an
+empty or whitespace-only string, takes precedence. Comparisons are exact and
+case-sensitive: they do not trim, resolve aliases or fall back to `note.namespace`.
+
+The stored row's kind controls this preference, including messages encountered
+by a broad `kind="note"` list. Non-message notes retain their legacy-property
+string comparison even if they contain actor-shaped fields. Omitted or null
+filter arguments impose no endpoint filter; an empty string is an exact filter.
+
+These filters narrow the already-authorized mailbox view. They cannot select
+another actor's mailbox or admit a row rejected by its routing fields. The same
+rule applies before pagination in ordinary offset, UUID cursor and keyed-note
+lists, including `after_key`. Existing scan caps and continuation rules remain
+unchanged; filtering by an actor is not a bound on scan work.
+
+Filtering does not rewrite returned notes. KG list responses retain their stored
+properties. Comm's separate message renderer uses a string sender actor or the
+note namespace for `from`, and the stored recipient actor value or null for `to`.
+The list filters therefore do not promise identical legacy display values across
+those APIs.
+
 ## Prefixes and configured backends
 
 Full-ID KG reads can resolve through `VerbRegistry::resolve_kg_read_by_id`, which checks

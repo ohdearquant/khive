@@ -51,6 +51,9 @@ pub struct PostCommitEffectsReport {
     pub outcomes: Vec<PostCommitEmbeddingOutcome>,
     /// One `effect[<index>] <effect>: <error>` entry per effect that failed.
     pub failures: Vec<String>,
+    /// Each failed effect beside its error, in effect order, so a caller can
+    /// name the row an error belongs to.
+    pub failed_effects: Vec<(PostCommitEffect, String)>,
 }
 
 impl PostCommitEffectsReport {
@@ -79,15 +82,20 @@ pub async fn apply_post_commit_effects_with_failures(
     let mut report = PostCommitEffectsReport {
         outcomes: Vec::new(),
         failures: Vec::new(),
+        failed_effects: Vec::new(),
     };
     for (index, effect) in effects.into_effects().into_iter().enumerate() {
         let identity = format!("{effect:?}");
+        let attempted = effect.clone();
         match apply_one_post_commit_effect(runtime, token, effect).await {
             Ok(Some(outcome)) => report.outcomes.push(outcome),
             Ok(None) => {}
-            Err(error) => report
-                .failures
-                .push(format!("effect[{index}] {identity}: {error}")),
+            Err(error) => {
+                report
+                    .failures
+                    .push(format!("effect[{index}] {identity}: {error}"));
+                report.failed_effects.push((attempted, error.to_string()));
+            }
         }
     }
     report

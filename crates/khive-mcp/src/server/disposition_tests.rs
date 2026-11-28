@@ -107,21 +107,21 @@ impl khive_types::Pack for ErrorPack {
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [khive_runtime::HandlerDef] = &[
         khive_runtime::HandlerDef {
-            name: "a3_handler_invalid",
+            name: "a3fixture.a3_handler_invalid",
             description: "raise InvalidInput inside the handler",
             visibility: khive_runtime::Visibility::Verb,
             category: khive_runtime::VerbCategory::Directive,
             params: &[],
         },
         khive_runtime::HandlerDef {
-            name: "a3_handler_secret",
+            name: "a3fixture.a3_handler_secret",
             description: "invoke the actual secret gate inside the handler",
             visibility: khive_runtime::Visibility::Verb,
             category: khive_runtime::VerbCategory::Directive,
             params: &[],
         },
         khive_runtime::HandlerDef {
-            name: "a3_nested_refusal",
+            name: "a3fixture.a3_nested_refusal",
             description: "propagate a nested dispatch refusal through its parent handler",
             visibility: khive_runtime::Visibility::Verb,
             category: khive_runtime::VerbCategory::Directive,
@@ -159,15 +159,15 @@ impl khive_runtime::PackRuntime for ErrorPack {
         _token: &khive_runtime::NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "a3_handler_invalid" => Err(RuntimeError::InvalidInput(
+            "a3fixture.a3_handler_invalid" => Err(RuntimeError::InvalidInput(
                 "raised inside the handler".into(),
             )),
-            "a3_handler_secret" => {
+            "a3fixture.a3_handler_secret" => {
                 // Same fake token as the secret gate's own positive control.
                 khive_runtime::secret_gate::check("AKIAFAKEKEY1234567890")?;
                 panic!("the actual secret detector must reject its positive control")
             }
-            "a3_nested_refusal" => registry.dispatch("a3_missing_child", json!({})).await,
+            "a3fixture.a3_nested_refusal" => registry.dispatch("a3_missing_child", json!({})).await,
             "hidden" => panic!("wire subhandler guard was bypassed"),
             other => panic!("unexpected fixture handler {other}"),
         }
@@ -577,9 +577,9 @@ async fn wire_subhandler_refusal_covers_chains_batches_and_bracketed_units() {
 async fn a3_handler_errors_and_nested_child_refusal_remain_unknown() {
     let fixture = Fixture::new();
     for ops in [
-        "a3_handler_invalid()",
-        "a3_handler_secret()",
-        "a3_nested_refusal()",
+        "a3fixture.a3_handler_invalid()",
+        "a3fixture.a3_handler_secret()",
+        "a3fixture.a3_nested_refusal()",
     ] {
         let response = fixture.request(ops).await;
         let entry = &response["results"][0];
@@ -600,7 +600,7 @@ async fn a3_handler_errors_and_nested_child_refusal_remain_unknown() {
 async fn a3_failed_chain_marks_only_unreached_operations_aborted() {
     let fixture = Fixture::new();
     let before = fixture.stats().await;
-    let response = fixture.request(r#"a3_handler_invalid() | create(kind="entity", entity_kind="concept", name="must-not-exist") | comm.send(to="local", content="must-not-exist")"#).await;
+    let response = fixture.request(r#"a3fixture.a3_handler_invalid() | create(kind="entity", entity_kind="concept", name="must-not-exist") | comm.send(to="local", content="must-not-exist")"#).await;
     assert_eq!(
         response["results"][0]["error"]["domain_disposition"],
         "unknown"
@@ -631,7 +631,7 @@ async fn issue_2951_parallel_failures_surface_each_domain_outcome_beside_ok() {
             r#"[
         create(kind="concept", name="issue-2951-persisted"),
         a3_missing_verb(),
-        a3_handler_invalid()
+        a3fixture.a3_handler_invalid()
     ]"#,
         )
         .await;
@@ -1276,6 +1276,36 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "khive-mcp/src/server.rs",
         "server_core",
         "khive-mcp/src/server/server_core.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
+        "bridge_share",
+        "khive-mcp/src/server/bridge_share.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
+        "computer_bridge",
+        "khive-mcp/src/server/computer_bridge.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
+        "computer_catalog",
+        "khive-mcp/src/server/computer_catalog.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
+        "computer_client",
+        "khive-mcp/src/server/computer_client.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
+        "computer_http",
+        "khive-mcp/src/server/computer_http.rs",
+    ),
+    (
+        "khive-mcp/src/server.rs",
+        "computer_routing",
+        "khive-mcp/src/server/computer_routing.rs",
     ),
     (
         "khive-mcp/src/daemon.rs",

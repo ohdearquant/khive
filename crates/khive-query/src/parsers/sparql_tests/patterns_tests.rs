@@ -39,6 +39,23 @@ fn explicit_range() {
 }
 
 #[test]
+fn explicit_zero_ranges_preserve_bounds_without_admitting_bare_star() {
+    for max in [0, 1, 3] {
+        let q = parse(&format!(
+            "SELECT ?a ?b WHERE {{ ?a :extends{{0,{max}}} ?b . }}"
+        ))
+        .unwrap();
+        let edge = q.pattern.edges().next().unwrap();
+        assert_eq!((edge.min_hops, edge.max_hops), (0, max));
+        assert!(q.pattern.has_variable_length());
+    }
+    assert!(matches!(
+        parse("SELECT ?a ?b WHERE { ?a :extends* ?b . }"),
+        Err(QueryError::Unsupported(_))
+    ));
+}
+
+#[test]
 fn three_node_chain() {
     let q = parse("SELECT ?a ?c WHERE { ?a :extends ?b . ?b :introduced_by ?c . ?c a :paper . }")
         .unwrap();

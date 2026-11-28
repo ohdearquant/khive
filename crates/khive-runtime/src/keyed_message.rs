@@ -63,6 +63,7 @@ pub async fn create_keyed_message_pair_with_extra_statements(
     extra_statements: Vec<SqlStatement>,
 ) -> RuntimeResult<KeyedMessageWrite> {
     crate::atomic_message::validate_note_attachments(runtime, attachments)?;
+    crate::secret_gate::check_at(physical_key, "note", "key")?;
     let namespace = specs[0].token.namespace().as_str().to_owned();
     if specs.iter().any(|spec| spec.kind != "message")
         || specs[1].token.namespace().as_str() != namespace
@@ -188,3 +189,7 @@ pub async fn find_keyed_message_holder(
         )),
     }
 }
+
+#[cfg(test)]
+#[path = "keyed_message_tests.rs"]
+mod tests;

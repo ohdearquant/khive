@@ -31,6 +31,11 @@ pub(crate) struct BulkCreateEntry {
     pub(crate) entity_kind: Option<String>,
     pub(crate) entity_type: Option<String>,
     pub(crate) description: Option<String>,
+    // entity-only: the item's caller key and `on_key` (ADR-221 section 1)
+    pub(crate) key: Option<String>,
+    pub(crate) on_key: Option<String>,
+    // entity-only: caller aliases (ADR-221 section 2)
+    pub(crate) aliases: Option<Vec<String>>,
     // note-only
     pub(crate) content: Option<String>,
     pub(crate) note_kind: Option<String>,
@@ -58,6 +63,11 @@ pub(crate) struct CreateParams {
     /// sent to the embedder is replaced with this value.
     pub(crate) embedding_content: Option<String>,
     pub(crate) key: Option<String>,
+    /// ADR-221 section 1: `"update"` turns a keyed entity create whose
+    /// held key carries a different payload into an update of the holder.
+    pub(crate) on_key: Option<String>,
+    /// ADR-221 section 2: other exact names of the entity. Entities only.
+    pub(crate) aliases: Option<Vec<String>>,
     pub(crate) embed: Option<bool>,
     #[serde(
         default,
@@ -101,6 +111,8 @@ pub(crate) struct ListParams {
     /// page. An empty string starts cursor mode from the beginning.
     pub(crate) after: Option<String>,
     pub(crate) note_kind: Option<String>,
+    #[serde(default)]
+    pub(crate) exclude_superseded: bool,
     /// Substrate notes.status selection, separate from workflow status below.
     pub(crate) note_status: Option<khive_storage::note::NoteStatusSelector>,
     pub(crate) status: Option<String>,
@@ -175,6 +187,13 @@ pub struct UpdateParams {
     pub(crate) weight: Option<f64>,
     pub(crate) entity_kind: Option<Value>,
     pub(crate) expected_version: Option<i64>,
+    /// ADR-221 section 2: caller aliases to add to and remove from an
+    /// entity. `remove_aliases` reaches caller-origin aliases only.
+    pub(crate) add_aliases: Option<Vec<String>>,
+    pub(crate) remove_aliases: Option<Vec<String>>,
+    /// ADR-221 section 3: whether a rename keeps the old name as an alias.
+    /// Absent means true.
+    pub(crate) keep_old_name: Option<bool>,
     #[serde(
         default,
         deserialize_with = "khive_runtime::note_write::deserialize_optional_fences"
@@ -248,6 +267,7 @@ pub(crate) struct SearchParams {
     pub(crate) order_by: Option<String>,
     pub(crate) created_after: Option<String>,
     pub(crate) created_before: Option<String>,
+    pub(crate) follow: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -328,6 +348,8 @@ pub(crate) enum NeighborProjection {
     Edge,
     Summary,
     Record,
+    /// Record plus the neighbor's properties and description and the edge's metadata.
+    Full,
 }
 
 #[derive(Deserialize)]

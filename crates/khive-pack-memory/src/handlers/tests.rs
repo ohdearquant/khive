@@ -68,9 +68,11 @@ fn effective_config_uses_defaults() {
         tags: None,
         tag_mode: TagMode::Any,
         exclude_tags: None,
+        prefer_tags: None,
         include_source_id: None,
         include_timings: None,
         entity_names: None,
+        label: None,
         full_content: None,
         profile_id: None,
         created_after: None,
@@ -103,9 +105,11 @@ fn effective_config_legacy_overrides() {
         tags: None,
         tag_mode: TagMode::Any,
         exclude_tags: None,
+        prefer_tags: None,
         include_source_id: None,
         include_timings: None,
         entity_names: None,
+        label: None,
         full_content: None,
         profile_id: None,
         created_after: None,
@@ -140,9 +144,11 @@ fn effective_config_explicit_config_wins() {
         tags: None,
         tag_mode: TagMode::Any,
         exclude_tags: None,
+        prefer_tags: None,
         include_source_id: None,
         include_timings: None,
         entity_names: None,
+        label: None,
         full_content: None,
         profile_id: None,
         created_after: None,
@@ -181,9 +187,11 @@ fn test_weighted_strategy_preserves_pack_weights() {
         tags: None,
         tag_mode: TagMode::Any,
         exclude_tags: None,
+        prefer_tags: None,
         include_source_id: None,
         include_timings: None,
         entity_names: None,
+        label: None,
         full_content: None,
         profile_id: None,
         created_after: None,
@@ -245,9 +253,11 @@ fn test_weighted_strategy_from_rrf_config_uses_vector_heavy_defaults() {
         tags: None,
         tag_mode: TagMode::Any,
         exclude_tags: None,
+        prefer_tags: None,
         include_source_id: None,
         include_timings: None,
         entity_names: None,
+        label: None,
         full_content: None,
         profile_id: None,
         created_after: None,
@@ -1220,6 +1230,36 @@ fn recall_help_states_the_server_side_caps_it_enforces() {
                 .contains(&format!("max {MAX_RECALL_LIMIT})")),
             "{name} help must state the enforced maximum {MAX_RECALL_LIMIT}: {}",
             param.description
+        );
+    }
+}
+
+#[test]
+fn recall_help_states_the_scaled_entity_term_and_its_breakdown_fields() {
+    use khive_types::Pack;
+
+    let recall_def = <crate::MemoryPack as Pack>::HANDLERS
+        .iter()
+        .find(|h| h.name == "memory.recall")
+        .expect("memory.recall HandlerDef exists");
+    let param = |name: &str| {
+        recall_def
+            .params
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("memory.recall advertises {name}"))
+            .description
+    };
+    let min_score = param("min_score");
+    assert!(
+        min_score.contains("1 + (t0 - 1) * n / (n + 16)"),
+        "min_score help must state the evidence-scaled entity term: {min_score}"
+    );
+    let breakdown = param("include_breakdown");
+    for field in ["`entity_posterior_mean`", "`entity_evidence_mass`"] {
+        assert!(
+            breakdown.contains(field),
+            "include_breakdown help must list {field}: {breakdown}"
         );
     }
 }

@@ -1,7 +1,10 @@
 # Workspace pack registration
 
 `WorkspacePack` registers the `workspace` entity kind, its creation hook, and five membership edge
-rules with the shared runtime. It contributes no verbs or private schema.
+rules with the shared runtime. It contributes no verbs. Its idempotent pack schema plan creates
+the auxiliary `workspace_mirror_cursor` table outside the graph, with `path TEXT PRIMARY KEY`,
+`last_mtime INTEGER`, `last_hash TEXT`, and `last_synced_at INTEGER`. Writable registry schema
+initialization applies this plan after the core migrations; reapplication preserves existing rows.
 
 ## `WorkspacePack::new`
 

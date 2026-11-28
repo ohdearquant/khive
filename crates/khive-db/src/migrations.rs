@@ -421,6 +421,54 @@ const V62_UP: &str = include_str!("../sql/062-authority-store.sql");
 const V63_UP: &str = include_str!("../sql/063-pending-entity-indexes.sql");
 const V64_UP: &str = include_str!("../sql/064-node-confirmed-pins.sql");
 const V65_UP: &str = include_str!("../sql/065-graph-edges-target-relation-index.sql");
+const V66_UP: &str = include_str!("../sql/066-comm-undelivered-due-index.sql");
+const V67_UP: &str = include_str!("../sql/067-entity-keys.sql");
+
+/// DDL for entity keys (ADR-221): the `entity_keys` table and the triggers on
+/// `entities` that release, reclaim and drop its rows. Shared between
+/// migration V67 and the entity store's idempotent schema setup, so a store
+/// opened without the migration chain still has the table its triggers name.
+pub const ENTITY_KEYS_DDL: &str = V67_UP;
+
+const V68_UP: &str = include_str!("../sql/068-entity-aliases.sql");
+
+/// DDL for entity aliases (ADR-221): the `entity_aliases` table, its indexes
+/// and the trigger on `entities` that drops its rows on a hard delete. Shared
+/// between migration V68 and the entity store's idempotent schema setup, as
+/// [`ENTITY_KEYS_DDL`] is.
+pub const ENTITY_ALIASES_DDL: &str = V68_UP;
+
+const V69_UP: &str = include_str!("../sql/069-entity-key-kind-guard.sql");
+
+/// DDL for the trigger on `entities` that refuses a kind change of a live
+/// entity holding keys, and a restore under a kind other than the one its keys
+/// were released under (ADR-221 section 1). Shared between migration V69 and
+/// the entity store's idempotent schema setup, as [`ENTITY_KEYS_DDL`] is; it
+/// names `entity_keys`, so it runs after that DDL.
+pub const ENTITY_KEY_KIND_GUARD_DDL: &str = V69_UP;
+
+/// Retained V66 schema needs only its ledger restored, not an index rebuild.
+fn migrate_undelivered_due_index(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let installed: Option<String> = tx
+        .query_row(
+            include_str!("../sql/comm-outbound-due-index-definition.sql"),
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let (_, create) = V66_UP
+        .split_once("CREATE INDEX")
+        .ok_or(rusqlite::Error::InvalidQuery)?;
+    let expected = format!("CREATE INDEX{create}");
+    // SQLite omits the terminal semicolon. Preserve every interior byte,
+    // including whitespace in SQL string literals, when comparing definitions.
+    if installed.as_deref().is_some_and(|sql| {
+        sql.trim().trim_end_matches(';') == expected.trim().trim_end_matches(';')
+    }) {
+        return Ok(());
+    }
+    tx.execute_batch(V66_UP)
+}
 
 // Ledger-tail replay may retain the physical column; accept only its exact shape.
 fn migrate_proposal_archive(tx: &rusqlite::Transaction<'_>) -> Result<(), SqliteError> {
@@ -870,6 +918,26 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 65,
         name: "graph_edges_target_relation_index",
         up: V65_UP,
+    },
+    VersionedMigration {
+        version: 66,
+        name: "comm_undelivered_due_index",
+        up: V66_UP,
+    },
+    VersionedMigration {
+        version: 67,
+        name: "entity_keys",
+        up: V67_UP,
+    },
+    VersionedMigration {
+        version: 68,
+        name: "entity_aliases",
+        up: V68_UP,
+    },
+    VersionedMigration {
+        version: 69,
+        name: "entity_key_kind_guard",
+        up: V69_UP,
     },
 ];
 
@@ -2172,6 +2240,9 @@ fn apply_versioned_migration(
             .map_err(|error| SqliteError::migration(migration.version, error))?;
     } else if migration.version == 58 {
         migrate_proposal_archive(&tx)?;
+    } else if migration.version == 66 {
+        migrate_undelivered_due_index(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
     } else if migration.name == SESSION_IDENTITY_MIGRATION_NAME {
         tx.execute_batch(migration.up)
             .map_err(|error| SqliteError::migration(migration.version, error))?;

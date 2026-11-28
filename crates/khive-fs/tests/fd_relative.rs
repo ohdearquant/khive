@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use khive_fs::fd_relative::{
     clear_errno, current_errno, errno_location, list_names, open_at, open_dir_at, open_file_at,
-    stat_at, stat_fd, Create, OpenFileOptions,
+    open_search_dir_at, open_search_root, stat_at, stat_fd, Create, OpenFileOptions,
 };
 
 /// A scratch directory under the system temporary directory, removed on drop.
@@ -180,6 +180,59 @@ fn open_dir_at_refuses_a_final_symlink_and_opens_a_directory() {
 
     let error = open_dir_at(&dir, OsStr::new("link")).unwrap_err();
     assert_refused_symlink(&error);
+}
+
+#[test]
+fn open_search_dir_at_refuses_a_final_symlink_and_opens_a_directory() {
+    let scratch = Scratch::new("open-search-dir-at");
+    std::fs::create_dir(scratch.path().join("sub")).unwrap();
+    symlink("sub", scratch.path().join("link")).unwrap();
+    let dir = scratch.open();
+
+    let sub = open_search_dir_at(&dir, OsStr::new("sub")).unwrap();
+    let stat = stat_fd(&sub).unwrap();
+    assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFDIR);
+
+    let error = open_search_dir_at(&dir, OsStr::new("link")).unwrap_err();
+    assert_refused_symlink(&error);
+
+    let root = open_search_root().unwrap();
+    let stat = stat_fd(&root).unwrap();
+    assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFDIR);
+}
+
+/// On Apple targets a search-only handle needs search permission alone: a directory
+/// that cannot be listed still opens, and a file below it opens through the handle.
+/// A read open of the same directory is refused (control).
+#[cfg(target_vendor = "apple")]
+#[test]
+fn open_search_dir_at_passes_a_directory_that_cannot_be_listed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = Scratch::new("open-search-unlisted");
+    let passage = scratch.path().join("passage");
+    std::fs::create_dir(&passage).unwrap();
+    std::fs::write(passage.join("inside"), b"x").unwrap();
+    std::fs::set_permissions(&passage, std::fs::Permissions::from_mode(0o111)).unwrap();
+    let dir = scratch.open();
+
+    let read = open_dir_at(&dir, OsStr::new("passage")).map(|_| ());
+    let search = open_search_dir_at(&dir, OsStr::new("passage"));
+    let through = search
+        .as_ref()
+        .ok()
+        .map(|handle| open_at(handle, OsStr::new("inside"), false).map(|_| ()));
+    std::fs::set_permissions(&passage, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        read.expect_err("control: a read open of the directory is refused")
+            .raw_os_error(),
+        Some(libc::EACCES)
+    );
+    search.expect("a search-only open passes");
+    through
+        .expect("a search handle")
+        .expect("a file below opens through the search handle");
 }
 
 #[test]

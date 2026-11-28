@@ -68,6 +68,7 @@ mod _pack_links {
     use khive_pack_exec::ExecPack as _;
     #[cfg(feature = "pack-formal")]
     use khive_pack_formal::FormalPack as _;
+    use khive_pack_forms::FormsPack as _;
     use khive_pack_git::GitPack as _;
     use khive_pack_gtd::GtdPack as _;
     use khive_pack_kg::KgPack as _;
@@ -75,6 +76,7 @@ mod _pack_links {
     use khive_pack_memory::MemoryPack as _;
     #[cfg(feature = "pack-moodboard")]
     use khive_pack_moodboard::MoodboardPack as _;
+    use khive_pack_operation::OperationPack as _;
     use khive_pack_schedule::SchedulePack as _;
     use khive_pack_session::SessionPack as _;
     #[cfg(feature = "pack-telemetry")]

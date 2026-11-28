@@ -516,10 +516,57 @@ dependencies without distinguishing them. This is an honest v1 limitation. Two c
 - **`depends_on` edges in v1** are derived from `refs_in_corpus` (refs filtered to known
   corpus members) without type tagging. The Extractor uses all refs as `depends_on` edges with
   `dependency_kind="runtime"`.
-- **`extends` edges in v1** are extracted by a return-type-head heuristic: declarations whose
-  return type begins with an `X.toY` or structure-projection pattern, intersected with
-  `refs_in_corpus`, are candidate `extends` edges. This is a heuristic approximation. The
-  authoritative path (v2 target) is a Lean metaprogram that emits typed refs, distinguishing
+- **`extends` edges in v1** use the declaration's parent-projection name and its final
+  codomain head, resolved through its references. For a declaration `N`, emit `P → H`
+  only when all seven conditions hold:
+  1. `N` has the form `P.to<S>`, with a nonempty suffix `S`.
+  2. The final codomain head resolves uniquely through `N`'s references to `H`, and `H`
+     belongs to the actual supplied corpus.
+  3. `P` also belongs to that corpus.
+  4. `S` equals the last name component of `H`.
+  5. `P` and `H` both have raw declaration kind `inductive`.
+  6. `N` has raw declaration kind `def`.
+  7. `N`'s type carries an immediate `self` binder whose type head resolves to `P`, the
+     mark of a generated parent projection.
+
+  For example, `Point3.toPoint2 : (self : Point3) → Point2` emits
+  `Point3 extends Point2` when the references and corpus satisfy these conditions. The
+  declaration name supplies the candidate parent and suffix, not the resolved codomain:
+  neither the suffix nor an arbitrary corpus basename can invent `H`. A self-less
+  conversion between two inductives produces no `extends`; its in-corpus references still
+  produce `depends_on`. Raw `inductive` covers both structures and classes in this extract.
+
+  The bounded textual interpretation peels balanced outer arrows and `∀` binders, recognizes
+  an identifier head with an optional universe annotation (`C.{v,u}` resolves as `C`), and
+  resolves only a unique exact or qualified-suffix reference. Unsupported notation or an
+  ambiguous head produces no `extends` candidate. The suffix is literal and nonempty, with
+  no ASCII-uppercase restriction. This is not Lean elaboration.
+
+  **Corpus check (2026-11-17):** `selected.jsonl`, SHA-256
+  `1d43a2e3e8e70aa5ac6c864a4cf2568f1a74af68e5a038c757ed2a985266b8ee`, contains
+  62,038 declarations: 31,878 `def`, 27,009 `theorem` and 3,151 `inductive`. Applying the
+  seven conditions sequentially gives this text-census funnel:
+
+  | Condition                    | Incoming | Dropped | Remaining |
+  | ---------------------------- | -------: | ------: | --------: |
+  | 1: projection name           |   62,038 |  58,856 |     3,182 |
+  | 2: referenced in-corpus head |    3,182 |   1,307 |     1,875 |
+  | 3: in-corpus parent          |    1,875 |     103 |     1,772 |
+  | 4: matching suffix           |    1,772 |     534 |     1,238 |
+  | 5: inductive endpoints       |    1,238 |     140 |     1,098 |
+  | 6: definition declaration    |    1,098 |     179 |       919 |
+  | 7: parent `self` binder      |      919 |     544 |       375 |
+
+  The earlier uppercase-only name comparison counted 2,825 candidates; the literal suffix
+  rule counts 3,182. Recognizing universe annotations adds three final projections to the
+  earlier 372. The earlier 547 self-less count included five theorems, which condition 6
+  rejects; two additional lowercase/Unicode-suffix definitions give 544 self-less definitions
+  after conditions 1–6. These are textual candidate counts, not emitted graph or proof counts.
+  The producer's `refs_in_corpus` also contains 1,014 reference occurrences outside the final
+  selection, so membership must be checked against the supplied corpus despite the field name.
+
+  A generated projection whose extracted type lacks the `self` binder is missed by v1.
+  The authoritative path remains a Lean metaprogram emitting typed refs in v2, distinguishing
   `extends` from `depends_on` at the AST level.
 
 **Extractor** (v1 state): reads `selected.jsonl` (62,038 records after Phase-2 selection,

@@ -2,14 +2,18 @@
 
 use khive_types::{Entity, Header, Link, Note};
 
+use crate::record::same_set;
 use crate::{
-    DeleteOp, DeletePreimage, EdgePreimage, EntityPreimage, NotePreimage, UpdateOp, UpdatePreimage,
+    DeleteOp, DeletePreimage, EdgePreimage, EntityPreimage, EntityRecord, NotePreimage, UpdateOp,
+    UpdatePreimage,
 };
 
 #[derive(Clone, Copy, Debug)]
 /// A caller-supplied record from the applying transaction, without a storage handle.
+///
+/// An entity is read whole, with the keys it holds and its aliases.
 pub enum CanonicalRecordRef<'a> {
-    Entity(&'a Entity),
+    Entity(&'a EntityRecord),
     Note(&'a Note),
     Edge(&'a Link),
 }
@@ -42,6 +46,21 @@ fn equal<T: PartialEq + ?Sized>(
     }
 }
 
+/// Two lists compared as sets: a carried set may list its members in any order.
+fn equal_set<T: Ord + Clone>(
+    field: &str,
+    captured: &[T],
+    live: &[T],
+) -> Result<(), PreimageMismatch> {
+    if same_set(captured, live) {
+        Ok(())
+    } else {
+        Err(PreimageMismatch {
+            field_path: field.into(),
+        })
+    }
+}
+
 fn touched<T: PartialEq>(
     field: &str,
     captured: &Option<T>,
@@ -56,7 +75,8 @@ fn touched<T: PartialEq>(
 /// The caller must read `live` inside the same transaction that applies `op`.
 pub fn check_update(op: &UpdateOp, live: CanonicalRecordRef<'_>) -> Result<(), PreimageMismatch> {
     match (op.preimage(), live) {
-        (UpdatePreimage::Entity(preimage), CanonicalRecordRef::Entity(live)) => {
+        (UpdatePreimage::Entity(preimage), CanonicalRecordRef::Entity(record)) => {
+            let live = &record.entity;
             equal("id", &op.target_id(), &live.header.id)?;
             let EntityPreimage {
                 name,
@@ -64,12 +84,17 @@ pub fn check_update(op: &UpdateOp, live: CanonicalRecordRef<'_>) -> Result<(), P
                 properties,
                 tags,
                 entity_type,
+                aliases,
             } = preimage;
             touched("name", name, &live.name)?;
             touched("description", description, &live.description)?;
             touched("properties", properties, &live.properties)?;
             touched("tags", tags, &live.tags)?;
-            touched("entity_type", entity_type, &live.entity_type)
+            touched("entity_type", entity_type, &live.entity_type)?;
+            match aliases {
+                Some(aliases) => equal_set("aliases", aliases, &record.aliases),
+                None => Ok(()),
+            }
         }
         (UpdatePreimage::Note(preimage), CanonicalRecordRef::Note(live)) => {
             equal("id", &op.target_id(), &live.header.id)?;
@@ -111,9 +136,11 @@ fn header(captured: &Header, live: &Header) -> Result<(), PreimageMismatch> {
 }
 
 /// The captured record is exact except for its applier-stamped `updated_at`.
+/// An entity's keys and aliases are compared as sets.
 pub fn check_delete(op: &DeleteOp, live: CanonicalRecordRef<'_>) -> Result<(), PreimageMismatch> {
     match (&op.preimage, live) {
-        (DeletePreimage::Entity(captured), CanonicalRecordRef::Entity(live)) => {
+        (DeletePreimage::Entity(captured_record), CanonicalRecordRef::Entity(live_record)) => {
+            let live = &live_record.entity;
             equal("id", &op.target_id, &live.header.id)?;
             let Entity {
                 header: captured_header,
@@ -124,7 +151,7 @@ pub fn check_delete(op: &DeleteOp, live: CanonicalRecordRef<'_>) -> Result<(), P
                 properties,
                 tags,
                 deleted_at,
-            } = captured.as_ref();
+            } = &captured_record.entity;
             header(captured_header, &live.header)?;
             equal("kind", kind, &live.kind)?;
             equal("entity_type", entity_type, &live.entity_type)?;
@@ -132,7 +159,9 @@ pub fn check_delete(op: &DeleteOp, live: CanonicalRecordRef<'_>) -> Result<(), P
             equal("description", description, &live.description)?;
             equal("properties", properties, &live.properties)?;
             equal("tags", tags, &live.tags)?;
-            equal("deleted_at", deleted_at, &live.deleted_at)
+            equal("deleted_at", deleted_at, &live.deleted_at)?;
+            equal_set("keys", &captured_record.keys, &live_record.keys)?;
+            equal_set("aliases", &captured_record.aliases, &live_record.aliases)
         }
         (DeletePreimage::Note(captured), CanonicalRecordRef::Note(live)) => {
             equal("id", &op.target_id, &live.header.id)?;

@@ -384,3 +384,257 @@ async fn runtime_native_reranker_scores_stored_entities() {
         expected
     );
 }
+
+use khive_retrieval::{LoraHook, LoraTargetGeometry, NoopLoraHook};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+struct DormantHook {
+    active_layer: Option<usize>,
+    calls: AtomicUsize,
+}
+
+impl LoraHook for DormantHook {
+    fn is_active(&self, layer: usize, module: &str) -> bool {
+        self.active_layer == Some(layer) && module == "ffn_output"
+    }
+
+    fn apply(&self, _: usize, _: &str, _: &[f32], _: &mut [f32]) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct ProjectionDelta<'a> {
+    calls: &'a AtomicUsize,
+}
+
+impl LoraHook for ProjectionDelta<'_> {
+    fn is_active(&self, layer: usize, module: &str) -> bool {
+        layer == 0 && module == "ffn_output"
+    }
+
+    fn apply(&self, layer: usize, module: &str, x: &[f32], output: &mut [f32]) {
+        assert_eq!(layer, 0);
+        assert_eq!(module, "ffn_output");
+        assert_eq!(x.len(), HIDDEN);
+        assert_eq!(output.len(), HIDDEN);
+        assert!(x.iter().all(|value| value.is_finite()));
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        // A uniform delta would disappear at the following layer normalization.
+        output[0] += 4.0;
+        output[1] -= 2.0;
+    }
+}
+
+fn score_bits(scores: &[f32]) -> Vec<u32> {
+    scores.iter().map(|score| score.to_bits()).collect()
+}
+
+#[test]
+fn native_hook_identity_paths_preserve_exact_scores_and_provenance() {
+    let directory = input_sensitive_checkpoint();
+    let model = NativeCrossEncoderModel::from_directory(directory.path()).unwrap();
+    let baseline = assert_input_sensitive(&model);
+    let inactive = DormantHook {
+        active_layer: None,
+        calls: AtomicUsize::new(0),
+    };
+    let unreachable = DormantHook {
+        active_layer: Some(99),
+        calls: AtomicUsize::new(0),
+    };
+    assert!(unreachable.is_active(99, "ffn_output"));
+    for hook in [
+        None,
+        Some(&NoopLoraHook as &dyn LoraHook),
+        Some(&inactive),
+        Some(&unreachable),
+    ] {
+        let direct =
+            CrossEncoderScorer::score_batch_with_hook(&model, QUERY, &DOCUMENTS, hook).unwrap();
+        assert_eq!(
+            score_bits(&direct.scores),
+            score_bits(&baseline),
+            "identity hooks must preserve every native score bit"
+        );
+        assert!(
+            !direct.hook_applied,
+            "hook presence or unreachable activity is not native application"
+        );
+    }
+    assert_eq!(inactive.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(unreachable.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn native_hook_changes_real_forward_scores_and_tracks_application() {
+    let directory = input_sensitive_checkpoint();
+    let model = Arc::new(NativeCrossEncoderModel::from_directory(directory.path()).unwrap());
+    let baseline = assert_input_sensitive(&model);
+    let calls = AtomicUsize::new(0);
+    let hook = ProjectionDelta { calls: &calls };
+    let adapted =
+        CrossEncoderScorer::score_batch_with_hook(model.as_ref(), QUERY, &DOCUMENTS, Some(&hook))
+            .unwrap();
+    assert!(
+        calls.load(Ordering::SeqCst) > 0,
+        "native hook must reach the actual forward projection"
+    );
+    assert!(adapted.hook_applied, "actual native apply must be reported");
+    assert_eq!(adapted.scores.len(), DOCUMENTS.len());
+    assert!(adapted
+        .scores
+        .iter()
+        .all(|score| score.is_finite() && (0.0..=1.0).contains(score)));
+    assert_ne!(
+        score_bits(&adapted.scores),
+        score_bits(&baseline),
+        "real projection adaptation must change the native scores"
+    );
+    let (runtime, token) = runtime();
+    let bright = create_entity(&runtime, &token, "document", Some("bright")).await;
+    let dark = create_entity(&runtime, &token, "document", Some("dark")).await;
+    let input = candidates(&[dark.id, Uuid::new_v4(), bright.id, dark.id]);
+    let reranker = runtime.native_cross_encoder_reranker(token, model.clone());
+    let unadapted = reranker.rerank(QUERY, input.clone(), 3).await.unwrap();
+    let mut expected = vec![
+        (dark.id, adapted.scores[1]),
+        (bright.id, adapted.scores[0]),
+        (dark.id, adapted.scores[1]),
+    ];
+    expected.sort_by(|left, right| right.1.total_cmp(&left.1));
+    let expected: Vec<_> = expected
+        .into_iter()
+        .map(|(id, score)| (id, DeterministicScore::from_f64(f64::from(score))))
+        .collect();
+    calls.store(0, Ordering::SeqCst);
+    let result = reranker
+        .rerank_with_hook(QUERY, input, 3, Some(&hook))
+        .await
+        .unwrap();
+    assert!(
+        calls.load(Ordering::SeqCst) > 0,
+        "stored-document reranking must forward this invocation's borrowed hook"
+    );
+    assert!(result.hook_applied);
+    assert_eq!(
+        result.results, expected,
+        "stored IDs and scores must match the actual adapted native pairs"
+    );
+    assert_ne!(result.results, unadapted);
+    let direct =
+        CrossEncoderScorer::score_batch_with_hook(model.as_ref(), QUERY, &DOCUMENTS, None).unwrap();
+    assert_eq!(score_bits(&direct.scores), score_bits(&baseline));
+    assert!(!direct.hook_applied);
+}
+
+struct RejectingGeometry {
+    legacy: bool,
+    calls: AtomicUsize,
+    compatibility_checks: AtomicUsize,
+    neutral_checks: AtomicUsize,
+}
+
+impl LoraHook for RejectingGeometry {
+    fn apply(&self, _: usize, _: &str, _: &[f32], _: &mut [f32]) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[allow(deprecated)]
+    fn validate_against_bert(
+        &self,
+        layers: usize,
+        hidden: usize,
+        intermediate: usize,
+    ) -> std::result::Result<(), String> {
+        assert_eq!((layers, hidden, intermediate), (1, HIDDEN, HIDDEN));
+        self.compatibility_checks.fetch_add(1, Ordering::SeqCst);
+        if self.legacy {
+            Err("native hook geometry sentinel".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_geometry(&self, _: &dyn LoraTargetGeometry) -> std::result::Result<(), String> {
+        self.neutral_checks.fetch_add(1, Ordering::SeqCst);
+        Err("native hook geometry sentinel".into())
+    }
+}
+
+#[tokio::test]
+async fn native_hook_geometry_refusal_precedes_forward() {
+    let directory = input_sensitive_checkpoint();
+    let model = Arc::new(NativeCrossEncoderModel::from_directory(directory.path()).unwrap());
+    let (runtime, token) = runtime();
+    let entity = create_entity(&runtime, &token, "document", Some("bright")).await;
+    let reranker = runtime.native_cross_encoder_reranker(token, model.clone());
+    for legacy in [false, true] {
+        let hook = RejectingGeometry {
+            legacy,
+            calls: AtomicUsize::new(0),
+            compatibility_checks: AtomicUsize::new(0),
+            neutral_checks: AtomicUsize::new(0),
+        };
+        let validation_counts = || {
+            (
+                hook.compatibility_checks.load(Ordering::SeqCst),
+                hook.neutral_checks.load(Ordering::SeqCst),
+            )
+        };
+        let assert_validated = |(previous_compatibility, previous_neutral)| {
+            let (compatibility, neutral) = validation_counts();
+            assert!(compatibility > previous_compatibility);
+            if legacy {
+                assert_eq!(
+                    neutral, previous_neutral,
+                    "legacy refusal must short-circuit"
+                );
+            } else {
+                assert!(neutral > previous_neutral);
+            }
+            assert_eq!(hook.calls.load(Ordering::SeqCst), 0);
+        };
+        for documents in [&[][..], &DOCUMENTS[..]] {
+            let before = validation_counts();
+            let result = CrossEncoderScorer::score_batch_with_hook(
+                model.as_ref(),
+                QUERY,
+                documents,
+                Some(&hook),
+            );
+            assert!(
+                matches!(result, Err(RetrievalError::Rerank(ref message)) if message.contains("native hook geometry sentinel")),
+                "native hook geometry refusal must survive even an empty scoring batch"
+            );
+            assert_validated(before);
+        }
+        let before = validation_counts();
+        let result = reranker
+            .rerank_with_hook(QUERY, candidates(&[entity.id]), 1, Some(&hook))
+            .await;
+        assert!(
+            matches!(result, Err(RetrievalError::Rerank(ref message)) if message.contains("native hook geometry sentinel")),
+            "stored-document reranking must preserve native geometry refusal"
+        );
+        assert_validated(before);
+        let before_skips = validation_counts();
+        for (input, limit) in [
+            (vec![], 1),
+            (candidates(&[entity.id]), 0),
+            (candidates(&[Uuid::new_v4()]), 1),
+        ] {
+            let skipped = reranker
+                .rerank_with_hook(QUERY, input, limit, Some(&hook))
+                .await
+                .unwrap();
+            assert!(skipped.results.is_empty());
+            assert!(!skipped.hook_applied);
+        }
+        assert_eq!(
+            validation_counts(),
+            before_skips,
+            "existing early-empty reranker paths must skip scoring and validation"
+        );
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 0);
+    }
+}
