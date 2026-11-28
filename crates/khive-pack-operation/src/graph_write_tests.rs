@@ -435,6 +435,7 @@ async fn a_define_writes_the_graph_with_its_names_and_a_repeat_changes_nothing()
     assert_eq!(status_of(&again, "filing"), unchanged(1), "{again}");
     let after = store.node(&type_key).await.expect("the type's node");
     assert_eq!(after.updated_at, node.updated_at);
+    assert_eq!(after.version, node.version);
     assert_eq!(after.properties, node.properties);
 }
 
