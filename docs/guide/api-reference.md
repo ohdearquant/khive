@@ -696,23 +696,24 @@ request(ops="merge(into_id=\"<canonical-uuid>\", from_id=\"<dup-uuid>\")")
 
 Hybrid FTS + vector search with RRF fusion.
 
-| Param                | Type    | Required | Notes                                                                                                                                                               |
-| -------------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `kind`               | string  | yes      | Substrate or granular kind to search.                                                                                                                               |
-| `query`              | string  | yes      | Free-text query.                                                                                                                                                    |
-| `text_mode`          | string  | no       | KG entity/note lexical matching: `all_terms` (default, including null) or `any_term`; does not change the vector arm.                                               |
-| `limit`              | integer | no       | Default 10.                                                                                                                                                         |
-| `entity_kind`        | string  | no       | Entity-substrate searches only.                                                                                                                                     |
-| `entity_type`        | string  | no       | Entity-substrate searches only.                                                                                                                                     |
-| `note_kind`          | string  | no       | Note-substrate searches only.                                                                                                                                       |
-| `include_superseded` | bool    | no       | Note-substrate searches only; default false excludes notes targeted by a `supersedes` edge.                                                                         |
-| `properties`         | object  | no       | Match records whose properties contain all listed key=value pairs, applied before result truncation inside a bounded candidate window.                              |
-| `tags`               | array   | no       | OR-match against tags; entity tags matched at the SQL level, note tags read from `properties.tags`.                                                                 |
-| `min_rank_score`     | number  | no       | Inclusive deterministic rank floor in [0,1], default 0; applied after fusion and modifiers, before the final limit. Strategy/query-local, not calibrated relevance. |
-| `min_score`          | number  | no       | Deprecated exact alias of `min_rank_score` in v0.8. Supplying both names is invalid, even when equal.                                                               |
-| `order_by`           | string  | no       | `score` (default), `created_at`, or `updated_at`; timestamps sort newest first after the rank floor, within the bounded candidate window.                           |
-| `created_after`      | string  | no       | Inclusive RFC 3339 lower bound on record `created_at`; at most nine fractional-second digits.                                                                       |
-| `created_before`     | string  | no       | Inclusive RFC 3339 upper bound on record `created_at`; at most nine fractional-second digits. Must not precede `created_after`.                                     |
+| Param                | Type    | Required | Notes                                                                                                                                                                        |
+| -------------------- | ------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kind`               | string  | yes      | Substrate or granular kind to search.                                                                                                                                        |
+| `query`              | string  | yes      | Free-text query.                                                                                                                                                             |
+| `text_mode`          | string  | no       | KG entity/note lexical matching: `all_terms` (default, including null) or `any_term`; does not change the vector arm.                                                        |
+| `limit`              | integer | no       | Default 10.                                                                                                                                                                  |
+| `entity_kind`        | string  | no       | Entity-substrate searches only.                                                                                                                                              |
+| `entity_type`        | string  | no       | Entity-substrate searches only.                                                                                                                                              |
+| `note_kind`          | string  | no       | Note-substrate searches only.                                                                                                                                                |
+| `include_superseded` | bool    | no       | Note-substrate searches only; default false excludes notes targeted by a `supersedes` edge.                                                                                  |
+| `properties`         | object  | no       | Match records whose properties contain all listed key=value pairs, applied before result truncation inside a bounded candidate window.                                       |
+| `tags`               | array   | no       | OR-match against tags; entity tags matched at the SQL level, note tags read from `properties.tags`.                                                                          |
+| `min_rank_score`     | number  | no       | Inclusive deterministic rank floor in [0,1], default 0; applied after fusion and modifiers, before the final limit. Strategy/query-local, not calibrated relevance.          |
+| `min_score`          | number  | no       | Deprecated exact alias of `min_rank_score` in v0.8. Supplying both names is invalid, even when equal.                                                                        |
+| `order_by`           | string  | no       | `score` (default), `created_at`, or `updated_at`; timestamps sort newest first after the rank floor, within the bounded candidate window.                                    |
+| `created_after`      | string  | no       | Inclusive RFC 3339 lower bound on record `created_at`; at most nine fractional-second digits.                                                                                |
+| `created_before`     | string  | no       | Inclusive RFC 3339 upper bound on record `created_at`; at most nine fractional-second digits. Must not precede `created_after`.                                              |
+| `follow`             | string  | no       | Edge relation to follow outward from each hit; adds `followed` (summary neighbor rows of the targets) and `followed_truncated` (more than 100 targets). Single-backend only. |
 
 ```
 request(ops="search(kind=\"entity\", query=\"knowledge graph runtime\", limit=10)")
@@ -725,6 +726,14 @@ contradiction is rejected. Entity-only fields on a note search and note-only
 fields on an entity search are also rejected explicitly; they are never
 ignored. `properties` must be an object and `tags` must be an array of strings.
 The same validated request is used for single- and multi-backend execution.
+
+`follow` names one edge relation, such as `instance_of`, to follow outward from
+each hit. Every hit then carries `followed`, the targets its outgoing edges of
+that relation reach, as the rows `neighbors(projection="summary")` returns, read
+with the same visibility and mailbox rules. `followed_truncated` is true when a
+hit has more than 100 such targets. A symmetric relation is followed both ways,
+as `neighbors` follows it. A multi-backend search refuses `follow`; call
+`neighbors` on each hit there.
 
 Creation-time bounds apply to both entities and notes, independently of `order_by`,
 and combine with kind, tags and entity-type filters. Omitted or null bounds are

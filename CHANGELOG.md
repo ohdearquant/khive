@@ -9,9 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `operation.frontier` reports `input_missing` for each value an owed step requires that no record
+  holds, in place of the act it owes. The item lists the places that state the field of a subject
+  in the requirement's slot: every loaded document type and system, in the order of the
+  namespace's newest `source_order`, then the rest by name. `stated_in_part` lists the lines that
+  state a parent of the field. The frontier names the source order and the form revisions it read.
+  `operation.define` publishes a `source_order` (`version`, `places`) and refuses a place that is
+  not a loaded document type or system (ADR-222 Amendments 1 and 2).
+- `forms.load` takes `narrows` on a field: the one ordinary field of the same value type, loaded
+  before or listed earlier in the document, whose values include every value of this one. The load
+  holds it as a contains edge from the broader field. A narrows naming the field itself, a field
+  the document leaves undecided, a general wording, several fields, a field of another value type,
+  a second broader field or one that would close a cycle is refused and writes nothing, and the
+  same narrows given again writes nothing; `forms.add_item` and `forms.same` refuse it.
+  `forms.neighbourhood` on a field gives the field it narrows as `broader` and the fields that
+  narrow it as `narrower`, and `general` lists only general wordings. `operation.frontier` follows
+  the chain of broader fields, nearest first, for `stated_in_part` (ADR-223 Amendment 1).
+
+## [0.24.0] - 2026-11-28
+
+### Added
+
 - `neighbors` takes `projection="full"`: each neighbor carries the record fields plus its
   `properties` and `description` and the edge's metadata as `edge_metadata`, so one call answers
   what took a `get` per neighbor.
+- `search` accepts `follow=<relation>`: each hit carries `followed`, the targets its outgoing
+  edges of that relation reach, so a search for a wording returns the concept it names in one
+  call. Targets are read with the same visibility as `neighbors`; more than 100 targets per hit
+  sets `followed_truncated`. A multi-backend search refuses it.
 - `gtd.tasks` accepts `compact=true` for smaller task pages with description lengths. Compact
   pages use the same filters, task order, and continuation as full pages (#6914).
 - `git.issue` reads one issue of a configured repository: its title, state, author, dates, label
@@ -34,13 +59,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `operation.define` publishes step types on their own, and a step of an operation type may pin
   one by id and version. A step may name the values it requires and produces and take a value
   another step produces; a step that requires a value comes after the step that produces it.
-- `operation.frontier` reports `input_missing` for each value an owed step requires that no record
-  holds, in place of the act it owes. The item lists the places that state the field of a subject
-  in the requirement's slot: every loaded document type and system, in the order of the
-  namespace's newest `source_order`, then the rest by name. `stated_in_part` lists the lines that
-  state a parent of the field. The frontier names the source order and the form revisions it read.
-  `operation.define` publishes a `source_order` (`version`, `places`) and refuses a place that is
-  not a loaded document type or system (ADR-222 Amendments 1 and 2).
 - The `forms` pack records what kind of document each form revision is. A `document_type` node
   (`id`, `name`, `origin` of `applicant`, `third_party` or `work`, optional `issuer_class`)
   contains its revisions; `forms.load` takes it as `document_type` and mints one, marked `minted`,
@@ -61,15 +79,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   holds in the same vocabulary is refused, the same name in another vocabulary is accepted, and a
   vocabulary named after an operation node type is refused (`reserved_vocabulary`). Export and
   replay keep the names (ADR-222 Amendment 2).
-- `forms.load` takes `narrows` on a field: the one ordinary field of the same value type, loaded
-  before or listed earlier in the document, whose values include every value of this one. The load
-  holds it as a contains edge from the broader field. A narrows naming the field itself, a field
-  the document leaves undecided, a general wording, several fields, a field of another value type,
-  a second broader field or one that would close a cycle is refused and writes nothing, and the
-  same narrows given again writes nothing; `forms.add_item` and `forms.same` refuse it.
-  `forms.neighbourhood` on a field gives the field it narrows as `broader` and the fields that
-  narrow it as `narrower`, and `general` lists only general wordings. `operation.frontier` follows
-  the chain of broader fields, nearest first, for `stated_in_part` (ADR-223 Amendment 1).
 - `git.pr_list` and `git.issue_list` list the pull requests or issues of a configured repository
   in the requested state (`open` unless `closed` or `all` is named), newest created first, one
   hundred to a page for at most ten pages, and say in `truncated` whether more matched.
