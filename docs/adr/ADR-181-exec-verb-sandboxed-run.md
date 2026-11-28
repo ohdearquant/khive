@@ -2153,9 +2153,12 @@ the schedule.
 ### Decision
 
 1. **`store_verbs`.** `exec.run` takes `store_verbs`, a list of verb names, empty by default. Refused before
-   materialization, naming the entry: a verb the daemon does not serve, a verb named twice, any verb of the `exec`,
-   `git`, `tool` or `schedule` packs (so a run starts no run, publishes nothing, grants itself nothing and makes no
-   schedule), and a non-empty list from an anonymous caller.
+   materialization, naming the entry: a verb the daemon does not serve, a verb named twice, a non-empty list from
+   an anonymous caller, and any verb of a pack whose verbs start a process outside the sandbox, publish, change
+   what an actor may do, make a schedule or reach the network. Today those packs are `exec`, `git`, `tool`,
+   `schedule`, `agent`, `charter` and `web`, so a run starts no run, publishes nothing, grants itself nothing, makes
+   no schedule and fetches nothing. A pack the daemon has not loaded is already refused as a verb it does not
+   serve; the refusal by pack still applies when one is loaded.
 2. **The socket.** For a run with a non-empty `store_verbs`, the daemon binds one unix socket,
    `khive-store.sock`, in the run's temporary directory (Amendment 16 item 1), and sets `KHIVE_STORE_SOCKET` to its
    path in the run's environment, replacing any caller value. The run connects to it under Amendment 16 item 3's
@@ -2163,7 +2166,10 @@ the schedule.
    macOS) is refused before materialization, naming it. The daemon closes and removes the socket when the run's
    initial process ends or times out, before capture, so a descendant that outlives the run calls nothing.
 3. **One call per line.** The run writes one op per line in the request syntax, a single verb with no batch and no
-   chain, and reads one JSON line back, `{ok, result}` or `{ok, error}`.
+   chain, and reads one JSON line back, `{ok, result}` or `{ok, error}`. Calls are served one at a time in the
+   order they arrive, across every connection to the socket: a second connection, or a second line sent before an
+   answer, waits its turn and is served after the call before it is answered and recorded, so `seq` and the cap
+   count one sequence per run.
 4. **As the run's actor, through the gate.** Each call dispatches with the run's token: the same actor, namespace,
    gate and admission as that caller's own request, so a run holds no authority its caller lacks. A verb outside
    `store_verbs` is refused `store_verb_undeclared` without dispatch.
@@ -2177,13 +2183,18 @@ the schedule.
    recorded, and the socket closes. The receipt carries `store_verbs` and `store_calls`, the table's rows in `seq`
    order, and `exec.receipt` and `exec.runs` return them.
 6. **A run fired by a schedule.** A run the schedule runner dispatches carries `origin: {schedule_id,
-   scheduled_for}` on its receipt, set from the dispatch. A caller that passes `origin` is refused. Each fire whose
-   action is `exec.run` appends `{scheduled_for, receipt_id}` to the schedule row's `run_receipts`, read from the
-   action's result, oldest first, keeping the newest 1000. `exec.runs` takes `origin` (a schedule id) and lists every
-   run that schedule fired.
+   scheduled_for}` on its receipt, set from the dispatch. A caller that passes `origin` is refused. The fired run
+   runs as the actor that created the schedule, read from the creator provenance the runner already replays from,
+   with that actor's gate; a fire whose schedule carries no such actor is refused and recorded on the schedule row,
+   and no run starts. Each fire whose action is `exec.run` appends `{scheduled_for, receipt_id}` to the schedule
+   row's `run_receipts`, read from the action's result, oldest first, keeping the newest 1000. `exec.runs` takes
+   `origin` (a schedule id) and lists every run that schedule fired.
 7. **Unchanged.** The profile, the read, write and cache roots, networked runs (Amendments 13 and 14), tool profiles
    (Amendment 17) and the version-control and `never` denials are unchanged. The daemon's socket is the only new
-   path out of a run, and it serves only the declared verbs, as the caller.
+   path out of a run, and it serves only the declared verbs, as the caller. Some verbs that stay allowed reach
+   outside the store, such as `comm.send` to an external channel and `blob.export`, and the script chooses their
+   arguments: declaring one is the caller opening that path out of the run, and the call's row and its audit event
+   are the record of what left.
 
 ### Acceptance
 
@@ -2194,11 +2205,15 @@ the schedule.
      and no write; a declared verb the caller's gate denies is `refused` with the gate's code. Mutation control:
      checking the list after dispatch turns this arm red.
 105. **Order.** With a test seam that holds the answer, the call's row is in `exec_store_calls` before the run
-     reads it. Mutation control: writing the row after the answer turns this arm red.
-106. **Load.** An unknown verb, a verb named twice, `exec.run`, `git.push`, `tool.grant`, `schedule.schedule`, an
-     anonymous caller and an over-long socket path are each refused before materialization, with no run directory.
+     reads it. Mutation control: writing the row after the answer turns this arm red. Two connections that each
+     send a call while the first is held get `seq` 1 and 2 in arrival order, and the second is answered only after
+     the first is answered and recorded.
+106. **Load.** An unknown verb, a verb named twice, `exec.run`, `git.push`, `tool.grant`, `schedule.schedule`, one
+     verb each of `agent`, `charter` and `web` with those packs loaded, an anonymous caller and an over-long socket
+     path are each refused before materialization, with no run directory.
 107. **Lifetime.** After the initial process exits, a detached descendant's connect fails and the socket path is
      gone; no row is written after the exit. The cap's next call is recorded as `store_calls_exhausted`.
 108. **Schedule.** A daily schedule whose action is `exec.run` with `store_verbs`, fired twice by the runner's test
      clock: each receipt's `origin` names the schedule and its `scheduled_for`; the row's `run_receipts` lists both
-     receipt ids in fire order; `exec.runs(origin=...)` returns both runs. A caller-passed `origin` is refused.
+     receipt ids in fire order; `exec.runs(origin=...)` returns both runs; each run's `store_calls` audit events
+     name the actor that created the schedule. A caller-passed `origin` is refused.
