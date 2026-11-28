@@ -34,6 +34,8 @@ fn forms_is_linked_for_explicit_selection_and_exposes_its_verbs() {
             "forms.split",
             "forms.resolve",
             "forms.neighbourhood",
+            "forms.terms",
+            "forms.subjects",
             "forms.check",
             "forms.lint",
             "forms.export",

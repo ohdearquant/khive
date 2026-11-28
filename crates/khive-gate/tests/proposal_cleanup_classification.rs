@@ -107,6 +107,8 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("forms.resolve", OperationAccess::Read),
     ("forms.same", OperationAccess::Write),
     ("forms.split", OperationAccess::Write),
+    ("forms.subjects", OperationAccess::Read),
+    ("forms.terms", OperationAccess::Read),
     ("get", OperationAccess::Read),
     ("git.branch", OperationAccess::Write),
     ("git.branch_delete", OperationAccess::Write),
@@ -188,10 +190,12 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
     ("moodboard.train_preference", OperationAccess::Write),
     ("neighbors", OperationAccess::Read),
     ("operation.bind", OperationAccess::Write),
+    ("operation.decide", OperationAccess::Write),
     ("operation.define", OperationAccess::Write),
     ("operation.frontier", OperationAccess::Read),
     ("operation.open", OperationAccess::Write),
     ("operation.record", OperationAccess::Write),
+    ("operation.resolve", OperationAccess::Read),
     ("propose", OperationAccess::Write),
     ("query", OperationAccess::Read),
     ("resolve", OperationAccess::Read),
@@ -250,7 +254,7 @@ const EXPECTED: &[(&str, OperationAccess)] = &[
 
 #[test]
 fn proposal_cleanup_revision_preserves_every_existing_classification() {
-    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v36");
+    assert_eq!(OPERATION_CLASSIFIER_VERSION, "domain-effects-v37");
     assert_eq!(CLASSIFIED_OPERATIONS, EXPECTED);
     for &(name, access) in EXPECTED {
         assert_eq!(classify_operation(name), Some(access), "{name}");

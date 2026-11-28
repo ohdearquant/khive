@@ -62,10 +62,13 @@ pub(crate) const MUSTS: [&str; 2] = ["match", "differ"];
 
 /// The term lists a document loads, by the name the document gives each list
 /// and the name a term node carries.
-pub(crate) const TERM_LISTS: [(&str, &str); 4] = [
+pub(crate) const TERM_LISTS: [(&str, &str); 5] = [
     ("kinds", "kind"),
     ("roles", "role"),
     ("relations", "relation"),
+    // Qualifiers that only count (first, second, additional); any other
+    // qualifier may change what a subject is.
+    ("counting_qualifiers", "counting_qualifier"),
     ("purposes", "purpose"),
 ];
 

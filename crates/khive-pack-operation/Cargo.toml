@@ -24,4 +24,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# Path-only: the tests install kg and forms beside operation; cargo strips them at publish.
+khive-pack-forms = { path = "../khive-pack-forms" }
+khive-pack-kg = { path = "../khive-pack-kg" }
 tokio = { workspace = true, features = ["full"] }

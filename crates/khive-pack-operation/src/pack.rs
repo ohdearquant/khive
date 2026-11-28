@@ -5,7 +5,9 @@ use std::collections::{BTreeSet, HashMap};
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, PackRuntime, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    KhiveRuntime, NamespaceToken, PackRuntime, RequestIdentity, RuntimeError, VerbRegistry,
+};
 use khive_storage::{
     AtomicUnitOp, SqlRow, SqlStatement, SqlValue, SqlWriter, StorageCapability, StorageError,
     StorageResult,
@@ -15,9 +17,10 @@ use khive_types::{
 };
 
 use crate::definition::{
-    canonical_json, compile_document, digest, Compiled, OperationType, Refusal, StepType,
+    canonical_json, compile_document, digest, fold, Compiled, OperationType, Refusal, StepType,
 };
 use crate::frontier::{evaluate, GroupBy, Identity, Payload};
+use crate::resolve::{resolve, Decision, Subject, Terms};
 
 const fn param(
     name: &'static str,
@@ -47,17 +50,17 @@ const OBSERVED_AT: ParamDef = param(
     "RFC 3339 time the thing happened; default the time it is recorded.",
 );
 
-pub(crate) static OPERATION_HANDLERS: [HandlerDef; 5] = [
+pub(crate) static OPERATION_HANDLERS: [HandlerDef; 7] = [
     HandlerDef {
         name: "operation.define",
-        description: "Publish operation types in the caller's namespace: slots, steps (who acts, after which steps, how many of a repeating slot), and rules that ask or skip a step on facts and on other steps. Each step is published as its own step type and pinned by digest. Publishing the same type again is a no-op; a different type under a published version is refused.",
+        description: "Publish operation types in the caller's namespace: slots, steps (who acts, after which steps, how many of a repeating slot), and rules that ask or skip a step on facts and on other steps. Each step is published as its own step type and pinned by digest. A slot is given by a kind and a role with an optional qualifier, by a relation to another slot of the type, or by neither; a kind, role or relation a slot names must be a term of the namespace (forms.terms) by name or alias. Publishing the same type again is a no-op; a different type under a published version is refused.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[param(
             "document",
             "object",
             true,
-            "{operation_types: [{id, version, slots: [{name, repeats?, required?}], steps: [{name, by, act?, after?, quantifier? all_of|at_least_one, activated_by?, unless?, outcome?}], rules?: [{step, action activate|skip, when, unless?, status?, owner?, citation?}]}]}. A condition list is alternatives of terms, each {fact: {field, slot?, present|equals|one_of}} or {step: {name, done}}.",
+            "{operation_types: [{id, version, slots: [{name, repeats?, required?, kind?, role?, qualifier?, defined_by?: {relation, slot}}], steps: [{name, by, act?, after?, quantifier? all_of|at_least_one, activated_by?, unless?, outcome?}], rules?: [{step, action activate|skip, when, unless?, status?, owner?, citation?}]}]}. A condition list is alternatives of terms, each {fact: {field, slot?, present|equals|one_of}} or {step: {name, done}}.",
         )],
     },
     HandlerDef {
@@ -113,6 +116,33 @@ pub(crate) static OPERATION_HANDLERS: [HandlerDef; 5] = [
             param("group_by", "string", false, "supplier (default): one group per identity or opener; by: one group per slot."),
         ],
     },
+    HandlerDef {
+        name: "operation.resolve",
+        description: "Say which slot of a published operation type each subject of a loaded form fills, and how it was found: by a recorded decision (decision), by the subject's kind, role and qualifier (role), by a relation to a subject that fills the slot another slot is defined by (relation), or by a carrying relation to a subject that has a slot (carried, with the slot of that subject). A subject offered more than one slot, or reaching a slot that does not repeat along with another subject, is undecided with its candidates; a subject nothing reaches is no_slot. A decision whose slot the type version no longer has, or whose subject the form revision no longer declares, is named as lapsed. Reads the type (the latest version unless one is given), the form's subjects (the revision loaded last unless one is given), the namespace's terms and the decisions kept beside the type. Writes nothing.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            param("type", "string", true, "Operation type id."),
+            param("version", "integer", false, "Type version; default the latest published."),
+            param("type_namespace", "string", false, "Namespace holding the type, when more than one visible namespace publishes the id."),
+            param("form", "string", true, "A form_id, or form_id@revision."),
+            param("revision", "string", false, "Form revision; default the one loaded last."),
+        ],
+    },
+    HandlerDef {
+        name: "operation.decide",
+        description: "Record that subjects of a form fill one slot of an operation type, or that they are not of this type, with the reason. The type must be published in the caller's namespace, and the decision is kept beside it. A subject the form's revision loaded last does not declare, or a slot the type's latest version does not have, is refused with nothing written. For each subject it names, a decision supersedes the earlier decisions naming that subject for this type and form; it keeps applying to later type versions and form revisions while its subject and its slot still exist. Decisions are never changed or removed.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[
+            param("type", "string", true, "Operation type id, published in the caller's namespace."),
+            param("form", "string", true, "The form_id whose subjects are decided."),
+            param("subjects", "array of string", true, "Subject ids the form declares."),
+            param("slot", "string", false, "The slot they fill; give this or not_this_type."),
+            param("not_this_type", "boolean", false, "true: the subjects fill no slot of this type."),
+            param("reason", "string", true, "Why, in a sentence a later reader can check."),
+        ],
+    },
 ];
 
 /// Operation graphs: published operation types, operations recorded against them, and the
@@ -126,6 +156,9 @@ impl Pack for OperationPack {
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &OPERATION_HANDLERS;
+    /// Slots name their kinds, roles and relations from the forms pack's term lists, and
+    /// resolve reads a form's subjects there.
+    const REQUIRES: &'static [&'static str] = &["forms"];
     const SCHEMA_PLAN: Option<PackSchemaPlan> = Some(PackSchemaPlan {
         pack: Self::NAME,
         statements: crate::schema::OPERATION_SCHEMA_STATEMENTS,
@@ -158,16 +191,18 @@ impl PackRuntime for OperationPack {
         &self,
         verb: &str,
         params: Value,
-        _registry: &VerbRegistry,
+        registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         let params = Params::new(verb, params)?;
         match verb {
-            "operation.define" => self.define(params, token).await,
+            "operation.define" => self.define(params, registry, token).await,
             "operation.open" => self.open(params, token).await,
             "operation.bind" => self.bind(params, token).await,
             "operation.record" => self.record(params, token).await,
             "operation.frontier" => self.frontier(params, token).await,
+            "operation.resolve" => self.resolve(params, registry, token).await,
+            "operation.decide" => self.decide(params, registry, token).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "operation pack does not handle verb {verb:?}"
             ))),
@@ -550,9 +585,15 @@ fn check_item(params: &Params, loaded: &Loaded, item: &Prepared) -> Result<(), R
 }
 
 impl OperationPack {
-    async fn define(&self, params: Params, token: &NamespaceToken) -> Result<Value, RuntimeError> {
+    async fn define(
+        &self,
+        params: Params,
+        registry: &VerbRegistry,
+        token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
         let document = Value::Object(params.object("document")?);
         let compiled = compile_document(&document).map_err(|refusal| params.refused(refusal))?;
+        check_terms(&params, &compiled, registry, token).await?;
         let namespace = token.namespace().as_str().to_owned();
         let now = now_us();
         let verb = params.verb.clone();
@@ -1158,6 +1199,332 @@ impl OperationPack {
         }
         Ok(view)
     }
+
+    async fn resolve(
+        &self,
+        params: Params,
+        registry: &VerbRegistry,
+        token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        let type_id = params.str("type")?;
+        let version = params.opt_i64("version")?;
+        if version.is_some_and(|v| v < 1) {
+            return Err(params.invalid("version must be 1 or more"));
+        }
+        let type_namespace = params.opt_str("type_namespace")?;
+        let form = params.str("form")?;
+        let revision = params.opt_str("revision")?;
+        let mut reader = self.runtime.sql().reader().await?;
+        let rows = reader
+            .query_all(stmt(
+                include_str!("../sql/definition-find.sql"),
+                vec![
+                    text(&type_id),
+                    text(&visible_namespaces_json(token)),
+                    SqlValue::from_opt_text(type_namespace.as_deref()),
+                    SqlValue::from_opt_i64(version),
+                ],
+            ))
+            .await?;
+        drop(reader);
+        let Some(row) = rows.first() else {
+            return Err(RuntimeError::NotFound(format!("operation type {type_id}")));
+        };
+        let namespaces: BTreeSet<String> = rows
+            .iter()
+            .map(|row| col_text(row, "namespace"))
+            .collect::<StorageResult<_>>()?;
+        if namespaces.len() > 1 {
+            return Err(params.refused(Refusal::new(
+                "ambiguous_type",
+                format!(
+                    "{type_id} is published in {}; name one as type_namespace",
+                    namespaces.into_iter().collect::<Vec<_>>().join(", ")
+                ),
+            )));
+        }
+        let definition_namespace = col_text(row, "namespace")?;
+        let type_digest = col_text(row, "digest")?;
+        let bytes = checked_definition(row, "operation_type", &type_digest)?;
+        let definition: OperationType = serde_json::from_slice(&bytes)
+            .map_err(|e| RuntimeError::Internal(format!("operation type {type_id}: {e}")))?;
+
+        let mut args = json!({ "form": form });
+        if let Some(revision) = &revision {
+            args["revision"] = json!(revision);
+        }
+        let declared = forms_read(registry, token, "forms.subjects", args).await?;
+        let terms =
+            Terms::from_reply(&forms_read(registry, token, "forms.terms", json!({})).await?);
+        let form_id = declared["form"]["form_id"]
+            .as_str()
+            .ok_or_else(|| RuntimeError::Internal("forms.subjects named no form_id".to_owned()))?
+            .to_owned();
+        let subjects: Vec<Subject> = declared["subjects"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Subject::from_view)
+            .collect();
+
+        let mut reader = self.runtime.sql().reader().await?;
+        let rows = reader
+            .query_all(stmt(
+                include_str!("../sql/decisions-for.sql"),
+                vec![text(&definition_namespace), text(&type_id), text(&form_id)],
+            ))
+            .await?;
+        drop(reader);
+        let decisions: Vec<Decision> = rows
+            .iter()
+            .map(|row| {
+                Ok(Decision {
+                    id: col_text(row, "decision_id")?,
+                    subjects: subject_ids(row)?,
+                    slot: col_opt_text(row, "slot")?,
+                })
+            })
+            .collect::<StorageResult<_>>()?;
+        let resolution = resolve(&definition, &terms, &subjects, &decisions);
+        Ok(json!({
+            "type": {
+                "namespace": definition_namespace,
+                "id": definition.id,
+                "version": definition.version,
+                "digest": type_digest,
+            },
+            "form": declared["form"],
+            "subjects": resolution.subjects,
+            "lapsed": resolution.lapsed,
+            "decisions_read": decisions.len(),
+        }))
+    }
+
+    async fn decide(
+        &self,
+        params: Params,
+        registry: &VerbRegistry,
+        token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        let type_id = params.str("type")?;
+        let form = params.str("form")?;
+        let reason = params.str("reason")?;
+        let given: Vec<String> = match params.opt_value("subjects") {
+            Some(Value::Array(items)) if !items.is_empty() => items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_owned)
+                        .ok_or_else(|| params.invalid("subjects is a list of subject ids"))
+                })
+                .collect::<Result<_, _>>()?,
+            _ => return Err(params.invalid("subjects is required: a list of subject ids")),
+        };
+        let slot = params.opt_str("slot")?;
+        let not_this_type = match params.opt_value("not_this_type") {
+            None => false,
+            Some(Value::Bool(flag)) => *flag,
+            Some(_) => return Err(params.invalid("not_this_type must be true or false")),
+        };
+        if slot.is_some() == not_this_type {
+            return Err(params.invalid("give exactly one of slot and not_this_type"));
+        }
+        let namespace = token.namespace().as_str().to_owned();
+        let mut reader = self.runtime.sql().reader().await?;
+        let rows = reader
+            .query_all(stmt(
+                include_str!("../sql/definition-find.sql"),
+                vec![
+                    text(&type_id),
+                    text(&json!([namespace]).to_string()),
+                    text(&namespace),
+                    SqlValue::Null,
+                ],
+            ))
+            .await?;
+        drop(reader);
+        let Some(row) = rows.first() else {
+            return Err(params.refused(Refusal::new(
+                "unknown_type",
+                format!(
+                    "{type_id} is not published in {namespace}; a decision is kept beside its type"
+                ),
+            )));
+        };
+        let type_digest = col_text(row, "digest")?;
+        let bytes = checked_definition(row, "operation_type", &type_digest)?;
+        let definition: OperationType = serde_json::from_slice(&bytes)
+            .map_err(|e| RuntimeError::Internal(format!("operation type {type_id}: {e}")))?;
+        if let Some(slot) = &slot {
+            if definition.slot(slot).is_none() {
+                return Err(params.refused(Refusal::new(
+                    "unknown_slot",
+                    format!("{type_id} v{} has no slot {slot}", definition.version),
+                )));
+            }
+        }
+
+        let declared =
+            forms_read(registry, token, "forms.subjects", json!({ "form": form })).await?;
+        let form_id = declared["form"]["form_id"]
+            .as_str()
+            .ok_or_else(|| RuntimeError::Internal("forms.subjects named no form_id".to_owned()))?
+            .to_owned();
+        let form_revision = declared["form"]["revision"]
+            .as_str()
+            .ok_or_else(|| RuntimeError::Internal("forms.subjects named no revision".to_owned()))?
+            .to_owned();
+        let ids: Vec<String> = declared["subjects"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s["id"].as_str().map(str::to_owned))
+            .collect();
+        let mut subjects: Vec<String> = Vec::new();
+        for wanted in &given {
+            let Some(id) = ids.iter().find(|id| fold(id) == fold(wanted)) else {
+                return Err(params.refused(Refusal::new(
+                    "unknown_subject",
+                    format!("{form_id}@{form_revision} declares no subject {wanted}"),
+                )));
+            };
+            if !subjects.contains(id) {
+                subjects.push(id.clone());
+            }
+        }
+
+        let decision_id = uuid::Uuid::now_v7().to_string();
+        let decided_by = token.actor().id.clone();
+        let now = now_us();
+        let verb = params.verb.clone();
+        let (unit_ns, unit_id, unit_type, unit_form) = (
+            namespace.clone(),
+            decision_id.clone(),
+            type_id.clone(),
+            form_id.clone(),
+        );
+        let (unit_subjects, unit_slot, unit_reason, unit_by) = (
+            subjects.clone(),
+            slot.clone(),
+            reason.clone(),
+            decided_by.clone(),
+        );
+        let (unit_version, unit_revision) = (definition.version, form_revision.clone());
+        let op: AtomicUnitOp = Box::new(move |writer| {
+            Box::pin(async move {
+                let earlier = writer
+                    .query_all(stmt(
+                        include_str!("../sql/decisions-for.sql"),
+                        vec![text(&unit_ns), text(&unit_type), text(&unit_form)],
+                    ))
+                    .await?;
+                let mut supersedes = Vec::new();
+                for row in &earlier {
+                    let named = subject_ids(row)?;
+                    if named
+                        .iter()
+                        .any(|n| unit_subjects.iter().any(|s| fold(s) == fold(n)))
+                    {
+                        supersedes.push(col_text(row, "decision_id")?);
+                    }
+                }
+                writer
+                    .execute(stmt(
+                        include_str!("../sql/decision-insert.sql"),
+                        vec![
+                            text(&unit_ns),
+                            text(&unit_id),
+                            text(&unit_type),
+                            text(&unit_form),
+                            text(&json!(unit_subjects).to_string()),
+                            SqlValue::Integer(unit_version),
+                            text(&unit_revision),
+                            SqlValue::from_opt_text(unit_slot.as_deref()),
+                            text(&unit_reason),
+                            text(&unit_by),
+                            SqlValue::Integer(now),
+                            text(&json!(supersedes).to_string()),
+                        ],
+                    ))
+                    .await?;
+                Ok(boxed(json!(supersedes)))
+            })
+        });
+        let out = self.runtime.sql().atomic_unit(op).await?;
+        let supersedes = unit_value(out, &verb)?;
+        Ok(json!({
+            "decision": {
+                "id": decision_id,
+                "namespace": namespace,
+                "type": {"id": type_id, "version": definition.version},
+                "form": {"form_id": form_id, "revision": form_revision},
+                "subjects": subjects,
+                "slot": slot,
+                "not_this_type": not_this_type,
+                "reason": reason,
+                "decided_by": decided_by,
+                "decided_at": format_time(now),
+                "supersedes": supersedes,
+            }
+        }))
+    }
+}
+
+/// A read of the forms pack, made as the caller.
+async fn forms_read(
+    registry: &VerbRegistry,
+    token: &NamespaceToken,
+    verb: &str,
+    args: Value,
+) -> Result<Value, RuntimeError> {
+    Box::pin(registry.dispatch_with_identity(verb, args, Some(RequestIdentity::from_token(token))))
+        .await
+}
+
+/// Refuse a type whose slot names a kind, role or relation that is not a term of the
+/// namespace by name or alias. The terms are read only when a slot names one.
+async fn check_terms(
+    params: &Params,
+    compiled: &[Compiled],
+    registry: &VerbRegistry,
+    token: &NamespaceToken,
+) -> Result<(), RuntimeError> {
+    let mut named: Vec<(&str, &str, &str, &str)> = Vec::new();
+    for type_ in compiled {
+        for slot in &type_.definition.slots {
+            for (list, term) in [
+                ("kind", slot.kind.as_deref()),
+                ("role", slot.role.as_deref()),
+                (
+                    "relation",
+                    slot.defined_by.as_ref().map(|d| d.relation.as_str()),
+                ),
+            ] {
+                if let Some(term) = term {
+                    named.push((&type_.definition.id, &slot.name, list, term));
+                }
+            }
+        }
+    }
+    if named.is_empty() {
+        return Ok(());
+    }
+    let terms = Terms::from_reply(&forms_read(registry, token, "forms.terms", json!({})).await?);
+    match named.iter().find(|(_, _, list, term)| !terms.knows(list, term)) {
+        Some((type_id, slot, list, term)) => Err(params.refused(Refusal::new(
+            "unknown_term",
+            format!(
+                "{type_id}: slot {slot} names the {list} \"{term}\", which is not a {list} of this namespace by name or alias; load it with forms.load"
+            ),
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn subject_ids(row: &SqlRow) -> StorageResult<Vec<String>> {
+    serde_json::from_str(&col_text(row, "subject_ids")?)
+        .map_err(|e| corrupt(format!("column subject_ids: {e}")))
 }
 
 fn summary(type_: &Compiled) -> Value {

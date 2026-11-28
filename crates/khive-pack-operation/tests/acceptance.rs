@@ -12,6 +12,9 @@ use khive_runtime::{
 use khive_types::Pack;
 use serde_json::{json, Value};
 
+use khive_pack_forms as _;
+use khive_pack_kg as _;
+
 const TYPES: &str = "filing-types";
 const PREPARER: &str = "preparer-1";
 
@@ -58,7 +61,11 @@ fn with_namespace(caller: &Caller, mut params: Value) -> Value {
 
 impl Store {
     fn new() -> Self {
-        let packs = vec![OperationPack::NAME.to_owned()];
+        let packs = vec![
+            "kg".to_owned(),
+            "forms".to_owned(),
+            OperationPack::NAME.to_owned(),
+        ];
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
             packs: packs.clone(),
@@ -69,11 +76,12 @@ impl Store {
         let mut builder = VerbRegistryBuilder::new();
         builder.with_actor_id(Some(PREPARER.to_owned()));
         PackRegistry::register_packs(&packs, runtime.clone(), &mut builder)
-            .expect("the operation pack is discovered through its factory");
+            .expect("the operation pack and the packs it requires are discovered");
         let registry = builder.build().expect("registry");
         registry
             .apply_schema_plans_with_map(&Default::default(), runtime.backend())
             .expect("pack schema installation");
+        runtime.install_edge_rules(registry.all_edge_rules());
         Self {
             registry,
             _runtime: runtime,

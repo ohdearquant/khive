@@ -19,49 +19,85 @@ pub(super) struct TermSpec {
     pub(super) list: &'static str,
     pub(super) name: String,
     pub(super) definition: Option<String>,
+    pub(super) aliases: Vec<String>,
 }
 
-/// The terms of a document's `terms` object, list by list.
-pub(super) fn term_specs(doc: &Args) -> Result<Vec<TermSpec>, RuntimeError> {
+impl TermSpec {
+    /// The term's name and its aliases, folded.
+    pub(super) fn wordings(&self) -> Vec<String> {
+        std::iter::once(&self.name)
+            .chain(&self.aliases)
+            .map(|w| normalize(w))
+            .collect()
+    }
+}
+
+/// The terms of a document's `terms` object, list by list, and the relations
+/// it names under `carrying_relations`.
+pub(super) fn term_specs(doc: &Args) -> Result<(Vec<TermSpec>, Vec<String>), RuntimeError> {
     let Some(terms) = params::object(doc, "terms")? else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
     if let Some(key) = terms
         .keys()
-        .find(|key| !TERM_LISTS.iter().any(|(name, _)| name == key))
+        .find(|key| *key != "carrying_relations" && !TERM_LISTS.iter().any(|(name, _)| name == key))
     {
         return Err(invalid(format!(
-            "terms has no list \"{key}\"; its lists are kinds, roles, relations and purposes"
+            "terms has no list \"{key}\"; its lists are kinds, roles, relations, purposes, counting_qualifiers and carrying_relations"
         )));
     }
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for (key, list) in TERM_LISTS {
         for entry in params::list(terms, key)? {
-            let (name, definition) = match entry {
-                Value::String(name) if !name.trim().is_empty() => (name.trim().to_owned(), None),
+            let (name, definition, aliases) = match entry {
+                Value::String(name) if !name.trim().is_empty() => {
+                    (name.trim().to_owned(), None, Vec::new())
+                }
                 Value::Object(obj) => (
                     params::text(obj, "name")?,
                     params::opt_text(obj, "definition")?,
+                    params::string_list(obj, "aliases")?,
                 ),
                 _ => {
                     return Err(invalid(format!(
-                        "each entry of terms.{key} is a name or {{name, definition?}}"
+                        "each entry of terms.{key} is a name or {{name, definition?, aliases?}}"
                     )))
                 }
             };
-            if !seen.insert((list, normalize(&name))) {
-                return Err(invalid(format!("terms.{key} lists \"{name}\" twice")));
-            }
-            out.push(TermSpec {
+            let spec = TermSpec {
                 list,
                 name,
                 definition,
-            });
+                aliases,
+            };
+            for wording in spec.wordings() {
+                if !seen.insert((list, wording.clone())) {
+                    return Err(invalid(format!(
+                        "terms.{key} gives \"{wording}\" twice, as a name or an alias"
+                    )));
+                }
+            }
+            out.push(spec);
         }
     }
-    Ok(out)
+    let mut carrying = Vec::new();
+    for entry in params::list(terms, "carrying_relations")? {
+        match entry {
+            Value::String(name) if !name.trim().is_empty() => carrying.push(name.trim().to_owned()),
+            _ => {
+                return Err(invalid(
+                    "each entry of terms.carrying_relations is the name of a relation",
+                ))
+            }
+        }
+    }
+    Ok((out, carrying))
 }
+
+/// Each loaded term by its list and a folded wording (its name or an alias),
+/// to its canonical name.
+pub(super) type KnownTerms = HashMap<(String, String), String>;
 
 /// A subject a document declares on its form.
 pub(super) struct SubjectSpec {
@@ -120,30 +156,41 @@ pub(super) fn subject_specs(doc: &Args) -> Result<Vec<SubjectSpec>, RuntimeError
 }
 
 /// Refuse a subject whose kind, role or relation is not a loaded term, or whose
-/// relation points at a subject the document does not declare. `known` holds
-/// (list, folded term) for every term loaded before or by the document.
+/// relation points at a subject the document does not declare, and write each
+/// term a subject names by an alias under the term's canonical name. `known`
+/// holds every term loaded before or by the document.
 pub(super) fn check_subjects(
-    specs: &[SubjectSpec],
-    known: &HashSet<(String, String)>,
+    specs: &mut [SubjectSpec],
+    known: &KnownTerms,
 ) -> Result<(), RuntimeError> {
     let declared: HashSet<String> = specs.iter().map(|s| normalize(&s.id)).collect();
-    let loaded = |list: &str, term: &str| known.contains(&(list.to_owned(), normalize(term)));
-    for spec in specs {
-        for (list, term) in [("kind", &spec.kind), ("role", &spec.role)] {
-            if !loaded(list, term) {
+    let canonical =
+        |list: &str, term: &str| known.get(&(list.to_owned(), normalize(term))).cloned();
+    for spec in specs.iter_mut() {
+        for (list, term) in [("kind", &mut spec.kind), ("role", &mut spec.role)] {
+            let Some(name) = canonical(list, term) else {
                 return Err(invalid(format!(
                     "subject \"{}\" has {list} \"{term}\", which is not a loaded {list}; list it under terms",
                     spec.id
                 )));
+            };
+            *term = name;
+        }
+        // A qualifier that is a loaded counting qualifier is stored under its
+        // canonical name; any other qualifier is kept as the document gives it.
+        if let Some(qualifier) = spec.qualifier.as_mut() {
+            if let Some(name) = canonical("counting_qualifier", qualifier) {
+                *qualifier = name;
             }
         }
-        for (relation, to) in &spec.relations {
-            if !loaded("relation", relation) {
+        for (relation, to) in spec.relations.iter_mut() {
+            let Some(name) = canonical("relation", relation) else {
                 return Err(invalid(format!(
                     "subject \"{}\" names the relation \"{relation}\", which is not a loaded relation; list it under terms",
                     spec.id
                 )));
-            }
+            };
+            *relation = name;
             if !declared.contains(&normalize(to)) {
                 return Err(invalid(format!(
                     "subject \"{}\" names \"{to}\" under the relation \"{relation}\", and the document does not declare \"{to}\"",
