@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already holds. An add to a deleted entity is refused as `entity_deleted` and to a merged-away one
   as `entity_merged` (ADR-221 Amendment 1).
 
+### Breaking (Rust crates)
+
+- `khive_storage::scope_request_correlation` and `khive_storage::current_request_correlation`
+  are now `khive_storage::scope_request_id` and `khive_storage::current_request_id`. These names
+  match `request_id` in daemon frames and writer attempt rows (#6773).
+
 ## [0.23.0] - 2026-11-26
 
 ### Added
