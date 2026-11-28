@@ -435,6 +435,8 @@ if query_files:
                             deterministic=True)
         con.create_function("code_name_score", 2, lambda name, query: None,
                             deterministic=True)
+        con.create_function("khive_rfc3339_strict_key", 1, lambda value: None,
+                            deterministic=True)
         for path in chain:
             with open(path) as fh:
                 try:

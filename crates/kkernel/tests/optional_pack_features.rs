@@ -55,6 +55,16 @@ fn discovered_packs_include_the_default_and_explicitly_selected_packs() {
         "the schema-only pack is opt-in"
     );
     expected.insert("charter".to_string());
+    assert!(
+        !expected.contains("forms"),
+        "the forms pack is selected by name"
+    );
+    expected.insert("forms".to_string());
+    assert!(
+        !expected.contains("operation"),
+        "the operation pack is selected by name"
+    );
+    expected.insert("operation".to_string());
     for (name, linked) in OPTIONAL_PACKS {
         if linked {
             expected.insert(name.to_string());
@@ -69,7 +79,7 @@ fn discovered_packs_include_the_default_and_explicitly_selected_packs() {
     assert_eq!(
         discovered(),
         expected,
-        "the linked packs must include charter and the packs whose feature is on"
+        "the linked packs must include charter, forms, operation and the packs whose feature is on"
     );
 }
 

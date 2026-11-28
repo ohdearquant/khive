@@ -15,7 +15,8 @@ pub type RuntimeResult<T> = Result<T, RuntimeError>;
 pub enum DomainDisposition {
     /// The handler returned its canonical success value before a later failure.
     Committed,
-    /// The operation was refused before its handler was invoked.
+    /// No requested domain write committed, established by pre-dispatch refusal
+    /// or an explicit handler/write proof.
     NotCommitted,
     /// The handler failed, so its domain effects are not established here.
     Unknown,
@@ -186,6 +187,13 @@ pub const WRITER_TASK_REQUEST_FAILED_STAGE: &str = "writer_task_request_failed";
 /// Stable wire code/stage for a request reported by a permanently retired
 /// writer seam.
 pub const WRITER_TASK_TERMINATED_STAGE: &str = "writer_task_terminated";
+
+/// COMMIT was issued but its caller cannot establish the outcome (ADR-135 F6).
+pub const WRITE_OUTCOME_UNKNOWN_STAGE: &str = "write_outcome_unknown";
+/// Strict routing could not reach its writer before execution (ADR-135 F6).
+pub const WRITER_OWNER_UNAVAILABLE_STAGE: &str = "writer_owner_unavailable";
+/// Strict routing refused an attempted direct logical write (ADR-135 F6).
+pub const WRITER_ROUTE_VIOLATION_STAGE: &str = "writer_route_violation";
 
 /// Stable wire code/stage for a bounded storage-admission wait (a
 /// reader/writer handle slot or a pooled reader checkout) that elapsed
@@ -648,11 +656,73 @@ impl std::error::Error for ResolutionFailureContext {
     }
 }
 
+/// The substrate whose required search metadata could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchReadSubstrate {
+    Entity,
+    Note,
+}
+
+impl SearchReadSubstrate {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Entity => "entity",
+            Self::Note => "note",
+        }
+    }
+}
+
+/// Search context with an intact typed cause that is never rendered publicly.
+#[derive(Debug)]
+pub struct SearchReadContext {
+    backend: crate::BackendId,
+    substrate: SearchReadSubstrate,
+    source: Box<RuntimeError>,
+}
+
+impl SearchReadContext {
+    pub fn backend(&self) -> &crate::BackendId {
+        &self.backend
+    }
+
+    pub fn substrate(&self) -> SearchReadSubstrate {
+        self.substrate
+    }
+
+    pub fn source(&self) -> &RuntimeError {
+        &self.source
+    }
+
+    pub(crate) fn into_source(self) -> RuntimeError {
+        *self.source
+    }
+}
+
+impl fmt::Display for SearchReadContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "search metadata read failed on backend {} ({})",
+            self.backend,
+            self.substrate.as_str()
+        )
+    }
+}
+
+impl std::error::Error for SearchReadContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Variants cover storage, query, validation, namespace isolation, and permission failures.
 /// Callers should match on `InvalidInput` for bad arguments, `NotFound` for missing records,
 /// and `NamespaceMismatch` (reported as not-found) for cross-namespace access attempts.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    /// A required search read failed; public context excludes source contents.
+    #[error(transparent)]
+    SearchRead { context: SearchReadContext },
     /// A decoded canonical operation has no live apply implementation.
     #[error(
         "canonical operation {op_index}: {operation} is KnownUnimplemented for canonical apply"
@@ -688,7 +758,7 @@ pub enum RuntimeError {
     },
 
     #[error("storage: {0}")]
-    Storage(#[from] khive_storage::StorageError),
+    Storage(#[source] khive_storage::StorageError),
 
     #[error("query: {0}")]
     Query(#[from] khive_query::QueryError),
@@ -963,6 +1033,77 @@ pub enum RuntimeError {
     },
 }
 
+impl From<khive_storage::StorageError> for RuntimeError {
+    fn from(error: khive_storage::StorageError) -> Self {
+        match error {
+            khive_storage::StorageError::SecretDetected { matched, .. } => {
+                Self::SecretDetected(*matched)
+            }
+            other => Self::Storage(other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod secret_storage_conversion_tests {
+    use super::RuntimeError;
+    use khive_storage::{StorageCapability, StorageError};
+    use std::error::Error;
+
+    #[test]
+    fn storage_secret_conversion_preserves_safe_match_and_runtime_refusal() {
+        let key = format!("ghp_{}", "A".repeat(40));
+        let storage =
+            khive_storage::note::validate_note_key_for_store(&key, "assign_note_key_if_unset")
+                .expect_err("storage must refuse the incoming key");
+        let display = storage.to_string();
+        let runtime: RuntimeError = storage.into();
+        let RuntimeError::SecretDetected(matched) = &runtime else {
+            panic!("typed storage secret must become the existing runtime refusal: {runtime:?}");
+        };
+        assert_eq!(matched.detector, "github-token");
+        assert_eq!(matched.trigger, None);
+        assert_eq!(matched.masked, "ghp_AA...44chars");
+        assert_eq!(matched.location.as_deref(), Some("note.key"));
+        assert_eq!(runtime.to_string(), display);
+        let direct = crate::secret_gate::check_at(&key, "note", "key").unwrap_err();
+        let RuntimeError::SecretDetected(direct_match) = direct else {
+            panic!("runtime scanner must retain its typed refusal");
+        };
+        assert_eq!(matched, &direct_match);
+        assert!(!runtime.to_string().contains(&key));
+        assert!(!format!("{runtime:?}").contains(&key));
+        assert!(runtime.source().is_none());
+    }
+
+    #[test]
+    fn ordinary_storage_conversion_and_direct_wrapper_keep_the_typed_source() {
+        for converted in [false, true] {
+            let storage = StorageError::InvalidInput {
+                capability: StorageCapability::Notes,
+                operation: "source-chain-fixture".into(),
+                message: "ordinary refusal".into(),
+            };
+            let expected = storage.to_string();
+            let runtime = if converted {
+                RuntimeError::from(storage)
+            } else {
+                RuntimeError::Storage(storage)
+            };
+            assert_eq!(runtime.to_string(), format!("storage: {expected}"));
+            let source = runtime
+                .source()
+                .expect("ordinary storage wrapper must retain Error::source");
+            assert!(
+                matches!(source.downcast_ref::<StorageError>(),
+                Some(StorageError::InvalidInput { capability: StorageCapability::Notes, operation, message })
+                    if operation == "source-chain-fixture" && message == "ordinary refusal"),
+                "the source must be the original typed StorageError"
+            );
+        }
+    }
+}
+
 // Compatibility bridge for concrete backend callers while ADR-071's raw-SQL
 // and backend-handle migrations remain in progress. Classification belongs to
 // the database boundary; the runtime exposes only the storage error envelope.
@@ -976,6 +1117,21 @@ impl From<khive_db::SqliteError> for RuntimeError {
 }
 
 impl RuntimeError {
+    /// Attach the owning backend and substrate without exposing the cause text.
+    pub fn with_search_read_context(
+        self,
+        backend: crate::BackendId,
+        substrate: SearchReadSubstrate,
+    ) -> Self {
+        Self::SearchRead {
+            context: SearchReadContext {
+                backend,
+                substrate,
+                source: Box::new(self),
+            },
+        }
+    }
+
     /// Certify that this operation refused before attempting requested data writes.
     pub fn before_requested_write(self) -> Self {
         Self::BatchWrite {
@@ -1001,17 +1157,18 @@ impl RuntimeError {
     /// Preserve a single atomic write's actual typed settlement, never its rendered text.
     pub fn atomic_write_failure(error: khive_storage::StorageError) -> Self {
         use khive_storage::{StorageError, WriterTaskRequestState};
-        let disposition = match error.without_sqlite_write_stage() {
-            StorageError::WriterTaskRequestFailed { request_state, .. }
-            | StorageError::WriterTaskTerminated { request_state, .. } => match request_state {
+        let disposition = match error.writer_request_state() {
+            Some(request_state) => match request_state {
                 WriterTaskRequestState::NotStarted
                 | WriterTaskRequestState::TransactionRolledBack => DomainDisposition::NotCommitted,
                 WriterTaskRequestState::SideEffectsUnknown => DomainDisposition::Unknown,
             },
-            StorageError::WriterTaskBusy { .. }
-            | StorageError::WriteQueueFull { .. }
-            | StorageError::AdmissionTimeout { .. } => DomainDisposition::NotCommitted,
-            _ => DomainDisposition::Unknown,
+            None => match error.without_sqlite_write_stage() {
+                StorageError::WriterTaskBusy { .. }
+                | StorageError::WriteQueueFull { .. }
+                | StorageError::AdmissionTimeout { .. } => DomainDisposition::NotCommitted,
+                _ => DomainDisposition::Unknown,
+            },
         };
         Self::BatchWrite {
             context: Box::new(BatchWriteContext {
@@ -1027,6 +1184,7 @@ impl RuntimeError {
         match self {
             Self::BatchWrite { context } => Some(context.disposition),
             Self::RefusedWithEvents { context } => context.source.batch_write_disposition(),
+            Self::SearchRead { context } => context.source.batch_write_disposition(),
             _ => None,
         }
     }
@@ -1070,6 +1228,7 @@ impl RuntimeError {
                 Self::RefusedWithEvents { context } => &context.source,
                 Self::BatchWrite { context } => &context.source,
                 Self::WithResolution { context } => context.source.as_ref(),
+                Self::SearchRead { context } => context.source.as_ref(),
                 Self::LintFix { source, .. } => source.as_ref(),
                 Self::CanonicalAdmission { source, .. } => source.as_ref(),
                 _ => return error,
@@ -1169,6 +1328,7 @@ impl RuntimeError {
             Self::RefusedWithEvents { context } => context.source.variant_name(),
             Self::BatchWrite { context } => context.source.variant_name(),
             Self::WithResolution { context } => context.source.variant_name(),
+            Self::SearchRead { context } => context.source.variant_name(),
             Self::LintFix { source, .. } => source.variant_name(),
             Self::CanonicalAdmission { source, .. } => source.variant_name(),
             Self::CanonicalUnsupportedOperation { .. } => "CanonicalUnsupportedOperation",
@@ -1260,6 +1420,30 @@ impl RuntimeError {
             return None;
         };
         match error.without_sqlite_write_stage() {
+            khive_storage::StorageError::WriteOutcomeUnknown { .. } => {
+                Some(WriterTaskFailureContext {
+                    stage: WRITE_OUTCOME_UNKNOWN_STAGE,
+                    request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                    task_terminated: false,
+                    retryable: false,
+                })
+            }
+            khive_storage::StorageError::WriterOwnerUnavailable { source, .. } => {
+                Some(WriterTaskFailureContext {
+                    stage: WRITER_OWNER_UNAVAILABLE_STAGE,
+                    request_state: khive_storage::WriterTaskRequestState::NotStarted,
+                    task_terminated: false,
+                    retryable: source.is_retryable(),
+                })
+            }
+            khive_storage::StorageError::WriterRouteViolation { .. } => {
+                Some(WriterTaskFailureContext {
+                    stage: WRITER_ROUTE_VIOLATION_STAGE,
+                    request_state: khive_storage::WriterTaskRequestState::NotStarted,
+                    task_terminated: false,
+                    retryable: false,
+                })
+            }
             khive_storage::StorageError::WriterTaskRequestFailed {
                 request_state,
                 source,
@@ -1291,6 +1475,7 @@ impl RuntimeError {
                 Self::RefusedWithEvents { context } => enclosing = &context.source,
                 Self::BatchWrite { context } => enclosing = &context.source,
                 Self::WithResolution { context } => enclosing = &context.source,
+                Self::SearchRead { context } => enclosing = &context.source,
                 _ => break,
             }
         }
@@ -1300,6 +1485,21 @@ impl RuntimeError {
             return Some(context.into());
         }
         if let Self::Storage(error) = source {
+            if let khive_storage::StorageError::WriterOwnerUnavailable { operation, source } =
+                error.without_sqlite_write_stage()
+            {
+                if source.is_retryable() {
+                    return Some(RetryableFailureContext {
+                        stage: WRITER_OWNER_UNAVAILABLE_STAGE,
+                        timeout: Duration::ZERO,
+                        capability: source.capability(),
+                        operation: Some(operation.to_string()),
+                        pool_identity: None,
+                        scope: None,
+                        retry_after_ms: None,
+                    });
+                }
+            }
             if let khive_storage::StorageError::WriterTaskBusy { timeout_ms } =
                 error.without_sqlite_write_stage()
             {
@@ -1431,6 +1631,47 @@ mod batch_write_proof_tests {
         let value = runtime_error_value(source, disposition);
         assert_eq!(value["domain_disposition"], disposition.as_str());
         (disposition, value)
+    }
+
+    #[test]
+    fn rejected_before_write_preserves_enclosing_disposition_and_error_class() {
+        let message = "decoding refused";
+        let (disposition, value) =
+            project_failed(RuntimeError::InvalidInput(message.into()).before_requested_write());
+        assert_eq!(disposition, DomainDisposition::NotCommitted);
+        assert_eq!(value["kind"], "runtime_error");
+        assert_eq!(value["message"], format!("invalid input: {message}"));
+        assert_eq!(
+            RuntimeError::InvalidInput(message.into())
+                .before_requested_write()
+                .audit_error_class(),
+            crate::audit_error::AuditErrorClass::InvalidParams
+        );
+        let (ordinary, _) = project_failed(RuntimeError::InvalidInput(message.into()));
+        assert_eq!(ordinary, DomainDisposition::Unknown);
+
+        let enclosing = RuntimeError::InvalidInput(message.into())
+            .before_requested_write()
+            .with_resolution(ResolutionFacts {
+                project_id: Uuid::new_v4(),
+                duplicate_anchor_ids: vec![],
+                slug_backfilled: false,
+                project_created: true,
+                orphaned_project_id: None,
+                orphaned_note_count: 0,
+            });
+        let (disposition, _) = project_failed(enclosing);
+        assert_eq!(disposition, DomainDisposition::Unknown);
+        let committed = DispatchError::after_handler(
+            RuntimeError::InvalidInput(message.into()).before_requested_write(),
+            true,
+        );
+        assert_eq!(committed.disposition(), DomainDisposition::Committed);
+        let (source, disposition) = committed.into_parts();
+        assert_eq!(
+            runtime_error_value(source, disposition)["domain_disposition"],
+            "committed"
+        );
     }
 
     #[test]

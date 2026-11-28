@@ -17,14 +17,14 @@ pub enum EntityChange {
     /// Present in base, unchanged in branch.
     Unchanged,
     /// Added in branch (absent in base).
-    Added(ExportedEntity),
+    Added(Box<ExportedEntity>),
     /// Deleted in branch (present in base, absent in branch).
     Deleted,
     /// Modified in branch (fields differ from base).
     Modified {
         // Used by three-way property reconciliation and future “was → now” displays.
-        base: ExportedEntity,
-        branch: ExportedEntity,
+        base: Box<ExportedEntity>,
+        branch: Box<ExportedEntity>,
     },
 }
 
@@ -92,15 +92,15 @@ pub fn diff_entities(base: &KgArchive, branch: &KgArchive) -> HashMap<Uuid, Enti
 
     for id in all_ids_sorted {
         let change = match (base_map.get(&id), branch_map.get(&id)) {
-            (None, Some(b)) => EntityChange::Added((*b).clone()),
+            (None, Some(b)) => EntityChange::Added(Box::new((*b).clone())),
             (Some(_), None) => EntityChange::Deleted,
             (Some(base_e), Some(branch_e)) => {
                 if entities_equal(base_e, branch_e) {
                     EntityChange::Unchanged
                 } else {
                     EntityChange::Modified {
-                        base: (*base_e).clone(),
-                        branch: (*branch_e).clone(),
+                        base: Box::new((*base_e).clone()),
+                        branch: Box::new((*branch_e).clone()),
                     }
                 }
             }
@@ -193,6 +193,19 @@ fn entities_equal(a: &ExportedEntity, b: &ExportedEntity) -> bool {
         && a.description == b.description
         && a.tags == b.tags
         && properties_equal(&a.properties, &b.properties)
+        && names_equal(a, b)
+}
+
+/// Compares an entity's keys and aliases as sets, ignoring order.
+pub(crate) fn names_equal(a: &ExportedEntity, b: &ExportedEntity) -> bool {
+    sorted_set(&a.keys) == sorted_set(&b.keys) && sorted_set(&a.aliases) == sorted_set(&b.aliases)
+}
+
+fn sorted_set<T: Ord + Clone>(items: &[T]) -> Vec<T> {
+    let mut items = items.to_vec();
+    items.sort();
+    items.dedup();
+    items
 }
 
 /// Compares optional property payloads exactly.

@@ -133,6 +133,26 @@ fn propose_params_has_required_title_description_changeset() {
 }
 
 #[test]
+fn propose_changeset_help_states_the_one_step_compound_limit() {
+    let changeset = find_handler("propose")
+        .params
+        .iter()
+        .find(|p| p.name == "changeset")
+        .expect("propose has a changeset param");
+    assert!(
+        changeset.description.contains(
+            "compound — {kind: \"compound\", steps: [<changeset>]}: one step only for now"
+        ),
+        "propose help must state the one-step compound limit: {}",
+        changeset.description
+    );
+    assert!(
+        !changeset.description.contains("steps: [<changeset>, ...]"),
+        "propose help must not advertise multi-step compounds while they are refused"
+    );
+}
+
+#[test]
 fn link_help_schema_matches_strict_singleton_and_bulk_params() {
     let handler = find_handler("link");
     let advertised = handler

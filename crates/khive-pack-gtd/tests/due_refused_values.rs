@@ -153,6 +153,37 @@ async fn assign_and_create_timezone_refusals_mask_credentials_before_due() {
 }
 
 #[tokio::test]
+async fn assign_and_create_refuse_invalid_timezones_without_due_without_writes() {
+    let registry = fixture();
+    let retained = [seed(&registry).await];
+    let secret = credential();
+    for verb in ["gtd.assign", "create"] {
+        for explicit_null_due in [false, true] {
+            for (raw, shown, masked) in [
+                ("Mars/Olympus", "Mars/Olympus", false),
+                (&secret, "***MASKED***", true),
+            ] {
+                let mut fields = json!({"timezone": raw});
+                if explicit_null_due {
+                    fields["due"] = Value::Null;
+                }
+                refuse_task_shape_with_snapshots(
+                    &registry,
+                    verb,
+                    create_args(verb, "Refused zone without deadline", fields),
+                    format!(
+                        "timezone must be an IANA zone name (e.g. \"America/New_York\"); got {shown:?}"
+                    ),
+                    masked.then_some(secret.as_str()),
+                    &retained,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn task_update_due_refusals_mask_credentials_and_preserve_the_snapshot() {
     let registry = fixture();
     let id = seed(&registry).await;
@@ -197,7 +228,7 @@ async fn task_update_due_refusals_mask_credentials_and_preserve_the_snapshot() {
 }
 
 #[tokio::test]
-async fn valid_deadlines_keep_normalization_aliases_and_unused_timezone_behavior() {
+async fn valid_deadlines_keep_normalization_aliases_and_no_due_means_no_echo() {
     let registry = fixture();
     for verb in ["gtd.assign", "create"] {
         for (index, fields, due, zone) in [
@@ -215,13 +246,13 @@ async fn valid_deadlines_keep_normalization_aliases_and_unused_timezone_behavior
             ),
             (
                 2,
-                json!({"timezone": "unused-invalid-zone"}),
+                json!({"timezone": "Asia/Tokyo"}),
                 Value::Null,
                 Value::Null,
             ),
             (
                 3,
-                json!({"due": null, "timezone": "unused-invalid-zone"}),
+                json!({"due": null, "timezone": "America/New_York"}),
                 Value::Null,
                 Value::Null,
             ),
@@ -995,14 +1026,27 @@ async fn create_normalizes_timezone_aliases_in_raw_stored_properties() {
         (
             "property-only",
             json!({"due": "2026-06-01", "timezone": "Asia/Tokyo"}),
-            "2026-06-01T00:00:00+09:00",
-            "Asia/Tokyo",
+            Some("2026-06-01T00:00:00+09:00"),
+            Some("Asia/Tokyo"),
         ),
         (
             "null-alias",
             json!({"due": "2026-06-01T12:00:00+02:00", "timezone": null}),
-            "2026-06-01T10:00:00+00:00",
-            configured_zone,
+            Some("2026-06-01T10:00:00+00:00"),
+            Some(configured_zone),
+        ),
+        ("absent-due", json!({"timezone": "Asia/Tokyo"}), None, None),
+        (
+            "null-due",
+            json!({"due": null, "timezone": "America/New_York"}),
+            None,
+            None,
+        ),
+        (
+            "null-alias-without-due",
+            json!({"timezone": null}),
+            None,
+            None,
         ),
     ] {
         let title = format!("Raw timezone normalization {case}");
@@ -1035,6 +1079,16 @@ async fn create_normalizes_timezone_aliases_in_raw_stored_properties() {
             json!(zone),
             "{case}: canonical deadline zone"
         );
+        if due.is_none() {
+            assert!(
+                properties.get("due").is_none(),
+                "{case}: no stored deadline"
+            );
+            assert!(
+                properties.get("due_timezone").is_none(),
+                "{case}: no stored deadline zone without a deadline"
+            );
+        }
         assert!(
             properties.get("timezone").is_none(),
             "{case}: the raw stored timezone alias must be consumed"
@@ -1101,40 +1155,69 @@ async fn stream_append_refuses_shadowed_invalid_nested_timezone_after_valid_base
         baseline.get("timezone").is_none(),
         "the valid stream baseline must consume the raw timezone alias"
     );
+    let before_tasks = tasks(&registry).await;
+    let before_stream = registry
+        .dispatch(
+            "stream.stat",
+            json!({"stream": "gtd-timezone-validation-r2"}),
+        )
+        .await
+        .unwrap();
 
     let secret = credential();
     for (raw, shown, masked) in [
         ("Mars/Olympus", "Mars/Olympus", false),
         (&secret, "***MASKED***", true),
     ] {
-        let error = registry
-            .dispatch(
-                "stream.append",
-                json!({
-                    "stream": "gtd-timezone-validation-r2",
-                    "note_kind": "task",
-                    "record": {
-                        "title": "Refused stream shadowed timezone",
-                        "due": "2026-06-01",
-                        "timezone": "America/New_York",
-                        "properties": {"timezone": raw}
-                    }
-                }),
-            )
-            .await
-            .expect_err("public task stream append must refuse a shadowed invalid nested zone");
-        let rendered = error.to_string();
-        let expected = format!(
-            "properties.timezone must be an IANA zone name (e.g. \"America/New_York\"); got {shown:?}"
-        );
-        assert!(
-            rendered.contains(&expected),
-            "expected the nested-zone refusal after the successful stream baseline: {rendered}"
-        );
-        if masked {
+        for due in [Some(json!("2026-06-01")), None, Some(Value::Null)] {
+            let mut record = json!({
+                "title": "Refused stream shadowed timezone",
+                "timezone": "America/New_York",
+                "properties": {"timezone": raw}
+            });
+            if let Some(due) = due {
+                record["due"] = due;
+            }
+            let error = registry
+                .dispatch(
+                    "stream.append",
+                    json!({
+                        "stream": "gtd-timezone-validation-r2",
+                        "note_kind": "task",
+                        "record": record
+                    }),
+                )
+                .await
+                .expect_err("public task stream append must refuse a shadowed invalid nested zone");
+            let rendered = error.to_string();
+            let expected = format!(
+                "properties.timezone must be an IANA zone name (e.g. \"America/New_York\"); got {shown:?}"
+            );
             assert!(
-                !rendered.contains(secret.as_str()),
-                "the nested-zone refusal must not expose the credential"
+                rendered.contains(&expected),
+                "expected the nested-zone refusal after the successful stream baseline: {rendered}"
+            );
+            if masked {
+                assert!(
+                    !rendered.contains(secret.as_str()),
+                    "the nested-zone refusal must not expose the credential"
+                );
+            }
+            assert_eq!(
+                tasks(&registry).await,
+                before_tasks,
+                "refusal changed tasks"
+            );
+            assert_eq!(
+                registry
+                    .dispatch(
+                        "stream.stat",
+                        json!({"stream": "gtd-timezone-validation-r2"})
+                    )
+                    .await
+                    .unwrap(),
+                before_stream,
+                "refusal advanced the stream"
             );
         }
     }

@@ -10,6 +10,7 @@ mod fresh_tail_tests;
 #[cfg(test)]
 mod fuse_equivalence_tests;
 mod prune;
+mod query_ir_adapter;
 mod recall;
 mod remember;
 #[cfg(test)]

@@ -583,9 +583,6 @@ impl KgPack {
 
         // ---- Stage 2: expansion ----
         let t2 = if prof { Some(Instant::now()) } else { None };
-        // Anchors seed the visited set so an anchor already shown at the top
-        // level never also appears inside another anchor's neighbor list.
-        let mut visited: HashSet<Uuid> = anchor_ids.iter().copied().collect();
         let anchor_id_set: HashSet<Uuid> = anchor_ids.iter().copied().collect();
         let mut seen_anchor_edge_ids = HashSet::new();
         let mut anchor_edge_records = Vec::new();
@@ -600,6 +597,11 @@ impl KgPack {
         };
 
         for &anchor in &anchor_ids {
+            // Each anchor owns its visited set (ADR-089 Amendment: one visited set per
+            // anchor), so a node several anchors reach is listed under each of them.
+            // The anchors seed it so an anchor shown at the top level never also
+            // appears inside an anchor's neighbor list.
+            let mut visited: HashSet<Uuid> = anchor_id_set.clone();
             let mut recs: Vec<NeighborRecord> = Vec::new();
             let mut hop1_parents: Vec<Uuid> = Vec::new();
 

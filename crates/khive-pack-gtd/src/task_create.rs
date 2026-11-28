@@ -402,6 +402,32 @@ pub(crate) async fn prepare_task_create(
     if let Some(ref assignee) = input.assignee {
         obj.insert("assignee".into(), json!(assignee));
     }
+    let zone = match input.timezone.as_deref() {
+        None => runtime.config().display_timezone,
+        Some(name) => name.parse::<chrono_tz::Tz>().map_err(|_| {
+            RuntimeError::InvalidInput(format!(
+                "timezone must be an IANA zone name (e.g. \"America/New_York\"); got {:?}",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, name)
+            ))
+        })?,
+    };
+    // Validate the retained nested alias after the selected zone so its
+    // existing refusal diagnostic remains unchanged, even without a deadline.
+    if let Some(value) = obj.get("timezone").filter(|value| !value.is_null()) {
+        let name = value.as_str().ok_or_else(|| {
+            RuntimeError::InvalidInput(format!(
+                "properties.timezone must be a string or null; got {}",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &value.to_string())
+            ))
+        })?;
+        name.parse::<chrono_tz::Tz>().map_err(|_| {
+            RuntimeError::InvalidInput(format!(
+                "properties.timezone must be an IANA zone name (e.g. \"America/New_York\"); got {:?}",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, name)
+            ))
+        })?;
+    }
+    obj.remove("timezone");
     if let Some(ref due) = input.due {
         // The zone a deadline is anchored in is a property of whose deadline it is,
         // and the runtime does not know whose. The configured display timezone is a
@@ -409,34 +435,8 @@ pub(crate) async fn prepare_task_create(
         // callers, so the caller may name the zone and the answer echoes which one
         // was used: without the echo a defaulted anchor and a caller-supplied one
         // are byte-identical in the record and the ambiguity just moves to the reader.
-        let zone = match input.timezone.as_deref() {
-            None => runtime.config().display_timezone,
-            Some(name) => name.parse::<chrono_tz::Tz>().map_err(|_| {
-                RuntimeError::InvalidInput(format!(
-                    "timezone must be an IANA zone name (e.g. \"America/New_York\"); got {:?}",
-                    mask_for_redaction_surface(RedactionSurface::GateProbe, name)
-                ))
-            })?,
-        };
-        // Validate the retained nested alias after the selected zone so its
-        // existing refusal diagnostic remains unchanged.
-        if let Some(value) = obj.get("timezone").filter(|value| !value.is_null()) {
-            let name = value.as_str().ok_or_else(|| {
-                RuntimeError::InvalidInput(format!(
-                    "properties.timezone must be a string or null; got {}",
-                    mask_for_redaction_surface(RedactionSurface::GateProbe, &value.to_string())
-                ))
-            })?;
-            name.parse::<chrono_tz::Tz>().map_err(|_| {
-                RuntimeError::InvalidInput(format!(
-                    "properties.timezone must be an IANA zone name (e.g. \"America/New_York\"); got {:?}",
-                    mask_for_redaction_surface(RedactionSurface::GateProbe, name)
-                ))
-            })?;
-        }
         obj.insert("due".into(), json!(parse_due(due, zone)?));
         obj.insert("due_timezone".into(), json!(zone.name()));
-        obj.remove("timezone");
     }
     if let Some(ref start) = input.start {
         obj.insert("start".into(), json!(start));

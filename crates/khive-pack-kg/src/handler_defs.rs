@@ -15,6 +15,20 @@ use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 pub(crate) static SEARCH_PARAMS: &[ParamDef] = &[
     ParamDef {
+        name: "created_after",
+        param_type: "string",
+        required: false,
+        description: "Inclusive RFC 3339 lower bound on entity/note created_at (at most 9 fractional-second digits). Metadata filter before the final limit over returned candidates: limit × 50, capped at 500 per backend. Can underfill; does not scan the full time range or use the larger property/tag pushdown window.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
+        name: "created_before",
+        param_type: "string",
+        required: false,
+        description: "Inclusive RFC 3339 upper bound on entity/note created_at (at most 9 fractional-second digits). Must not precede created_after. Omitted/null bounds are unrestricted; compared as instants before ordering and the final limit within the returned candidate window.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
+    ParamDef {
         name: "kind",
         param_type: "string",
         required: true,
@@ -119,6 +133,13 @@ pub(crate) static SEARCH_PARAMS: &[ParamDef] = &[
         description: "Result order: score (default, by relevance) | updated_at | created_at. Both time orders are descending — most recent first — and records sharing a timestamp keep their relevance order. An unrecognised value is refused. A time order ranks a bounded candidate window rather than the whole corpus, so a match whose relevance falls outside that window may still be missed — use a specific query to bring it into the candidates.",
         resolution_mode: IdResolutionMode::NotApplicable,
     },
+    ParamDef {
+        name: "follow",
+        param_type: "string",
+        required: false,
+        description: "Relation to follow outward from each hit, one of the edge relations (for example instance_of). Each hit then carries followed, the targets its outgoing edges of that relation reach as summary neighbor rows (id, edge_id, relation, weight, name, kind), read with the same visibility as neighbors, and followed_truncated, true when a hit has more than 100 such targets. A symmetric relation is followed both ways, as neighbors does. Single-backend search only; a multi-backend search refuses it.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
 ];
 pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
     HandlerDef {
@@ -152,7 +173,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
-            ParamDef { name: "delta", param_type: "string", required: true, description: "Complete original NDJSON-delta text including its supported schema envelope, at most 2000 operations in source order.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "delta", param_type: "string", required: true, description: "Complete original NDJSON-delta text, at most 2000 operations in source order, one JSON object per line and no blank line. Line 1 is the envelope, for example {\"schema_version\":2,\"producer\":\"agent:x\",\"producer_model_family\":\"family:x\",\"staged_at\":1700000000000000} (staged_at in microseconds since the Unix epoch, an optional batch_id, no other key). Each later line is one operation, for example {\"op\":\"create\",\"id\":\"11111111-1111-4111-8111-111111111111\",\"namespace\":\"local\",\"target\":{\"kind\":\"entity\",\"entity_kind\":\"concept\",\"name\":\"X\"}}.", resolution_mode: IdResolutionMode::NotApplicable },
         ],
     },
     HandlerDef {
@@ -266,7 +287,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
-            ParamDef { name: "key", param_type: "string", required: false, description: "Singleton notes only: immutable live namespace/kind identity, at most 512 UTF-8 bytes without U+0000. An occupied key fails with key_conflict; existing_id is disclosed only when list is allowed.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "key", param_type: "string", required: false, description: "Singleton notes and entities, and each entity item of a bulk create as the item's own field: immutable live namespace/kind identity, at most 512 UTF-8 bytes without U+0000. A held key with the same payload returns the holder's id with created:false and writes nothing; a different payload fails with key_conflict; existing_id is disclosed only when list is allowed. A fresh keyed create returns created:true. An entity key is scoped to the base entity kind and is released when the entity is deleted.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "on_key", param_type: "string", required: false, description: "Keyed entity creates, singleton or as a bulk entity item's own field; the one value is \"update\". When the key is held with a different payload, the holder is updated to the request's payload instead of answering key_conflict, and the answer carries created:false, updated:true. The request replaces the holder's name, description, entity_type, tags, properties and caller aliases (rename and merge aliases stay): an optional field the request leaves out is cleared on the holder. The write is the ordinary update, so a holder carrying a runtime-owned property key is refused as update refuses it. An identical payload still answers created:false and writes nothing. The update needs the caller to be allowed to update the holder; otherwise the answer is key_conflict. Cannot be combined with edges, embed or fence. A top-level on_key beside items is refused; set it on each item.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "aliases", param_type: "array of string", required: false, description: "Entities only, singleton or as a bulk entity item's own field: other exact names the entity answers to in resolve and text search, taken as a set (order and repeats do not matter). Each alias is non-empty, at most 512 UTF-8 bytes, without U+0000, and is checked by the secret gate before any key lookup. An alias equal to the entity's name is not stored and is listed in aliases_not_stored. An absent aliases means none: a keyed replay compares the caller aliases as a set, so a replay that differs from the holder only in aliases is key_conflict without on_key. Entity reads return aliases, each with its origin (caller, rename or merge), and omit the field when there are none.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "embed", param_type: "boolean", required: false, description: "Singleton notes only: defaults false for head and true otherwise. False skips inference and vector insertion while retaining lexical indexing.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "Singleton notes only. A fence object {key, kind, expected_version, live_until?, id?} or a non-empty list of at most 100 distinct (kind, key) objects, checked in order in the same writer transaction. Each expected_version is required: an integer >=1 asserts the live note's version in the write namespace; null asserts no live holder of (kind, key), so missing or soft-deleted notes satisfy it. Input alias version is accepted instead; serialization (including null) and refusal details use expected_version. Both names together or unknown fields are invalid, as is outer fence:null. Oversized lists return invalid_input naming the cap and count sent before entry interpretation or writer admission. A mismatch returns fence_conflict; absence conflicts carry expected_version='absent' and the live current_version. List refusals also carry string index (zero-based). Optional live_until is a dotted document path (for example lease.expires_at) whose RFC 3339 value must be strictly later than one writer-transaction clock reading shared by every entry in that write; it requires a positive expected_version, because an absence assertion has no document to read a deadline from, and live_until beside expected_version null is invalid. An expired or unreadable deadline refuses with reason expired or live_until_unreadable; an expired refusal names the deadline it read and the clock it compared, an unreadable one names value_type (absent, string, number, boolean, array, object, null) and never the value itself. Optional id pins the note UUID that must hold (kind, key) and requires a positive expected_version, because an absence assertion has no note for an identity to name; id beside expected_version null is invalid. Identity is compared before the version and before the deadline, matching the batch observation route: a replacement refuses with reason identity_conflict naming the pinned id and the current_id holding the key. An absent holder is not an identity refusal; it falls through to the version comparison.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
@@ -356,9 +379,22 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                               `kind` (required), `name` (required), and optional \
                               `entity_kind`, `entity_type`, `description`, `properties`, \
                               `tags`. When present, the top-level `kind` is NOT required. \
-                              Capped at 1000 entries per request. Bulk-created entities \
+                              Capped at 1000 entries per request. Each successful \
+                              `results[i].result` carries `id` and `full_id`; agent \
+                              presentation shortens `id`, while `full_id` stays the whole \
+                              UUID to pass to traverse or context. Bulk-created entities \
                               skip vector embedding and are not vector-searchable until \
-                              a subsequent `reindex` call.",
+                              a subsequent `reindex` call. An entity item may carry `key` and \
+                              `on_key` (see those parameters); items are judged in order, and \
+                              a key an earlier item of the same request used is judged \
+                              against that item's payload, as if it were stored. Under \
+                              atomic, a unit that rolls back because a key's holder moved \
+                              is judged again, at most three times. An item that writes \
+                              nothing answers created:false and counts in neither `created` \
+                              nor `updated`; an item that updates a holder answers \
+                              created:false, updated:true and counts in `updated`, which \
+                              appears only when nonzero. A failed reindex after such an \
+                              update is named in that item's `reindex_error`.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -401,8 +437,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                 description: "Default false. For returned notes only, parse content as JSON (object, array, number, boolean, string, or null). Invalid JSON refuses and names the note id and content field. Omitted/false preserve existing bytes. Storage, metadata and pagination are unchanged. JSON/auto preserve parsed values; table stringifies objects and arrays for display.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
-            ParamDef { name: "key", param_type: "string", required: false, description: "Live note key in the caller's primary namespace; excludes id and include_deleted=true. With no note_kind, multiple holders fail with key_ambiguous, never a guessed match.", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "kind", param_type: "string", required: false, description: "Optional note substrate or registered note-kind hint for key lookup only.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "key", param_type: "string", required: false, description: "Live note or entity key in the caller's primary namespace; excludes id and include_deleted=true. An entity key needs kind set to its base entity kind. For notes with no note_kind, multiple holders fail with key_ambiguous, never a guessed match.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "kind", param_type: "string", required: false, description: "For key lookup only: the note substrate or a registered note kind, or the base entity kind an entity key is scoped to.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "note_kind", param_type: "string", required: false, description: "Optional registered note kind for key lookup, disambiguating the same key across note kinds.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "id",
@@ -458,6 +494,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
             ParamDef { name: "updated_after", param_type: "string", required: false, description: "Notes only: inclusive RFC 3339 updated_at lower bound; without key_prefix it includes keyed and unkeyed notes.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "tag_mode", param_type: "string", required: false, description: "Notes only: any (default) or all requested tags, ASCII case-insensitive, applied before pagination. Empty tags impose no constraint.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "note_status", param_type: "string", required: false, description: "Notes only: active (default), archived, or any, selecting the note status before pagination. Omitted/null selects active. Any includes every stored note status while soft-deleted rows stay excluded. Separate from scheduled-event workflow status.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "exclude_superseded", param_type: "boolean", required: false, description: "Memory notes only (kind=memory or kind=note with note_kind=memory). Default false; null and non-booleans are invalid. True excludes targets of live incoming supersedes edges in the request's visible namespaces before offset and page selection, even if the superseding note is soft-deleted or outside the requested filters. Does not interpret legacy properties.supersedes or alter stored status. Scans at most 10,000 rows in batches of at most 200; a capped scan reports scan_incomplete and has_more=true, not exhaustion. Cursor pages can resume from next_after; capped offset pages may not advance, so use cursors to continue beyond the scan ceiling.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "status", param_type: "string", required: false, description: "For scheduled_event notes only (kind=scheduled_event or kind=note with note_kind=scheduled_event): exact property status, applied before pagination. Valid: provisioning, pending, firing, fired, cancelled, missed, failed. Omitted/null imposes no constraint. Proposal lists retain their separate proposal-status filter; other kinds reject this parameter.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "created_by_actor", param_type: "string", required: false, description: "Scheduled_event notes only: exact, case-sensitive, non-blank creator display metadata, applied before pagination. May name any creator; never an authorization check or verified attribution. No implicit self-filter or wildcard. Omitted/null imposes no constraint; other kinds reject this parameter.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
@@ -744,7 +781,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
     HandlerDef {
         name: "update",
         description: "Patch entity, note, or edge fields. Accepted fields depend on substrate: \
-                       entities accept name/description/properties/tags/entity_type; notes accept \
+                       entities accept name/description/properties/tags/entity_type/add_aliases/remove_aliases/keep_old_name; notes accept \
                        name/content/salience/decay_factor/properties/tags; edges accept relation/weight/properties.",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
@@ -752,12 +789,17 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
             ParamDef { name: "expected_version", param_type: "integer", required: false, description: "Entities and notes: positive persisted version required inside the writer transaction. A stale version fails without mutation, with reason=version_conflict and expected_version/current_version details. Omission preserves unconditional caller semantics. A fenced update that changes nothing is still a write and advances the version by one; only an unfenced identical note patch is answered as a no-op with unchanged=true. Entity updates preserve their existing write behavior even for identical fields.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "fence", param_type: "object or array of object", required: false, description: "Singleton notes only. A fence object {key, kind, expected_version, live_until?, id?} or a non-empty list of at most 100 distinct (kind, key) objects, checked in order in the same writer transaction. Each expected_version is required: an integer >=1 asserts the live note's version in the write namespace; null asserts no live holder of (kind, key), so missing or soft-deleted notes satisfy it. Input alias version is accepted instead; serialization (including null) and refusal details use expected_version. Both names together or unknown fields are invalid, as is outer fence:null. Oversized lists return invalid_input naming the cap and count sent before entry interpretation or writer admission. A mismatch returns fence_conflict; absence conflicts carry expected_version='absent' and the live current_version. List refusals also carry string index (zero-based). Optional live_until is a dotted document path (for example lease.expires_at) whose RFC 3339 value must be strictly later than one writer-transaction clock reading shared by every entry in that write; it requires a positive expected_version, because an absence assertion has no document to read a deadline from, and live_until beside expected_version null is invalid. An expired or unreadable deadline refuses with reason expired or live_until_unreadable; an expired refusal names the deadline it read and the clock it compared, an unreadable one names value_type (absent, string, number, boolean, array, object, null) and never the value itself. Optional id pins the note UUID that must hold (kind, key) and requires a positive expected_version, because an absence assertion has no note for an identity to name; id beside expected_version null is invalid. Identity is compared before the version and before the deadline, matching the batch observation route: a replacement refuses with reason identity_conflict naming the pinned id and the current_id holding the key. An absent holder is not an identity refusal; it falls through to the version comparison.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "embed", param_type: "boolean", required: false, description: "Notes only: omission retains embedding state. True enables reindexing; false performs no inference, removes existing vector rows transactionally and retains lexical indexing. Delayed reindex work cannot restore a stale revision.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "key", param_type: "string", required: false, description: "Entities only: patch the live entity holding this key in the caller's primary namespace, in place of id. Needs kind set to the base entity kind the key is scoped to; id and key are mutually exclusive. A deleted entity holds no key.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "add_aliases", param_type: "array of string", required: false, description: "Entities only: aliases to add, taken as a set, under the rules of create's aliases. An alias the entity already holds, of any origin, is left as it is. An alias equal to the entity's name after the update is not stored and is listed in aliases_not_stored. A change to the aliases reindexes the entity.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "remove_aliases", param_type: "array of string", required: false, description: "Entities only: caller aliases to remove. An alias the entity does not hold as a caller alias, a rename or merge alias included, is not an error and is listed in aliases_not_removed. One alias in both add_aliases and remove_aliases is invalid.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "keep_old_name", param_type: "boolean", required: false, description: "Entities only, default true: an update that changes the name keeps the old name as an alias of origin rename, so resolve still finds the entity by it; the entity_updated event names previous_name and name either way. False keeps no alias, as a split that hands the old name to another entity needs. An alias the entity holds equal to the new name is removed whatever its origin.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "id",
                 param_type: "uuid",
-                required: true,
+                required: false,
                 description: "Complete UUID or globally unique 8+ hex prefix of the entity, note, \
-                              or edge to patch. Entity-name fallback uses the primary namespace.",
+                              or edge to patch. Entity-name fallback uses the primary namespace. \
+                              Required when key is absent.",
                 resolution_mode: IdResolutionMode::UnscopedById,
             },
             ParamDef {
@@ -849,16 +891,18 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
             ParamDef {
                 name: "id",
                 param_type: "uuid",
-                required: true,
+                required: false,
                 description: "Complete UUID or globally unique 8+ hex prefix of the record to \
-                              delete. Entity-name fallback uses the primary namespace.",
+                              delete. Entity-name fallback uses the primary namespace. Required \
+                              when key is absent.",
                 resolution_mode: IdResolutionMode::UnscopedById,
             },
+            ParamDef { name: "key", param_type: "string", required: false, description: "Entities only: delete the live entity holding this key in the caller's primary namespace, in place of id. Needs kind set to the base entity kind the key is scoped to; id and key are mutually exclusive. A deleted entity holds no key, so a tombstone is reached by id.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef {
                 name: "kind",
                 param_type: "string",
                 required: false,
-                description: "Substrate hint (entity | note | edge). Omit to resolve substrate from UUID.",
+                description: "Substrate hint (entity | note | edge). Omit to resolve substrate from UUID. With key, the base entity kind the key is scoped to.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -1182,7 +1226,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                 name: "projection",
                 param_type: "string",
                 required: false,
-                description: "Neighbor response shape: edge (edge identity and endpoints), summary (neighbor identity and metadata), or record (full current record shape, default).",
+                description: "Neighbor response shape: edge (origin_id, source_id, target_id, edge_id, relation, weight), summary (origin_id, id, edge_id, relation, weight, name, kind, entity_type), record (default: the summary fields plus the stored source_id and target_id of the edge), or full (the record fields plus the neighbor's properties and description and the edge's metadata as edge_metadata, each null when absent; a note neighbor has no description, and a note neighbor in another visible namespace has null properties, since notes are read in the caller's own namespace).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -1273,7 +1317,8 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
         name: "context",
         description: "Entity-anchored live graph context: resolve anchors from `query` and/or \
                       `entity_ids`, expand 1-2 hops with neighbors_with_query, and assemble \
-                      a budgeted, deterministically-ordered response. `direction` defaults to \
+                      a budgeted, deterministically-ordered response. A neighbor that several \
+                      anchors reach is listed under each of them. `direction` defaults to \
                       \"both\" here (unlike `neighbors`, which defaults to \"outgoing\"). At \
                       least one of `query`/`entity_ids` is required. One embedding inference \
                       when `query` is used; zero for a pure `entity_ids` call. This verb does not \
@@ -1420,10 +1465,12 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                     add_entity — {kind: \"add_entity\", entity: {kind: <entity-kind>, name: <string>, description?: <string>, properties?: <object>, tags?: [<string>]}}; \
                     update_entity — {kind: \"update_entity\", id: <full UUID>, patch: {name?: <string>, description?: <string|null>, properties?: <object>, tags?: [<string>]}}; \
                     add_edge — {kind: \"add_edge\", source: <full UUID>, target: <full UUID>, relation: <EdgeRelation>, weight?: <float>}; \
+                    retire_edge — {kind: \"retire_edge\", source: <full UUID>, target: <full UUID>, relation: <EdgeRelation>}: soft-deletes the live edge with that key, which restore brings back; \
+                    supersede_edge — {kind: \"supersede_edge\", old: {source, target, relation}, new: {source, target, relation, weight?, metadata?}}: retires old and adds new in one unit, both or neither; \
                     add_note — {kind: \"add_note\", note: {kind: <note-kind>, content: <string>, name?: <string>, properties?: <object>}}; \
                     merge_entities — {kind: \"merge_entities\", into: <full UUID>, from: <full UUID>}; \
                     supersede_entity — {kind: \"supersede_entity\", old: <full UUID>, new: <full UUID>}; \
-                    compound — {kind: \"compound\", steps: [<changeset>, ...]}.",
+                    compound — {kind: \"compound\", steps: [<changeset>]}: one step only for now; a compound with more than one step, at any depth, is refused until multi-step compounds apply atomically.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -1517,10 +1564,12 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                        Entity ids only: note, edge, and event ids return \
                        NotFound here; use `get` for auto-detection. (2) this \
                        actor's recently-referenced ring; (3) an exact, \
-                       case-sensitive entity-name match, which resolves \
-                       deterministically regardless of search rank (one match \
-                       -> Resolved; several identically-named entities -> \
-                       Ambiguous over exactly that set); (4) hybrid search over \
+                       case-sensitive match on an entity's name or on an alias it \
+                       holds, which resolves deterministically regardless of search \
+                       rank (one matching entity -> Resolved, carrying `matched_alias` \
+                       when the match was through an alias; several matching entities \
+                       -> Ambiguous over exactly that set; an entity matching by name \
+                       and alias counts once); (4) hybrid search over \
                        the namespace, discarding vector hits with raw cosine similarity \
                        below 0.3 before RRF fusion. A merged entity id resolves to the live kept \
                        id with an ordered `redirected_from` chain after an effective-id Gate check; \
@@ -1540,7 +1589,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                 required: true,
                 description: "Natural-language references to resolve (e.g. \
                               \"the old record\", a UUID, a short hex prefix, \
-                              or an exact entity name).",
+                              or an exact entity name or alias).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

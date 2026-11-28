@@ -10,6 +10,7 @@
 //! can reference pack metadata without pulling in the full runtime.
 
 use crate::edge::EdgeRelation;
+use crate::entity::EntityKind;
 use crate::entity_type::EntityTypeDef;
 
 /// Argument names owned by the outer request envelope rather than verb handlers.
@@ -18,6 +19,9 @@ use crate::entity_type::EntityTypeDef;
 /// before pack dispatch. Keeping this list in the shared type crate lets both request parsing and
 /// registry construction enforce one exact contract.
 pub const RESERVED_ENVELOPE_ARGS: &[&str] = &["presentation", "presentation_per_op"];
+
+/// Base entity kind stored for a `tool` pack registry object.
+pub const TOOL_REGISTRY_ENTITY_KIND: EntityKind = EntityKind::Project;
 
 /// Tag marking a `tool` pack registry object.
 ///
@@ -513,7 +517,7 @@ pub trait Pack {
 
     /// Entity-type subtypes this pack contributes to the `(EntityKind,
     /// entity_type)` registry (the `entity_type` axis is distinct from and
-    /// finer-grained than the closed [`EntityKind`](crate::entity::EntityKind)
+    /// finer-grained than the closed [`EntityKind`]
     /// taxonomy — see `khive-types::entity_type::EntityTypeRegistry`).
     ///
     /// Defaults to empty, mirroring [`EDGE_RULES`]'s additive contract:

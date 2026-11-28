@@ -42,6 +42,8 @@ impl Fixture {
             exported_at: timestamp,
             entities: (1..=2)
                 .map(|id| ExportedEntity {
+                    keys: Vec::new(),
+                    aliases: Vec::new(),
                     id: Uuid::from_u128(id),
                     kind: "concept".into(),
                     entity_type: None,
@@ -279,6 +281,8 @@ async fn import_resolves_existing_note_event_and_edge_endpoints_and_guards_note_
 
     let mut raced = annotations;
     raced.entities = vec![ExportedEntity {
+        keys: Vec::new(),
+        aliases: Vec::new(),
         id: Uuid::from_u128(3),
         ..seed.entities[0].clone()
     }];

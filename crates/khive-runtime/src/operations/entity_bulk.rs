@@ -1,10 +1,12 @@
 //! Prepared entity bulk construction.
 
+use super::entity_keys::{validate_entity_key, PendingEntityId};
 use super::*;
 use crate::secret_gate_finalizer::entity_admission::{
     prepare_entity_admission_at, EntityAdmission, EntityEntryPoint,
 };
 use crate::EntityCandidateMutation;
+use khive_db::stores::entity::entity_key_claim_statement;
 
 impl KhiveRuntime {
     /// Create a batch of entities atomically.
@@ -32,13 +34,17 @@ impl KhiveRuntime {
         // Any validation failure here guarantees zero rows are written.
         let mut admissions = Vec::with_capacity(specs.len());
         for (index, spec) in specs.iter().enumerate() {
-            let entity = self.validate_bulk_entity(ns, spec)?;
-            admissions.push(prepare_entity_admission_at(
-                token,
-                EntityEntryPoint::Bulk,
-                entity,
-                &format!("entity[{index}]"),
-            )?);
+            let (mut entity, aliases) = self.validate_bulk_entity(ns, spec)?;
+            let alias_statements = project_bulk_aliases(&mut entity, &aliases);
+            admissions.push((
+                prepare_entity_admission_at(
+                    token,
+                    EntityEntryPoint::Bulk,
+                    entity,
+                    &format!("entity[{index}]"),
+                )?,
+                alias_statements,
+            ));
         }
 
         #[cfg(any(test, feature = "fault-injection"))]
@@ -65,10 +71,16 @@ impl KhiveRuntime {
         let mut entities = Vec::with_capacity(admissions.len());
         let mut plans = Vec::with_capacity(admissions.len());
         let mut has_finalizer = false;
-        for (index, admission) in admissions.into_iter().enumerate() {
+        for (index, (admission, alias_statements)) in admissions.into_iter().enumerate() {
             has_finalizer |= matches!(&admission, EntityAdmission::Exempt(_));
             let (entity, plan) = self
-                .finish_bulk_entity_plan(token, admission, injected_failure_index == Some(index))
+                .finish_bulk_entity_plan(
+                    token,
+                    admission,
+                    injected_failure_index == Some(index),
+                    None,
+                    alias_statements,
+                )
                 .await?;
             entities.push(entity);
             plans.push(plan);
@@ -94,8 +106,14 @@ impl KhiveRuntime {
     /// One bulk entity spec's pre-write checks and its row, shared by
     /// `create_many` and [`Self::prepare_bulk_entity_plan`] so the two bulk
     /// entity paths cannot drift apart: kind, entity_type, a nonempty name,
-    /// the reserved secret-gate property and the secret gate itself.
-    fn validate_bulk_entity(&self, ns: &str, spec: &EntityCreateSpec) -> RuntimeResult<Entity> {
+    /// the reserved secret-gate property, the caller aliases and the secret
+    /// gate itself. The aliases are returned unapplied, so a caller that
+    /// names the row's id first writes them under that id.
+    fn validate_bulk_entity(
+        &self,
+        ns: &str,
+        spec: &EntityCreateSpec,
+    ) -> RuntimeResult<(Entity, EntityAliasChange)> {
         self.validate_entity_kind(&spec.kind)?;
         // Validate entity_type at the runtime layer via pack-installed callback.
         // When no validator is installed (bare runtime, unit tests without packs),
@@ -107,6 +125,7 @@ impl KhiveRuntime {
             return Err(RuntimeError::InvalidInput("name must not be empty".into()));
         }
         crate::secret_gate::reject_reserved_secret_gate_property(spec.properties.as_ref())?;
+        let aliases = EntityAliasChange::replace(&spec.aliases)?;
 
         let mut entity =
             Entity::new(ns, &spec.kind, &spec.name).with_entity_type(validated_type.as_deref());
@@ -119,7 +138,7 @@ impl KhiveRuntime {
         if !spec.tags.is_empty() {
             entity = entity.with_tags(spec.tags.clone());
         }
-        Ok(entity)
+        Ok((entity, aliases))
     }
 
     /// Validate and prepare one entity item for a bulk `create(items=[...])`
@@ -133,12 +152,68 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         spec: EntityCreateSpec,
     ) -> RuntimeResult<(Entity, AtomicOpPlan)> {
-        let entity = self.validate_bulk_entity(token.namespace().as_str(), &spec)?;
+        let (mut entity, aliases) = self.validate_bulk_entity(token.namespace().as_str(), &spec)?;
+        let alias_statements = project_bulk_aliases(&mut entity, &aliases);
         let admission =
             prepare_entity_admission_at(token, EntityEntryPoint::Bulk, entity, "entity")?;
         let _ = self.entities(token)?;
         let _ = self.text(token)?;
-        self.finish_bulk_entity_plan(token, admission, false).await
+        self.finish_bulk_entity_plan(token, admission, false, None, alias_statements)
+            .await
+    }
+
+    /// [`Self::prepare_bulk_entity_plan`] for a bulk item under caller key
+    /// `key` (ADR-221 section 1). The row takes the id `id` names, and the
+    /// plan claims the key for it first under an exactly-one guard, so a key
+    /// another writer took after the caller read it rolls the whole unit
+    /// back. The key is validated and secret-gated before anything else.
+    pub async fn prepare_keyed_bulk_entity_plan(
+        &self,
+        token: &NamespaceToken,
+        spec: EntityCreateSpec,
+        key: &str,
+        id: PendingEntityId,
+    ) -> RuntimeResult<(Entity, AtomicOpPlan)> {
+        validate_entity_key(key)?;
+        let ns = token.namespace().as_str();
+        let (mut entity, aliases) = self.validate_bulk_entity(ns, &spec)?;
+        entity.id = id.0;
+        let alias_statements = project_bulk_aliases(&mut entity, &aliases);
+        let claim = PlanStatement {
+            statement: entity_key_claim_statement(
+                ns,
+                &entity.kind,
+                key,
+                entity.id,
+                entity.created_at,
+            ),
+            guard: Some(AffectedRowGuard::exactly(1)),
+        };
+        let admission =
+            prepare_entity_admission_at(token, EntityEntryPoint::Bulk, entity, "entity")?;
+        let _ = self.entities(token)?;
+        let _ = self.text(token)?;
+        self.finish_bulk_entity_plan(token, admission, false, Some(claim), alias_statements)
+            .await
+    }
+
+    /// [`Self::prepare_keyed_bulk_entity_plan`] again for the row `planned`
+    /// holds, with `spec` as its payload: a later item of the same request
+    /// replaced the payload under `on_key: "update"` (ADR-221 section 1).
+    /// The row keeps its id and the new plan replaces the old one, so one id
+    /// still names one new row. On a refusal `planned` is left as it was.
+    pub async fn replan_keyed_bulk_entity(
+        &self,
+        token: &NamespaceToken,
+        spec: EntityCreateSpec,
+        key: &str,
+        planned: &mut (Entity, AtomicOpPlan),
+    ) -> RuntimeResult<()> {
+        let id = PendingEntityId(planned.0.id);
+        *planned = self
+            .prepare_keyed_bulk_entity_plan(token, spec, key, id)
+            .await?;
+        Ok(())
     }
 
     async fn finish_bulk_entity_plan(
@@ -146,6 +221,8 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         admission: EntityAdmission,
         inject_fts_failure: bool,
+        key_claim: Option<PlanStatement>,
+        alias_statements: Vec<SqlStatement>,
     ) -> RuntimeResult<(Entity, AtomicOpPlan)> {
         match admission {
             EntityAdmission::Legacy(entity) => {
@@ -154,6 +231,11 @@ impl KhiveRuntime {
                     plan.statements.truncate(1);
                     plan.statements.push(bulk_fts_failure());
                 }
+                if let Some(claim) = key_claim {
+                    plan.statements.insert(0, claim);
+                }
+                plan.statements
+                    .extend(super::entity_aliases::unguarded(alias_statements));
                 Ok((entity, AtomicOpPlan::AddEntity(plan)))
             }
             EntityAdmission::Exempt(prepared) => {
@@ -164,6 +246,10 @@ impl KhiveRuntime {
                 if inject_fts_failure {
                     required = vec![bulk_fts_failure()];
                 }
+                if let Some(claim) = key_claim {
+                    required.insert(0, claim);
+                }
+                required.extend(super::entity_aliases::unguarded(alias_statements));
                 let plan = prepared.into_plan(
                     EntityCandidateMutation::CreateIfAbsent,
                     required,
@@ -173,6 +259,13 @@ impl KhiveRuntime {
             }
         }
     }
+}
+
+/// Project `aliases` onto the bulk row `entity` and return the statements
+/// that write them, under the id and creation time the row carries now.
+fn project_bulk_aliases(entity: &mut Entity, aliases: &EntityAliasChange) -> Vec<SqlStatement> {
+    let created_at = entity.created_at;
+    super::entity_aliases::apply_entity_alias_change(entity, aliases, created_at, None).1
 }
 
 fn bulk_entity_plan(entity: &Entity) -> RuntimeResult<AddEntityPlan> {

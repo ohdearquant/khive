@@ -10,8 +10,8 @@ use khive_storage::ContentRef;
 
 pub(crate) use khive_runtime::blob_tree::parse_entries;
 pub use khive_runtime::blob_tree::{
-    blob_store, entries_json, load, store, store_from_value, validate_relative_path, verify_blobs,
-    TreeEntry, MAX_MANIFEST_BYTES,
+    blob_store, entries_json, load, load_tree, store, store_from_value, store_tree,
+    validate_relative_path, verify_blobs, Tree, TreeEntry, MAX_MANIFEST_BYTES,
 };
 
 // Preflight has no child timeout: bound both each expansion and retained work.

@@ -18,7 +18,9 @@ use khive_types::{EventKind, EventOutcome, Pack};
 use serde_json::{json, Value};
 
 use crate::receipts::{self, Disposition};
-use crate::remote_transport::{ApiRequest, PushRequest, RemoteError, RemoteTransport};
+use crate::remote_transport::{
+    ApiRequest, FetchRequest, Fetched, PushRequest, RemoteError, RemoteTransport,
+};
 use crate::GitPack;
 
 #[derive(Default)]
@@ -44,6 +46,10 @@ impl RemoteTransport for ObservedRemote {
         Err(RemoteError::Unavailable)
     }
     async fn push(&self, _: Option<&str>, _: PushRequest) -> Result<(), RemoteError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(RemoteError::Unavailable)
+    }
+    async fn fetch(&self, _: Option<&str>, _: FetchRequest) -> Result<Fetched, RemoteError> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Err(RemoteError::Unavailable)
     }
@@ -161,21 +167,29 @@ async fn assert_refusal_evidence(
             | "git.diff"
             | "git.branch"
             | "git.update_ref"
+            | "git.branch_delete"
             | "git.reconcile"
             | "git.push"
+            | "git.fetch"
             | "git.pr_open"
             | "git.pr_review"
             | "git.pr_merge"
+            | "git.pr_edit"
+            | "git.pr_close"
     ) || (verb == "git.commit" && params.get("tree").is_some());
     let has_audit = matches!(
         verb,
         "git.commit"
             | "git.branch"
             | "git.update_ref"
+            | "git.branch_delete"
             | "git.push"
+            | "git.fetch"
             | "git.pr_open"
             | "git.pr_review"
             | "git.pr_merge"
+            | "git.pr_edit"
+            | "git.pr_close"
     );
     let after = refusal_evidence(rt, actor, verb).await;
     assert!(
@@ -281,9 +295,14 @@ async fn every_registered_git_verb_rejects_named_unknowns_preserving_refusal_evi
                 .map(|path| GitWriteEntryConfig {
                     repo: path.display().to_string(),
                     branches: vec!["*".into()],
+                    access: Default::default(),
                 })
                 .collect(),
             ..Default::default()
+        },
+        git_digest: khive_runtime::GitDigestSectionConfig {
+            local_roots: vec![std::env::temp_dir()],
+            remotes: Vec::new(),
         },
         ..RuntimeConfig::no_embeddings()
     })
@@ -336,8 +355,18 @@ async fn every_registered_git_verb_rejects_named_unknowns_preserving_refusal_evi
             "expected",
         ),
         (
+            "git.branch_delete",
+            json!({"repo":repo,"name":"candidate","expected":head}),
+            "expected",
+        ),
+        (
             "git.push",
             json!({"repo":repo,"branch":"main","expected_local":head,"expected_remote":null}),
+            "expected_remote",
+        ),
+        (
+            "git.fetch",
+            json!({"repo":repo,"ref":"main","expected_remote":head}),
             "expected_remote",
         ),
         (
@@ -354,6 +383,25 @@ async fn every_registered_git_verb_rejects_named_unknowns_preserving_refusal_evi
             "git.pr_merge",
             json!({"repo":repo,"number":1,"method":"squash","subject":"fixture","body":"","expected_head":head}),
             "method",
+        ),
+        ("git.pr_state", json!({"repo":repo,"number":1}), "number"),
+        ("git.pr_list", json!({"repo":repo}), "repo"),
+        ("git.issue", json!({"repo":repo,"number":1}), "number"),
+        ("git.issue_list", json!({"repo":repo}), "repo"),
+        (
+            "git.check_log",
+            json!({"repo":repo,"check_run":1}),
+            "check_run",
+        ),
+        (
+            "git.pr_edit",
+            json!({"repo":repo,"number":1,"title":"fixture","expected_head":head}),
+            "title",
+        ),
+        (
+            "git.pr_close",
+            json!({"repo":repo,"number":1,"expected_head":head}),
+            "expected_head",
         ),
         ("git.init", json!({"repo":blank,"branch":"main"}), "branch"),
         ("git.checkout", json!({"repo":repo,"ref":"HEAD"}), "ref"),
