@@ -761,8 +761,9 @@ Not checked:
 
 Serves #6894 rows 1, 2, 3 and 9 and A1.4 (#6904 section 3). Building item 3 left questions that
 section 3, section 7 and A1.4 do not settle; this amendment settles them. It changes one sentence of
-section 7 (A2.5) and where A1.4 point 3 stores a source order (A2.6), and none of section 3. It
-also specifies the two forms reads that A1.3's `resolve` calls and two additions to
+section 7 (A2.5) and where A1.4 point 3 stores a source order (A2.6), says what section 2's canonical
+name is for a node that belongs to one operation type or step type and which edges the working graph
+holds (A2.10), and changes none of section 3. It also specifies the two forms reads that A1.3's `resolve` calls and two additions to
 `forms.neighbourhood` that A1.4's places read (A2.8), which no record specified before.
 
 ### A2.1 A step type published alone, and pinned
@@ -944,3 +945,60 @@ refusal arms of one section may be rows of one table test.
   both in `form` and in `revision`. `forms.neighbourhood` on a field lists each stating line in
   `stated_by`, and on `document_type:<id>` names the type, its system mark and its forms; an id
   naming no loaded document type is refused.
+- A2.10: two operation types pin the same two published step types in opposite orders; each type's
+  `pins` edges carry its own order, no edge joins the two step type nodes, and each frontier follows
+  its own type's order. A step type whose requirement is about `holder`, pinned by two types that
+  each declare `holder`, has a requirement node naming the slot and no edge to either slot node. A
+  slot of the same name in two types is two nodes, and a requirement whose field name holds a `/`
+  gets a key no other requirement holds.
+
+### A2.10 The working type graph: keys and edges
+
+Section 2 gives each type-level node the key `operation/<entity_type>/<canonical name>`. An
+operation type's canonical name is its id, and so is a published step type's. A node that belongs
+to one operation type or one step type is named within it, as A2.5 names a shorthand step type:
+
+- a slot: `operation/slot/<operation type>/<slot>`;
+- a shorthand step type: `operation/step_type/<operation type>/<step>` (A2.5);
+- a requirement: `operation/requirement/<step type>/<slot>/<field>`, where `<step type>` is written
+  as that step type's key writes it, `<slot>` is empty for a requirement about the operation, and
+  the field name is escaped.
+
+A name in a vocabulary (section 7) is qualified the same way:
+`operation/<vocabulary>/slot/<operation type>/<name>` for a slot,
+`operation/<vocabulary>/step_type/<operation type>/<name>` for a shorthand step type, and
+`operation/<vocabulary>/<entity_type>/<name>` for an operation type or a published step type. The
+name is escaped.
+
+Escaping writes `%` as `%25` and `/` as `%2F`. Ids, slots, step names and vocabularies hold no `/`
+(`invalid_name`), and a field name or a name in a vocabulary is escaped, so the number of segments
+says which form a key has and no two nodes share one. A key longer than ADR-221's 512 bytes is refused
+at `define` (`invalid_name`).
+
+A node is one per key and carries no version. A later publish updates the node's properties to
+that publish's version and digest. The node shows the newest publish, and the published bytes
+remain the record of every version, including one a running operation pinned: every derived read
+works from published bytes (section 2).
+
+The edges use existing relations. Where one pair of node types needs more than one meaning, the
+meaning is `properties.role` (section 2):
+
+- operation type `contains` slot;
+- operation type `contains` step type, `role: pins`, for a pinned step and a shorthand one alike;
+- step type `contains` requirement;
+- requirement `links_to` its forms field, `role: requires`;
+- step type `links_to` a forms field it produces, `role: produces`, with the slot it is about.
+
+A published step type may be pinned by several operation types. So no edge between two nodes that
+two operation types can share states a fact of one of them. Two facts are of that kind, and both
+sit on the operation type's own `pins` edge:
+
+- Order. The `pins` edge carries `steps: [{name, after}]`, one entry for each step of this
+  operation type that pins the step type, with that step's `after`. No `precedes` edge joins two
+  step type nodes.
+- The slot a requirement is about. The requirement node holds the slot name its step type gives.
+  The slot node is the one each pinning operation type declares under that name, which A2.1 makes
+  every pinning type declare. No edge runs from a requirement to a slot.
+
+A reader of one operation type's order or slots follows that operation type's `pins` edges, so
+what one operation type says never reads as true of another.
