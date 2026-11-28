@@ -133,11 +133,11 @@ printf 'finished\n' > '{}'
         "the clone child must be terminated before its completion marker"
     );
 
+    // The size refusal certifies that cleanup has already finished.
     let namespace = staging_namespace_path(&dir.path().join("scratch"));
     let leftovers = std::fs::read_dir(namespace)
         .expect("read staging namespace")
-        .filter_map(Result::ok)
-        .map(|entry| entry.file_name())
+        .map(|entry| entry.expect("read staging entry").file_name())
         .filter(|name| is_staging_wrapper_name(name))
         .collect::<Vec<_>>();
     assert!(
