@@ -205,6 +205,7 @@ impl VolumeIdentity {
         let process = acquire_process_slot(
             ProcessSlotKey::new(self.key, lock_dir),
             deadline,
+            timeout,
             Location::caller(),
         )?;
         let file = OpenOptions::new()
@@ -476,15 +477,18 @@ impl Drop for ProcessSlot {
 fn acquire_process_slot(
     key: ProcessSlotKey,
     deadline: Instant,
+    timeout: Duration,
     requester: &'static Location<'static>,
 ) -> Result<ProcessSlot, LeaseRefusal> {
     let registry = process_registry();
     let current = std::thread::current().id();
     let mut slots = registry.slots.lock();
     if Instant::now() >= deadline {
-        return Err(LeaseRefusal::TimedOut(lock_contended_error(
-            "timed out waiting for in-process volume lease",
-        )));
+        return Err(LeaseRefusal::TimedOut(lock_contended_error(format!(
+            "volume lease deadline expired while waiting for in-process slot \
+             (configured budget: {} ms)",
+            timeout.as_millis()
+        ))));
     }
     if let Some(holder) = slots.get(&key).and_then(|slot| slot.holder.as_ref()) {
         if holder.thread == Some(current) {
@@ -522,9 +526,11 @@ fn acquire_process_slot(
             }
             drop(slots);
             registry.available.notify_all();
-            return Err(LeaseRefusal::TimedOut(lock_contended_error(
-                "timed out waiting for in-process volume lease",
-            )));
+            return Err(LeaseRefusal::TimedOut(lock_contended_error(format!(
+                "volume lease deadline expired while waiting for in-process slot \
+                 (configured budget: {} ms)",
+                timeout.as_millis()
+            ))));
         }
         let slot = slots.get_mut(&key).expect("queued volume lease slot");
         if slot.holder.is_none() && slot.waiters.front() == Some(&current) {
@@ -752,13 +758,17 @@ mod tests {
                 .unwrap()
         })
         .expect_err("same-volume lease must time out");
-        assert!(matches!(
-            error,
-            SqliteError::CapacityUnavailable {
-                phase: CapacityUnavailablePhase::LockContended,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                &error,
+                SqliteError::CapacityUnavailable {
+                    phase: CapacityUnavailablePhase::LockContended,
+                    message,
+                } if message == "volume lease deadline expired while waiting for in-process slot \
+                                 (configured budget: 30 ms)"
+            ),
+            "{error}"
+        );
         drop(held);
         second
             .acquire_in(Duration::from_millis(100), &lock_dir)

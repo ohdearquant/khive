@@ -855,8 +855,10 @@ fn top_level_request_returning_with_open_transaction_reports_side_effects_unknow
             0,
             None,
             SubmitLabels::None,
-            false,
-            false,
+            WriteTelemetryOptions {
+                attempt_log: false,
+                top_level: false,
+            },
         ),
         admission: None,
     };
@@ -917,8 +919,10 @@ fn commit_failure_with_failed_rollback_reports_side_effects_unknown() {
             0,
             None,
             SubmitLabels::None,
-            false,
-            false,
+            WriteTelemetryOptions {
+                attempt_log: false,
+                top_level: false,
+            },
         ),
         admission: None,
     };
@@ -1086,8 +1090,10 @@ fn operation_failure_with_failed_rollback_reports_side_effects_unknown() {
             0,
             None,
             SubmitLabels::None,
-            false,
-            false,
+            WriteTelemetryOptions {
+                attempt_log: false,
+                top_level: false,
+            },
         ),
         admission: None,
     };
@@ -1146,8 +1152,10 @@ fn wrapped_panic_with_failed_rollback_reports_side_effects_unknown() {
             0,
             None,
             SubmitLabels::None,
-            false,
-            false,
+            WriteTelemetryOptions {
+                attempt_log: false,
+                top_level: false,
+            },
         ),
         admission: None,
     };
@@ -1539,8 +1547,10 @@ fn writer_stage_sample_attributes_body_and_commit_at_boundaries() {
         0,
         None,
         SubmitLabels::None,
-        false,
-        false,
+        WriteTelemetryOptions {
+            attempt_log: false,
+            top_level: false,
+        },
     );
     telemetry.test_clock = Some(clock);
     let (reply_tx, mut reply_rx) = oneshot::channel();

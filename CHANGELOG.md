@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a pull request. Terminal escapes and control and format characters are removed from the text and
   `text_altered` says when that changed anything; the text is returned as untrusted data. It is a
   read: a `[[git_write.allowed]]` row with `access = "read"` admits it, and it writes no receipt.
+- `git.pr_list` and `git.issue_list` list the pull requests or issues of a configured repository
+  in the requested state (`open` unless `closed` or `all` is named), newest created first, one
+  hundred to a page for at most ten pages, and say in `truncated` whether more matched.
+  `git.issue_list` omits the pull requests the platform lists among issues and counts them.
+  Hidden characters are removed from titles, refs, labels and logins and `text_altered` says so;
+  the text is returned as untrusted data. Both are reads, admitted by a row with
+  `access = "read"`, and write no receipt.
 - The runtime adds a caller key to an entity that already exists (`add_entity_key`, and
   `entity_key_add_plans` for a caller that joins the add to its own atomic unit), under the rules of
   a keyed create: the same limits and secret scan on the key, the same uniqueness per namespace and
