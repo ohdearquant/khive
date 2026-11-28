@@ -138,7 +138,7 @@ The additional endpoint names consume response budget, so a budget-constrained r
 
 ## Amendment 1 (2026-10-13): anchor edges share the response budget
 
-**Status:** Proposed. The parent ADR's architecture acceptance gate remains in force.
+**Status:** Accepted 2026-11-19 (#5323).
 
 `anchor_edges` is an always-present response array for stored edges discovered by the
 existing hop-1 walk whose two endpoints were selected anchors. Records are deduplicated by

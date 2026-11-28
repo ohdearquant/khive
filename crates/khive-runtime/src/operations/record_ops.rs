@@ -191,7 +191,7 @@ impl KhiveRuntime {
     /// or path nodes whose entities live in an extra-visible namespace are left
     /// with `name = None`, `kind = None`.  Missing or out-of-scope IDs are
     /// silently omitted (best-effort, same as `get_entities_by_ids`).
-    pub(super) async fn get_entities_by_ids_visible(
+    pub async fn get_entities_by_ids_visible(
         &self,
         token: &NamespaceToken,
         ids: &[Uuid],

@@ -28,7 +28,17 @@ impl Fixture {
         let root = tempfile::tempdir_in(physical_temp).expect("isolated ingest fixture");
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
-        let runtime = KhiveRuntime::memory().unwrap();
+        let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            brain_profile: None,
+            actor_id: None,
+            code_ingest: khive_runtime::CodeIngestSectionConfig {
+                roots: vec![std::env::temp_dir()],
+            },
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
         Self {
             root,
             source,
@@ -113,6 +123,9 @@ fn file_backed_registry(main: &Path, declared_backend_db_paths: Vec<PathBuf>) ->
     let runtime = KhiveRuntime::new(RuntimeConfig {
         db_path: Some(main.to_path_buf()),
         packs: vec!["kg".into(), "code".into()],
+        code_ingest: khive_runtime::CodeIngestSectionConfig {
+            roots: vec![std::env::temp_dir()],
+        },
         ..RuntimeConfig::no_embeddings()
     })
     .unwrap()
@@ -125,6 +138,9 @@ fn create_runtime_database(path: &Path) {
         KhiveRuntime::new(RuntimeConfig {
             db_path: Some(path.to_path_buf()),
             packs: vec!["kg".into(), "code".into()],
+            code_ingest: khive_runtime::CodeIngestSectionConfig {
+                roots: vec![std::env::temp_dir()],
+            },
             ..RuntimeConfig::no_embeddings()
         })
         .unwrap(),
@@ -327,7 +343,19 @@ async fn omitted_var_parent_alias_creates_physical_default() {
         .expect("source is below the physical /var directory");
     let alias_source = Path::new("/var").join(suffix);
     let physical_target = physical_source.join(".khive").join("code-map.db");
-    let registry = registry(KhiveRuntime::memory().unwrap());
+    let registry = registry(
+        KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            brain_profile: None,
+            actor_id: None,
+            code_ingest: khive_runtime::CodeIngestSectionConfig {
+                roots: vec![std::env::temp_dir()],
+            },
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .unwrap(),
+    );
     let response = registry
         .dispatch("code.ingest", json!({"path": alias_source, "tiers": []}))
         .await
@@ -383,6 +411,9 @@ async fn explicit_current_runtime_database_is_still_refused() {
         packs: vec!["kg".into(), "code".into()],
         actor_id: None,
         brain_profile: None,
+        code_ingest: khive_runtime::CodeIngestSectionConfig {
+            roots: vec![std::env::temp_dir()],
+        },
         ..RuntimeConfig::no_embeddings()
     })
     .unwrap();
@@ -467,6 +498,9 @@ async fn hardlink_to_runtime_main_is_refused_but_fresh_inode_copy_is_accepted() 
     drop(
         KhiveRuntime::new_readonly(RuntimeConfig {
             db_path: Some(copy.clone()),
+            code_ingest: khive_runtime::CodeIngestSectionConfig {
+                roots: vec![std::env::temp_dir()],
+            },
             ..RuntimeConfig::no_embeddings()
         })
         .expect("closed source runtime leaves a standalone, readable database copy"),

@@ -533,11 +533,19 @@ class AggregateGateWorkflowTests(unittest.TestCase):
     SCOPE_PREDICATE = ("(needs.changed-paths.outputs.test_scope == 'full'"
                        " || needs.changed-paths.outputs.test_scope == '')")
     SCOPED_SKIP_JOBS = {"coverage-measurement", "coverage-ratchet"}
+    # A draft pull request skips every lane job until it is marked ready; the gate refuses a draft by name.
+    DRAFT_PREDICATE = "github.event.pull_request.draft != true"
+    # Coverage runs on main pushes, the nightly run and manual dispatches only; the gate forgives its skip
+    # on pull requests and integration pushes (COVERAGE_SKIPS).
+    EVENT_PREDICATE = ("github.event_name != 'pull_request'"
+                       " && !startsWith(github.ref, 'refs/heads/integration/')")
+    EVENT_SKIP_JOBS = SCOPED_SKIP_JOBS
     DOCS_LANE_JOBS = {
         "ci", "khive-py", "kg-editor", "supply-chain", "doc-build",
         "dependency-review", "coverage-measurement", "coverage-ratchet",
         "wasm-parity", "vamana-portability", "minio-blob-compat",
-        "msrv-check", "core-only",
+        "msrv-check", "core-only", "release-checks", "channel-tests", "s3-blob-tests",
+        "clippy-checks",
     }
     # The Windows compile check is not a gate dependency, so nothing forgives its skip; the lane skips it to
     # save the runner, like the gated lane jobs.
@@ -553,7 +561,7 @@ class AggregateGateWorkflowTests(unittest.TestCase):
         step = self.gate.split("- name: Check aggregated job results\n", 1)[1]
         self.script = textwrap.dedent(step.split("        run: |\n", 1)[1])
 
-    def run_gate(self, results, docs_only="false", classifier=None, test_scope="full"):
+    def run_gate(self, results, docs_only="false", classifier=None, test_scope="full", coverage_skips=None):
         """test_scope=None leaves the output unset, as when the scope step did not run."""
         needs = {job: {"result": result} for job, result in results.items()}
         if "changed-paths" in needs:
@@ -564,7 +572,8 @@ class AggregateGateWorkflowTests(unittest.TestCase):
                 needs["changed-paths"]["outputs"]["test_scope"] = test_scope
         return subprocess.run(
             ["bash", "-e", "-c", self.script],
-            env={**os.environ, "NEEDS": json.dumps(needs)},
+            env={**{k: v for k, v in os.environ.items() if k != "COVERAGE_SKIPS"}, "NEEDS": json.dumps(needs),
+                 **({} if coverage_skips is None else {"COVERAGE_SKIPS": coverage_skips})},
             capture_output=True, text=True, timeout=5, check=False,
         )
 
@@ -574,7 +583,9 @@ class AggregateGateWorkflowTests(unittest.TestCase):
     def lane_conditions(self, job):
         predicate = self.DOCS_LANE_PREDICATE
         if job in self.SCOPED_SKIP_JOBS:
-            predicate = f"{predicate} && {self.SCOPE_PREDICATE}"
+            predicate = f"{predicate} && {self.SCOPE_PREDICATE} && {self.EVENT_PREDICATE}"
+        else:
+            predicate = f"{predicate} && {self.DRAFT_PREDICATE}"
         return [[predicate], [f"always() && {predicate}"]]
 
     def test_docs_lane_jobs_and_the_gate_list_are_one_set(self):
@@ -591,7 +602,7 @@ class AggregateGateWorkflowTests(unittest.TestCase):
         self.assertEqual(carrying - self.needs, self.UNGATED_DOCS_LANE_JOBS)
         lists = [set(re.findall(r'"([a-z0-9-]+)"', block.split("]", 1)[0]))
                  for block in self.script.split("then [")[1:]]
-        self.assertEqual(lists, [self.DOCS_LANE_JOBS, self.SCOPED_SKIP_JOBS])
+        self.assertEqual(lists, [self.DOCS_LANE_JOBS, self.SCOPED_SKIP_JOBS, self.EVENT_SKIP_JOBS])
         scoped = {
             job for job in jobs
             if any(self.SCOPE_PREDICATE in condition for condition in self.job_conditions(job))
@@ -607,6 +618,33 @@ class AggregateGateWorkflowTests(unittest.TestCase):
             with self.subTest(kept=job):
                 self.assertNotIn(self.DOCS_LANE_PREDICATE, indented_block(self.workflow, job, 2))
         self.assertIn("- changed-paths", indented_block(self.gate, "needs", 4))
+
+    def test_coverage_skips_are_forgiven_only_on_pull_requests_and_integration_pushes(self):
+        for coverage_skips in ("true", "false", None, "TRUE"):
+            for job in sorted(self.needs):
+                with self.subTest(coverage_skips=coverage_skips, job=job):
+                    results = dict.fromkeys(self.needs, "success")
+                    results[job] = "skipped"
+                    result = self.run_gate(results, coverage_skips=coverage_skips)
+                    accepted = job in self.FORGIVEN_SKIPS or (
+                        coverage_skips == "true" and job in self.EVENT_SKIP_JOBS)
+                    self.assertEqual(result.returncode, 0 if accepted else 1, result.stdout + result.stderr)
+                    if job in self.EVENT_SKIP_JOBS:
+                        failed = dict.fromkeys(self.needs, "success")
+                        failed[job] = "failure"
+                        refused = self.run_gate(failed, coverage_skips=coverage_skips)
+                        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+
+    def test_the_gate_refuses_a_draft_pull_request_by_name(self):
+        steps = self.gate.split("- name: Check aggregated job results\n", 1)[0]
+        self.assertIn("- name: Refuse a draft pull request\n", steps)
+        self.assertIn("if: github.event_name == 'pull_request' && github.event.pull_request.draft == true\n", steps)
+        self.assertIn("exit 1\n", steps)
+        env = indented_block(self.gate.split("- name: Check aggregated job results\n", 1)[1], "env", 8)
+        self.assertIn("COVERAGE_SKIPS: ${{ github.event_name == 'pull_request' || "
+                      "startsWith(github.ref, 'refs/heads/integration/') }}", env)
+        triggers = indented_block(self.workflow, "pull_request", 2)
+        self.assertIn("types: [opened, synchronize, reopened, ready_for_review]", triggers)
 
     def test_failed_classifier_does_not_forgive_the_lane_skips(self):
         # A failed classifier already fails the gate by itself; the rejected list shows
@@ -788,7 +826,8 @@ class CiMatrixWorkflowTests(unittest.TestCase):
 
     UBUNTU = [{"os": "ubuntu-latest", "shard": 1}, {"os": "ubuntu-latest", "shard": 2}]
 
-    def matrix_for(self, event_name, head_ref="", head_repo=None, repository="ohdearquant/khive"):
+    def matrix_for(self, event_name, head_ref="", head_repo=None, repository="ohdearquant/khive",
+                   ref="refs/heads/main"):
         text = workflow_text("ci.yml")
         match = re.search(r"include: \$\{\{ fromJSON\((.*?)\) \}\}", text, re.S)
         self.assertIsNotNone(match, "the ci job's matrix include expression was not found")
@@ -798,6 +837,7 @@ class CiMatrixWorkflowTests(unittest.TestCase):
             "github.event_name": "event_name",
             "github.head_ref": "head_ref",
             "github.repository": "repository",
+            "github.ref": "ref",
         }
         for name, local in names.items():
             expression = expression.replace(name, local)
@@ -815,6 +855,7 @@ class CiMatrixWorkflowTests(unittest.TestCase):
             "head_ref": head_ref,
             "head_repo": head_repo,
             "repository": repository,
+            "ref": ref,
         }
         return json.loads(eval(expression, {"__builtins__": {}}, scope))
 
@@ -851,6 +892,17 @@ class CiMatrixWorkflowTests(unittest.TestCase):
         for event_name in ["push", "schedule", "workflow_dispatch"]:
             with self.subTest(event_name=event_name):
                 self.assertEqual(self.matrix_for(event_name), expected)
+        # Integration pushes other than trains keep all four, and so does a train-named ref on another event.
+        for event_name, ref in [("push", "refs/heads/integration/batch-7"), ("push", "refs/heads/main"),
+                                ("workflow_dispatch", "refs/heads/integration/train-12"),
+                                ("schedule", "refs/heads/integration/train-12")]:
+            with self.subTest(event_name=event_name, ref=ref):
+                self.assertEqual(self.matrix_for(event_name, ref=ref), expected)
+
+    def test_integration_train_pushes_run_the_linux_shards_only(self):
+        for ref in ["refs/heads/integration/train-12", "refs/heads/integration/train-213-a"]:
+            with self.subTest(ref=ref):
+                self.assertEqual(self.matrix_for("push", ref=ref), self.UBUNTU)
 
 
 class WasmtimeParityWorkflowTests(unittest.TestCase):
@@ -2052,8 +2104,9 @@ class DocsFormatPhaseTests(unittest.TestCase):
     def test_ripgrep_install_has_one_copy(self):
         workflow = workflow_text("ci.yml")
         self.assertNotIn("apt-get install", workflow)
-        ci_job = indented_block(workflow, "ci", 2)
-        self.assertIn("run: ../scripts/ci-install-ripgrep.sh", ci_job)
+        # khive-contract, the one phase that needs rg, runs in the release-checks job.
+        release_job = indented_block(workflow, "release-checks", 2)
+        self.assertIn("run: ../scripts/ci-install-ripgrep.sh", release_job)
         script = (REPO_ROOT / "scripts" / "ci-install-ripgrep.sh").read_text()
         self.assertIn("apt-get install --yes ripgrep", script)
         self.assertIn("set -euo pipefail", script)
@@ -2239,6 +2292,10 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         "check-windows": "Windows compile check",
         "msrv-check": "MSRV compile check",
         "core-only": "Core-only feature set build and tests",
+        "release-checks": "Release build and release checks (${{ matrix.os }})",
+        "channel-tests": "Channel feature tests (${{ matrix.os }})",
+        "s3-blob-tests": "S3 blob store library tests",
+        "clippy-checks": "Clippy and forward-deployed checks (${{ matrix.os }})",
         "coverage-measurement": "Coverage measurement",
         "coverage-ratchet": "Coverage ratchet",
         "changed-paths": "Classify changed paths",
@@ -2425,9 +2482,13 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         # for the coverage jobs, a successful crate-list test scope
         # (AggregateGateWorkflowTests). Gating the same jobs per step would
         # still start every runner, the macOS one included.
-        docs_lane = "needs.changed-paths.outputs.docs_only != 'true'"
-        scoped_lane = (f"{docs_lane} && (needs.changed-paths.outputs.test_scope == 'full'"
-                       " || needs.changed-paths.outputs.test_scope == '')")
+        docs_lane = ("needs.changed-paths.outputs.docs_only != 'true'"
+                     " && github.event.pull_request.draft != true")
+        scoped_lane = ("needs.changed-paths.outputs.docs_only != 'true'"
+                       " && (needs.changed-paths.outputs.test_scope == 'full'"
+                       " || needs.changed-paths.outputs.test_scope == '')"
+                       " && github.event_name != 'pull_request'"
+                       " && !startsWith(github.ref, 'refs/heads/integration/')")
         for name in [*self.CHECKOUT_NAMES, "ci-gate"]:
             with self.subTest(job=name):
                 job = indented_block(self.workflow, name, 2)
@@ -2448,7 +2509,7 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
                         "CHECK_NAME_ADMISSION: admit even after failed or skipped dependencies",
                     )
                 if name in {"ci-gate", "secret-scan", "docs", "changed-paths", "resolve-revision"}:
-                    self.assertNotIn(docs_lane, job)
+                    self.assertNotIn("needs.changed-paths.outputs.docs_only != 'true'", job)
 
     def test_dependency_review_work_is_pr_only_after_revision_validation(self):
         job = indented_block(self.workflow, "dependency-review", 2)
@@ -2680,6 +2741,122 @@ class DocsOnlyClassifierTests(unittest.TestCase):
         self.write("docs/adr/ADR-001-guide.md", "# ADR\n\nAmended.\n")
         verdict, reasons = self.classify(self.base, self.commit("adr"))
         self.assertEqual(verdict, "true", reasons)
+
+    def shared_readme_base(self):
+        """An ADR index and a crate readme share the base name README.md; the crate's code names its own."""
+        self.write("docs/adr/README.md", "# ADR index\n")
+        self.write("crates/widget/README.md", "# Widget\n")
+        self.write("crates/widget/src/lib.rs", '#![doc = include_str!("../README.md")]\n')
+        self.write("crates/widget/Cargo.toml", '[package]\nname = "widget"\nreadme = "README.md"\n')
+        return self.commit("shared readme base")
+
+    def test_a_shared_base_name_named_only_by_other_directories_takes_the_documentation_lane(self):
+        base = self.shared_readme_base()
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-001\n")
+        verdict, reasons = self.classify(base, self.commit("index row"))
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: docs/adr/README.md", reasons)
+        # CONTROL: the crate's own readme, which its code names relatively, still runs the full suite.
+        self.write("crates/widget/README.md", "# Widget\n\nChanged.\n")
+        verdict, reasons = self.classify(base, self.commit("crate readme"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("crates/widget/README.md is named by a non-Markdown file in crates/widget", reasons)
+
+    def test_a_shared_base_name_reached_by_path_runs_the_full_suite(self):
+        cases = [
+            ("tools/index.py", 'INDEX = "docs/adr/README.md"\n', "named as adr/README.md"),
+            ("tools/index.py", 'INDEX = ROOT / "docs" / "adr" / "README.md"\n', "named as a joined adr and README.md"),
+            ("tools/index.py", "index = join('adr', 'README.md')\n", "named as a joined adr and README.md"),
+            ("docs/adr/index.json", '{"index": "README.md"}\n', "named by a non-Markdown file in docs/adr"),
+        ]
+        for reader, text, reason in cases:
+            with self.subTest(reader=reader, text=text):
+                base = self.shared_readme_base()
+                self.write(reader, text)
+                with_reader = self.commit("reader")
+                self.write("docs/adr/README.md", "# ADR index\n\n- ADR-002\n")
+                verdict, reasons = self.classify(with_reader, self.commit("index row"))
+                self.assertEqual(verdict, "false", reasons)
+                self.assertIn(f"docs/adr/README.md is {reason}", reasons)
+                self.git("rm", "-q", "-r", "--cached", "tools", "docs/adr/index.json", "--ignore-unmatch")
+                for leftover in ("tools/index.py", "docs/adr/index.json"):
+                    (self.repo / leftover).unlink(missing_ok=True)
+                self.commit("drop reader")
+
+    def test_a_symlink_inside_the_directory_of_a_shared_base_name_runs_the_full_suite(self):
+        base = self.shared_readme_base()
+        (self.repo / "docs/adr/INDEX.md").symlink_to("README.md")
+        with_link = self.commit("link")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-003\n")
+        verdict, reasons = self.classify(with_link, self.commit("index row"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("docs/adr/README.md is named by a symlink in docs/adr", reasons)
+
+    def test_the_classifier_naming_a_path_in_its_comments_takes_the_documentation_lane(self):
+        base = self.shared_readme_base()
+        comment = '# the parent directory and the name as one path ("adr/README.md")\n'
+        self.write("scripts/ci-docs-only.sh", comment)
+        with_classifier = self.commit("classifier")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-004\n")
+        verdict, reasons = self.classify(with_classifier, self.commit("index row"))
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: docs/adr/README.md", reasons)
+        # CONTROL: the same line in any other script still names the index.
+        self.git("checkout", "-q", "--detach", base)
+        self.write("scripts/other.sh", comment)
+        with_other = self.commit("other script")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-005\n")
+        verdict, reasons = self.classify(with_other, self.commit("index row"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("docs/adr/README.md is named as adr/README.md by a non-Markdown file", reasons)
+
+    def test_a_fixture_pair_exempts_its_reader_for_that_one_path_only(self):
+        base = self.shared_readme_base()
+        self.write("scripts/tests/test_ci_workflows.py",
+                   'self.write("docs/adr/README.md", "# ADR index\\n")\nself.write("notes/guide.md", "# Guide\\n")\n')
+        with_tests = self.commit("fixture tests")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-006\n")
+        verdict, reasons = self.classify(with_tests, self.commit("index row"))
+        self.assertEqual(verdict, "true", reasons)
+        self.assertIn("documentation only: docs/adr/README.md", reasons)
+        # CONTROL: the same file naming a path outside its pair still runs the full suite.
+        self.git("checkout", "-q", "--detach", with_tests)
+        self.write("notes/guide.md", "# Guide\n\nChanged.\n")
+        verdict, reasons = self.classify(with_tests, self.commit("guide"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("notes/guide.md is named by a non-Markdown file", reasons)
+        # CONTROL: the same fixture line in another test file is not exempt.
+        self.git("checkout", "-q", "--detach", base)
+        self.write("scripts/tests/test_other.py", 'self.write("docs/adr/README.md", "# ADR index\\n")\n')
+        with_other = self.commit("other tests")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-007\n")
+        verdict, reasons = self.classify(with_other, self.commit("index row"))
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("docs/adr/README.md is named as adr/README.md by a non-Markdown file", reasons)
+
+    def test_named_paths_are_judged_alone(self):
+        self.write("notes/guide.md", "# Guide\n\nMore.\n")
+        self.write("notes/wire.md", "# Wire\n\nChanged.\n")
+        head = self.commit("guide and wire")
+        def judge(*paths):
+            completed = subprocess.run(
+                ["bash", str(self.CLASSIFIER), self.base, head, *paths], cwd=self.repo, env=self.env,
+                text=True, capture_output=True, timeout=30, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return completed.stdout.strip(), completed.stderr
+        verdict, reasons = judge("notes/guide.md")
+        self.assertEqual(verdict, "true", reasons)
+        self.assertNotIn("notes/wire.md", reasons)
+        # CONTROL: the whole change, and the code-named file alone, still run the full suite.
+        self.assertEqual(judge()[0], "false")
+        verdict, reasons = judge("notes/wire.md")
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("notes/wire.md is named by a non-Markdown file", reasons)
+        # A path the change does not touch is refused rather than judged.
+        verdict, reasons = judge("docs/guide/counts.md")
+        self.assertEqual(verdict, "false", reasons)
+        self.assertIn("docs/guide/counts.md is not a path changed between", reasons)
 
     def test_a_failing_count_scanner_runs_the_full_suite(self):
         # A copy of the classifier beside no scanner: the question cannot be answered, so the
@@ -3423,6 +3600,9 @@ class ScopeFixture(unittest.TestCase):
         for path, text in self.TREE.items():
             self.write(path, text)
         shutil.copy(REPO_ROOT / "scripts" / "ci-test-scope.py", self.repo / "scripts" / "ci-test-scope.py")
+        # The scope classifier admits Markdown by running the documentation-lane classifier on it.
+        for script in ("ci-docs-only.sh", "ci-inert-docs-data.txt"):
+            shutil.copy(REPO_ROOT / "scripts" / script, self.repo / "scripts" / script)
         shutil.copy(REPO_ROOT / "tests" / "documented_verb_counts.py",
                     self.repo / "tests" / "documented_verb_counts.py")
         self.base = self.commit("base")
@@ -3533,6 +3713,35 @@ class TestScopeClassifierTests(ScopeFixture):
         verdict, reasons = self.scope(named, self.commit("notes and source"))
         self.assertEqual(verdict, "full")
         self.assertIn("notes/k-notes.md is named by a non-Markdown file", reasons)
+
+    def test_markdown_beside_crate_source_follows_the_documentation_lane_rule(self):
+        # An ADR index shares its base name with a crate readme, and the copied documentation-lane classifier names
+        # "adr/README.md" in its comments. The scope step applies that classifier's own rule, so the index is admitted
+        # beside crate source, as it would be on its own.
+        self.write("docs/adr/README.md", "# ADR index\n")
+        with_index = self.commit("adr index")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-001\n")
+        self.write("crates/m/src/extra.rs", "\n")
+        verdict, reasons = self.scope(with_index, self.commit("index and source"))
+        self.assertEqual(verdict, "m", reasons)
+        self.assertIn("documentation only: docs/adr/README.md", reasons)
+        # CONTROL: a script that names the index by path still puts the run on the full suite.
+        self.git("checkout", "-q", "--detach", with_index)
+        self.write("scripts/index.py", 'INDEX = "docs/adr/README.md"\n')
+        named = self.commit("name the index")
+        self.write("docs/adr/README.md", "# ADR index\n\n- ADR-002\n")
+        self.write("crates/m/src/extra.rs", "\n")
+        verdict, reasons = self.scope(named, self.commit("index and source"))
+        self.assertEqual(verdict, "full", reasons)
+        self.assertIn("docs/adr/README.md is named as adr/README.md by a non-Markdown file", reasons)
+
+    def test_markdown_beside_crate_source_runs_full_when_the_documentation_rule_cannot_run(self):
+        (self.repo / "scripts" / "ci-docs-only.sh").unlink()
+        without_rule = self.commit("drop the documentation-lane classifier")
+        self.write("notes/k-notes.md", "# Notes\n\nMore.\n")
+        self.write("crates/m/src/extra.rs", "\n")
+        verdict, reasons = self.scope(without_rule, self.commit("notes and source"))
+        self.assertEqual(verdict, "full", reasons)
 
     def test_the_map_is_read_across_pages(self):
         self.set_graph({**self.GRAPH, "pages": [["k"], ["j", "ksub"], ["m"]]})

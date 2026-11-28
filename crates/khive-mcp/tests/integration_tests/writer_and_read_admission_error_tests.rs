@@ -7,7 +7,7 @@ async fn writer_task_busy_survives_storage_runtime_and_mcp_wire() -> anyhow::Res
     let result = call(
         &client,
         "request",
-        serde_json::json!({"ops": "writer_task_busy()"}),
+        serde_json::json!({"ops": "error_inject.writer_task_busy()"}),
     )
     .await?;
     let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
@@ -46,7 +46,7 @@ async fn writer_task_finality_survives_storage_runtime_and_mcp_wire() -> anyhow:
     let rolled_back = call(
         &client,
         "request",
-        serde_json::json!({"ops": "writer_task_rolled_back()"}),
+        serde_json::json!({"ops": "error_inject.writer_task_rolled_back()"}),
     )
     .await?;
     let rolled_back_body: serde_json::Value = serde_json::from_str(&first_text(&rolled_back))?;
@@ -67,7 +67,7 @@ async fn writer_task_finality_survives_storage_runtime_and_mcp_wire() -> anyhow:
     let unknown = call(
         &client,
         "request",
-        serde_json::json!({"ops": "writer_task_side_effects_unknown()"}),
+        serde_json::json!({"ops": "error_inject.writer_task_side_effects_unknown()"}),
     )
     .await?;
     let unknown_body: serde_json::Value = serde_json::from_str(&first_text(&unknown))?;
@@ -98,7 +98,7 @@ async fn storage_admission_timeout_survives_storage_runtime_and_mcp_wire() -> an
     let result = call(
         &client,
         "request",
-        serde_json::json!({"ops": "storage_admission_timeout()"}),
+        serde_json::json!({"ops": "error_inject.storage_admission_timeout()"}),
     )
     .await?;
     let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
@@ -132,7 +132,7 @@ async fn storage_admission_pool_identity_survives_the_mcp_wire() -> anyhow::Resu
     let result = call(
         &client,
         "request",
-        serde_json::json!({"ops": "storage_admission_timeout_with_pool()"}),
+        serde_json::json!({"ops": "error_inject.storage_admission_timeout_with_pool()"}),
     )
     .await?;
     let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
@@ -175,7 +175,7 @@ async fn read_tx_age_evicted_survives_storage_runtime_and_mcp_wire() -> anyhow::
     let result = call(
         &client,
         "request",
-        serde_json::json!({"ops": "read_tx_age_evicted()"}),
+        serde_json::json!({"ops": "error_inject.read_tx_age_evicted()"}),
     )
     .await?;
     let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;
@@ -217,7 +217,7 @@ async fn read_tx_age_eviction_cleanup_failure_survives_storage_runtime_and_mcp_w
     let result = call(
         &client,
         "request",
-        serde_json::json!({"ops": "read_tx_age_eviction_cleanup_failed()"}),
+        serde_json::json!({"ops": "error_inject.read_tx_age_eviction_cleanup_failed()"}),
     )
     .await?;
     let body: serde_json::Value = serde_json::from_str(&first_text(&result))?;

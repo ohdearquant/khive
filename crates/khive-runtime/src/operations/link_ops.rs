@@ -1,13 +1,14 @@
 use khive_storage::{EdgeInsertIfAbsentOutcome, GraphStatementGuard};
 
 use super::{
-    accepted_entity_relations_description, base_entity_rule_allows, canonical_edge_endpoint_kinds,
-    canonical_edge_endpoints, compose_graph_mutation_events, merge_dependency_kind,
-    pack_rule_allows, validate_edge_metadata, validate_edge_weight, Edge, EdgeEndpointKind,
-    EdgeRelation, EdgeUpsertDisposition, EdgeUpsertRefusal, EdgeUpsertRequest, EdgeUpsertResult,
-    Event, EventKind, GraphMutationOutcome, GraphMutationPreconditions, GraphMutationRequest,
-    GuardedEdgeUpsertOutcome, GuardedWriteFailure, KhiveRuntime, LinkId, LinkSpec, NamespaceToken,
-    Resolved, RuntimeError, RuntimeResult, SubstrateKind, Uuid,
+    accepted_entity_relations_description, allowed_pairs_for_relation_description,
+    base_entity_rule_allows, canonical_edge_endpoint_kinds, canonical_edge_endpoints,
+    compose_graph_mutation_events, merge_dependency_kind, pack_rule_allows, validate_edge_metadata,
+    validate_edge_weight, Edge, EdgeEndpointKind, EdgeRelation, EdgeUpsertDisposition,
+    EdgeUpsertRefusal, EdgeUpsertRequest, EdgeUpsertResult, Event, EventKind, GraphMutationOutcome,
+    GraphMutationPreconditions, GraphMutationRequest, GuardedEdgeUpsertOutcome,
+    GuardedWriteFailure, KhiveRuntime, LinkId, LinkSpec, NamespaceToken, Resolved, RuntimeError,
+    RuntimeResult, SubstrateKind, Uuid,
 };
 
 pub(super) fn guarded_link_batch_failure(
@@ -288,11 +289,13 @@ impl KhiveRuntime {
                     tgt_kind,
                     tgt_entity_type,
                 );
+                let allowed_pairs = allowed_pairs_for_relation_description(&pack_rules, relation);
                 return Err(RuntimeError::InvalidInput(format!(
                     "({src_kind}) -[{}]-> ({tgt_kind}) is not in the base endpoint \
                      allowlist; use pack EDGE_RULES to extend the allowlist; currently legal \
                      relations for {src_kind} -> {tgt_kind} under the loaded endpoint rules: \
-                     {legal_relations}",
+                     {legal_relations}; allowed pairs for {}: {allowed_pairs}",
+                    relation.as_str(),
                     relation.as_str()
                 )));
             }
@@ -564,10 +567,13 @@ impl KhiveRuntime {
                 tgt_kind,
                 tgt_entity_type,
             );
+            let allowed_pairs = allowed_pairs_for_relation_description(pack_rules, relation);
             return Err(RuntimeError::InvalidInput(format!(
                 "({src_kind}) -[{}]-> ({tgt_kind}) is not in the base endpoint \
                  allowlist; use pack EDGE_RULES to extend the allowlist; currently legal relations \
-                 for {src_kind} -> {tgt_kind} under the loaded endpoint rules: {legal_relations}",
+                 for {src_kind} -> {tgt_kind} under the loaded endpoint rules: {legal_relations}; \
+                 allowed pairs for {}: {allowed_pairs}",
+                relation.as_str(),
                 relation.as_str()
             )));
         }

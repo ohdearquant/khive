@@ -172,11 +172,12 @@ therefore requires a matching daemon configuration.
 ### 4. Verb naming — kg bare, all others pack-prefixed
 
 The native kg pack (`khive-pack-kg`) owns the **substrate verbs** and exposes them as
-bare verb names. This document deliberately makes no total normative. The authoritative set is
-the 20-entry `KG_HANDLERS` table in `crates/khive-pack-kg/src/handler_defs.rs`, cross-checked by
-`KG_SUBSTRATE_VERBS` in `crates/kkernel/tests/verb_namespace_contract.rs`; the current surface is
-readable at runtime with `request(ops="verbs(pack=\"kg\")")`. The table below classifies the
-shipped semantic allowlist by speech act, which is this section's actual subject:
+bare verb names, with the `stream.*` exception specified below. This document deliberately
+makes no total normative. Handler declarations live in
+`KG_HANDLERS` in `crates/khive-pack-kg/src/handler_defs.rs`; the bare allowlist is cross-checked by
+`KG_SUBSTRATE_VERBS` in `crates/kkernel/tests/verb_namespace_contract.rs`. The current public
+surface is readable with `request(ops="verbs(pack=\"kg\")")`. The table below classifies verbs by
+speech act; the complete public naming contract follows it.
 
 | Verb             | Speech act  | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | ---------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -235,7 +236,7 @@ places `search` limit metadata on successful MCP operation wrappers beside
 retain their exact array contract. This does not introduce a uniform metadata
 object into every pack handler's return value.
 
-Every other pack prefixes its verbs with the pack name and a single dot:
+Every other pack prefixes its verbs, public and internal, with the pack name and a single dot:
 
 ```
 memory.remember, memory.recall, memory.recall_candidates, memory.recall_score
@@ -255,18 +256,53 @@ dots:
 ✗ memory.recall.candidates       two dots, breaks "first dot is pack" rule
 ```
 
-The single rule: **first dot is always the pack name. There is no second dot.**
+#### Public declaration ownership (2026-11-15)
 
-**Enforcement**: This rule is enforced at CI time by the contract test at
-`crates/kkernel/tests/verb_namespace_contract.rs`. The test loads every
-`inventory`-registered pack, walks all `HandlerDef` names, and asserts:
+Runtime registration must enforce the following contract for native handlers with
+`Visibility::Verb`, in both ordinary and metadata-only registry construction. This
+specifies required behavior; it does not claim that runtime enforcement has shipped.
+The existing identifier grammar applies first, without case folding, automatic
+prefixing or new length restrictions.
 
-- A bare name (no dot) must be owned by the kg pack and appear in the
-  kg-substrate allowlist.
-- A dotted name must carry exactly one dot whose prefix matches `Pack::NAME`.
-- Two or more dots are always a violation.
+- A bare name requires the owner label to be exactly `kg` and membership in the kg
+  bare allowlist. `KG_SUBSTRATE_VERBS` in the contract test is the authoritative set.
+  The runtime check keeps its own copy of that set, and a test fails if the two
+  copies differ.
+- The kg pack may also declare `stream.<identifier>`, with exactly one dot and a
+  suffix accepted by the existing grammar, under
+  [ADR-174](ADR-174-ordered-streams-append.md). No other dotted public name is
+  admitted under `kg`. In particular, `kg.proposal_cleanup` remains an internal
+  `Subhandler` under §2, not a public exception.
+- A public name under any other owner must contain exactly one dot, with its
+  prefix equal to `PackRuntime::name()` byte-for-byte.
+- The label `stream` is reserved: a pack that reports it, or a mounted
+  registration that uses it as its namespace, is refused, because `stream.*` names belong to kg under ADR-174 and verb
+  classification is keyed on the name.
 
-Any verb name change or new pack registration that violates §4 will fail CI.
+A violation must refuse registry construction with `InvalidInput` identifying the
+declaring owner and handler. Disabling the declaration does not bypass validation.
+Rejecting previously admitted third-party declarations that violate this contract
+is an intentional compatibility change.
+
+The owner is the label reported by `PackRuntime::name()`, not authentication of the
+pack implementation. A pack that reports `kg` is held to the kg rules above whatever
+its implementation; because a registry refuses two packs with the same label
+(`PackRedeclared`), a second pack cannot report `kg` beside the real one. When the
+real kg pack is not loaded, a pack reporting `kg` is the only owner of those names;
+choosing which packs to load remains the embedder's trust decision. Ownership validation does not grant registration trust or
+change the distinction between `register` and `register_trusted`; neither route
+bypasses the public naming rule. Mounted registrations retain their separate
+policy. Internal `Visibility::Subhandler` admission, collision and visibility
+rules remain unchanged; this public ownership check does not apply to them.
+
+**CI coverage** remains the contract test at
+`crates/kkernel/tests/verb_namespace_contract.rs`. It loads the linked
+`inventory`-registered packs and walks **all** `HandlerDef` names, including
+internal handlers. Its naming checks require kg ownership and allowlist membership
+for bare names; they recognize kg's `stream.*` namespace and the exact internal
+name `kg.proposal_cleanup`, and require other packs' own prefixes with one dot.
+That all-handler check is distinct from runtime public-declaration validation:
+its internal cleanup exception does not make cleanup MCP-callable.
 
 The kkernel CLI uses the same dotted verb-DSL form as MCP, via the `exec` subcommand:
 

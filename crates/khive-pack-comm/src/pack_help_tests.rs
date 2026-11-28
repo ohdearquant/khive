@@ -9,6 +9,23 @@ fn find_handler(name: &str) -> &'static HandlerDef {
 }
 
 #[test]
+fn quiet_is_a_public_directive_with_required_integer_ttl() {
+    let handler = find_handler("comm.quiet");
+    assert_eq!(handler.visibility, Visibility::Verb);
+    assert_eq!(handler.category, VerbCategory::Directive);
+    assert_eq!(handler.params.len(), 1);
+    let ttl = &handler.params[0];
+    assert_eq!(ttl.name, "ttl_secs");
+    assert_eq!(ttl.param_type, "integer");
+    assert!(ttl.required);
+    assert!(handler.description.contains("1..=300"));
+    assert!(handler.description.contains("monotonic"));
+    assert!(find_handler("comm.health")
+        .description
+        .contains("quiet_until"));
+}
+
+#[test]
 fn send_has_required_to_and_content() {
     let h = find_handler("comm.send");
     assert!(!h.params.is_empty(), "send must have non-empty params");
@@ -435,4 +452,46 @@ fn health_help_declares_bounded_heartbeat_priority_and_unknown_liveness() {
         description.contains("consecutive_failures: null"),
         "health help must not describe a fabricated zero for quarantine-only rows"
     );
+}
+
+#[test]
+fn read_modes_declare_fetch_and_mark_side_effects() {
+    let read = find_handler("comm.read");
+    let mark = read
+        .params
+        .iter()
+        .find(|p| p.name == "mark")
+        .expect("comm help must explicitly distinguish fetching from marking");
+    assert_eq!(mark.param_type, "boolean");
+    assert!(!mark.required);
+    for phrase in [
+        "Defaults to true",
+        "single id",
+        "without marking",
+        "Not supported with ids",
+        "even when empty",
+    ] {
+        assert!(
+            mark.description.contains(phrase),
+            "mark help omitted {phrase}"
+        );
+    }
+    assert!(read.description.contains("mark them read by default"));
+    assert!(read
+        .description
+        .contains("mark=false fetches without marking"));
+    let body = read.params.iter().find(|p| p.name == "body").unwrap();
+    assert!(body.description.contains("without acknowledging a mark"));
+    assert_eq!(read.category, VerbCategory::Declaration);
+    assert!(find_handler("comm.mark_read")
+        .description
+        .contains("without returning message content"));
+    for verb in ["comm.inbox", "comm.thread"] {
+        assert!(
+            find_handler(verb)
+                .description
+                .contains("without marking them read"),
+            "comm help must explicitly distinguish fetching from marking: {verb}"
+        );
+    }
 }

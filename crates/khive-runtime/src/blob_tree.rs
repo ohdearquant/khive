@@ -3,6 +3,12 @@
 //! A manifest is stored as one blob whose reference is the tree id. The
 //! serialization is canonical (entries sorted by path, compact JSON) so two
 //! runs that leave identical content produce identical tree references.
+//!
+//! A scoped tree holds only the entries under named paths:
+//! `{"schema":"khive-tree/scoped-v1","scope":[paths],"entries":[...]}`. [`load`]
+//! refuses it, so no caller that reads a manifest as the whole tree can take a
+//! scoped one for whole; [`load_tree`] returns the scope and [`store_tree`]
+//! writes it back (ADR-182 Amendment 24).
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -16,6 +22,12 @@ use khive_storage::{BlobStore, ContentRef};
 use crate::{KhiveRuntime, RuntimeError};
 
 pub const TREE_SCHEMA: &str = "khive-tree/v1";
+
+/// Schema of a manifest that holds only the entries under the paths its `scope` names.
+pub const SCOPED_TREE_SCHEMA: &str = "khive-tree/scoped-v1";
+
+/// Most paths one scope may name.
+pub const MAX_SCOPE_PATHS: usize = 64;
 
 /// Largest manifest the shared load path will read back.
 pub const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
@@ -31,7 +43,18 @@ pub struct TreeEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Manifest {
     schema: String,
+    // Absent on a whole tree, so a v1 manifest's bytes and reference are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<Vec<String>>,
     entries: Vec<TreeEntry>,
+}
+
+/// A loaded manifest: its entries and, for a scoped tree, the paths it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tree {
+    pub entries: Vec<TreeEntry>,
+    /// `None` for a whole tree; the paths in canonical order for a scoped one.
+    pub scope: Option<Vec<String>>,
 }
 
 /// Validate a relative path: no empty components, no `.`/`..`, no leading
@@ -58,6 +81,37 @@ pub fn validate_relative_path(path: &str, what: &str) -> Result<String, RuntimeE
         }
     }
     Ok(path.to_string())
+}
+
+/// Validate a scope and return it in canonical order: 1 to [`MAX_SCOPE_PATHS`] normalized
+/// relative paths, none repeated and none beneath another.
+pub fn canonical_scope(paths: &[String]) -> Result<Vec<String>, RuntimeError> {
+    if paths.is_empty() || paths.len() > MAX_SCOPE_PATHS {
+        return Err(RuntimeError::InvalidInput(format!(
+            "a tree scope names 1 to {MAX_SCOPE_PATHS} paths; this one names {}",
+            paths.len()
+        )));
+    }
+    let mut sorted = paths
+        .iter()
+        .map(|path| validate_relative_path(path, "scope"))
+        .collect::<Result<Vec<_>, _>>()?;
+    sorted.sort();
+    for (index, path) in sorted.iter().enumerate() {
+        for other in &sorted[index + 1..] {
+            if other == path {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "scope names {path:?} twice"
+                )));
+            }
+            if other.starts_with(path.as_str()) && other.as_bytes()[path.len()] == b'/' {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "scope path {other:?} is beneath scope path {path:?}"
+                )));
+            }
+        }
+    }
+    Ok(sorted)
 }
 
 /// Validate wire entries in input order: paths, refs, modes, duplicates, and
@@ -432,13 +486,28 @@ fn insert_entry(seen: &mut EntryIndex, entry: TreeEntry) -> Result<(), RuntimeEr
     Ok(())
 }
 
+#[cfg(test)]
+fn canonical_bytes(entries: &[TreeEntry]) -> Result<Vec<u8>, RuntimeError> {
+    manifest_bytes(entries, None)
+}
+
 /// Serialize only a manifest that the load path can read back. The writer
 /// refuses as soon as the 8 MiB budget is crossed, before retaining more.
-fn canonical_bytes(entries: &[TreeEntry]) -> Result<Vec<u8>, RuntimeError> {
+/// `scope` is already canonical; `None` writes a whole tree.
+fn manifest_bytes(
+    entries: &[TreeEntry],
+    scope: Option<&[String]>,
+) -> Result<Vec<u8>, RuntimeError> {
     let mut sorted: Vec<TreeEntry> = entries.to_vec();
     sorted.sort_by(|a, b| a.path.cmp(&b.path));
     let manifest = Manifest {
-        schema: TREE_SCHEMA.to_string(),
+        schema: if scope.is_some() {
+            SCOPED_TREE_SCHEMA
+        } else {
+            TREE_SCHEMA
+        }
+        .to_string(),
+        scope: scope.map(<[String]>::to_vec),
         entries: sorted,
     };
     struct BoundedWriter {
@@ -490,18 +559,44 @@ pub async fn store_from_value(rt: &KhiveRuntime, entries: &Value) -> Result<Stri
     store(rt, &entries).await
 }
 
-/// Validate and store entries from any producer; returns a loadable tree ref.
+/// Validate and store entries from any producer as a whole tree; returns a loadable tree ref.
 pub async fn store(rt: &KhiveRuntime, entries: &[TreeEntry]) -> Result<String, RuntimeError> {
+    store_tree(rt, entries, None).await
+}
+
+/// Validate and store entries with a scope; `None` stores a whole tree. A verb that writes a
+/// tree from one it loaded passes that tree's scope, so an edit of a scoped tree stays scoped.
+pub async fn store_tree(
+    rt: &KhiveRuntime,
+    entries: &[TreeEntry],
+    scope: Option<&[String]>,
+) -> Result<String, RuntimeError> {
+    let scope = scope.map(canonical_scope).transpose()?;
     let entries = validate_entries(entries)?;
-    let bytes = canonical_bytes(&entries)?;
+    let bytes = manifest_bytes(&entries, scope.as_deref())?;
     let store = blob_store(rt)?;
     let content_ref = store.put(bytes).await?;
     Ok(content_ref.as_str().to_string())
 }
 
-/// Load a manifest by reference. An unknown reference or a non-manifest
-/// object is an error naming the reference.
+/// Load a whole tree by reference. An unknown reference or a non-manifest
+/// object is an error naming the reference, and so is a scoped tree: a caller
+/// of this function reads the entries as the whole tree, and a scoped tree read
+/// that way loses every path outside its scope.
 pub async fn load(rt: &KhiveRuntime, tree_ref: &str) -> Result<Vec<TreeEntry>, RuntimeError> {
+    let tree = load_tree(rt, tree_ref).await?;
+    match tree.scope {
+        None => Ok(tree.entries),
+        Some(scope) => Err(RuntimeError::InvalidInput(format!(
+            "tree {tree_ref} is scoped to {}; this operation reads only whole trees",
+            scope.join(", ")
+        ))),
+    }
+}
+
+/// Load a manifest by reference with its scope, whole or scoped. A caller that
+/// writes a tree from the result passes the scope to [`store_tree`].
+pub async fn load_tree(rt: &KhiveRuntime, tree_ref: &str) -> Result<Tree, RuntimeError> {
     let content_ref = ContentRef::from_hex(tree_ref)
         .map_err(|e| RuntimeError::InvalidInput(format!("tree ref {tree_ref:?}: {e}")))?;
     let store = blob_store(rt)?;
@@ -520,14 +615,40 @@ pub async fn load(rt: &KhiveRuntime, tree_ref: &str) -> Result<Vec<TreeEntry>, R
         RuntimeError::InvalidInput(format!("tree {tree_ref} is not a khive-tree manifest: {e}"))
     })?;
     drop(bytes);
-    if manifest.schema != TREE_SCHEMA {
-        return Err(RuntimeError::InvalidInput(format!(
-            "tree {tree_ref} has schema {:?}; expected {TREE_SCHEMA:?}",
-            manifest.schema
-        )));
-    }
+    let scope = match (manifest.schema.as_str(), manifest.scope) {
+        (TREE_SCHEMA, None) => None,
+        (SCOPED_TREE_SCHEMA, Some(scope)) => {
+            let canonical = canonical_scope(&scope).map_err(|error| match error {
+                RuntimeError::InvalidInput(text) => {
+                    RuntimeError::InvalidInput(format!("tree {tree_ref}: {text}"))
+                }
+                other => other,
+            })?;
+            if canonical != scope {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "tree {tree_ref} lists its scope out of canonical order"
+                )));
+            }
+            Some(canonical)
+        }
+        (TREE_SCHEMA, Some(_)) => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "tree {tree_ref} has schema {TREE_SCHEMA:?} and a scope; a whole tree carries none"
+            )));
+        }
+        (SCOPED_TREE_SCHEMA, None) => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "tree {tree_ref} has schema {SCOPED_TREE_SCHEMA:?} and no scope"
+            )));
+        }
+        (other, _) => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "tree {tree_ref} has schema {other:?}; expected {TREE_SCHEMA:?} or {SCOPED_TREE_SCHEMA:?}"
+            )));
+        }
+    };
     let entries = validate_entries(&manifest.entries)?;
-    Ok(entries)
+    Ok(Tree { entries, scope })
 }
 
 /// Every entry's blob must exist before materialization starts.

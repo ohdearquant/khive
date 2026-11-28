@@ -200,20 +200,32 @@ fn audit_success_rows_constants_and_registration_boundary() {
         .audit_success_row_sampled_verbs
         .contains_key("stats"));
     assert!(!trusted.admission_degrade_safe_probe("comm.cursor_get"));
-    for owner in ["comm", "extension"] {
-        let mut builder = VerbRegistryBuilder::new();
-        builder.with_audit_success_rows_mode(AuditSuccessRowsMode::Reduced);
-        builder.register(PolicyPack(owner, COMM_HANDLERS));
-        let untrusted = builder.build().expect("untrusted registry");
-        assert!(untrusted.audit_success_row_omitted_verbs.is_empty());
-        assert!(untrusted.audit_success_row_sampled_verbs.is_empty());
-    }
     let mut builder = VerbRegistryBuilder::new();
     builder.with_audit_success_rows_mode(AuditSuccessRowsMode::Reduced);
-    builder.register_trusted(PolicyPack("extension", COMM_HANDLERS));
-    let wrong_owner = builder.build().expect("trusted noncanonical owner");
-    assert!(wrong_owner.audit_success_row_omitted_verbs.is_empty());
-    assert!(wrong_owner.audit_success_row_sampled_verbs.is_empty());
+    builder.register(PolicyPack("comm", COMM_HANDLERS));
+    let untrusted = builder.build().expect("same-owner untrusted registry");
+    assert!(untrusted.audit_success_row_omitted_verbs.is_empty());
+    assert!(untrusted.audit_success_row_sampled_verbs.is_empty());
+
+    for trusted in [false, true] {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_audit_success_rows_mode(AuditSuccessRowsMode::Reduced);
+        let pack = PolicyPack("extension", COMM_HANDLERS);
+        if trusted {
+            builder.register_trusted(pack);
+        } else {
+            builder.register(pack);
+        }
+        let error = builder
+            .build()
+            .err()
+            .expect("foreign public owner must fail");
+        assert!(
+            matches!(&error, RuntimeError::InvalidInput(message)
+                if message.contains("extension") && message.contains("comm.inbox")),
+            "trusted={trusted}: expected ownership refusal, got {error:?}"
+        );
+    }
 }
 
 #[tokio::test]

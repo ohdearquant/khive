@@ -11835,6 +11835,7 @@ async fn create_many_runtime_validator_installed_via_pack_registration() {
         description: None,
         properties: None,
         tags: vec![],
+        aliases: Vec::new(),
     }];
 
     let result = rt.create_many(&tok, bad_specs).await;
@@ -11909,6 +11910,7 @@ async fn create_many_runtime_validator_installed_on_per_pack_runtime_multi_backe
         description: None,
         properties: None,
         tags: vec![],
+        aliases: Vec::new(),
     }];
 
     let result = kg_runtime.create_many(&tok, bad_specs).await;
@@ -12793,7 +12795,7 @@ async fn context_hops_zero_does_not_expand_even_with_edges_present() {
 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
-async fn context_dedup_across_anchors_neighbor_appears_once_under_first_anchor() {
+async fn context_shared_neighbor_appears_under_each_anchor_that_reaches_it() {
     let pack = pack();
     let a = pack
         .dispatch(
@@ -12846,14 +12848,17 @@ async fn context_dedup_across_anchors_neighbor_appears_once_under_first_anchor()
     assert_eq!(anchors.len(), 2);
     let a_neighbors = anchors[0]["neighbors"].as_array().unwrap();
     let b_neighbors = anchors[1]["neighbors"].as_array().unwrap();
-    assert!(
-        a_neighbors.iter().any(|n| n["id"] == shared_id),
-        "Shared must appear under the first anchor (A)"
+    assert_eq!(
+        a_neighbors.iter().filter(|n| n["id"] == shared_id).count(),
+        1,
+        "Shared must appear once under the first anchor (A)"
     );
-    assert!(
-        !b_neighbors.iter().any(|n| n["id"] == shared_id),
-        "Shared must NOT be repeated under the second anchor (B) — global visited-set dedup"
+    assert_eq!(
+        b_neighbors.iter().filter(|n| n["id"] == shared_id).count(),
+        1,
+        "Shared must also appear once under the second anchor (B): each anchor keeps its own visited set"
     );
+    assert_eq!(resp["dropped"]["neighbors"], 0);
 }
 
 #[tokio::test]

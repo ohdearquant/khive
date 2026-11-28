@@ -152,7 +152,8 @@ async fn backend_registration_order_does_not_change_tied_evidence() {
             let request = request(serde_json::json!({"kind":kind,"query":"candidate","limit":10}));
             let (entities, notes, per_backend) = coordinator
                 .fan_out_search(&request, &Namespace::local())
-                .await;
+                .await
+                .expect("active search succeeds");
             assert_eq!(
                 per_backend
                     .iter()
@@ -197,7 +198,8 @@ async fn multiple_selected_backends_keep_outer_rrf_when_only_one_contributes() {
             let request = request(serde_json::json!({"kind":kind,"query":"candidate","limit":10}));
             let (entities, notes, per_backend) = coordinator
                 .fan_out_search(&request, &Namespace::local())
-                .await;
+                .await
+                .expect("active search succeeds");
             assert_eq!(per_backend.len(), 2);
             assert_eq!(per_backend[1].error.is_some(), failed);
             assert!(per_backend[1].hits.is_empty());
@@ -232,7 +234,8 @@ async fn finalization_preserves_backend_rank_kind_and_signals() {
     let request = request(serde_json::json!({"kind":"entity","query":"candidate","limit":10}));
     coordinator
         .finalize_search_hits(&mut entities, &mut notes, &request, &Namespace::local())
-        .await;
+        .await
+        .expect("active search succeeds");
     assert_eq!(entities.len(), 1);
     assert_eq!(notes.len(), 1);
     assert_entity_eq(&entities[0], &entity);
@@ -293,7 +296,8 @@ async fn one_selected_backend_preserves_real_entity_and_note_evidence() {
         .unwrap();
     let (entities, _, backends) = coordinator
         .fan_out_search(&entity_request, &namespace)
-        .await;
+        .await
+        .expect("active search succeeds");
     assert_eq!(backends.len(), 1);
     assert_eq!(backends[0].backend_id.as_str(), "entities");
     assert!(backends[0].error.is_none());
@@ -315,7 +319,10 @@ async fn one_selected_backend_preserves_real_entity_and_note_evidence() {
         )
         .await
         .unwrap();
-    let (_, notes, backends) = coordinator.fan_out_search(&note_request, &namespace).await;
+    let (_, notes, backends) = coordinator
+        .fan_out_search(&note_request, &namespace)
+        .await
+        .expect("active search succeeds");
     assert_eq!(backends.len(), 1);
     assert_eq!(backends[0].backend_id.as_str(), "notes");
     assert!(backends[0].error.is_none());
@@ -342,7 +349,8 @@ async fn finalization_quantizes_floor_once_and_keeps_equality() {
     );
     coordinator
         .finalize_search_hits(&mut entities, &mut notes, &request, &Namespace::local())
-        .await;
+        .await
+        .expect("active search succeeds");
     assert_eq!(
         entities
             .iter()
@@ -430,7 +438,8 @@ async fn coordinator_time_order_applies_floor_before_limit_for_both_substrates()
             );
             let result = service
                 .fan_out_search(&request, &Namespace::local(), &[])
-                .await;
+                .await
+                .expect("active search succeeds");
             assert!(!result.partial);
             assert_eq!(result.per_backend.len(), 2);
             assert!(result.per_backend.iter().all(|row| row.error.is_none()));
@@ -502,7 +511,8 @@ async fn time_order_preserves_rank_and_uuid_ties_and_places_missing_last() {
         );
         coordinator
             .finalize_search_hits(&mut entities, &mut notes, &request, &Namespace::local())
-            .await;
+            .await
+            .expect("active search succeeds");
         assert_eq!(
             entities.iter().map(|hit| hit.entity_id).collect::<Vec<_>>(),
             [1, 2, 3].map(Uuid::from_u128)
@@ -510,6 +520,282 @@ async fn time_order_preserves_rank_and_uuid_ties_and_places_missing_last() {
         assert_eq!(
             notes.iter().map(|hit| hit.note_id).collect::<Vec<_>>(),
             [11, 12, 13].map(Uuid::from_u128)
+        );
+    }
+}
+
+async fn seed_created_candidate(
+    runtime: &KhiveRuntime,
+    substrate: &str,
+    id: u128,
+    created: i64,
+    preferred: bool,
+    fields: (&str, Option<&str>, &str),
+) {
+    use khive_runtime::curation::{entity_fts_document, note_fts_document};
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let query = "createdrangefixture";
+    if substrate == "entity" {
+        let mut row = Entity::new(
+            "local",
+            fields.0,
+            if preferred {
+                query.to_string()
+            } else {
+                format!("{query} secondary")
+            },
+        );
+        row.id = Uuid::from_u128(id);
+        row.created_at = created;
+        row.updated_at = 10_000_000 - created;
+        row.entity_type = fields.1.map(str::to_owned);
+        row.tags = vec![fields.2.into()];
+        row.properties = Some(serde_json::json!({"bucket":"range"}));
+        runtime
+            .entities(&token)
+            .unwrap()
+            .upsert_entity(row.clone())
+            .await
+            .unwrap();
+        runtime
+            .text(&token)
+            .unwrap()
+            .upsert_document(entity_fts_document(&row))
+            .await
+            .unwrap();
+    } else {
+        let mut row = Note::new("local", fields.0, query);
+        row.id = Uuid::from_u128(id);
+        row.created_at = created;
+        row.updated_at = 10_000_000 - created;
+        row.salience = Some(if preferred { 1.0 } else { 0.0 });
+        row.properties = Some(serde_json::json!({"bucket":"range", "tags":[fields.2]}));
+        runtime
+            .notes(&token)
+            .unwrap()
+            .upsert_note(row.clone())
+            .await
+            .unwrap();
+        runtime
+            .text_for_notes(&token)
+            .unwrap()
+            .upsert_document(note_fts_document(&row))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn created_range_filters_real_one_and_two_backend_search_before_limit() {
+    for backend_count in [1, 2] {
+        for substrate in ["entity", "note"] {
+            let mut registry = BackendRegistry::new();
+            let mut runtimes = Vec::new();
+            let kind = if substrate == "entity" {
+                "concept"
+            } else {
+                "observation"
+            };
+            for index in 0..backend_count {
+                let runtime = memory_runtime();
+                for row in 1..=12 {
+                    seed_created_candidate(
+                        &runtime,
+                        substrate,
+                        index * 100 + row,
+                        1_000_000,
+                        true,
+                        (kind, Some("theorem"), "range"),
+                    )
+                    .await;
+                }
+                registry.register(
+                    backend_id(&format!("backend-{index}")),
+                    Arc::clone(&runtime),
+                );
+                runtimes.push(runtime);
+            }
+            let target = Uuid::from_u128(999);
+            seed_created_candidate(
+                &runtimes[0],
+                substrate,
+                target.as_u128(),
+                2_000_000,
+                false,
+                (kind, Some("theorem"), "range"),
+            )
+            .await;
+            let service = SubstrateCoordinatorService::new(SubstrateCoordinator::new(registry));
+            let base =
+                serde_json::json!({"kind":substrate,"query":"createdrangefixture","limit":50});
+            let baseline = service
+                .fan_out_search(&request(base.clone()), &Namespace::local(), &[])
+                .await
+                .expect("active search succeeds");
+            assert!(!baseline.partial);
+            let ids: Vec<_> = if substrate == "entity" {
+                baseline
+                    .entity_hits
+                    .iter()
+                    .map(|hit| hit.entity_id)
+                    .collect()
+            } else {
+                baseline.note_hits.iter().map(|hit| hit.note_id).collect()
+            };
+            let target_rank = ids
+                .iter()
+                .position(|id| *id == target)
+                .expect("real indexed target");
+            assert!(
+                (12..50).contains(&target_rank),
+                "baseline rank {target_rank}"
+            );
+            // Range is the only filter: the coordinator's existing 10x floor alone is insufficient.
+            let mut ranged = base.clone();
+            ranged["limit"] = serde_json::json!(1);
+            ranged["created_after"] = serde_json::json!("1970-01-01T00:00:01.000000001Z");
+            ranged["created_before"] = serde_json::json!("1970-01-01T00:00:02Z");
+            for order in ["score", "created_at", "updated_at"] {
+                ranged["order_by"] = serde_json::json!(order);
+                let found = service
+                    .fan_out_search(&request(ranged.clone()), &Namespace::local(), &[])
+                    .await
+                    .expect("active search succeeds");
+                assert!(!found.partial);
+                assert_eq!(found.per_backend.len(), backend_count as usize);
+                if substrate == "entity" {
+                    assert_eq!(found.entity_hits.len(), 1);
+                    assert_eq!(found.entity_hits[0].entity_id, target);
+                } else {
+                    assert_eq!(found.note_hits.len(), 1);
+                    assert_eq!(found.note_hits[0].note_id, target);
+                }
+            }
+
+            seed_created_candidate(
+                &runtimes[0],
+                substrate,
+                1001,
+                2_000_000,
+                true,
+                (kind, Some("theorem"), "other"),
+            )
+            .await;
+            seed_created_candidate(
+                &runtimes[0],
+                substrate,
+                1002,
+                2_000_000,
+                true,
+                (
+                    if substrate == "entity" {
+                        "document"
+                    } else {
+                        "insight"
+                    },
+                    None,
+                    "range",
+                ),
+            )
+            .await;
+            if substrate == "entity" {
+                seed_created_candidate(
+                    &runtimes[0],
+                    substrate,
+                    1003,
+                    2_000_000,
+                    true,
+                    (kind, Some("algorithm"), "range"),
+                )
+                .await;
+            }
+            ranged["kind"] = serde_json::json!(kind);
+            ranged["tags"] = serde_json::json!(["range"]);
+            ranged["properties"] = serde_json::json!({"bucket":"range"});
+            ranged["created_after"] = serde_json::json!("1970-01-01T01:00:02+01:00");
+            if substrate == "entity" {
+                ranged["entity_type"] = serde_json::json!("theorem");
+            }
+            for order in ["score", "created_at", "updated_at"] {
+                ranged["order_by"] = serde_json::json!(order);
+                let found = service
+                    .fan_out_search(&request(ranged.clone()), &Namespace::local(), &[])
+                    .await
+                    .expect("active search succeeds");
+                assert!(!found.partial);
+                if substrate == "entity" {
+                    assert_eq!(
+                        found
+                            .entity_hits
+                            .iter()
+                            .map(|hit| hit.entity_id)
+                            .collect::<Vec<_>>(),
+                        vec![target]
+                    );
+                } else {
+                    assert_eq!(
+                        found
+                            .note_hits
+                            .iter()
+                            .map(|hit| hit.note_id)
+                            .collect::<Vec<_>>(),
+                        vec![target]
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn created_range_excludes_missing_metadata_without_changing_unfiltered_score_order() {
+    let runtime = memory_runtime();
+    seed_timestamps(
+        &runtime,
+        Uuid::from_u128(1),
+        Uuid::from_u128(11),
+        2_000_000,
+        9_000_000,
+    )
+    .await;
+    let coordinator = SubstrateCoordinator::single(runtime);
+    for ranged in [false, true] {
+        let mut entities: Vec<_> = [2, 1]
+            .into_iter()
+            .map(|id| entity_hit(Uuid::from_u128(id), RankScoreKind::Keyword, keyword(17)))
+            .collect();
+        let mut notes: Vec<_> = [12, 11]
+            .into_iter()
+            .map(|id| {
+                as_note(entity_hit(
+                    Uuid::from_u128(id),
+                    RankScoreKind::Keyword,
+                    keyword(17),
+                ))
+            })
+            .collect();
+        let mut args = serde_json::json!({"kind":"entity","query":"candidate","limit":1});
+        if ranged {
+            args["created_after"] = serde_json::json!("1970-01-01T00:00:02Z");
+        }
+        coordinator
+            .finalize_search_hits(
+                &mut entities,
+                &mut notes,
+                &request(args),
+                &Namespace::local(),
+            )
+            .await
+            .expect("active search succeeds");
+        assert_eq!(
+            entities[0].entity_id,
+            Uuid::from_u128(if ranged { 1 } else { 2 })
+        );
+        assert_eq!(
+            notes[0].note_id,
+            Uuid::from_u128(if ranged { 11 } else { 12 })
         );
     }
 }
