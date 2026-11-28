@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `forms.terms` lists the loaded terms with their aliases, and `forms.subjects` lists the subjects
   of one form revision. A term may carry aliases, and two more term lists, `counting_qualifiers`
   and `carrying_relations`, sit beside kinds, roles and relations.
+- `operation.define` publishes step types on their own, and a step of an operation type may pin
+  one by id and version. A step may name the values it requires and produces and take a value
+  another step produces; a step that requires a value comes after the step that produces it.
 - `git.pr_list` and `git.issue_list` list the pull requests or issues of a configured repository
   in the requested state (`open` unless `closed` or `all` is named), newest created first, one
   hundred to a page for at most ten pages, and say in `truncated` whether more matched.
