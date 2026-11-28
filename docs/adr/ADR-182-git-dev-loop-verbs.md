@@ -1682,13 +1682,14 @@ refusals the verb makes.
 2. **`git.commit` of a scoped tree.** The commit's tree is the tree of `expected_head` with each
    scope path replaced by the manifest's entries at or under it, written as a whole-tree commit
    writes its entries (Amendment 2 item 2). A scope path under which the manifest holds no entry is
-   removed, and one the parent does not hold is added with the directories above it. Every path
-   outside the scope keeps the parent's object and mode, links and submodules included, and no blob
-   outside the scope is read: git lists, one level at a time, only the directories on the way from
-   the root to each scope path, and `mktree` writes those directories again with the changed child.
-   The work grows with the scope and its depth, never with the size of the repository. With
-   `merge_parent` the base is still the tree of `expected_head`, and the parents are recorded as
-   Amendment 14 gives.
+   removed, and so is every directory above it that the removal leaves with no entry, up to the
+   root, since git holds no empty tree as a child. A scope path the parent does not hold is added
+   with the directories above it. Every path outside the scope keeps the parent's object and mode,
+   links and submodules included, and no blob outside the scope is read: git lists, one level at a
+   time, only the directories on the way from the root to each scope path, and `mktree` writes
+   those directories again with the changed child. The work grows with the scope and its depth,
+   never with the size of the repository. With `merge_parent` the base is still the tree of
+   `expected_head`, and the parents are recorded as Amendment 14 gives.
 3. **Refused before any ref moves.** `outside_scope` names a manifest entry under no scope path:
    the tree store does not hold entries to their scope, so an edit through `exec.tree_put` can add
    one, and it is never dropped silently. `scope_conflict` names a path of the parent the scoped
@@ -1716,8 +1717,10 @@ manifest entry outside the scope refuses `outside_scope` naming it, with no ref 
 the path, with no ref moved; 133 a repository holding a submodule and a link outside the scope
 commits a scoped edit, and both keep their mode and object; 134 a scoped commit with `merge_parent`
 has `expected_head` as its first parent and the merge parent as its second; 135 the repository of
-arm 125, too large for one manifest, commits a scoped edit; arm 126 now reads: each of its scoped
-trees keeps its scope and commits as a scoped tree, its tree equal to the parent's outside the scope,
-the one whose paths cover every entry included, and its mutation control stands; mutation control:
+arm 125, too large for one manifest, commits a scoped edit; 136 deleting the only file under
+`a/b/c`, where `a/b` holds nothing else and `a` holds a sibling, removes `a/b` and keeps `a` with
+the sibling's object unchanged; arm 126 now reads: each of its scoped trees keeps its scope and
+commits as a scoped tree, its tree equal to the parent's outside the scope, the one whose paths
+cover every entry included, and its mutation control stands; mutation control:
 building the commit from the manifest alone, without the parent's entries, turns arms 129 and 133
 red.
