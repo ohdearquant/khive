@@ -8,6 +8,7 @@ use khive_db::stores::note::note_hard_delete_statement;
 use khive_db::stores::text::insert_document_statements;
 use khive_storage::types::{DeleteMode, SqlStatement, SqlValue};
 use khive_storage::{AttachmentSubstrate, Edge, Entity};
+use khive_types::pack::{pack_registry_tag, TOOL_REGISTRY_ENTITY_KIND, TOOL_REGISTRY_TAG};
 use khive_types::{EventKind, SubstrateKind};
 
 use crate::atomic_plan::{
@@ -625,12 +626,12 @@ impl KhiveRuntime {
         companions: [SqlStatement; 2],
     ) -> RuntimeResult<([u64; 2], Vec<PostCommitDegradation>)> {
         if expected.namespace != token.namespace().as_str()
-            || expected.kind != "project"
+            || expected.kind != TOOL_REGISTRY_ENTITY_KIND.name()
             || expected.deleted_at.is_some()
             || !expected
                 .tags
                 .iter()
-                .any(|tag| khive_types::pack::pack_registry_tag(tag) == Some("tool-registry"))
+                .any(|tag| pack_registry_tag(tag) == Some(TOOL_REGISTRY_TAG))
         {
             return Err(RuntimeError::InvalidInput(
                 "retirement requires a live Tool registry row in the write namespace".into(),
