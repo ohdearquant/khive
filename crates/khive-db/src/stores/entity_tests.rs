@@ -1,5 +1,6 @@
 use super::*;
 use crate::migrations::run_migrations;
+use crate::migrations::ENTITY_ALIASES_DDL;
 use crate::pool::PoolConfig;
 use crate::test_hooks::TestHooks;
 use khive_storage::{Attachment, AttachmentSubstrate, ContentRef};
@@ -17,7 +18,9 @@ fn setup_pool() -> Arc<ConnectionPool> {
         let writer = pool.writer().unwrap();
         writer
             .conn()
-            .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+            .execute_batch(&format!(
+                "{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}\n{TEST_ATTACHMENTS_DDL}"
+            ))
             .unwrap();
     }
     pool
@@ -43,6 +46,14 @@ fn setup_memory_store() -> SqlEntityStore {
 
 fn setup_memory_store_ns(_ns: &str) -> SqlEntityStore {
     SqlEntityStore::new(setup_pool(), false)
+}
+
+#[test]
+fn entity_reads_end_with_the_published_aliases_column() {
+    assert!(
+        ENTITY_SELECT_COLUMNS.ends_with(&format!("{ENTITY_ALIASES_COLUMN} AS aliases")),
+        "the store's entity reads and ENTITY_ALIASES_COLUMN must carry the same subquery"
+    );
 }
 
 fn id_filter_plan(
@@ -78,7 +89,8 @@ fn assert_entity_id_seek(plan: &[String]) {
 #[test]
 fn id_filtered_entity_count_page_cursor_and_candidate_use_primary_key() {
     let conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
-    conn.execute_batch(ENTITIES_DDL).unwrap();
+    conn.execute_batch(&format!("{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}"))
+        .unwrap();
     conn.execute_batch(TEST_ATTACHMENTS_DDL).unwrap();
     let filter = EntityFilter {
         ids: (1..=48).map(Uuid::from_u128).collect(),
@@ -152,7 +164,8 @@ fn id_filtered_entity_count_page_cursor_and_candidate_use_primary_key() {
 
 fn id_filtered_page_steps(unrelated: usize) -> (Vec<String>, i32) {
     let conn = crate::test_hooks::registered(rusqlite::Connection::open_in_memory().unwrap());
-    conn.execute_batch(ENTITIES_DDL).unwrap();
+    conn.execute_batch(&format!("{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}"))
+        .unwrap();
     conn.execute_batch(TEST_ATTACHMENTS_DDL).unwrap();
     conn.execute_batch("BEGIN").unwrap();
     for i in 1..=2 + unrelated {
@@ -225,6 +238,7 @@ fn make_entity(namespace: &str, kind: &str, name: &str) -> Entity {
         merge_event_id: None,
         version: 1,
         content_ref: None,
+        aliases: Vec::new(),
     }
 }
 
@@ -1134,6 +1148,7 @@ async fn test_same_id_upsert_replaces_row() {
         merge_event_id: None,
         version: 1,
         content_ref: None,
+        aliases: Vec::new(),
     };
     store.upsert_entity(entity_a).await.unwrap();
 
@@ -1159,6 +1174,7 @@ async fn test_same_id_upsert_replaces_row() {
         merge_event_id: None,
         version: 1,
         content_ref: None,
+        aliases: Vec::new(),
     };
     store.upsert_entity(entity_b).await.unwrap();
 
@@ -1344,7 +1360,9 @@ async fn upsert_entities_routes_through_writer_task_when_flag_enabled() {
         let writer = pool.writer().unwrap();
         writer
             .conn()
-            .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+            .execute_batch(&format!(
+                "{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}\n{TEST_ATTACHMENTS_DDL}"
+            ))
             .unwrap();
     }
 
@@ -1421,7 +1439,9 @@ async fn multiple_stores_over_one_pool_share_a_single_writer_task() {
         let writer = pool.writer().unwrap();
         writer
             .conn()
-            .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+            .execute_batch(&format!(
+                "{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}\n{TEST_ATTACHMENTS_DDL}"
+            ))
             .unwrap();
     }
 
@@ -1482,7 +1502,9 @@ async fn concurrent_writes_across_all_migrated_stores_share_one_writer_task() {
         let writer = pool.writer().unwrap();
         writer
             .conn()
-            .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+            .execute_batch(&format!(
+                "{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}\n{TEST_ATTACHMENTS_DDL}"
+            ))
             .unwrap();
         crate::stores::note::ensure_notes_schema(writer.conn()).unwrap();
         crate::stores::graph::ensure_graph_schema(writer.conn()).unwrap();
@@ -1641,7 +1663,9 @@ async fn upsert_entity_routes_through_writer_task_when_flag_enabled() {
         let writer = pool.writer().unwrap();
         writer
             .conn()
-            .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+            .execute_batch(&format!(
+                "{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}\n{TEST_ATTACHMENTS_DDL}"
+            ))
             .unwrap();
     }
 
@@ -1953,7 +1977,9 @@ fn batch_write_refreshes_writer_task_after_construction_outside_runtime() {
         let writer = pool.writer().unwrap();
         writer
             .conn()
-            .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+            .execute_batch(&format!(
+                "{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}\n{TEST_ATTACHMENTS_DDL}"
+            ))
             .unwrap();
     }
     let store = Arc::new(SqlEntityStore::new(Arc::clone(&pool), true));
@@ -2029,7 +2055,9 @@ async fn pooled_entity_read_classifies_exhaustion_and_cancellation_distinctly() 
     pool.writer()
         .unwrap()
         .conn()
-        .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+        .execute_batch(&format!(
+            "{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}\n{TEST_ATTACHMENTS_DDL}"
+        ))
         .unwrap();
     // Production-shaped file-backed reads must contend on the same bounded
     // reader pool. Before ADR-165 Slice 2 they opened a fresh standalone
@@ -2099,7 +2127,9 @@ async fn pooled_entity_read_counts_busy_handler_timeouts() {
     pool.writer()
         .unwrap()
         .conn()
-        .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+        .execute_batch(&format!(
+            "{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}\n{TEST_ATTACHMENTS_DDL}"
+        ))
         .unwrap();
     let store = SqlEntityStore::new(Arc::clone(&pool), true);
 
@@ -2251,7 +2281,9 @@ async fn entity_count_free_page_never_calls_count() {
         let writer = pool.writer().unwrap();
         writer
             .conn()
-            .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+            .execute_batch(&format!(
+                "{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}\n{TEST_ATTACHMENTS_DDL}"
+            ))
             .unwrap();
         for i in 1..=2_000 {
             writer.conn().execute(

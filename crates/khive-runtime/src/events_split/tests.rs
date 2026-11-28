@@ -372,6 +372,7 @@ fn proven_rollback_crosses_the_wire_without_claiming_task_termination() {
         EventsResponse::Error {
             writer_task_failure: Some(WireWriterTaskFailure::RequestFailed {
                 request_state: WireWriterTaskState::TransactionRolledBack,
+                evidence: None,
             }),
             ..
         }
@@ -1734,4 +1735,199 @@ async fn direct_mode_appends_and_reads_without_a_daemon() {
         .await
         .expect("count");
     assert_eq!(count, 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn new_writer_outcomes_round_trip_with_legacy_readable_evidence() {
+    use khive_storage::error::{SqliteWriteFailure, SqliteWriteStage};
+    use khive_storage::WriterTaskRequestState as S;
+
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum LegacyFailure {
+        RequestFailed { request_state: WireWriterTaskState },
+    }
+    #[derive(serde::Deserialize)]
+    struct LegacyResponse {
+        retryable: bool,
+        writer_task_failure: Option<LegacyFailure>,
+    }
+
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
+    let client = EventsSplitClient::new(dir.path().join("never-bound.sock")).unwrap();
+    let store = ForwardingEventStore::new("test", client);
+    for with_native in [false, true] {
+        for (index, error) in [
+            StorageError::WriteOutcomeUnknown {
+                source: Box::new(std::io::Error::other("lost COMMIT reply")),
+            },
+            StorageError::WriterOwnerUnavailable {
+                operation: "writer_task_enqueue".into(),
+                source: Box::new(StorageError::Pool {
+                    operation: "owner lookup".into(),
+                    message: "owner stopped".into(),
+                }),
+            },
+            StorageError::WriterOwnerUnavailable {
+                operation: "write".into(),
+                source: Box::new(StorageError::WriterTaskNoRuntime),
+            },
+            StorageError::WriterRouteViolation {
+                operation: "raw write".into(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let native = SqliteWriteFailure {
+                stage: SqliteWriteStage::Commit,
+                primary_code: 10,
+                extended_code: 1034,
+                settlement_unknown: false,
+            };
+            let error = if with_native {
+                error.with_sqlite_write_failure(native)
+            } else {
+                error
+            };
+            let response = storage_error_response(&error);
+            let bytes = serde_json::to_vec(&response).unwrap();
+            let old: LegacyResponse =
+                serde_json::from_slice(&bytes).expect("old reader ignores additive evidence");
+            let Some(LegacyFailure::RequestFailed { request_state }) = old.writer_task_failure
+            else {
+                panic!("new outcomes must retain the legacy request-failed envelope");
+            };
+            assert_eq!(
+                request_state,
+                if index == 0 {
+                    WireWriterTaskState::SideEffectsUnknown
+                } else {
+                    WireWriterTaskState::NotStarted
+                }
+            );
+            assert_eq!(old.retryable, index == 1);
+            let parsed: EventsResponse = serde_json::from_slice(&bytes).unwrap();
+            let restored = store.unexpected("append_events_idempotent", parsed);
+            assert_eq!(
+                restored.writer_request_state(),
+                Some(if index == 0 {
+                    S::SideEffectsUnknown
+                } else {
+                    S::NotStarted
+                })
+            );
+            assert_eq!(restored.is_retryable(), index == 1);
+            assert_eq!(
+                restored.sqlite_write_failure(),
+                with_native.then_some(native)
+            );
+            match (index, restored.without_sqlite_write_stage()) {
+                (0, StorageError::WriteOutcomeUnknown { .. }) => (),
+                (1, StorageError::WriterOwnerUnavailable { operation, source }) => {
+                    assert_eq!(operation, "writer_task_enqueue");
+                    assert!(
+                        matches!(source.without_sqlite_write_stage(), StorageError::Pool { operation, message }
+                        if operation == "owner lookup" && message == "owner stopped")
+                    );
+                }
+                (2, StorageError::WriterOwnerUnavailable { operation, source }) => {
+                    assert_eq!(operation, "write");
+                    assert!(matches!(source.as_ref(), StorageError::WriterTaskNoRuntime));
+                }
+                (3, StorageError::WriterRouteViolation { operation }) => {
+                    assert_eq!(operation, "raw write")
+                }
+                _ => panic!("typed writer outcome was lost over the event wire: {restored:?}"),
+            }
+            let wire = crate::error_projection::runtime_error_value(
+                crate::RuntimeError::Storage(restored),
+                crate::error::DomainDisposition::NotCommitted,
+            );
+            assert_eq!(wire["task_terminated"], false);
+            if index == 0 {
+                assert_eq!(wire["code"], "write_outcome_unknown");
+                assert_eq!(wire["domain_disposition"], "unknown");
+                assert_eq!(wire["retryable"], false);
+            }
+        }
+    }
+    let legacy = br#"{"kind":"error","message":"rolled back","retryable":false,"writer_task_failure":{"kind":"request_failed","request_state":"transaction_rolled_back"}}"#;
+    let parsed = serde_json::from_slice(legacy).expect("legacy request frame still parses");
+    assert!(matches!(
+        store.unexpected("append", parsed),
+        StorageError::WriterTaskRequestFailed {
+            request_state: S::TransactionRolledBack,
+            ..
+        }
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn contradictory_writer_outcome_evidence_is_refused() {
+    use super::protocol::{WireWriterFailureEvidence as E, WireWriterOwnerCause as C};
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
+    let client = EventsSplitClient::new(dir.path().join("never-bound.sock")).unwrap();
+    let store = ForwardingEventStore::new("test", client);
+    for (request_state, retryable, evidence) in [
+        (
+            WireWriterTaskState::TransactionRolledBack,
+            false,
+            E::WriteOutcomeUnknown,
+        ),
+        (
+            WireWriterTaskState::SideEffectsUnknown,
+            true,
+            E::WriteOutcomeUnknown,
+        ),
+        (
+            WireWriterTaskState::SideEffectsUnknown,
+            false,
+            E::RouteViolation {
+                operation: "write".into(),
+            },
+        ),
+        (
+            WireWriterTaskState::NotStarted,
+            true,
+            E::OwnerUnavailable {
+                operation: "write".into(),
+                cause: C::NoRuntime,
+            },
+        ),
+        (
+            WireWriterTaskState::NotStarted,
+            false,
+            E::OwnerUnavailable {
+                operation: "write".into(),
+                cause: C::Pool {
+                    operation: "lookup".into(),
+                    message: "stopped".into(),
+                },
+            },
+        ),
+    ] {
+        let response = EventsResponse::Error {
+            message: "fixture".into(),
+            retryable,
+            writer_task_failure: Some(WireWriterTaskFailure::RequestFailed {
+                request_state,
+                evidence: Some(evidence),
+            }),
+            sqlite_write_failure: None,
+            read_failure: None,
+        };
+        let error = store.unexpected("append", response);
+        assert!(
+            matches!(error, StorageError::Serialization { .. }),
+            "contradictory evidence must not manufacture writer finality: {error:?}"
+        );
+        assert!(!error.is_retryable());
+    }
 }

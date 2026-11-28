@@ -172,6 +172,27 @@ fn normalize_import_root(path: &Path) -> PathBuf {
     path.components().collect()
 }
 
+/// Admit a requested import path only when its resolved form, symlinks
+/// included, lies under one of the resolved `[knowledge].import_roots`. A path
+/// outside every root and a path that cannot be resolved give the same message,
+/// so a refusal says nothing about what exists outside the roots.
+fn admit_import_path(
+    requested: &Path,
+    roots: &[PathBuf],
+    path_str: &str,
+) -> Result<(), RuntimeError> {
+    let admitted = std::fs::canonicalize(requested)
+        .map(|resolved| roots.iter().any(|root| resolved.starts_with(root)))
+        .unwrap_or(false);
+    if admitted {
+        Ok(())
+    } else {
+        Err(RuntimeError::InvalidInput(format!(
+            "import path is not under a configured import root: {path_str:?}"
+        )))
+    }
+}
+
 fn collect_md_files_with_limits(
     root: &Path,
     limits: ImportTraversalLimits,
@@ -1234,6 +1255,11 @@ impl KnowledgeHandlers {
 
         let normalized_md_path = normalize_import_root(Path::new(&path_str));
         let md_path = normalized_md_path.as_path();
+        admit_import_path(
+            md_path,
+            &runtime.config().knowledge.resolved_import_roots(),
+            &path_str,
+        )?;
         let metadata = std::fs::symlink_metadata(md_path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 RuntimeError::NotFound(format!("path does not exist: {path_str:?}"))

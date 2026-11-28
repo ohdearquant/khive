@@ -18,12 +18,27 @@ mod backend_disk_guard;
 
 #[path = "engine_config_embed_batch.rs"]
 mod embed_batch;
-pub use embed_batch::EmbedSectionConfig;
+pub use embed_batch::{EmbedSectionConfig, EntityEmbeddingFields, LegacyEmbedDevice};
 
 #[path = "engine_config_peers.rs"]
 mod peers;
 pub use peers::EngineConfig;
 pub(crate) use peers::{canonical_engine_name, validate_peer_engines};
+
+#[path = "engine_config_computer.rs"]
+mod computer;
+pub use computer::{
+    read_computer_key, ComputerEndpoint, ComputerKey, ComputerKeyError, ComputerKeyRefusal,
+    ComputerSectionConfig, COMMAND_RUNNING_PACKS, COMPUTER_ROUTABLE_PACKS,
+    DEFAULT_COMPUTER_CALL_TIMEOUT_S, MAX_COMPUTER_CALL_TIMEOUT_S, MAX_COMPUTER_KEY_BYTES,
+};
+
+#[path = "engine_config_share.rs"]
+mod share;
+pub use share::{
+    ShareSectionConfig, ShareTargetConfig, DEFAULT_SHARE_FILES, DEFAULT_SHARE_TOTAL_BYTES,
+    MAX_SHARE_FILES, MAX_SHARE_FILE_BYTES, MAX_SHARE_TOTAL_BYTES,
+};
 
 // ---- Error type ----
 
@@ -39,8 +54,8 @@ pub enum ConfigError {
     #[error("mount configuration: {reason}")]
     InvalidMountConfig { reason: String },
 
-    #[error("channel.node: {reason}")]
-    InvalidNodeConfig { reason: String },
+    #[error("channel configuration: {reason}")]
+    InvalidChannelConfig { reason: String },
 
     #[error("config file I/O: {0}")]
     Io(#[from] std::io::Error),
@@ -222,6 +237,15 @@ pub enum ConfigError {
     #[error("[web] {key}: {reason}")]
     InvalidWebConfig { key: String, reason: String },
 
+    #[error("[computer].{key}: {reason}")]
+    InvalidComputerConfig { key: String, reason: String },
+
+    #[error("[actor].computer {reason}")]
+    InvalidActorComputer { reason: String },
+
+    #[error("[share].{key}: {reason}")]
+    InvalidShareConfig { key: String, reason: String },
+
     #[error("[runtime] {key}: {reason}")]
     InvalidRuntimeConfig { key: String, reason: String },
 
@@ -311,6 +335,7 @@ impl ConfigError {
 /// display_name = "example actor"   # human label (optional)
 /// visible_namespaces = ["lambda:khive", "local"]  # widens default read scope (ADR-007 Rev 4 Rule 3b)
 /// require_attributed = true                       # refuse comm without an actor (optional)
+/// computer = "build-1"                             # with a [computer] table only (ADR-220)
 /// ```
 ///
 /// `visible_namespaces` is consumed by OSS dispatch to widen the DEFAULT
@@ -396,6 +421,15 @@ pub struct ActorConfig {
     /// read. Valid without `id`. Defaults to `false`.
     #[serde(default)]
     pub require_attributed: bool,
+
+    /// The name of this caller's computer (ADR-220). Required exactly when a
+    /// `[computer]` table is present, and equal to its `name`: either one
+    /// without the other fails startup. The field lives in this closed table
+    /// so that a build which predates `[computer]` but closes `[actor]`
+    /// refuses the file, instead of starting with the table ignored and the
+    /// command verbs dispatching on the store's machine.
+    #[serde(default)]
+    pub computer: Option<String>,
 }
 
 /// Built-in caller-enrollment policy configured by `[gate]`.
@@ -694,6 +728,107 @@ pub struct BlobSectionConfig {
     pub file_transfers: bool,
 }
 
+/// `[knowledge]` pack policy.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeSectionConfig {
+    /// Absolute directories `knowledge.import` may read from. A requested path is
+    /// resolved, symlinks included, before it is compared against the resolved
+    /// roots. Absent or empty refuses every import path.
+    #[serde(default)]
+    pub import_roots: Vec<std::path::PathBuf>,
+}
+
+/// Whether an `https://` remote entry names exactly one repository: a host and at
+/// least an owner and a repository segment, with no empty segment, wildcard, query or
+/// fragment. An entry matches only the repository it names, so an owner-level entry
+/// would admit nothing and a pattern would read as wider than it is; both are refused.
+fn names_one_repository(remote: &str) -> bool {
+    let Some(rest) = remote.strip_prefix("https://") else {
+        return false;
+    };
+    if rest.contains(['*', '?', '#', '[', ']']) {
+        return false;
+    }
+    let rest = rest.trim_end_matches('/');
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let mut segments = rest.split('/');
+    let host = segments.next().unwrap_or("");
+    let path: Vec<&str> = segments.collect();
+    !host.is_empty() && path.len() >= 2 && path.iter().all(|segment| !segment.is_empty())
+}
+
+/// Whether an entry carries userinfo (a user name, with or without a password)
+/// before its host. Read leniently, because the entry may be mistyped: whatever
+/// precedes the first `:` is dropped as a scheme unless it holds an `@` or a `/`,
+/// leading slashes and backslashes are dropped, and the authority runs to the
+/// first `/`, so a missing scheme, a one-slash scheme or a password holding `?`
+/// or `#` still counts.
+fn authority_carries_userinfo(remote: &str) -> bool {
+    let rest = match remote.split_once(':') {
+        Some((scheme, rest)) if !scheme.contains(['@', '/']) => rest,
+        _ => remote,
+    };
+    rest.trim_start_matches(['/', '\\'])
+        .split('/')
+        .next()
+        .is_some_and(|authority| authority.contains('@'))
+}
+
+/// An entry as a refusal may quote it: an entry holding an `@` may carry a
+/// credential the userinfo reading did not recognise, so it is described rather
+/// than quoted.
+fn quoted_remote(remote: &str) -> String {
+    if remote.contains('@') {
+        "an entry holding '@'".to_owned()
+    } else {
+        format!("{remote:?}")
+    }
+}
+
+/// `[git_digest]` policy: the sources `git.digest` may read. Absent or empty
+/// lists refuse every source of that kind.
+///
+/// ```toml
+/// [git_digest]
+/// local_roots = ["/srv/repos"]
+/// remotes = ["https://github.com/example/repo"]
+/// ```
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitDigestSectionConfig {
+    /// Absolute directories a local source may resolve under, symlinks included.
+    #[serde(default)]
+    pub local_roots: Vec<std::path::PathBuf>,
+    /// `https://` repositories a remote source may name, compared after the
+    /// trailing `/` and `.git` are removed and the host is lowercased.
+    #[serde(default)]
+    pub remotes: Vec<String>,
+}
+
+/// `[code_ingest]` policy: the directories `code.ingest` may read and write a
+/// map database under. Absent or empty refuses every path.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodeIngestSectionConfig {
+    /// Absolute directories; a source path and an explicit `db` must resolve,
+    /// symlinks included, under one of them.
+    #[serde(default)]
+    pub roots: Vec<std::path::PathBuf>,
+}
+
+impl KnowledgeSectionConfig {
+    /// The configured roots that resolve to existing directories, resolved. A root
+    /// that does not resolve admits nothing.
+    pub fn resolved_import_roots(&self) -> Vec<std::path::PathBuf> {
+        self.import_roots
+            .iter()
+            .filter_map(|root| std::fs::canonicalize(root).ok())
+            .filter(|root| root.is_dir())
+            .collect()
+    }
+}
+
 /// `[storage]` section in `khive.toml`. Holds storage-layer config not
 /// already covered by `[[backends]]` (ADR-028). Unknown fields are rejected
 /// so an unsupported database selector cannot silently select the default store.
@@ -719,22 +854,44 @@ pub struct BrainSectionConfig {
 
 // ---- git-write policy (ADR-108 Amendment) ----
 
+/// What an allowlisted repository row lets the git verbs do (ADR-108 Amendment 2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitRepoAccess {
+    /// Only the verbs that change neither the repository nor its remote.
+    Read,
+    /// Every verb, writes limited to the row's branch patterns. The default,
+    /// so a row written before this field existed keeps its meaning.
+    #[default]
+    Write,
+}
+
 /// One `[[git_write.allowed]]` entry: a repo this operator has declared
-/// trusted for khive-mediated git writes, plus the branches on it a write
-/// verb (`git.commit`/`git.branch`/`git.update_ref`/`git.push`) may target.
+/// trusted for khive-mediated git work. A write row names the branches a
+/// write verb (`git.commit`/`git.branch`/`git.update_ref`/`git.push`) may
+/// target; a read row (`access = "read"`) names none and admits only the verbs
+/// that change neither the repository nor its remote.
 ///
 /// ```toml
 /// [[git_write.allowed]]
 /// repo = "/abs/path/repo"
 /// branches = ["feat/*", "fix/*"]
+///
+/// [[git_write.allowed]]
+/// repo = "/abs/path/other"
+/// access = "read"
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitWriteEntryConfig {
     /// Absolute local path to the allowlisted repository.
     pub repo: String,
-    /// Non-empty list of exact branch names or single-`*`-wildcard globs
-    /// this repo entry permits writes against.
+    /// Exact branch names or single-`*`-wildcard globs this repo entry
+    /// permits writes against: non-empty on a write row, empty on a read row.
+    #[serde(default)]
     pub branches: Vec<String>,
+    /// What the row admits; `write` when absent.
+    #[serde(default)]
+    pub access: GitRepoAccess,
 }
 
 /// `[git_write]` section — the closed repo/branch allowlist consulted by
@@ -782,6 +939,19 @@ pub struct GitWriteRepositoryConfig {
     /// default) refuses neither.
     #[serde(default)]
     pub merge_refusals: Vec<String>,
+    /// The commit identity `git.commit` uses in this repository (ADR-182 Amendment 20). When
+    /// present it replaces the calling actor's name and email as author and committer; the
+    /// actor's row still authorizes the call, and pushes still present the actor's credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<GitWriteAuthorConfig>,
+}
+
+/// A repository's own commit identity (ADR-182 Amendment 20).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitWriteAuthorConfig {
+    pub name: String,
+    pub email: String,
 }
 
 impl GitWriteRepositoryConfig {
@@ -904,6 +1074,22 @@ impl GitWriteSectionConfig {
                     return Err(invalid(&key, "entries must not repeat"));
                 }
                 seen.push(entry);
+            }
+            if let Some(author) = &repository.author {
+                // The same rule the commit applies to an actor's identity, checked at load so a
+                // bad row refuses at startup rather than at the first commit.
+                let invalid_value = |value: &str| {
+                    value.trim().is_empty()
+                        || value
+                            .chars()
+                            .any(|c| c.is_control() || matches!(c, '<' | '>'))
+                };
+                if invalid_value(&author.name) || invalid_value(&author.email) {
+                    return Err(invalid(
+                        &format!("repositories.{path}.author"),
+                        "name and email must be non-empty and hold no control character or angle bracket",
+                    ));
+                }
             }
         }
         // The default keychain program is Unix-only. Legacy configurations with
@@ -1047,6 +1233,11 @@ pub struct ExecSectionConfig {
     pub root: Option<String>,
     #[serde(default)]
     pub read_roots: Vec<String>,
+    /// Directories every run may read, write and load code from, kept between
+    /// runs and never captured into a run's output tree (a compiler's package
+    /// cache and build output). Absolute, outside `root`.
+    #[serde(default)]
+    pub cache_roots: Vec<String>,
     #[serde(default)]
     pub env: Vec<String>,
     #[serde(default)]
@@ -1064,6 +1255,46 @@ pub struct ExecSectionConfig {
     pub keep: bool,
     #[serde(default)]
     pub limits: ExecLimitsConfig,
+    /// Additions to the sandbox for the runs of one registered tool each
+    /// (`[[exec.tool_profiles]]`). Empty by default.
+    #[serde(default)]
+    pub tool_profiles: Vec<ExecToolProfileConfig>,
+}
+
+/// What the runs of one registered tool get on top of the sandbox every run
+/// has. Each field is off or empty unless set, and a tool with no entry runs
+/// under the unchanged sandbox.
+///
+/// ```toml
+/// [[exec.tool_profiles]]
+/// tool = "sh-gpu"
+/// metal = true
+/// files = ["/tmp/gpu-test.lock"]
+/// list_dirs = ["/Volumes/work"]
+/// ```
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecToolProfileConfig {
+    /// The registered tool's name, exactly.
+    pub tool: String,
+    /// The Metal GPU device, the system shader compiler and Metal's own
+    /// per-user shader cache folder.
+    #[serde(default)]
+    pub metal: bool,
+    /// Accepted and adds no rule. Every run may already bind and connect
+    /// unix-domain sockets under its run directory and its own temporary
+    /// directory, which is the one socket rule. The key still loads so a
+    /// configuration that sets it keeps working, and `exec.identity` names
+    /// it under the profile's `superseded_keys`.
+    #[serde(default)]
+    pub unix_sockets: bool,
+    /// Exact files, absolute, that a run may read, create and write.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Exact directories, absolute, that a run may open and list. Nothing
+    /// below them is granted.
+    #[serde(default)]
+    pub list_dirs: Vec<String>,
 }
 
 pub const DEFAULT_EXEC_BINARY_DIGEST_TIMEOUT_S: u64 = 10;
@@ -1437,7 +1668,7 @@ where
 /// - `[actor]`: default namespace / identity (OSS actor model)
 /// - `[gate]`: built-in caller enrollment
 /// - `[schema]`: explicit import unknown-entity-kind admission
-/// - `[embed].batch_size`: explicit reindex batch size
+/// - `[embed]`: validated policy, explicit reindex batch size and legacy diagnostics
 /// - `[runtime]`: runtime knobs (pack selection, brain profile, output format)
 /// - `[brain]`: actor read policy
 /// - `[telemetry]`: stream and channel carrier policy
@@ -1446,9 +1677,12 @@ where
 /// - `code_map_root` and `[[code_maps]]`: registered code maps (ADR-139)
 /// - `[display]`: rendering timezone (ADR-169)
 /// - `[blob]`: server-local file-transfer opt-in
+/// - `[knowledge]`: directories `knowledge.import` may read
+/// - `[git_digest]`: sources `git.digest` may read
+/// - `[code_ingest]`: directories `code.ingest` may read and write under
 ///
 /// Unknown top-level keys are silently ignored by serde for forward
-/// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, and `[telemetry]` tables are closed
+/// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, `[knowledge]`, `[git_digest]`, `[code_ingest]`, `[telemetry]`, `[computer]` and `[share]` tables are closed
 /// with `deny_unknown_fields` so a misspelled policy key always fails startup.
 /// `[storage]`, `[[backends]]` entries and `[exec]` are also closed so unknown
 /// destination keys cannot be silently dropped, as are `[web]` and `[[mounts]]` entries.
@@ -1458,7 +1692,7 @@ pub struct KhiveConfig {
     #[serde(default)]
     pub schema: SchemaSectionConfig,
 
-    /// Explicit reindex batch size; automatic embedding settings remain separate.
+    /// Validated declarations; automatic and field-selection execution is host-owned.
     #[serde(default, deserialize_with = "embed_batch::deserialize_table")]
     pub embed: EmbedSectionConfig,
 
@@ -1469,10 +1703,10 @@ pub struct KhiveConfig {
     #[serde(skip)]
     pub visibility_receipts: Option<crate::credentials::VisibilityReceiptConfig>,
 
-    /// `[channel]` section. A `[channel.node]` table is accepted so an existing
-    /// config file keeps loading; its contents are not interpreted.
+    /// Opaque `[channel.*]` values. Registered components validate their own
+    /// values at activation; unregistered values remain stored without effect.
     #[serde(default)]
-    pub channel: crate::node_config::ChannelSectionConfig,
+    pub channel: crate::channel_section::ChannelSectionConfig,
 
     #[serde(default)]
     pub mounts: Vec<crate::mount_config::MountConfig>,
@@ -1552,6 +1786,18 @@ pub struct KhiveConfig {
     #[serde(default)]
     pub blob: BlobSectionConfig,
 
+    /// Knowledge-pack policy: the directories `knowledge.import` may read.
+    #[serde(default)]
+    pub knowledge: KnowledgeSectionConfig,
+
+    /// The local roots and remote repositories `git.digest` may read.
+    #[serde(default)]
+    pub git_digest: GitDigestSectionConfig,
+
+    /// The directories `code.ingest` may read and write a map database under.
+    #[serde(default)]
+    pub code_ingest: CodeIngestSectionConfig,
+
     /// Storage-layer config not covered by `[[backends]]` (ADR-111
     /// Amendment 2: `[storage.blob]`'s `fs`/`s3` selector).
     #[serde(default)]
@@ -1578,6 +1824,19 @@ pub struct KhiveConfig {
     /// allowlist configured).
     #[serde(default)]
     pub web: WebSectionConfig,
+
+    /// The caller's computer (ADR-220). Absent leaves every pack on the
+    /// store's machine; present routes `packs` to that computer. Read only by
+    /// the process that resolved this file, and not part of the daemon's
+    /// configuration id: the daemon never routes.
+    #[serde(default)]
+    pub computer: Option<ComputerSectionConfig>,
+
+    /// What `bridge.share` may send and where (ADR-220 Amendment 1). Absent
+    /// refuses every share. Read only by the process that resolved this
+    /// file, like `computer`, and not part of the daemon's configuration id.
+    #[serde(default)]
+    pub share: Option<ShareSectionConfig>,
 }
 
 /// `[runtime]` section in `khive.toml`.
@@ -1712,6 +1971,11 @@ impl KhiveConfig {
         let (embed, unknown_embed_keys) = embed_batch::parse(&raw, &document, &diagnostic_path)?;
         let engines_declared = peers::normalize_engine_input(&mut document, &diagnostic_path)
             .map_err(|error| error.in_file(&diagnostic_path))?;
+        // Keep the validated original-order embed parse. Detached TOML tables
+        // can reorder unknown keys into the reserved datetime-marker position.
+        if let Some(table) = document.as_table_mut() {
+            table.remove("embed");
+        }
         let mut cfg: KhiveConfig = document.try_into().map_err(|source| ConfigError::Parse {
             path: diagnostic_path.clone(),
             source,
@@ -1979,6 +2243,82 @@ impl KhiveConfig {
             return Err(ConfigError::BlobS3FeatureDisabled);
         }
 
+        if let Some(root) = self
+            .knowledge
+            .import_roots
+            .iter()
+            .find(|root| !root.is_absolute())
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "knowledge.import_roots".to_owned(),
+                reason: format!("{root:?} is not an absolute path"),
+            });
+        }
+        if let Some(root) = self
+            .git_digest
+            .local_roots
+            .iter()
+            .find(|root| !root.is_absolute())
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "git_digest.local_roots".to_owned(),
+                reason: format!("{root:?} is not an absolute path"),
+            });
+        }
+        if let Some(root) = self
+            .code_ingest
+            .roots
+            .iter()
+            .find(|root| !root.is_absolute())
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "code_ingest.roots".to_owned(),
+                reason: format!("{root:?} is not an absolute path"),
+            });
+        }
+        // Checked before the refusals below, because those quote the entry: an
+        // entry carrying userinfo may hold a credential, so its refusal names the
+        // key and never the value.
+        if self
+            .git_digest
+            .remotes
+            .iter()
+            .any(|remote| authority_carries_userinfo(remote))
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "git_digest.remotes".to_owned(),
+                reason: "an entry carries a user name or password before its host; \
+                         list the repository URL without credentials"
+                    .to_owned(),
+            });
+        }
+        if let Some(remote) = self
+            .git_digest
+            .remotes
+            .iter()
+            .find(|remote| !remote.starts_with("https://"))
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "git_digest.remotes".to_owned(),
+                reason: format!("{} is not an https:// URL", quoted_remote(remote)),
+            });
+        }
+        if let Some(remote) = self
+            .git_digest
+            .remotes
+            .iter()
+            .find(|remote| !names_one_repository(remote))
+        {
+            return Err(ConfigError::InvalidRuntimeConfig {
+                key: "git_digest.remotes".to_owned(),
+                reason: format!(
+                    "{} does not name one repository: an entry is a full https://host/owner/repo URL, \
+                     never an owner, a host or a pattern",
+                    quoted_remote(remote)
+                ),
+            });
+        }
+
         let warm = self
             .runtime
             .warm_concurrency
@@ -2011,6 +2351,13 @@ impl KhiveConfig {
         self.git_write.validate_dev_loop()?;
         self.telemetry.validate()?;
         self.web.validate()?;
+        if let Some(computer) = &self.computer {
+            computer.validate()?;
+        }
+        computer::validate_actor_computer(self.computer.as_ref(), self.actor.computer.as_deref())?;
+        if let Some(share) = &self.share {
+            share.validate()?;
+        }
         crate::credentials::CredentialConfig::validate_all(&self.credentials)?;
         if let Some(receipts) = &self.visibility_receipts {
             receipts.validate(&self.credentials)?;
@@ -2317,11 +2664,13 @@ impl KhiveConfig {
         }
 
         // Validate [[git_write.allowed]] entries (ADR-108 Amendment): each
-        // repo must be a non-empty absolute path, and each entry must carry
-        // at least one branch pattern — an entry with an empty `branches`
-        // list would silently allowlist a repo for no branch at all, which
-        // reads as "configured" while behaving identically to "not
-        // allowlisted"; reject it loudly instead of leaving that trap.
+        // repo must be a non-empty absolute path, and each write entry must
+        // carry at least one branch pattern — a write entry with an empty
+        // `branches` list would silently allowlist a repo for no branch at all,
+        // which reads as "configured" while behaving identically to "not
+        // allowlisted"; reject it loudly instead of leaving that trap. A read
+        // entry names no branches (Amendment 2): a pattern on it would read as
+        // a write grant it does not give.
         for entry in &self.git_write.allowed {
             if entry.repo.trim().is_empty() {
                 return Err(ConfigError::InvalidGitWriteEntry {
@@ -2335,11 +2684,20 @@ impl KhiveConfig {
                     reason: "repo must be an absolute path".to_string(),
                 });
             }
-            if entry.branches.is_empty() {
-                return Err(ConfigError::InvalidGitWriteEntry {
-                    repo: entry.repo.clone(),
-                    reason: "branches must not be empty".to_string(),
-                });
+            match entry.access {
+                GitRepoAccess::Write if entry.branches.is_empty() => {
+                    return Err(ConfigError::InvalidGitWriteEntry {
+                        repo: entry.repo.clone(),
+                        reason: "branches must not be empty".to_string(),
+                    });
+                }
+                GitRepoAccess::Read if !entry.branches.is_empty() => {
+                    return Err(ConfigError::InvalidGitWriteEntry {
+                        repo: entry.repo.clone(),
+                        reason: "a read entry names no branches".to_string(),
+                    });
+                }
+                _ => {}
             }
             if entry.branches.iter().any(|b| b.trim().is_empty()) {
                 return Err(ConfigError::InvalidGitWriteEntry {

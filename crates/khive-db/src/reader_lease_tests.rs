@@ -380,7 +380,7 @@ async fn reader_lease_parameter_reentry_cannot_remove_outer_progress_handler() {
         );
     }
 
-    // The exclusion is per lease, not a thread-wide ban on nested reads.
+    // A different lease also refuses nesting without disarming the outer read.
     let dir = tempfile::tempdir().unwrap();
     let pool = ConnectionPool::new(PoolConfig {
         path: Some(dir.path().join("separate-readers.db")),
@@ -392,20 +392,58 @@ async fn reader_lease_parameter_reentry_cannot_remove_outer_progress_handler() {
     let outer = pool.reader().unwrap();
     let inner = pool.reader().unwrap();
     let outcome = RefCell::new(None);
+    let (tx, rx) = tokio::sync::watch::channel(false);
     let parameter = NestedReadParameter {
         lease: &inner,
         outcome: &outcome,
-        cancellation: None,
+        cancellation: Some(&tx),
     };
-    assert_eq!(
-        outer
-            .query_row("SELECT ?1", rusqlite::params![parameter], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap(),
-        0
+    let mapper_called = Cell::new(false);
+    let progress = Arc::new(AtomicUsize::new(0));
+    let stopped = Arc::new(crate::read_cancellation::DiagnosticGraphTestProbe::default());
+    stopped.armed.store(true, Ordering::Release);
+    stopped.release.store(true, Ordering::Release);
+    let result = crate::read_cancellation::scope_test_diagnostic_graph_probe(
+        Arc::clone(&stopped),
+        crate::scope_test_read_progress(
+            Arc::clone(&progress),
+            crate::scope_request_read_cancellation(rx, async {
+                outer.query_row(
+                    "WITH RECURSIVE n(x) AS (VALUES(?1) UNION ALL \
+                     SELECT x+1 FROM n WHERE x<10000) SELECT sum(x) FROM n",
+                    rusqlite::params![parameter],
+                    |row| {
+                        mapper_called.set(true);
+                        row.get::<_, i64>(0)
+                    },
+                )
+            }),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(outcome.take().unwrap(), Err(SqliteError::RequestReadStopped(StorageError::Internal(message)))
+            if message.contains("nested SQLite read registration"))
     );
-    assert_eq!(outcome.take().unwrap().unwrap(), 17);
+    assert_stopped(result);
+    assert!(progress.load(Ordering::Acquire) > 0);
+    assert!(
+        stopped.progress_returned_stop.load(Ordering::Acquire),
+        "the outer progress handler must return stop"
+    );
+    assert!(
+        !mapper_called.get(),
+        "the outer SQL must stop while stepping, before its mapper"
+    );
+    for lease in [&outer, &inner] {
+        assert_eq!(
+            lease
+                .query_row("SELECT 19", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            19,
+            "both leases must remain reusable after the refused nesting"
+        );
+    }
 }
 
 /// `docs/api/pool.md` states that an already cancelled or expired request never enters the

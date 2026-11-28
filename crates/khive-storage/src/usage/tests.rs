@@ -270,3 +270,63 @@ async fn native_evidence_preserves_unknown_event_accounting() {
         assert!(context.shipping_snapshot().is_none());
     }
 }
+
+#[tokio::test]
+async fn commit_reply_loss_suppresses_usage_but_not_known_refusals() {
+    for with_evidence in [false, true] {
+        let context = UsageContext::new();
+        let error = crate::StorageError::WriteOutcomeUnknown {
+            source: Box::new(std::io::Error::other("lost COMMIT reply")),
+        };
+        let error = if with_evidence {
+            error.with_sqlite_write_failure(crate::error::SqliteWriteFailure {
+                stage: crate::error::SqliteWriteStage::Commit,
+                primary_code: 10,
+                extended_code: 1034,
+                settlement_unknown: false,
+            })
+        } else {
+            error
+        };
+        scope(context.clone(), async {
+            account_event_write(Ok(1));
+            context.freeze();
+            account_event_write(Err(&error));
+        })
+        .await;
+        assert_eq!(context.snapshot()["event_rows"], 1);
+        assert!(
+            context.shipping_snapshot().is_none(),
+            "lost COMMIT reply must suppress even a previously frozen usage snapshot"
+        );
+    }
+    for error in [
+        crate::StorageError::WriterRouteViolation {
+            operation: "append".into(),
+        },
+        crate::StorageError::WriterOwnerUnavailable {
+            operation: "append".into(),
+            source: Box::new(crate::StorageError::WriterTaskNoRuntime),
+        },
+        crate::StorageError::WriterTaskRequestFailed {
+            request_state: crate::WriterTaskRequestState::TransactionRolledBack,
+            source: Box::new(crate::StorageError::WriteOutcomeUnknown {
+                source: Box::new(std::io::Error::other(
+                    "inner cause cannot override rollback",
+                )),
+            }),
+        },
+    ] {
+        let context = UsageContext::new();
+        scope(context.clone(), async {
+            account_event_write(Ok(1));
+            account_event_write(Err(&error));
+        })
+        .await;
+        assert_eq!(
+            context.shipping_snapshot(),
+            Some(serde_json::json!({"event_rows":1})),
+            "known NotStarted/rollback must retain measured usage"
+        );
+    }
+}

@@ -208,8 +208,12 @@ async fn the_profile_verb_serves_a_snapshot_the_signal_path_never_wrote() {
         );
         serde_json::to_value(state.balanced_recall.to_snapshot()).expect("live state")
     };
+    let token = pack
+        .runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("local token");
     let value = pack
-        .handle_profile(json!({ "profile_id": "balanced-recall-v1" }))
+        .handle_profile(&token, json!({ "profile_id": "balanced-recall-v1" }))
         .await
         .expect("brain.profile must answer");
     assert_eq!(value["state_snapshot"], expected);

@@ -1,7 +1,7 @@
 use super::super::StorageBackend;
 use super::map_open_error;
 use async_trait::async_trait;
-use khive_storage::entity::{Entity, EntityFilter, EntityStore, EntityTypeCounts};
+use khive_storage::entity::{Entity, EntityFilter, EntityKeyHolder, EntityStore, EntityTypeCounts};
 use khive_storage::{
     Attachment, BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage,
     StorageCapability, StorageResult,
@@ -133,6 +133,25 @@ impl EntityStore for StorageBackend {
         self.entities()
             .map_err(|error| map_open_error(error, StorageCapability::Entities, "entities"))?
             .get_entity_including_deleted(id)
+            .await
+    }
+
+    async fn get_entity_by_key(
+        &self,
+        namespace: &str,
+        kind: &str,
+        key: &str,
+    ) -> StorageResult<Option<Entity>> {
+        self.entities()
+            .map_err(|error| map_open_error(error, StorageCapability::Entities, "entities"))?
+            .get_entity_by_key(namespace, kind, key)
+            .await
+    }
+
+    async fn taken_entity_keys(&self, id: Uuid) -> StorageResult<Vec<EntityKeyHolder>> {
+        self.entities()
+            .map_err(|error| map_open_error(error, StorageCapability::Entities, "entities"))?
+            .taken_entity_keys(id)
             .await
     }
 }

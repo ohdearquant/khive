@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use super::manifest::{digest_to_hex, scoped_digest, ManifestSnapshot, RuntimeFieldScope};
 use super::outcome::{FinalizerOutcome, ManifestFault};
+use crate::secret_gate::property_context::PropertyContext;
 use crate::{EventAttribution, NamespaceToken, RuntimeError, RuntimeResult};
 
 #[cfg(test)]
@@ -114,11 +115,8 @@ impl EntityCandidateContext {
     pub fn check_properties(&self, properties: Option<&Value>) -> RuntimeResult<()> {
         crate::secret_gate::reject_reserved_secret_gate_property(properties)?;
         if let Some(value) = properties {
-            let mut values = Vec::new();
-            property_strings(value, &mut values);
-            for value in values {
-                self.check_value(RuntimeFieldScope::JsonProperties, value)?;
-            }
+            let mut found = None;
+            scan_properties(self, value, &mut found)?;
         }
         Ok(())
     }
@@ -298,6 +296,7 @@ fn admit(
         field_scope: match scope {
             RuntimeFieldScope::NameDescription => "name-description",
             RuntimeFieldScope::JsonProperties => "json-properties",
+            RuntimeFieldScope::JsonPropertiesContextV2 => "json-properties-context-v2",
             RuntimeFieldScope::Tags => "tags",
             RuntimeFieldScope::RecordContent => "record-content",
             RuntimeFieldScope::CodeSource => "code-source",
@@ -334,70 +333,100 @@ fn scan_candidate(
         crate::secret_gate::check_tags_at(&entity.tags, &context.record, "tags")?;
         return Ok(None);
     }
-    let mut values = vec![(
+    let mut found = None;
+    scan_scalar(
+        context,
         RuntimeFieldScope::NameDescription,
-        entity.name.as_str(),
+        &entity.name,
         "name",
-    )];
+        &mut found,
+    )?;
     if let Some(description) = &entity.description {
-        values.push((
+        scan_scalar(
+            context,
             RuntimeFieldScope::NameDescription,
             description,
             "description",
-        ));
+            &mut found,
+        )?;
     }
     if let Some(properties) = &entity.properties {
-        let mut leaves = Vec::new();
-        property_strings(properties, &mut leaves);
-        values.extend(
-            leaves
-                .into_iter()
-                .map(|value| (RuntimeFieldScope::JsonProperties, value, "properties")),
-        );
+        scan_properties(context, properties, &mut found)?;
     }
-    values.extend(
-        entity
-            .tags
-            .iter()
-            .map(|value| (RuntimeFieldScope::Tags, value.as_str(), "tags")),
-    );
-    let mut found: Option<CandidateMatch> = None;
-    for (scope, value, field) in values {
-        if let Some(meta) = context.snapshot.lookup(scope, value) {
-            let digest = digest_to_hex(&scoped_digest(scope, value));
-            if found.as_ref().is_some_and(|(old_scope, old_digest, _)| {
-                *old_scope != scope || *old_digest != digest
-            }) {
-                observe(
-                    &entity.namespace,
-                    FinalizerOutcome::ManifestInvalid(ManifestFault::MultipleMatches),
-                );
-                return Err(RuntimeError::InvalidInput(
-                    "secret-gate manifest has multiple candidate matches".into(),
-                ));
-            }
-            found = Some((scope, digest, meta.overridden_detector.clone()));
-        } else {
-            crate::secret_gate::check_at(value, &context.record, field)?;
-        }
+    for tag in &entity.tags {
+        scan_scalar(context, RuntimeFieldScope::Tags, tag, "tags", &mut found)?;
     }
     Ok(found)
 }
 
-fn property_strings<'a>(value: &'a Value, values: &mut Vec<&'a str>) {
-    match value {
-        Value::String(value) => values.push(value),
-        Value::Array(array) => array
-            .iter()
-            .for_each(|value| property_strings(value, values)),
-        Value::Object(object) => {
-            for (key, value) in object {
-                values.push(key);
-                property_strings(value, values);
-            }
-        }
-        _ => {}
+fn add_match(
+    context: &EntityCandidateContext,
+    found: &mut Option<CandidateMatch>,
+    scope: RuntimeFieldScope,
+    digest: String,
+    detector: &str,
+) -> RuntimeResult<()> {
+    if found
+        .as_ref()
+        .is_some_and(|(old_scope, old_digest, _)| *old_scope != scope || *old_digest != digest)
+    {
+        observe(
+            &context.namespace,
+            FinalizerOutcome::ManifestInvalid(ManifestFault::MultipleMatches),
+        );
+        return Err(RuntimeError::InvalidInput(
+            "secret-gate manifest has multiple candidate matches".into(),
+        ));
     }
+    *found = Some((scope, digest, detector.into()));
+    Ok(())
+}
+
+fn scan_scalar(
+    context: &EntityCandidateContext,
+    scope: RuntimeFieldScope,
+    value: &str,
+    field: &str,
+    found: &mut Option<CandidateMatch>,
+) -> RuntimeResult<()> {
+    if let Some(meta) = context.snapshot.lookup(scope, value) {
+        add_match(
+            context,
+            found,
+            scope,
+            digest_to_hex(&scoped_digest(scope, value)),
+            &meta.overridden_detector,
+        )
+    } else {
+        crate::secret_gate::check_at(value, &context.record, field)
+    }
+}
+
+fn scan_properties(
+    context: &EntityCandidateContext,
+    properties: &Value,
+    found: &mut Option<CandidateMatch>,
+) -> RuntimeResult<()> {
+    let properties = PropertyContext::new(properties)?;
+    for scanned in properties.scan_atoms()? {
+        let scanned = scanned?;
+        if let Some(meta) = context.snapshot.lookup_property(scanned.atom) {
+            add_match(
+                context,
+                found,
+                RuntimeFieldScope::JsonPropertiesContextV2,
+                digest_to_hex(scanned.atom.digest()),
+                &meta.overridden_detector,
+            )?;
+        } else if let Some(matched) = scanned.matches.into_iter().next() {
+            return crate::secret_gate::locate(
+                Err(RuntimeError::SecretDetected(matched)),
+                &context.record,
+                "properties",
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn observe(namespace: &str, outcome: FinalizerOutcome) {

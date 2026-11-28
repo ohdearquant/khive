@@ -76,7 +76,7 @@ batching path intact.
    `rename(2)` calls, so a reader never observes a mix of old and new
    files — at every instant the cache dir is either the complete old
    directory, briefly absent, or the complete new directory.
-7. `meta.json` records `fetched_at`, `git_ref`, `commit_sha`, `content_hash`
+7. `meta.json` records `fetched_at`, `git_ref`, `commit_sha`, `content_hash`, `coverage`
    — written even when no pin is present, for auditability.
 
 The remote archive conversion retains edge properties and both timestamps. Edge

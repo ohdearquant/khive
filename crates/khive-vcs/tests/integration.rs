@@ -36,6 +36,8 @@ fn make_archive(namespace: &str) -> KgArchive {
 fn make_entity(id: Uuid, name: &str) -> ExportedEntity {
     let now = Utc::now();
     ExportedEntity {
+        keys: Vec::new(),
+        aliases: Vec::new(),
         id,
         kind: "concept".into(),
         entity_type: None,
@@ -222,6 +224,8 @@ fn json_adapter_records_survive_entity_hash_pipeline() {
         namespace: "test".into(),
         exported_at: now,
         entities: vec![ExportedEntity {
+            keys: Vec::new(),
+            aliases: Vec::new(),
             id: entities[0].id,
             kind: entities[0].kind.clone(),
             entity_type: None,

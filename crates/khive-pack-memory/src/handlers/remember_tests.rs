@@ -959,33 +959,102 @@ fn properties_refuse_reserved_keys() {
     }
 }
 
-#[tokio::test]
-async fn remember_refuses_supersedes_property() {
+async fn remember_reserved_property_refusal(key: &str) -> String {
     let rt = with_receipt_credentials(KhiveRuntime::memory().expect("in-memory runtime"));
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
     builder.register(MemoryPack::new(rt));
     let registry = builder.build().expect("registry");
-    let target = uuid::Uuid::new_v4();
 
     let error = registry
         .dispatch(
             "memory.remember",
             serde_json::json!({
-                "content": "a replacement memory",
-                "properties": {"supersedes": target.to_string()}
+                "content": "memory with a reserved property",
+                "properties": single_entry(key, serde_json::json!("caller value"))
             }),
         )
         .await
-        .expect_err("memory.remember must refuse caller-supplied supersedes");
+        .expect_err("memory.remember must refuse caller-supplied reserved properties");
     let RuntimeError::InvalidInput(message) = error else {
         panic!("expected InvalidInput, got {error:?}");
     };
-    assert!(message.contains("\"supersedes\""), "{message}");
-    assert!(message.contains("memory.apply_batch"), "{message}");
+    assert!(message.contains(&format!("{key:?}")), "{message}");
+    assert!(message.contains("reserved"), "{message}");
+    message
+}
+
+#[tokio::test]
+async fn remember_refuses_memory_type_property_with_top_level_parameter() {
+    let message = remember_reserved_property_refusal("memory_type").await;
     assert!(
-        message.contains("link(relation=\"supersedes\")"),
+        message.contains("use the top-level memory_type parameter"),
         "{message}"
+    );
+}
+
+#[tokio::test]
+async fn remember_refuses_tags_property_with_top_level_parameter() {
+    let message = remember_reserved_property_refusal("tags").await;
+    assert!(
+        message.contains("use the top-level tags parameter"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn remember_refuses_attribution_property_with_runtime_guidance() {
+    let message = remember_reserved_property_refusal("attribution").await;
+    assert!(
+        message.contains("omit attribution; the runtime sets it for anonymous callers"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn remember_refuses_supersedes_property() {
+    let message = remember_reserved_property_refusal("supersedes").await;
+    assert!(
+        message.contains("memory.apply_batch row with action=\"supersede\""),
+        "{message}"
+    );
+    assert!(
+        message.contains("link(relation=\"supersedes\") from the new memory to the old memory"),
+        "{message}"
+    );
+}
+
+#[test]
+fn memory_guide_reserved_properties_match_handler() {
+    let guide = include_str!("../../../../docs/guide/memory.md");
+    let section = guide
+        .split_once("### Reserved properties\n")
+        .expect("reserved properties section")
+        .1
+        .split("\n### ")
+        .next()
+        .expect("reserved properties section body");
+    let mut documented: Vec<_> = section
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .map(|line| {
+            let cells: Vec<_> = line.split('|').map(str::trim).collect();
+            assert_eq!(cells.len(), 4, "two-column reserved property row: {line}");
+            (
+                cells[1].trim_matches('`').to_owned(),
+                cells[2].replace('`', ""),
+            )
+        })
+        .collect();
+    let mut expected: Vec<_> = super::RESERVED_PROPERTY_KEYS
+        .iter()
+        .map(|(key, replacement)| (key.to_string(), replacement.to_string()))
+        .collect();
+    documented.sort();
+    expected.sort();
+    assert_eq!(
+        documented, expected,
+        "guide reserved properties and replacements"
     );
 }
 

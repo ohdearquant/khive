@@ -404,17 +404,17 @@ enum MarkReadFailure {
 }
 
 /// Classify a mark-read storage error by its real variant, never by its
-/// display text. `SideEffectsUnknown` means the write was accepted before its
-/// execution seam terminated — the patch may already be committed, so it must
+/// display text. `SideEffectsUnknown` means the patch may already be committed
+/// even when the writer remains alive after losing its acknowledgement, so it must
 /// not be reported as a definite failure. Same match shape as
 /// `message::attach_outbound_id_to_ambiguous_write`'s dual-write classifier.
 fn classify_mark_read_error(error: &khive_storage::StorageError) -> MarkReadFailure {
-    match error.without_sqlite_write_stage() {
-        khive_storage::StorageError::WriterTaskTerminated {
-            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-            ..
-        } => MarkReadFailure::Unknown,
-        _ => MarkReadFailure::Failed,
+    if error.writer_request_state()
+        == Some(khive_storage::WriterTaskRequestState::SideEffectsUnknown)
+    {
+        MarkReadFailure::Unknown
+    } else {
+        MarkReadFailure::Failed
     }
 }
 
@@ -712,6 +712,68 @@ mod native_evidence_tests {
             } else {
                 assert_eq!(response["mark_error"], "no live row updated");
             }
+        }
+    }
+    #[test]
+    fn commit_reply_loss_keeps_mark_result_unknown_and_properties_unchanged() {
+        use khive_storage::{StorageError, WriterTaskRequestState};
+        for with_evidence in [false, true] {
+            let error = StorageError::WriteOutcomeUnknown {
+                source: Box::new(std::io::Error::other("lost COMMIT reply")),
+            };
+            let error = if with_evidence {
+                error.with_sqlite_write_failure(khive_storage::error::SqliteWriteFailure {
+                    stage: khive_storage::error::SqliteWriteStage::Commit,
+                    primary_code: 10,
+                    extended_code: 1034,
+                    settlement_unknown: false,
+                })
+            } else {
+                error
+            };
+            let original = json!({"read":false,"other":"retained"});
+            let response = read_response(
+                "short".into(),
+                Uuid::nil().to_string(),
+                Err(error),
+                Some(original.clone()),
+                Value::Null,
+            );
+            assert_eq!(
+                response["status"], "unknown",
+                "COMMIT reply loss must not claim a failed mark"
+            );
+            assert_eq!(response["read"], Value::Null);
+            assert_eq!(response["properties"], original);
+            let details = &response["mark_error_details"];
+            assert_eq!(details["code"], "write_outcome_unknown");
+            assert_eq!(details["request_state"], "side_effects_unknown");
+            assert_eq!(details["task_terminated"], false);
+            assert_eq!(details["domain_disposition"], "unknown");
+        }
+        for state in [
+            WriterTaskRequestState::NotStarted,
+            WriterTaskRequestState::TransactionRolledBack,
+        ] {
+            let error = StorageError::WriterTaskRequestFailed {
+                request_state: state,
+                source: Box::new(StorageError::WriteOutcomeUnknown {
+                    source: Box::new(std::io::Error::other("known outer finality")),
+                }),
+            };
+            let response = read_response(
+                "short".into(),
+                Uuid::nil().to_string(),
+                Err(error),
+                None,
+                Value::Null,
+            );
+            assert_eq!(response["status"], "failed");
+            assert_eq!(response["read"], false);
+            assert_eq!(
+                response["mark_error_details"]["domain_disposition"],
+                "not_committed"
+            );
         }
     }
 }

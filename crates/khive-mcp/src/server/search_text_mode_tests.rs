@@ -511,7 +511,7 @@ mod note_status_disclosure_tests {
     }
 
     impl khive_types::Pack for BrokenDisclosurePack {
-        const NAME: &'static str = "broken-search-disclosure";
+        const NAME: &'static str = "kg";
         const NOTE_KINDS: &'static [&'static str] = &[];
         const ENTITY_KINDS: &'static [&'static str] = &[];
         const HANDLERS: &'static [khive_runtime::HandlerDef] =
@@ -521,7 +521,7 @@ mod note_status_disclosure_tests {
     #[async_trait::async_trait]
     impl khive_runtime::PackRuntime for BrokenDisclosurePack {
         fn name(&self) -> &str {
-            "broken-search-disclosure"
+            "kg"
         }
         fn note_kinds(&self) -> &'static [&'static str] {
             &[]

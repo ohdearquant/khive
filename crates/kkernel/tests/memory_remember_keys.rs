@@ -98,6 +98,7 @@ impl Fixture {
         let root = tempfile::Builder::new()
             .prefix("memory-keys-")
             .tempdir_in("/tmp")
+            .or_else(|_| tempfile::Builder::new().prefix("memory-keys-").tempdir())
             .expect("short isolated socket directory");
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir_all(root.path().join("home")).unwrap();

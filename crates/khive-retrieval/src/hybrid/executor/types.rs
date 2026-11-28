@@ -17,7 +17,8 @@ pub struct SearchScope<'a, F: ?Sized> {
 
 /// The vector adapter's existing query representation.
 pub enum VectorInput<'a> {
-    /// Let the adapter embed this text.
+    /// Input to a [`VectorGroupPreparer`], never passed to the search interpreter.
+    /// A selected text-vector input without a preparer is refused after operator resolution.
     Text(&'a str),
     /// Use an already prepared embedding.
     Embedding(&'a [f32]),
@@ -291,7 +292,7 @@ pub struct ExecutorRequest<'a, A: ExecutorArm + ?Sized> {
     pub max_in_flight: NonZeroUsize,
     /// Vector slots in increasing original plan order; every vector input belongs here.
     pub vector_slots: &'a [usize],
-    /// Optional embedding barrier. `None` preserves each arm's existing input.
+    /// Optional embedding barrier. Without one, selected vector inputs must be embeddings.
     pub vector_preparer: Option<
         &'a dyn VectorGroupPreparer<Filter = A::Filter, Evidence = A::Evidence, Error = A::Error>,
     >,
@@ -303,6 +304,8 @@ pub struct ExecutorRequest<'a, A: ExecutorArm + ?Sized> {
 
 /// Bounded final results plus raw evidence in original plan order.
 pub struct ExecutorOutcome<I, L, D, T, E> {
+    /// Exact consumed candidate tree, excluding caller eligibility/hydration phases.
+    pub plan: crate::QueryNode,
     /// Hydrated and ranked results after the final cut.
     pub hits: Vec<HydratedHit<I, L, T>>,
     /// Raw arm accounting.
@@ -315,6 +318,13 @@ pub struct ExecutorOutcome<I, L, D, T, E> {
 pub enum ExecutorError<E, D> {
     /// Invalid plan shape or bound.
     Invalid(&'static str),
+    /// A selected text-vector input has no embedding preparer.
+    MissingVectorPreparer {
+        /// Original arm slot.
+        slot: usize,
+    },
+    /// IR fusion parameters violated the existing strategy contract.
+    StrategyValidation(khive_fusion::FusionStrategyError),
     /// Cancellation or the inherited absolute deadline stopped the request.
     RequestStopped(StorageError),
     /// An intolerable arm error at its original slot.
@@ -341,6 +351,12 @@ pub enum ExecutorError<E, D> {
     FusionResolution(E),
     /// The resolved fusion operation failed.
     Fusion(E),
+    /// Reranker resolution failed before provider work.
+    RerankResolution(E),
+    /// Typed metadata access failed during filtering.
+    Metadata(E),
+    /// The resolved reranker failed.
+    Rerank(E),
     /// Post-fusion hydration or ranking failed.
     Hydration(E),
     /// A provider or callback violated a bound or identity contract.

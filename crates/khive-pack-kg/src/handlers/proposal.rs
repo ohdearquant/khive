@@ -85,6 +85,8 @@ fn reject_reserved_changeset_properties(changeset: &ProposalChangeset) -> Result
             Ok(())
         }
         ProposalChangeset::AddEdge { .. }
+        | ProposalChangeset::RetireEdge { .. }
+        | ProposalChangeset::SupersedeEdge { .. }
         | ProposalChangeset::MergeEntities { .. }
         | ProposalChangeset::SupersedeEntity { .. } => Ok(()),
     }
@@ -237,6 +239,9 @@ impl KgPack {
             })?;
         crate::canonical_apply::validate_proposal(&changeset, registry)?;
         reject_reserved_changeset_properties(&changeset)?;
+        crate::apply_worker::ProposalApplyWorker::new(self.runtime.clone())
+            .validate_supersede_entity_preconditions(token, &changeset)
+            .await?;
         if has_multi_step_compound(&changeset) {
             return Err(RuntimeError::InvalidInput(
                 "multi-step Compound proposals are not supported until atomic proposal apply is available"
@@ -672,3 +677,7 @@ mod reservation_tests;
 #[cfg(test)]
 #[path = "proposal_cleanup_tests.rs"]
 mod cleanup_tests;
+
+#[cfg(test)]
+#[path = "proposal_entity_precondition_tests.rs"]
+mod entity_precondition_tests;
