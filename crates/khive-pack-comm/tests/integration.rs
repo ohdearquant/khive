@@ -17699,3 +17699,6 @@ mod transport_status_tests {
         }
     }
 }
+
+#[path = "integration/quarantine_visibility.rs"]
+mod quarantine_visibility;

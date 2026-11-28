@@ -239,6 +239,7 @@ impl KhiveRuntime {
         let mailbox_view = crate::MailboxView {
             actor_id: token.actor().id.clone(),
             delegated: false,
+            maintainer_actor: self.config().actor_id.clone().filter(|id| !id.is_empty()),
         };
         let mut alive_notes: HashMap<Uuid, Note> = HashMap::new();
         // Fused candidate IDs and the batched identity read each contain one row per note.

@@ -54,13 +54,12 @@ impl ThreadRow {
     }
 }
 
-/// The selected note and the rows retained in a thread use the same mailbox view.
-fn thread_note_visible(
-    note: &Note,
-    actor_id: &str,
-    delegated: bool,
-    inherits_legacy_pool: bool,
-) -> bool {
+/// The root, ID cursor, and retained rows use the same mailbox view.
+fn thread_note_visible(note: &Note, view: &MailboxView, inherits_legacy_pool: bool) -> bool {
+    if let Some(admitted) = view.quarantine_override(note) {
+        return admitted;
+    }
+    let actor_id = view.actor_id.as_str();
     let props = note.properties.as_ref();
     let to_actor = props
         .and_then(|props| props.get("to_actor"))
@@ -68,7 +67,7 @@ fn thread_note_visible(
     let from_actor = props
         .and_then(|props| props.get("from_actor"))
         .and_then(Value::as_str);
-    if delegated {
+    if view.delegated {
         to_actor.is_some_and(|recipient| {
             is_valid_mailbox_actor_label(recipient)
                 && (from_actor == Some(actor_id) || recipient == actor_id)
@@ -113,11 +112,10 @@ fn fold_thread_note(
     canonical: &mut HashMap<Uuid, ThreadRow>,
     canonical_order: &mut Vec<Uuid>,
     note: Note,
-    actor_id: &str,
-    delegated: bool,
+    view: &MailboxView,
     inherits_legacy_pool: bool,
 ) {
-    if !thread_note_visible(&note, actor_id, delegated, inherits_legacy_pool) {
+    if !thread_note_visible(&note, view, inherits_legacy_pool) {
         return;
     }
 
@@ -186,7 +184,7 @@ pub(crate) async fn handle_thread(
             .ok_or_else(|| RuntimeError::NotFound("thread: message not found".into()))?;
 
         if note.namespace != token.namespace().as_str()
-            || !thread_note_visible(&note, &view.actor_id, view.delegated, inherits_legacy_pool)
+            || !thread_note_visible(&note, &view, inherits_legacy_pool)
         {
             return Err(RuntimeError::NotFound("thread: message not found".into()));
         }
@@ -235,7 +233,7 @@ pub(crate) async fn handle_thread(
             .into_iter()
             .map(SqlValue::Text)
             .collect();
-    let thread_filter = NoteFilter {
+    let mut thread_filter = NoteFilter {
         kind: Some("message".to_string()),
         property_filters: vec![PropertyFilter {
             json_path: "$.thread_id".to_string(),
@@ -245,6 +243,13 @@ pub(crate) async fn handle_thread(
         order_by: None,
         ..Default::default()
     };
+    if view.maintainer_actor.is_some()
+        && view.maintainer_actor.as_deref() != Some(view.actor_id.as_str())
+    {
+        thread_filter
+            .property_filters
+            .extend(non_quarantine_property_filters());
+    }
     let mut physical_cursor = None;
     let mut seen_row_ids = HashSet::new();
     loop {
@@ -281,8 +286,7 @@ pub(crate) async fn handle_thread(
                     &mut canonical,
                     &mut canonical_order,
                     note,
-                    &view.actor_id,
-                    view.delegated,
+                    &view,
                     inherits_legacy_pool,
                 );
             }
@@ -306,8 +310,7 @@ pub(crate) async fn handle_thread(
             &mut canonical,
             &mut canonical_order,
             root_note,
-            &view.actor_id,
-            view.delegated,
+            &view,
             inherits_legacy_pool,
         );
     }
@@ -347,12 +350,7 @@ pub(crate) async fn handle_thread(
                     .map_err(|e| RuntimeError::Internal(format!("thread: get_note (after): {e}")))?
                     .ok_or_else(|| invalid_after_cursor(raw))?;
                 if cursor_note.namespace != token.namespace().as_str()
-                    || !thread_note_visible(
-                        &cursor_note,
-                        &view.actor_id,
-                        view.delegated,
-                        inherits_legacy_pool,
-                    )
+                    || !thread_note_visible(&cursor_note, &view, inherits_legacy_pool)
                 {
                     return Err(invalid_after_cursor(raw));
                 }
