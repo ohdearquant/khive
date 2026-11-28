@@ -11,9 +11,12 @@ use std::time::{Duration, Instant};
 #[test]
 fn serve_entrypoints_do_not_start_components_before_ownership_or_in_client_roles() {
     for scenario in ["run-daemon", "server-daemon", "run-client", "server-client"] {
+        // /tmp keeps the socket path short; where /tmp is closed, as in a
+        // sandboxed run, the process's own temporary directory takes its place.
         let dir = tempfile::Builder::new()
             .prefix("kh-serve-")
             .tempdir_in("/tmp")
+            .or_else(|_| tempfile::Builder::new().prefix("kh-serve-").tempdir())
             .unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([

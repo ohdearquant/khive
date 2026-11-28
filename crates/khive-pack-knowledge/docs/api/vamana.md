@@ -98,7 +98,9 @@ The startup callers continue to await each claimed warm before advancing, while
 `ensure_ann_background` still spawns and returns immediately. `Ready` suppresses duplicate work;
 both empty and operational `Failed` outcomes may be retried by a later request. An explicit worker
 outcome keeps a failed Stale-rebuild replacement retryable even though ADR-079 rule 8 leaves its
-older bridge available to search. Search's bounded wait and FTS degradation timing are unchanged.
+older bridge available to search. When `comm.quiet` is active and the warm has yet to load the
+index, search takes its existing fallback immediately. Outside quiet, search waits a bounded time
+for the warm before falling back.
 
 `finish_warm`'s Ready decision (reading `AnnState::indexes` for the just-built bridge) and its
 publication into `warm_states` share one `indexes` read-lock critical section: the guard stays held

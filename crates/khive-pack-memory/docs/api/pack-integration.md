@@ -64,7 +64,7 @@ The memory pack exposes three parameters:
 
 `current_state` returns the pack's `BalancedRecallState`. `project_config` maps posterior means into a `RecallConfig`, preserving unrelated configuration. `apply_config` validates a projected configuration before replacing the active value, so tuning cannot install a negative or all-zero weight set.
 
-The three posterior domains correspond directly to the three recall weights. Serve-time projection for a named brain profile is request-local; applying a pack tuning artifact changes the pack's active default configuration.
+The three posterior domains correspond directly to the three recall weights. A named brain profile does not change the scoring weights of a request it serves: the projection of its posterior means is computed per request for the `profile_component` breakdown field only. Applying a pack tuning artifact changes the pack's active default configuration.
 
 ## Configuration concurrency
 

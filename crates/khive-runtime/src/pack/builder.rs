@@ -57,6 +57,13 @@ pub struct VerbRegistryBuilder {
     /// is a precise escape and is not widened by this set. A cloud gate may also
     /// consult the list as policy input at its own layer.
     visible_namespaces: Vec<Namespace>,
+    /// Operator-declared namespaces the configured actor owns (`[actor]
+    /// owned_namespaces`, ADR-021 Delta 1).
+    ///
+    /// Threads into `VerbRegistry::owned_namespaces` and is stamped onto every
+    /// token the registry mints. It is read by the `memory.apply_batch` old-row
+    /// namespace check alone: it grants no write and widens no read.
+    owned_namespaces: Vec<Namespace>,
     /// Configured actor identity label (ADR-057). When set, dispatch mints tokens
     /// carrying this actor so that `comm.inbox` filters by `to_actor`.
     actor_id: Option<String>,
@@ -99,6 +106,7 @@ impl VerbRegistryBuilder {
             gate: std::sync::Arc::new(AllowAllGate),
             default_namespace: Namespace::local().as_str().to_string(),
             visible_namespaces: vec![],
+            owned_namespaces: vec![],
             actor_id: None,
             event_store: None,
             runtime_event_store: None,
@@ -117,6 +125,13 @@ impl VerbRegistryBuilder {
         self
     }
 
+    /// The exact runtime bare-name allowlist, for the independent kkernel contract test.
+    #[cfg(any(test, feature = "test-internals"))]
+    #[doc(hidden)]
+    pub fn kg_substrate_verbs_for_test() -> &'static [&'static str] {
+        super::declaration_validation::KG_SUBSTRATE_VERBS
+    }
+
     /// Set the operator-configured read-visibility set (ADR-007 Rev 4 Rule 3b).
     ///
     /// On the default (no explicit `namespace=` param) dispatch path, reads fan
@@ -126,6 +141,18 @@ impl VerbRegistryBuilder {
     /// policy input at its own layer.
     pub fn with_visible_namespaces(&mut self, ns: Vec<Namespace>) -> &mut Self {
         self.visible_namespaces = ns;
+        self
+    }
+
+    /// Set the namespaces the configured actor declared it owns (ADR-021 Delta 1).
+    ///
+    /// Every token the registry mints carries this list, and the
+    /// `memory.apply_batch` old-row namespace check admits an old row in a listed
+    /// namespace like one in the caller's own namespace. Ownership grants no
+    /// write into the namespace and widens no read; `visible_namespaces` stays a
+    /// read-only grant. A per-request identity overrides this baked list.
+    pub fn with_owned_namespaces(&mut self, ns: Vec<Namespace>) -> &mut Self {
+        self.owned_namespaces = ns;
         self
     }
 
@@ -182,6 +209,12 @@ impl VerbRegistryBuilder {
             return Err(RuntimeError::InvalidInput(
                 "invalid mounted namespace registration".into(),
             ));
+        }
+        if pack.name() == "stream" {
+            return Err(RuntimeError::InvalidInput(format!(
+                "pack {:?} uses reserved mounted namespace; stream.* public names belong to kg",
+                pack.name()
+            )));
         }
         self.packs.push(pack);
         self.pack_trusted.push(false);
@@ -594,12 +627,8 @@ impl VerbRegistryBuilder {
             }
             let pack_name = pack.name();
             for handler in pack.handlers() {
-                let canonical_owner = handler
-                    .name
-                    .split_once('.')
-                    .map_or("kg", |(owner, _)| owner);
                 if matches!(handler.visibility, Visibility::Verb)
-                    && pack_name == canonical_owner
+                    && has_canonical_replay_owner(pack_name, handler.name)
                     && crate::classify_operation(handler.name) == Some(crate::OperationAccess::Read)
                     && !VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS.contains(&handler.name)
                 {
@@ -610,10 +639,7 @@ impl VerbRegistryBuilder {
                 {
                     continue;
                 }
-                let eligible = VerbRegistry::admission_degrade_safe_sorted()
-                    .binary_search_by(|&(p, v)| p.cmp(pack_name).then_with(|| v.cmp(handler.name)))
-                    .is_ok();
-                if eligible {
+                if is_admission_degrade_safe_pair(pack_name, handler.name) {
                     degrade_safe_verbs.insert(handler.name);
                 }
             }
@@ -687,6 +713,7 @@ impl VerbRegistryBuilder {
             gate: self.gate,
             default_namespace: self.default_namespace,
             visible_namespaces: self.visible_namespaces,
+            owned_namespaces: self.owned_namespaces,
             actor_id: self.actor_id,
             event_store,
             config_lock_runtime,
@@ -704,6 +731,21 @@ impl VerbRegistryBuilder {
             audit_batch,
         })
     }
+}
+
+// Replay classification remains independent of declaration admission. In
+// particular, the kg exception for stream.* does not grant replay safety.
+fn has_canonical_replay_owner(pack_name: &str, handler_name: &str) -> bool {
+    let canonical_owner = handler_name
+        .split_once('.')
+        .map_or("kg", |(owner, _)| owner);
+    pack_name == canonical_owner
+}
+
+fn is_admission_degrade_safe_pair(pack_name: &str, handler_name: &str) -> bool {
+    VerbRegistry::admission_degrade_safe_sorted()
+        .binary_search_by(|&(p, v)| p.cmp(pack_name).then_with(|| v.cmp(handler_name)))
+        .is_ok()
 }
 
 /// Validate and capture property metadata in topological pack/declaration order.
@@ -994,5 +1036,51 @@ impl PackMetadataRegistry {
     /// Pack ownership for every declared endpoint rule, in installation order.
     pub fn all_edge_rules_with_packs(&self) -> Vec<(&str, EdgeEndpointRule)> {
         self.registry.all_edge_rules_with_packs()
+    }
+}
+
+#[cfg(test)]
+mod ownership_predicate_tests {
+    use super::{has_canonical_replay_owner, is_admission_degrade_safe_pair};
+
+    #[test]
+    fn replay_owner_predicate_rejects_foreign_owners_independently_of_admission() {
+        for (owner, verb) in [
+            ("kg", "get"),
+            ("comm", "comm.inbox"),
+            ("memory", "memory.recall"),
+            ("stream", "stream.read"),
+        ] {
+            assert!(has_canonical_replay_owner(owner, verb), "{owner}/{verb}");
+            assert!(
+                !has_canonical_replay_owner("extension", verb),
+                "a foreign owner must not borrow replay classification for {verb}"
+            );
+        }
+        // Registration separately reserves the stream label. The existing
+        // name-based predicate must not be broadened to kg by that admission rule.
+        assert!(!has_canonical_replay_owner("kg", "stream.read"));
+    }
+
+    #[test]
+    fn admission_degrade_predicate_requires_the_exact_allowlisted_pair() {
+        for (owner, verb) in [
+            ("kg", "get"),
+            ("comm", "comm.inbox"),
+            ("gtd", "gtd.next"),
+            ("kg", "stream.read"),
+        ] {
+            assert!(
+                is_admission_degrade_safe_pair(owner, verb),
+                "{owner}/{verb}"
+            );
+            assert!(
+                !is_admission_degrade_safe_pair("extension", verb),
+                "a foreign owner must not borrow audit degradation for {verb}"
+            );
+        }
+        assert!(!is_admission_degrade_safe_pair("stream", "stream.read"));
+        assert!(!is_admission_degrade_safe_pair("kg", "db_diagnostics"));
+        assert!(!is_admission_degrade_safe_pair("comm", "comm.send"));
     }
 }

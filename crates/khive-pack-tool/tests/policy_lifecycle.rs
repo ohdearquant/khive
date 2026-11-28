@@ -94,6 +94,222 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn tool_policies_lookup_by_policy_id_finds_row_beyond_page_limit() {
+    let f = Fixture::new(true);
+    let first_page = f.policy("svc:a", "t.first", "allow").await;
+    let target = f.policy("svc:a", "t.last", "deny").await;
+    let target_id = target["id"].as_str().unwrap();
+
+    // Put the last-created row beyond the first page deterministically.
+    f.write(
+        "UPDATE tool_policy SET created_at=?1 WHERE id=?2",
+        vec![
+            SqlValue::Integer(2),
+            SqlValue::Text(first_page["id"].as_str().unwrap().into()),
+        ],
+    )
+    .await;
+    f.write(
+        "UPDATE tool_policy SET created_at=?1 WHERE id=?2",
+        vec![SqlValue::Integer(1), SqlValue::Text(target_id.into())],
+    )
+    .await;
+
+    let check = f.check("svc:a", "t.last").await;
+    assert_eq!(check["policy_id"], target["id"]);
+    let page = f
+        .call("tool.policies", json!({"actor":"svc:a", "limit":1}))
+        .await;
+    assert_eq!(page["count"], 1);
+    assert_eq!(page["policies"][0]["id"], first_page["id"]);
+
+    let exact = f
+        .call(
+            "tool.policies",
+            json!({"actor":"svc:a", "policy_id":check["policy_id"], "limit":1}),
+        )
+        .await;
+    assert_eq!(exact["count"], 1);
+    assert_eq!(exact["policies"][0]["id"], target["id"]);
+    assert_eq!(exact["policies"][0]["tool"], "t.last");
+
+    let help = f.registry.describe_verb("tool.policies").unwrap();
+    assert_eq!(
+        help["input_schema"]["properties"]["policy_id"]["type"],
+        "string"
+    );
+}
+
+#[tokio::test]
+async fn tool_policies_without_policy_id_preserves_actor_and_limit_behavior() {
+    let f = Fixture::new(true);
+    let older = f.policy("svc:a", "t.old", "deny").await;
+    let latest = f.policy("svc:a", "t.latest", "allow").await;
+    f.policy("svc:b", "t.other", "allow").await;
+    f.write(
+        "UPDATE tool_policy SET created_at=?1 WHERE id=?2",
+        vec![
+            SqlValue::Integer(1),
+            SqlValue::Text(older["id"].as_str().unwrap().into()),
+        ],
+    )
+    .await;
+    f.write(
+        "UPDATE tool_policy SET created_at=?1 WHERE id=?2",
+        vec![
+            SqlValue::Integer(2),
+            SqlValue::Text(latest["id"].as_str().unwrap().into()),
+        ],
+    )
+    .await;
+
+    let listed = f
+        .call("tool.policies", json!({"actor":"svc:a", "limit":1}))
+        .await;
+    assert_eq!(listed["count"], 1);
+    assert_eq!(listed["policies"][0]["id"], latest["id"]);
+}
+
+#[tokio::test]
+async fn malformed_policy_timestamps_cannot_fall_through_to_read_allow() {
+    for column in ["created_at", "updated_at", "deleted_at"] {
+        let f = Fixture::new(true);
+        let policy = f.policy("svc:a", "t.x", "deny").await;
+        let id = policy["id"].as_str().unwrap();
+        let before =
+            khive_pack_tool::policy::decide(&f.rt, "local", "svc:a", "t.x", Some("read"), None)
+                .await
+                .unwrap();
+        assert_eq!(before.decision, "deny");
+        f.write(
+            &format!("UPDATE tool_policy SET {column}=?1 WHERE id=?2"),
+            vec![SqlValue::Float(1.5), SqlValue::Text(id.into())],
+        )
+        .await;
+        let error =
+            khive_pack_tool::policy::decide(&f.rt, "local", "svc:a", "t.x", Some("read"), None)
+                .await
+                .expect_err("malformed policy must not become a default allow")
+                .to_string();
+        assert!(error.contains(id) && error.contains(column), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn valid_deleted_policy_still_falls_through_to_read_default() {
+    let f = Fixture::new(true);
+    let policy = f.policy("svc:a", "t.x", "deny").await;
+    let id = policy["id"].as_str().unwrap();
+    f.write(
+        "UPDATE tool_policy SET deleted_at=?1 WHERE id=?2",
+        vec![SqlValue::Integer(1), SqlValue::Text(id.into())],
+    )
+    .await;
+    let decision =
+        khive_pack_tool::policy::decide(&f.rt, "local", "svc:a", "t.x", Some("read"), None)
+            .await
+            .unwrap();
+    assert_eq!(decision.decision, "allow");
+    assert_eq!(decision.source, "default");
+}
+
+#[tokio::test]
+async fn legacy_null_updated_at_keeps_the_policy_active() {
+    let f = Fixture::new(true);
+    let policy = f.policy("svc:a", "t.x", "deny").await;
+    let id = policy["id"].as_str().unwrap();
+    assert_eq!(
+        f.scalar("SELECT COUNT(*) FROM tool_policy WHERE typeof(created_at)='integer' AND typeof(updated_at)='integer'").await,
+        1
+    );
+    f.write(
+        "UPDATE tool_policy SET updated_at=NULL WHERE id=?1",
+        vec![SqlValue::Text(id.into())],
+    )
+    .await;
+    let decision =
+        khive_pack_tool::policy::decide(&f.rt, "local", "svc:a", "t.x", Some("read"), None)
+            .await
+            .unwrap();
+    assert_eq!(decision.decision, "deny");
+    assert_eq!(decision.policy_id.as_deref(), Some(id));
+}
+
+#[tokio::test]
+async fn malformed_deleted_timestamp_refuses_upsert_and_delete_without_writes() {
+    let f = Fixture::new(true);
+    let policy = f.policy("svc:a", "t.x", "deny").await;
+    let id = policy["id"].as_str().unwrap();
+    f.write(
+        "UPDATE tool_policy SET deleted_at=?1 WHERE id=?2",
+        vec![SqlValue::Float(1.5), SqlValue::Text(id.into())],
+    )
+    .await;
+    for (verb, args) in [
+        (
+            "tool.policy",
+            json!({"actor":"svc:a", "tool":"t.x", "decision":"allow"}),
+        ),
+        ("tool.policy_delete", json!({"actor":"svc:a", "tool":"t.x"})),
+    ] {
+        let error = f.error(verb, args).await;
+        assert!(
+            error.contains(id) && error.contains("deleted_at"),
+            "{error}"
+        );
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM tool_policy").await, 1);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM tool_policy WHERE decision='deny' AND typeof(deleted_at)='real' AND deleted_at=1.5").await, 1);
+    }
+}
+
+#[tokio::test]
+async fn valid_deleted_history_does_not_block_a_new_policy() {
+    let f = Fixture::new(true);
+    let prior = f.policy("svc:a", "t.x", "deny").await;
+    let prior_id = prior["id"].as_str().unwrap();
+    f.write(
+        "UPDATE tool_policy SET deleted_at=?1 WHERE id=?2",
+        vec![SqlValue::Integer(1), SqlValue::Text(prior_id.into())],
+    )
+    .await;
+    let error = f
+        .error("tool.policy_delete", json!({"actor":"svc:a", "tool":"t.x"}))
+        .await;
+    assert!(error.contains("no live tool policy"), "{error}");
+    let active = f.policy("svc:a", "t.x", "allow").await;
+    assert_ne!(active["id"], prior["id"]);
+    assert_eq!(f.scalar("SELECT COUNT(*) FROM tool_policy").await, 2);
+
+    // A malformed historical row must not hide behind that healthy live row.
+    f.write(
+        "UPDATE tool_policy SET deleted_at=?1 WHERE id=?2",
+        vec![SqlValue::Float(1.5), SqlValue::Text(prior_id.into())],
+    )
+    .await;
+    for (verb, args) in [
+        (
+            "tool.policy",
+            json!({"actor":"svc:a", "tool":"t.x", "decision":"deny"}),
+        ),
+        ("tool.policy_delete", json!({"actor":"svc:a", "tool":"t.x"})),
+    ] {
+        let error = f.error(verb, args).await;
+        assert!(
+            error.contains(prior_id) && error.contains("deleted_at"),
+            "{error}"
+        );
+        assert_eq!(
+            f.scalar(
+                "SELECT COUNT(*) FROM tool_policy WHERE deleted_at IS NULL AND decision='allow'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM tool_policy").await, 2);
+    }
+}
+
+#[tokio::test]
 async fn deny_correction_requires_the_current_row_id_and_retains_history() {
     let f = Fixture::new(true);
     let deny = f

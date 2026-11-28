@@ -25,7 +25,7 @@ impl Pack for RefusalFixture {
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
-        name: "refusal_fixture",
+        name: "refusal_fixture.run",
         description: "return a typed refusal with fixture recording evidence",
         visibility: Visibility::Verb,
         category: VerbCategory::Directive,
@@ -92,7 +92,7 @@ async fn dispatch(mode: Mode) -> Value {
     // No runtime, storage, or ambient database config is needed for this seam.
     let registry = builder.build().unwrap();
     let error = registry
-        .dispatch_with_disposition("refusal_fixture", json!({}), None)
+        .dispatch_with_disposition("refusal_fixture.run", json!({}), None)
         .await
         .expect_err("fixture must refuse");
     if !matches!(mode, Mode::Lookalike) {
@@ -103,7 +103,7 @@ async fn dispatch(mode: Mode) -> Value {
             }
         );
     }
-    DispatchFailure::from_dispatch("refusal_fixture", error).into_entry()
+    DispatchFailure::from_dispatch("refusal_fixture.run", error).into_entry()
 }
 
 #[tokio::test]

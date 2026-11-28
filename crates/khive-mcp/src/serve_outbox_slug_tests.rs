@@ -114,7 +114,7 @@ async fn legacy_row_requires_one_adapter() {
 }
 
 #[tokio::test]
-async fn ambiguous_legacy_and_unknown_slug_stay_pending() {
+async fn unnamed_row_resumes_when_one_same_kind_channel_remains() {
     for kind in ["email", "telegram"] {
         let (runtime, token) = fixture();
         let a = Arc::new(RecordingChannel::new(
@@ -146,6 +146,18 @@ async fn ambiguous_legacy_and_unknown_slug_stay_pending() {
             "ambiguous legacy adapter must not send"
         );
         assert_eq!(props(&runtime, &token, legacy).await, before_legacy);
+        assert_eq!(props(&runtime, &token, unknown).await, before_unknown);
+
+        drop(registry);
+        let mut registry = ChannelRegistry::new();
+        registry.register(a.clone());
+        pass(&runtime, &registry, kind, "a@example.com").await;
+        assert_eq!(a.sent.lock().unwrap().len(), 1, "{kind} resumed send");
+        assert!(b.sent.lock().unwrap().is_empty(), "{kind} removed adapter");
+        assert_eq!(
+            props(&runtime, &token, legacy).await["delivery"],
+            "delivered"
+        );
         assert_eq!(props(&runtime, &token, unknown).await, before_unknown);
     }
 }

@@ -1,6 +1,6 @@
 //! Verb handler implementations for the comm pack.
 //!
-//! All fifteen public comm verbs store or query comm state.
+//! Sixteen public comm verbs query or change communication and process-control state.
 //! Message-specific metadata lives
 //! in the `properties` JSON column; `content` is the message body.
 
@@ -24,7 +24,7 @@ use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
 use crate::idempotency::MessageIdentity;
 use crate::inbox_signal::InboxSignal;
 use crate::message::{
-    dual_write_message_with_identity, note_to_message_json, project_message_json, short_id,
+    dual_write_message_with_transport, note_to_message_json, project_message_json, short_id,
     validate_message_projection_fields, MessageWrite, COMM_SCHEMA_VERSION,
     COMM_STABLE_PROPERTY_KEYS,
 };
@@ -51,6 +51,7 @@ mod outbox_scan;
 mod parameter_aliases;
 mod probe_cursor;
 mod quarantine_heartbeat;
+mod quiet;
 mod read_marking;
 mod reply;
 mod suppression;
@@ -66,6 +67,7 @@ pub(crate) use thread::handle_thread;
 use health::channel_stalled;
 pub(crate) use health::handle_health;
 pub use outbox_scan::{record_outbox_scan, OutboxScan, OutboxScanOutcome};
+pub(crate) use quiet::handle_quiet;
 
 #[cfg(test)]
 use inbox::wait_for_inbox_response;
@@ -116,13 +118,38 @@ use validation::{
 /// Caller-keyed sends reconcile through the atomic outbound claim and its
 /// intact recipient sibling. Without a key each call creates a new message.
 /// See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_send
+#[cfg(test)]
 pub(crate) async fn handle_send(
     runtime: &KhiveRuntime,
     inbox_signal: &InboxSignal,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
-    let p: SendParams = deser(params)?;
+    handle_send_with_route(runtime, inbox_signal, token, params, None).await
+}
+
+/// `send` with an optional node route. A recipient in the node address form (scheme matched
+/// case-insensitively, no surrounding whitespace) is sealed through `route` before any row is
+/// written, and its sender transport row commits in the same transaction as the message pair.
+/// A node-form recipient with no route installed is refused as disabled; it is never handled as
+/// an ordinary actor label.
+pub(crate) async fn handle_send_with_route(
+    runtime: &KhiveRuntime,
+    inbox_signal: &InboxSignal,
+    token: &NamespaceToken,
+    params: Value,
+    route: Option<&dyn crate::node_route::NodeSendRoute>,
+) -> Result<Value, RuntimeError> {
+    let p: SendParams = deser(params.clone())?;
+    // Classify the recipient exactly as written, before anything can read or write. A node
+    // address with no route installed is refused as disabled here and never falls through to the
+    // local actor-label path; a padded node address is refused rather than trimmed.
+    let recipient_form = crate::node_route::classify_recipient(&p.to);
+    if let Some(refusal) = crate::node_route::refusal_before_write(recipient_form, route.is_some())
+    {
+        return Err(refusal.into_runtime_error());
+    }
+    let node_recipient = recipient_form == crate::node_route::RecipientForm::Node;
     validate_actor_label("send", &p.to, "to")?;
     if p.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -156,7 +183,8 @@ pub(crate) async fn handle_send(
              worktree-scoped `.khive/config.toml`, so they are not addressable as distinct \
              principals until each is configured with its own actor identity. If this send is \
              genuinely a note to yourself, resend with `self_send=true`."
-        )));
+        ))
+        .before_requested_write());
     }
 
     // #200: unattributed callers stamp from_actor="local", corrupting reply-thread
@@ -169,6 +197,13 @@ pub(crate) async fn handle_send(
              reply-thread routing in multi-actor deployments. \
              Set [actor] id in khive.toml to fix (issue #200)."
         );
+    }
+
+    if let Some(channel_route) = runtime.config().channel_send_routes.resolve(&p.to)? {
+        if let Some(key) = p.idempotency_key.as_deref() {
+            khive_runtime::keyed_memory::validate_memory_key(key)?;
+        }
+        return channel_route.send(runtime, token, params).await;
     }
 
     let sent_at = Utc::now().to_rfc3339();
@@ -189,11 +224,73 @@ pub(crate) async fn handle_send(
             &p.attachments,
         )
     })?;
+    // A node-addressed recipient is sealed before any write, so a disabled channel, an
+    // unparseable address or an unknown pin refuses with nothing stored.
+    //
+    // The logical message id of a caller-keyed send is derived from the key's physical form, so
+    // a replay of the same keyed request seals under the identity of the first attempt even when
+    // the first attempt's transport row was lost. An un-keyed send mints a fresh id.
+    let logical_message_id = match identity.as_ref() {
+        Some(identity) => Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            identity.physical_key(token).as_bytes(),
+        ),
+        None => Uuid::new_v4(),
+    };
+    // The seal decision comes after the idempotency read, so a keyed replay of a send that already
+    // succeeded never reaches the route again.
+    let mut skip_seal = false;
+    let mut repair_holder: Option<Uuid> = None;
+    if node_recipient {
+        if let Some(identity) = identity.as_ref() {
+            if let Some(holder) = khive_runtime::keyed_message::find_keyed_message_holder(
+                runtime,
+                &caller_ns,
+                &identity.physical_key(token),
+            )
+            .await?
+            {
+                if runtime.sender_transport_status(token, holder).await?
+                    != khive_runtime::comm_transport::TransportStatus::Unknown
+                {
+                    skip_seal = true;
+                } else {
+                    repair_holder = Some(holder);
+                }
+            }
+        }
+    }
+    let sealed = match route {
+        Some(route) if node_recipient && !skip_seal => Some(
+            route
+                .seal(crate::node_route::NodeSealRequest {
+                    address: &to_actor,
+                    logical_message_id,
+                    from_actor: &from_actor,
+                    content: &p.content,
+                    subject: p.subject.as_deref(),
+                    thread_id: thread_id.as_deref(),
+                    namespace: &caller_ns,
+                    sent_at: &sent_at,
+                })
+                .await
+                .map_err(|refusal| refusal.into_runtime_error())?,
+        ),
+        _ => None,
+    };
+    // A fresh node send commits its transport row in the same transaction as the message pair.
+    // Only a keyed replay whose pair landed without a row stores the row on its own, because the
+    // pair is already committed by then.
+    let (inline_transport, repair_transport) = if repair_holder.is_some() {
+        (None, sealed)
+    } else {
+        (sealed, None)
+    };
     let MessageWrite {
         outbound: outbound_note,
         embedding_truncation,
         replayed,
-    } = dual_write_message_with_identity(
+    } = dual_write_message_with_transport(
         runtime,
         token,
         "comm.send",
@@ -211,8 +308,13 @@ pub(crate) async fn handle_send(
         p.tags.as_deref(),
         &attachments,
         identity.as_ref(),
+        inline_transport,
     )
     .await?;
+    if let Some(mut envelope) = repair_transport {
+        envelope.outbound_note_id = outbound_note.id;
+        runtime.create_sender_transport(token, envelope).await?;
+    }
     if !replayed {
         inbox_signal.publish();
     }
@@ -264,13 +366,19 @@ pub(crate) async fn handle_transport_status(
 /// See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_inbox
 pub const MAX_INBOX_WAIT_MS: u64 = 30_000;
 
-/// `read` — retrieve an inbound message and mark it as read.
+/// `read` — retrieve inbound messages, marking them unless a single fetch opts out.
 pub(crate) async fn handle_read(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
+    let supplied_ids = params.get("ids").is_some();
     let p: ReadParams = deser(params)?;
+    if !p.mark && supplied_ids {
+        return Err(RuntimeError::InvalidInput(
+            "read: mark=false requires a single `id`; `ids` is not supported".into(),
+        ));
+    }
     let include_body = p.body;
     match (p.id, p.ids) {
         (Some(_), Some(_)) => Err(RuntimeError::InvalidInput(
@@ -286,7 +394,23 @@ pub(crate) async fn handle_read(
             } else {
                 None
             };
-            let result = mark_read_target(runtime, token, id, note).await?;
+            let result = if p.mark {
+                mark_read_target(runtime, token, id, note).await?
+            } else {
+                let read = note
+                    .properties
+                    .as_ref()
+                    .and_then(|properties| properties.get("read"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                json!({
+                    "id": short_id(id),
+                    "full_id": id.as_hyphenated().to_string(),
+                    "status": "success",
+                    "read": read,
+                    "properties": note.properties,
+                })
+            };
             Ok(read_result_with_body(result, message))
         }
         (None, Some(raw_ids)) => {

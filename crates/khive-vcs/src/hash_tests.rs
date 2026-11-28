@@ -19,6 +19,8 @@ fn empty_archive() -> KgArchive {
 
 fn make_entity(id: Uuid, name: &str) -> ExportedEntity {
     ExportedEntity {
+        keys: Vec::new(),
+        aliases: Vec::new(),
         id,
         kind: "concept".into(),
         entity_type: None,

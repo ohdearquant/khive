@@ -254,8 +254,8 @@ async fn compose_nested_profile_reads_preserve_request_identity() {
                 namespace: "local".to_string(),
                 actor_id: Some("requester".to_string()),
                 visible_namespaces: vec!["local".to_string()],
-                process_ref: None,
                 request_id: Some(1505),
+                ..Default::default()
             }),
         )
         .await

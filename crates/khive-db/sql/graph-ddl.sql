@@ -28,6 +28,7 @@ CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_target ON graph_edges(namespace, t
 CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_relation ON graph_edges(namespace, relation);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_src_rel ON graph_edges(namespace, source_id, relation);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_ns_tgt_rel ON graph_edges(namespace, target_id, relation);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_target_relation ON graph_edges(target_id, relation);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_target_backend ON graph_edges(target_backend) WHERE target_backend IS NOT NULL;
 
 -- Durable list-cursor insertion order. This mirrors migration V13 as a

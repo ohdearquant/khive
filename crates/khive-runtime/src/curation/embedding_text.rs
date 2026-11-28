@@ -6,13 +6,21 @@ use super::{Entity, Note, SubstrateKind, TextDocument};
 
 /// Build the canonical text embedded for an entity on create, update, merge,
 /// and repair paths.
+///
+/// The text is the name, then each alias in the record's order, then the
+/// description when it is non-empty, joined by single spaces. An entity with
+/// no aliases gets exactly the text it got before aliases existed.
 pub fn entity_embedding_text(entity: &Entity) -> String {
-    match &entity.description {
-        Some(description) if !description.is_empty() => {
-            format!("{} {description}", entity.name)
-        }
-        _ => entity.name.clone(),
+    let mut text = entity.name.clone();
+    for alias in &entity.aliases {
+        text.push(' ');
+        text.push_str(&alias.alias);
     }
+    if let Some(description) = entity.description.as_deref().filter(|d| !d.is_empty()) {
+        text.push(' ');
+        text.push_str(description);
+    }
+    text
 }
 
 /// Build the canonical text embedded for a note when no explicit bounded
@@ -31,10 +39,10 @@ pub(crate) fn note_embedding_text_ref(note: &Note) -> &str {
 /// entity FTS document shape; all write paths (create, update, merge, reindex, backfill)
 /// must go through this function so search parity is guaranteed.
 ///
-/// Body rule: when the entity has a non-empty description, prepend the name
-/// (`"<name> <description>"`). Otherwise the body is just the name. This
-/// matches the FTS index contract: `title` and `body` are the ranked columns;
-/// `tags`, `metadata`, and `namespace` are UNINDEXED.
+/// Body rule: the body is [`entity_embedding_text`]: the name, then the
+/// entity's aliases, then the description when it is non-empty. The title is
+/// the name alone. This matches the FTS index contract: `title` and `body` are
+/// the ranked columns; `tags`, `metadata`, and `namespace` are UNINDEXED.
 ///
 /// `updated_at` is taken from the entity's own timestamp so that backfill and
 /// reindex runs record the entity's actual mutation time rather than the

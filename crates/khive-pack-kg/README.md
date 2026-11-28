@@ -51,6 +51,17 @@ captured preimages in one writer transaction.
 `propose`/`review`/`withdraw` implement the event-sourced proposal lifecycle from
 [ADR-046](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-046-event-sourced-proposals.md).
 
+An `add_edge` changeset accepts optional `metadata`, for example
+`{"kind":"add_edge","source":"<existing source UUID>","target":"<existing target UUID>","relation":"depends_on","metadata":{"dependency_kind":"runtime","optional":true}}`.
+The proposal retains this object and applies the same metadata validation and
+dependency-kind inference as `link` when approved. Omitted or null metadata means
+no supplied metadata; other values must be objects. `optional` must be a boolean,
+and `dependency_kind` is allowed only on `depends_on` with its existing vocabulary.
+Other metadata keys remain caller-defined. An invalid object can be recorded as
+proposal intent, but its apply attempt records a failure without writing an edge.
+Both endpoint UUIDs must already identify existing records; this does not add
+step-local references or enable multi-step compounds.
+
 `count(kind="event", group_by="verb")` returns an object such as
 `{"create": 3, "update": 2}`. Group by `kind` or `actor` to use those stored keys
 instead. Optional `since`/`until` are exclusive UTC-microsecond bounds;

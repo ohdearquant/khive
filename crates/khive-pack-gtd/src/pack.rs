@@ -80,6 +80,7 @@ impl PackRuntime for GtdPack {
         match verb {
             "gtd.assign" => self.handle_assign(token, params).await,
             "gtd.census" => self.handle_census(token, params).await,
+            "gtd.counts" => self.handle_counts(token, params).await,
             "gtd.repair" => self.handle_repair(token, params).await,
             "gtd.next" => self.handle_next(token, params).await,
             "gtd.complete" => self.handle_complete(token, params).await,

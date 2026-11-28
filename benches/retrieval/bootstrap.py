@@ -9,6 +9,10 @@ or unseeded randomness.
 
 Usage:
     uv run python bootstrap.py results/A_fused_direct.jsonl results/B_other.jsonl
+    uv run python bootstrap.py run/recall_rrf.jsonl run/profile_on.jsonl --metrics hit@10,coverage@10,MRR@10
+
+--metrics names the per-row fields to compare (default: the evaluate.py metrics); bank.py arm files carry hit@5,
+hit@10, coverage@5, coverage@10 and MRR@10.
 """
 
 from __future__ import annotations
@@ -106,11 +110,11 @@ def cohens_dz_note(deltas: list[float], dz: float | None) -> str | None:
     return "undefined (zero variance)"
 
 
-def compare(path_a: Path, path_b: Path, seed: int) -> list[dict]:
+def compare(path_a: Path, path_b: Path, seed: int, metrics: list[str] = METRICS) -> list[dict]:
     a = load_rows(path_a)
     b = load_rows(path_b)
     out = []
-    for metric in METRICS:
+    for metric in metrics:
         deltas = paired_deltas(a, b, metric)
         rng = random.Random(seed)
         ci_lo, ci_hi = bootstrap_ci(deltas, rng, N_BOOTSTRAP)
@@ -137,9 +141,13 @@ def main() -> int:
     ap.add_argument("result_b", type=Path, help="comparison condition's result JSONL")
     ap.add_argument("--seed", type=int, default=939)
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--metrics", default=",".join(METRICS), help="comma-separated per-row fields to compare")
     args = ap.parse_args()
 
-    rows = compare(args.result_a, args.result_b, args.seed)
+    metrics = [m for m in args.metrics.split(",") if m]
+    if not metrics:
+        ap.error("--metrics names no field")
+    rows = compare(args.result_a, args.result_b, args.seed, metrics)
 
     print(f"Paired comparison: {args.result_b.name} vs {args.result_a.name}")
     print("| Metric | n | Δ mean | 95% CI | p (sign-flip) | Cohen's dz |")

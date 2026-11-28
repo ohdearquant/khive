@@ -45,7 +45,7 @@ pub(super) struct CachedReadTransaction {
 }
 
 pub(super) struct StandaloneHandle {
-    pub(super) conn: rusqlite::Connection,
+    pub(super) conn: crate::ProgressConn,
     /// Present only for a standalone read-write handle, whose one-permit
     /// connection budget remains handle-scoped. Read-only connections exist
     /// only for explicit deferred transactions and retain reader admission in
@@ -101,6 +101,8 @@ pub(super) async fn open_explicit_read_transaction_handle(
     )
     .await??;
     drop(open_slot);
+    let conn = crate::ProgressConn::new(conn)
+        .map_err(|error| super::map_rusqlite_err(error, "sql_bridge.reader_open"))?;
     Ok(StandaloneHandle {
         conn,
         _retained_slot: None,
@@ -187,7 +189,7 @@ where
     R: Send + 'static,
     F: FnOnce(
             &crate::read_cancellation::InterruptibleReadScope,
-            &rusqlite::Connection,
+            &crate::ProgressConn,
             bool,
             bool,
         ) -> khive_storage::types::StorageResult<R>
@@ -603,6 +605,66 @@ impl khive_storage::SqlReader for SqliteReader {
                     conn,
                     &statement,
                     "query_all",
+                    rollback,
+                    interruptible,
+                )
+            },
+        )
+        .await;
+        if self.handle.is_none() {
+            self.poisoned = true;
+        }
+        self.close_inactive_transaction_handle();
+        result
+    }
+
+    async fn query_consume(
+        &mut self,
+        statement: SqlStatement,
+        consumer: Box<dyn khive_storage::SqlRowConsumer>,
+    ) -> khive_storage::types::StorageResult<Box<dyn khive_storage::SqlRowConsumer>> {
+        let transaction_control = cached_read_transaction_control(&statement.sql);
+        admit_reader_capability_sql(&statement, transaction_control, "query_consume")?;
+        if transaction_control.is_some() {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Sql,
+                operation: "query_consume".into(),
+                message: "row consumption does not execute transaction control".into(),
+            });
+        }
+        if !self
+            .use_explicit_transaction_handle(transaction_control, "query_consume")
+            .await?
+        {
+            return run_pool_reader_query(
+                Arc::clone(&self.pool),
+                "query_consume",
+                move |scope, conn| {
+                    super::reader_capability::execute_query_consume_interruptibly(
+                        scope,
+                        conn,
+                        &statement,
+                        consumer,
+                        "query_consume",
+                        false,
+                        true,
+                    )
+                },
+            )
+            .await;
+        }
+        let result = execute_standalone_read(
+            &mut self.handle,
+            Arc::clone(&self.pool),
+            "query_consume",
+            transaction_control,
+            move |scope, conn, rollback, interruptible| {
+                super::reader_capability::execute_query_consume_interruptibly(
+                    scope,
+                    conn,
+                    &statement,
+                    consumer,
+                    "query_consume",
                     rollback,
                     interruptible,
                 )

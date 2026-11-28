@@ -1,5 +1,12 @@
 use super::*;
 
+use serde::ser::{SerializeMap, SerializeStruct};
+
+use crate::disk_guard::{lease_hold_snapshot, LeaseClass};
+use crate::writer_admission_metrics::{HistogramSnapshot, Unavailable};
+
+use super::writer_admission::HistogramWire;
+
 /// The configured write-admission reserve and the volume metadata used to
 /// sample it. The reserve is an admission floor, not reserved disk capacity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -13,6 +20,53 @@ pub struct DiskGuardDiagnostics {
     pub volume_identity: Option<String>,
     pub volume_root: Option<String>,
     pub unavailable_reason: Option<String>,
+    /// How long volume leases were held in this process, by what each was
+    /// taken for. Process-wide: every pool on every volume records here.
+    pub lease_hold_seconds: LeaseHoldDiagnostics,
+}
+
+/// Lease hold-time histograms by operation class since the process started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseHoldDiagnostics {
+    holds: Result<Vec<(LeaseClass, HistogramSnapshot)>, Unavailable>,
+}
+
+impl LeaseHoldDiagnostics {
+    pub(super) fn snapshot() -> Self {
+        Self {
+            holds: lease_hold_snapshot(),
+        }
+    }
+}
+
+impl Serialize for LeaseHoldDiagnostics {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut wire = serializer.serialize_struct("LeaseHoldDiagnostics", 3)?;
+        wire.serialize_field("scope", "process")?;
+        match &self.holds {
+            Ok(holds) => {
+                wire.serialize_field("by_class", &ByClass(holds))?;
+                wire.serialize_field("unavailable_reason", &Option::<&str>::None)?;
+            }
+            Err(reason) => {
+                wire.serialize_field("by_class", &Option::<()>::None)?;
+                wire.serialize_field("unavailable_reason", &Some(reason.reason()))?;
+            }
+        }
+        wire.end()
+    }
+}
+
+struct ByClass<'a>(&'a [(LeaseClass, HistogramSnapshot)]);
+
+impl Serialize for ByClass<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (class, histogram) in self.0 {
+            map.serialize_entry(class.as_str(), &HistogramWire(histogram))?;
+        }
+        map.end()
+    }
 }
 
 impl DiskGuardDiagnostics {
@@ -32,6 +86,7 @@ impl DiskGuardDiagnostics {
                 } else {
                     "in-memory backend: no filesystem volume to guard".to_string()
                 }),
+                lease_hold_seconds: LeaseHoldDiagnostics::snapshot(),
             };
         };
         let identity = pool.write_admission().volume_identity();
@@ -60,6 +115,7 @@ impl DiskGuardDiagnostics {
             volume_identity,
             volume_root,
             unavailable_reason,
+            lease_hold_seconds: LeaseHoldDiagnostics::snapshot(),
         }
     }
 }
@@ -102,6 +158,27 @@ mod tests {
         let json = serde_json::to_value(&diagnostics).unwrap();
         assert_eq!(json["effective_reserve_bytes"], 123);
         assert_eq!(json["reserve_source"], "backend");
+        let holds = &json["lease_hold_seconds"];
+        assert_eq!(holds["scope"], "process");
+        assert!(holds["unavailable_reason"].is_null());
+        let classes = holds["by_class"].as_object().expect("holds by class");
+        let mut names = classes.keys().map(String::as_str).collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "bootstrap",
+                "maintenance",
+                "migration",
+                "pooled",
+                "standalone",
+                "writer_task"
+            ]
+        );
+        assert_eq!(
+            classes["standalone"]["buckets"].as_array().unwrap().len(),
+            18
+        );
         #[cfg(any(unix, windows))]
         {
             pool.write_admission()
@@ -115,7 +192,10 @@ mod tests {
                 .unwrap()
                 .contains("database volume changed"));
             pool.write_admission().set_test_current_volume(None);
-            assert_eq!(DiskGuardDiagnostics::snapshot(&pool), diagnostics);
+            // Lease holds are process-wide; a parallel test may record between reads.
+            let mut restored = DiskGuardDiagnostics::snapshot(&pool);
+            restored.lease_hold_seconds = diagnostics.lease_hold_seconds.clone();
+            assert_eq!(restored, diagnostics);
         }
     }
 }

@@ -61,6 +61,7 @@ fn policy(repo: &Path, branches: &[&str]) -> GitWriteSectionConfig {
         allowed: vec![GitWriteEntryConfig {
             repo: repo.display().to_string(),
             branches: branches.iter().map(|b| b.to_string()).collect(),
+            access: Default::default(),
         }],
         ..GitWriteSectionConfig::default()
     }

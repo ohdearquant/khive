@@ -10,6 +10,7 @@ over the notes substrate, the read-only `gtd.census` timestamp census, and expli
 | Verb             | What it does                                                                          |
 | ---------------- | ------------------------------------------------------------------------------------- |
 | `gtd.census`     | Count task timestamp values by raw numeric magnitude without repair or unit inference |
+| `gtd.counts`     | Per-assignee task counts by status, plus open rows of one tag; no task bodies         |
 | `gtd.assign`     | Create a task (note with `kind=task`); defaults `status=inbox`, `priority=p2`         |
 | `gtd.next`       | List actionable tasks; optionally include blocked/broken dependency states            |
 | `gtd.repair`     | Preview or apply explicit timestamp and legacy-status corrections with observed-value checks |
@@ -17,7 +18,7 @@ over the notes substrate, the read-only `gtd.census` timestamp census, and expli
 | `gtd.tasks`      | Filtered task listing by status, assignee, priority                                   |
 | `gtd.transition` | Explicit lifecycle change, validated against the state machine below                  |
 
-All seven verbs are declared in `GTD_HANDLERS` (`src/vocab.rs`) and dispatched
+All eight verbs are declared in `GTD_HANDLERS` (`src/vocab.rs`) and dispatched
 by `GtdPack::dispatch` (`src/pack.rs`).
 
 `gtd.complete` and `gtd.transition` are by-ID operations: a full UUID or a

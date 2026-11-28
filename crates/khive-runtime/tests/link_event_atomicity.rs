@@ -1,4 +1,5 @@
 //! Link/event transaction contract through the existing public runtime APIs.
+use khive_db::test_hooks::TestHooks;
 use std::fs::File;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -806,7 +807,7 @@ async fn unknown_link_usage() {
             .expect("real writer-task route")
             .send_top_level(move |connection| {
                 connection
-                    .authorizer(Some(deny))
+                    .test_authorizer(Some(deny))
                     .map_err(|error| StorageError::Pool {
                         operation: "link_usage_authorizer".into(),
                         message: error.to_string(),
@@ -821,7 +822,7 @@ async fn unknown_link_usage() {
         // file-backed route opens an independent standalone writer instead.
         pool.writer()
             .unwrap()
-            .autocommit(|conn| Ok(conn.authorizer(Some(deny))?))
+            .autocommit(|conn| Ok(conn.test_authorizer(Some(deny))?))
             .unwrap();
     }
     let error = scope(

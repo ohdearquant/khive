@@ -1,0 +1,18 @@
+# Allow-list for scripts/lint-source-file-size.sh (#3931).
+#
+# One row per source file that is already over the line cap: a repo-relative
+# path and a ceiling separated by a single space. The ceiling is the file's
+# line count when it was listed. Blank lines and lines starting with `#` are
+# ignored; any other line that is not exactly `<path> <ceiling>` fails the check.
+#
+# The check fails a file over the cap that is not listed, a listed file over or
+# under its ceiling (a ceiling always equals the file's line count), and a row
+# whose file is at or under the cap or is no longer a counted source file (a
+# stale row: delete it). In a pull request a row may be lowered or
+# deleted but never raised or added, judged against the base branch copy of this
+# file, so the list only shrinks. Splitting a file means lowering or deleting its
+# row in the same change; the check reads line counts from the committed tree, so
+# commit the split before running it locally. The script header states the
+# population rule.
+crates/khive-db/src/stores/note.rs 3025
+crates/kkernel/src/cli.rs 3423

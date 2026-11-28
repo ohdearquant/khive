@@ -154,7 +154,7 @@ fn deferred_tail_refusal_precedes_that_element_but_not_earlier_ddl() {
 #[test]
 fn existing_authorizer_remains_effective() {
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-    let conn = setup();
+    let mut conn = setup();
     conn.execute_batch("BEGIN").unwrap();
     conn.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
         AuthAction::Delete { .. } => Authorization::Deny,

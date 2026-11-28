@@ -45,7 +45,9 @@ pub(super) fn open_writer(
     identity_path: Option<&Path>,
 ) -> Result<Connection, SqliteError> {
     let Some(_) = config.path.as_ref() else {
-        return Connection::open_in_memory().map_err(Into::into);
+        return Connection::open_in_memory()
+            .and_then(crate::pool::register_test_hooks)
+            .map_err(Into::into);
     };
     let flags = if config.read_only {
         writer_read_only_open_flags()

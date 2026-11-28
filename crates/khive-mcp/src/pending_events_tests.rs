@@ -91,7 +91,7 @@ struct AsyncBlockingSideEffectPack {
 }
 
 impl khive_types::Pack for AsyncBlockingSideEffectPack {
-    const NAME: &'static str = "async-blocking-side-effect-test";
+    const NAME: &'static str = "test";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -192,7 +192,7 @@ impl Gate for DenyOrdinaryHandlerFailureGate {
 }
 
 impl khive_types::Pack for OrdinaryHandlerFailurePack {
-    const NAME: &'static str = "ordinary-handler-failure-test";
+    const NAME: &'static str = "test";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -239,7 +239,7 @@ impl khive_runtime::PackRuntime for OrdinaryHandlerFailurePack {
 }
 
 impl khive_types::Pack for AmbiguousSideEffectPack {
-    const NAME: &'static str = "ambiguous-side-effect-test";
+    const NAME: &'static str = "test";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -2102,6 +2102,7 @@ async fn dispatch_action_rejects_non_literal_prev_reference() {
         Some(VerifiedActor::new("lambda:test").expect("verified actor")),
         &server,
         false,
+        super::dispatch::NamespaceInjection::EventNamespace,
     )
     .await
     .unwrap_err();
@@ -2126,6 +2127,7 @@ async fn replay_defense_rejects_legacy_internal_subhandler_payload() {
         Some(VerifiedActor::new("lambda:scheduler").expect("verified actor")),
         &server,
         false,
+        super::dispatch::NamespaceInjection::EventNamespace,
     )
     .await
     .unwrap_err();
@@ -5569,6 +5571,7 @@ async fn wrapper_seam_falls_through_to_project_actor_instead_of_clearing_it() {
         namespace: None,
         no_embed: false,
         pack: Vec::new(),
+        catalog_verbosity: crate::args::CatalogVerbosity::Full,
         config: None,
         daemon: false,
         lifetime: None,
@@ -5626,6 +5629,7 @@ async fn build_server_cli_seam_clears_actor_for_explicit_local_namespace() {
         namespace: Some("local".to_string()),
         no_embed: false,
         pack: Vec::new(),
+        catalog_verbosity: crate::args::CatalogVerbosity::Full,
         config: None,
         daemon: false,
         lifetime: None,
@@ -6291,6 +6295,7 @@ async fn dispatch_action_masks_credential_shaped_stored_action_string_in_parse_f
         Some(VerifiedActor::new("lambda:test").expect("verified actor")),
         &server,
         false,
+        super::dispatch::NamespaceInjection::EventNamespace,
     )
     .await
     .unwrap_err();
@@ -6314,6 +6319,7 @@ async fn dispatch_action_masks_credential_shaped_stored_action_string_in_parse_f
         Some(VerifiedActor::new("lambda:test").expect("verified actor")),
         &server,
         false,
+        super::dispatch::NamespaceInjection::EventNamespace,
     )
     .await
     .unwrap_err();

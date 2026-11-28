@@ -162,7 +162,8 @@ pub(crate) async fn repair_legacy_quarantine_at_boot(
         );
         return Ok(None);
     }
-    repair_legacy_quarantine(main_runtime, sources)
+    khive_db::WriteClassContext::migration()
+        .scope_future(repair_legacy_quarantine(main_runtime, sources))
         .await
         .map(Some)
 }

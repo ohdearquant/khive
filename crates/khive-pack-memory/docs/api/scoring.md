@@ -1,6 +1,6 @@
 # Scoring and Reranking
 
-The scoring subsystem turns fused retrieval evidence, memory salience, age, profile state, and entity evidence into a deterministic score. The response `score` field is clamped to `[0, 1]`; the ordering `rank_score` is multiplied by the entity posterior term without a final clamp and may exceed `1.0`. This reference covers normalization, conditional adjustments, entity extraction, and weighted reranking.
+The scoring subsystem turns fused retrieval evidence, memory salience, age, profile state, and entity evidence into a deterministic score. The response `score` field is clamped to `[0, 1]`; the ordering `rank_score` is multiplied by the entity posterior term without a final clamp and may exceed `1.0`. When a serving profile carries a `local_factor`, the `rank_score` of rows in the `local` namespace is also multiplied by it. This reference covers normalization, conditional adjustments, entity extraction, and weighted reranking.
 
 ## `calculate_score`
 
@@ -12,7 +12,7 @@ score = w_rel * relevance
       * (1 + w_imp * salience)
 ```
 
-Age is measured in days and clamped at zero. `decay_factor` is capped by `ScoringConfig.decay_cap` before `exp(-decay * age)` computes temporal recency. Configured `ScoreAdjustment` values then apply in order. If their combined `f32` arithmetic produces a non-finite value, the score falls to zero; otherwise the final value is clamped to `[0, 1]`.
+Age is measured in days and clamped at zero. `decay_factor` is capped by `ScoringConfig.decay_cap` before `exp(-decay * age)` computes temporal recency. Configured `ScoreAdjustment` values then apply in order. If their combined `f32` arithmetic produces a non-finite value, the score falls to zero; otherwise the final value is clamped to `[0, 1]`. A recall with `include_breakdown` reports the factors of this product in `breakdown.composite` (see `configuration.md#score-breakdowns`).
 
 `ScoreInput` groups candidate fields to keep the function interface manageable: salience, memory type, content, creation time, decay factor, current time, normalized relevance, and entity names.
 
@@ -68,13 +68,16 @@ Both functions discard non-finite values, values below `min_rrf_relevance`, and 
 
 ## Per-entity posterior term
 
-`entity_posterior_term(mean, weight)` calculates:
+`entity_posterior_term(Some((mean, n)), weight)` calculates, with `n` the posterior's evidence mass and `k = 16` (`ENTITY_EVIDENCE_HALF_MASS`):
 
 ```text
-clamp(1 + weight * (mean - 0.5), 0.85, 1.15)
+t0   = clamp(1 + weight * (mean - 0.5), 0.85, 1.15)
+term = 1 + (t0 - 1) * n / (n + k)
 ```
 
-The default weight is `0.3`, making both clamp endpoints reachable at posterior means zero and one. `None` returns exactly `1.0`; an untouched memory must receive the identity multiplier rather than merely some value inside the band. The term can never move a candidate by more than ±15%.
+`entity_posterior_t0(mean, weight)` computes `t0` alone. The default weight is `0.3`, so `t0` reaches the clamp endpoints at posterior means zero and one. `entity_evidence_mass(alpha, beta)` gives `n = max(0, alpha + beta - 2)` for a posterior stored with the Beta(1, 1) prior inside `alpha` and `beta`; one explicit judgment adds 1.0 and a weighted signal adds its weight. `None` and `n = 0` return exactly `1.0`; an untouched memory must receive the identity multiplier rather than merely some value inside the band.
+
+The term scales `t0` toward neutral in both directions: it reaches half of `t0 - 1` at an evidence mass of 16 and approaches `t0` as evidence grows. It stays within [0.85, 1.15] and never moves past `t0`, so it can never move a candidate by more than ±15%. One `useful` judgment moves a memory by about +0.29%, 16 by about +6.67% (ADR-104 Amendment 6).
 
 ## `weighted_rerank`
 

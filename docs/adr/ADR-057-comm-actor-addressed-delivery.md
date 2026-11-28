@@ -341,6 +341,10 @@ before mutation. Atomic mode changes only the transaction boundary across alread
 targets, not principal resolution, namespace behavior, or legacy visibility. Reply's fold-in read
 mark applies the same recipient rule and rechecks it at mutation time.
 
+The single-`id` `comm.read(..., mark=false)` path defined by ADR-040's 2026-11-16
+amendment is the exception: it retains the same target validation but does not
+enter the mutation path.
+
 ### Interaction with ADR-007 Rev 3 (namespace as attribution)
 
 Option A writes both copies to the caller's namespace. No `NamespaceToken::with_namespace`

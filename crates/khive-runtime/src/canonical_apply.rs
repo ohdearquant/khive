@@ -1,6 +1,7 @@
 //! Ordered canonical changesets use ordinary atomic plans after writer-local checks.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use khive_changeset::{
     CanonicalRecordRef, ChangeSet, CreateTarget, DeleteOp, Op, UpdateOp, UpdatePatch,
@@ -27,18 +28,32 @@ fn id128(id: Uuid) -> khive_types::Id128 {
 }
 
 mod entities;
+pub(crate) use entities::unchanged_entity_assertion_plan;
 mod links;
 mod notes;
 mod projection;
 mod rows;
 
 /// An opaque, admitted operation. Only this module can construct its captured state.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CanonicalMutationPlan {
     token: NamespaceToken,
+    request_scope: Arc<NamespaceToken>,
     target_id: Uuid,
     now: i64,
     mutation: Mutation,
+}
+
+impl std::fmt::Debug for CanonicalMutationPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Preserve the admitted operation's existing fields without formatting caller scope.
+        f.debug_struct("CanonicalMutationPlan")
+            .field("token", &self.token)
+            .field("target_id", &self.target_id)
+            .field("now", &self.now)
+            .field("mutation", &self.mutation)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -102,9 +117,13 @@ impl Record {
     fn check_update(&self, op: &UpdateOp) -> Result<(), AtomicOpFailure> {
         let result = match self {
             Self::Entity(x) => {
-                let mut live = projection::entity(x).map_err(storage)?;
+                // An update never reads keys, so none are read for it.
+                let mut live = entity_record(x, Vec::new())?;
                 if let khive_changeset::UpdatePreimage::Entity(captured) = op.preimage() {
-                    omit_unclaimed_reserved(captured.properties.as_ref(), &mut live.properties);
+                    omit_unclaimed_reserved(
+                        captured.properties.as_ref(),
+                        &mut live.entity.properties,
+                    );
                 }
                 khive_changeset::check_update(op, CanonicalRecordRef::Entity(&live))
             }
@@ -123,11 +142,12 @@ impl Record {
         };
         result.map_err(|e| mismatch(uuid(op.target_id()), &e.field_path))
     }
-    fn check_delete(&self, op: &DeleteOp) -> Result<(), AtomicOpFailure> {
+    /// `keys` are the keys the live row holds; only an entity holds any.
+    fn check_delete(&self, op: &DeleteOp, keys: Vec<String>) -> Result<(), AtomicOpFailure> {
         let result = match self {
             Self::Entity(x) => khive_changeset::check_delete(
                 op,
-                CanonicalRecordRef::Entity(&projection::entity(x).map_err(storage)?),
+                CanonicalRecordRef::Entity(&entity_record(x, keys)?),
             ),
             Self::Note(x) => khive_changeset::check_delete(
                 op,
@@ -140,6 +160,75 @@ impl Record {
             Self::Event => return Err(mismatch(uuid(op.target_id), "substrate")),
         };
         result.map_err(|e| mismatch(uuid(op.target_id), &e.field_path))
+    }
+}
+
+/// The change-set view of a stored entity: its fields, the keys it holds and
+/// its aliases with their origins.
+fn entity_record(
+    row: &Entity,
+    keys: Vec<String>,
+) -> Result<khive_changeset::EntityRecord, AtomicOpFailure> {
+    Ok(khive_changeset::EntityRecord {
+        entity: projection::entity(row).map_err(storage)?,
+        keys,
+        aliases: row.aliases.clone(),
+    })
+}
+
+/// The keys a live record holds, read on the writer: an entity's held keys,
+/// none for any other record.
+async fn live_keys(
+    writer: &mut dyn SqlWriter,
+    live: &Record,
+) -> Result<Vec<String>, AtomicOpFailure> {
+    match live {
+        Record::Entity(row) => rows::held_keys(writer, &row.namespace, row.id)
+            .await
+            .map_err(storage),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Keys taken by the creates prepared so far in one change set, and the
+/// entities its earlier operations delete, whose keys those deletes release.
+#[derive(Default)]
+struct KeyLedger {
+    claimed: HashMap<(String, String), Uuid>,
+    released_by: std::collections::HashSet<Uuid>,
+}
+
+impl KeyLedger {
+    /// Refuse `key` under `kind` as `key_conflict` when an earlier create in
+    /// the change set took it, or a live entity holds it that no earlier
+    /// operation deletes; otherwise record it as taken by `id`. The refusal
+    /// names the key and not the holder.
+    async fn claim(
+        &mut self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        kind: &str,
+        key: &str,
+        id: Uuid,
+    ) -> RuntimeResult<()> {
+        let slot = (kind.to_owned(), key.to_owned());
+        if self.claimed.contains_key(&slot) {
+            return Err(crate::operations::entity_key_conflict(key, None));
+        }
+        if let Some(holder) = runtime.get_entity_by_key(token, kind, key).await? {
+            if !self.released_by.contains(&holder.id) {
+                return Err(crate::operations::entity_key_conflict(key, None));
+            }
+        }
+        self.claimed.insert(slot, id);
+        Ok(())
+    }
+
+    /// An entity deleted by an earlier operation gives up its keys, those
+    /// held in the store and those a create earlier in the change set took.
+    fn release(&mut self, id: Uuid) {
+        self.released_by.insert(id);
+        self.claimed.retain(|_, holder| *holder != id);
     }
 }
 
@@ -159,6 +248,9 @@ pub async fn prepare_canonical_changeset(
     let mut shadow: HashMap<Uuid, Option<Record>> = HashMap::new();
     let mut plans = Vec::with_capacity(changeset.ops.len());
     let mut hook_links: HashMap<String, (usize, Vec<crate::LinkSpec>)> = HashMap::new();
+    let mut keys = KeyLedger::default();
+    // Operation tokens narrow visibility; retain the caller scope only for diagnostic disclosure.
+    let request_scope = Arc::new(token.clone());
     for (op_index, op) in changeset.ops.iter().enumerate() {
         let prepared: RuntimeResult<AtomicOpPlan> = async {
             let (verb, id, args) = gate_args(op)?;
@@ -176,8 +268,14 @@ pub async fn prepare_canonical_changeset(
                     // runtime boundary, without dispatching create lifecycle hooks.
                     validate_create_owner(registry, create)?;
                     let (record, plan) = match &create.target {
-                        CreateTarget::Entity(_) => {
-                            let (row, plan) = crate::atomic_prepare::prepare_add_entity_record(
+                        CreateTarget::Entity(fields) => {
+                            // ADR-221 sections 1 and 2: the key and every alias are
+                            // validated and secret-gated before any read.
+                            if let Some(key) = &fields.key {
+                                crate::operations::validate_entity_key(key)?;
+                            }
+                            let aliases = crate::EntityAliasChange::replace(&fields.aliases)?;
+                            let (mut row, plan) = crate::atomic_prepare::prepare_add_entity_record(
                                 runtime,
                                 &op_token,
                                 &args,
@@ -187,6 +285,18 @@ pub async fn prepare_canonical_changeset(
                             crate::atomic_prepare::canonical_refuse_registry_tags(
                                 &row.tags, "create",
                             )?;
+                            let plan = if fields.key.is_none() && fields.aliases.is_empty() {
+                                plan
+                            } else {
+                                if let Some(key) = &fields.key {
+                                    keys.claim(runtime, &op_token, &row.kind, key, id).await?;
+                                }
+                                crate::atomic_prepare::canonical_entity_create_plan(
+                                    &mut row,
+                                    fields.key.as_deref(),
+                                    &aliases,
+                                )?
+                            };
                             (Record::Entity(row), plan)
                         }
                         CreateTarget::Note(_) => {
@@ -218,6 +328,19 @@ pub async fn prepare_canonical_changeset(
                         .ok_or_else(|| RuntimeError::NotFound("canonical link target".into()))?;
                     let rules = runtime.pack_edge_rules();
                     links::endpoints(&source, &target, link.relation, &rules)?;
+                    if let (Record::Note(source_note), Record::Note(target_note)) =
+                        (&source, &target)
+                    {
+                        KhiveRuntime::ensure_memory_note_edge_namespace(
+                            request_scope.as_ref(),
+                            "apply_changeset",
+                            op_token.namespace().as_str(),
+                            (uuid(link.source), uuid(link.target)),
+                            link.relation,
+                            source_note,
+                            target_note,
+                        )?;
+                    }
                     let edge = links::draft(link, &source, &target, now)?;
                     if let Record::Note(note) = source {
                         hook_links
@@ -323,6 +446,9 @@ pub async fn prepare_canonical_changeset(
                 Op::Delete(delete) => {
                     reject_delete_alias(delete)?;
                     let current = read_prepare(runtime, &op_token, id, &mut shadow).await?;
+                    if let Some(Record::Entity(row)) = &current {
+                        keys.release(row.id);
+                    }
                     let plan = match current {
                         Some(Record::Entity(row)) => Some(
                             crate::atomic_prepare::prepare_delete_from_snapshot(
@@ -369,6 +495,7 @@ pub async fn prepare_canonical_changeset(
             };
             Ok(AtomicOpPlan::Canonical(Box::new(CanonicalMutationPlan {
                 token: op_token,
+                request_scope: Arc::clone(&request_scope),
                 target_id: id,
                 now,
                 mutation,
@@ -468,8 +595,15 @@ fn gate_args(op: &Op) -> RuntimeResult<(&'static str, Uuid, Value)> {
         Op::Create(x) => {
             let mut args = match &x.target {
                 CreateTarget::Entity(e) => {
-                    json!({"kind":e.entity_kind.name(),"name":e.name,"description":e.description,
-                "entity_type":e.entity_type,"properties":e.properties,"tags":e.tags})
+                    let mut args = json!({"kind":e.entity_kind.name(),"name":e.name,"description":e.description,
+                "entity_type":e.entity_type,"properties":e.properties,"tags":e.tags});
+                    if let Some(key) = &e.key {
+                        args["key"] = json!(key);
+                    }
+                    if !e.aliases.is_empty() {
+                        args["aliases"] = json!(e.aliases);
+                    }
+                    args
                 }
                 CreateTarget::Note(n) => {
                     if n.properties.contains_key("tags") {
@@ -556,7 +690,14 @@ pub(crate) async fn materialize(
         }
         Mutation::Link { edge, rules } => {
             identity_absent(writer, id).await?;
-            links::materialize(writer, &plan.token, edge, rules).await
+            links::materialize(
+                writer,
+                &plan.token,
+                plan.request_scope.as_ref(),
+                edge,
+                rules,
+            )
+            .await
         }
         mutation => {
             let live = read_writer(writer, id)
@@ -645,7 +786,8 @@ pub(crate) async fn materialize(
                     .map_err(|e| failure(e.to_string()))
                 }
                 Mutation::Delete { op, plan: ordinary } => {
-                    live.check_delete(op)?;
+                    let keys = live_keys(writer, &live).await?;
+                    live.check_delete(op, keys)?;
                     Ok((**ordinary).clone())
                 }
                 Mutation::Unresolved(Op::Update(op)) => {
@@ -653,7 +795,8 @@ pub(crate) async fn materialize(
                     Err(failure("canonical target changed after preparation"))
                 }
                 Mutation::Unresolved(Op::Delete(op)) => {
-                    live.check_delete(op)?;
+                    let keys = live_keys(writer, &live).await?;
+                    live.check_delete(op, keys)?;
                     Err(failure("canonical target changed after preparation"))
                 }
                 _ => Err(failure("invalid canonical mutation plan")),

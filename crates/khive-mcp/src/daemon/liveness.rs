@@ -580,6 +580,7 @@ pub(super) async fn probe_daemon_identity(
     timeout_ms: u64,
 ) -> ProbeOutcome {
     let probe = DaemonRequestFrame {
+        owned_namespaces: Vec::new(),
         plan: false,
         ops: String::new(),
         presentation: None,
@@ -590,6 +591,7 @@ pub(super) async fn probe_daemon_identity(
         // checks), so no per-request identity is meaningful here.
         actor_id: None,
         process_ref: None,
+        client_cwd: None,
         visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,

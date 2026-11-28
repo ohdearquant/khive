@@ -92,6 +92,14 @@ impl KgPack {
                 .is_some_and(|kinds| !kinds.is_empty())
             || !matches!(projection, NeighborProjection::Record);
         let enrich = !matches!(projection, NeighborProjection::Edge);
+        let hidden_relations: Option<Vec<String>> = relations
+            .as_ref()
+            .filter(|scope| !scope.is_empty())
+            .map(|scope| scope.iter().map(|relation| relation.to_string()).collect());
+        let count_hidden_incoming = matches!(
+            &direction,
+            khive_storage::Direction::In | khive_storage::Direction::Both
+        );
         let mut query = NeighborQuery {
             direction,
             relations,
@@ -106,6 +114,10 @@ impl KgPack {
                     .await?
             }
         };
+        let memory_anchor = matches!(
+            &origin,
+            Some(Resolved::Note(note)) if note.kind == "memory"
+        );
         let anchor_permitted = match &origin {
             Some(Resolved::Note(note)) => mailbox_view.permits_message_note(token, note),
             Some(_) => true,
@@ -243,7 +255,7 @@ impl KgPack {
         } else {
             None
         };
-        let endpoints = match projection {
+        let edges: Vec<Option<(Uuid, Uuid, Option<Value>)>> = match projection {
             NeighborProjection::Summary => vec![None; hits.len()],
             _ => {
                 let ids: Vec<_> = hits.iter().map(|hit| hit.edge_id).collect();
@@ -251,12 +263,22 @@ impl KgPack {
                     .get_edges_by_id(token, &ids)
                     .await?
                     .into_iter()
-                    .map(|edge| edge.map(|edge| (edge.source_id, edge.target_id)))
+                    .map(|edge| edge.map(|edge| (edge.source_id, edge.target_id, edge.metadata)))
                     .collect()
             }
         };
+        let bodies = if matches!(projection, NeighborProjection::Full) {
+            self.neighbor_bodies(token, hits.iter().map(|hit| hit.node_id).collect())
+                .await?
+        } else {
+            HashMap::new()
+        };
         let mut responses = Vec::with_capacity(hits.len());
-        for (hit, endpoints) in hits.into_iter().zip(endpoints) {
+        for (hit, edge) in hits.into_iter().zip(edges) {
+            let (endpoints, metadata) = match edge {
+                Some((source, target, metadata)) => (Some((source, target)), metadata),
+                None => (None, None),
+            };
             let response = match projection {
                 NeighborProjection::Edge => serde_json::json!({
                     "origin_id": node_id,
@@ -282,9 +304,57 @@ impl KgPack {
                     target_id: endpoints.map(|(_, target)| target),
                     hit,
                 })?,
+                NeighborProjection::Full => {
+                    let (properties, description) =
+                        bodies.get(&hit.node_id).cloned().unwrap_or_default();
+                    let mut response = to_json(&NeighborHitResponse {
+                        origin_id: node_id,
+                        source_id: endpoints.map(|(source, _)| source),
+                        target_id: endpoints.map(|(_, target)| target),
+                        hit,
+                    })?;
+                    response["properties"] = properties.unwrap_or(Value::Null);
+                    response["description"] = description.map_or(Value::Null, Value::String);
+                    response["edge_metadata"] = metadata.unwrap_or(Value::Null);
+                    response
+                }
             };
             responses.push(response);
         }
+        let hidden_incoming_edges = if memory_anchor {
+            let mut by_relation = serde_json::Map::new();
+            if let Some(scope) = &hidden_relations {
+                for relation in scope {
+                    by_relation.insert(relation.clone(), serde_json::json!(0_u64));
+                }
+            }
+            let mut total = 0_u64;
+            if count_hidden_incoming {
+                let namespaces: Vec<String> = token
+                    .visible_namespaces()
+                    .iter()
+                    .map(|namespace| namespace.as_str().to_string())
+                    .collect();
+                let counts = self
+                    .runtime
+                    .graph(token)?
+                    .count_hidden_incoming_memory_edges(
+                        &[node_id.to_string()],
+                        hidden_relations.as_deref(),
+                        &namespaces,
+                    )
+                    .await?;
+                for (_, relation, count) in counts {
+                    total = total.checked_add(count).ok_or_else(|| {
+                        RuntimeError::Internal("hidden incoming edge count overflow".into())
+                    })?;
+                    by_relation.insert(relation, serde_json::json!(count));
+                }
+            }
+            Some(serde_json::json!({ "total": total, "by_relation": by_relation }))
+        } else {
+            None
+        };
         if let Some(requested) = requested_limit {
             let report = LimitReport::new(requested, effective_limit.unwrap_or(requested)).value();
             let mut response = serde_json::json!({
@@ -295,6 +365,9 @@ impl KgPack {
             if scan_incomplete {
                 response["scan_incomplete"] = serde_json::json!(true);
             }
+            if let Some(hidden) = &hidden_incoming_edges {
+                response["hidden_incoming_edges"] = hidden.clone();
+            }
             if let Some(fields) = report.as_object() {
                 response
                     .as_object_mut()
@@ -303,7 +376,43 @@ impl KgPack {
             }
             return Ok(response);
         }
+        if let Some(hidden) = hidden_incoming_edges {
+            return Ok(serde_json::json!({
+                "neighbors": responses,
+                "next_after": null,
+                "hidden_incoming_edges": hidden,
+            }));
+        }
         to_json(&responses)
+    }
+
+    /// Each neighbor's properties and description, read once per distinct node across the
+    /// caller's visible namespaces. A note has properties and no description.
+    async fn neighbor_bodies(
+        &self,
+        token: &NamespaceToken,
+        mut ids: Vec<Uuid>,
+    ) -> Result<HashMap<Uuid, (Option<Value>, Option<String>)>, RuntimeError> {
+        ids.sort_unstable();
+        ids.dedup();
+        let mut bodies = HashMap::with_capacity(ids.len());
+        for entity in self
+            .runtime
+            .get_entities_by_ids_visible(token, &ids)
+            .await?
+        {
+            bodies.insert(entity.id, (entity.properties, entity.description));
+        }
+        let notes: Vec<Uuid> = ids
+            .into_iter()
+            .filter(|id| !bodies.contains_key(id))
+            .collect();
+        if !notes.is_empty() {
+            for note in self.runtime.notes(token)?.get_notes_batch(&notes).await? {
+                bodies.insert(note.id, (note.properties, None));
+            }
+        }
+        Ok(bodies)
     }
 
     fn parse_neighbor_cursor(raw: &str) -> Result<Option<NeighborCursor>, RuntimeError> {
