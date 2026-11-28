@@ -241,7 +241,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dimensions` and `device` values still select no provider, vector size or hardware:
   `[[engines]]` controls providers. A differing model name, dimensions that disagree with the
   default engine's declared dimensions, or any supplied device produces a startup warning;
-  agreement is silent. Unknown `[embed]` and `[embed.fields]` keys still warn and load (#6537).
+  agreement is silent. `embed.auto_embed = false` and non-default `embed.fields.include` selectors
+  are validated and accepted with a warning. Write-time embedding continues and entity vectors
+  use their usual inputs. Unknown `[embed]` and `[embed.fields]` keys still warn and load (#6537).
 
 ### Breaking (Rust crates)
 
