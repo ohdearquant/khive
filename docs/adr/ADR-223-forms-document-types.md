@@ -1,6 +1,6 @@
 # ADR-223: Forms Document Types
 
-- **Status:** Proposed
+- **Status:** Accepted 2026-11-28 (#6939)
 - **Date:** 2026-11-27
 - **Grounding commit:** `838beb7e5ab97299416b44e3cae7eab18e78244a`
 - **Serves:** issue [#6892](https://github.com/ohdearquant/khive/issues/6892) section 3 (part 2 of
