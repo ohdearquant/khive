@@ -19,20 +19,19 @@ use khive_runtime::{
 };
 use khive_score::DeterministicScore;
 use khive_storage::types::{PageRequest, TextQueryMode};
-use khive_storage::EntityFilter;
+use khive_storage::{EdgeRelation, EntityFilter};
 
 use super::common::{
     canonical_entity_kind, canonical_note_kind, deser, missing_kind_error, parse_relation,
     props_match, reconcile_entity_type, reconcile_specific, resolve_kind_spec, tags_match_any,
     to_json, validate_graph_read_kind, KindSpec, SearchParams,
 };
-use khive_storage::EdgeRelation;
+use crate::handler_defs::SEARCH_PARAMS;
+use crate::KgPack;
 
 /// Most targets one search hit carries over a followed relation. A hit with
 /// more reports `followed_truncated: true`.
 const FOLLOW_TARGET_CAP: u32 = 100;
-use crate::handler_defs::SEARCH_PARAMS;
-use crate::KgPack;
 
 /// Canonical search ranking fields shared by KG and coordinated search.
 /// These floats are wire projections only, never inputs to rank decisions.

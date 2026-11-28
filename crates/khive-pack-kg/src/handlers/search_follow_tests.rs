@@ -89,6 +89,28 @@ async fn follow_returns_the_targets_of_the_named_outgoing_relation() {
 }
 
 #[tokio::test]
+async fn follow_past_the_cap_returns_one_hundred_targets_and_says_truncated() {
+    let registry = configured();
+    let wording = concept(&registry, "printed wording sample").await;
+    for index in 0..101 {
+        let target = concept(&registry, &format!("Far Target {index}")).await;
+        link(&registry, &wording, &target, "extends").await;
+    }
+
+    let found = registry
+        .dispatch(
+            "search",
+            json!({"kind": "entity", "query": "printed wording", "follow": "extends"}),
+        )
+        .await
+        .expect("search with follow");
+    let row = hit(&found, &wording);
+    let followed = row["followed"].as_array().expect("followed rows");
+    assert_eq!(followed.len(), 100, "{row}");
+    assert_eq!(row["followed_truncated"], json!(true), "{row}");
+}
+
+#[tokio::test]
 async fn follow_on_a_note_search_returns_the_annotated_targets() {
     let registry = configured();
     let named = concept(&registry, "Named Concept").await;
