@@ -17,8 +17,9 @@ use khive_types::{
 };
 
 use crate::definition::{
-    canonical_json, compile_document, digest, fold, step_type_refs, Available, Compiled, Document,
-    OperationType, Refusal, StepType, Stored,
+    canonical_json, compile_document, digest, fold, named_fields, step_type_refs,
+    write_canonical_field_names, Available, Compiled, Document, OperationType, Refusal, StepType,
+    Stored,
 };
 use crate::frontier::{evaluate, GroupBy, Identity, Payload};
 use crate::resolve::{resolve, Decision, Subject, Terms};
@@ -54,7 +55,7 @@ const OBSERVED_AT: ParamDef = param(
 pub(crate) static OPERATION_HANDLERS: [HandlerDef; 7] = [
     HandlerDef {
         name: "operation.define",
-        description: "Publish operation types in the caller's namespace: slots, steps (who acts, after which steps, how many of a repeating slot), and rules that ask or skip a step on facts and on other steps. Step types may also be published on their own and pinned by a step of a type. Each step given inside a type is published as its own step type, and every step type a type uses is pinned by digest. A step that requires a value another step produces comes after it. A slot is given by a kind and a role with an optional qualifier, by a relation to another slot of the type, or by neither; a kind, role or relation a slot names must be a term of the namespace (forms.terms) by name or alias. Publishing the same type again is a no-op; a different type under a published version is refused.",
+        description: "Publish operation types in the caller's namespace: slots, steps (who acts, after which steps, how many of a repeating slot), and rules that ask or skip a step on facts and on other steps. Step types may also be published on their own and pinned by a step of a type. Each step given inside a type is published as its own step type, and every step type a type uses is pinned by digest. A step that requires a value another step produces comes after it. A requirement, product or supply names a field by its canonical name in any case or spacing, and the canonical name is what is stored. A slot is given by a kind and a role with an optional qualifier, by a relation to another slot of the type, or by neither; a kind, role or relation a slot names must be a term of the namespace (forms.terms) by name or alias. Publishing the same type again is a no-op; a different type under a published version is refused.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[param(
@@ -592,15 +593,21 @@ impl OperationPack {
         registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
-        let source = Value::Object(params.object("document")?);
+        let mut source = Value::Object(params.object("document")?);
         let namespace = token.namespace().as_str().to_owned();
+        let fields = read_fields(&params, &named_fields(&source), registry, token).await?;
+        let canonical: BTreeMap<String, String> = fields
+            .iter()
+            .map(|(folded, (name, _))| (folded.clone(), name.clone()))
+            .collect();
+        write_canonical_field_names(&mut source, &canonical);
         let held = self
             .published_step_types(&namespace, &step_type_refs(&source))
             .await?;
         let document =
             compile_document(&source, &held).map_err(|refusal| params.refused(refusal))?;
         check_terms(&params, &document.operation_types, registry, token).await?;
-        check_fields(&params, &document, registry, token).await?;
+        check_value_types(&params, &document, &fields)?;
         let now = now_us();
         let verb = params.verb.clone();
         let unit_verb = verb.clone();
@@ -1579,35 +1586,17 @@ fn summary(type_: &Compiled) -> Value {
     })
 }
 
-/// Refuse a requirement or product that names a field the forms pack does not hold, and a
-/// requirement whose value type is not the field's (ADR-222 A2.2). Each distinct field is read
-/// once, through `forms.neighbourhood`, and must be named by its canonical name.
-async fn check_fields(
+/// Refuse a requirement or product that names a field the forms pack does not hold, or names
+/// it by anything but its canonical name in some case and spacing. Each distinct name is read
+/// once, through `forms.neighbourhood`. Returns each field by its folded name: its canonical
+/// name and its value type.
+async fn read_fields(
     params: &Params,
-    document: &Document,
+    named: &BTreeSet<String>,
     registry: &VerbRegistry,
     token: &NamespaceToken,
-) -> Result<(), RuntimeError> {
-    let mut step_types = Vec::new();
-    for stored in document.step_types.iter().chain(
-        document
-            .operation_types
-            .iter()
-            .flat_map(|type_| type_.step_types.iter()),
-    ) {
-        let step_type: StepType = serde_json::from_slice(&stored.bytes)
-            .map_err(|e| RuntimeError::Internal(format!("step type {}: {e}", stored.id)))?;
-        step_types.push(step_type);
-    }
-    let mut fields: BTreeMap<String, String> = BTreeMap::new();
-    let named = step_types.iter().flat_map(|step_type| {
-        step_type
-            .requires
-            .iter()
-            .map(|need| need.field.clone())
-            .chain(step_type.produces.iter().map(|made| made.field.clone()))
-    });
-    let named: BTreeSet<String> = named.collect();
+) -> Result<BTreeMap<String, (String, String)>, RuntimeError> {
+    let mut fields = BTreeMap::new();
     for field in named {
         let unknown = |why: &str| {
             params.refused(Refusal::new(
@@ -1633,7 +1622,7 @@ async fn check_fields(
             return Err(unknown("names a forms node that is not a field"));
         }
         let canonical = reply["field"]["name"].as_str().unwrap_or_default();
-        if fold(canonical) != fold(&field) {
+        if fold(canonical) != fold(field) {
             return Err(unknown(&format!(
                 "is not a canonical field name (it answers to \"{canonical}\")"
             )));
@@ -1642,13 +1631,31 @@ async fn check_fields(
             .as_str()
             .unwrap_or_default()
             .to_owned();
-        fields.insert(field, value_type);
+        fields.insert(fold(canonical), (canonical.to_owned(), value_type));
     }
-    for step_type in &step_types {
+    Ok(fields)
+}
+
+/// Refuse a requirement whose value type is not its field's (ADR-222 A2.2), the fields being
+/// those `read_fields` returned. A step type pinned from the namespace was checked when it was
+/// published.
+fn check_value_types(
+    params: &Params,
+    document: &Document,
+    fields: &BTreeMap<String, (String, String)>,
+) -> Result<(), RuntimeError> {
+    for stored in document.step_types.iter().chain(
+        document
+            .operation_types
+            .iter()
+            .flat_map(|type_| type_.step_types.iter()),
+    ) {
+        let step_type: StepType = serde_json::from_slice(&stored.bytes)
+            .map_err(|e| RuntimeError::Internal(format!("step type {}: {e}", stored.id)))?;
         for need in &step_type.requires {
             let held = fields
-                .get(&need.field)
-                .map(String::as_str)
+                .get(&fold(&need.field))
+                .map(|(_, value_type)| value_type.as_str())
                 .unwrap_or_default();
             if held != need.value_type {
                 return Err(params.refused(Refusal::new(

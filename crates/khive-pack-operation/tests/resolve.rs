@@ -575,6 +575,18 @@ async fn define_names_only_loaded_fields_by_their_canonical_name_and_value_type(
         )
         .await;
     assert_eq!(reply["published"][0]["id"], "t", "{reply}");
+    // The canonical name is what is stored: the type written with it is the one published.
+    let again = store
+        .call(
+            "operation.define",
+            define(flow_document("t", ID, "identifier", ID)),
+        )
+        .await;
+    assert_eq!(again["published"], json!([]), "{again}");
+    assert_eq!(
+        again["already_published"][0]["digest"], reply["published"][0]["digest"],
+        "{again}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

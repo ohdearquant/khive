@@ -686,8 +686,9 @@ fn step_spec(type_id: &str, step: StepInput, available: &Available) -> Result<St
     Ok(spec)
 }
 
-/// A supply names a step of the type that produces `field` about the same slot this step
-/// requires `as` about.
+/// A supply names a step of the type that produces `field` about a slot this step requires
+/// `as` about. A step may require `as` about more than one slot; the requirement supplied is
+/// the one whose slot the producer produces `field` about.
 fn check_supply(
     type_id: &str,
     step: &StepSpec,
@@ -712,11 +713,12 @@ fn check_supply(
             ),
         ));
     }
-    let Some(need) = step
+    let needs: Vec<&Requirement> = step
         .requires
         .iter()
-        .find(|need| need.field == supply.as_field)
-    else {
+        .filter(|need| need.field == supply.as_field)
+        .collect();
+    if needs.is_empty() {
         return Err(Refusal::new(
             "unknown_supply",
             format!(
@@ -724,13 +726,13 @@ fn check_supply(
                 step.name, supply.as_field
             ),
         ));
-    };
-    let mut made = from
+    }
+    let made: Vec<&Product> = from
         .produces
         .iter()
         .filter(|made| made.field == supply.field)
-        .peekable();
-    if made.peek().is_none() {
+        .collect();
+    if made.is_empty() {
         return Err(Refusal::new(
             "unknown_supply",
             format!(
@@ -739,14 +741,21 @@ fn check_supply(
             ),
         ));
     }
-    if !made.any(|made| made.slot == need.slot) {
+    if !needs
+        .iter()
+        .any(|need| made.iter().any(|made| made.slot == need.slot))
+    {
+        let about: Vec<&str> = needs
+            .iter()
+            .map(|need| need.slot.as_deref().unwrap_or("the operation"))
+            .collect();
         return Err(Refusal::new(
             "supply_slot_mismatch",
             format!(
                 "{type_id}: step {} requires {} about {}, but {} produces {} about another slot",
                 step.name,
                 supply.as_field,
-                need.slot.as_deref().unwrap_or("the operation"),
+                about.join(" or "),
                 supply.from,
                 supply.field
             ),
@@ -1006,6 +1015,85 @@ pub(crate) fn fold(text: &str) -> String {
         .map(str::to_lowercase)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Visit each field name a document gives: the field of every requirement and product of its
+/// step types and of the steps of its operation types, and the `field` and `as` of every
+/// supply. `visit` is told whether the name is a supply's.
+fn each_field_name(document: &mut Value, visit: &mut dyn FnMut(&mut Value, bool)) {
+    let mut visit_step = |step: &mut Value| {
+        for (list, keys) in [
+            ("requires", &["field"][..]),
+            ("produces", &["field"][..]),
+            ("supplies", &["field", "as"][..]),
+        ] {
+            let entries = step
+                .get_mut(list)
+                .and_then(Value::as_array_mut)
+                .into_iter()
+                .flatten();
+            for entry in entries {
+                for key in keys {
+                    if let Some(name) = entry.get_mut(*key) {
+                        visit(name, list == "supplies");
+                    }
+                }
+            }
+        }
+    };
+    let step_types = document
+        .get_mut("step_types")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten();
+    for step_type in step_types {
+        visit_step(step_type);
+    }
+    let types = document
+        .get_mut("operation_types")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten();
+    for type_ in types {
+        let steps = type_
+            .get_mut("steps")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten();
+        for step in steps {
+            visit_step(step);
+        }
+    }
+}
+
+/// The field names a document's requirements and products give, as written.
+pub(crate) fn named_fields(document: &Value) -> BTreeSet<String> {
+    let mut document = document.clone();
+    let mut named = BTreeSet::new();
+    each_field_name(&mut document, &mut |name, supply| {
+        if let (false, Some(name)) = (supply, name.as_str()) {
+            named.insert(name.to_owned());
+        }
+    });
+    named
+}
+
+/// Write each field name of a document, a supply's included, as the canonical name in
+/// `canonical` (keyed by folded name) that it folds to, so that a requirement, a product and a
+/// supply naming one field in another case or spacing compare equal and the stored bytes carry
+/// the canonical name. A name that folds to none is left as written.
+pub(crate) fn write_canonical_field_names(
+    document: &mut Value,
+    canonical: &BTreeMap<String, String>,
+) {
+    each_field_name(document, &mut |name, _| {
+        if let Some(canonical) = name
+            .as_str()
+            .and_then(|written| canonical.get(&fold(written)))
+        {
+            *name = Value::String(canonical.clone());
+        }
+    });
 }
 
 /// The first slot, in name order, whose chain of `defined_by` relations returns to it.
@@ -1781,5 +1869,66 @@ mod tests {
         let stored: Value =
             serde_json::from_slice(&ordered.operation_type.bytes).expect("stored bytes");
         assert!(stored["steps"][1].get("derived_after").is_none());
+
+        // A step that requires one field about two slots is supplied the requirement whose
+        // slot the producer makes the field about.
+        let two_slots = json!([{"field": "r", "slot": "x", "value_type": "text"},
+            {"field": "r", "slot": "y", "value_type": "text"}]);
+        let supplied = one(flowing(
+            json!({"produces": [{"field": "p", "slot": "y", "class": "read"}]}),
+            json!({"requires": two_slots.clone(), "supplies": [{"from": "a", "field": "p", "as": "r"}]}),
+        ))
+        .expect("compiles");
+        assert_eq!(supplied.definition.steps[1].derived_after, vec!["a"]);
+        let refusal = one(flowing(
+            json!({"produces": [{"field": "p", "class": "read"}]}),
+            json!({"requires": two_slots, "supplies": [{"from": "a", "field": "p", "as": "r"}]}),
+        ))
+        .expect_err("no requirement about the operation");
+        assert_eq!(refusal.code, "supply_slot_mismatch", "{refusal}");
+        assert!(refusal.message.contains("about x or y"), "{refusal}");
+    }
+
+    #[test]
+    fn field_names_are_written_canonically_before_the_type_is_stored() {
+        let mut document = json!({"operation_types": [flowing(
+            json!({"produces": [{"field": "Case  Number", "class": "stated"}]}),
+            json!({"requires": [{"field": "CASE number", "value_type": "text"}]}),
+        )]});
+        assert_eq!(
+            named_fields(&document),
+            BTreeSet::from(["CASE number".to_owned(), "Case  Number".to_owned()])
+        );
+        let compiled = |document: &Value| {
+            compile_document(document, &Available::new())
+                .expect("compiles")
+                .operation_types
+                .into_iter()
+                .next()
+                .expect("one type")
+        };
+        // As written, the two names compare unequal and nothing is derived.
+        assert!(compiled(&document).definition.steps[1]
+            .derived_after
+            .is_empty());
+
+        let canonical = BTreeMap::from([("case number".to_owned(), "case number".to_owned())]);
+        write_canonical_field_names(&mut document, &canonical);
+        let type_ = compiled(&document);
+        assert_eq!(type_.definition.steps[1].derived_after, vec!["a"]);
+        let stored: Value = serde_json::from_slice(&type_.operation_type.bytes).expect("bytes");
+        assert_eq!(stored["steps"][1]["derived_after"], json!(["a"]));
+        let steps: Vec<Value> = type_
+            .step_types
+            .iter()
+            .map(|step| serde_json::from_slice(&step.bytes).expect("step bytes"))
+            .collect();
+        assert_eq!(steps[0]["produces"][0]["field"], "case number");
+        assert_eq!(steps[1]["requires"][0]["field"], "case number");
+        assert!(
+            !type_.operation_type.source.contains("CASE"),
+            "{}",
+            type_.operation_type.source
+        );
     }
 }

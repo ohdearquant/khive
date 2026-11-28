@@ -701,44 +701,56 @@ async fn a_step_waits_on_the_step_that_produces_what_it_requires() {
         )
         .await;
     assert_eq!(loaded["loaded"], true, "{loaded}");
-    // `issue` requires what `assign` produces and names no `after`.
-    let document = json!({"operation_types": [{
-        "id": "numbered-case",
-        "version": 1,
-        "slots": [{"name": "clerk"}],
-        "steps": [
-            {"name": "assign", "by": "clerk", "produces": [{"field": field, "class": "stated"}]},
-            {"name": "issue", "by": "clerk", "requires": [{"field": field, "value_type": "identifier"}], "outcome": true}
-        ]
-    }]});
-    store
-        .call(author(), "operation.define", json!({"document": document}))
-        .await;
-    let opened = store
-        .call(
-            office(),
-            "operation.open",
-            json!({"type": "numbered-case", "bindings": {"clerk": person("c1")}}),
-        )
-        .await;
-    let operation = opened["operation_id"].as_str().expect("id").to_owned();
+    // `issue` requires what `assign` produces and names no `after`; the second type names the
+    // field in another case and spacing on each side.
+    for (id, produced, required) in [
+        ("numbered-case", field, field),
+        ("mixed-case", "Case  Number", "CASE number"),
+    ] {
+        let document = json!({"operation_types": [{
+            "id": id,
+            "version": 1,
+            "slots": [{"name": "clerk"}],
+            "steps": [
+                {"name": "assign", "by": "clerk", "produces": [{"field": produced, "class": "stated"}]},
+                {"name": "issue", "by": "clerk", "requires": [{"field": required, "value_type": "identifier"}], "outcome": true}
+            ]
+        }]});
+        store
+            .call(author(), "operation.define", json!({"document": document}))
+            .await;
+        let opened = store
+            .call(
+                office(),
+                "operation.open",
+                json!({"type": id, "bindings": {"clerk": person("c1")}}),
+            )
+            .await;
+        let operation = opened["operation_id"].as_str().expect("id").to_owned();
 
-    let before = store.frontier(&operation, json!({})).await;
-    let owed = items_of(&before, "act_owed");
-    assert_eq!(owed.len(), 1, "{before}");
-    assert_eq!(owed[0]["step"], "assign");
-    let blocked = items_of(&before, "act_blocked");
-    assert_eq!(blocked.len(), 1, "{before}");
-    assert_eq!(blocked[0]["step"], "issue");
-    assert_eq!(blocked[0]["waits_on"][0]["step"], "assign", "{before}");
-    assert_eq!(status(&before, "issue"), "blocked");
+        let before = store.frontier(&operation, json!({})).await;
+        let owed = items_of(&before, "act_owed");
+        assert_eq!(owed.len(), 1, "{id}: {before}");
+        assert_eq!(owed[0]["step"], "assign");
+        let blocked = items_of(&before, "act_blocked");
+        assert_eq!(blocked.len(), 1, "{id}: {before}");
+        assert_eq!(blocked[0]["step"], "issue");
+        assert_eq!(
+            blocked[0]["waits_on"][0]["step"], "assign",
+            "{id}: {before}"
+        );
+        assert_eq!(status(&before, "issue"), "blocked");
 
-    store
-        .record(&operation, json!([act("assign-1", "assign", None)]))
-        .await;
-    let after = store.frontier(&operation, json!({})).await;
-    let owed = items_of(&after, "act_owed");
-    assert_eq!(owed.len(), 1, "{after}");
-    assert_eq!(owed[0]["step"], "issue");
-    assert!(items_of(&after, "act_blocked").is_empty(), "{after}");
+        store
+            .record(
+                &operation,
+                json!([act(&format!("assign-{id}"), "assign", None)]),
+            )
+            .await;
+        let after = store.frontier(&operation, json!({})).await;
+        let owed = items_of(&after, "act_owed");
+        assert_eq!(owed.len(), 1, "{id}: {after}");
+        assert_eq!(owed[0]["step"], "issue");
+        assert!(items_of(&after, "act_blocked").is_empty(), "{id}: {after}");
+    }
 }
