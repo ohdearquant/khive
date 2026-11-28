@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `text_altered` says when that changed anything; the text is returned as untrusted data. It is a
   read: a `[[git_write.allowed]]` row with `access = "read"` admits it, and it writes no receipt.
 
+### Breaking (Rust crates)
+
+- `khive_storage::scope_request_correlation` and `khive_storage::current_request_correlation`
+  are now `khive_storage::scope_request_id` and `khive_storage::current_request_id`. These names
+  match `request_id` in daemon frames and writer attempt rows (#6773).
+
 ## [0.23.0] - 2026-11-26
 
 ### Added
