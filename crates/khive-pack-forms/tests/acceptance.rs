@@ -1700,8 +1700,14 @@ async fn the_semantic_rung_runs_only_when_named_and_never_outranks_a_lexical_hit
         hits[1]["rank"].as_u64() > hits[0]["rank"].as_u64(),
         "a semantic hit ranks below every lexical one: {reply}"
     );
+    // Letter counts of "account number" and "signature date": 11 / 19.
     let similarity = hits[1]["similarity"].as_f64().expect("similarity");
-    assert!(similarity > 0.0 && similarity <= 1.0, "{reply}");
+    assert!((similarity - 11.0 / 19.0).abs() < 1e-9, "{reply}");
+    assert_eq!(reply["semantic"]["min_similarity"], 0.5, "{reply}");
+    assert_eq!(
+        reply["semantic"]["embedded"], 2,
+        "the text and the one wording of the one field no lexical rung found: {reply}"
+    );
     let again = store
         .call(
             "forms.resolve",
@@ -1709,6 +1715,108 @@ async fn the_semantic_rung_runs_only_when_named_and_never_outranks_a_lexical_hit
         )
         .await;
     assert_eq!(again, reply, "same graph, same answer");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_semantic_match_needs_the_similarity_floor() {
+    let store = with_wording_forms(Store::with_letter_embedder()).await;
+    let resolve = |text: &str, floor: f64| json!({"text": text, "min_rung": "semantic", "min_similarity": floor});
+
+    // "signature date" sits at 11 / 19 from "account number".
+    let above = store
+        .call("forms.resolve", resolve("account number", 0.57))
+        .await;
+    assert_eq!(field_hits(&above).len(), 2, "{above}");
+    let below = store
+        .call("forms.resolve", resolve("account number", 0.6))
+        .await;
+    let hits = field_hits(&below);
+    assert_eq!(hits.len(), 1, "{below}");
+    assert_eq!(hits[0]["matched_by"], "words", "{below}");
+    assert_eq!(below["ambiguous"], false, "{below}");
+    assert_eq!(below["semantic"]["min_similarity"], 0.6, "{below}");
+    assert_eq!(below["semantic"]["embedded"], 2, "{below}");
+
+    // No lexical rung finds a field for this text; a floor no wording reaches
+    // leaves it a miss, which names its nearest fields.
+    let miss = store
+        .call("forms.resolve", resolve("routing number", 0.99))
+        .await;
+    assert_eq!(miss["total"], 0, "{miss}");
+    assert_eq!(
+        miss["near"][0]["name"], "recipient account number",
+        "{miss}"
+    );
+    assert_eq!(
+        miss["semantic"]["embedded"], 4,
+        "the text, both wordings of the account field and the date field's one: {miss}"
+    );
+
+    for floor in [json!(0), json!(-0.1), json!(1.5), json!("high")] {
+        let message = store
+            .refused(
+                "forms.resolve",
+                json!({"text": "date", "min_similarity": floor}),
+            )
+            .await;
+        assert!(
+            message.contains("min_similarity must be a number above 0 and at most 1"),
+            "{floor}: {message}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_load_giving_one_new_alias_to_two_reused_fields_is_refused_whole() {
+    let store = Store::new();
+    store
+        .call("forms.load", json!({"document": form_a()}))
+        .await;
+    let revision = json!({
+        "form_id": A,
+        "revision": "2026-09",
+        "title": "Outgoing international wire",
+        "source": {"url": "https://forms.example/wire-1-2026-09.pdf", "sha256": "8".repeat(64)},
+        "fields": [
+            {
+                "name": "sender name",
+                "definition": "Full legal name of the person sending the money.",
+                "value_type": "text",
+                "aliases": ["party name"]
+            },
+            {
+                "name": "recipient name",
+                "definition": "Full legal name of the person receiving the money.",
+                "value_type": "text",
+                "aliases": ["party name"]
+            }
+        ],
+        "items": [
+            item("Sender name", 1, 1, "text", "sender name"),
+            item("Recipient name", 1, 2, "text", "recipient name")
+        ]
+    });
+    let message = store
+        .refused("forms.load", json!({"document": revision}))
+        .await;
+    assert!(
+        message.contains("the document gives \"party name\" to more than one field"),
+        "{message}"
+    );
+    for name in ["sender name", "recipient name"] {
+        let field = store
+            .call("forms.neighbourhood", json!({"node": name}))
+            .await;
+        assert_eq!(
+            field["field"]["aliases"],
+            json!([name]),
+            "the refused load added no alias: {field}"
+        );
+    }
+    let resolved = store
+        .call("forms.resolve", json!({"text": "party name"}))
+        .await;
+    assert_eq!(resolved["total"], 0, "{resolved}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

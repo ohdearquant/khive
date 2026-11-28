@@ -16,7 +16,8 @@ use crate::strict::StrictEntity;
 ///
 /// Both lists are omitted from the wire when empty, so an entity that holds
 /// neither serializes exactly as the bare entity record. Comparisons read each
-/// list as a set; see [`EntityRecord::same_names`].
+/// list as a set; see [`EntityRecord::same_names`]. A record that names one
+/// key or one alias twice, whatever the origins, is refused when it is read.
 #[derive(Clone, Debug, Serialize)]
 pub struct EntityRecord {
     /// The entity row.
@@ -58,7 +59,9 @@ impl<'de> Deserialize<'de> for EntityRecord {
     where
         D: Deserializer<'de>,
     {
-        StrictEntity::deserialize(deserializer).map(Into::into)
+        StrictEntity::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -73,4 +76,10 @@ pub(crate) fn same_set<T: Ord + Clone>(first: &[T], second: &[T]) -> bool {
     first.sort();
     second.sort();
     first == second
+}
+
+/// The first name a list holds twice.
+pub(crate) fn repeated<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let mut seen = std::collections::BTreeSet::new();
+    names.into_iter().find(|name| !seen.insert(*name))
 }

@@ -4,7 +4,7 @@ Delete and merge operations carry full stage-time preimages so later review, con
 
 ## `DeleteOp`
 
-`DeleteOp` contains a target ID, hard/soft flag, and required `DeletePreimage`. The preimage is an entity, note, or edge tagged by `substrate`; `substrate` avoids colliding with the embedded entity/note record's own `kind` field. An entity preimage is an `EntityRecord`: the entity's fields, plus `keys` (the keys it holds) and `aliases` (its alias set with origins), each omitted when empty. A delete is applied only when the live entity holds exactly those keys and aliases, compared as sets. A merge preimage records both entities the same way.
+`DeleteOp` contains a target ID, hard/soft flag, and required `DeletePreimage`. The preimage is an entity, note, or edge tagged by `substrate`; `substrate` avoids colliding with the embedded entity/note record's own `kind` field. An entity preimage is an `EntityRecord`: the entity's fields, plus `keys` (the keys it holds) and `aliases` (its alias set with origins), each omitted when empty. A record that names one key or one alias twice is refused when it is read. A delete is applied only when the live entity holds exactly those keys and aliases, compared as sets. A merge preimage records both entities the same way.
 
 Custom deserialization requires `target_id` to equal the embedded record ID. A missing preimage, mismatched ID, unknown field, invalid note salience/decay factor, or invalid edge weight is a parse error. Because `preimage` is not optional, a delete without captured prior state is unrepresentable.
 
