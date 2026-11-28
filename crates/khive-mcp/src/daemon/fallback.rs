@@ -1,4 +1,5 @@
 use super::*;
+use serde_json::Value;
 
 // ── local-dispatch fallback telemetry ─────────────────────────────────────────
 //
@@ -447,6 +448,48 @@ pub(super) fn fallback_or_reject(
         )));
     }
     None
+}
+
+pub(crate) fn daemon_reported_pid(detail: Option<&Value>) -> Option<u32> {
+    let pid = detail?.get("daemon_pid")?.as_u64()?;
+    u32::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
+// A reported PID is diagnostic only, never authority to signal a process.
+pub(crate) fn config_mismatch_remedy(daemon_pid: Option<u32>) -> String {
+    match daemon_pid {
+        Some(pid) => format!(
+            "daemon reports PID {pid}; stop or restart that daemon \
+             (through its supervisor if managed), then retry"
+        ),
+        None => "daemon PID is unavailable; stop or restart the daemon serving this \
+                 configuration (through its supervisor if managed), then retry"
+            .to_owned(),
+    }
+}
+
+pub(super) fn config_mismatch_fallback_or_reject(
+    config_id_client: &str,
+    config_id_daemon: Option<&str>,
+    namespace_client: &str,
+    daemon_pid: Option<u32>,
+) -> Option<Result<String, McpError>> {
+    let mut outcome = fallback_or_reject(
+        FallbackReason::ConfigMismatch,
+        config_id_client,
+        config_id_daemon,
+        namespace_client,
+    );
+    if let Some(Err(error)) = &mut outcome {
+        error.message = format!("{}; {}", error.message, config_mismatch_remedy(daemon_pid)).into();
+        if let Some(data) = error.data.as_mut().and_then(Value::as_object_mut) {
+            data.insert("message".into(), Value::String(error.message.to_string()));
+            if let Some(pid) = daemon_pid {
+                data.insert("daemon_pid".into(), Value::from(pid));
+            }
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]
