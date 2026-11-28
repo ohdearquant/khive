@@ -422,6 +422,7 @@ Amendments to accepted records:
 - [ADR-182 Amendment 21](ADR-182-git-dev-loop-verbs.md#amendment-21-2026-11-25-deleting-a-local-branch) (2026-11-25): accepted; `git.branch_delete` deletes one local branch by compare-and-delete at the commit the caller names, refusing while a worktree has it checked out or an open pull request has it as its head, and never deletes on the remote.
 - [ADR-182 Amendment 22](ADR-182-git-dev-loop-verbs.md#amendment-22-2026-11-27-reading-an-issue) (2026-11-27): accepted; `git.issue` reads one issue, its whole body and its comments up to ten pages of one hundred with the platform's count beside them, removes hidden characters and terminal escapes and says so, and returns the text as untrusted data with no receipt.
 - [ADR-212 Amendment 1](ADR-212-expendable-event-retention-class.md#amendment-1-2026-10-28----an-interim-historical-prune-before-implementation) (2026-10-28): proposed record of the interim historical prune run before implementation, its edge-writer precondition and compensating read; it authorizes no further interim run.
+- [ADR-221 Amendment 1](ADR-221-entity-keys-and-aliases.md#amendment-1-2026-11-27-a-key-added-to-a-live-entity) (2026-11-27): proposed runtime method that adds a caller key to a live entity under a keyed create's rules: the same limits and secret scan, uniqueness over held rows of the entity's own kind, nothing written for a key it already holds, and `entity_deleted` or `entity_merged` for an entity that is not live.
 
 Amendments inside records whose own status is Proposed:
 
