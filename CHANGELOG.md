@@ -61,6 +61,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   holds in the same vocabulary is refused, the same name in another vocabulary is accepted, and a
   vocabulary named after an operation node type is refused (`reserved_vocabulary`). Export and
   replay keep the names (ADR-222 Amendment 2).
+- `forms.load` takes `narrows` on a field: the one ordinary field of the same value type, loaded
+  before or listed earlier in the document, whose values include every value of this one. The load
+  holds it as a contains edge from the broader field. A narrows naming the field itself, a field
+  the document leaves undecided, a general wording, several fields, a field of another value type,
+  a second broader field or one that would close a cycle is refused and writes nothing, and the
+  same narrows given again writes nothing; `forms.add_item` and `forms.same` refuse it.
+  `forms.neighbourhood` on a field gives the field it narrows as `broader` and the fields that
+  narrow it as `narrower`, and `general` lists only general wordings. `operation.frontier` follows
+  the chain of broader fields, nearest first, for `stated_in_part` (ADR-223 Amendment 1).
 - `git.pr_list` and `git.issue_list` list the pull requests or issues of a configured repository
   in the requested state (`open` unless `closed` or `all` is named), newest created first, one
   hundred to a page for at most ten pages, and say in `truncated` whether more matched.
