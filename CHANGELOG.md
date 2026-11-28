@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state a parent of the field. The frontier names the source order and the form revisions it read.
   `operation.define` publishes a `source_order` (`version`, `places`) and refuses a place that is
   not a loaded document type or system (ADR-222 Amendments 1 and 2).
+- The workspace mirror accepts an optional per-file byte limit,
+  `KHIVE_MIRROR_WORKSPACE_MAX_FILE_BYTES`. Unset keeps today's behaviour (no
+  limit). A file over the limit is not committed: the pass reports it in
+  `MirrorPassSummary::oversized_files` with its masked path and the bytes
+  observed (a lower bound), and its cursor is unchanged. An invalid value is
+  refused as `WorkspaceMirrorConfigError::InvalidMaxFileBytes`.
 
 ## [0.24.0] - 2026-11-28
 

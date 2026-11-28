@@ -705,3 +705,314 @@ async fn mirror_no_current_diagnostic_masks_credential_path() {
     .await;
     mirror_done(NAME);
 }
+
+#[tokio::test]
+async fn mirror_file_limit_preserves_cursor_and_allows_retry() {
+    const NAME: &str = "mirror_file_limit_preserves_cursor_and_allows_retry";
+    if mirror_child(NAME) {
+        return;
+    }
+    mirror_bounded(async {
+        let tree = MirrorTree::new();
+        let limited_path = ".khive/notes/limited.md";
+        let at_limit_path = ".khive/notes/at-limit.md";
+        tree.write(limited_path, "initial-long-content");
+        let (runtime, registry, token) = mirror_fixture();
+        let mut config = crate::WorkspaceMirrorConfig::from_defaults_for_test().unwrap();
+        config.set_max_file_bytes_for_test(None);
+        let baseline = crate::mirror::mirror_directory_once(
+            &runtime, &registry, &token, &tree.0, &config,
+        )
+        .await
+        .expect("unlimited positive baseline");
+        assert_eq!(baseline.max_file_bytes, None);
+        assert!(baseline.oversized_files.is_empty());
+        assert_eq!(baseline.committed, 1);
+        let (limited_uri, limited_key) = mirror_slot(&tree, limited_path, &token);
+        let before_cursor = read(&runtime, &limited_key)
+            .await
+            .expect("positive baseline must create a cursor");
+        let before_docs = mirror_documents(&runtime, &token).await;
+        let initial_document = before_docs
+            .iter()
+            .find(|doc| doc["properties"]["source_uri"].as_str() == Some(limited_uri.as_str()))
+            .expect("unlimited positive baseline must create a document");
+        assert_eq!(initial_document["description"].as_str(), Some("initial-long-content"));
+        let before_id = initial_document["id"].as_str().unwrap().to_owned();
+
+        tree.write(limited_path, "12345");
+        tree.write(at_limit_path, "four");
+        config.set_max_file_bytes_for_test(Some(4));
+        let limited = crate::mirror::mirror_directory_once(
+            &runtime, &registry, &token, &tree.0, &config,
+        )
+        .await
+        .expect("oversized file must be skipped");
+        assert_eq!(limited.max_file_bytes, Some(4));
+        assert_eq!(limited.committed, 1, "a file at the limit must commit");
+        assert_eq!(limited.oversized_files.len(), 1);
+        assert_eq!(limited.oversized_files[0].path, std::path::PathBuf::from(limited_path));
+        assert_eq!(limited.oversized_files[0].observed_bytes, 5);
+        assert_eq!(read(&runtime, &limited_key).await.as_ref(), Some(&before_cursor));
+        let after_docs = mirror_documents(&runtime, &token).await;
+        let limited_docs: Vec<_> = after_docs
+            .iter()
+            .filter(|doc| doc["properties"]["source_uri"].as_str() == Some(limited_uri.as_str()))
+            .collect();
+        assert_eq!(limited_docs.len(), 1, "oversized file must not create a version");
+        assert_eq!(limited_docs[0]["id"].as_str(), Some(before_id.as_str()));
+        assert_eq!(limited_docs[0]["description"].as_str(), Some("initial-long-content"));
+        let (at_uri, at_key) = mirror_slot(&tree, at_limit_path, &token);
+        assert!(read(&runtime, &at_key).await.is_some());
+        assert!(after_docs.iter().any(|doc| {
+            doc["properties"]["source_uri"].as_str() == Some(at_uri.as_str())
+                && doc["description"].as_str() == Some("four")
+        }));
+
+        tree.write(limited_path, "new");
+        let retried = crate::mirror::mirror_directory_once(
+            &runtime, &registry, &token, &tree.0, &config,
+        )
+        .await
+        .expect("file under the limit must be retried");
+        assert_eq!(retried.max_file_bytes, Some(4));
+        assert!(retried.oversized_files.is_empty());
+        assert_eq!(retried.committed, 1);
+        assert_ne!(read(&runtime, &limited_key).await, Some(before_cursor));
+        assert!(mirror_documents(&runtime, &token).await.iter().any(|doc| {
+            doc["properties"]["source_uri"].as_str() == Some(limited_uri.as_str())
+                && doc["description"].as_str() == Some("new")
+        }));
+    })
+    .await;
+    mirror_done(NAME);
+}
+
+#[tokio::test]
+async fn mirror_oversize_diagnostic_masks_credential_path() {
+    const NAME: &str = "mirror_oversize_diagnostic_masks_credential_path";
+    if mirror_child(NAME) {
+        return;
+    }
+    mirror_bounded(async {
+        const SECRET: &str = concat!("gh", "p_", "abcdefghijklmnopqrstuvwxyz0123456789");
+        let tree = MirrorTree::new();
+        let relative = format!(".khive/notes/{SECRET}.md");
+        tree.write(&relative, "12345");
+        tree.write(".khive/notes/safe.md", "okay");
+        let (runtime, registry, token) = mirror_fixture();
+        let mut config = crate::WorkspaceMirrorConfig::from_defaults_for_test().unwrap();
+        config.set_max_file_bytes_for_test(Some(4));
+        let summary = crate::mirror::mirror_directory_once(
+            &runtime, &registry, &token, &tree.0, &config,
+        )
+        .await
+        .expect("oversized file must be skipped");
+        assert_eq!(summary.max_file_bytes, Some(4));
+        assert_eq!(summary.committed, 1);
+        assert_eq!(summary.oversized_files.len(), 1);
+        let report = &summary.oversized_files[0];
+        assert_eq!(report.observed_bytes, 5);
+        let shown = report.path.to_string_lossy();
+        assert!(!shown.contains(SECRET));
+        assert_eq!(
+            shown,
+            khive_runtime::secret_gate::mask_for_redaction_surface(
+                khive_runtime::secret_gate::RedactionSurface::WorkspaceMirror,
+                &relative,
+            ),
+        );
+        assert!(!format!("{summary:?}").contains(SECRET));
+        let (_, key) = mirror_slot(&tree, &relative, &token);
+        assert!(read(&runtime, &key).await.is_none());
+    })
+    .await;
+    mirror_done(NAME);
+}
+
+#[tokio::test]
+async fn mirror_growth_during_read_is_skipped_and_retryable() {
+    const NAME: &str = "mirror_growth_during_read_is_skipped_and_retryable";
+    if mirror_child(NAME) {
+        return;
+    }
+    mirror_bounded(async {
+        use std::io::Write;
+
+        let tree = MirrorTree::new();
+        let growing = ".khive/notes/a-growing.md";
+        let healthy = ".khive/notes/z-healthy.md";
+        tree.write(growing, "old");
+        let (runtime, registry, token) = mirror_fixture();
+        let mut config = crate::WorkspaceMirrorConfig::from_defaults_for_test().unwrap();
+        let baseline = crate::mirror::mirror_directory_once(
+            &runtime, &registry, &token, &tree.0, &config,
+        )
+        .await
+        .expect("positive unlimited baseline");
+        assert_eq!(baseline.committed, 1);
+        let (growing_uri, growing_key) = mirror_slot(&tree, growing, &token);
+        let before_cursor = read(&runtime, &growing_key)
+            .await
+            .expect("positive baseline must create a cursor");
+        let before_edges = mirror_edges(&runtime, &token).await;
+        assert!(before_edges.is_empty(), "one initial version has no supersedes edge");
+        let before_lexical = mirror_lexical_rows(&runtime).await;
+        assert_eq!(before_lexical, (1, 1), "baseline must index the initial document");
+        let before_docs = mirror_documents(&runtime, &token).await;
+        let before_doc = before_docs
+            .iter()
+            .find(|doc| doc["properties"]["source_uri"].as_str() == Some(growing_uri.as_str()))
+            .expect("positive baseline must create a document");
+        let before_id = before_doc["id"].as_str().unwrap().to_owned();
+        assert_eq!(before_doc["description"].as_str(), Some("old"));
+
+        tree.write(growing, "1234");
+        tree.write(healthy, "new");
+        config.set_max_file_bytes_for_test(Some(4));
+        let canonical_root = std::fs::canonicalize(&tree.0).expect("canonical fixture root");
+        let growing_abs = canonical_root.join(growing);
+        let mut appended = false;
+        let result = {
+            let mut hook = |path: &std::path::Path| {
+                if path == growing_abs.as_path() {
+                    let before = std::fs::metadata(path).unwrap().len();
+                    assert_eq!(before, 4, "growth must start at the exact limit");
+                    let mut writer = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(path)
+                        .expect("open selected synthetic file for append");
+                    writer.write_all(b"5").expect("append during first read");
+                    let after = std::fs::metadata(path).unwrap().len();
+                    assert_eq!(after, 5, "hook must grow the file before the sentinel");
+                    appended = true;
+                }
+            };
+            crate::mirror::mirror_directory_once_with_read_hook(
+                &runtime, &registry, &token, &tree.0, &config, &mut hook,
+            )
+            .await
+        };
+        assert!(appended, "the real-read hook must grow the selected file");
+        assert_eq!(std::fs::read(&growing_abs).unwrap().as_slice(), b"12345");
+        let summary = result.expect("growing file should be reported and skipped");
+        assert_eq!(summary.max_file_bytes, Some(4));
+        assert_eq!(summary.committed, 1, "healthy file must still commit");
+        assert_eq!(summary.oversized_files.len(), 1);
+        assert_eq!(summary.oversized_files[0].path, std::path::PathBuf::from(growing));
+        assert_eq!(summary.oversized_files[0].observed_bytes, 5);
+        assert_eq!(read(&runtime, &growing_key).await.as_ref(), Some(&before_cursor));
+        let after_docs = mirror_documents(&runtime, &token).await;
+        let growing_docs: Vec<_> = after_docs
+            .iter()
+            .filter(|doc| doc["properties"]["source_uri"].as_str() == Some(growing_uri.as_str()))
+            .collect();
+        assert_eq!(growing_docs.len(), 1, "growing file must not add a document");
+        assert_eq!(growing_docs[0]["id"].as_str(), Some(before_id.as_str()));
+        assert_eq!(growing_docs[0]["description"].as_str(), Some("old"));
+        let (_, healthy_key) = mirror_slot(&tree, healthy, &token);
+        assert!(read(&runtime, &healthy_key).await.is_some());
+        assert_eq!(mirror_edges(&runtime, &token).await, before_edges);
+        assert_eq!(
+            mirror_lexical_rows(&runtime).await,
+            (before_lexical.0 + 1, before_lexical.1 + 1),
+            "only the healthy new document may add lexical rows"
+        );
+
+        tree.write(growing, "new");
+        let retried = crate::mirror::mirror_directory_once(
+            &runtime, &registry, &token, &tree.0, &config,
+        )
+        .await
+        .expect("smaller file must be retried");
+        assert_eq!(retried.committed, 1);
+        assert!(retried.oversized_files.is_empty());
+        assert_ne!(read(&runtime, &growing_key).await, Some(before_cursor));
+        assert_eq!(mirror_edges(&runtime, &token).await.len(), 1, "retry must link one new version");
+        assert!(mirror_documents(&runtime, &token).await.iter().any(|doc| {
+            doc["properties"]["source_uri"].as_str() == Some(growing_uri.as_str())
+                && doc["description"].as_str() == Some("new")
+        }));
+    })
+    .await;
+    mirror_done(NAME);
+}
+
+#[tokio::test]
+async fn mirror_growth_during_read_masks_path_and_leaves_no_cursor() {
+    const NAME: &str = "mirror_growth_during_read_masks_path_and_leaves_no_cursor";
+    if mirror_child(NAME) {
+        return;
+    }
+    mirror_bounded(async {
+        use std::io::Write;
+
+        const SECRET: &str = concat!("gh", "p_", "abcdefghijklmnopqrstuvwxyz0123456789");
+        let tree = MirrorTree::new();
+        tree.write(".khive/notes/baseline.md", "ok");
+        let (runtime, registry, token) = mirror_fixture();
+        let mut config = crate::WorkspaceMirrorConfig::from_defaults_for_test().unwrap();
+        let baseline = crate::mirror::mirror_directory_once(
+            &runtime, &registry, &token, &tree.0, &config,
+        )
+        .await
+        .expect("positive unlimited baseline");
+        assert_eq!(baseline.committed, 1);
+        let before_docs = mirror_documents(&runtime, &token).await;
+        assert_eq!(before_docs.len(), 1);
+        let before_edges = mirror_edges(&runtime, &token).await;
+        let before_lexical = mirror_lexical_rows(&runtime).await;
+        assert!(before_edges.is_empty());
+        assert_eq!(before_lexical, (1, 1));
+
+        let secret_path = format!(".khive/notes/{SECRET}.md");
+        tree.write(&secret_path, "1234");
+        config.set_max_file_bytes_for_test(Some(4));
+        let canonical_root = std::fs::canonicalize(&tree.0).expect("canonical fixture root");
+        let secret_abs = canonical_root.join(&secret_path);
+        let mut appended = false;
+        let result = {
+            let mut hook = |path: &std::path::Path| {
+                if path == secret_abs.as_path() {
+                    let before = std::fs::metadata(path).unwrap().len();
+                    assert_eq!(before, 4, "growth must start at the exact limit");
+                    let mut writer = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(path)
+                        .expect("open selected synthetic file for append");
+                    writer.write_all(b"5").expect("append during first read");
+                    let after = std::fs::metadata(path).unwrap().len();
+                    assert_eq!(after, 5, "hook must grow the file before the sentinel");
+                    appended = true;
+                }
+            };
+            crate::mirror::mirror_directory_once_with_read_hook(
+                &runtime, &registry, &token, &tree.0, &config, &mut hook,
+            )
+            .await
+        };
+        assert!(appended, "the real-read hook must grow the selected file");
+        assert_eq!(std::fs::read(&secret_abs).unwrap().as_slice(), b"12345");
+        let summary = result.expect("growing secret-path file should be reported and skipped");
+        assert_eq!(summary.max_file_bytes, Some(4));
+        assert_eq!(summary.committed, 0);
+        assert_eq!(summary.oversized_files.len(), 1);
+        let masked = khive_runtime::secret_gate::mask_for_redaction_surface(
+            khive_runtime::secret_gate::RedactionSurface::WorkspaceMirror,
+            &secret_path,
+        );
+        assert!(!masked.contains(SECRET));
+        let masked_path = std::path::PathBuf::from(masked.into_owned());
+        assert!(!summary.oversized_files[0].path.to_string_lossy().contains(SECRET));
+        assert!(!format!("{summary:?}").contains(SECRET));
+        assert_eq!(summary.oversized_files[0].path, masked_path);
+        assert_eq!(summary.oversized_files[0].observed_bytes, 5);
+        let (_, secret_key) = mirror_slot(&tree, &secret_path, &token);
+        assert!(read(&runtime, &secret_key).await.is_none());
+        assert_eq!(mirror_documents(&runtime, &token).await.len(), before_docs.len());
+        assert_eq!(mirror_edges(&runtime, &token).await, before_edges);
+        assert_eq!(mirror_lexical_rows(&runtime).await, before_lexical);
+    })
+    .await;
+    mirror_done(NAME);
+}

@@ -19,6 +19,18 @@ their type or identity changes. Diagnostic paths are masked and are not stable i
 different paths may produce the same masked value. A skipped file does not advance its cursor.
 A previously mirrored file with a retained cursor and no live current document is not recreated.
 
+Set `KHIVE_MIRROR_WORKSPACE_MAX_FILE_BYTES` to a positive integer byte count to limit each
+selected file. When unset, no per-file limit is applied; there is no built-in hard cap. Zero,
+non-numeric values, and values outside the unsigned 64-bit range are rejected. The pass result's
+`max_file_bytes` reports the configured limit even when no file exceeds it.
+
+With a limit, a read consumes at most the limit plus one byte. If the extra byte is observed,
+the pass skips that file, creates no document, and does not update its cursor. The result's
+`oversized_files` contains the masked relative path and `observed_bytes`: the number of bytes
+actually observed before stopping, which is a lower bound rather than a claim about the file's
+final size. Files within the limit retain the same complete-content hashing and masking behavior.
+Reads remain synchronous; the byte limit does not promise an exact process-memory bound.
+
 On Unix, traversal uses directory handles pinned for that pass, with descriptor-relative no-follow
 opens. This anchors operations to the opened directory capabilities; it does not prevent hard links,
 mounts, or movement of an already-open directory, and it does not bind root identity across passes.
