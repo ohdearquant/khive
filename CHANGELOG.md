@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entity's keys and aliases. If any key is taken, it returns `restore_key_conflict`, names every
   taken key, and writes nothing from the change set. It still refuses note and edge restores
   (#6886).
+- `operation.frontier` reports `input_missing` for each value an owed step requires that no record
+  holds, in place of the act it owes. The item lists the places that state the field of a subject
+  in the requirement's slot: every loaded document type and system, in the order of the
+  namespace's newest `source_order`, then the rest by name. `stated_in_part` lists the lines that
+  state a parent of the field. The frontier names the source order and the form revisions it read.
+  `operation.define` publishes a `source_order` (`version`, `places`) and refuses a place that is
+  not a loaded document type or system (ADR-222 Amendments 1 and 2).
 
 ## [0.24.0] - 2026-11-28
 
