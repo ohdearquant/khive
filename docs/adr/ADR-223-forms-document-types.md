@@ -36,15 +36,20 @@ Facts at the grounding commit:
 ### 1. A document type node
 
 A tenth forms type, `document_type`, is a `concept` entity stored as the form node is, with
-`document_type_id`, a name, an `origin` (`applicant`, `third_party` or `work`) and an optional
-`issuer_class`. Its key is `document_type:<document_type_id>`, so a namespace holds one per id. A
+`document_type_id`, a name, an `origin` (`applicant`, `third_party` or `work`) or, in its place,
+`system: true`, and an optional `issuer_class`. Its key is `document_type:<document_type_id>`, so a namespace holds one per id. A
 document type contains its form revisions by the existing `contains` relation, under one added
 endpoint rule (`document_type` contains `form`); no relation is added. A revision stays a `form`
 node whatever its type, because renaming a stored type would break loaded stores.
 
 ### 2. Load declares the type or mints one
 
-`forms.load` takes an optional `document_type` object, `{id, name, origin, issuer_class?}`.
+`forms.load` takes an optional `document_type` object, `{id, name, origin, issuer_class?}` or
+`{id, name, system: true, issuer_class?}`. A declaration carries an origin, or `system: true` in its
+place, as ADR-222 Amendment 1 A1.4 point 2 decides. A system type has no origin, and its lines only
+state: a load or `forms.add_item` that gives a form of a system an asking or requiring line is
+refused. A type minted for a loaded form is never declared a system, because its forms were loaded
+as forms to fill in.
 
 - When it is absent, the load mints a type whose id is the form id, whose name is the title, whose
   origin is `applicant`, and which carries `minted: true`. The origin is a guess, and the mark keeps
@@ -85,14 +90,14 @@ silent check on one is not a satisfied one. The missing and satisfied findings f
 `forms.lint` lists `minted_document_types`, each with its id, and `forms_without_document_type`,
 the form revisions no type contains (loaded before this record). Both list what was guessed or not
 yet said, not what is broken, so neither counts against `clean`. `missing_source` treats a document
-type as it treats an issuer: it is sourced when it contains a form.
+type as it treats an issuer: it is sourced when it contains a form. `missing_required` asks a
+document type for its id and its origin, and asks a system for its id alone.
 
 ### 5. Left out
 
 Mapping a field of one document type to another waits for ADR-222's build order item 5. The read
-of which types state a field for a subject lands with ADR-222's build order item 3, and so does the
-mark that declares an outside system the way a document type is declared (ADR-222 Amendment 1,
-A1.4 point 2); no origin here means a system. No confidence is stored on a type or a line.
+of which types state a field for a subject is ADR-222's (Amendment 2, A2.8), not this record's. No
+confidence is stored on a type or a line.
 
 ## Migration
 
@@ -117,6 +122,10 @@ application form requires attached:
   later revision that declares the type replaces it, with no second type node.
 - A declaration that differs from the loaded type is refused and writes nothing; one that agrees
   reuses the type.
+- A system declared with `system: true` has no origin, lint reads it clean, and an asking or
+  requiring line on one of its forms is refused at load and at `forms.add_item`; a declaration with
+  both `system: true` and an origin, or with neither, is refused, and so is declaring a minted type
+  a system.
 - Export then replay into an empty namespace gives identical nodes and edges, and the minted mark
   survives. An export with its types removed replays, and lint lists its forms.
 

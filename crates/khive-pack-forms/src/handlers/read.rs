@@ -639,11 +639,14 @@ pub(crate) async fn lint(ctx: &Ctx<'_>, _params: Value) -> Result<Value, Runtime
     let mut missing_source = Vec::new();
     for entity_type in ALL_TYPES {
         for node in graph.of_type(entity_type) {
-            // A stating line has nobody who fills it in.
+            // A stating line has nobody who fills it in, and a system has no origin.
             let missing: Vec<&str> = vocab::required_properties(entity_type)
                 .iter()
                 .copied()
                 .filter(|key| !(*key == "filled_by" && is_stating(node)))
+                .filter(|key| {
+                    !(*key == "origin" && entity_type == DOCUMENT_TYPE && is_system(node))
+                })
                 .filter(|key| !present(node, key))
                 .collect();
             if !missing.is_empty() {

@@ -570,6 +570,10 @@ async fn a_system_is_declared_as_a_document_type_whose_lines_only_state() {
     // A second record of the same system joins the type it declared.
     let second = store.load(portal_record("PORTAL-2", 4)).await;
     assert_eq!(second["document_type"]["minted"], false, "{second}");
+    // A system has no origin, and lint does not count that as missing.
+    let lint = store.call("forms.lint", json!({})).await;
+    assert_eq!(lint["missing_required"], json!([]), "{lint}");
+    assert_eq!(lint["clean"], true, "{lint}");
 
     for (n, line) in [
         (5, asking("Your legal name", 1)),
@@ -797,6 +801,17 @@ async fn a_field_name_in_a_vocabulary_names_one_field() {
         ))
         .await;
     assert!(message.contains("reserved_vocabulary"), "{message}");
+    // A '/' in a vocabulary is refused: vocabulary "x/field/y" with name "z" would
+    // otherwise share a key with vocabulary "x" and name "y/field/z".
+    let message = store
+        .refused_load(naming_form(
+            "NAME-E",
+            16,
+            "middle name",
+            json!([known("x/field/y", "z")]),
+        ))
+        .await;
+    assert!(message.contains("which contains '/'"), "{message}");
 
     // Replay writes the names as keys again: the replayed store refuses the same clash,
     // here on a field it reuses.

@@ -96,6 +96,13 @@ fn known_as_spec(obj: &Args, field: &str) -> Result<Vec<(String, String)>, Runti
         let entry = params::entry(entry, "known_as")?;
         let vocabulary = params::text(entry, "vocabulary")?;
         let name = params::text(entry, "name")?;
+        // The key joins vocabulary and name with '/field/', so a '/' in the vocabulary
+        // could make two pairs one key.
+        if vocabulary.contains('/') {
+            return Err(invalid(format!(
+                "field \"{field}\" names vocabulary \"{vocabulary}\", which contains '/'; a vocabulary name has no '/'"
+            )));
+        }
         if RESERVED_VOCABULARIES
             .iter()
             .any(|reserved| normalize(reserved) == normalize(&vocabulary))
