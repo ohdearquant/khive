@@ -63,10 +63,21 @@ const REPO: ParamDef = param(
 
 pub(crate) const CHECKOUT: HandlerDef = HandlerDef {
     name: "git.checkout",
-    description: "Read one resolved commit into an immutable khive tree manifest without changing refs, index or working files. A symlink becomes a mode 120000 entry whose blob is its literal target; submodules refuse. Returns commit, tree and receipt_id.",
+    description: "Read one resolved commit into an immutable khive tree manifest without changing refs, index or working files. A symlink becomes a mode 120000 entry whose blob is its literal target; submodules refuse. With paths, only the entries at or beneath those paths are read, each path matched as literal text, into a scoped tree that git.commit refuses; a path that names nothing at the commit refuses path_not_found before any blob is read. Returns commit, tree, paths when given, and receipt_id.",
     visibility: Visibility::Verb,
     category: VerbCategory::Assertive,
-    params: &[REPO, param("ref", true, "Commit SHA or ref resolved exactly once before reading its objects."), SESSION],
+    params: &[
+        REPO,
+        param("ref", true, "Commit SHA or ref resolved exactly once before reading its objects."),
+        ParamDef {
+            name: "paths",
+            param_type: "array of string",
+            required: false,
+            description: "Optional 1 to 64 repository-relative paths, each a file or a directory, spelled as the tree names them. A leading or trailing slash, an empty, . or .. component, or a NUL refuses invalid_path, and a path inside another refuses overlapping_paths, both before git runs. A whole-tree checkout over the manifest limit refuses output_limit and says a checkout may name paths.",
+            resolution_mode: IdResolutionMode::NotApplicable,
+        },
+        SESSION,
+    ],
 };
 pub(crate) const DIFF: HandlerDef = HandlerDef {
     name: "git.diff",

@@ -5,7 +5,7 @@
 
 /// Revision of the reviewed classification contract, included in policy identity.
 /// Bump whenever a classification or the allowed-read contract changes.
-pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v35";
+pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v37";
 
 /// Strongest caller-requested effect of a reviewed operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +121,8 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("forms.resolve", OperationAccess::Read),
     ("forms.same", OperationAccess::Write),
     ("forms.split", OperationAccess::Write),
+    ("forms.subjects", OperationAccess::Read),
+    ("forms.terms", OperationAccess::Read),
     ("get", OperationAccess::Read),
     ("git.branch", OperationAccess::Write),
     ("git.branch_delete", OperationAccess::Write),
@@ -134,9 +136,11 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("git.ingest_cursor", OperationAccess::Read),
     ("git.init", OperationAccess::Write),
     ("git.issue", OperationAccess::Read),
+    ("git.issue_list", OperationAccess::Read),
     ("git.log", OperationAccess::Read),
     ("git.pr_close", OperationAccess::Write),
     ("git.pr_edit", OperationAccess::Write),
+    ("git.pr_list", OperationAccess::Read),
     ("git.pr_merge", OperationAccess::Write),
     ("git.pr_open", OperationAccess::Write),
     ("git.pr_review", OperationAccess::Write),
@@ -200,10 +204,12 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("moodboard.train_preference", OperationAccess::Write),
     ("neighbors", OperationAccess::Read),
     ("operation.bind", OperationAccess::Write),
+    ("operation.decide", OperationAccess::Write),
     ("operation.define", OperationAccess::Write),
     ("operation.frontier", OperationAccess::Read),
     ("operation.open", OperationAccess::Write),
     ("operation.record", OperationAccess::Write),
+    ("operation.resolve", OperationAccess::Read),
     ("propose", OperationAccess::Write),
     ("query", OperationAccess::Read),
     ("resolve", OperationAccess::Read),

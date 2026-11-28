@@ -986,6 +986,8 @@ load-bearing.
 
 ## Amendment 15 (2026-11-21): reading a pull request's state
 
+This amendment is dated a day before Amendment 14, which was numbered first.
+
 **Status**: Accepted 2026-11-22. The ADR's Accepted status and every amendment above stand unchanged.
 
 Adopted from a reading of a real caller, as Amendment 8 was. A client with no shell can commit,
@@ -1542,3 +1544,122 @@ refuses `remote_scheme` before any credential read; 112 a repository answering u
 or visibility, and a spent allowance, each refuse after exactly one request, and the same call
 reads the issue once the platform answers (control); 113 the classifier lists the verb as a read at
 version 34 with every published verb total counting it.
+
+## Amendment 23 (2026-11-27): listing pull requests and issues
+
+**Status**: Accepted 2026-11-27. The ADR's Accepted status and every amendment above stand unchanged.
+
+Adopted from a reading of real callers, as Amendment 22 was. A client with no shell can read one pull
+request or one issue when it already holds the number, and has no way to learn the numbers: what is
+open, what closed since yesterday, which pull request carries a branch. These two reads enter here,
+under the gates of `git.issue`.
+
+1. **`git.pr_list(repo, state?)` and `git.issue_list(repo, state?)`.** `state` is `open`, `closed`
+   or `all`, and `open` when omitted; any other value refuses `invalid_params` before any platform
+   request. Each result is its rows (`pull_requests` or `issues`), `truncated`, `text_altered` and
+   `trust`, beside the `repo`, `gate`,
+   `slug` and `state` the call resolved to. A pull request row is `number`, `title`, `state`,
+   `draft`, `author` (the login, or null when the platform names none), `head_ref`, `head_sha`,
+   `base_ref`, `created_at` and `updated_at`. An issue row is `number`, `title`, `state`, `author`,
+   `labels` (their names), `comments` (the platform's count), `created_at` and `updated_at`.
+2. **Gated and credentialed like `git.issue`.** The order is arguments, the repo-only allowlist
+   match, `tool.check` on the verb itself, the repository mapping, the dispatching actor's
+   credential, the platform, with the refusals of Amendment 22 item 2 at the same steps and the
+   repository's name and visibility compared before the first listing request. Each verb is checked under
+   its own name, never under `git.pr_state` or `git.issue`. Every platform request is a
+   `GET`, nothing is stored and no receipt is written: the classifier lists both as reads, a read
+   row of ADR-108 admits them, and their policy decision makes them known incidental writers for
+   admission, never admission-degrade-safe.
+3. **Newest first, up to a disclosed bound.** Each request names its order, newest created first,
+   never the platform's default. Rows are read one hundred to a page, from the first page, until a
+   page holds fewer than one hundred or ten pages have been read; a page of more than one hundred
+   refuses `remote_response`. After ten full pages one more request for the single row past the
+   thousandth decides `truncated`, which is true exactly when that row exists. A call therefore costs
+   between two and twelve requests against the allowance `git.pr_state` uses.
+4. **Pull requests are not issues.** The platform lists pull requests among issues. `git.issue_list`
+   omits those entries and counts them in `pull_requests_omitted`; the page and truncation rules of
+   item 3 count entries as the platform returns them, before that omission.
+5. **The text is cleaned, never cut.** Titles, refs, label names and logins lose the hidden
+   characters of Amendment 15 item 7, `text_altered` is true when that changed any field, no field is
+   shortened, and the reply carries `trust: "untrusted"` as `git.issue` does.
+
+What this does not cover: searching by text, author, label or branch, sorting by anything but
+creation, reading past the thousandth row, and anything a row of `git.pr_state` or `git.issue`
+holds that a list row does not. A caller filters the rows it gets or reads one number in full.
+
+Acceptance arms added: 114 a pull request listing returns every field of item 1 newest first after
+exactly two `GET` requests, the repository and the first page, whose request names the creation
+order, with `truncated` false, `text_altered` false, `trust` untrusted, and no receipt or platform
+write; 115 `closed` and `all` are accepted and passed to the platform, and any other state refuses
+with no platform request; 116 an issue listing that the platform answers with pull requests among
+its issues omits them and counts them in `pull_requests_omitted`, and an issue with no author keeps
+a null author; 117 250 pull requests are read in four requests, 1,000 issues in twelve with
+`truncated` false, 1,001 pull requests return the first 1,000 after twelve requests with `truncated`
+true, and 1,001 issue entries of which every second is a pull request return 500 issues with 500
+omitted and `truncated` true; 118 a pull request title holding a direction override, its head ref
+holding an isolate, an issue title ending in a byte order mark and a label holding an isolate each
+come back with those removed, the issue title's accented and Han text kept, and `text_altered` true;
+119 an unknown argument refuses with no platform request, a policy denying each listing verb refuses
+it with `policy_denied` and no platform request while `git.pr_state` and `git.issue` are allowed for
+the same caller, and a local mapping refuses `remote_scheme` before any credential read; 120 a
+pull request listing answered with an object and an issue listing whose labels are not a list each
+refuse `remote_response`, and a repository answering under another name refuses
+`repository_identity_mismatch` after exactly one request while the same call lists once the platform
+answers (control); 121 the classifier lists both verbs as reads at version 36 with every published
+verb total counting them.
+
+## Amendment 24 (2026-11-27): a checkout of named paths
+
+**Status**: Accepted 2026-11-27 (#6930). The ADR's Accepted status and every amendment above stand unchanged.
+
+A checkout lists the whole tree at `ref` and stores one manifest for it (Amendment 2 item 8). The
+manifest has an 8 MiB load limit (`MAX_MANIFEST_BYTES`, ADR-181). A repository whose manifest is
+larger refuses `output_limit` at the tree limit, and nothing in it can be read through
+`git.checkout`. This amendment lets a caller check out only the paths it needs. Committing from such
+a checkout is a later amendment; until then a scoped tree is refused by `git.commit` (item 3).
+
+1. **`git.checkout(repo, ref, paths?)`.** `paths` lists 1 to 64 repository-relative paths, each a
+   file or a directory, spelled as the tree names them. A path with a leading slash, an empty, `.` or
+   `..` component, a trailing slash or a NUL byte refuses `invalid_path`, and one path inside another
+   refuses `overlapping_paths`, both before git runs. The listing is
+   `ls-tree -r -z --full-tree <commit> -- <paths>` with literal pathspecs set on that command alone,
+   so a path is never a pattern. A path that names nothing at the commit refuses `path_not_found`,
+   naming it, before any blob is read.
+2. **The same checkout, of fewer entries.** The manifest holds the listed entries at their full
+   repository paths. Amendment 2 item 8's bounds and blob reuse, the manifest limit and Amendment 19's
+   links apply to the listing unchanged. The result is `{commit, tree, paths}`, and the receipt's
+   inputs gain `paths`, sorted. Without `paths` nothing changes, except that the whole-tree
+   `output_limit` refusal now says a checkout may name paths.
+3. **A scoped tree is not a whole tree, and every tree written from it stays scoped.** A scoped
+   checkout writes its manifest with the schema `khive-tree/scoped-v1` and a `scope` field holding
+   its sorted `paths`; a whole checkout writes `khive-tree/v1` as today. The runtime's tree store
+   loads a manifest as its entries with its scope and stores one only from both, so a verb that
+   writes a tree from a tree it read (`exec.tree_put`, a run's `tree_out`) writes the same scope, and
+   so does any tool outside this repository that edits trees through the same store.
+   `git.commit` reads a manifest as the whole tree, and a path the manifest omits is a deletion
+   (Amendment 2 item 2), so it refuses every `khive-tree/scoped-v1` manifest (`scoped_tree`, naming
+   the scope) before any git command runs. The guard reads the manifest's schema, never its
+   entries: a scoped tree whose paths happen to cover every entry of the repository is refused all
+   the same, and only a tree written from a whole checkout commits. A binary older than this
+   amendment refuses the scoped schema when it loads the manifest, as it refuses every schema but
+   `khive-tree/v1`, so neither it nor a tool built on its store can run, edit or commit a scoped
+   tree as a whole one. A manifest a caller writes itself as raw bytes is outside this guard.
+
+What this does not cover: committing from a scoped tree, a pattern or glob in `paths`, and a
+listing limited by depth or size.
+
+Acceptance arms added: 122 a checkout naming one directory and one file returns exactly the entries
+under them at full paths with their bytes, and the receipt's inputs name both paths, while the same
+ref unscoped returns a superset (control); 123 `invalid_path` for each bad spelling,
+`overlapping_paths`, and `path_not_found` naming the path, each before any blob is read; 124 a path
+holding glob characters matches only itself; 125 a repository whose whole manifest exceeds the limit
+refuses unscoped, with the refusal naming `paths`, and checks out scoped under it; 126 `git.commit` of
+a scoped checkout's tree refuses `scoped_tree` naming its scope with no ref moved; the same tree with
+one file edited through `exec.tree_put`, and with one file written by a run and read back as its
+`tree_out`, keeps the scope and refuses the same way; a scoped checkout whose paths cover every entry
+of a small repository refuses although its entries equal the whole tree's; and the whole checkout's
+tree commits (control); mutation control: storing an edited tree without its scope turns the edited
+cases red; 127 a scoped link entry keeps mode `120000` and its literal target (Amendment 19); 128 a
+scoped checkout's stored manifest bytes carry a schema other than `khive-tree/v1`, and a manifest with
+any schema the store does not know is refused at load, the branch an older binary takes on a scoped
+manifest.

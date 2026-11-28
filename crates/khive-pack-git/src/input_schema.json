@@ -284,6 +284,12 @@
         "type": "string",
         "minLength": 1
       },
+      "paths": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
       "session_id": {
         "type": "string",
         "minLength": 1
@@ -615,6 +621,28 @@
     ],
     "additionalProperties": false
   },
+  "git.pr_list": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "state": {
+        "type": "string",
+        "enum": [
+          "open",
+          "closed",
+          "all"
+        ],
+        "default": "open"
+      }
+    },
+    "required": [
+      "repo"
+    ],
+    "additionalProperties": false
+  },
   "git.issue": {
     "type": "object",
     "properties": {
@@ -630,6 +658,28 @@
     "required": [
       "repo",
       "number"
+    ],
+    "additionalProperties": false
+  },
+  "git.issue_list": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "state": {
+        "type": "string",
+        "enum": [
+          "open",
+          "closed",
+          "all"
+        ],
+        "default": "open"
+      }
+    },
+    "required": [
+      "repo"
     ],
     "additionalProperties": false
   },

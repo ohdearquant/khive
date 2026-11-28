@@ -359,6 +359,7 @@ fn manifest_preflight_counts_actual_json_escaping_and_fixed_digest_width() {
         }];
         let preview = PreviewManifest {
             schema: "khive-tree/v1",
+            scope: None,
             entries: vec![PreviewEntry {
                 path,
                 content_ref: PLACEHOLDER_REF,
@@ -372,14 +373,14 @@ fn manifest_preflight_counts_actual_json_escaping_and_fixed_digest_width() {
             serde_json::to_vec(&preview).unwrap().len(),
             actual.to_string().len()
         );
-        admit_manifest(&listed).unwrap();
+        admit_manifest(&listed, None).unwrap();
     }
     let listed = vec![ListedBlob {
         path: "\n".repeat(tree::MAX_MANIFEST_BYTES as usize / 2),
         oid: "0".repeat(40),
         mode: 644,
     }];
-    let admission = admit_manifest(&listed);
+    let admission = admit_manifest(&listed, None);
     assert!(
         matches!(admission, Err(ref error) if error.code() == "output_limit"),
         "JSON escapes count toward the manifest limit"

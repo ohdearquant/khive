@@ -442,6 +442,13 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 8] = [
                 description: "Pagination offset (default 0). When `has_more` is true, add the number of returned tasks to this offset and keep the same filters. Separate pages use separate snapshots; concurrent changes can shift later pages.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
+            ParamDef {
+                name: "compact",
+                param_type: "boolean",
+                required: false,
+                description: "Return only id, title, status, priority, assignee, tags, updated_at, and description_length in UTF-8 bytes. Defaults to false. Filters, ordering, and pagination are unchanged.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
         ],
     },
     // Declaration: changes task lifecycle status

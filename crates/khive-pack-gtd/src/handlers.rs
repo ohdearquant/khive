@@ -275,6 +275,8 @@ fn complete_target_status(status: Option<&str>) -> Result<&'static str, RuntimeE
 #[serde(deny_unknown_fields)]
 struct TasksParams {
     #[serde(default)]
+    compact: bool,
+    #[serde(default)]
     status: Option<String>,
     #[serde(default)]
     assignee: Option<String>,
@@ -542,6 +544,28 @@ fn priority_rank(props: Option<&Value>) -> u8 {
     }
 }
 
+fn task_title(note: &khive_storage::note::Note) -> String {
+    note.name
+        .clone()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| format!("[{}]", note.kind.as_str()))
+}
+
+fn render_compact_task(note: &khive_storage::note::Note) -> Value {
+    let props = note.properties.as_ref();
+    let field = |name| props.and_then(|props| props.get(name));
+    json!({
+        "id": short_id(note.id),
+        "title": task_title(note),
+        "status": task_status(props),
+        "priority": field("priority").and_then(Value::as_str).unwrap_or(DEFAULT_PRIORITY),
+        "assignee": field("assignee"),
+        "tags": field("tags").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default(),
+        "updated_at": ts_to_rfc(note.updated_at),
+        "description_length": field("description").and_then(Value::as_str).map_or(0, str::len),
+    })
+}
+
 /// Build the response object for any task-shaped operation.
 ///
 /// `pub` (widened from private, ADR-099 B3): the
@@ -551,11 +575,7 @@ fn priority_rank(props: Option<&Value>) -> u8 {
 /// field-for-field without a duplicated renderer.
 pub fn render_task(note: &khive_storage::note::Note) -> Value {
     let props = note.properties.clone().unwrap_or(json!({}));
-    let title = note
-        .name
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| format!("[{}]", note.kind.as_str()));
+    let title = task_title(note);
     let status = props
         .get("status")
         .and_then(|v| v.as_str())
@@ -1628,14 +1648,17 @@ impl GtdPack {
         // The lookahead only witnesses continuation; it is not part of the
         // caller's page and must not incur dependency diagnostics.
         page.items.truncate(limit as usize);
-        let diagnostics =
-            crate::dependency::diagnose_tasks(self.runtime(), token, &page.items).await?;
-        let result: Vec<Value> = page
-            .items
-            .iter()
-            .zip(diagnostics.iter())
-            .map(|(note, diagnostic)| diagnostic.render(note))
-            .collect();
+        let result: Vec<Value> = if p.compact {
+            page.items.iter().map(render_compact_task).collect()
+        } else {
+            let diagnostics =
+                crate::dependency::diagnose_tasks(self.runtime(), token, &page.items).await?;
+            page.items
+                .iter()
+                .zip(diagnostics.iter())
+                .map(|(note, diagnostic)| diagnostic.render(note))
+                .collect()
+        };
 
         // #96: a bare `[]` is indistinguishable from "no such task" when the
         // *default* state exclusion is what emptied the result —

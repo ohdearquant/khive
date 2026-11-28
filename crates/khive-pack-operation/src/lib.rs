@@ -8,6 +8,7 @@
 mod definition;
 mod frontier;
 mod pack;
+mod resolve;
 mod schema;
 
 pub use pack::OperationPack;

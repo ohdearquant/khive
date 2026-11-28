@@ -17,7 +17,8 @@ use uuid::Uuid;
 
 use crate::text::normalize;
 use crate::vocab::{
-    self, FIELD, FIELD_VALUE, FORM, FORM_ISSUER, FORM_ITEM, FORM_RULE, FORM_SECTION,
+    self, DOCUMENT_TYPE, FIELD, FIELD_VALUE, FORM, FORM_ISSUER, FORM_ITEM, FORM_RULE, FORM_SECTION,
+    FORM_SUBJECT, FORM_TERM,
 };
 
 const ENTITY_PAGE: u32 = 500;
@@ -144,6 +145,66 @@ pub(crate) fn pending_premise(field: &str, value: Option<&str>) -> Value {
 /// The content key of one form revision.
 pub(crate) fn form_key(form_id: &str, revision: &str) -> String {
     format!("form:{form_id}@{revision}")
+}
+
+/// The content key of one document type.
+pub(crate) fn document_type_key(document_type_id: &str) -> String {
+    format!("document_type:{document_type_id}")
+}
+
+/// What a line does with its field: `asks` (the default), `states` or
+/// `requires`.
+pub(crate) fn line_relation(item: &Entity) -> String {
+    prop_text(item, "relation").unwrap_or_else(|| "asks".to_owned())
+}
+
+/// Whether a line states its field rather than asking for it.
+pub(crate) fn is_stating(item: &Entity) -> bool {
+    line_relation(item) == "states"
+}
+
+/// The ADR-221 key a field holds for one of its names in a vocabulary
+/// (ADR-222 A2.5). The forms pack writes these keys; other packs read them.
+pub(crate) fn field_name_key(vocabulary: &str, name: &str) -> String {
+    format!("forms/{}/field/{}", normalize(vocabulary), normalize(name))
+}
+
+/// The (vocabulary, name) pairs a field is known by, as its properties hold
+/// them.
+pub(crate) fn known_as_of(field: &Entity) -> Vec<(String, String)> {
+    known_as_pairs(prop(field, "known_as"))
+}
+
+/// The (vocabulary, name) pairs of a stored `known_as` value.
+pub(crate) fn known_as_pairs(value: Option<&Value>) -> Vec<(String, String)> {
+    value
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|entry| {
+                    Some((
+                        entry.get("vocabulary")?.as_str()?.to_owned(),
+                        entry.get("name")?.as_str()?.to_owned(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `known_as` property a field stores for these pairs.
+pub(crate) fn known_as_value(pairs: &[(String, String)]) -> Value {
+    Value::Array(
+        pairs
+            .iter()
+            .map(|(vocabulary, name)| serde_json::json!({"vocabulary": vocabulary, "name": name}))
+            .collect(),
+    )
+}
+
+/// Whether a document type is an outside system's record schema.
+pub(crate) fn is_system(document_type: &Entity) -> bool {
+    prop(document_type, "system").and_then(Value::as_bool) == Some(true)
 }
 
 pub(crate) fn quoted_names(entities: &[&Entity]) -> String {
@@ -308,6 +369,13 @@ impl Graph {
                 prop_text(e, "source_page")?,
                 normalize(&prop_text(e, "text").unwrap_or_else(|| e.name.clone()))
             ),
+            FORM_SUBJECT => format!(
+                "{}/subject:{}",
+                prop_text(e, "form_key")?,
+                normalize(&prop_text(e, "subject_id")?)
+            ),
+            FORM_TERM => format!("term:{}:{}", prop_text(e, "list")?, normalize(&e.name)),
+            DOCUMENT_TYPE => document_type_key(&prop_text(e, "document_type_id")?),
             _ => return None,
         })
     }
@@ -316,6 +384,23 @@ impl Graph {
         self.of_type(FORM)
             .into_iter()
             .find(|f| self.key(f.id).as_deref() == Some(key))
+    }
+
+    /// A document type by the id its documents give it.
+    pub(crate) fn document_type_by_id(&self, document_type_id: &str) -> Option<&Entity> {
+        let key = document_type_key(document_type_id);
+        self.of_type(DOCUMENT_TYPE)
+            .into_iter()
+            .find(|t| self.key(t.id).as_deref() == Some(key.as_str()))
+    }
+
+    /// The document type a form revision belongs to; absent for a form
+    /// loaded before document types existed.
+    pub(crate) fn document_type_of(&self, form: Uuid) -> Option<&Entity> {
+        self.incoming(form, EdgeRelation::Contains)
+            .into_iter()
+            .filter_map(|t| self.get(t))
+            .find(|t| type_of(t) == DOCUMENT_TYPE)
     }
 
     /// The form a section, item or rule belongs to.
@@ -460,6 +545,28 @@ impl Graph {
         }
         items
     }
+
+    /// The subjects one form revision declares, by folded id.
+    pub(crate) fn subjects_of(&self, form_key: &str) -> HashMap<String, &Entity> {
+        self.of_type(FORM_SUBJECT)
+            .into_iter()
+            .filter(|s| prop_text(s, "form_key").as_deref() == Some(form_key))
+            .filter_map(|s| prop_text(s, "subject_id").map(|id| (normalize(&id), s)))
+            .collect()
+    }
+
+    /// The loaded terms of one list, by folded name and by each folded alias.
+    pub(crate) fn terms(&self, list: &str) -> HashMap<String, &Entity> {
+        self.of_type(FORM_TERM)
+            .into_iter()
+            .filter(|t| prop_text(t, "list").as_deref() == Some(list))
+            .flat_map(|t| {
+                std::iter::once(normalize(&t.name))
+                    .chain(aliases(t).into_iter().map(|a| normalize(&a)))
+                    .map(move |wording| (wording, t))
+            })
+            .collect()
+    }
 }
 
 fn id128(id: Uuid) -> Id128 {
@@ -481,6 +588,8 @@ pub(crate) struct Committed {
 pub(crate) struct Writes {
     namespace: Namespace,
     ops: Vec<Op>,
+    /// Keys to claim on entities, after the operations, in the same transaction.
+    keys: Vec<(Uuid, String)>,
 }
 
 impl Writes {
@@ -488,7 +597,14 @@ impl Writes {
         Self {
             namespace: token.namespace().clone(),
             ops: Vec::new(),
+            keys: Vec::new(),
         }
+    }
+
+    /// Stage a claim of `key` on concept entity `id`, which this write may
+    /// create. A key another live entity holds rolls the whole write back.
+    pub(crate) fn add_key(&mut self, id: Uuid, key: String) {
+        self.keys.push((id, key));
     }
 
     pub(crate) fn create_entity(
@@ -619,15 +735,17 @@ impl Writes {
         registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Committed, RuntimeError> {
-        if self.ops.is_empty() {
+        if self.ops.is_empty() && self.keys.is_empty() {
             return Ok(Committed {
                 index_warning: None,
             });
         }
-        let staged_at = Timestamp::from_secs(chrono::Utc::now().timestamp().max(0) as u64);
-        let producer = format!("{}:{}", token.actor().kind, token.actor().id);
-        let changeset = ChangeSet::new(Envelope::new(producer, "forms", staged_at), self.ops);
-        let plans =
+        let mut plans = if self.ops.is_empty() {
+            Vec::new()
+        } else {
+            let staged_at = Timestamp::from_secs(chrono::Utc::now().timestamp().max(0) as u64);
+            let producer = format!("{}:{}", token.actor().kind, token.actor().id);
+            let changeset = ChangeSet::new(Envelope::new(producer, "forms", staged_at), self.ops);
             khive_runtime::prepare_canonical_changeset(runtime, registry, token, &changeset)
                 .await
                 .map_err(|error| match error {
@@ -635,7 +753,18 @@ impl Writes {
                 "the forms write was refused at operation {op_index} and wrote nothing: {source}"
             )),
                     other => other,
-                })?;
+                })?
+        };
+        let at = chrono::Utc::now().timestamp_micros();
+        for (id, key) in &self.keys {
+            plans.extend(khive_runtime::entity_key_add_plans(
+                self.namespace.as_str(),
+                *id,
+                "concept",
+                key,
+                at,
+            )?);
+        }
         match khive_runtime::run_atomic_unit(runtime.sql().as_ref(), plans).await {
             Err(error) => Err(RuntimeError::Storage(error.0)),
             Ok(AtomicRunOutcome::RolledBack {

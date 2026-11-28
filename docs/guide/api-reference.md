@@ -27,7 +27,7 @@ An always-machine-readable copy of this page is at
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 21    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 7     | `KHIVE_PACKS=kg,session`                   | Yes                 |
-| `git`       | 24    | `KHIVE_PACKS=kg,git`                       | Yes                 |
+| `git`       | 26    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 4     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 9     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
@@ -36,13 +36,13 @@ An always-machine-readable copy of this page is at
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
-`kkernel git-ingest` CLI drive. Its 24 verbs are `git.digest` (read/ingest), `git.ingest_cursor` (a read of the
+`kkernel git-ingest` CLI drive. Its 26 verbs are `git.digest` (read/ingest), `git.ingest_cursor` (a read of the
 stored ingest cursor and checkpoint for one project and source kind), the four
 write verbs `git.commit` / `git.branch` / `git.update_ref` / `git.push` (ADR-108) that shell to system git
 with hardened, allowlisted argv construction, the three read verbs `git.status` /
 `git.log` / `git.init`, and the dev-loop verbs `git.checkout` /
 `git.diff` / `git.gates` / `git.receipts` / `git.reconcile` / `git.pr_open` / `git.pr_review` /
-`git.pr_merge` / `git.pr_state` / `git.issue` / `git.fetch` / `git.pr_edit` / `git.pr_close` /
+`git.pr_merge` / `git.pr_state` / `git.pr_list` / `git.issue` / `git.issue_list` / `git.fetch` / `git.pr_edit` / `git.pr_close` /
 `git.check_log` / `git.branch_delete` (ADR-182). Initial remote cache setup failures and terminal refetch/reclone
 cache failures in `git.digest` return `RemoteFetchError` in-process. On the MCP `request`
 wire, the failed `tool: "git.digest"` result carries
@@ -696,23 +696,24 @@ request(ops="merge(into_id=\"<canonical-uuid>\", from_id=\"<dup-uuid>\")")
 
 Hybrid FTS + vector search with RRF fusion.
 
-| Param                | Type    | Required | Notes                                                                                                                                                               |
-| -------------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `kind`               | string  | yes      | Substrate or granular kind to search.                                                                                                                               |
-| `query`              | string  | yes      | Free-text query.                                                                                                                                                    |
-| `text_mode`          | string  | no       | KG entity/note lexical matching: `all_terms` (default, including null) or `any_term`; does not change the vector arm.                                               |
-| `limit`              | integer | no       | Default 10.                                                                                                                                                         |
-| `entity_kind`        | string  | no       | Entity-substrate searches only.                                                                                                                                     |
-| `entity_type`        | string  | no       | Entity-substrate searches only.                                                                                                                                     |
-| `note_kind`          | string  | no       | Note-substrate searches only.                                                                                                                                       |
-| `include_superseded` | bool    | no       | Note-substrate searches only; default false excludes notes targeted by a `supersedes` edge.                                                                         |
-| `properties`         | object  | no       | Match records whose properties contain all listed key=value pairs, applied before result truncation inside a bounded candidate window.                              |
-| `tags`               | array   | no       | OR-match against tags; entity tags matched at the SQL level, note tags read from `properties.tags`.                                                                 |
-| `min_rank_score`     | number  | no       | Inclusive deterministic rank floor in [0,1], default 0; applied after fusion and modifiers, before the final limit. Strategy/query-local, not calibrated relevance. |
-| `min_score`          | number  | no       | Deprecated exact alias of `min_rank_score` in v0.8. Supplying both names is invalid, even when equal.                                                               |
-| `order_by`           | string  | no       | `score` (default), `created_at`, or `updated_at`; timestamps sort newest first after the rank floor, within the bounded candidate window.                           |
-| `created_after`      | string  | no       | Inclusive RFC 3339 lower bound on record `created_at`; at most nine fractional-second digits.                                                                       |
-| `created_before`     | string  | no       | Inclusive RFC 3339 upper bound on record `created_at`; at most nine fractional-second digits. Must not precede `created_after`.                                     |
+| Param                | Type    | Required | Notes                                                                                                                                                                        |
+| -------------------- | ------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kind`               | string  | yes      | Substrate or granular kind to search.                                                                                                                                        |
+| `query`              | string  | yes      | Free-text query.                                                                                                                                                             |
+| `text_mode`          | string  | no       | KG entity/note lexical matching: `all_terms` (default, including null) or `any_term`; does not change the vector arm.                                                        |
+| `limit`              | integer | no       | Default 10.                                                                                                                                                                  |
+| `entity_kind`        | string  | no       | Entity-substrate searches only.                                                                                                                                              |
+| `entity_type`        | string  | no       | Entity-substrate searches only.                                                                                                                                              |
+| `note_kind`          | string  | no       | Note-substrate searches only.                                                                                                                                                |
+| `include_superseded` | bool    | no       | Note-substrate searches only; default false excludes notes targeted by a `supersedes` edge.                                                                                  |
+| `properties`         | object  | no       | Match records whose properties contain all listed key=value pairs, applied before result truncation inside a bounded candidate window.                                       |
+| `tags`               | array   | no       | OR-match against tags; entity tags matched at the SQL level, note tags read from `properties.tags`.                                                                          |
+| `min_rank_score`     | number  | no       | Inclusive deterministic rank floor in [0,1], default 0; applied after fusion and modifiers, before the final limit. Strategy/query-local, not calibrated relevance.          |
+| `min_score`          | number  | no       | Deprecated exact alias of `min_rank_score` in v0.8. Supplying both names is invalid, even when equal.                                                                        |
+| `order_by`           | string  | no       | `score` (default), `created_at`, or `updated_at`; timestamps sort newest first after the rank floor, within the bounded candidate window.                                    |
+| `created_after`      | string  | no       | Inclusive RFC 3339 lower bound on record `created_at`; at most nine fractional-second digits.                                                                                |
+| `created_before`     | string  | no       | Inclusive RFC 3339 upper bound on record `created_at`; at most nine fractional-second digits. Must not precede `created_after`.                                              |
+| `follow`             | string  | no       | Edge relation to follow outward from each hit; adds `followed` (summary neighbor rows of the targets) and `followed_truncated` (more than 100 targets). Single-backend only. |
 
 ```
 request(ops="search(kind=\"entity\", query=\"knowledge graph runtime\", limit=10)")
@@ -725,6 +726,14 @@ contradiction is rejected. Entity-only fields on a note search and note-only
 fields on an entity search are also rejected explicitly; they are never
 ignored. `properties` must be an object and `tags` must be an array of strings.
 The same validated request is used for single- and multi-backend execution.
+
+`follow` names one edge relation, such as `instance_of`, to follow outward from
+each hit. Every hit then carries `followed`, the targets its outgoing edges of
+that relation reach, as the rows `neighbors(projection="summary")` returns, read
+with the same visibility and mailbox rules. `followed_truncated` is true when a
+hit has more than 100 such targets. A symmetric relation is followed both ways,
+as `neighbors` follows it. A multi-backend search refuses `follow`; call
+`neighbors` on each hit there.
 
 Creation-time bounds apply to both entities and notes, independently of `order_by`,
 and combine with kind, tags and entity-type filters. Omitted or null bounds are
@@ -926,16 +935,16 @@ Immediate graph neighbors. For an anchor that is not a memory row, a call withou
 Each returned hit includes `origin_id`, the resolved queried node. This lets
 batch callers verify that every result is associated with the submitted root.
 
-| Param            | Type            | Required | Notes                                                                                                                                                                                        |
-| ---------------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`             | uuid            | yes      | Node whose neighbors to return. The legacy `node_id` input alias is still accepted.                                                                                                          |
-| `direction`      | string          | no       | `outgoing`\|`incoming`\|`both` (default `both`).                                                                                                                                             |
-| `relations`      | array\<string\> | no       | Restrict to these relation types.                                                                                                                                                            |
-| `min_weight`     | number          | no       | Exclude edges below this weight.                                                                                                                                                             |
-| `limit`          | integer         | no       | Page size, capped at 1000; explicit values report `requested_limit`, `effective_limit`, `limit_clamped` and switch the response to the page shape. Default: every neighbor, as a bare array. |
-| `after`          | string          | no       | Opaque cursor from a previous page's `next_after`; `""` starts a cursor walk. Requires an explicit `limit`. Order is weight descending, then neighbor id, then edge id.                      |
-| `neighbor_kinds` | array\<string\> | no       | Keep only neighbors of these entity or note kinds, applied before the limit.                                                                                                                 |
-| `projection`     | string          | no       | `edge` (edge identity and endpoints only), `summary` (neighbor identity and metadata), or `record` (full hit, default).                                                                      |
+| Param            | Type            | Required | Notes                                                                                                                                                                                                                                                                                                                                                                               |
+| ---------------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`             | uuid            | yes      | Node whose neighbors to return. The legacy `node_id` input alias is still accepted.                                                                                                                                                                                                                                                                                                 |
+| `direction`      | string          | no       | `outgoing`\|`incoming`\|`both` (default `both`).                                                                                                                                                                                                                                                                                                                                    |
+| `relations`      | array\<string\> | no       | Restrict to these relation types.                                                                                                                                                                                                                                                                                                                                                   |
+| `min_weight`     | number          | no       | Exclude edges below this weight.                                                                                                                                                                                                                                                                                                                                                    |
+| `limit`          | integer         | no       | Page size, capped at 1000; explicit values report `requested_limit`, `effective_limit`, `limit_clamped` and switch the response to the page shape. Default: every neighbor, as a bare array.                                                                                                                                                                                        |
+| `after`          | string          | no       | Opaque cursor from a previous page's `next_after`; `""` starts a cursor walk. Requires an explicit `limit`. Order is weight descending, then neighbor id, then edge id.                                                                                                                                                                                                             |
+| `neighbor_kinds` | array\<string\> | no       | Keep only neighbors of these entity or note kinds, applied before the limit.                                                                                                                                                                                                                                                                                                        |
+| `projection`     | string          | no       | `edge` (edge identity and endpoints only), `summary` (neighbor identity and metadata), `record` (full hit, default), or `full` (the record hit plus the neighbor's `properties` and `description` and the edge's `edge_metadata`, each `null` when absent; a note neighbor in another visible namespace has `null` properties, since notes are read in the caller's own namespace). |
 
 ```
 request(ops="neighbors(id=\"<uuid>\", direction=\"both\")")
@@ -958,7 +967,9 @@ Response shape:
 ]
 ```
 
-Flat rows, one per edge: never the neighbor's full entity/note record. `name`, `kind`, and
+Flat rows, one per edge: never the neighbor's full entity/note record, except that
+`projection="full"` adds the neighbor's `properties` and `description` (a note has properties and
+no description) and the edge's `edge_metadata`. `name`, `kind`, and
 `entity_type` are filled in by a batch entity+note lookup performed after the graph query, and
 are **omitted from the JSON entirely (not `null`)** when that lookup can't resolve the neighbor
 id (a dangling/bogus id that never matched an entity or note row). Soft-deleted entity neighbors
@@ -3363,11 +3374,11 @@ This does not change the separate `git.checkout` symlink-refusal contract.
 
 ---
 
-## `git` pack — 24 verbs
+## `git` pack — 26 verbs
 
 The entries below cover the ingest and write surface; the dev-loop verbs
 (`git.checkout`, `git.diff`, `git.gates`, `git.receipts`, `git.reconcile`, `git.status`,
-`git.log`, `git.init`, `git.pr_open`, `git.pr_review`, `git.pr_merge`, `git.pr_state`, `git.issue`, `git.fetch`, `git.pr_edit`, `git.pr_close`, `git.check_log`, `git.branch_delete`) are specified in
+`git.log`, `git.init`, `git.pr_open`, `git.pr_review`, `git.pr_merge`, `git.pr_state`, `git.pr_list`, `git.issue`, `git.issue_list`, `git.fetch`, `git.pr_edit`, `git.pr_close`, `git.check_log`, `git.branch_delete`) are specified in
 ADR-182 and its amendments.
 
 Git-history ingester plus a hardened write surface (ADR-088,
@@ -3522,8 +3533,8 @@ access = "read"
 
 A row with `access = "read"` names a repository and no branches (ADR-108 Amendment 2). It
 admits the verbs that change neither the repository nor its remote: `git.checkout`,
-`git.diff`, `git.status`, `git.log`, `git.gates`, `git.pr_state`, `git.issue`, `git.check_log`
-and `git.reconcile`. Every
+`git.diff`, `git.status`, `git.log`, `git.gates`, `git.pr_state`, `git.pr_list`, `git.issue`,
+`git.issue_list`, `git.check_log` and `git.reconcile`. Every
 other verb refuses on it with `repo_read_only`. A row without `access` is a write row, which
 also admits every read.
 

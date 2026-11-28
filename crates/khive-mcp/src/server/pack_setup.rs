@@ -146,6 +146,8 @@ impl KhiveMcpServer {
             stdio_bridge: false,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: Some(runtime.clone()),
+            #[cfg(unix)]
+            per_pack_local_callbacks: false,
             runtime: Some(runtime),
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_loop_admission,

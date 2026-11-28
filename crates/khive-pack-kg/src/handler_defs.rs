@@ -133,6 +133,13 @@ pub(crate) static SEARCH_PARAMS: &[ParamDef] = &[
         description: "Result order: score (default, by relevance) | updated_at | created_at. Both time orders are descending — most recent first — and records sharing a timestamp keep their relevance order. An unrecognised value is refused. A time order ranks a bounded candidate window rather than the whole corpus, so a match whose relevance falls outside that window may still be missed — use a specific query to bring it into the candidates.",
         resolution_mode: IdResolutionMode::NotApplicable,
     },
+    ParamDef {
+        name: "follow",
+        param_type: "string",
+        required: false,
+        description: "Relation to follow outward from each hit, one of the edge relations (for example instance_of). Each hit then carries followed, the targets its outgoing edges of that relation reach as summary neighbor rows (id, edge_id, relation, weight, name, kind), read with the same visibility as neighbors, and followed_truncated, true when a hit has more than 100 such targets. A symmetric relation is followed both ways, as neighbors does. Single-backend search only; a multi-backend search refuses it.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
 ];
 pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
     HandlerDef {
@@ -1219,7 +1226,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
                 name: "projection",
                 param_type: "string",
                 required: false,
-                description: "Neighbor response shape: edge (origin_id, source_id, target_id, edge_id, relation, weight), summary (origin_id, id, edge_id, relation, weight, name, kind, entity_type), or record (default: the summary fields plus the stored source_id and target_id of the edge). No projection carries the neighbor's properties or description or the edge's metadata; traverse with include_properties=true or get returns the node's properties.",
+                description: "Neighbor response shape: edge (origin_id, source_id, target_id, edge_id, relation, weight), summary (origin_id, id, edge_id, relation, weight, name, kind, entity_type), record (default: the summary fields plus the stored source_id and target_id of the edge), or full (the record fields plus the neighbor's properties and description and the edge's metadata as edge_metadata, each null when absent; a note neighbor has no description, and a note neighbor in another visible namespace has null properties, since notes are read in the caller's own namespace).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

@@ -12,9 +12,9 @@ categories.workspace = true
 description = "Operation pack: published operation types, operations recorded against them, and the frontier of what is owed"
 
 [dependencies]
-khive-types = { version = "0.23.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.23.0", path = "../khive-runtime" }
-khive-storage = { version = "0.23.0", path = "../khive-storage" }
+khive-types = { version = "0.24.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.24.0", path = "../khive-runtime" }
+khive-storage = { version = "0.24.0", path = "../khive-storage" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -24,4 +24,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# Path-only: the tests install kg and forms beside operation; cargo strips them at publish.
+khive-pack-forms = { path = "../khive-pack-forms" }
+khive-pack-kg = { path = "../khive-pack-kg" }
 tokio = { workspace = true, features = ["full"] }

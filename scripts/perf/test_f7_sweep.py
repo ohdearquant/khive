@@ -9,6 +9,7 @@ import types
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
+import bench_load_harness as harness
 import f7_sweep as sweep
 import writer_attempt_report as war
 
@@ -48,10 +49,10 @@ class FakeHarness:
         if "--burst-size" in argv:
             for row in records[2:]:
                 row.update(burst=1, scheduled_s=1.0, finished_s=1.0 + self.burst_finish.get(name, 0.01))
-        errors = [f"tenant=0 worker={i}: {sweep.DRAIN_TIMEOUT_CRASH}"
+        errors = [harness.format_worker_error(0, i, harness.DRAIN_TIMEOUT_CRASH)
                   for i, state in enumerate(states) if state == "outstanding"]
         if name in self.failing:
-            errors.append("tenant=0 worker=0: daemon exited with code 137")
+            errors.append(harness.format_worker_error(0, 0, "daemon exited with code 137"))
         report = {"smoke_result": smoke, "smoke_errors": errors, "arrival": {
             "request_id_prefix": PREFIX, "request_id_sequence_bits": BITS, "records": records,
             "observed_duration_s": 1.0, "counts": {"submitted": 4, **counts},
@@ -200,12 +201,16 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(summary["paired_cost"]["classes"]["stream.append"]["on"]["n"], 8)
 
     def test_a_round_still_void_after_retries_leaves_both_arms(self):
-        summary, rc, lines, _ = self.run_plan(FakeHarness(drops={"pair-1-on": 1, "pair-1-on-retry1": 1}))
+        off_retry_states = ["completed", "completed", "completed", "outstanding"]
+        fake = FakeHarness(drops={"pair-1-on": 1, "pair-1-on-retry1": 1},
+                           states={"pair-1-off-retry1": off_retry_states})
+        summary, rc, lines, _ = self.run_plan(fake)
         self.assertEqual(rc, 1)
         self.assertIn("[pair-1] still VOID after 1 retries; no reading at this round; the round leaves both arms",
                       lines)
         self.assertEqual(summary["paired_cost"]["rounds"], 1)
         self.assertEqual(summary["paired_cost"]["classes"]["stream.append"]["off"]["n"], 4)
+        self.assertNotIn("dropped_paired_latency", summary)
 
     def test_a_drain_timeout_is_a_reading_outside_the_envelope(self):
         states = ["completed", "completed", "outstanding", "outstanding"]
@@ -221,22 +226,37 @@ class ExecuteTests(unittest.TestCase):
         self.assertIn("(1 of 4 arrivals failed)", lines[0])
 
     def test_a_pair_round_with_unfinished_arrivals_leaves_both_arms(self):
-        states = ["completed", "completed", "completed", "outstanding"]
-        summary, rc, lines, _ = self.run_plan(FakeHarness(states={"pair-2-off": states}))
+        states = ["completed", "failed", "completed", "outstanding"]
+        fake = FakeHarness(states={"pair-2-off": states}, latency={"pair-2-off": 1000, "pair-2-on": 2400})
+        summary, rc, lines, _ = self.run_plan(fake)
         self.assertEqual(rc, 0)
         self.assertIn("[pair-2] pair-2-off had failed or outstanding arrivals; the round leaves both arms", lines)
         self.assertEqual(summary["paired_cost"]["rounds"], 1)
         self.assertIn("paired arm: 1 of 2 rounds left both arms for failed or outstanding arrivals; the cost line "
                       "covers the clean rounds only", lines)
         self.assertEqual(summary["paired_rounds"], {"planned": 2, "unclean": 1})
+        self.assertEqual(summary["paired_cost"]["classes"]["stream.append"]["off"]["p99"], 103)
+        dropped = summary["dropped_paired_latency"]
+        self.assertEqual(dropped["rounds"], 1)
+        op = dropped["classes"]["stream.append"]
+        self.assertEqual((op["off"]["n"], op["off"]["p50"], op["off"]["p99"]), (2, 1002, 1002))
+        self.assertEqual((op["on"]["n"], op["on"]["p50"], op["on"]["p99"]), (4, 2402, 2403))
+        self.assertIn("completed client latency for dropped paired rounds (count=1) | stream.append "
+                      "(off n=2 p50=1002 us p99=1002 us, on n=4 p50=2402 us p99=2403 us)", lines)
 
     def test_no_clean_paired_round_is_no_reading(self):
-        states = ["completed", "completed", "completed", "outstanding"]
-        summary, rc, lines, _ = self.run_plan(FakeHarness(states={"pair-1-on": states, "pair-2-off": states}))
+        states = ["outstanding"] * 4
+        summary, rc, lines, _ = self.run_plan(FakeHarness(states={"pair-1-off": states, "pair-2-off": states}))
         self.assertEqual(rc, 1)
         self.assertIn("paired arm: none of 2 rounds was clean; no cost line", lines)
         self.assertIsNone(summary["paired_cost"])
         self.assertFalse(any(line.startswith("attempt-log cost") for line in lines))
+        op = summary["dropped_paired_latency"]["classes"]["stream.append"]
+        self.assertEqual(op["off"], {"n": 0})
+        self.assertEqual(op["on"]["n"], 8)
+        self.assertIsNone(op["p50_cost_us"])
+        self.assertIn("completed client latency for dropped paired rounds (count=2) | stream.append "
+                      "(off n=0, on n=8 p50=102 us p99=103 us)", lines)
 
     def test_a_harness_that_failed_with_nothing_outstanding_is_broken(self):
         summary, rc, lines, _ = self.run_plan(FakeHarness(failing={"sweep-100"}))
@@ -275,11 +295,19 @@ class ExecuteTests(unittest.TestCase):
             (run_dir / "harness.json").write_text("[]")
             with self.assertRaisesRegex(war.ReportError, "the harness report is a list, not an object"):
                 sweep.read_run({"name": "x", "attempt_log": False}, run_dir, loss_limit=0.01, util_limit=0.7,
-                               queue_p99_limit_micros=None)
+                               queue_p99_limit_micros=None, harness_rc=0)
+
+    def test_read_run_requires_the_harness_exit_status(self):
+        with self.assertRaisesRegex(TypeError, "harness_rc"):
+            sweep.read_run(
+                {"name": "x", "attempt_log": False}, pathlib.Path("."), loss_limit=0.01,
+                util_limit=0.7, queue_p99_limit_micros=None,
+            )
 
     def test_a_pair_from_two_rounds_is_refused(self):
-        runs = sweep.plan_runs([100], aa=False, paired_workers=100, paired_rounds=2)
-        runs = runs[:1] + [runs[2], runs[3], runs[1], runs[4]]
+        plan = sweep.plan_runs([100], aa=False, paired_workers=100, paired_rounds=2)
+        by_name = {run["name"]: run for run in plan}
+        runs = [by_name[name] for name in ("sweep-100", "pair-1-on", "pair-2-off", "pair-1-off", "pair-2-on")]
         with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(ValueError, "same round"):
             sweep.execute(runs, pathlib.Path(tmp), args(), spawn=FakeHarness(), emit=lambda _: None)
 

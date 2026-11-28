@@ -158,6 +158,11 @@ trait TestWriterStageClock: Send + Sync {
     fn at_commit(&self);
 }
 
+struct WriteTelemetryOptions {
+    attempt_log: bool,
+    top_level: bool,
+}
+
 struct WriteTelemetry {
     #[cfg(test)]
     test_clock: Option<std::sync::Arc<dyn TestWriterStageClock>>,
@@ -184,8 +189,7 @@ impl WriteTelemetry {
         queue_depth_at_entry: usize,
         slow_write_threshold: Option<Duration>,
         labels: SubmitLabels,
-        attempt_log: bool,
-        top_level: bool,
+        options: WriteTelemetryOptions,
     ) -> Self {
         Self {
             #[cfg(test)]
@@ -196,9 +200,9 @@ impl WriteTelemetry {
             queue_depth_at_entry,
             slow_write_threshold,
             labels,
-            attempt_log,
-            top_level,
-            request_id: khive_storage::current_request_correlation(),
+            attempt_log: options.attempt_log,
+            top_level: options.top_level,
+            request_id: khive_storage::current_request_id(),
         }
     }
 
@@ -1144,8 +1148,10 @@ impl WriterTaskHandle {
             self.queue_depth(),
             self.slow_write_threshold,
             labels,
-            self.attempt_log,
-            top_level,
+            WriteTelemetryOptions {
+                attempt_log: self.attempt_log,
+                top_level,
+            },
         );
         let mut request = Box::new(WriteRequest {
             op: Box::new(op),
