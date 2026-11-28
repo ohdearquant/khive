@@ -986,6 +986,8 @@ load-bearing.
 
 ## Amendment 15 (2026-11-21): reading a pull request's state
 
+This amendment is dated a day before Amendment 14, which was numbered first.
+
 **Status**: Accepted 2026-11-22. The ADR's Accepted status and every amendment above stand unchanged.
 
 Adopted from a reading of a real caller, as Amendment 8 was. A client with no shell can commit,

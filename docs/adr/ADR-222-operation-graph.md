@@ -756,3 +756,161 @@ Not checked:
 - How much of a form resolves without a decision depends on how normalized the role list is; #6904
   section 8 reports six of eleven rows with one wording and ten with another. Nothing here measures
   the counting-qualifier list either.
+
+## Amendment 2 (2026-11-27): item 3, step types, inputs and names
+
+Serves #6894 rows 1, 2, 3 and 9 and A1.4 (#6904 section 3). Building item 3 left questions that
+section 3, section 7 and A1.4 do not settle; this amendment settles them. It changes one sentence of
+section 7 (A2.5) and none of section 3 or A1.4. It also specifies the two forms reads that A1.3's
+`resolve` calls (A2.8), which no record specified before.
+
+### A2.1 A step type published alone, and pinned
+
+`define` takes `step_types` beside `operation_types`. Either list may be empty, not both
+(`invalid_document`). A step type given there is compiled and published as its own row of kind
+`step_type` (section 2), in the same atomic unit as the document's operation types. It carries `id`,
+`version`, `name` (default: the id), `act` (default: the name), `by`, an optional `quantifier`,
+`requires` and `produces`. These are the fields item 3 builds. Section 3 gives a step type more: an
+effect, the system or party acted on, a document type, `via`, gap codes and citations. Each of those
+keeps the item that builds it, and this list is not a new definition of a step type. A step type's
+`by`, and the slots its values are about, are slot names: an operation type that pins it must
+declare those slots (`unknown_slot`).
+
+An operation type's step either pins a step type, `{name, step_type: {id, version}}`, or is the
+in-type shorthand of section 3. A pin resolves against the document's own step types and those
+already published in the namespace. Where neither holds it, the pin is refused
+(`unknown_step_type`). The digest pinned is read from that row; the caller never gives one.
+
+A pinned step gives no `by`, `act`, `quantifier`, `requires` or `produces` of its own
+(`pinned_step_shape`), so what the step is has one definition. `via` is part of what the step is as
+well: once an item builds it, a pinned step that gives `via` is refused the same way. A pinned step
+keeps `after`, `activated_by`, `unless`, `outcome` and `supplies`, which say how this operation type
+uses it. A step type pinned on a repeating slot must carry a quantifier (`quantifier_missing`).
+
+Publishing again an id and version already published with the same digest writes nothing. With
+another digest it is refused (`version_conflict`). A document that gives one step type, or one
+operation type, twice is refused (`duplicate_type`).
+
+### A2.2 Requirements and products name loaded fields
+
+`requires` and `produces` name a forms-pack field by its canonical name. `define` refuses a field
+the forms pack has not loaded in the namespace (`unknown_field`), as it refuses an unknown slot term
+(A1.1). A requirement's `value_type` must equal the field's (`value_type_mismatch`), because a
+second value type for one field would be a second source of truth for what the field holds. The
+check runs at `define`, and the published bytes keep the value type it passed with (section 2).
+
+### A2.3 Order derived from values
+
+As section 3 says, a step that requires (field, slot) which another step of the type produces comes
+after that step, and a step with `supplies: {from, field, as}` comes after `from`. A supply's `from`
+must be a step of the type (`unknown_step`). Its `as` must be a field the step requires, and `from`
+must produce `field` (`unknown_supply`), about the slot the requirement is about
+(`supply_slot_mismatch`). A step supplied from itself is a `derived_cycle` of one step.
+
+An edge that `after` already states is not derived again. Cycles are checked in this order: through
+`after` alone (`after_cycle`), then through rules (`rule_cycle`), then through derived edges
+(`derived_cycle`, naming the steps). A document with cycles of more than one kind is refused with
+the first. The published bytes carry each step's derived predecessors (`derived_after`) beside
+`after`, so the frontier reads order from bytes only (section 2). Section 3's sentence on a skipped
+step holds for derived edges as written.
+
+### A2.4 `input_missing` and `act_owed`
+
+A step whose predecessors are done or bypassed is checked input by input. For a requirement (field,
+slot), the fact sought is that field about the identity bound to the slot, or about the operation
+when it names no slot. For a supplied requirement, it is the supply's `field`.
+
+A producer that is not yet done holds the step back as `act_blocked`, as today, because it is a
+predecessor by A2.3. Where the producer is done and left no fact, or no step produces the field, the
+frontier gives one `input_missing` item per missing input, and the step is not `act_owed` while any
+input is missing. The item carries: the step; the field and its value type; `by` and the supplier;
+the slot and the identity it is about; `produced_by` when a producer exists; and the places and
+`stated_in_part` of A1.4. On a repeating slot it is expanded per identity, as section 3 expands
+steps. It groups like the step's other items.
+
+### A2.5 A field's names in a vocabulary: a change to section 7
+
+Section 7's fourth paragraph said the forms pack holds a field's names "as the same key". That
+sentence changes. The forms pack holds them under its own prefix, `forms/<vocabulary>/field/<name>`,
+on the field entity. `forms.load` takes `known_as` on a field and writes them; this pack reads them
+and writes none. `operation/<vocabulary>/<entity_type>/<name>` stays for this pack's own nodes.
+
+A key's prefix then names the pack that writes it, so a reader knows whose uniqueness refused a
+clash, and neither pack writes under the other's prefix. A field name and an operation node name in
+one vocabulary never clash, which is section 7's per-node-type reading already. #6894 row 9's clash
+between two fields is refused by the same key uniqueness, inside forms.
+
+A vocabulary may not be named after one of section 2's node types (`reserved_vocabulary`). The
+shorthand step type `<operation type>/<step>` has the canonical key
+`operation/step_type/<operation type>/<step>`, which a vocabulary named `step_type` could otherwise
+collide with.
+
+### A2.6 `source_order`
+
+`define` takes `source_order: {version, places}`, one id per namespace, versioned as section 2
+versions definitions. Each place names a document type or system loaded in the forms pack. `define`
+refuses a name the forms pack has not loaded (`unknown_place`) and a name given twice
+(`duplicate_place`).
+
+So a source order loads after the document types and systems it names. A deployment that loads a
+new document type publishes a new version that names it, and until then that type's places come
+after the listed ones, in name order (A1.4 point 3). The frontier reads the newest published version
+in the namespace and names it.
+
+### A2.7 A key added to a live entity
+
+Section 2's canonical key and section 7's names are keys on nodes that already exist. ADR-221
+assigned a key only at keyed create. ADR-221 Amendment 1 adds one runtime method that adds a key to
+a live entity under keyed create's rules. Section 2 and section 7 write through it. It is a runtime
+method, not a verb. It answers a key another live entity holds with that entity's id, whatever the
+caller may read; the pack that calls it reports `key_conflict` with `existing_id` only when the
+caller may list the holder, as ADR-221 section 1 says of a keyed create.
+
+### A2.8 Two forms reads
+
+A1.3's `resolve` reads the namespace's terms and one form revision's subjects from the forms pack,
+through two read verbs the forms pack gains with A1.1 to A1.3. Neither writes anything.
+
+- `forms.terms` takes no argument. It returns the term lists `forms.load` takes (`kinds`, `roles`,
+  `relations` and `counting_qualifiers`, A1.1), each term with its name, its definition, its aliases
+  and `carries`, which is true for a relation by which one subject carries another.
+- `forms.subjects(form, revision?)` returns the subjects one form revision declares, in name order,
+  each with its id, kind and role and, where it has them, its qualifier, row count (`repeats`) and
+  relations. `form` is a form id or `form_id@revision`. With no revision named, it reads the
+  revision loaded last. The reply names the revision it read and lists every revision of the form
+  in load order. A form or revision that is not loaded is refused, naming it, and so is a revision
+  named both in `form` and in `revision`.
+
+### A2.9 Admission rows, and where it lands
+
+No operation verb is added by this amendment. Of Amendment 1's verbs, `operation.resolve` is a read
+and joins `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` and ADR-103 Amendment 3's list;
+`operation.decide` writes and does not. `forms.terms` and `forms.subjects` (A2.8) are reads and join
+both lists. All three land with the A1.1 to A1.3 pull request.
+
+Item 3 lands as three pull requests, after ADR-221 Amendment 1:
+
+- 3a: forms, `known_as` on fields (A2.5) and the system mark of ADR-223.
+- 3b: operation, A2.1 to A2.4 and A2.6, with A1.4's places and `stated_in_part`.
+- 3c: operation, the working type graph with section 2's canonical keys and section 7's names.
+
+Each refusal code this amendment adds has an arm; the refusal arms of one section may be rows of one
+table test.
+
+- A2.1: a pinned step type shared by two operation types. Refused: a pin neither the document nor
+  the namespace holds (`unknown_step_type`); a pinned step that gives `by` (`pinned_step_shape`); a
+  step type with no quantifier pinned on a repeating slot (`quantifier_missing`); an id and version
+  published again with another digest (`version_conflict`), beside the same digest writing nothing;
+  one step type given twice in a document (`duplicate_type`).
+- A2.2: a requirement naming a field the forms pack has not loaded (`unknown_field`), and one whose
+  value type is not the field's (`value_type_mismatch`).
+- A2.3: a cycle through derived edges, refused as `derived_cycle` naming its steps; a supply whose
+  `as` the step does not require (`unknown_supply`); a supply whose `from` produces the field about
+  another slot (`supply_slot_mismatch`); a document with an `after` cycle and a derived cycle,
+  refused as `after_cycle`.
+- A2.4: the #6893 fixture's `issue`, which waits on a value `sign` produces.
+- A2.5: a field clash refused in one vocabulary and accepted across two; a vocabulary named
+  `step_type` (`reserved_vocabulary`).
+- A2.6: an unknown place (`unknown_place`) and a place given twice (`duplicate_place`).
+- A2.8: `forms.terms` returns a term's alias and a carrying relation's `carries`; `forms.subjects`
+  reads a named revision and, with none named, the revision loaded last.
