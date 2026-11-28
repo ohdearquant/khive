@@ -10,6 +10,47 @@ fn operation_type(value: Value) -> OperationType {
     serde_json::from_value(value).expect("an operation type")
 }
 
+/// One field produced both about the operation and about a slot is one edge that says both.
+#[test]
+fn a_field_produced_about_the_operation_and_a_slot_is_one_edge_saying_both() {
+    let step = step_type(json!({
+        "kind": "step_type", "id": "issue", "version": 1, "name": "issue", "act": "issue",
+        "by": "clerk",
+        "produces": [{"field": "permit number", "class": "stated"},
+                     {"field": "permit number", "slot": "holder", "class": "stated"}]
+    }));
+    let graph = TypeGraph::of_step_type(&step, "blake3:v1");
+    let produces: Vec<_> = graph
+        .edges
+        .iter()
+        .filter(|(_, properties)| properties.get("role") == Some(&json!("produces")))
+        .collect();
+    assert_eq!(produces.len(), 1, "{produces:?}");
+    assert_eq!(produces[0].1["about_operation"], json!(true));
+    assert_eq!(produces[0].1["slots"], json!(["holder"]));
+}
+
+/// A produces edge about neither the operation nor a slot is refused. No document gives one,
+/// since each edge comes from at least one product, so the graph is built by hand.
+#[test]
+fn a_produces_edge_about_nothing_is_refused() {
+    let mut graph = TypeGraph::default();
+    graph.edges.insert(
+        EdgeKey {
+            source: "operation/step_type/issue".to_owned(),
+            relation: "links_to",
+            target: Target::Field("permit number".to_owned()),
+        },
+        Map::from_iter([
+            ("role".to_owned(), json!("produces")),
+            ("about_operation".to_owned(), json!(false)),
+            ("slots".to_owned(), json!([])),
+        ]),
+    );
+    let refusal = check_products(&graph).expect_err("about nothing");
+    assert_eq!(refusal.code, "invalid_product");
+}
+
 #[test]
 fn keys_follow_section_2_and_a2_10() {
     assert_eq!(
@@ -100,14 +141,13 @@ fn a_step_type_shows_its_requirements_and_one_produces_edge_per_field() {
             })
             .cloned()
     };
-    assert_eq!(
-        produces("decision").expect("one produces edge")["slots"],
-        json!(["agent", "holder"])
-    );
-    assert_eq!(
-        produces("receipt").expect("about the operation")["slots"],
-        json!([])
-    );
+    let decision = produces("decision").expect("one produces edge");
+    assert_eq!(decision["slots"], json!(["agent", "holder"]));
+    assert_eq!(decision["about_operation"], json!(false));
+    let receipt = produces("receipt").expect("about the operation");
+    assert_eq!(receipt["slots"], json!([]));
+    assert_eq!(receipt["about_operation"], json!(true));
+    assert!(check_products(&graph).is_ok());
     // Two contains, two requires and two produces.
     assert_eq!(graph.edges.len(), 6);
     // A requirement holds its slot by name; no edge runs to a slot node.

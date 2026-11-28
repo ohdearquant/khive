@@ -26,9 +26,9 @@ use uuid::Uuid;
 
 use crate::definition::{Document, OperationType, Refusal, StepType};
 use crate::graph::{
-    check_key_length, definition_key, names_in_source, relation_of, requirement_key, slot_key,
-    EdgeKey, NameSpec, NodeSpec, Target, TypeGraph, FIELD, GRAPH_REVISION, OPERATION_TYPE,
-    REQUIREMENT, SLOT, STEP_TYPE,
+    check_key_length, check_products, definition_key, names_in_source, relation_of,
+    requirement_key, slot_key, EdgeKey, NameSpec, NodeSpec, Target, TypeGraph, FIELD,
+    GRAPH_REVISION, OPERATION_TYPE, REQUIREMENT, SLOT, STEP_TYPE,
 };
 use crate::pack::{checked_definition, col_i64, col_opt_text, col_text, forms_read, stmt, text};
 
@@ -153,6 +153,9 @@ pub(crate) async fn check_document(
         {
             return Ok(Err(refusal));
         }
+    }
+    if let Err(refusal) = check_products(&graph) {
+        return Ok(Err(refusal));
     }
     let mut claimed: BTreeMap<&str, &NameSpec> = BTreeMap::new();
     for name in &names {

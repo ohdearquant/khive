@@ -115,6 +115,35 @@ pub(crate) fn name_key(
 }
 
 /// Refuse a key longer than ADR-221 allows, naming what it would key.
+/// Refuse a `produces` edge that says its value is about nothing: `about_operation` false and
+/// no slot. A reader takes the operation from `about_operation`, never from an empty `slots`.
+pub(crate) fn check_products(graph: &TypeGraph) -> Result<(), Refusal> {
+    for (edge, properties) in &graph.edges {
+        if properties.get("role") != Some(&json!("produces")) {
+            continue;
+        }
+        let about_operation = properties
+            .get("about_operation")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let no_slot = properties
+            .get("slots")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty);
+        if !about_operation && no_slot {
+            let (Target::Field(field) | Target::Node(field)) = &edge.target;
+            return Err(Refusal::new(
+                "invalid_product",
+                format!(
+                    "{} produces \"{field}\" about neither the operation nor a slot",
+                    edge.source
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn check_key_length(key: &str, what: &str) -> Result<(), Refusal> {
     if key.len() > MAX_KEY_BYTES {
         return Err(Refusal::new(
@@ -352,8 +381,9 @@ impl TypeGraph {
     }
 
     /// A step type node, its requirement nodes, and the fields it requires and produces, from
-    /// the bytes of the version it shows. A product of one field about several slots is one
-    /// `produces` edge naming every slot; `slots` is empty for a value about the operation.
+    /// the bytes of the version it shows. The products of one field are one `produces` edge:
+    /// `about_operation` says whether a value about the operation is produced, and `slots`
+    /// names every slot a value is produced about.
     pub fn of_step_type(step: &StepType, digest: &str) -> Self {
         let mut graph = Self::default();
         let key = definition_key(STEP_TYPE, &step.id);
@@ -398,22 +428,25 @@ impl TypeGraph {
                 json!({"role": "requires"}),
             );
         }
-        let mut produced: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        let mut produced: BTreeMap<&str, (bool, Vec<String>)> = BTreeMap::new();
         for product in &step.produces {
-            let slots = produced.entry(product.field.as_str()).or_default();
-            if let Some(slot) = &product.slot {
-                if !slots.contains(slot) {
-                    slots.push(slot.clone());
+            let (about_operation, slots) = produced.entry(product.field.as_str()).or_default();
+            match &product.slot {
+                Some(slot) => {
+                    if !slots.contains(slot) {
+                        slots.push(slot.clone());
+                    }
                 }
+                None => *about_operation = true,
             }
         }
-        for (field, mut slots) in produced {
+        for (field, (about_operation, mut slots)) in produced {
             slots.sort();
             graph.edge(
                 &key,
                 "links_to",
                 Target::Field(field.to_owned()),
-                json!({"role": "produces", "slots": slots}),
+                json!({"role": "produces", "about_operation": about_operation, "slots": slots}),
             );
         }
         graph

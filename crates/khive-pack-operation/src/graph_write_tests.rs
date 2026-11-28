@@ -677,6 +677,7 @@ async fn products_requirements_and_slots_are_keyed_as_a2_10_says() {
         Target::Field("signed date".to_owned())
     );
     assert_eq!(produces[0].1["slots"], json!(["clerk", "holder"]));
+    assert_eq!(produces[0].1["about_operation"], json!(false));
     // The requirement names its slot; no edge runs from it to either type's slot node.
     let requirement = requirement_key("record", Some("holder"), "holder name");
     assert_eq!(nodes[&requirement]["slot"], "holder");
