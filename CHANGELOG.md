@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- On a shared host, `comm.quiet` requires the authenticated operator. Renewals have a
+  15-minute continuous cap and background work gets 60 seconds before a new quiet window.
+  `comm.health` reports `quiet_retry_at` and `quiet_refusal_reason` when the cap blocks
+  renewal (#6563).
+
+### Breaking (Rust crates)
+
+- `RuntimeConfig` adds the public `quiet_operator` field. Code that constructs it with a
+  complete struct literal must supply the field (#6563).
+
 ## [0.24.0] - 2026-11-28
 
 ### Added
