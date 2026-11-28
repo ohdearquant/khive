@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a pull request. Terminal escapes and control and format characters are removed from the text and
   `text_altered` says when that changed anything; the text is returned as untrusted data. It is a
   read: a `[[git_write.allowed]]` row with `access = "read"` admits it, and it writes no receipt.
+- The runtime adds a caller key to an entity that already exists (`add_entity_key`, and
+  `entity_key_add_plans` for a caller that joins the add to its own atomic unit), under the rules of
+  a keyed create: the same limits and secret scan on the key, the same uniqueness per namespace and
+  base kind, `key_conflict` against another live holder, and nothing written for a key the entity
+  already holds. An add to a deleted entity is refused as `entity_deleted` and to a merged-away one
+  as `entity_merged` (ADR-221 Amendment 1).
 
 ## [0.23.0] - 2026-11-26
 

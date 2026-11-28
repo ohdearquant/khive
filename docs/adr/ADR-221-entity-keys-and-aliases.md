@@ -254,3 +254,49 @@ or an alias. Existing full-text rows are unchanged until the entity is next writ
 14. An alias equal to the entity's name is not stored on create, on `add_aliases`, on a rename back
     to a name held as an alias (which deletes that alias), or on a merge, including one whose
     strategy takes `from`'s name; resolve of that string returns the entity once.
+
+## Amendment 1 (2026-11-27): a key added to a live entity
+
+[ADR-222](ADR-222-operation-graph.md) Amendment 2 (A2.7) holds names as keys on entities that
+already exist. The runtime gains one method that adds a key to a live entity under the rules of a
+keyed create (section 1):
+
+- the same limits on the key (at most 512 UTF-8 bytes, no U+0000);
+- the secret scan on its exact bytes before any holder lookup;
+- the same uniqueness over held rows of `(namespace, kind, key)`, `kind` being the entity's own base
+  kind;
+- `key_conflict`, with `existing_id` when the caller may list the holder.
+
+A key the entity already holds is added again as nothing written and no error, so it stays one
+row. An add to a deleted entity is refused as `entity_deleted`, and one to a merged-away entity as
+`entity_merged`, naming the kept entity. A key another entity of the same kind released is free
+to add, and that entity's later `restore` then refuses with `restore_key_conflict` and leaves it
+deleted. A key held under another kind never clashes.
+
+The method comes in two forms. `entity_key_add_plans` returns the plans a caller joins to its own
+atomic unit: they hold only while the entity is live and of the kind the key is added under, claim
+the key when it is free, and roll the whole unit back when another live entity holds it, so a pack
+can add names in the transaction that writes the rest of its change. `add_entity_key` commits one
+add by itself.
+
+Section 1's sentence "After merges one entity can hold several keys" now reads: an entity holds
+several keys after a merge or after keys are added to it. All that section 1 says of held keys
+holds for an added key: `delete` releases it, `restore` takes it back all or nothing, a merge
+moves it, and it travels through the carriers of section 4 as any key row does. An added key holds
+its entity to its kind as a created one does (the kind guard in `crates/khive-db/sql/069-entity-key-kind-guard.sql`). The method is not a
+verb, so no admission row or published count changes.
+
+Acceptance:
+
+1. A free key is added beside the key the entity was created with, and to an entity created with
+   none; `get` by either key finds the entity.
+2. Adding a key the entity holds writes nothing and leaves one row, through either form.
+3. A key another live entity of the same kind holds answers `key_conflict` and writes nothing; a
+   key taken between the read and the commit rolls the unit back.
+4. A key another entity of the same kind released is added; that entity's `restore` refuses with
+   `restore_key_conflict` naming the key and leaves it deleted.
+5. A key held under another kind does not clash.
+6. An entity holding an added key cannot change kind.
+7. An add to a deleted entity is refused as `entity_deleted`, to a merged-away one as
+   `entity_merged`, and to a missing one as not found; a malformed or secret-shaped key is refused
+   before any read.
