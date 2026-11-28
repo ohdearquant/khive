@@ -21,10 +21,11 @@ Each run gets its own directory under --out with the harness report (harness.jso
 directory the daemon wrote (sink/), which is kept. Every attempt-log run prints the attempts expected, rows written,
 sequence gaps, drop counter and loss bound, then its point verdict (writer_attempt_report.py). A run whose loss bound
 is over --loss-limit is VOID and runs again, up to --void-retries more times; the void runs stay on the record. In the
-paired arm the whole round runs again, off and on in the same order, so the two stay adjacent, and a round still VOID
-after its retries is dropped from both arms, as is a round in which either run had failed or outstanding arrivals,
-so the cost line pools clean rounds only. A run with the attempt log off must leave no writer_attempt row in its
-sink: one there means the variable reached a daemon it should not have, and the paired arm is BROKEN.
+paired arm the whole round runs again, off and on in the same order, so the two stay adjacent. A round still VOID
+after its retries leaves both arms. For rounds with failed or outstanding arrivals, the sweep reports completed
+client latency separately for both arms. The cost line pools clean rounds. A run with the attempt log off must
+leave no writer_attempt row in its sink: one there means the variable reached a daemon it should not have, and
+the paired arm is BROKEN.
 
 Every run, both paired arms included, shortens the sink heartbeat and waits for it to settle before teardown
 (bench_load_harness.py SINK_HEARTBEAT_MS and SINK_SETTLE_S), which a default daemon does not do. The closing lines
@@ -104,16 +105,14 @@ DRAIN_TIMEOUT_CRASH = "open-loop drain exceeded --worker-timeout"
 def drain_timeout_only(harness, harness_rc):
     """True when the harness failed only because arrivals were outstanding at its drain timeout.
 
-    The harness writes the drain-timeout error only for a worker whose process was still running at the timeout; an
-    exited worker process carries another error and the run reads BROKEN. A worker process alive but wedged on a
-    daemon that died behind it is not told apart from an overloaded one."""
+    A drain-timeout-only report has outstanding arrivals and no separate worker or daemon failure."""
     errors = harness.get("smoke_errors") or []
     outstanding = (harness.get("arrival") or {}).get("counts", {}).get("outstanding")
     return (bool(outstanding) and harness_rc in (0, 1) and bool(errors)
             and all(str(error).endswith(f": {DRAIN_TIMEOUT_CRASH}") for error in errors))
 
 
-def read_run(run, run_dir, *, loss_limit, util_limit, queue_p99_limit_micros, burst_deadline_s=None, harness_rc=0):
+def read_run(run, run_dir, *, loss_limit, util_limit, queue_p99_limit_micros, harness_rc, burst_deadline_s=None):
     """One run's reading: the point report for a log-on run, client latency and a row count for a log-off run.
 
     A harness that failed for any reason but arrivals left outstanding at its drain timeout supports no reading,
@@ -207,6 +206,23 @@ def cost_line(cost):
     return f"attempt-log cost, on minus off, pooled over {cost['rounds']} rounds: " + "; ".join(parts)
 
 
+def dropped_latency_line(latency):
+    def arm(name, stats):
+        count = stats["n"]
+        if not count:
+            return f"{name} n=0"
+        return f"{name} n={count} p50={stats['p50']} us p99={stats['p99']} us"
+
+    parts = [
+        f"{op} ({arm('off', entry['off'])}, {arm('on', entry['on'])})"
+        for op, entry in latency["classes"].items()
+    ]
+    rounds = latency["rounds"]
+    if not parts:
+        return f"no completed client samples across {rounds} dropped paired rounds"
+    return f"completed client latency for dropped paired rounds (count={rounds}) | " + ", ".join(parts)
+
+
 def run_once(run, name, out, args, spawn, deadline_s):
     """One harness run under `name`: (record entry, reading or None when the inputs could not support a reading)."""
     run_dir = out / name
@@ -224,6 +240,26 @@ def run_once(run, name, out, args, spawn, deadline_s):
     return {**entry, "verdict": reading["verdict"], "point": reading.get("point")}, reading
 
 
+def run_group(group, out, args, *, spawn, deadline_s, emit):
+    """Return all attempts and readings, plus the first non-VOID group, a terminal error, or None at retry exhaustion."""
+    entries, seen = [], []
+    for tries in range(args.void_retries + 1):
+        readings = []
+        for run in group:
+            name = run["name"] if tries == 0 else f"{run['name']}-retry{tries}"
+            entry, reading = run_once(run, name, out, args, spawn, deadline_s)
+            entries.append(entry)
+            if isinstance(reading, war.ReportError):
+                emit(f"[{name}] BROKEN: {reading}")
+                return entries, seen, reading
+            emit(run_line(dict(run, name=name), reading))
+            readings.append(reading)
+            seen.append(reading)
+        if all(reading["verdict"] != "VOID" for reading in readings):
+            return entries, seen, readings
+    return entries, seen, None
+
+
 def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
     """Run the plan in order and return (record, rc). `spawn` runs one harness argv; it is replaced in tests.
 
@@ -231,56 +267,53 @@ def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
     the same order, so the partners stay adjacent; a round still VOID after --void-retries leaves both arms, and so
     does a round in which either run had failed or outstanding arrivals, so the cost line pools clean rounds only."""
     record, pairs, bursts, seen, rc = [], {"off": [], "on": []}, [], [], 0
+    dropped_pairs = {"off": [], "on": []}
     rounds = {"planned": 0, "unclean": 0}
     deadline_s = None if args.burst_deadline_ms is None else args.burst_deadline_ms / 1000
     i = 0
     while i < len(runs):
-        group = runs[i:i + 2] if runs[i]["role"] == "pair" else runs[i:i + 1]
+        paired = runs[i]["role"] == "pair"
+        group = runs[i:i + 2] if paired else runs[i:i + 1]
         i += len(group)
-        if group[0]["role"] == "pair" and (len(group) != 2 or group[0].get("round") != group[1].get("round")
-                                           or group[0]["attempt_log"] == group[1]["attempt_log"]):
+        if paired and (len(group) != 2 or group[1]["role"] != "pair"
+                       or group[0].get("round") != group[1].get("round")
+                       or group[0]["attempt_log"] == group[1]["attempt_log"]):
             raise ValueError(f"paired runs must come as one off and one on run of the same round: {group}")
-        label = f"pair-{group[0]['round']}" if group[0]["role"] == "pair" else group[0]["name"]
-        if group[0]["role"] == "pair":
+        label = f"pair-{group[0]['round']}" if paired else group[0]["name"]
+        if paired:
             rounds["planned"] += 1
-        for tries in range(args.void_retries + 1):
-            readings = []
-            for run in group:
-                name = run["name"] if tries == 0 else f"{run['name']}-retry{tries}"
-                entry, reading = run_once(run, name, out, args, spawn, deadline_s)
-                record.append(entry)
-                if isinstance(reading, war.ReportError):
-                    emit(f"[{name}] BROKEN: {reading}")
-                    return {"runs": record, "paired_cost": None}, 2
-                emit(run_line(dict(run, name=name), reading))
-                readings.append(reading)
-                seen.append(reading)
-            if all(r["verdict"] != "VOID" for r in readings):
-                break
-        else:
-            what = "round" if group[0]["role"] == "pair" else "point"
+        entries, observed, readings = run_group(group, out, args, spawn=spawn, deadline_s=deadline_s, emit=emit)
+        record.extend(entries)
+        seen.extend(observed)
+        if isinstance(readings, war.ReportError):
+            return {"runs": record, "paired_cost": None}, 2
+        if readings is None:
+            what = "round" if paired else "point"
             emit(f"[{label}] still VOID after {args.void_retries} retries; no reading at this {what}"
                  + ("; the round leaves both arms" if what == "round" else ""))
             rc = 1
             continue
-        unclean = [run["name"] for run, reading in zip(group, readings)
-                   if run["role"] == "pair" and unfinished(reading["arrival"])]
-        if unclean:
-            emit(f"[{label}] {', '.join(unclean)} had failed or outstanding arrivals; the round leaves both arms")
-            rounds["unclean"] += 1
-            continue
-        for run, reading in zip(group, readings):
-            if run["role"] == "pair":
-                pairs["on" if run["attempt_log"] else "off"].append(reading["arrival"])
-            if run["role"] == "burst":
-                bursts.append((run["burst_size"], reading["point"]["burst_drain"]))
+        if paired:
+            unclean = [run["name"] for run, reading in zip(group, readings) if unfinished(reading["arrival"])]
+            pool = pairs
+            if unclean:
+                emit(f"[{label}] {', '.join(unclean)} had failed or outstanding arrivals; the round leaves both arms")
+                rounds["unclean"] += 1
+                pool = dropped_pairs
+            for run, reading in zip(group, readings):
+                pool["on" if run["attempt_log"] else "off"].append(reading["arrival"])
+        elif group[0]["role"] == "burst":
+            bursts.append((group[0]["burst_size"], readings[0]["point"]["burst_drain"]))
     sink = sorted({(r["arrival"].get("sink_heartbeat_ms"), r["arrival"].get("sink_settle_s")) for r in seen},
                   key=repr)
     if sink:
         emit(sink_line(sink))
+    dropped_latency = None
     if rounds["unclean"]:
         emit(f"paired arm: {rounds['unclean']} of {rounds['planned']} rounds left both arms for failed or "
              f"outstanding arrivals; the cost line covers the clean rounds only")
+        dropped_latency = war.paired_latency_cost(dropped_pairs["off"], dropped_pairs["on"])
+        emit(dropped_latency_line(dropped_latency))
     cost = None
     if rounds["planned"] and not (pairs["off"] or pairs["on"]):
         emit(f"paired arm: none of {rounds['planned']} rounds was clean; no cost line")
@@ -294,7 +327,10 @@ def execute(runs, out, args, *, spawn=subprocess.run, emit=print):
             rc = 2
     if bursts:
         emit(knee_line(bursts, deadline_s))
-    return {"runs": record, "paired_cost": cost, "sink_conditions": sink, "paired_rounds": rounds}, rc
+    summary = {"runs": record, "paired_cost": cost, "sink_conditions": sink, "paired_rounds": rounds}
+    if dropped_latency is not None:
+        summary["dropped_paired_latency"] = dropped_latency
+    return summary, rc
 
 
 def parse_args(argv=None):
