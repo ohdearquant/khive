@@ -2073,7 +2073,7 @@ minted and the caller never saw its reference.
 
 ## Amendment 19 (2026-11-27): `tool.request` creates a request unless a grant allows
 
-**Status: Proposed.** It amends ADR-180's Approval fast path for every registered row, and replaces Amendment 13
+**Status: Accepted 2026-11-27 (#6926).** It amends ADR-180's Approval fast path for every registered row, and replaces Amendment 13
 Decision item 7, whose rule it applies to every row instead of rows carrying `network` only. A call whose decision is
 `allow` from a grant is answered as today, and no decision changes.
 
