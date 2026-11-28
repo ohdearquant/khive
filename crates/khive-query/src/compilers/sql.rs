@@ -131,6 +131,8 @@ pub struct QueryMailboxScope {
     pub actor_id: String,
     /// Whether the anonymous, non-delegated local caller may see legacy rows.
     pub legacy_local: bool,
+    /// Trusted configured maintainer copied from the authorized mailbox view.
+    pub maintainer_actor: Option<String>,
 }
 
 /// Runtime options injected by the caller to scope and cap query execution.

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use khive_gate::{check_with_mailbox_policy, mailbox_read_owner};
-use khive_storage::note::{Note, NoteMailboxScope};
+use khive_storage::note::{is_quarantined_message, Note, NoteMailboxScope};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -15,9 +15,14 @@ use crate::{
 pub struct MailboxView {
     pub actor_id: String,
     pub delegated: bool,
+    pub maintainer_actor: Option<String>,
 }
 
 impl MailboxView {
+    pub fn quarantine_override(&self, note: &Note) -> Option<bool> {
+        quarantine_override(&self.actor_id, self.maintainer_actor.as_deref(), note)
+    }
+
     fn legacy_local(&self, token: &NamespaceToken) -> bool {
         !self.delegated && token.actor().is_anonymous() && token.actor().id == "local"
     }
@@ -29,6 +34,7 @@ impl MailboxView {
         NoteMailboxScope {
             actor_id: self.actor_id.clone(),
             legacy_local: self.legacy_local(token),
+            maintainer_actor: self.maintainer_actor.clone(),
         }
     }
 
@@ -36,15 +42,27 @@ impl MailboxView {
     /// reads apply this before returning message rows, including broad
     /// kind=note reads that encounter a message row.
     pub fn permits_message_note(&self, token: &NamespaceToken, note: &Note) -> bool {
-        permits_message_note(&self.actor_id, self.legacy_local(token), note)
+        self.quarantine_override(note)
+            .unwrap_or_else(|| permits_message_note(&self.actor_id, self.legacy_local(token), note))
     }
 
     /// [`Self::permits_message_note`] for a view already reduced to its
     /// store-side [`NoteMailboxScope`], so a caller-supplied cursor or key
     /// anchor is judged by the same rule as the rows the scope admits.
     pub fn scope_permits_message_note(scope: &NoteMailboxScope, note: &Note) -> bool {
-        permits_message_note(&scope.actor_id, scope.legacy_local, note)
+        quarantine_override(&scope.actor_id, scope.maintainer_actor.as_deref(), note)
+            .unwrap_or_else(|| permits_message_note(&scope.actor_id, scope.legacy_local, note))
     }
+}
+
+fn quarantine_override(
+    actor_id: &str,
+    maintainer_actor: Option<&str>,
+    note: &Note,
+) -> Option<bool> {
+    maintainer_actor
+        .filter(|maintainer| !maintainer.is_empty())
+        .and_then(|maintainer| is_quarantined_message(note).then_some(actor_id == maintainer))
 }
 
 fn permits_message_note(actor_id: &str, legacy_local: bool, note: &Note) -> bool {
@@ -145,6 +163,7 @@ impl KhiveRuntime {
                     .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
                 Ok(MailboxView {
                     delegated: owner.is_some(),
+                    maintainer_actor: self.config().actor_id.clone().filter(|id| !id.is_empty()),
                     actor_id: owner.map_or_else(|| token.actor().id.clone(), |owner| owner.id),
                 })
             }

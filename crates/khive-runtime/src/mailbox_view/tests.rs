@@ -73,7 +73,8 @@ fn gate_mailbox_direct_api_preserves_actor_and_rechecks_base_policy() {
             view,
             MailboxView {
                 actor_id: "lambda:owner".into(),
-                delegated: true
+                delegated: true,
+                maintainer_actor: Some("lambda:owner".into()),
             }
         );
         assert_eq!(reader.actor(), &ActorRef::new("actor", "lambda:reader"));
@@ -155,7 +156,8 @@ fn gate_mailbox_direct_api_validates_original_null_and_mismatched_selector() {
         view,
         MailboxView {
             actor_id: "local".into(),
-            delegated: false
+            delegated: false,
+            maintainer_actor: Some("lambda:owner".into()),
         }
     );
     assert!(matches!(
@@ -264,7 +266,8 @@ fn probe_view_requires_an_exact_grant_and_preserves_caller_identity() {
             .unwrap(),
         MailboxView {
             actor_id: "lambda:owner".into(),
-            delegated: true
+            delegated: true,
+            maintainer_actor: Some("lambda:owner".into()),
         }
     );
     assert_eq!(reader.actor(), &ActorRef::new("actor", "lambda:reader"));
@@ -309,7 +312,8 @@ fn probe_view_keeps_own_named_and_anonymous_local_access() {
                 .unwrap(),
             MailboxView {
                 actor_id: selected.into(),
-                delegated: false
+                delegated: false,
+                maintainer_actor: Some("lambda:owner".into()),
             }
         );
     }
@@ -355,4 +359,135 @@ fn probe_view_validates_original_actor_and_preserves_failures() {
         broken.authorize_mailbox_view(&reader, "comm.probe", Some("lambda:owner"), &args),
         Err(RuntimeError::GateUnavailable { reason, .. }) if reason == "gate backend unavailable"
     ));
+}
+
+#[test]
+fn am6_row_and_scope_override_match_independent_typed_quarantine_formula() {
+    let q_values = [
+        None,
+        Some(Value::Null),
+        Some(json!(true)),
+        Some(json!("true")),
+        Some(json!(1)),
+        Some(json!(1.0)),
+        Some(json!(false)),
+        Some(json!("True")),
+        Some(json!([true])),
+        Some(json!({"quarantined":true})),
+    ];
+    let directions = [
+        None,
+        Some(json!("inbound")),
+        Some(json!("outbound")),
+        Some(Value::Null),
+        Some(json!("unknown")),
+        Some(json!(7)),
+    ];
+    let routes = [
+        None,
+        Some(json!("lambda:landing")),
+        Some(json!("lambda:owner")),
+        Some(Value::Null),
+        Some(json!(["lambda:landing"])),
+        Some(json!(7)),
+    ];
+    for (actor, delegated, anonymous) in [
+        ("lambda:landing", false, false),
+        ("lambda:owner", false, false),
+        ("lambda:owner", true, false),
+        ("lambda:landing", true, false),
+        ("local", false, true),
+        ("local", true, false),
+    ] {
+        let caller = if anonymous {
+            NamespaceToken::mint_authorized(Namespace::local(), ActorRef::anonymous())
+        } else {
+            token(if delegated { "lambda:reader" } else { actor })
+        };
+        let original = MailboxView {
+            actor_id: actor.into(),
+            delegated,
+            maintainer_actor: None,
+        };
+        for kind in ["message", "observation"] {
+            for q in &q_values {
+                for direction in &directions {
+                    for to in &routes {
+                        for from in &routes {
+                            let mut properties = json!({});
+                            for (key, value) in [
+                                ("quarantined", q),
+                                ("direction", direction),
+                                ("to_actor", to),
+                                ("from_actor", from),
+                            ] {
+                                if let Some(value) = value {
+                                    properties[key] = value.clone();
+                                }
+                            }
+                            let note = Note::new("local", kind, "formula fixture")
+                                .with_properties(properties);
+                            let old_b = original.permits_message_note(&caller, &note);
+                            let exact_q = kind == "message"
+                                && (q.as_ref() == Some(&json!(true))
+                                    || q.as_ref() == Some(&json!("true")));
+                            for configured in [false, true] {
+                                let view = MailboxView {
+                                    actor_id: actor.into(),
+                                    delegated,
+                                    maintainer_actor: configured.then(|| "lambda:owner".into()),
+                                };
+                                let expected = if configured && exact_q {
+                                    actor == "lambda:owner"
+                                } else {
+                                    old_b
+                                };
+                                assert_eq!(view.permits_message_note(&caller, &note), expected,
+                                    "row actor={actor} delegated={delegated} Q={q:?} direction={direction:?} to={to:?} from={from:?}");
+                                assert_eq!(MailboxView::scope_permits_message_note(&view.note_scope(&caller), &note), expected,
+                                    "generic cursor/key scope must match the same independent formula");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn am6_authorized_view_snapshots_the_configured_maintainer_beside_selected_actor() {
+    let reader = token("lambda:reader");
+    let runtime = KhiveRuntime::new(config(policy(Arc::new(AllowAllGate)))).unwrap();
+    let delegated = runtime
+        .authorize_mailbox_view(
+            &reader,
+            "comm.inbox",
+            Some("lambda:owner"),
+            &json!({"mailbox_actor":"lambda:owner"}),
+        )
+        .unwrap();
+    assert_eq!(delegated.actor_id, "lambda:owner");
+    assert_eq!(delegated.maintainer_actor.as_deref(), Some("lambda:owner"));
+    let own = runtime
+        .authorize_mailbox_view(&reader, "get", None, &json!({}))
+        .unwrap();
+    assert_eq!(own.actor_id, "lambda:reader");
+    assert_eq!(own.maintainer_actor.as_deref(), Some("lambda:owner"));
+    assert_eq!(
+        own.note_scope(&reader).maintainer_actor,
+        own.maintainer_actor
+    );
+    for actor_id in [None, Some(String::new())] {
+        let mut cfg = config(Arc::new(AllowAllGate));
+        cfg.actor_id = actor_id;
+        let unconfigured = KhiveRuntime::new(cfg).unwrap();
+        assert_eq!(
+            unconfigured
+                .authorize_mailbox_view(&reader, "get", None, &json!({}))
+                .unwrap()
+                .maintainer_actor,
+            None
+        );
+    }
 }

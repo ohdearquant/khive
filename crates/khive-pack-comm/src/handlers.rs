@@ -33,6 +33,29 @@ use crate::params::{
     ReplyParams, SendParams, ThreadParams, TransportStatusParams, UnreadParams,
 };
 
+fn quarantine_property_filter() -> PropertyFilter {
+    PropertyFilter {
+        json_path: "$.quarantined".into(),
+        op: FilterOp::TrueOrTextTrue,
+        value: SqlValue::Null,
+    }
+}
+
+fn non_quarantine_property_filters() -> [PropertyFilter; 2] {
+    [
+        PropertyFilter {
+            json_path: "$.quarantined".into(),
+            op: FilterOp::JsonTypeNeMissing,
+            value: SqlValue::Text("true".into()),
+        },
+        PropertyFilter {
+            json_path: "$.quarantined".into(),
+            op: FilterOp::NotInOrMissing(vec![SqlValue::Text("true".into())]),
+            value: SqlValue::Null,
+        },
+    ]
+}
+
 mod email_headers;
 use email_headers::{
     build_references_header, external_id_unverifiable, message_id_match_candidates,
