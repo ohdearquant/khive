@@ -141,6 +141,47 @@ fn keep_free_aliases(graph: &Graph, spec: &mut FieldSpec, warnings: &mut Vec<Str
     });
 }
 
+/// Whether `alias` is free to become an alias of `field`: no other live field
+/// answers to it. Warns when it is not.
+fn free_alias(graph: &Graph, field: &Entity, alias: &str, warnings: &mut Vec<String>) -> bool {
+    let others = graph.owners(alias, Some(field.id));
+    if others.is_empty() {
+        return true;
+    }
+    warnings.push(format!(
+        "\"{alias}\" already names {}, so it was not added as an alias of \"{}\"",
+        quoted_names(&others),
+        field.name
+    ));
+    false
+}
+
+/// The aliases a document gives a field it reuses that the field does not
+/// answer to yet. An alias another live field answers to is warned about and
+/// dropped from the document, so no item of it reaches the field through it.
+fn new_aliases(
+    graph: &Graph,
+    field: &Entity,
+    spec: &mut FieldSpec,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let mut known = wordings(field);
+    let mut added = Vec::new();
+    spec.aliases.retain(|alias| {
+        let folded = normalize(alias);
+        if folded.is_empty() || known.contains(&folded) {
+            return true;
+        }
+        if !free_alias(graph, field, alias, warnings) {
+            return false;
+        }
+        known.push(folded);
+        added.push(alias.clone());
+        true
+    });
+    added
+}
+
 /// Stage a new field with its values; returns its id and its values by folded name.
 fn stage_field(
     writes: &mut Writes,
@@ -263,6 +304,7 @@ struct Counts {
     items: usize,
     fields: usize,
     fields_reused: usize,
+    aliases_added: usize,
     values: usize,
     rules: usize,
     relations: usize,
@@ -277,6 +319,7 @@ impl Counts {
             "items": self.items,
             "fields": self.fields,
             "fields_reused": self.fields_reused,
+            "aliases_added": self.aliases_added,
             "values": self.values,
             "rules": self.rules,
             "relations": self.relations,
@@ -445,6 +488,17 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                         == Some(spec.value_type.as_str()) =>
             {
                 counts.fields_reused += 1;
+                // A later revision may print a shorter wording of a field it
+                // reuses; the field keeps it.
+                let added_aliases = new_aliases(&graph, existing, &mut spec, &mut warnings);
+                if !added_aliases.is_empty() {
+                    let mut list = aliases(existing);
+                    list.extend(added_aliases.iter().cloned());
+                    let mut properties = props(existing);
+                    properties.insert("aliases".to_owned(), json!(list));
+                    writes.update_entity(existing, None, None, Some(properties))?;
+                    counts.aliases_added += added_aliases.len();
+                }
                 let mut values = graph_values(&graph, existing.id);
                 let old: Vec<Uuid> = values.values().copied().collect();
                 let mut added = Vec::new();
@@ -781,35 +835,60 @@ fn decision_note(
     Ok(())
 }
 
-/// Bind an item to a field it means the same as: the edge, the label as an
-/// alias when no other field answers to it, and a logged decision.
+/// What binding an item to a field added as aliases: the item's label, and
+/// the further wordings the caller gave.
+type AliasesAdded = (Option<String>, Vec<String>);
+
+/// The printed item a decision binds: its id, its label and its form's key.
+struct Printed<'a> {
+    id: Uuid,
+    label: &'a str,
+    form: &'a str,
+}
+
+/// Bind an item to a field it means the same as: the edge, the label and any
+/// further wordings as aliases when no other field answers to them, in one
+/// update, and a logged decision.
 fn bind_same(
     graph: &Graph,
     writes: &mut Writes,
-    item: Uuid,
-    item_label: &str,
-    form: &str,
+    printed: Printed<'_>,
     field: &Entity,
+    further: &[String],
     warnings: &mut Vec<String>,
-) -> Result<Option<String>, RuntimeError> {
+) -> Result<AliasesAdded, RuntimeError> {
+    let Printed {
+        id: item,
+        label: item_label,
+        form,
+    } = printed;
     writes.link(item, EdgeRelation::VariantOf, field.id);
+    let mut list = aliases(field);
+    let mut known = wordings(field);
     let mut added = None;
-    if !wordings(field).contains(&normalize(item_label)) {
-        let others = graph.owners(item_label, Some(field.id));
-        if others.is_empty() {
-            let mut properties = props(field);
-            let mut list = aliases(field);
-            list.push(item_label.to_owned());
-            properties.insert("aliases".to_owned(), json!(list));
-            writes.update_entity(field, None, None, Some(properties))?;
-            added = Some(item_label.to_owned());
-        } else {
-            warnings.push(format!(
-                "\"{item_label}\" already names {}, so it was not added as an alias of \"{}\"",
-                quoted_names(&others),
-                field.name
-            ));
+    let mut more = Vec::new();
+    for (wording, is_label) in std::iter::once((item_label, true))
+        .chain(further.iter().map(|alias| (alias.as_str(), false)))
+    {
+        let folded = normalize(wording);
+        if folded.is_empty()
+            || known.contains(&folded)
+            || !free_alias(graph, field, wording, warnings)
+        {
+            continue;
         }
+        known.push(folded);
+        list.push(wording.to_owned());
+        if is_label {
+            added = Some(wording.to_owned());
+        } else {
+            more.push(wording.to_owned());
+        }
+    }
+    if added.is_some() || !more.is_empty() {
+        let mut properties = props(field);
+        properties.insert("aliases".to_owned(), json!(list));
+        writes.update_entity(field, None, None, Some(properties))?;
     }
     decision_note(
         writes,
@@ -825,7 +904,7 @@ fn bind_same(
         ]),
         field.id,
     )?;
-    Ok(added)
+    Ok((added, more))
 }
 
 /// An item that waited on a wording is decided: the rules of its form that
@@ -949,13 +1028,16 @@ pub(crate) async fn add_item(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runt
     if let Some(target) = same_as {
         let field = graph.find_field(&target)?;
         refuse_general(&graph, field)?;
-        let added = bind_same(
+        let (added, _) = bind_same(
             &graph,
             &mut writes,
-            item,
-            &spec.label,
-            &key,
+            Printed {
+                id: item,
+                label: &spec.label,
+                form: &key,
+            },
             field,
+            &[],
             &mut warnings,
         )?;
         reply["status"] = json!("same");
@@ -1006,6 +1088,7 @@ pub(crate) async fn same(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
     let item_spec_text = params::text(&args, "item")?;
     let field = params::opt_text(&args, "field")?;
     let new_field = params::object(&args, "new_field")?;
+    let further = params::string_list(&args, "aliases")?;
     if field.is_some() == new_field.is_some() {
         return Err(invalid("pass exactly one of field and new_field"));
     }
@@ -1023,13 +1106,16 @@ pub(crate) async fn same(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
     if let Some(field) = field {
         let field = graph.find_field(&field)?;
         refuse_general(&graph, field)?;
-        let added = bind_same(
+        let (added, more) = bind_same(
             &graph,
             &mut writes,
-            item.id,
-            &item_label,
-            &form,
+            Printed {
+                id: item.id,
+                label: &item_label,
+                form: &form,
+            },
             field,
+            &further,
             &mut warnings,
         )?;
         settled = settle_pending(
@@ -1042,8 +1128,10 @@ pub(crate) async fn same(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
         )?;
         reply["field"] = json!({"id": field.id.to_string(), "name": field.name});
         reply["alias_added"] = json!(added);
+        reply["aliases_added"] = json!(more);
     } else if let Some(new_field) = new_field {
         let mut proposed = field_spec(new_field)?;
+        proposed.aliases.extend(further);
         let owners = graph.owners(&proposed.name, None);
         if !owners.is_empty() {
             return Err(invalid(format!(
@@ -1057,6 +1145,7 @@ pub(crate) async fn same(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
         writes.link(item.id, EdgeRelation::VariantOf, id);
         settled = settle_pending(&graph, &mut writes, item, id, &values, &mut warnings)?;
         reply["field"] = json!({"id": id.to_string(), "name": proposed.name});
+        reply["aliases"] = json!(alias_list(&proposed.name, &proposed.aliases));
     }
     reply["rules_settled"] = json!(settled);
 

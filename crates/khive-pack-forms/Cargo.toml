@@ -25,4 +25,5 @@ uuid = { workspace = true }
 [dev-dependencies]
 # Path-only: the acceptance tests install kg beside forms; cargo strips it at publish.
 khive-pack-kg = { path = "../khive-pack-kg" }
+lattice-embed = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

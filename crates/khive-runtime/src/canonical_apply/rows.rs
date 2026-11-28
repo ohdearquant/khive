@@ -120,6 +120,27 @@ pub(super) async fn entity(
     }))
 }
 
+/// The keys `entity_id` holds, read inside the writer's transaction.
+pub(super) async fn held_keys(
+    writer: &mut dyn SqlWriter,
+    namespace: &str,
+    entity_id: Uuid,
+) -> Result<Vec<String>, StorageError> {
+    let rows = writer
+        .query_all(
+            SqlStatement::new(
+                khive_db::stores::entity::ENTITY_HELD_KEYS_SQL,
+                vec![
+                    SqlValue::Text(namespace.to_owned()),
+                    SqlValue::Text(entity_id.to_string()),
+                ],
+            )
+            .labelled("canonical-held-keys"),
+        )
+        .await?;
+    rows.iter().map(|row| text(row, "key")).collect()
+}
+
 pub(super) async fn note(
     writer: &mut dyn SqlWriter,
     target: Uuid,

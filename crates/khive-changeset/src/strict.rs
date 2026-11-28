@@ -4,10 +4,12 @@
 use std::collections::BTreeMap;
 
 use khive_types::{
-    EdgeRelation, Entity, EntityKind, Header, Id128, Link, Namespace, Note, NoteStatus,
-    PropertyValue, Timestamp,
+    EdgeRelation, Entity, EntityAlias, EntityKind, Header, Id128, Link, Namespace, Note,
+    NoteStatus, PropertyValue, Timestamp,
 };
 use serde::Deserialize;
+
+use crate::EntityRecord;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,24 +30,32 @@ pub(crate) struct StrictEntity {
     tags: Vec<String>,
     #[serde(default)]
     deleted_at: Option<Timestamp>,
+    #[serde(default)]
+    keys: Vec<String>,
+    #[serde(default)]
+    aliases: Vec<EntityAlias>,
 }
 
-impl From<StrictEntity> for Entity {
+impl From<StrictEntity> for EntityRecord {
     fn from(s: StrictEntity) -> Self {
-        Entity {
-            header: Header {
-                id: s.id,
-                namespace: s.namespace,
-                created_at: s.created_at,
-                updated_at: s.updated_at,
+        EntityRecord {
+            entity: Entity {
+                header: Header {
+                    id: s.id,
+                    namespace: s.namespace,
+                    created_at: s.created_at,
+                    updated_at: s.updated_at,
+                },
+                kind: s.kind,
+                entity_type: s.entity_type,
+                name: s.name,
+                description: s.description,
+                properties: s.properties,
+                tags: s.tags,
+                deleted_at: s.deleted_at,
             },
-            kind: s.kind,
-            entity_type: s.entity_type,
-            name: s.name,
-            description: s.description,
-            properties: s.properties,
-            tags: s.tags,
-            deleted_at: s.deleted_at,
+            keys: s.keys,
+            aliases: s.aliases,
         }
     }
 }
