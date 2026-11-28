@@ -5076,3 +5076,72 @@ async fn atomic_update_edge_properties_null_value_is_stored_literally() {
         "atomic properties update must store literal null and preserve omitted metadata keys"
     );
 }
+
+#[test]
+fn vector_purge_statement_count_scales_with_chunks_and_tables() {
+    let tables: Vec<String> = (0..4).map(|n| format!("vec_scale_{n}")).collect();
+    let ids: Vec<String> = (0..520)
+        .map(|n| uuid::Uuid::from_u128(n + 1).to_string())
+        .collect();
+    let per_chunk: Vec<_> = ids
+        .chunks(128)
+        .map(|chunk| {
+            crate::atomic_prepare::vector_purge_statements(
+                &tables,
+                "local",
+                chunk,
+                Some("knowledge.atom"),
+                "scale",
+            )
+            .expect("valid vector table names")
+        })
+        .collect();
+    for (chunk, statements) in ids.chunks(128).zip(&per_chunk) {
+        assert_eq!(statements.len(), tables.len() * (2 * chunk.len() + 1));
+        for block in statements.chunks_exact(2 * chunk.len() + 1) {
+            let (pairs, provenance) = block.split_at(2 * chunk.len());
+            for pair in pairs.chunks_exact(2) {
+                assert!(pair[0].sql.starts_with("INSERT INTO main.ann_write_log"));
+                assert!(pair[1].sql.starts_with("DELETE FROM main.\"vec_"));
+                // vec0 plans a point lookup only for equality on subject_id.
+                assert!(pair
+                    .iter()
+                    .all(|s| s.sql.contains("WHERE subject_id = ?3") && !s.sql.contains(" IN (")));
+            }
+            assert!(provenance[0]
+                .sql
+                .starts_with("DELETE FROM main.vector_provenance"));
+        }
+    }
+    assert_eq!(
+        per_chunk.iter().map(Vec::len).sum::<usize>(),
+        4 * (2 * 520 + 5)
+    );
+}
+
+#[test]
+fn public_vector_purge_rejects_bad_prefix_and_quotes_identifiers() {
+    let ids = vec![uuid::Uuid::from_u128(1).to_string()];
+    assert!(crate::atomic_prepare::vector_purge_statements(
+        &["not_a_vector".into()],
+        "local",
+        &ids,
+        Some("knowledge.atom"),
+        "test",
+    )
+    .is_err());
+    let statements = crate::atomic_prepare::vector_purge_statements(
+        &["vec_a\"; DROP TABLE knowledge_atoms; --".into()],
+        "local",
+        &ids,
+        Some("knowledge.atom"),
+        "test",
+    )
+    .expect("prefixed name is safely quoted");
+    assert!(statements[0]
+        .sql
+        .contains("\"vec_a\"\"; DROP TABLE knowledge_atoms; --\""));
+    assert!(statements[1]
+        .sql
+        .contains("\"vec_a\"\"; DROP TABLE knowledge_atoms; --\""));
+}

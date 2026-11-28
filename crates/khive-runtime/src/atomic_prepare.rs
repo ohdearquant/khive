@@ -20,6 +20,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 mod index_purge;
+pub use index_purge::{discover_vector_tables_in_writer, vector_purge_statements};
 
 use index_purge::push_index_purge_statements;
 pub(crate) use index_purge::{
