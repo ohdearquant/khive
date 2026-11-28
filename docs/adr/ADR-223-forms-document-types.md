@@ -133,3 +133,117 @@ application form requires attached:
 
 - How #6892 part 3 represents an attached document, and so the shape of the answer that satisfies a
   requiring line.
+
+## Amendment 1 (2026-11-28): a field narrows a broader field
+
+ADR-222 A1.4 point 4 reads a field's parents to list the places that state a value in part. Today
+the only field that contains another is a general wording that `forms.split` writes, so a parent
+is always an ambiguous wording, never a broader field. This amendment lets a load declare a
+broader field.
+
+Facts at main `e0aaf4785e7fa4fe35980ee9bdf653ea22256be2`:
+
+1. The pack already allows `contains` from a field to a field
+   (`crates/khive-pack-forms/src/vocab.rs`). `forms.split` is its only writer, and the containing
+   field it writes carries `general: true`.
+2. `forms.neighbourhood` on a field lists, under `general`, every field that contains it, general
+   or not, and under `narrower` every field it contains.
+3. `forms.resolve` expands only a general field into the fields it contains; a match on any
+   other field returns that field alone.
+4. `forms.same` binds an item to one field, existing or new. It never makes two fields one.
+
+### A1.1 What it declares
+
+A `forms.load` field entry takes an optional `narrows`, the name of one field: every answer to
+this field is also an answer to the named one, as a legal name is a name. It is stored as the
+existing `contains` edge from the broader field to this one; no relation, property or node type
+is added. The broader field stays an ordinary field: it can be asked, and it keeps its items,
+values and comparison. A field narrows at most one field, and may be narrowed by many.
+
+Inside the forms pack the edge is declared and read back, and nothing more. `forms.check` does
+not take an answer to the narrower field as answering an item that asks the broader one, and
+`forms.resolve` does not follow it. The only reader that draws the inference is ADR-222's
+`stated_in_part` (A1.5).
+
+### A1.2 What is refused
+
+The load is refused and writes nothing when `narrows`:
+
+- names a field that is neither loaded nor listed earlier in the same document;
+- names the field itself;
+- names a general wording;
+- names a field of another value type, so that an answer to the narrower field is always a
+  well-typed answer for the broader one;
+- would close a cycle of narrows. The refusal is what keeps a walk up the chain (A1.5) finite;
+- is given for a field that already narrows a different field.
+
+Giving the same `narrows` again changes nothing, and a loaded field that narrows nothing may gain
+one. `forms.add_item` and `forms.same` do not take `narrows` and refuse it, as they refuse
+`known_as`. A choice field's values are not mapped to the broader field's values; that waits for
+ADR-222's build order item 5, as section 5 says.
+
+### A1.3 How a narrows goes away
+
+This amendment gives no way to remove or change a narrows through a forms verb: once written, a
+load can only repeat it. A wrong one is fixed by deleting the edge with the generic
+`delete(id=<edge id>, kind="edge", hard=true)`. The forms pack does not guard it: `delete` on an
+edge goes straight to the runtime's edge delete (`crates/khive-pack-kg/src/handlers/update.rs`).
+The delete is hard because an edge is unique per source, target and relation, so a soft-deleted
+row would still hold the pair. After it, the field narrows nothing, and a later load may give it
+a narrows again, the same one included.
+
+`forms.same` leaves the edge alone, because it never makes two fields one (fact 4). Binding an
+item to a field moves no edge of the field; `new_field` creates a field that narrows nothing.
+`forms.split` also leaves the edges alone: the renamed field keeps its narrows edges, and the new
+field narrows nothing.
+
+### A1.4 What forms.neighbourhood reads from it
+
+On a field, `general` lists only the general wordings that contain it, so a broader field is
+never reported as an ambiguous wording. A new `broader` lists the ordinary field it narrows, none
+or one. `narrower` keeps its meaning: the fields this one contains, which for an ordinary field
+are the fields that narrow it.
+
+### A1.5 Who reads it
+
+ADR-222's `stated_in_part` (A1.4 point 4) reads `broader` in place of `general`, and walks it up
+the chain: with `legal name` narrowing `name` and `name` narrowing `label`, a line stating
+`label` is listed for a required `legal name`, as is a line stating `name`. Each listed line names
+the field it states. The nearest broader field comes first, then the next one up. The walk ends
+because A1.2 refuses a cycle. That change, with its test moved from a hand-written edge to a
+loaded `narrows`, lands in the same pull request as this amendment's forms code.
+
+### A1.6 Lint, migration and the change log
+
+A field that another field narrows counts as sourced, as a general field does. It stays in
+`fields_without_items` when no item asks it, because that is still true.
+
+No migration. A store whose field-to-field `contains` edges all come from `forms.split` reads the
+same. In a store where an ordinary field was made to contain a field by hand before this
+amendment, `forms.neighbourhood` lists the containing field under `broader` and no longer under
+`general`. The change log entry says that `general` loses those entries, and the verb's
+description says what `broader` holds.
+
+### A1.7 Acceptance
+
+`crates/khive-pack-forms/tests/narrows.rs`:
+
+- Loading `name`, then `legal name` with `narrows: name`, writes one `contains` edge, and the
+  export shows it. `forms.neighbourhood` on `legal name` gives `broader` `[name]` and `general`
+  `[]`; on `name` it gives `narrower` `[legal name]`. Resolving `name` returns `name` alone.
+- `forms.check` on a form that asks `name`, answered only with a `legal name` value, reports
+  `name` unanswered.
+- Each refusal in A1.2 writes nothing: a field not loaded, a field listed later in the same
+  document, the field itself, a general wording, another value type, a cycle of two fields, a
+  second different narrows. The same narrows given again changes nothing.
+- After a hard `delete` of the edge, `legal name` has no `broader`, and a load may give it
+  `narrows: name` again.
+- A split field keeps its narrows edge; `forms.same` with `new_field` writes a field with no
+  `broader`.
+- Lint counts `name` sourced. Export, then replay into an empty namespace, gives identical nodes
+  and edges.
+
+In the operation pack: `stated_in_part` passes on a loaded narrows with no hand-written edge. With
+three fields `legal name`, `name` and `label` chained, a line stating `label` is listed for
+`legal name` after a line stating `name`. A general wording that contains `legal name` adds
+nothing to `stated_in_part`.

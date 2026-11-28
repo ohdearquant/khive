@@ -403,3 +403,325 @@ async fn suggest_ranks_on_field_domain_above_lexical_collision() {
         report_rows.join("\n")
     );
 }
+
+const COMPOSE_COHORT_QUERY: &str =
+    "zxqalpha zxqbravo zxqcharlie zxqdelta zxqecho zxqfoxtrot zxqgolf zxqhotel zxqindia zxqjuliet";
+const COMPOSE_COHORT_DOMAINS: usize = 41;
+const COMPOSE_COHORT_MARKER: &str = "COHORT_DOMAIN_";
+
+tokio::task_local! {
+    static COHORT_RERANK_TEXTS: Arc<std::sync::Mutex<Vec<String>>>;
+}
+
+fn cohort_vector(text: &str) -> Vec<f32> {
+    let dimensions = EmbeddingModel::AllMiniLmL6V2.dimensions();
+    // These nonce terms occur in no fixture name/content. The semantic query
+    // remains nonzero even if the provider adds a role prefix to the text.
+    if text.contains(COMPOSE_COHORT_QUERY) {
+        let mut query = vec![0.0; dimensions];
+        query[0] = 1.0;
+        return query;
+    }
+    let Some(marker) = text.find(COMPOSE_COHORT_MARKER) else {
+        let mut topic = text_to_vector(text);
+        if topic.iter().any(|value| *value != 0.0) {
+            topic.resize(dimensions, 0.0);
+            return topic;
+        }
+        let mut neutral = vec![0.0; dimensions];
+        neutral[2] = 1.0;
+        return neutral;
+    };
+    let ordinal = text[marker + COMPOSE_COHORT_MARKER.len()..]
+        .get(..2)
+        .and_then(|digits| digits.parse::<usize>().ok())
+        .expect("fixture domain ordinal");
+    assert!(ordinal < COMPOSE_COHORT_DOMAINS);
+    let mut vector = vec![0.0; dimensions];
+    vector[0] = 1.0;
+    vector[1] = (COMPOSE_COHORT_DOMAINS - ordinal) as f32 / COMPOSE_COHORT_DOMAINS as f32;
+    vector
+}
+
+struct CohortEmbedService;
+
+#[async_trait]
+impl EmbeddingService for CohortEmbedService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        // Only this request task records. Detached ANN warming does not inherit
+        // the task-local capture; seeding and explicit warming run outside it.
+        let _ = COHORT_RERANK_TEXTS.try_with(|capture| {
+            capture.lock().expect("domain embedding log").extend(
+                texts
+                    .iter()
+                    .filter(|text| text.contains(COMPOSE_COHORT_MARKER))
+                    .cloned(),
+            );
+        });
+        Ok(texts.iter().map(|text| cohort_vector(text)).collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "fixture-compose-cohort"
+    }
+}
+
+struct CohortEmbedProvider;
+
+#[async_trait]
+impl EmbedderProvider for CohortEmbedProvider {
+    fn name(&self) -> &str {
+        MODEL_KEY
+    }
+
+    fn dimensions(&self) -> usize {
+        EmbeddingModel::AllMiniLmL6V2.dimensions()
+    }
+
+    async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+        Ok(Arc::new(CohortEmbedService))
+    }
+}
+
+async fn cohort_statement(
+    runtime: &KhiveRuntime,
+    sql: &str,
+    params: Vec<khive_storage::types::SqlValue>,
+) {
+    runtime
+        .sql()
+        .writer()
+        .await
+        .expect("cohort writer")
+        .execute(khive_storage::types::SqlStatement {
+            sql: sql.into(),
+            params,
+            label: None,
+        })
+        .await
+        .expect("cohort fixture statement");
+}
+
+async fn seed_compose_cohort(runtime: &KhiveRuntime, registry: &VerbRegistry) {
+    use khive_storage::types::SqlValue;
+
+    for index in 0..COMPOSE_COHORT_DOMAINS {
+        let slug = format!("cohort-domain-{index:02}");
+        let member = format!("cohort-member-{index:02}");
+        let member_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, member.as_bytes());
+        // Member rows use the admitted compose-read fixture schema. Domain
+        // publication still uses the actual public indexing/upsert path.
+        cohort_statement(runtime,
+            "INSERT INTO knowledge_atoms(id,namespace,slug,name,content,tags,status,finalized,created_at,updated_at,deleted_at) VALUES(?1,'local',?2,?2,'fixture corpus content describing compile source code query detail','[]','reviewed',1,0,0,NULL)",
+            vec![SqlValue::Text(member_id.to_string()), SqlValue::Text(member.clone())],
+        ).await;
+        registry.dispatch("knowledge.upsert_domains", json!({ "domains": [{
+            "slug": &slug,
+            "name": format!("{COMPOSE_COHORT_MARKER}{index:02} inference"),
+            "description": format!("LLM_SERVING serving latency acceleration for large language models. Additional background supplies ordinary context for readers across common topics and examples. {}", "inference ".repeat(index + 1)),
+        }] })).await.expect("publish cohort domain");
+        cohort_statement(
+            runtime,
+            "UPDATE knowledge_domains SET members=?1 WHERE namespace='local' AND slug=?2",
+            vec![
+                SqlValue::Text(serde_json::to_string(&[member]).expect("member list")),
+                SqlValue::Text(slug),
+            ],
+        )
+        .await;
+    }
+}
+
+fn build_cohort_registry(runtime: &KhiveRuntime) -> (VerbRegistry, vamana::SharedAnn) {
+    let knowledge = crate::KnowledgePack::new(runtime.clone());
+    let ann = knowledge.ann.clone();
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(runtime.clone()));
+    builder.register(knowledge);
+    let registry = builder.build().expect("cohort registry");
+    runtime.install_edge_rules(registry.all_edge_rules());
+    (registry, ann)
+}
+
+async fn dispatch_cohort_compose(
+    registry: &VerbRegistry,
+    params: serde_json::Value,
+) -> (serde_json::Value, Vec<String>) {
+    let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let response = COHORT_RERANK_TEXTS
+        .scope(
+            Arc::clone(&capture),
+            registry.dispatch("knowledge.compose", params),
+        )
+        .await
+        .expect("public compose must succeed");
+    assert_eq!(response["status"], "ok", "response: {response}");
+    assert!(
+        response.pointer("/data/suggest_error").is_none(),
+        "response: {response}"
+    );
+    assert!(
+        response.pointer("/data/ann_unavailable").is_none(),
+        "the fixed loaded ANN must serve this request: {response}"
+    );
+    let mut cohort = capture.lock().expect("domain embedding log").clone();
+    cohort.sort();
+    cohort.dedup();
+    (response, cohort)
+}
+
+fn compose_domain_ids(response: &serde_json::Value) -> Vec<String> {
+    response["data"]["domains"]
+        .as_array()
+        .expect("domain array")
+        .iter()
+        .map(|domain| domain["id"].as_str().expect("domain id").to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn compose_presentation_limit_preserves_rerank_cohort_and_selected_prefix() {
+    let corpus = tempfile::TempDir::new().expect("cohort tempdir");
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: Some(corpus.path().join("cohort.db")),
+        default_namespace: Namespace::local(),
+        embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+        gate: Arc::new(AllowAllGate),
+        packs: vec!["kg".to_owned(), "knowledge".to_owned()],
+        ..RuntimeConfig::no_embeddings()
+    })
+    .expect("cohort in-memory runtime");
+    runtime
+        .try_register_embedder(CohortEmbedProvider)
+        .expect("register deterministic cohort provider before first resolution");
+    // Probe the same generic embedding boundary used by fresh reranking before
+    // seeding/indexing; this query has no marker and runs outside capture scope.
+    let probe_texts = vec![COMPOSE_COHORT_QUERY.to_owned()];
+    let probe_vectors = runtime
+        .embed_batch(&probe_texts)
+        .await
+        .expect("deterministic cohort provider probe");
+    assert_eq!(
+        probe_vectors,
+        vec![cohort_vector(COMPOSE_COHORT_QUERY)],
+        "cohort fixture must use the registered deterministic provider"
+    );
+    let seed_registry = build_registry(&runtime);
+    seed_compose_cohort(&runtime, &seed_registry).await;
+    let index_result = seed_registry
+        .dispatch("knowledge.index", json!({ "rebuild_ann": true }))
+        .await
+        .expect("prepare stored fixture vectors");
+    let indexed = index_result
+        .get("indexed")
+        .and_then(|count| count.as_u64())
+        .unwrap_or(0);
+    assert!(
+        indexed >= COMPOSE_COHORT_DOMAINS as u64,
+        "indexing must prepare the nonvacuous domain corpus: {index_result}"
+    );
+    drop(seed_registry);
+
+    // The final registry owns this exact ANN instance and is created only after
+    // all corpus writes. No corpus writes occur during the K comparisons.
+    let (registry, ann) = build_cohort_registry(&runtime);
+    let token = runtime.authorize(Namespace::local()).expect("cohort token");
+    let model = runtime.default_embedder_name().to_owned();
+    let key = vamana::AnnKey::new("local", &model);
+    let _ = vamana::ensure_ann_for_model(&runtime, &token, &ann, &model).await;
+    assert!(
+        vamana::wait_ready(&ann, &key, 0, 1).await,
+        "completed warm must have installed the fixture index"
+    );
+    // Freeze maintenance at an existing supported test state while continuing
+    // to serve the real loaded index; no background attempt can replace it.
+    vamana::simulate_warming_in_flight(&ann, key.clone());
+    assert!(
+        vamana::search_loaded(&ann, &key, &cohort_vector(COMPOSE_COHORT_QUERY), 60)
+            .await
+            .is_some(),
+        "the actual registered ANN must stay loaded after the sentinel"
+    );
+
+    // No query term occurs in the corpus: both successful and timed-out lexical
+    // probes have no matching candidates. Loaded ANN is the only candidate leg.
+    let mut observations = Vec::new();
+    for limit in [1_usize, 5, 8, 20] {
+        assert!(
+            vamana::wait_ready(&ann, &key, 0, 1).await,
+            "fixture ANN lost readiness"
+        );
+        let (response, cohort) = dispatch_cohort_compose(&registry,
+            json!({ "query": COMPOSE_COHORT_QUERY, "auto_limit": limit, "max_tokens": 1200, "blend_kg": false }),
+        ).await;
+        assert_eq!(
+            compose_domain_ids(&response).len(),
+            limit,
+            "response: {response}"
+        );
+        assert!(
+            response["data"]["count"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "response: {response}"
+        );
+        observations.push((limit, response, cohort));
+    }
+    let (_, full_response, full_cohort) = observations.last().expect("twenty-domain observation");
+    let full_domains = compose_domain_ids(full_response);
+    assert_eq!(full_domains.len(), 20);
+    assert_eq!(
+        full_cohort.len(),
+        COMPOSE_COHORT_DOMAINS,
+        "every seeded matching domain must reach fresh reranking; fixture qualification failed"
+    );
+    for (limit, response, cohort) in &observations {
+        assert_eq!(
+            cohort, full_cohort,
+            "changing presentation limit to {limit} must not change the domain rerank cohort"
+        );
+        assert_eq!(
+            compose_domain_ids(response).as_slice(),
+            &full_domains[..*limit],
+            "limit {limit} must select the ordered prefix of the same twenty-domain ranking"
+        );
+    }
+
+    // Explicit domains bypass automatic selection, including its ten-word gate.
+    let mut pinned_domains = None;
+    for limit in [1_usize, 5, 8, 20] {
+        assert!(
+            vamana::wait_ready(&ann, &key, 0, 1).await,
+            "fixture ANN lost readiness"
+        );
+        let (response, cohort) = dispatch_cohort_compose(
+            &registry,
+            json!({ "query": "serving", "domain_ids": ["cohort-domain-00"],
+                "auto_limit": limit, "max_tokens": 1200, "blend_kg": false }),
+        )
+        .await;
+        assert!(
+            cohort.is_empty(),
+            "explicit domains must bypass automatic domain reranking"
+        );
+        let domains = &response["data"]["domains"];
+        if let Some(expected) = &pinned_domains {
+            assert_eq!(domains, expected);
+        } else {
+            pinned_domains = Some(domains.clone());
+        }
+        assert_eq!(domains.as_array().expect("pinned domains").len(), 1);
+        assert_eq!(domains[0]["slug"], "cohort-domain-00");
+        assert!(response["data"]["count"]
+            .as_u64()
+            .is_some_and(|count| count > 0));
+    }
+}

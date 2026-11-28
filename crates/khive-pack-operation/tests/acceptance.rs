@@ -679,28 +679,48 @@ async fn at_least_one_is_done_when_one_identity_acts() {
     assert_eq!(items_of(&after, "act_owed")[0]["step"], "submit");
 }
 
+impl Store {
+    /// Loads, in the type namespace, one form whose clerk fills one line per field given.
+    async fn load_fields(&self, form_id: &str, fields: &[(&str, &str)]) {
+        let items: Vec<Value> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| {
+                json!({"label": name, "page": 1, "order": i + 1, "item_kind": "text",
+                    "filled_by": "clerk", "about": "clerk", "field": name})
+            })
+            .collect();
+        let definitions: Vec<Value> = fields
+            .iter()
+            .map(|(name, value_type)| {
+                json!({"name": name, "definition": format!("The {name} of a filing."), "value_type": value_type})
+            })
+            .collect();
+        let loaded = self
+            .call(
+                author(),
+                "forms.load",
+                json!({"document": {
+                    "form_id": form_id,
+                    "revision": "2026-01",
+                    "title": format!("Form {form_id}"),
+                    "source": {"url": format!("https://forms.example/{form_id}.pdf"), "sha256": "7".repeat(64)},
+                    "terms": {"kinds": ["person"], "roles": ["clerk"]},
+                    "subjects": [{"id": "clerk", "kind": "person", "role": "clerk"}],
+                    "fields": definitions,
+                    "items": items,
+                }}),
+            )
+            .await;
+        assert_eq!(loaded["loaded"], true, "{loaded}");
+    }
+}
+
 #[tokio::test]
 async fn a_step_waits_on_the_step_that_produces_what_it_requires() {
     let store = Store::new();
     let field = "case number";
-    let loaded = store
-        .call(
-            author(),
-            "forms.load",
-            json!({"document": {
-                "form_id": "CASE-1",
-                "revision": "2026-01",
-                "title": "Case form",
-                "source": {"url": "https://forms.example/case-1.pdf", "sha256": "7".repeat(64)},
-                "terms": {"kinds": ["person"], "roles": ["clerk"]},
-                "subjects": [{"id": "clerk", "kind": "person", "role": "clerk"}],
-                "fields": [{"name": field, "definition": "Number the registry gives a case.", "value_type": "identifier"}],
-                "items": [{"label": "Case number", "page": 1, "order": 1, "item_kind": "text",
-                    "filled_by": "clerk", "about": "clerk", "field": field}]
-            }}),
-        )
-        .await;
-    assert_eq!(loaded["loaded"], true, "{loaded}");
+    store.load_fields("CASE-1", &[(field, "identifier")]).await;
     // `issue` requires what `assign` produces and names no `after`; the second type names the
     // field in another case and spacing on each side.
     for (id, produced, required) in [
@@ -741,6 +761,7 @@ async fn a_step_waits_on_the_step_that_produces_what_it_requires() {
         );
         assert_eq!(status(&before, "issue"), "blocked");
 
+        // Done, `assign` left no case number: `issue` is not owed while its input is missing.
         store
             .record(
                 &operation,
@@ -748,9 +769,369 @@ async fn a_step_waits_on_the_step_that_produces_what_it_requires() {
             )
             .await;
         let after = store.frontier(&operation, json!({})).await;
-        let owed = items_of(&after, "act_owed");
-        assert_eq!(owed.len(), 1, "{id}: {after}");
-        assert_eq!(owed[0]["step"], "issue");
+        assert!(items_of(&after, "act_owed").is_empty(), "{id}: {after}");
         assert!(items_of(&after, "act_blocked").is_empty(), "{id}: {after}");
+        let missing = items_of(&after, "input_missing");
+        assert_eq!(missing.len(), 1, "{id}: {after}");
+        assert_eq!(missing[0]["step"], "issue");
+        // The canonical name, whatever case the type was written in.
+        assert_eq!(missing[0]["field"], field, "{id}: {after}");
+        assert_eq!(missing[0]["value_type"], "identifier");
+        assert_eq!(missing[0]["produced_by"], json!(["assign"]));
+        assert_eq!(
+            missing[0]["supplier"],
+            json!({"slot": "clerk", "identity": person("c1")})
+        );
+        assert!(missing[0].get("slot").is_none(), "about the operation");
+        // The case form asks for the number and states it nowhere, so it is no place.
+        assert_eq!(missing[0]["places"], json!([]), "{id}: {after}");
+        assert_eq!(missing[0]["stated_in_part"], json!([]));
+        assert_eq!(after["source_order"], Value::Null, "{after}");
+        assert_eq!(after["form_revisions"], json!([]), "{after}");
+
+        store
+            .record(
+                &operation,
+                json!([{"kind": "fact", "key": "case-number", "field": field, "value": "C-1"}]),
+            )
+            .await;
+        let recorded = store.frontier(&operation, json!({})).await;
+        let owed = items_of(&recorded, "act_owed");
+        assert_eq!(owed.len(), 1, "{id}: {recorded}");
+        assert_eq!(owed[0]["step"], "issue");
+        assert!(
+            items_of(&recorded, "input_missing").is_empty(),
+            "{id}: {recorded}"
+        );
     }
+}
+
+#[tokio::test]
+async fn the_issue_waits_on_a_value_the_signature_produces() {
+    let store = Store::new();
+    let field = "signed date";
+    store.load_fields("SIGNED-1", &[(field, "date")]).await;
+    let mut document: Value =
+        serde_json::from_str(include_str!("fixtures/joint-filing.json")).expect("fixture");
+    document["operation_types"][0]["id"] = json!("dated-filing");
+    document["operation_types"][0]["steps"][1]["produces"] =
+        json!([{"field": field, "class": "stated"}]);
+    document["operation_types"][0]["steps"][3]["requires"] =
+        json!([{"field": field, "value_type": "date"}]);
+    let defined = store
+        .call(author(), "operation.define", json!({"document": document}))
+        .await;
+    let issue = &defined["published"][0];
+    assert_eq!(issue["id"], "dated-filing", "{defined}");
+    let opened = store
+        .call(
+            office(),
+            "operation.open",
+            json!({
+                "type": "dated-filing",
+                "bindings": {"applicant": [person("a1"), person("a2")], "office": {"kind": "office", "key": "registry"}, "preparer": person(PREPARER)}
+            }),
+        )
+        .await;
+    let operation = opened["operation_id"].as_str().expect("id").to_owned();
+    store
+        .record(
+            &operation,
+            json!([
+                {"kind": "fact", "key": "channel", "field": "channel", "value": "online"},
+                act("request-1", "request", None),
+                act("sign-a1", "sign", Some("a1")),
+            ]),
+        )
+        .await;
+    // One signature owed: `issue` waits on `sign`, through the bypassed submission too.
+    let partly = store.frontier(&operation, json!({})).await;
+    assert!(items_of(&partly, "input_missing").is_empty(), "{partly}");
+    let blocked = items_of(&partly, "act_blocked");
+    assert_eq!(blocked.len(), 1, "{partly}");
+    assert_eq!(blocked[0]["step"], "issue");
+    assert_eq!(blocked[0]["waits_on"][0]["step"], "sign", "{partly}");
+
+    store
+        .record(&operation, json!([act("sign-a2", "sign", Some("a2"))]))
+        .await;
+    let signed = store.frontier(&operation, json!({})).await;
+    assert!(items_of(&signed, "act_owed").is_empty(), "{signed}");
+    let missing = items_of(&signed, "input_missing");
+    assert_eq!(missing.len(), 1, "{signed}");
+    assert_eq!(missing[0]["step"], "issue");
+    assert_eq!(missing[0]["produced_by"], json!(["sign"]));
+    assert_eq!(missing[0]["by"], "office");
+    assert_eq!(missing[0]["places"], json!([]), "{signed}");
+    // It groups with the office's other items.
+    let group = signed["groups"]
+        .as_array()
+        .expect("groups")
+        .iter()
+        .find(|group| group["supplier"]["slot"] == "office")
+        .unwrap_or_else(|| panic!("an office group: {signed}"));
+    assert_eq!(group["items"][0]["kind"], "input_missing");
+
+    store
+        .record(
+            &operation,
+            json!([{"kind": "fact", "key": "signed", "field": field, "value": "2026-11-27"}]),
+        )
+        .await;
+    let dated = store.frontier(&operation, json!({})).await;
+    assert_eq!(items_of(&dated, "act_owed")[0]["step"], "issue", "{dated}");
+}
+
+#[tokio::test]
+async fn a_value_required_of_a_repeating_slot_is_sought_of_each_identity_bound_to_it() {
+    let store = Store::new();
+    let field = "tax number";
+    store.load_fields("TAX-1", &[(field, "identifier")]).await;
+    let mut document: Value =
+        serde_json::from_str(include_str!("fixtures/joint-filing.json")).expect("fixture");
+    document["operation_types"][0]["id"] = json!("taxed-filing");
+    // The office issues once, and needs the tax number of every applicant.
+    document["operation_types"][0]["steps"][3]["requires"] =
+        json!([{"field": field, "value_type": "identifier", "slot": "applicant"}]);
+    let defined = store
+        .call(author(), "operation.define", json!({"document": document}))
+        .await;
+    assert_eq!(defined["published"][0]["id"], "taxed-filing", "{defined}");
+    let opened = store
+        .call(
+            office(),
+            "operation.open",
+            json!({
+                "type": "taxed-filing",
+                "bindings": {"applicant": [person("a1"), person("a2")], "office": {"kind": "office", "key": "registry"}, "preparer": person(PREPARER)}
+            }),
+        )
+        .await;
+    let operation = opened["operation_id"].as_str().expect("id").to_owned();
+    store
+        .record(
+            &operation,
+            json!([
+                {"kind": "fact", "key": "channel", "field": "channel", "value": "online"},
+                act("request-1", "request", None),
+                act("sign-a1", "sign", Some("a1")),
+                act("sign-a2", "sign", Some("a2")),
+            ]),
+        )
+        .await;
+    let identities = |frontier: &Value| -> Vec<Value> {
+        items_of(frontier, "input_missing")
+            .iter()
+            .map(|item| item["identity"].clone())
+            .collect()
+    };
+    let none = store.frontier(&operation, json!({})).await;
+    assert!(items_of(&none, "act_owed").is_empty(), "{none}");
+    assert_eq!(
+        identities(&none),
+        vec![person("a1"), person("a2")],
+        "{none}"
+    );
+
+    store
+        .record(
+            &operation,
+            json!([{"kind": "fact", "key": "tax-a1", "field": field, "value": "T-1", "identity": person("a1")}]),
+        )
+        .await;
+    let one = store.frontier(&operation, json!({})).await;
+    assert!(items_of(&one, "act_owed").is_empty(), "{one}");
+    assert_eq!(identities(&one), vec![person("a2")], "{one}");
+    let missing = items_of(&one, "input_missing");
+    assert_eq!(missing[0]["step"], "issue");
+    assert_eq!(missing[0]["slot"], "applicant");
+    assert_eq!(missing[0]["by"], "office");
+
+    store
+        .record(
+            &operation,
+            json!([{"kind": "fact", "key": "tax-a2", "field": field, "value": "T-2", "identity": person("a2")}]),
+        )
+        .await;
+    let both = store.frontier(&operation, json!({})).await;
+    assert_eq!(items_of(&both, "act_owed")[0]["step"], "issue", "{both}");
+    assert!(items_of(&both, "input_missing").is_empty(), "{both}");
+}
+
+const PERMIT: &str = "permit number";
+const REFERENCE: &str = "permit reference";
+
+/// A record of `document_type` whose lines state each (field, subject) given. Its subjects are
+/// a holder and a witness.
+fn stating_record(form_id: &str, n: u8, document_type: Value, lines: &[(&str, &str)]) -> Value {
+    let items: Vec<Value> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, (field, subject))| {
+            json!({"label": format!("{field} of the {subject}"), "page": 1, "order": i + 1,
+                "item_kind": "text", "relation": "states", "about": subject, "field": field})
+        })
+        .collect();
+    json!({
+        "form_id": form_id,
+        "revision": "2026-01",
+        "title": format!("Record {form_id}"),
+        "source": {"url": format!("https://forms.example/{form_id}.pdf"), "sha256": n.to_string().repeat(64)},
+        "document_type": document_type,
+        "terms": {"kinds": ["person"], "roles": ["holder", "witness"]},
+        "subjects": [
+            {"id": "holder", "kind": "person", "role": "holder"},
+            {"id": "witness", "kind": "person", "role": "witness"}
+        ],
+        "fields": [
+            {"name": PERMIT, "definition": "The number a registry gives a permit.", "value_type": "identifier"},
+            {"name": REFERENCE, "definition": "Any reference a registry gives a permit.", "value_type": "identifier"}
+        ],
+        "items": items,
+    })
+}
+
+#[tokio::test]
+async fn a_missing_input_lists_its_places_in_the_source_order_and_its_parent_stated_in_part() {
+    let store = Store::new();
+    let system = |id: &str, name: &str| json!({"id": id, "name": name, "system": true});
+    for (form_id, n, document_type, lines) in [
+        (
+            "ARCH-1",
+            1,
+            system("archive-index", "Archive index"),
+            vec![(PERMIT, "holder")],
+        ),
+        (
+            "REG-1",
+            2,
+            json!({"id": "registry-extract", "name": "Registry extract", "origin": "third_party"}),
+            vec![(PERMIT, "witness"), (PERMIT, "holder")],
+        ),
+        (
+            "ZETA-1",
+            3,
+            system("zeta-portal", "Zeta portal"),
+            vec![(PERMIT, "holder")],
+        ),
+        // States the number only of the witness, who fills no slot of the type.
+        (
+            "WIT-1",
+            4,
+            system("witness-log", "Witness log"),
+            vec![(PERMIT, "witness")],
+        ),
+        (
+            "LEDGER-1",
+            5,
+            system("ledger-portal", "Ledger portal"),
+            vec![(REFERENCE, "holder"), (REFERENCE, "witness")],
+        ),
+    ] {
+        let loaded = store
+            .call(
+                author(),
+                "forms.load",
+                json!({"document": stating_record(form_id, n, document_type, &lines)}),
+            )
+            .await;
+        assert_eq!(loaded["loaded"], true, "{loaded}");
+    }
+    // The permit reference is the parent of the permit number in the field hierarchy.
+    let node = |reply: &Value| reply["node"]["id"].as_str().expect("a node id").to_owned();
+    let parent = store
+        .call(author(), "forms.neighbourhood", json!({"node": REFERENCE}))
+        .await;
+    let child = store
+        .call(author(), "forms.neighbourhood", json!({"node": PERMIT}))
+        .await;
+    store
+        .call(
+            author(),
+            "link",
+            json!({"source_id": node(&parent), "target_id": node(&child), "relation": "contains"}),
+        )
+        .await;
+
+    let document = json!({
+        "source_order": {"version": 1, "places": ["zeta-portal", "registry-extract"]},
+        "operation_types": [{
+            "id": "permit-renewal",
+            "version": 1,
+            "slots": [{"name": "holder", "kind": "person", "role": "holder"}],
+            "steps": [{"name": "renew", "by": "holder", "outcome": true,
+                "requires": [{"field": PERMIT, "value_type": "identifier", "slot": "holder"}]}]
+        }]
+    });
+    let defined = store
+        .call(author(), "operation.define", json!({"document": document}))
+        .await;
+    assert_eq!(defined["source_order_published"]["version"], 1, "{defined}");
+    let opened = store
+        .call(
+            office(),
+            "operation.open",
+            json!({"type": "permit-renewal", "bindings": {"holder": person("h1")}}),
+        )
+        .await;
+    let operation = opened["operation_id"].as_str().expect("id").to_owned();
+
+    let line = |form: &str| json!({"form": form, "revision": "2026-01", "subject": "holder"});
+    let place = |document_type: &str, system: bool, form: &str| json!({"document_type": document_type, "system": system, "lines": [line(form)]});
+    let view = store.frontier(&operation, json!({})).await;
+    assert!(items_of(&view, "act_owed").is_empty(), "{view}");
+    let missing = items_of(&view, "input_missing");
+    assert_eq!(missing.len(), 1, "{view}");
+    assert_eq!(missing[0]["slot"], "holder");
+    assert_eq!(missing[0]["identity"], person("h1"));
+    // The source order's places in its order, then the rest by name; only the holder's lines.
+    assert_eq!(
+        missing[0]["places"],
+        json!([
+            place("zeta-portal", true, "ZETA-1"),
+            place("registry-extract", false, "REG-1"),
+            place("archive-index", true, "ARCH-1"),
+        ]),
+        "{view}"
+    );
+    assert_eq!(
+        missing[0]["stated_in_part"],
+        json!([{"form": "LEDGER-1", "revision": "2026-01", "subject": "holder",
+            "stated": REFERENCE, "required": PERMIT, "document_type": "ledger-portal", "system": true}]),
+        "{view}"
+    );
+    assert_eq!(
+        view["source_order"],
+        json!({"namespace": TYPES, "version": 1, "digest": defined["source_order_published"]["digest"]}),
+        "{view}"
+    );
+    let read: Vec<Value> = ["ARCH-1", "LEDGER-1", "REG-1", "WIT-1", "ZETA-1"]
+        .into_iter()
+        .map(|form| json!({"form": form, "revision": "2026-01"}))
+        .collect();
+    assert_eq!(view["form_revisions"], json!(read), "{view}");
+
+    // The newest source order governs, and the places it leaves out follow by name.
+    let reordered = store
+        .call(
+            author(),
+            "operation.define",
+            json!({"document": {"source_order": {"version": 2, "places": ["registry-extract"]}}}),
+        )
+        .await;
+    assert_eq!(
+        reordered["source_order_published"]["version"], 2,
+        "{reordered}"
+    );
+    let view = store.frontier(&operation, json!({})).await;
+    assert_eq!(
+        items_of(&view, "input_missing")[0]["places"],
+        json!([
+            place("registry-extract", false, "REG-1"),
+            place("archive-index", true, "ARCH-1"),
+            place("zeta-portal", true, "ZETA-1"),
+        ]),
+        "{view}"
+    );
+    assert_eq!(view["source_order"]["version"], 2, "{view}");
 }

@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::borrow::Cow;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use async_trait::async_trait;
@@ -18,10 +19,10 @@ use khive_types::{
 
 use crate::definition::{
     canonical_json, compile_document, digest, fold, named_fields, step_type_refs,
-    write_canonical_field_names, Available, Compiled, Document, OperationType, Refusal, StepType,
-    Stored,
+    write_canonical_field_names, Available, Compiled, Document, OperationType, Refusal,
+    SourceOrder, StepType, Stored,
 };
-use crate::frontier::{evaluate, GroupBy, Identity, Payload};
+use crate::frontier::{evaluate, sought_inputs, Found, GroupBy, Identity, Payload, Places};
 use crate::resolve::{resolve, Decision, Subject, Terms};
 
 const fn param(
@@ -55,14 +56,14 @@ const OBSERVED_AT: ParamDef = param(
 pub(crate) static OPERATION_HANDLERS: [HandlerDef; 7] = [
     HandlerDef {
         name: "operation.define",
-        description: "Publish operation types in the caller's namespace: slots, steps (who acts, after which steps, how many of a repeating slot), and rules that ask or skip a step on facts and on other steps. Step types may also be published on their own and pinned by a step of a type. Each step given inside a type is published as its own step type, and every step type a type uses is pinned by digest. A step that requires a value another step produces comes after it. A requirement, product or supply names a field by its canonical name in any case or spacing, and the canonical name is what is stored. A slot is given by a kind and a role with an optional qualifier, by a relation to another slot of the type, or by neither; a kind, role or relation a slot names must be a term of the namespace (forms.terms) by name or alias. Publishing the same type again is a no-op; a different type under a published version is refused.",
+        description: "Publish operation types in the caller's namespace: slots, steps (who acts, after which steps, how many of a repeating slot), and rules that ask or skip a step on facts and on other steps. Step types may also be published on their own and pinned by a step of a type. Each step given inside a type is published as its own step type, and every step type a type uses is pinned by digest. A step that requires a value another step produces comes after it. A requirement, product or supply names a field by its canonical name in any case or spacing, and the canonical name is what is stored; a supply from a step type pinned from the namespace names the product as that type stores it, and in another case or spacing it is refused as unknown_supply unless the document names the field in a requirement or product too. A slot is given by a kind and a role with an optional qualifier, by a relation to another slot of the type, or by neither; a kind, role or relation a slot names must be a term of the namespace (forms.terms) by name or alias. Publishing the same type again is a no-op; a different type under a published version is refused. A document may also publish the namespace's source order: the document types a value is read from, in the deployment's order, each a form loaded in the namespace and named once.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[param(
             "document",
             "object",
             true,
-            "{step_types?: [{id, version, by, name?, act?, quantifier?, requires?, produces?}], operation_types?: [{id, version, slots: [{name, repeats?, required?, kind?, role?, qualifier?, defined_by?: {relation, slot}}], steps: [{name, by, act?, after?, quantifier? all_of|at_least_one, activated_by?, unless?, outcome?, requires?, produces?, supplies?} or {name, step_type: {id, version}, after?, activated_by?, unless?, outcome?, supplies?}], rules?: [{step, action activate|skip, when, unless?, status?, owner?, citation?}]}]}, with at least one of the two lists. A requirement is {field, slot?, value_type}; a product is {field, slot?, class read|computed|stated}; a supply {from, field, as} takes the value step from produces as field and gives it to this step's requirement as. A condition list is alternatives of terms, each {fact: {field, slot?, present|equals|one_of}} or {step: {name, done}}.",
+            "{step_types?: [{id, version, by, name?, act?, quantifier?, requires?, produces?}], operation_types?: [{id, version, slots: [{name, repeats?, required?, kind?, role?, qualifier?, defined_by?: {relation, slot}}], steps: [{name, by, act?, after?, quantifier? all_of|at_least_one, activated_by?, unless?, outcome?, requires?, produces?, supplies?} or {name, step_type: {id, version}, after?, activated_by?, unless?, outcome?, supplies?}], rules?: [{step, action activate|skip, when, unless?, status?, owner?, citation?}]}], source_order?: {version, places: [form_id, ...]}}, with at least one of the three. A requirement is {field, slot?, value_type}; a product is {field, slot?, class read|computed|stated}; a supply {from, field, as} takes the value step from produces as field and gives it to this step's requirement as. A condition list is alternatives of terms, each {fact: {field, slot?, present|equals|one_of}} or {step: {name, done}}. A source order is one per namespace, versioned like a type.",
         )],
     },
     HandlerDef {
@@ -108,7 +109,7 @@ pub(crate) static OPERATION_HANDLERS: [HandlerDef; 7] = [
     },
     HandlerDef {
         name: "operation.frontier",
-        description: "What an operation owes as of a time: each act owed now and who supplies it, each act blocked and the steps it waits on, each required slot nobody has bound, grouped by supplier, and the steps not asked with the rule that skipped them. Writes nothing.",
+        description: "What an operation owes as of a time: each act owed now and who supplies it, each act blocked and the steps it waits on, each input a step requires that no record holds (input_missing, with the places that state it in the namespace's source order and then by name, and the places that state its parent field as stated_in_part), each required slot nobody has bound, grouped by supplier, and the steps not asked with the rule that skipped them. Names the source order version and the form revisions it read. Writes nothing.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -202,7 +203,7 @@ impl PackRuntime for OperationPack {
             "operation.open" => self.open(params, token).await,
             "operation.bind" => self.bind(params, token).await,
             "operation.record" => self.record(params, token).await,
-            "operation.frontier" => self.frontier(params, token).await,
+            "operation.frontier" => self.frontier(params, registry, token).await,
             "operation.resolve" => self.resolve(params, registry, token).await,
             "operation.decide" => self.decide(params, registry, token).await,
             _ => Err(RuntimeError::InvalidInput(format!(
@@ -608,6 +609,7 @@ impl OperationPack {
             compile_document(&source, &held).map_err(|refusal| params.refused(refusal))?;
         check_terms(&params, &document.operation_types, registry, token).await?;
         check_value_types(&params, &document, &fields)?;
+        check_places(&params, &document, registry, token).await?;
         let now = now_us();
         let verb = params.verb.clone();
         let unit_verb = verb.clone();
@@ -646,12 +648,25 @@ impl OperationPack {
                     }
                     published.push(summary(type_));
                 }
+                let mut order_published = Value::Null;
+                let mut order_already = Value::Null;
+                if let Some((stored, _)) = &document.source_order {
+                    let summary = json!({"version": stored.version, "digest": stored.digest});
+                    if held_order(&mut *writer, &unit_verb, &namespace, stored).await? {
+                        order_already = summary;
+                    } else {
+                        insert_source_order(&mut *writer, &namespace, stored, now).await?;
+                        order_published = summary;
+                    }
+                }
                 Ok(boxed(json!({
                     "namespace": namespace,
                     "published": published,
                     "already_published": already,
                     "step_types_published": step_types_published,
                     "step_types_already_published": step_types_already,
+                    "source_order_published": order_published,
+                    "source_order_already_published": order_already,
                 })))
             })
         });
@@ -1163,6 +1178,7 @@ impl OperationPack {
     async fn frontier(
         &self,
         params: Params,
+        registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         let operation_id = params.str("operation")?;
@@ -1219,9 +1235,12 @@ impl OperationPack {
             }
         });
         let applied: Vec<Payload> = records.into_iter().map(|(_, _, payload)| payload).collect();
+        let (places, source_order, form_revisions) =
+            self.read_places(&loaded, registry, token).await?;
         let mut view = evaluate(
             &loaded.definition,
             &loaded.step_types,
+            &places,
             &applied,
             &loaded.opened_by,
             group_by,
@@ -1242,8 +1261,262 @@ impl OperationPack {
             );
             map.insert("basis".to_owned(), json!(basis));
             map.insert("records_applied".to_owned(), json!(applied.len()));
+            map.insert("source_order".to_owned(), source_order);
+            map.insert("form_revisions".to_owned(), json!(form_revisions));
         }
         Ok(view)
+    }
+
+    /// The slot decisions kept beside a type for one form, oldest first.
+    async fn decisions_for(
+        &self,
+        namespace: &str,
+        type_id: &str,
+        form_id: &str,
+    ) -> Result<Vec<Decision>, RuntimeError> {
+        let mut reader = self.runtime.sql().reader().await?;
+        let rows = reader
+            .query_all(stmt(
+                include_str!("../sql/decisions-for.sql"),
+                vec![text(namespace), text(type_id), text(form_id)],
+            ))
+            .await?;
+        drop(reader);
+        let decisions = rows
+            .iter()
+            .map(|row| {
+                Ok(Decision {
+                    id: col_text(row, "decision_id")?,
+                    subjects: subject_ids(row)?,
+                    slot: col_opt_text(row, "slot")?,
+                })
+            })
+            .collect::<StorageResult<_>>()?;
+        Ok(decisions)
+    }
+
+    /// Where each input the type may find missing can be found (ADR-222 A1.4), all read in the
+    /// namespace that publishes the type: its newest source order, the lines that state each
+    /// sought field and its parent fields in the forms pack, and the slot each subject of those
+    /// lines fills by A1.3. Returns
+    /// the places by (field, slot), the source order read and the form revisions read.
+    async fn read_places(
+        &self,
+        loaded: &Loaded,
+        registry: &VerbRegistry,
+        token: &NamespaceToken,
+    ) -> Result<(Places, Value, Vec<Value>), RuntimeError> {
+        let sought = sought_inputs(&loaded.definition, &loaded.step_types);
+        if sought.is_empty() {
+            return Ok((Places::new(), Value::Null, Vec::new()));
+        }
+        let mut reader = self.runtime.sql().reader().await?;
+        let rows = reader
+            .query_all(stmt(
+                include_str!("../sql/source-order-newest.sql"),
+                vec![text(&loaded.type_namespace)],
+            ))
+            .await?;
+        drop(reader);
+        let (order, order_view) = match rows.first() {
+            Some(row) => {
+                let held = col_text(row, "digest")?;
+                let bytes = col_bytes(row, "order_bytes")?;
+                if digest(&bytes) != held {
+                    return Err(corrupt(format!(
+                        "source_order v{} does not match its digest",
+                        col_i64(row, "version")?
+                    ))
+                    .into());
+                }
+                let order: SourceOrder = serde_json::from_slice(&bytes)
+                    .map_err(|e| RuntimeError::Internal(format!("source order: {e}")))?;
+                let view = json!({
+                    "namespace": loaded.type_namespace,
+                    "version": order.version,
+                    "digest": held,
+                });
+                (order.places, view)
+            }
+            None => (Vec::new(), Value::Null),
+        };
+
+        // The forms are read where the type is published, beside its source order.
+        let forms_namespace = loaded.type_namespace.as_str();
+        // Each sought field's lines, then the lines of each parent field not read yet.
+        let mut stated: HashMap<String, Vec<Value>> = HashMap::new();
+        let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+        for field in sought.iter().map(|(field, _)| field) {
+            if stated.contains_key(field) {
+                continue;
+            }
+            let reply = field_lines(registry, token, forms_namespace, field).await?;
+            let general = reply["general"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            parents.insert(field.clone(), general);
+            stated.insert(field.clone(), stated_by(&reply));
+        }
+        let general: BTreeSet<String> = parents.values().flatten().cloned().collect();
+        for parent in general {
+            if let Entry::Vacant(entry) = stated.entry(parent) {
+                let reply = field_lines(registry, token, forms_namespace, entry.key()).await?;
+                entry.insert(stated_by(&reply));
+            }
+        }
+
+        // Which slot each subject of each form revision read fills.
+        let revisions: BTreeSet<(String, String)> = stated
+            .values()
+            .flatten()
+            .filter_map(|row| {
+                Some((
+                    row["form"].as_str()?.to_owned(),
+                    row["revision"].as_str()?.to_owned(),
+                ))
+            })
+            .collect();
+        let terms = if revisions.is_empty() {
+            Terms::default()
+        } else {
+            Terms::from_reply(
+                &forms_read(
+                    registry,
+                    token,
+                    "forms.terms",
+                    json!({ "namespace": forms_namespace }),
+                )
+                .await?,
+            )
+        };
+        let mut decisions: HashMap<String, Vec<Decision>> = HashMap::new();
+        let mut slot_of: HashMap<(String, String), HashMap<String, Option<String>>> =
+            HashMap::new();
+        for (form, revision) in &revisions {
+            let declared = forms_read(
+                registry,
+                token,
+                "forms.subjects",
+                json!({ "form": form, "revision": revision, "namespace": forms_namespace }),
+            )
+            .await?;
+            let subjects: Vec<Subject> = declared["subjects"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Subject::from_view)
+                .collect();
+            if !decisions.contains_key(form) {
+                let held = self
+                    .decisions_for(&loaded.type_namespace, &loaded.definition.id, form)
+                    .await?;
+                decisions.insert(form.clone(), held);
+            }
+            let resolution = resolve(
+                &loaded.definition,
+                &terms,
+                &subjects,
+                decisions.get(form).map(Vec::as_slice).unwrap_or_default(),
+            );
+            let slots = resolution
+                .subjects
+                .iter()
+                .filter_map(|view| {
+                    Some((
+                        fold(view["subject"].as_str()?),
+                        view["slot"].as_str().map(str::to_owned),
+                    ))
+                })
+                .collect();
+            slot_of.insert((form.clone(), revision.clone()), slots);
+        }
+
+        // A line answers a requirement about the operation whoever it is about, and a
+        // requirement about a slot when its subject fills that slot.
+        let fills = |row: &Value, slot: &Option<String>| -> bool {
+            let Some(slot) = slot else {
+                return true;
+            };
+            let (Some(form), Some(revision), Some(subject)) = (
+                row["form"].as_str(),
+                row["revision"].as_str(),
+                row["subject"].as_str(),
+            ) else {
+                return false;
+            };
+            slot_of
+                .get(&(form.to_owned(), revision.to_owned()))
+                .and_then(|slots| slots.get(&fold(subject)))
+                .is_some_and(|filled| filled.as_deref() == Some(slot.as_str()))
+        };
+        // The source order's places first, in its order, then the rest by name.
+        let rank = |document_type: &str| -> (usize, String) {
+            (
+                order
+                    .iter()
+                    .position(|place| place == document_type)
+                    .unwrap_or(order.len()),
+                document_type.to_owned(),
+            )
+        };
+        let line = |row: &Value| json!({"form": row["form"], "revision": row["revision"], "subject": row["subject"]});
+        let mut places = Places::new();
+        for (field, slot) in sought {
+            let mut by_place: BTreeMap<(usize, String), (bool, Vec<Value>)> = BTreeMap::new();
+            for row in stated.get(&field).into_iter().flatten() {
+                let Some(document_type) = row["document_type"].as_str() else {
+                    continue;
+                };
+                if !fills(row, &slot) {
+                    continue;
+                }
+                by_place
+                    .entry(rank(document_type))
+                    .or_insert_with(|| (row["system"].as_bool() == Some(true), Vec::new()))
+                    .1
+                    .push(line(row));
+            }
+            let found_places = by_place
+                .into_iter()
+                .map(|((_, document_type), (system, lines))| {
+                    json!({"document_type": document_type, "system": system, "lines": lines})
+                })
+                .collect();
+            let mut in_part: Vec<((usize, String), String, Value)> = Vec::new();
+            for parent in parents.get(&field).into_iter().flatten() {
+                for row in stated.get(parent).into_iter().flatten() {
+                    let Some(document_type) = row["document_type"].as_str() else {
+                        continue;
+                    };
+                    if !fills(row, &slot) {
+                        continue;
+                    }
+                    let mut part = line(row);
+                    part["stated"] = json!(parent);
+                    part["required"] = json!(field);
+                    part["document_type"] = json!(document_type);
+                    part["system"] = json!(row["system"].as_bool() == Some(true));
+                    in_part.push((rank(document_type), parent.clone(), part));
+                }
+            }
+            in_part.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+            places.insert(
+                (field, slot),
+                Found {
+                    places: found_places,
+                    stated_in_part: in_part.into_iter().map(|(_, _, part)| part).collect(),
+                },
+            );
+        }
+        let read = revisions
+            .into_iter()
+            .map(|(form, revision)| json!({"form": form, "revision": revision}))
+            .collect();
+        Ok((places, order_view, read))
     }
 
     async fn resolve(
@@ -1313,24 +1586,9 @@ impl OperationPack {
             .filter_map(Subject::from_view)
             .collect();
 
-        let mut reader = self.runtime.sql().reader().await?;
-        let rows = reader
-            .query_all(stmt(
-                include_str!("../sql/decisions-for.sql"),
-                vec![text(&definition_namespace), text(&type_id), text(&form_id)],
-            ))
+        let decisions = self
+            .decisions_for(&definition_namespace, &type_id, &form_id)
             .await?;
-        drop(reader);
-        let decisions: Vec<Decision> = rows
-            .iter()
-            .map(|row| {
-                Ok(Decision {
-                    id: col_text(row, "decision_id")?,
-                    subjects: subject_ids(row)?,
-                    slot: col_opt_text(row, "slot")?,
-                })
-            })
-            .collect::<StorageResult<_>>()?;
         let resolution = resolve(&definition, &terms, &subjects, &decisions);
         Ok(json!({
             "type": {
@@ -1528,6 +1786,33 @@ async fn forms_read(
         .await
 }
 
+/// A field's `forms.neighbourhood` reply, or null when the forms pack holds no field by that
+/// name for the caller.
+async fn field_lines(
+    registry: &VerbRegistry,
+    token: &NamespaceToken,
+    namespace: &str,
+    field: &str,
+) -> Result<Value, RuntimeError> {
+    match forms_read(
+        registry,
+        token,
+        "forms.neighbourhood",
+        json!({ "node": field, "namespace": namespace }),
+    )
+    .await
+    {
+        Ok(reply) if reply["node"]["type"].as_str() == Some("field") => Ok(reply),
+        Ok(_) | Err(RuntimeError::InvalidInput(_)) => Ok(Value::Null),
+        Err(error) => Err(error),
+    }
+}
+
+/// The lines a field reply says state the field (ADR-222 A2.8).
+fn stated_by(reply: &Value) -> Vec<Value> {
+    reply["stated_by"].as_array().cloned().unwrap_or_default()
+}
+
 /// Refuse a type whose slot names a kind, role or relation that is not a term of the
 /// namespace by name or alias. The terms are read only when a slot names one.
 async fn check_terms(
@@ -1669,6 +1954,106 @@ fn check_value_types(
         }
     }
     Ok(())
+}
+
+/// Refuse a source order that names a place the forms pack has not loaded (ADR-222 A2.6). A
+/// place is a document type or system, named by its id; each is read once, through
+/// `forms.neighbourhood` as `document_type:<id>`, as the caller.
+async fn check_places(
+    params: &Params,
+    document: &Document,
+    registry: &VerbRegistry,
+    token: &NamespaceToken,
+) -> Result<(), RuntimeError> {
+    let Some((_, order)) = &document.source_order else {
+        return Ok(());
+    };
+    for place in &order.places {
+        let unknown = |why: &str| {
+            params.refused(Refusal::new(
+                "unknown_place",
+                format!("place \"{place}\" {why}; load it with forms.load"),
+            ))
+        };
+        if place.contains('@') {
+            return Err(unknown(
+                "names a form revision, and a place is a document type",
+            ));
+        }
+        let reply = match forms_read(
+            registry,
+            token,
+            "forms.neighbourhood",
+            json!({ "node": format!("document_type:{place}") }),
+        )
+        .await
+        {
+            Ok(reply) => reply,
+            Err(RuntimeError::InvalidInput(_)) => {
+                return Err(unknown("is not a document type of this namespace"))
+            }
+            Err(error) => return Err(error),
+        };
+        if reply["node"]["type"].as_str() != Some("document_type") {
+            return Err(unknown("names a forms node that is not a document type"));
+        }
+    }
+    Ok(())
+}
+
+async fn insert_source_order(
+    writer: &mut dyn SqlWriter,
+    namespace: &str,
+    stored: &Stored,
+    now: i64,
+) -> StorageResult<()> {
+    writer
+        .execute(stmt(
+            include_str!("../sql/source-order-insert.sql"),
+            vec![
+                text(namespace),
+                SqlValue::Integer(stored.version),
+                text(&stored.digest),
+                SqlValue::Blob(stored.bytes.clone()),
+                text(&stored.source),
+                SqlValue::Integer(now),
+            ],
+        ))
+        .await?;
+    Ok(())
+}
+
+/// True when the namespace already holds this source order version with the same digest; a
+/// different order under a held version is refused.
+async fn held_order(
+    writer: &mut dyn SqlWriter,
+    verb: &str,
+    namespace: &str,
+    stored: &Stored,
+) -> StorageResult<bool> {
+    let held = writer
+        .query_row(stmt(
+            include_str!("../sql/source-order-get.sql"),
+            vec![text(namespace), SqlValue::Integer(stored.version)],
+        ))
+        .await?;
+    let Some(row) = held else {
+        return Ok(false);
+    };
+    let held_digest = col_text(&row, "digest")?;
+    if held_digest != stored.digest {
+        return Err(refuse(
+            verb,
+            Refusal::new(
+                "version_conflict",
+                format!(
+                    "source_order v{} is published with a different order ({held_digest}); publish a new version",
+                    stored.version
+                ),
+            ),
+        ));
+    }
+    Ok(true)
 }
 
 fn stored_summary(stored: &Stored) -> Value {

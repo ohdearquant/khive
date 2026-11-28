@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `operation.frontier` reports `input_missing` for each value an owed step requires that no record
+  holds, in place of the act it owes. The item lists the places that state the field of a subject
+  in the requirement's slot: every loaded document type and system, in the order of the
+  namespace's newest `source_order`, then the rest by name. `stated_in_part` lists the lines that
+  state a parent of the field. The frontier names the source order and the form revisions it read.
+  `operation.define` publishes a `source_order` (`version`, `places`) and refuses a place that is
+  not a loaded document type or system (ADR-222 Amendments 1 and 2).
+
 ### Changed
 
 - On a shared host, `comm.quiet` requires the authenticated operator. Renewals have a
