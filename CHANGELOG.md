@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `operation.define` publishes step types on their own, and a step of an operation type may pin
   one by id and version. A step may name the values it requires and produces and take a value
   another step produces; a step that requires a value comes after the step that produces it.
+- `operation.frontier` reports `input_missing` for each value an owed step requires that no record
+  holds, in place of the act it owes. The item lists the places that state the field of a subject
+  in the requirement's slot: every loaded document type and system, in the order of the
+  namespace's newest `source_order`, then the rest by name. `stated_in_part` lists the lines that
+  state a parent of the field. The frontier names the source order and the form revisions it read.
+  `operation.define` publishes a `source_order` (`version`, `places`) and refuses a place that is
+  not a loaded document type or system (ADR-222 Amendments 1 and 2).
 - The `forms` pack records what kind of document each form revision is. A `document_type` node
   (`id`, `name`, `origin` of `applicant`, `third_party` or `work`, optional `issuer_class`)
   contains its revisions; `forms.load` takes it as `document_type` and mints one, marked `minted`,
