@@ -30,7 +30,7 @@ const DOCUMENT: ParamDef = param(
     "document",
     "object",
     true,
-    "One form revision: {form_id, revision, title, source: {url, sha256}, issuer?: {name, jurisdiction}, fields?: [{name, definition, value_type, aliases?, values?: [{name, definition}], exclusive?}], sections?: [{label, order, sections?}], items?: [{label, page, order, item_kind, filled_by, section?, field?, value?, widget?, links_to?}], rules?: [{text, page, depends_on?: [{field, value?}], enables?: [{section | item | form}]}], relations?: [{relation, form, revision?}]}. item_kind is text, choice, signature or attachment; value_type is text, date, amount, identifier or choice; relation is competes_with, composed_with, precedes or depends_on, toward a form already loaded.",
+    "One form revision: {form_id, revision, title, source: {url, sha256}, issuer?: {name, jurisdiction}, terms?: {kinds?, roles?, relations?: [name | {name, definition?}]}, subjects?: [{id, kind, role, qualifier?, repeats?, relations?: [{relation, to}]}], fields?: [{name, definition, value_type, aliases?, values?: [{name, definition}], exclusive?}], sections?: [{label, order, sections?}], items?: [{label, page, order, item_kind, filled_by, about?, state?, repeats?, necessity?, group?, selects?, section?, field?, value?, widget?, links_to?}], rules?: [{text, page, depends_on?: [{field, value?}], enables?: [{section | item | subject | form}]}], relations?: [{relation, form, revision?}]}. item_kind is text, choice, signature or attachment; value_type is text, date, amount, identifier or choice; necessity is required, optional, one_of (with group) or at_least_one_row; relation is competes_with, composed_with, precedes or depends_on, toward a form already loaded.",
 );
 const ITEM_ID: ParamDef = param(
     "item",
@@ -42,7 +42,7 @@ const ITEM_ID: ParamDef = param(
 pub(crate) static FORMS_HANDLERS: [HandlerDef; 10] = [
     HandlerDef {
         name: "forms.load",
-        description: "Load one form revision from one document in one transaction: the form, its issuer, sections, items, the fields and choice values the items mean, printed rules, and relations to forms already loaded. Loading the same form_id and revision again changes nothing. A live field with the same name, definition and value type is reused, and keeps any alias the document gives it that no other live field answers to (counted as aliases_added; the others come back as warnings); a live field of that name with another meaning leaves the items asking for it without a field, with a warning, to be decided with forms.same or forms.split; a printed rule whose premise names such a field is kept, marked as waiting on it. An exclusive choice field holds at most 48 values, and a reused exclusive field's new values exclude its existing ones.",
+        description: "Load one form revision from one document in one transaction: the form, its issuer, sections, items, the fields and choice values the items mean, printed rules, and relations to forms already loaded. Loading the same form_id and revision again changes nothing. A live field with the same name, definition and value type is reused, and keeps any alias the document gives it that no other live field answers to (counted as aliases_added; the others come back as warnings); a live field of that name with another meaning leaves the items asking for it without a field, with a warning, to be decided with forms.same or forms.split; a printed rule whose premise names such a field is kept, marked as waiting on it. An exclusive choice field holds at most 48 values, and a reused exclusive field's new values exclude its existing ones. A form may declare subjects, the parties and things its lines are about: each has an id unique in the form, a kind and a role from the term lists (loaded by any document under terms and kept), an optional qualifier and row count (repeats), and named relations to other subjects of the form. On such a form every item that asks for a field names the declared subject it is about (about) and the declared subject who writes it (filled_by), and is required unless it states another necessity; an item naming an undeclared subject refuses the whole document. state tells apart two lines on one subject and field (a former and a new value), repeats gives a line its own row count, and selects lists the subjects a line's value may name. A rule may enable a subject, so that its lines are asked only when the rule's premise holds.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[DOCUMENT],
@@ -54,7 +54,7 @@ pub(crate) static FORMS_HANDLERS: [HandlerDef; 10] = [
         category: VerbCategory::Commissive,
         params: &[
             param("form", "string", true, "The form: its id, its form_id, or form_id@revision."),
-            param("item", "object", true, "The printed item: {label, page, order, item_kind, filled_by, section?, widget?}."),
+            param("item", "object", true, "The printed item: {label, page, order, item_kind, filled_by, about?, state?, repeats?, necessity?, group?, selects?, section?, widget?}, checked against the subjects its form declares as in forms.load."),
             param("field", "object", false, "The proposed field: {name, definition, value_type, aliases?, values?}."),
             param("same_as", "string", false, "The id or name of the field this item means."),
         ],
@@ -100,22 +100,22 @@ pub(crate) static FORMS_HANDLERS: [HandlerDef; 10] = [
     },
     HandlerDef {
         name: "forms.neighbourhood",
-        description: "Show what surrounds a form, a field or any forms node: the typed nodes and edges within depth, each with its source. A form also gets its sections and items in printed order, its rules and its related forms by relation; a field gets every item that asks for it, its general and narrower fields and its values.",
+        description: "Show what surrounds a form, a field or any forms node: the typed nodes and edges within depth, each with its source. A form also gets its sections and items in printed order, its rules and its related forms by relation; a field gets every item that asks for it, whom each line on a form with subjects asks it of, its general and narrower fields and its values. A form also lists the subjects it declares; a subject gets the fields its lines ask for; a term gets every subject that names it, with its form and the fields asked of it.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
-            param("node", "string", true, "A node id, a form (form_id or form_id@revision) or a field name."),
+            param("node", "string", true, "A node id, a form (form_id or form_id@revision), a field name, or a term as kind:<name>, role:<name> or relation:<name>."),
             param("depth", "integer", false, "Edges to follow outward: 1 to 3, default 1."),
         ],
     },
     HandlerDef {
         name: "forms.check",
-        description: "Check a set of forms, and optional answers, against the forms' own rules. Findings: two competing forms both present; a form that must be attached is absent; a printed rule whose premise holds and whose section, item or form is not filled; an answer outside its field's values; two exclusive values given together. Each finding cites its form and, for a rule, the page that prints it. Answers that name no single field are listed apart, and so are rules still waiting on a field to be decided (rules_unchecked). consistent is true only when there are no findings, no such answers and no such rules.",
+        description: "Check a set of forms, and optional answers, against the forms' own rules. Findings: two competing forms both present; a form that must be attached is absent; a printed rule whose premise holds and whose section, item or form is not filled; an answer outside its field's values; two exclusive values given together. Each finding cites its form and, for a rule, the page that prints it. An answer given as a list entry names the subject it is for (and the form, when two checked forms declare that subject), the row of a repeating line and the state of the line, and fills only the lines of that subject, row and state; an answer of the object form fills the lines about no subject, and comes back unplaced where the checked forms ask its field only of subjects. A line with a necessity that no answer fills is a missing finding, row by row for a required line, once for a repeating line that needs at least one row, once for a group of which one line is needed; a line a rule enables is not asked, and not missing, while the rule's premise does not hold (counted in lines_not_asked). An answer whose lines are all not asked comes back in answers_not_asked and holds no premise. A required line bound to no field yet is a line_without_field finding. A line whose value selects a subject takes only the subjects it lists. Answers that name no single field are listed apart, answers that fit no subject or no line of it come back in unplaced_answers with the reason, and rules still waiting on a field to be decided in rules_unchecked. consistent is true only when there are no findings and none of those lists has an entry.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
             param("forms", "array of string", true, "The forms in the set: ids, form_ids or form_id@revision."),
-            param("answers", "object", false, "Field name or id to its answer: text, or a list of values."),
+            param("answers", "object or array of object", false, "Field name or id to its answer (text, or a list of values), or a list of {subject?, form?, field, row?, state?, value}."),
         ],
     },
     HandlerDef {

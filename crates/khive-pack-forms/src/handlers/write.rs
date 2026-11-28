@@ -9,6 +9,9 @@ use khive_types::EdgeRelation;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
+use super::lines::{
+    check_subjects, declared_in, declared_on, line_props, subject_props, subject_specs, term_specs,
+};
 use super::params::{self, Args};
 use super::views::{field_reply, nearest};
 use super::Ctx;
@@ -18,8 +21,8 @@ use crate::store::{
 };
 use crate::text::normalize;
 use crate::vocab::{
-    self, FIELD, FIELD_VALUE, FORM, FORM_ISSUER, FORM_ITEM, FORM_RULE, FORM_SECTION, ITEM_KINDS,
-    VALUE_TYPES,
+    self, FIELD, FIELD_VALUE, FORM, FORM_ISSUER, FORM_ITEM, FORM_RULE, FORM_SECTION, FORM_SUBJECT,
+    FORM_TERM, ITEM_KINDS, TERM_LISTS, VALUE_TYPES,
 };
 
 /// The format tag of an export document, checked by replay.
@@ -308,6 +311,8 @@ struct Counts {
     values: usize,
     rules: usize,
     relations: usize,
+    subjects: usize,
+    terms: usize,
 }
 
 impl Counts {
@@ -323,6 +328,8 @@ impl Counts {
             "values": self.values,
             "rules": self.rules,
             "relations": self.relations,
+            "subjects": self.subjects,
+            "terms": self.terms,
         })
     }
 }
@@ -458,6 +465,35 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
         };
         writes.link(issuer, EdgeRelation::Contains, form);
     }
+
+    // The term lists first, so the subjects below can name what they load.
+    let terms = term_specs(doc)?;
+    let mut known: HashSet<(String, String)> = HashSet::new();
+    for (_, list) in TERM_LISTS {
+        for folded in graph.terms(list).into_keys() {
+            known.insert((list.to_owned(), folded));
+        }
+    }
+    for term in &terms {
+        if known.insert((term.list.to_owned(), normalize(&term.name))) {
+            let mut properties = map([("list", json!(term.list))]);
+            if let Some(definition) = &term.definition {
+                properties.insert("definition".to_owned(), json!(definition));
+            }
+            writes.create_entity(FORM_TERM, &term.name, None, properties)?;
+            counts.terms += 1;
+        }
+    }
+    let subjects = subject_specs(doc)?;
+    check_subjects(&subjects, &known)?;
+    let mut subject_ids: HashMap<String, Uuid> = HashMap::new();
+    for spec in &subjects {
+        let id = writes.create_entity(FORM_SUBJECT, &spec.id, None, subject_props(spec, &key))?;
+        writes.link(form, EdgeRelation::Contains, id);
+        subject_ids.insert(normalize(&spec.id), id);
+        counts.subjects += 1;
+    }
+    let declared = declared_in(&subjects);
 
     let mut fields: HashMap<String, Slot> = HashMap::new();
     // Each wording of a field left undecided, to the name the document gives it.
@@ -606,6 +642,13 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
             None => None,
         };
         let mut item_properties = item_props(&spec, &key);
+        item_properties.extend(line_props(
+            obj,
+            &spec.label,
+            &spec.item_kind,
+            &spec.filled_by,
+            &declared,
+        )?);
         if let (Some(name), Some(None)) = (&field_name, &slot) {
             // The wording waits for forms.same or forms.split, and so do the
             // rules of this form that take it as a premise.
@@ -733,6 +776,12 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                 })?
             } else if let Some(item) = params::opt_text(conclusion, "item")? {
                 unique_item(&item)?
+            } else if let Some(subject) = params::opt_text(conclusion, "subject")? {
+                *subject_ids.get(&normalize(&subject)).ok_or_else(|| {
+                    invalid(format!(
+                        "rule \"{text}\" names subject \"{subject}\", which the document does not declare"
+                    ))
+                })?
             } else if let Some(other) = params::opt_text(conclusion, "form")? {
                 if normalize(&other) == normalize(&form_id) || other == key {
                     form
@@ -741,7 +790,7 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                 }
             } else {
                 return Err(invalid(format!(
-                    "each conclusion of rule \"{text}\" names a section, an item or a form"
+                    "each conclusion of rule \"{text}\" names a section, an item, a subject or a form"
                 )));
             };
             writes.link(id, EdgeRelation::Enables, target);
@@ -972,8 +1021,8 @@ fn settle_pending(
 pub(crate) async fn add_item(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeError> {
     let args = params::args(params)?;
     let form_spec = params::text(&args, "form")?;
-    let spec =
-        item_spec(params::object(&args, "item")?.ok_or_else(|| invalid("item is required"))?)?;
+    let item_obj = params::object(&args, "item")?.ok_or_else(|| invalid("item is required"))?;
+    let spec = item_spec(item_obj)?;
     let field = params::object(&args, "field")?;
     let same_as = params::opt_text(&args, "same_as")?;
     if field.is_some() && same_as.is_some() {
@@ -1017,9 +1066,18 @@ pub(crate) async fn add_item(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runt
             .ok_or_else(|| invalid(format!("{key} has no section \"{section}\"")))?,
     };
 
+    let mut properties = item_props(&spec, &key);
+    properties.extend(line_props(
+        item_obj,
+        &spec.label,
+        &spec.item_kind,
+        &spec.filled_by,
+        &declared_on(&graph.subjects_of(&key)),
+    )?);
+
     let mut writes = Writes::new(ctx.token);
     let mut warnings = Vec::new();
-    let item = writes.create_entity(FORM_ITEM, &spec.label, None, item_props(&spec, &key))?;
+    let item = writes.create_entity(FORM_ITEM, &spec.label, None, properties)?;
     writes.link(parent, EdgeRelation::Contains, item);
 
     let mut reply = json!({

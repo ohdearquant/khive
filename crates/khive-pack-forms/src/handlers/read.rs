@@ -13,12 +13,13 @@ use super::views::{field_reply, usage};
 use super::write::{DECISION, FORMAT, LOG_KEYS};
 use super::Ctx;
 use crate::store::{
-    definition, invalid, is_general, label, pending_premises, prop, prop_text, props, quoted_names,
-    scalar, strings, type_of, wordings, Graph,
+    definition, invalid, is_general, label, prop, prop_text, props, scalar, strings, type_of,
+    wordings, Graph,
 };
 use crate::text::normalize;
 use crate::vocab::{
     self, ALL_TYPES, FIELD, FIELD_VALUE, FORM, FORM_ISSUER, FORM_ITEM, FORM_RULE, FORM_SECTION,
+    FORM_SUBJECT, FORM_TERM, TERM_LISTS,
 };
 
 const ANNOTATION_PAGE: u32 = 1000;
@@ -34,7 +35,7 @@ pub(super) fn cite(form: &Entity) -> Value {
     })
 }
 
-fn form_name(form: &Entity) -> String {
+pub(super) fn form_name(form: &Entity) -> String {
     match (prop_text(form, "form_id"), prop_text(form, "revision")) {
         (Some(id), Some(revision)) => format!("{id} ({revision})"),
         _ => form.name.clone(),
@@ -54,6 +55,7 @@ fn source(node: &Entity) -> Value {
             "form": prop_text(node, "form_key"),
             "page": prop(node, "source_page"),
         }),
+        FORM_SUBJECT => json!({"form": prop_text(node, "form_key")}),
         _ => Value::Null,
     }
 }
@@ -89,7 +91,83 @@ fn item_view(graph: &Graph, item: &Entity) -> Value {
         };
         view[slot] = json!(target.name);
     }
+    for key in ["about", "state", "repeats", "necessity", "group", "selects"] {
+        if let Some(value) = prop(item, key) {
+            view[key] = value.clone();
+        }
+    }
     view
+}
+
+/// A subject as a form's neighbourhood shows it.
+fn subject_view(subject: &Entity) -> Value {
+    let mut view = json!({
+        "id": prop_text(subject, "subject_id"),
+        "kind": prop_text(subject, "kind"),
+        "role": prop_text(subject, "role"),
+    });
+    for key in ["qualifier", "repeats", "relations"] {
+        if let Some(value) = prop(subject, key) {
+            view[key] = value.clone();
+        }
+    }
+    view
+}
+
+/// Whether a subject names a folded term of a list: as its kind, its role, or
+/// the name of one of its relations.
+fn names_term(subject: &Entity, list: &str, term: &str) -> bool {
+    if list != "relation" {
+        return prop_text(subject, list).is_some_and(|v| normalize(&v) == term);
+    }
+    prop(subject, "relations")
+        .and_then(Value::as_array)
+        .is_some_and(|relations| {
+            relations.iter().any(|r| {
+                r.get("relation")
+                    .and_then(Value::as_str)
+                    .is_some_and(|r| normalize(r) == term)
+            })
+        })
+}
+
+/// The fields each line about a subject asks for, in printed order.
+fn fields_asked_of(graph: &Graph, subject: &Entity) -> Vec<String> {
+    let (Some(form_key), Some(id)) = (
+        prop_text(subject, "form_key"),
+        prop_text(subject, "subject_id"),
+    ) else {
+        return Vec::new();
+    };
+    let mut items: Vec<&Entity> = graph
+        .of_type(FORM_ITEM)
+        .into_iter()
+        .filter(|i| {
+            prop_text(i, "form_key").as_deref() == Some(form_key.as_str())
+                && prop_text(i, "about").is_some_and(|a| normalize(&a) == normalize(&id))
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        number_of(a, "page")
+            .total_cmp(&number_of(b, "page"))
+            .then(number_of(a, "order").total_cmp(&number_of(b, "order")))
+    });
+    let mut fields = Vec::new();
+    for item in items {
+        for target in graph.out(item.id, EdgeRelation::VariantOf) {
+            let field = if graph.is(target, FIELD_VALUE) {
+                graph.parent_field(target)
+            } else {
+                Some(target)
+            };
+            if let Some(name) = field.and_then(|f| graph.get(f)).map(|f| f.name.clone()) {
+                if !fields.contains(&name) {
+                    fields.push(name);
+                }
+            }
+        }
+    }
+    fields
 }
 
 fn number_of(node: &Entity, key: &str) -> f64 {
@@ -102,10 +180,14 @@ fn find_node<'g>(graph: &'g Graph, spec: &str) -> Result<&'g Entity, RuntimeErro
             .get(id)
             .ok_or_else(|| invalid(format!("no forms node has id {spec}")));
     }
-    graph
-        .find_form(spec)
-        .or_else(|_| graph.find_field(spec))
-        .map_err(|_| invalid(format!("no form or field is named \"{spec}\"")))
+    if let Ok(found) = graph.find_form(spec).or_else(|_| graph.find_field(spec)) {
+        return Ok(found);
+    }
+    // A term is named by its list and itself: kind:party, role:payer.
+    spec.split_once(':')
+        .filter(|(list, _)| TERM_LISTS.iter().any(|(_, name)| name == list))
+        .and_then(|(list, name)| graph.terms(list).remove(&normalize(name)))
+        .ok_or_else(|| invalid(format!("no form, field or term is named \"{spec}\"")))
 }
 
 /// Sections and items of a container in printed order, nested.
@@ -155,7 +237,7 @@ fn outline(graph: &Graph, container: Uuid) -> Value {
     )
 }
 
-fn names(graph: &Graph, ids: &[Uuid]) -> Vec<String> {
+pub(super) fn names(graph: &Graph, ids: &[Uuid]) -> Vec<String> {
     ids.iter()
         .filter_map(|id| graph.get(*id))
         .map(label)
@@ -265,6 +347,9 @@ pub(crate) async fn neighbourhood(ctx: &Ctx<'_>, params: Value) -> Result<Value,
         FORM => {
             let key = graph.key(root.id).unwrap_or_default();
             reply["outline"] = outline(&graph, root.id);
+            let mut subjects: Vec<&Entity> = graph.subjects_of(&key).into_values().collect();
+            subjects.sort_by(|a, b| a.name.cmp(&b.name));
+            reply["subjects"] = Value::Array(subjects.into_iter().map(subject_view).collect());
             reply["rules"] = json!(rules_of(&graph, &key));
             reply["related"] = json!({
                 "competes_with": forms_cited(&graph, graph.either(root.id, EdgeRelation::CompetesWith)),
@@ -285,6 +370,23 @@ pub(crate) async fn neighbourhood(ctx: &Ctx<'_>, params: Value) -> Result<Value,
                     .map(usage)
                     .collect(),
             );
+            // Whom each line on this field asks it of, on forms that declare subjects.
+            reply["asked_of"] = Value::Array(
+                graph
+                    .items_of_field(root.id)
+                    .into_iter()
+                    .filter_map(|i| graph.get(i))
+                    .filter_map(|item| {
+                        let form = prop_text(item, "form_key")?;
+                        let about = prop_text(item, "about")?;
+                        let role = graph
+                            .subjects_of(&form)
+                            .get(&normalize(&about))
+                            .and_then(|s| prop_text(s, "role"));
+                        Some(json!({"form": form, "item": label(item), "subject": about, "role": role}))
+                    })
+                    .collect(),
+            );
             reply["general"] = json!(names(
                 &graph,
                 &graph
@@ -295,305 +397,42 @@ pub(crate) async fn neighbourhood(ctx: &Ctx<'_>, params: Value) -> Result<Value,
             ));
             reply["narrower"] = json!(names(&graph, &graph.children_of_field(root.id)));
         }
+        FORM_SUBJECT => {
+            reply["subject"] = subject_view(root);
+            reply["fields"] = json!(fields_asked_of(&graph, root));
+        }
+        FORM_TERM => {
+            // Every subject this term names, as its kind, its role or one of
+            // its relations, with the form that declares it and the fields
+            // that form asks of it.
+            let list = prop_text(root, "list").unwrap_or_default();
+            let term = normalize(&root.name);
+            let mut subjects: Vec<&Entity> = graph
+                .of_type(FORM_SUBJECT)
+                .into_iter()
+                .filter(|s| names_term(s, &list, &term))
+                .collect();
+            subjects.sort_by(|a, b| {
+                prop_text(a, "form_key")
+                    .cmp(&prop_text(b, "form_key"))
+                    .then(a.name.cmp(&b.name))
+            });
+            reply["term"] = json!({"list": list, "name": root.name, "definition": prop_text(root, "definition")});
+            reply["subjects"] = Value::Array(
+                subjects
+                    .into_iter()
+                    .map(|s| {
+                        let mut view = subject_view(s);
+                        view["form"] = json!(prop_text(s, "form_key"));
+                        view["fields"] = json!(fields_asked_of(&graph, s));
+                        view
+                    })
+                    .collect(),
+            );
+        }
         _ => {}
     }
     Ok(reply)
-}
-
-fn item_answered(
-    graph: &Graph,
-    item: Uuid,
-    fields: &HashSet<Uuid>,
-    values: &HashSet<Uuid>,
-) -> bool {
-    graph
-        .out(item, EdgeRelation::VariantOf)
-        .iter()
-        .any(|t| fields.contains(t) || values.contains(t))
-}
-
-fn met(
-    graph: &Graph,
-    target: Uuid,
-    fields: &HashSet<Uuid>,
-    values: &HashSet<Uuid>,
-    forms: &HashSet<Uuid>,
-) -> bool {
-    match graph.get(target).map(type_of) {
-        Some(FORM) => forms.contains(&target),
-        Some(FORM_ITEM) => item_answered(graph, target, fields, values),
-        Some(FORM_SECTION) => {
-            // A section is filled when every item in it that asks for a field
-            // is answered; a section of attachments alone, when any item is.
-            let items = graph.items_in(target);
-            let asking: Vec<Uuid> = items
-                .iter()
-                .copied()
-                .filter(|item| {
-                    graph
-                        .get(*item)
-                        .and_then(|i| prop_text(i, "item_kind"))
-                        .is_some_and(|k| vocab::item_needs_field(&k))
-                })
-                .collect();
-            if asking.is_empty() {
-                items
-                    .iter()
-                    .any(|item| item_answered(graph, *item, fields, values))
-            } else {
-                asking
-                    .iter()
-                    .all(|item| item_answered(graph, *item, fields, values))
-            }
-        }
-        _ => true,
-    }
-}
-
-/// The items on the checked forms that ask for a field, as citations.
-fn asked_on(graph: &Graph, field: Uuid, forms: &HashSet<Uuid>) -> Vec<Value> {
-    graph
-        .items_of_field(field)
-        .into_iter()
-        .filter_map(|i| graph.get(i))
-        .filter(|i| graph.form_of(i).is_some_and(|f| forms.contains(&f.id)))
-        .map(usage)
-        .collect()
-}
-
-/// forms.check: a set of forms and answers against the forms' own rules.
-pub(crate) async fn check(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeError> {
-    let args = params::args(params)?;
-    let specs = params::string_list(&args, "forms")?;
-    if specs.is_empty() {
-        return Err(invalid("forms must name at least one form"));
-    }
-    let answers = params::object(&args, "answers")?
-        .cloned()
-        .unwrap_or_default();
-    let graph = Graph::load(ctx.runtime, ctx.token).await?;
-
-    let mut set: Vec<&Entity> = Vec::new();
-    for spec in &specs {
-        let form = graph.find_form(spec)?;
-        if !set.iter().any(|f| f.id == form.id) {
-            set.push(form);
-        }
-    }
-    let in_set: HashSet<Uuid> = set.iter().map(|f| f.id).collect();
-    let mut findings = Vec::new();
-
-    for (i, first) in set.iter().enumerate() {
-        for second in &set[i + 1..] {
-            if graph
-                .either(first.id, EdgeRelation::CompetesWith)
-                .contains(&second.id)
-            {
-                findings.push(json!({
-                    "kind": "competing_forms",
-                    "forms": [cite(first), cite(second)],
-                    "message": format!(
-                        "{} and {} are filed one or the other, never both",
-                        form_name(first),
-                        form_name(second)
-                    ),
-                }));
-            }
-        }
-    }
-    for form in &set {
-        for required in graph.out(form.id, EdgeRelation::DependsOn) {
-            if in_set.contains(&required) {
-                continue;
-            }
-            let Some(required) = graph.get(required).filter(|r| type_of(r) == FORM) else {
-                continue;
-            };
-            findings.push(json!({
-                "kind": "missing_prerequisite",
-                "form": cite(form),
-                "requires": cite(required),
-                "message": format!(
-                    "{} must be filed with {}, which is not in the set",
-                    form_name(form),
-                    form_name(required)
-                ),
-            }));
-        }
-    }
-
-    let mut answered: HashSet<Uuid> = HashSet::new();
-    let mut given: Vec<(Uuid, Uuid)> = Vec::new();
-    let mut unresolved = Vec::new();
-    for (key, raw) in &answers {
-        let field = match graph.find_field(key) {
-            Ok(field) if is_general(field) => {
-                let children: Vec<&Entity> = graph
-                    .children_of_field(field.id)
-                    .into_iter()
-                    .filter_map(|c| graph.get(c))
-                    .collect();
-                unresolved.push(json!({
-                    "answer": key,
-                    "reason": format!("\"{key}\" may mean {}; answer one of them", quoted_names(&children)),
-                }));
-                continue;
-            }
-            Ok(field) => field,
-            Err(error) => {
-                unresolved.push(json!({"answer": key, "reason": error.to_string()}));
-                continue;
-            }
-        };
-        let texts: Vec<String> = match raw {
-            Value::Array(list) => list.iter().filter_map(scalar).collect(),
-            other => scalar(other).into_iter().collect(),
-        };
-        if texts.is_empty() {
-            unresolved.push(
-                json!({"answer": key, "reason": "an answer is text, a number or a list of them"}),
-            );
-            continue;
-        }
-        // A choice field is answered only through a value it lists: an answer
-        // outside its values is reported below and holds no premise or item.
-        if prop_text(field, "value_type").as_deref() != Some("choice") {
-            answered.insert(field.id);
-            continue;
-        }
-        let values = graph.values_of_field(field.id);
-        for text in &texts {
-            let hit = values.iter().copied().find(|v| {
-                graph
-                    .get(*v)
-                    .is_some_and(|e| normalize(&e.name) == normalize(text))
-            });
-            match hit {
-                Some(value) => {
-                    answered.insert(field.id);
-                    given.push((field.id, value));
-                }
-                None => findings.push(json!({
-                    "kind": "value_outside_domain",
-                    "field": field.name,
-                    "answer": text,
-                    "allowed": names(&graph, &values),
-                    "asked_on": asked_on(&graph, field.id, &in_set),
-                    "message": format!("\"{text}\" is not one of the values of \"{}\"", field.name),
-                })),
-            }
-        }
-    }
-    for (i, (first_field, first)) in given.iter().enumerate() {
-        for (second_field, second) in &given[i + 1..] {
-            if !graph
-                .either(*first, EdgeRelation::CompetesWith)
-                .contains(second)
-            {
-                continue;
-            }
-            let first_name = graph
-                .get(*first)
-                .map(|e| e.name.clone())
-                .unwrap_or_default();
-            let second_name = graph
-                .get(*second)
-                .map(|e| e.name.clone())
-                .unwrap_or_default();
-            let mut cited = asked_on(&graph, *first_field, &in_set);
-            if second_field != first_field {
-                cited.extend(asked_on(&graph, *second_field, &in_set));
-            }
-            findings.push(json!({
-                "kind": "exclusive_values",
-                "values": [first_name, second_name],
-                "asked_on": cited,
-                "message": format!("\"{first_name}\" and \"{second_name}\" exclude each other"),
-            }));
-        }
-    }
-
-    let given_values: HashSet<Uuid> = given.iter().map(|(_, v)| *v).collect();
-    let mut unchecked = Vec::new();
-    for rule in graph.of_type(FORM_RULE) {
-        let Some(form) = graph.form_of(rule) else {
-            continue;
-        };
-        if !in_set.contains(&form.id) {
-            continue;
-        }
-        let pending = pending_premises(rule);
-        if !pending.is_empty() {
-            // Its bound premises are only part of the printed rule, so it is
-            // not evaluated until every premise names a field.
-            let mut waiting: Vec<String> = Vec::new();
-            for (wording, _) in pending {
-                if !waiting.contains(&wording) {
-                    waiting.push(wording);
-                }
-            }
-            let text = prop_text(rule, "text").unwrap_or_else(|| rule.name.clone());
-            unchecked.push(json!({
-                "rule": text,
-                "form": cite(form),
-                "page": prop(rule, "source_page"),
-                "pending": waiting,
-                "message": format!(
-                    "{} states \"{text}\"; it is not checked until {} is decided with forms.same or forms.split",
-                    form_name(form),
-                    waiting.iter().map(|w| format!("\"{w}\"")).collect::<Vec<_>>().join(", ")
-                ),
-            }));
-            continue;
-        }
-        let premises = graph.out(rule.id, EdgeRelation::DependsOn);
-        if premises.is_empty() {
-            continue;
-        }
-        let holds = premises.iter().all(|p| {
-            if graph.is(*p, FIELD_VALUE) {
-                given_values.contains(p)
-            } else {
-                answered.contains(p)
-            }
-        });
-        if !holds {
-            continue;
-        }
-        let unmet: Vec<&Entity> = graph
-            .out(rule.id, EdgeRelation::Enables)
-            .into_iter()
-            .filter(|c| !met(&graph, *c, &answered, &given_values, &in_set))
-            .filter_map(|c| graph.get(c))
-            .collect();
-        if unmet.is_empty() {
-            continue;
-        }
-        let text = prop_text(rule, "text").unwrap_or_else(|| rule.name.clone());
-        let page = prop(rule, "source_page")
-            .and_then(scalar)
-            .unwrap_or_default();
-        findings.push(json!({
-            "kind": "rule_unmet",
-            "rule": text,
-            "form": cite(form),
-            "page": prop(rule, "source_page"),
-            "unmet": unmet.iter().map(|c| json!({"id": c.id.to_string(), "type": type_of(c), "name": label(c)})).collect::<Vec<_>>(),
-            "message": format!(
-                "{} page {page} states \"{text}\"; it applies, and {} is not filled",
-                form_name(form),
-                unmet.iter().map(|c| format!("\"{}\"", label(c))).collect::<Vec<_>>().join(", ")
-            ),
-        }));
-    }
-
-    Ok(json!({
-        "forms": set.iter().map(|f| cite(f)).collect::<Vec<_>>(),
-        "consistent": findings.is_empty() && unresolved.is_empty() && unchecked.is_empty(),
-        "findings": findings,
-        "unresolved_answers": unresolved,
-        "rules_unchecked": unchecked,
-    }))
 }
 
 fn present(node: &Entity, key: &str) -> bool {
@@ -712,7 +551,9 @@ pub(crate) async fn lint(ctx: &Ctx<'_>, _params: Value) -> Result<Value, Runtime
             }
             let sourced = match entity_type {
                 FORM => present(node, "source_url") && present(node, "source_sha256"),
-                FORM_SECTION | FORM_ITEM | FORM_RULE => graph.form_of(node).is_some(),
+                FORM_SECTION | FORM_ITEM | FORM_RULE | FORM_SUBJECT => {
+                    graph.form_of(node).is_some()
+                }
                 FIELD => {
                     is_general(node)
                         || !graph.items_of_field(node.id).is_empty()

@@ -902,21 +902,20 @@ async fn a_choice_answer_outside_its_values_answers_nothing() {
             json!({"forms": [ACCT], "answers": {"account type": "corporate", "joint holder name": "Pat Doe"}}),
         )
         .await;
-    let mut found = kinds(&required);
-    found.sort();
+    // The joint holder line is asked only once an account type is given, so
+    // while the type is outside its values the joint holder's answer fills a
+    // line that is not asked and holds no premise of its own rule.
     assert_eq!(
-        found,
-        ["rule_unmet", "value_outside_domain"],
-        "an answer outside the values fills no required item: {required}"
+        kinds(&required),
+        ["value_outside_domain"],
+        "an answer outside the values brings no line into play: {required}"
     );
-    let unmet = required["findings"]
+    let not_asked = required["answers_not_asked"]
         .as_array()
-        .expect("findings")
-        .iter()
-        .find(|f| f["kind"] == "rule_unmet")
-        .expect("rule_unmet");
-    assert_eq!(unmet["rule"], JOINT_RULE, "{required}");
-    assert_eq!(unmet["unmet"][0]["name"], "Account type", "{required}");
+        .expect("answers_not_asked");
+    assert_eq!(not_asked.len(), 1, "{required}");
+    assert_eq!(not_asked[0]["field"], "joint holder name", "{required}");
+    assert_eq!(required["consistent"], false, "{required}");
 
     let within = store
         .call(
