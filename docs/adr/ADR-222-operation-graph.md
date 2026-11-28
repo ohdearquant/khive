@@ -798,9 +798,8 @@ the forms pack has not loaded in the namespace (`unknown_field`), as it refuses 
 (A1.1). A requirement's `value_type` must equal the field's (`value_type_mismatch`), because a
 second value type for one field would be a second source of truth for what the field holds. The
 check runs at `define`, and the published bytes keep the value type it passed with (section 2).
-`define` reads a field's value type through `forms.neighbourhood`, whose view of a field node gains
-`value_type`, one read per distinct field the document names; a field the forms pack does not hold
-is `unknown_field`.
+`define` reads a field's value type from the `field` part of `forms.neighbourhood`'s reply, one read
+per distinct field the document names; a field the forms pack does not hold is `unknown_field`.
 
 ### A2.3 Order derived from values
 
@@ -894,7 +893,7 @@ both lists. All three land with the A1.1 to A1.3 pull request.
 Item 3 lands as four pull requests, after ADR-221 Amendment 1:
 
 - 3a: forms, `known_as` on fields (A2.5) and the system mark of ADR-223.
-- 3b-1: operation at `define`, A2.1 to A2.3, with the field view's `value_type` in forms.
+- 3b-1: operation at `define`, A2.1 to A2.3.
 - 3b-2: operation at the frontier, A2.4 and A2.6, with A1.4's places and `stated_in_part`.
 - 3c: operation, the working type graph with section 2's canonical keys and section 7's names.
 
@@ -905,11 +904,13 @@ refusal arms of one section may be rows of one table test.
   the namespace holds (`unknown_step_type`); a pinned step that gives `by` (`pinned_step_shape`); a
   step type with no quantifier pinned on a repeating slot (`quantifier_missing`); an id and version
   published again with another digest (`version_conflict`), beside the same digest writing nothing;
-  one step type given twice in a document (`duplicate_type`).
+  one step type given twice in a document (`duplicate_type`); a pinned step type whose `by`, or a
+  slot one of its values is about, the pinning operation type does not declare (`unknown_slot`).
 - A2.2: a requirement naming a field the forms pack has not loaded (`unknown_field`), and one whose
   value type is not the field's (`value_type_mismatch`).
 - A2.3: a cycle through derived edges, refused as `derived_cycle` naming its steps; a supply whose
-  `as` the step does not require (`unknown_supply`); a supply whose `from` produces the field about
+  `from` is not a step of the type (`unknown_step`); a supply whose `as` the step does not require
+  (`unknown_supply`); a supply whose `from` produces the field about
   another slot (`supply_slot_mismatch`); a document with an `after` cycle and a derived cycle,
   refused as `after_cycle`.
 - A2.4: the #6893 fixture's `issue`, which waits on a value `sign` produces.
@@ -917,4 +918,6 @@ refusal arms of one section may be rows of one table test.
   `step_type` (`reserved_vocabulary`).
 - A2.6: an unknown place (`unknown_place`) and a place given twice (`duplicate_place`).
 - A2.8: `forms.terms` returns a term's alias and a carrying relation's `carries`; `forms.subjects`
-  reads a named revision and, with none named, the revision loaded last.
+  reads a named revision and, with none named, the revision loaded last. Refused by
+  `forms.subjects`: a form that is not loaded, a revision that is not loaded, and a revision named
+  both in `form` and in `revision`.
