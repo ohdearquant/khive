@@ -30,6 +30,10 @@ const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 100;
 /// How many fields a miss names as near.
 const NEAR: usize = 3;
+/// The similarity a semantic match needs when the caller names none. What a
+/// similarity means depends on the embedding model, so a caller that knows its
+/// model passes its own floor.
+const DEFAULT_MIN_SIMILARITY: f64 = 0.5;
 
 // Ranks. The exact rung: 0 a field's name, 1 its alias, 2 a value's name or a
 // form id, 3 a printed label, 4 a form title. Each weaker rung ranks below.
@@ -202,6 +206,16 @@ fn limit(args: &Args) -> Result<usize, RuntimeError> {
     }
 }
 
+fn min_similarity(args: &Args) -> Result<f64, RuntimeError> {
+    match args.get("min_similarity") {
+        None | Some(Value::Null) => Ok(DEFAULT_MIN_SIMILARITY),
+        Some(value) => value
+            .as_f64()
+            .filter(|n| *n > 0.0 && *n <= 1.0)
+            .ok_or_else(|| invalid("min_similarity must be a number above 0 and at most 1")),
+    }
+}
+
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
     let (mut dot, mut aa, mut bb) = (0.0_f64, 0.0_f64, 0.0_f64);
     for (x, y) in a.iter().zip(b) {
@@ -218,12 +232,14 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
 }
 
 /// The semantic rung: each field no lexical rung found, by the similarity of
-/// its nearest wording to the text under the configured embedding model.
-/// Returns what the reply says about the rung.
+/// its nearest wording to the text under the configured embedding model, when
+/// that similarity reaches `floor`. Every wording of every such field is
+/// embedded on each call. Returns what the reply says about the rung.
 async fn semantic(
     ctx: &Ctx<'_>,
     text: &str,
     fields: &[&Entity],
+    floor: f64,
     matches: &mut Matches<'_>,
 ) -> Result<Value, RuntimeError> {
     let model = ctx.runtime.default_embedder_name().to_owned();
@@ -240,7 +256,7 @@ async fn semantic(
         }
     }
     if owners.is_empty() {
-        return Ok(json!({"ran": true, "model": model}));
+        return Ok(json!({"ran": true, "model": model, "min_similarity": floor, "embedded": 0}));
     }
     let mut texts = vec![text.to_owned()];
     texts.extend(owners.iter().map(|(_, wording)| wording.clone()));
@@ -255,7 +271,7 @@ async fn semantic(
     let mut nearest: BTreeMap<Uuid, (&Entity, String, f64)> = BTreeMap::new();
     for ((field, wording), vector) in owners.into_iter().zip(&vectors[1..]) {
         let similarity = cosine(&vectors[0], vector);
-        if similarity <= 0.0 {
+        if similarity < floor {
             continue;
         }
         let closer = nearest
@@ -271,7 +287,12 @@ async fn semantic(
             Found::new(RANK_SEMANTIC, "semantic", Some(wording), Some(similarity)),
         );
     }
-    Ok(json!({"ran": true, "model": model}))
+    Ok(json!({
+        "ran": true,
+        "model": model,
+        "min_similarity": floor,
+        "embedded": texts.len(),
+    }))
 }
 
 /// The fields nearest a wording that matched nothing: most shared words
@@ -348,6 +369,7 @@ pub(crate) async fn resolve(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runti
         None => WORDS,
     };
     let limit = limit(&args)?;
+    let floor = min_similarity(&args)?;
     let folded = normalize(&text);
     if folded.is_empty() {
         return Err(invalid("text must contain a letter or a digit"));
@@ -468,7 +490,7 @@ pub(crate) async fn resolve(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runti
     }
 
     let semantic_rung = if last >= SEMANTIC && wants(FIELD) {
-        Some(semantic(ctx, &text, &fields, &mut matches).await?)
+        Some(semantic(ctx, &text, &fields, floor, &mut matches).await?)
     } else {
         None
     };
