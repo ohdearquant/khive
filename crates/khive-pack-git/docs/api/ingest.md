@@ -61,11 +61,81 @@ git history work remains outside this remote-command bound. Exact-budget
 passes retain the conservative
 `done=false` result; a subsequent pass proves completion.
 
+## Existing issue and pull-request annotations
+
+When a fresh, budgeted by-number lookup finds an existing issue or pull-request
+note, one additional point read checks for its live `annotates` edge to the
+project in the same namespace. A missing edge adds a warning naming the kind,
+number, note UUID and project UUID. This reports the observation without creating,
+restoring or changing an edge. The check revalidates the note's ID, namespace,
+kind, number, project and live state in the same read snapshot as the edge check.
+If that note no longer matches, or the read fails, a distinct annotation-check
+unavailable warning is emitted; storage details use the ingest secret masker.
+
+An exact checkpoint acknowledgment still skips the by-number lookup and consumes
+no fresh visit. When encountered by the existing traversal, it can now receive a
+point check of its saved note UUID. Eligibility comes from the validated checkpoint
+at invocation start: its `acknowledged(number, observed_updated_at)` must return
+that same UUID. A newly acknowledged observation is not eligible until a later
+invocation, including an initially undated record that acquires a timestamp during
+this pass. The check never resolves a replacement note by number. A deleted,
+changed or foreign saved note therefore reports unavailable evidence.
+
+Replay checks have a separate allowance of **128 attempted reads per source per
+invocation**: up to 128 issues and 128 PRs when both sources run. Each eligible
+`(number, note UUID)` is reserved before its read, including reads that fail or
+find an invalid saved note, and is attempted at most once. One state per source
+spans all fetched pages; at most 128 attempted identities and one exhaustion flag
+are retained. The initial eligibility snapshot retains the existing bounded
+checkpoint maps and their dated floor. The first additional eligible identity
+emits one exhaustion warning for that source; later such identities neither read
+nor add warnings. No skipped-identity collection, additional history fetch, or
+historical-note sweep is introduced. A new invocation starts a new allowance.
+
+`existing_project_annotation_warning_count` counts observed missing or unavailable
+checks from fresh lookup hits and eligible replay checks, across both sources.
+Only the first **20 corresponding detail strings**, in encounter order, are
+retained in `warnings`. The count continues after that cap and is always
+serialized, including zero. A count greater than the number of retained
+existing-note details means details were omitted; compare against this category's
+details, not the length of the heterogeneous `warnings` array. Successful live-edge
+checks contribute neither a detail nor a count. The separate once-per-source
+exhaustion warning is outside both the count and detail cap. Unrelated warnings
+remain unchanged, so the cap bounds these details, not every warning or the whole
+receipt size. The count is neither a unique-note count nor an estimate of
+uninspected annotations.
+
+The historical census remains separate: it inspects the lowest 1,000 live project
+issue/PR note IDs and displays at most 20 missing IDs. Fresh and replay diagnostics
+do not change its count, sample, completeness or scanned count. Notes outside the
+fetched window have only this bounded census coverage.
+
+Fresh point checks remain within the fresh-visit budget. Public `git.digest`
+defaults an omitted `max_items` to 500 and caps explicit values at 2,000; only an
+administrative `run_ingest` call with `max_items=None` has an unbounded fresh
+budget. Replay checks do not consume it. Skipped-existing counts, PR linking maps,
+checkpoint advancement, source status and completion semantics are unchanged.
+`done=true` and `history_exhausted=true` can coexist with missing or unavailable
+annotations or an exhausted replay allowance: remote traversal completion does
+not establish complete annotation reporting.
+
+The complete returned report, including the count, retained details and any
+exhaustion warning, is preserved in the new durable `git.digest` receipt. Replaying
+a digest observes current edges and creates a new report and receipt; reading an
+older receipt still returns its original result. Existing receipts are never
+rewritten to add the new field or reflect later graph changes.
+
 ## Secret-gate refusal accounting
 
-`run_ingest` keeps its established per-record fail-closed/continue behavior: a refused
-`create` does not land and freezes that section's cursor, while clean sibling records are
-still attempted. The result makes that partial outcome mechanically visible through
+`run_ingest` never stores a refused `create` payload. When the refusal is
+`SecretDetected`, it makes one redacted replacement attempt through the same
+gate. A valid replacement receipt allows cursor progress if no earlier record
+stalled the source. Any other unresolved create refusal, or a failed replacement,
+freezes that section's cursor while sibling records are still attempted. Commit
+key conflicts retain their existing reconciliation path: reusing a committed
+winner and completing its missing annotations also permits cursor progress.
+The result makes
+the refusal visible through
 `IngestReport::writes_refused` and `IngestReport::write_refusals`, in addition to the
 human-readable warning. Only `RuntimeError::SecretDetected` increments this counter;
 ordinary validation, storage, and embedding failures remain warnings but are not
@@ -76,6 +146,17 @@ natural key (commit SHA or GitHub number), plus `SecretMatch`'s detector and mas
 excerpt. It never includes the rejected content. Accounting is per ingest call rather
 than process-global daemon telemetry, so a caller can reliably assert
 `writes_refused == 0` even when other digests run concurrently.
+
+A commit replacement uses `REDACTED_COMMIT_MESSAGE` as its content and retains only
+the Git-generated `sha`, `short_sha`, `committed_at`, and `parents` properties.
+It omits `author`, `author_email`, and `changed_paths`: masking alone does not
+guarantee that encoded credentials in those fields will pass the gate. The
+SHA-derived key, project annotations, and parent-edge processing are preserved.
+Issue and pull-request replacements likewise retain their trusted structured
+metadata and replace caller text. The original structured refusal has
+`redacted: false` until a valid replacement receipt is received, then
+`redacted: true`; this is a report field, not a stored note property. A successful
+replacement does not remove or decrement the original refusal.
 
 ## Per-source tri-state and walk exhaustion (issue #1617)
 
@@ -193,6 +274,21 @@ scoped by kind + namespace + `project_id` since GitHub issue/PR numbers are
 repository-scoped — a bare `kind`+`number` filter would incorrectly collide
 two different repos' `#1`.
 
+Number lookups select the first live matching row by stored `id` in ascending
+binary order and read at most two candidates. Two returned rows emit one
+operational WARN, targeted at `khive_pack_git::ingest`, with `kind`, `namespace`,
+`project_id`, `number`, and `matched_at_least=2`. This is a lower bound, not an
+exact duplicate count. The warning contains no note content or properties and
+is not added to `IngestReport`. Each actual duplicate lookup may warn again;
+checkpoint or per-pass map hits that bypass the lookup do not emit it.
+
+The first row's ID is decoded as a UUID. A malformed first stored ID returns
+`None`, even if the second row has a valid UUID; the lookup neither skips nor
+repairs malformed rows. Zero matches return `None`, and one matching row emits
+no duplicate warning. The two-row limit bounds returned candidates, not the
+work SQLite may perform to order all matches. Commit-SHA lookup keeps its
+separate duplicate-refusal behavior.
+
 ## `find_document_for_path`
 
 Finds an existing `document` entity by exact `properties.source_uri`, then
@@ -248,7 +344,10 @@ are pruned to the currently fetched page. A cap overflow stops with a stalled
 cursor instead of silently dropping progress. Records acknowledged before an upstream
 edit are still governed by the existing append-only natural-key ingest behavior.
 
-Any per-record failure freezes the saved prefix. Neither later new nor existing
+Any unresolved per-record failure freezes the saved prefix. A successful redacted
+replacement or successful committed-winner reconciliation resolves its create
+refusal for this purpose; a failure that leaves the record unacknowledged does
+not. Neither later new nor existing
 records may advance it or be acknowledged beyond that failure. Publish this stall
 in the report before a fallible checkpoint write. The next pass retries the failed
 record; already-landed later records remain idempotent via natural-key dedupe.
@@ -336,6 +435,9 @@ and go through the typed `GitIngest` permanent mask-only surface backed by the s
 detector `content` already used —
 closing the gap where the commit note `name` (built from the raw subject)
 and its `author`/`author_email` properties skipped masking entirely.
+The create gate still checks the masked result. If it detects a secret, the one
+replacement attempt discards all caller-text properties as well as the original
+message, as described under [Secret-gate refusal accounting](#secret-gate-refusal-accounting).
 
 For `MaskedPrFields`: `number`, `created_at`, `merged_at`, `closed_at`, and
 `merge_commit`'s `oid` are GitHub-generated (not attacker-authored free
@@ -410,7 +512,8 @@ allowance are recomputed before every subsequent fetch.
 
 ## `ingest_prs` / `ingest_issues` cursor semantics
 
-`cursor_stalled` mirrors `ingest_commits`: once one record fails to create,
+`cursor_stalled` mirrors `ingest_commits`: once one record remains unwritten after
+its create and any permitted redacted replacement,
 later records in this pass are still attempted (so every failure surfaces
 in this pass's warnings), but `checkpoint.floor` no longer advances past the
 stall point — the next pass re-fetches from before the failure and retries
@@ -516,12 +619,16 @@ the pair away from the exact path facts that join against ADR-085 modules.
 A merge commit carries one canonical path set: its diff against the first
 parent. Paths that survive the canonical filter are secret-masked, sorted,
 and deduplicated before storage.
-The stored property has exactly three states: `[]` for a genuinely empty
+For commit notes stored without redaction, the property has exactly three states:
+`[]` for a genuinely empty
 commit — and only for one; the canonical remainder array when at least one
 touched path survives the filter; and an omitted `changed_paths` (the hook
 treats it as optional) when the raw touched set was non-empty but every
 path was filtered — the all-filtered third state, whose evidence is the
-run's `changed_paths_filtered_noncanonical` count and bounded warning. A
+run's `changed_paths_filtered_noncanonical` count and bounded warning. A redacted
+replacement always omits `changed_paths`, independently of that filter result;
+the omission does not increment the noncanonical-path counter or claim an empty
+commit. A
 malformed `--name-only` token
 stream fails the phase (retried on the next pass via the cursor contract),
 and a walked commit with no recorded path set is skipped with a warning and
@@ -532,8 +639,8 @@ newest-first, so a header lost mid-stream attaches its record's path tokens
 to that NEWER commit — the commit already walked in the same stream — never
 to an older one. The parser does not guess at path content; containment is
 per-record, not per-stream: the missing sha has no path-set entry, so the
-run warns and stalls the cursor, but the polluted newer commit is created as
-usual — the orphaned tokens ride into its `changed_paths`, and commit notes
+run warns and stalls the cursor, but the polluted newer commit is still attempted.
+If stored without redaction, the orphaned tokens ride into its `changed_paths`, and commit notes
 are immutable, so the pollution persists (a re-ingest skips the stored sha;
 repair requires deleting the note and re-ingesting). At a bounded command
 chunk boundary, a missing first header instead leaves an orphan token and
@@ -568,11 +675,11 @@ inflate the count, and the run's bounded warning names the first skipped
 paths (masked, truncated) so the count is actionable. There is no suffix match, inferred rename, entity
 creation, or arbitrary winner. A failure to load the module index degrades
 the pass to no module annotation with a warning instead of aborting it,
-because the annotation is best-effort enrichment while `changed_paths` is
-the durable fact. This makes module churn and repeated
+because the annotation is best-effort enrichment while an unredacted note's
+`changed_paths` is the durable fact. This makes module churn and repeated
 cross-project co-change derivable from incoming `annotates` graph reads while
 retaining `changed_paths` as a durable path fact when no matching code map
-exists.
+exists, except on redacted replacement notes, which omit it.
 
 Commit notes are keyed by SHA within a namespace, while commit checkpoints
 belong to individual projects. When a later project walks an already stored

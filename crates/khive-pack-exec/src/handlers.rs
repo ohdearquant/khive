@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::future::Future;
 use std::io::Read;
+use std::ops::Bound::{Included, Unbounded};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -31,10 +32,13 @@ use khive_storage::ContentRef;
 
 #[cfg(unix)]
 use crate::capture::{drain_until, walk, CaptureRead, CaptureRoot, DrainStop, Drained, Tail};
+use crate::changes;
+#[cfg(unix)]
+use crate::group_child::GroupChild;
 use crate::membership::{MembershipWork, SuppliedRefs};
 use crate::process_cleanup::{ProcessCleanup, TreeQuiescence};
 use crate::receipts;
-use crate::sandbox::{self, check_binary, render_profile, Resolved};
+use crate::sandbox::{self, check_binary, render_profile_for_tool, Resolved, ToolProfile};
 use crate::tree::{self, digest_hex, Change, TreeEntry};
 
 const MAX_RUN_INPUT_BYTES: u64 = 256 * 1024 * 1024;
@@ -114,6 +118,14 @@ fn edit_mode(edit: &Value, index: usize) -> Result<Option<u64>, RuntimeError> {
     }
 }
 
+/// The refusal for an edit under a directory another edit of the same call deletes recursively.
+fn under_recursive_delete(dir_index: usize, dir: &str, index: usize, path: &str) -> RuntimeError {
+    let (first, second) = (dir_index.min(index), dir_index.max(index));
+    RuntimeError::InvalidInput(format!(
+        "edits[{first}] and edits[{second}] overlap: edits[{dir_index}] deletes directory {dir:?} recursively and edits[{index}] names {path:?} under it; an edit under a recursively deleted directory is refused"
+    ))
+}
+
 /// Apply a list of edits to a tree and return the new tree. The tree is an immutable manifest
 /// blob, so this mints a new one and never mutates the input; a single-path edit is a list of one.
 ///
@@ -140,7 +152,13 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
                 .into(),
         ));
     }
-    let base = tree::load(rt, &tree_ref).await?;
+    // Refused here, before any write (Amendment 4 item 2).
+    let limit = changes::changed_limit(&params)?;
+    // An edit of a scoped tree is stored with the same scope (ADR-182 Amendment 24, item 3).
+    let tree::Tree {
+        entries: base,
+        scope,
+    } = tree::load_tree(rt, &tree_ref).await?;
     let mut entries: BTreeMap<String, (String, u64)> = base
         .iter()
         .map(|entry| {
@@ -152,6 +170,8 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
         .collect();
 
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    // Directories deleted recursively so far, by the index of the edit that deleted them.
+    let mut recursive_dirs: BTreeMap<String, usize> = BTreeMap::new();
     let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
     let mut supplied_refs: Vec<String> = Vec::new();
     for (index, edit) in edits.iter().enumerate() {
@@ -173,6 +193,16 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
             )));
         }
         seen.insert(path.clone(), index);
+        // An edit under a directory that another edit of this call deletes recursively is
+        // refused in either order, naming both, as duplicates are: otherwise the result would
+        // depend on the order of the list, and one of the two intents would vanish.
+        if let Some((dir, dir_index)) = path
+            .match_indices('/')
+            .map(|(at, _)| &path[..at])
+            .find_map(|dir| recursive_dirs.get(dir).map(|at| (dir.to_string(), *at)))
+        {
+            return Err(under_recursive_delete(dir_index, &dir, index, &path));
+        }
 
         let deleting = match edit.get("delete") {
             None | Some(Value::Null) => false,
@@ -180,6 +210,15 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
             Some(_) => {
                 return Err(RuntimeError::InvalidInput(format!(
                     "edits[{index}].delete must be a boolean"
+                )));
+            }
+        };
+        let recursive = match edit.get("recursive") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(recursive)) => *recursive,
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "edits[{index}].recursive must be a boolean"
                 )));
             }
         };
@@ -193,15 +232,64 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
                 "edits[{index}] names {named} of ref, content and delete; exactly one is required"
             )));
         }
+        if recursive && !deleting {
+            return Err(RuntimeError::InvalidInput(format!(
+                "edits[{index}] sets recursive on an edit that is not a delete; recursive applies only with delete: true"
+            )));
+        }
         if deleting {
             if edit.get("mode").is_some_and(|mode| !mode.is_null()) {
                 return Err(RuntimeError::InvalidInput(format!(
                     "edits[{index}] is a delete and cannot carry a mode"
                 )));
             }
+            // Matched by path component: `dir/` is the prefix, so `dir2` and `dir.txt` never
+            // fall under `dir`.
+            let prefix = format!("{path}/");
+            if recursive {
+                if let Some((under, under_index)) = seen
+                    .range::<str, _>((Included(prefix.as_str()), Unbounded))
+                    .next()
+                    .filter(|(under, _)| under.starts_with(&prefix))
+                {
+                    return Err(under_recursive_delete(index, &path, *under_index, under));
+                }
+                if entries.contains_key(&path) {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "edits[{index}] deletes {path:?} recursively, but the tree holds {path:?} as a file or link entry, not a directory; delete it without recursive"
+                    )));
+                }
+                // A link under the directory is removed as an entry: a tree stores a link as its
+                // target text, so nothing it names is read or touched.
+                let doomed: Vec<String> = entries
+                    .range::<str, _>((Included(prefix.as_str()), Unbounded))
+                    .map(|(entry, _)| entry)
+                    .take_while(|entry| entry.starts_with(&prefix))
+                    .cloned()
+                    .collect();
+                if doomed.is_empty() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "edits[{index}] deletes directory {path:?} recursively, but the tree holds no entry under it"
+                    )));
+                }
+                for entry in &doomed {
+                    entries.remove(entry);
+                }
+                recursive_dirs.insert(path, index);
+                continue;
+            }
             // A delete of a path the tree does not hold refuses rather than succeeding quietly,
             // because a silent no-op is how a caller comes to believe it removed something.
             if entries.remove(&path).is_none() {
+                let is_directory = entries
+                    .range::<str, _>((Included(prefix.as_str()), Unbounded))
+                    .next()
+                    .is_some_and(|(entry, _)| entry.starts_with(&prefix));
+                if is_directory {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "edits[{index}] deletes path {path:?}, which is a directory in the tree; set recursive: true to delete every entry under it"
+                    )));
+                }
                 return Err(RuntimeError::InvalidInput(format!(
                     "edits[{index}] deletes path {path:?}, which the tree does not hold"
                 )));
@@ -258,30 +346,54 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
             "blob store keys on a different digest"
         );
     }
-    let next_ref = tree::store(rt, &next).await?;
+    let next_ref = tree::store_tree(rt, &next, scope.as_deref()).await?;
     let changed: Vec<Value> = tree::diff(&base, &next)
         .iter()
         .map(Change::to_json)
         .collect();
-    Ok(json!({ "tree": next_ref, "base": tree_ref, "entries": next.len(), "changed": changed }))
+    // No receipt row keeps this list, so the blob is written whenever the list is not empty.
+    let changed_ref = changes::store_list(rt, &changed).await?;
+    let mut reply = json!({ "tree": next_ref, "base": tree_ref, "entries": next.len() });
+    // Present only on a scoped tree, so a whole tree's reply is unchanged.
+    if let Some(scope) = &scope {
+        reply["scope"] = json!(scope);
+    }
+    changes::bound_reply(&mut reply, &changed, changed_ref.as_deref(), limit);
+    Ok(reply)
 }
 
 pub async fn tree_get(rt: &KhiveRuntime, params: Value) -> Result<Value, RuntimeError> {
     let tree_ref = req_str(&params, "tree")?;
-    let entries = tree::load(rt, &tree_ref).await?;
-    Ok(json!({ "tree": tree_ref, "entries": tree::entries_json(&entries) }))
+    let loaded = tree::load_tree(rt, &tree_ref).await?;
+    let mut reply = json!({ "tree": tree_ref, "entries": tree::entries_json(&loaded.entries) });
+    if let Some(scope) = &loaded.scope {
+        reply["scope"] = json!(scope);
+    }
+    Ok(reply)
 }
 
 pub async fn tree_diff(rt: &KhiveRuntime, params: Value) -> Result<Value, RuntimeError> {
     let base_ref = req_str(&params, "base")?;
     let head_ref = req_str(&params, "head")?;
-    let base = tree::load(rt, &base_ref).await?;
-    let head = tree::load(rt, &head_ref).await?;
+    let limit = changes::changed_limit(&params)?;
+    // A diff reads both trees and writes neither, so a scoped tree compares like a whole one.
+    let base = tree::load_tree(rt, &base_ref).await?.entries;
+    let head = tree::load_tree(rt, &head_ref).await?.entries;
     let changed: Vec<Value> = tree::diff(&base, &head)
         .iter()
         .map(Change::to_json)
         .collect();
-    Ok(json!({ "base": base_ref, "head": head_ref, "changed": changed }))
+    // The list can be computed again from the two trees, so the blob is written only when the
+    // reply cuts the list.
+    let cut = changes::prefix(&changed, limit, changes::CHANGED_BYTE_BOUND);
+    let changed_ref = if cut.kept < changed.len() {
+        changes::store_list(rt, &changed).await?
+    } else {
+        None
+    };
+    let mut reply = json!({ "base": base_ref, "head": head_ref });
+    changes::bound_reply(&mut reply, &changed, changed_ref.as_deref(), limit);
+    Ok(reply)
 }
 
 // ── receipts ─────────────────────────────────────────────────────────────────
@@ -292,7 +404,11 @@ pub async fn receipt(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let id = req_str(&params, "id")?;
-    receipts::get(rt, token.namespace().as_str(), &id).await
+    let limit = changes::changed_limit(&params)?;
+    let mut value = receipts::get(rt, token.namespace().as_str(), &id).await?;
+    let mut budget = changes::CHANGED_BYTE_BOUND;
+    changes::bound_stored(&mut value, limit, &mut budget);
+    Ok(value)
 }
 
 pub async fn runs(
@@ -304,7 +420,8 @@ pub async fn runs(
     let tool = opt_str(&params, "tool")?;
     let session_id = opt_str(&params, "session_id")?;
     let limit = opt_limit(&params, "limit", 20, 500)?;
-    let rows = receipts::list(
+    let changed_limit = changes::changed_limit(&params)?;
+    let mut rows = receipts::list(
         rt,
         token.namespace().as_str(),
         &actor,
@@ -313,6 +430,12 @@ pub async fn runs(
         limit,
     )
     .await?;
+    // One byte bound across the whole reply, spent in the reply's order; changed_limit
+    // applies to each row.
+    let mut budget = changes::CHANGED_BYTE_BOUND;
+    for row in &mut rows {
+        changes::bound_stored(row, changed_limit, &mut budget);
+    }
     Ok(json!({ "runs": rows, "count": rows.len() }))
 }
 
@@ -328,6 +451,7 @@ pub async fn events(
 }
 
 pub fn identity(cfg: &Resolved) -> Value {
+    let cache_roots = sandbox::current_cache_roots(&cfg.cache_roots);
     let roots: Vec<String> = cfg
         .read_roots
         .iter()
@@ -338,8 +462,12 @@ pub fn identity(cfg: &Resolved) -> Value {
         "read_roots": roots,
         "read_roots_serialization": "compact JSON array of the sorted canonical read roots; digest = BLAKE3 hex",
         "read_roots_digest": sandbox::read_roots_digest(&cfg.read_roots),
+        "cache_roots": cache_roots.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+        "cache_roots_digest": sandbox::cache_roots_digest(&cache_roots),
+        "tool_profiles": cfg.tool_profiles.iter().map(sandbox::tool_profile_json).collect::<Vec<_>>(),
         "profile_template_digest": sandbox::template_digest(),
         "system_read_roots": sandbox::SYSTEM_READ_ROOTS,
+        "system_root_links": sandbox::SYSTEM_ROOT_LINKS,
         "env_keys": cfg.env_keys,
         "never": cfg.never.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
         "max_output_bytes": cfg.max_output_bytes,
@@ -393,6 +521,9 @@ struct Receipt {
     skipped: Vec<String>,
     cwd: String,
     env_keys: Vec<String>,
+    // Caller keys whose value did not reach the child as given: not
+    // allow-listed, or HOME or TMPDIR, which the server always replaces.
+    env_dropped: Vec<String>,
     session_id: Option<String>,
     seq: Option<i64>,
     sandbox: Option<Value>,
@@ -455,6 +586,9 @@ impl Receipt {
                 _ => None,
             },
         });
+        // Set outside the literal above: one more key there passes the macro's
+        // recursion limit.
+        value["env_dropped"] = json!(self.env_dropped);
         if self.refusal_code != "exec_refused" {
             value["refusal"] = json!({
                 "code": self.refusal_code,
@@ -484,6 +618,7 @@ struct Request {
     timeout: Duration,
     session_id: Option<String>,
     declared: Option<Vec<String>>,
+    changed_limit: usize,
 }
 
 fn parse_request(params: &Value, cfg: &Resolved) -> Result<Request, RuntimeError> {
@@ -533,6 +668,7 @@ fn parse_request(params: &Value, cfg: &Resolved) -> Result<Request, RuntimeError
             tree::validate_relative_path(p, "declared_write_paths")?;
         }
     }
+    let changed_limit = changes::changed_limit(params)?;
     Ok(Request {
         tree_in,
         tool,
@@ -543,6 +679,7 @@ fn parse_request(params: &Value, cfg: &Resolved) -> Result<Request, RuntimeError
         timeout,
         session_id,
         declared,
+        changed_limit,
     })
 }
 
@@ -869,6 +1006,7 @@ pub async fn run(
         skipped: vec![],
         cwd: req.cwd.clone(),
         env_keys: vec![],
+        env_dropped: vec![],
         session_id: req.session_id.clone(),
         seq: None,
         sandbox: None,
@@ -904,19 +1042,48 @@ pub async fn run(
                     finish_cleanup(&mut receipt, &run_dir, &profile_path, false);
                 }
             }
+            // The full list goes to a blob before the row is written, so the row can name it and
+            // exec.receipt and exec.runs read the reference without writing. A failed write
+            // fails the run, as a failed output capture does: the receipt still lands, with the
+            // full list, and says why.
+            let full: Vec<Value> = receipt.changed.iter().map(Change::to_json).collect();
+            let changed_ref = match changes::store_list(rt, &full).await {
+                Ok(changed_ref) => changed_ref,
+                Err(error) => {
+                    append_failure_reason(
+                        &mut receipt,
+                        format!("the change list could not be written to the blob store: {error}"),
+                    );
+                    None
+                }
+            };
             let mut value = receipt.to_json();
+            value["changed_count"] = json!(full.len());
+            value["changed_ref"] = json!(changed_ref);
             let seq = receipts::insert(rt, &ns, &value).await?;
             value["seq"] = seq.map_or(Value::Null, Value::from);
-            Ok(json!({
-                "receipt": value,
-                "changed": receipt.changed.iter().map(Change::to_json).collect::<Vec<_>>(),
-            }))
+            // The reply carries the list twice, at the top level and inside the receipt, and
+            // both are the same bounded list with the same three fields.
+            changes::bound_reply(&mut value, &full, changed_ref.as_deref(), req.changed_limit);
+            let mut reply = json!({});
+            for key in [
+                "changed",
+                "changed_count",
+                "changed_truncated",
+                "changed_ref",
+            ] {
+                reply[key] = value[key].clone();
+            }
+            reply["receipt"] = value;
+            Ok(reply)
         }
         Err(reason) => {
             receipt.denied = true;
             receipt.success = false;
             receipt.reason = Some(reason.clone());
-            let value = receipt.to_json();
+            let mut value = receipt.to_json();
+            value["changed_count"] = json!(0);
+            value["changed_ref"] = Value::Null;
             receipts::insert(rt, &ns, &value).await?;
             Err(refusal_error(&reason, &receipt))
         }
@@ -928,7 +1095,11 @@ struct Ready {
     binary_digest: String,
     registered: String,
     registry_id: Uuid,
+    /// The operator's additions for this tool, when the run earned them.
+    tool_profile: Option<ToolProfile>,
     entries: Vec<TreeEntry>,
+    /// The input tree's scope, which `tree_out` keeps (ADR-182 Amendment 24, item 3).
+    scope: Option<Vec<String>>,
     input_sizes: BTreeMap<String, u64>,
 }
 
@@ -1053,6 +1224,12 @@ async fn preflight(
             req.actor, entity.name, decision.decision, decision.source
         ));
     }
+    let tool_profile = honoured_tool_profile(
+        cfg,
+        &entity.name,
+        &decision.source,
+        token.actor().is_anonymous(),
+    )?;
     let maximum_digest_timeout = khive_runtime::engine_config::MAX_EXEC_BINARY_DIGEST_TIMEOUT_S;
     if !(1..=maximum_digest_timeout).contains(&cfg.binary_digest_timeout_s) {
         return Err(format!(
@@ -1095,7 +1272,7 @@ async fn preflight(
         }
     };
     // Tree and cwd.
-    let entries = tree::load(rt, &req.tree_in)
+    let tree::Tree { entries, scope } = tree::load_tree(rt, &req.tree_in)
         .await
         .map_err(|e| format!("tree: {e}"))?;
     let input_sizes = preflight_input_sizes(rt, &entries).await?;
@@ -1111,9 +1288,43 @@ async fn preflight(
         binary_digest,
         registered,
         registry_id: entity.id,
+        tool_profile,
         entries,
+        scope,
         input_sizes,
     })
+}
+
+/// The tool profile a run gets, or the reason it is refused. A tool with no
+/// configured profile gets none. A configured profile is a wider sandbox, so
+/// it is given only to a run a grant allowed for a named caller, and a run
+/// that would not get it is refused rather than run without it: the tool
+/// would fail later for a reason that reads as its own.
+fn honoured_tool_profile(
+    cfg: &Resolved,
+    tool: &str,
+    decision_source: &str,
+    anonymous: bool,
+) -> Result<Option<ToolProfile>, String> {
+    let Some(profile) = sandbox::tool_profile_for(&cfg.tool_profiles, tool) else {
+        return Ok(None);
+    };
+    if decision_source != "grant" {
+        return Err(format!(
+            "tool_profile_unhonoured: tool {tool:?} has a sandbox profile on this host, which a run gets only when a grant allows it; this run was allowed by {decision_source}"
+        ));
+    }
+    if anonymous {
+        return Err(format!(
+            "tool_profile_unhonoured: tool {tool:?} has a sandbox profile on this host, which an anonymous caller does not get"
+        ));
+    }
+    if profile.metal && profile.metal_cache.is_none() {
+        return Err(format!(
+            "tool_profile_unhonoured: tool {tool:?} is configured for Metal and this host did not name the user's cache folder"
+        ));
+    }
+    Ok(Some(profile.clone()))
 }
 
 #[cfg(unix)]
@@ -1427,6 +1638,17 @@ async fn execute(
     let root = std::fs::canonicalize(&cfg.root).map_err(|e| {
         RuntimeError::Unconfigured(format!("exec root {}: {e}", cfg.root.display()))
     })?;
+    // The cache roots in the form this check resolves now, not the form they
+    // had when the configuration was loaded: the profile grants these and the
+    // receipt's digest names them, so a cache root created after load, whose
+    // configured text is not its canonical path, is writable under that path.
+    let cache_roots = sandbox::resolve_cache_roots(&root, &cfg.read_roots, &cfg.cache_roots)
+        .map_err(RuntimeError::Unconfigured)?;
+    if let Some(conflict) =
+        sandbox::tool_profile_conflict(&root, &cfg.read_roots, &cache_roots, &cfg.tool_profiles)
+    {
+        return Err(RuntimeError::Unconfigured(conflict));
+    }
     let run_dir = root.join(&receipt.id);
     if let Err(error) = materialize_hydrated(rt, &run_dir, &ready.entries, &ready.input_sizes).await
     {
@@ -1437,6 +1659,22 @@ async fn execute(
         return Ok(());
     }
     receipt.owned_run_dir = Some(run_dir.clone());
+    // The run's own temporary directory (ADR-181 Amendment 16): beside the run
+    // directory, so nothing in it is captured, private to this run, and
+    // removed with it by `cleanup`, which derives the same path.
+    let scratch = sandbox::scratch_dir(&run_dir);
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&scratch)
+            .map_err(|e| {
+                RuntimeError::Unconfigured(format!(
+                    "run temporary directory {}: {e}",
+                    scratch.display()
+                ))
+            })?;
+    }
     let capture_root = CaptureRoot::open(&run_dir).map_err(|error| {
         RuntimeError::Unconfigured(format!("open capture root {}: {error}", run_dir.display()))
     })?;
@@ -1454,7 +1692,13 @@ async fn execute(
 
     // Profile: rendered per run, stored as a blob, written beside the run
     // directory for sandbox-exec to read, removed with it.
-    let profile = render_profile(&run_dir, &cfg.read_roots, &cfg.never);
+    let profile = render_profile_for_tool(
+        &run_dir,
+        &cfg.read_roots,
+        &cache_roots,
+        &cfg.never,
+        ready.tool_profile.as_ref(),
+    );
     let profile_ref = store.put(profile.clone().into_bytes()).await?;
     let profile_path = root.join(format!("{}.sb", receipt.id));
     std::fs::write(&profile_path, &profile).map_err(|e| {
@@ -1466,18 +1710,28 @@ async fn execute(
         "tool_source": format!("exec:{}", ready.registered),
         "tool_registry_id": ready.registry_id.to_string(),
         "read_roots_digest": sandbox::read_roots_digest(&cfg.read_roots),
+        "cache_roots_digest": sandbox::cache_roots_digest(&cache_roots),
+        "tool_profile": ready.tool_profile.as_ref().map(sandbox::tool_profile_json),
     }));
     receipt.profile_ref = Some(profile_ref.as_str().to_string());
 
-    // Environment: caller values for allow-listed keys only, plus HOME.
+    // Environment: caller values for allow-listed keys only, plus HOME and
+    // TMPDIR. A caller key that does not pass, and a caller HOME or TMPDIR
+    // (always replaced), is named on the receipt so the drop is visible to the
+    // caller. TMPDIR is the run's own directory, never one runs share.
     let mut env: BTreeMap<String, String> = BTreeMap::new();
+    let mut env_dropped: Vec<String> = Vec::new();
     for (k, v) in &req.env {
-        if cfg.env_keys.iter().any(|allowed| allowed == k) {
+        if k != "HOME" && k != "TMPDIR" && cfg.env_keys.iter().any(|allowed| allowed == k) {
             env.insert(k.clone(), v.clone());
+        } else {
+            env_dropped.push(k.clone());
         }
     }
     env.insert("HOME".into(), run_dir.to_string_lossy().to_string());
+    env.insert("TMPDIR".into(), scratch.to_string_lossy().to_string());
     receipt.env_keys = env.keys().cloned().collect();
+    receipt.env_dropped = env_dropped;
 
     let work_dir = if receipt.cwd == "." {
         run_dir.clone()
@@ -1495,8 +1749,7 @@ async fn execute(
         .current_dir(&work_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
     let prepared_limits = PreparedLimits::new(&cfg.limits);
     let (limit_reader, limit_writer) = limit_pipe()?;
     // SAFETY: the forked child uses fixed-size stack storage and only calls
@@ -1526,7 +1779,7 @@ async fn execute(
     let started = Instant::now();
     let wall_started = tokio::time::Instant::now();
     receipt.started_at = Some(receipts::now_micros());
-    let spawn = command.spawn();
+    let spawn = GroupChild::spawn(&mut command);
     // Parent side of the pipe: close the writer, read the child's report.
     unsafe {
         libc::close(limit_writer);
@@ -1544,7 +1797,7 @@ async fn execute(
         }
     };
     let report_wait = req.timeout.min(Duration::from_secs(1));
-    let pid = child.id().unwrap_or_default() as i32;
+    let pid = child.id() as i32;
     receipt.pids = Some(json!({ "child": pid, "pgid": pid }));
     if let Err(error) = receipts::event(
         rt,
@@ -1558,8 +1811,8 @@ async fn execute(
         append_failure_reason(receipt, format!("launched event write failed: {error}"));
     }
 
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
+    let stdout = child.take_stdout().expect("stdout piped");
+    let stderr = child.take_stderr().expect("stderr piped");
     let cap = cfg.max_output_bytes;
     let deadline = wall_started + req.timeout;
     let out_task = tokio::spawn(async move { drain_until(stdout, cap, deadline).await });
@@ -1569,34 +1822,38 @@ async fn execute(
         wall_started,
         req.timeout,
         collect_limit_report(limit_reader, report_wait),
-        child.wait(),
+        child.wait_unreaped(),
     )
     .await;
     receipt.limits = json!({ "requested": cfg.limits.to_json(), "enforced": enforced });
-    let status = match waited {
-        Ok(Ok(status)) => {
-            use std::os::unix::process::ExitStatusExt;
-            // Only the delivered signal for a configured limit is observable
-            // here. ENOMEM/EAGAIN inside a child and generic SIGKILL are not
-            // resource evidence; timeout keeps the initial explicit null.
-            receipt.limiting_resource = match status.signal() {
-                Some(libc::SIGXCPU) if cfg.limits.cpu_seconds.is_some() => Some("cpu_seconds"),
-                Some(libc::SIGXFSZ) if cfg.limits.file_size.is_some() => Some("file_size"),
-                _ => None,
-            };
-            Some(status)
+    let observed_exit = match waited {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            append_failure_reason(receipt, format!("child exit observation failed: {error}"));
+            false
         }
-        Ok(Err(_)) => None,
         Err(_) => {
             receipt.timed_out = true;
-            kill_group(pid);
-            let _ = child.wait().await;
-            None
+            false
         }
     };
-    // Signal any remaining members of the initial group. A descendant that
-    // called setsid is outside this group and can outlive the run.
-    kill_group(pid);
+    let finished = child.finish().await;
+    let (status, cleanup_error) =
+        finished_child_outcome(observed_exit, finished, child.exit_status());
+    if let Some(error) = cleanup_error {
+        append_failure_reason(receipt, format!("process group cleanup failed: {error}"));
+    }
+    if let Some(status) = status {
+        use std::os::unix::process::ExitStatusExt;
+        // Only the delivered signal for a configured limit is observable
+        // here. ENOMEM/EAGAIN inside a child and generic SIGKILL are not
+        // resource evidence; timeout keeps the initial explicit null.
+        receipt.limiting_resource = match status.signal() {
+            Some(libc::SIGXCPU) if cfg.limits.cpu_seconds.is_some() => Some("cpu_seconds"),
+            Some(libc::SIGXFSZ) if cfg.limits.file_size.is_some() => Some("file_size"),
+            _ => None,
+        };
+    }
     let out = collect_stream(out_task, deadline, cap).await;
     let err = collect_stream(err_task, deadline, cap).await;
     if out.stop == DrainStop::Deadline || err.stop == DrainStop::Deadline {
@@ -1781,7 +2038,7 @@ async fn execute(
         changes.sort_by(|a, b| a.path.cmp(&b.path));
         receipt.changed = changes;
         receipt.undeclared = undeclared.into_iter().collect();
-        receipt.tree_out = Some(tree::store(rt, &out_entries).await?);
+        receipt.tree_out = Some(tree::store_tree(rt, &out_entries, ready.scope.as_deref()).await?);
         receipt.success = !receipt.timed_out
             && receipt.exit_code == Some(0)
             && receipt.undeclared.is_empty()
@@ -1835,6 +2092,17 @@ fn cleanup(run_dir: &Path, profile_path: &Path, keep: bool) -> Vec<String> {
             ));
         }
     }
+    // The run's temporary directory holds no output, so it goes even when the
+    // run directory is kept.
+    let scratch = sandbox::scratch_dir(run_dir);
+    if let Err(error) = std::fs::remove_dir_all(&scratch) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            failures.push(format!(
+                "remove run temporary directory {}: {error}",
+                scratch.display()
+            ));
+        }
+    }
     if !keep {
         if let Err(error) = std::fs::remove_dir_all(run_dir) {
             if error.kind() != std::io::ErrorKind::NotFound {
@@ -1853,11 +2121,6 @@ fn finish_cleanup(receipt: &mut Receipt, run_dir: &Path, profile_path: &Path, ke
     for failure in cleanup(run_dir, profile_path, keep) {
         append_failure_reason(receipt, format!("exec cleanup failed: {failure}"));
     }
-}
-
-#[cfg(unix)]
-fn kill_group(pid: i32) {
-    let _ = khive_runtime::process_group::signal_process_group(pid, libc::SIGKILL);
 }
 
 #[cfg(unix)]
@@ -1992,6 +2255,19 @@ fn read_limit_report(reader: libc::c_int, wait: Duration) -> Value {
     }
 }
 
+#[cfg(unix)]
+fn finished_child_outcome(
+    observed_exit: bool,
+    finished: std::io::Result<std::process::ExitStatus>,
+    reaped_status: Option<std::process::ExitStatus>,
+) -> (Option<std::process::ExitStatus>, Option<std::io::Error>) {
+    let (status, error) = match finished {
+        Ok(status) => (Some(status), None),
+        Err(error) => (reaped_status, Some(error)),
+    };
+    (if observed_exit { status } else { None }, error)
+}
+
 #[cfg(test)]
 #[path = "parameter_helpers_tests.rs"]
 mod parameter_helpers_tests;
@@ -1999,6 +2275,47 @@ mod parameter_helpers_tests;
 #[cfg(test)]
 #[path = "process_cleanup_tests.rs"]
 mod process_cleanup_tests;
+
+#[cfg(all(test, unix))]
+mod finish_outcome_tests {
+    use super::finished_child_outcome;
+    use std::io;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    #[test]
+    fn cleanup_error_preserves_observed_status_without_exposing_timeout_status() {
+        for observed_exit in [true, false] {
+            let (status, error) = finished_child_outcome(
+                observed_exit,
+                Err(io::Error::from_raw_os_error(libc::EIO)),
+                Some(ExitStatus::from_raw(23 << 8)),
+            );
+            assert_eq!(
+                status.and_then(|status| status.code()),
+                observed_exit.then_some(23),
+                "cleanup failure must retain observed status and keep timeout status private"
+            );
+            assert_eq!(
+                error
+                    .expect("cleanup failure must remain visible")
+                    .raw_os_error(),
+                Some(libc::EIO)
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_failure_without_reaped_status_stays_unknown() {
+        let (status, error) =
+            finished_child_outcome(true, Err(io::Error::from_raw_os_error(libc::EPERM)), None);
+        assert!(
+            status.is_none(),
+            "failed cleanup must not invent exit status"
+        );
+        assert_eq!(error.unwrap().raw_os_error(), Some(libc::EPERM));
+    }
+}
 
 #[cfg(all(test, unix))]
 #[path = "grant_pin_tests.rs"]
@@ -2011,3 +2328,33 @@ mod capture_run_tests;
 #[cfg(all(test, unix))]
 #[path = "handlers/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod identity_cache_roots_tests {
+    use super::*;
+    use khive_runtime::engine_config::ExecSectionConfig;
+
+    #[test]
+    fn identity_carries_the_cache_roots_digest_and_it_follows_the_configuration() {
+        let none = identity(&sandbox::resolve(&ExecSectionConfig::default()));
+        assert_eq!(none["cache_roots"], json!([]));
+        assert_eq!(
+            none["cache_roots_digest"],
+            json!(sandbox::cache_roots_digest(&[])),
+            "no cache root reports the empty list's digest"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = std::fs::canonicalize(dir.path()).unwrap();
+        let one = identity(&sandbox::resolve(&ExecSectionConfig {
+            cache_roots: vec![cache.to_string_lossy().into_owned()],
+            ..Default::default()
+        }));
+        assert_eq!(one["cache_roots"], json!([cache.to_string_lossy()]));
+        assert_eq!(
+            one["cache_roots_digest"],
+            json!(sandbox::cache_roots_digest(std::slice::from_ref(&cache)))
+        );
+        assert_ne!(one["cache_roots_digest"], none["cache_roots_digest"]);
+    }
+}

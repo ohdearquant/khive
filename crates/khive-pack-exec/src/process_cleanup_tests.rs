@@ -46,6 +46,7 @@ fn collected_receipt() -> Receipt {
         skipped: vec![],
         cwd: ".".into(),
         env_keys: vec!["HOME".into()],
+        env_dropped: vec![],
         session_id: None,
         seq: None,
         sandbox: None,

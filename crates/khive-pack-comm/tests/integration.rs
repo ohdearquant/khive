@@ -14,6 +14,9 @@ use khive_types::{Pack, Visibility};
 #[path = "../../test_support/timing.rs"]
 mod timing;
 
+#[path = "integration/quiet_tests.rs"]
+mod quiet_tests;
+
 const LONG_POLL_TIMING_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const LONG_POLL_TIMING_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -138,17 +141,30 @@ async fn pack_registered_message_notes_are_queryable_through_gql() {
 }
 
 #[test]
-fn comm_pack_declares_twenty_handlers() {
+fn comm_pack_declares_twenty_one_handlers() {
     assert_eq!(
         CommPack::HANDLERS.len(),
-        20,
-        "comm pack must declare 20 handlers: send, delivered, transport_status, inbox, read, \
+        21,
+        "comm pack must declare 21 handlers: send, delivered, transport_status, inbox, read, \
          mark_read, unread, reply, \
-         thread, ingest, cleanup_expired_quarantine, heartbeat, health, probe, cursor_get, cursor_commit, \
+         thread, ingest, cleanup_expired_quarantine, heartbeat, health, quiet, probe, cursor_get, cursor_commit, \
          suppression_add, suppression_list, suppression_remove, withheld_body \
          (khive #1387, #1447, #449, #66)"
     );
     let names: Vec<&str> = CommPack::HANDLERS.iter().map(|h| h.name).collect();
+    assert_eq!(
+        CommPack::HANDLERS
+            .iter()
+            .filter(|handler| handler.visibility == Visibility::Verb)
+            .count(),
+        16
+    );
+    let quiet = CommPack::HANDLERS
+        .iter()
+        .find(|handler| handler.name == "comm.quiet")
+        .unwrap();
+    assert_eq!(quiet.visibility, Visibility::Verb);
+    assert_eq!(quiet.category, khive_types::VerbCategory::Directive);
     assert!(names.contains(&"comm.send"));
     assert!(
         names.contains(&"comm.delivered"),

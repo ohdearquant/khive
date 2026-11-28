@@ -1,5 +1,6 @@
 use super::*;
 use crate::backend::StorageBackend;
+use crate::migrations::ENTITY_ALIASES_DDL;
 use rusqlite::{Connection, StatementStatus};
 use std::time::Duration;
 
@@ -10,7 +11,8 @@ const INDEXES: [&str; 2] = [
 
 fn fixture(rows: usize) -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(ENTITIES_DDL).unwrap();
+    conn.execute_batch(&format!("{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}"))
+        .unwrap();
     conn.execute_batch(include_str!("../../sql/021-attachments-a-stage.sql"))
         .unwrap();
     for i in 1..=rows {
@@ -332,7 +334,7 @@ fn candidates_cursor_and_id_plans_keep_their_existing_sources() {
         );
         assert!(rows
             .windows(2)
-            .all(|pair| matches!((&pair[0][15], &pair[1][15]), (rusqlite::types::Value::Integer(a), rusqlite::types::Value::Integer(b)) if a < b)));
+            .all(|pair| matches!((&pair[0][16], &pair[1][16]), (rusqlite::types::Value::Integer(a), rusqlite::types::Value::Integer(b)) if a < b)));
         if !filter.ids.is_empty() {
             for sql in [
                 sql,
@@ -351,6 +353,140 @@ fn candidates_cursor_and_id_plans_keep_their_existing_sources() {
                     "explicit ID lookup must remain primary-key pinned"
                 );
             }
+        }
+    }
+}
+
+/// Resolve's name-or-alias lookup (ADR-221 section 2) seeks the name index
+/// and the alias index, so its work does not grow with the namespace.
+#[test]
+fn name_or_alias_lookup_seeks_the_name_and_alias_indexes() {
+    const ID_LIST: &str = "id IN (SELECT named.id FROM entities AS named ";
+    const ALIAS_EQ: &str = "entity_alias.alias = ";
+    const LIST_END: &str = " COLLATE BINARY)";
+
+    // The red control: the same statement with the name test and an alias
+    // subquery tied to the outer row, read without the primary-key pin.
+    fn correlated(sql: &str) -> String {
+        let start = sql.find(ID_LIST).expect("the id list");
+        let param = start + sql[start..].find(ALIAS_EQ).expect("the alias term") + ALIAS_EQ.len();
+        let param_end = param + sql[param..].find(' ').expect("the alias parameter");
+        let end =
+            param_end + sql[param_end..].find(LIST_END).expect("the list end") + LIST_END.len();
+        let param = &sql[param..param_end];
+        unforced(&format!(
+            "{}(name = {param} COLLATE BINARY OR EXISTS (SELECT 1 FROM entity_aliases AS entity_alias \
+             WHERE entity_alias.namespace = entities.namespace \
+             AND entity_alias.entity_id = entities.id \
+             AND entity_alias.alias = {param} COLLATE BINARY)){}",
+            &sql[..start],
+            &sql[end..]
+        ))
+    }
+
+    fn seeks(plan: &[String]) -> bool {
+        plan.iter()
+            .any(|line| line.contains("sqlite_autoindex_entities_1 (id=?)"))
+            && plan.iter().any(|line| line.contains("idx_entities_name ("))
+            && plan
+                .iter()
+                .any(|line| line.contains("idx_entity_aliases_alias ("))
+            && !plan.iter().any(|line| {
+                line.contains("idx_entities_live_namespace_order")
+                    || line.starts_with("SCAN entities")
+            })
+    }
+
+    fn add_alias(conn: &Connection, namespace: &str, entity: u128, alias: &str) {
+        conn.execute(
+            "INSERT INTO entity_aliases(namespace,entity_id,alias,origin,created_at) VALUES(?1,?2,?3,'caller',1)",
+            rusqlite::params![namespace, Uuid::from_u128(entity).to_string(), alias],
+        )
+        .unwrap();
+    }
+
+    let lookup = |namespaces: &[&str], kinds: &[&str]| EntityFilter {
+        name_or_alias_exact: Some("Name5".into()),
+        namespaces: namespaces.iter().map(|n| n.to_string()).collect(),
+        kinds: kinds.iter().map(|k| k.to_string()).collect(),
+        ..Default::default()
+    };
+    for analyzed in [false, true] {
+        let mut observed = Vec::new();
+        for size in [1000_usize, 10000] {
+            let conn = fixture(size);
+            for i in (50..=size).step_by(50) {
+                let namespace = if i % 100 == 0 { "minor" } else { "dominant" };
+                add_alias(&conn, namespace, i as u128, &format!("Alias{i}"));
+            }
+            // Entity 5 is named Name5 and holds it as an alias too; entity 6
+            // holds it as an alias; the row in `other` names entity 7 from a
+            // namespace no filter reads.
+            add_alias(&conn, "dominant", 5, "Name5");
+            add_alias(&conn, "dominant", 6, "Name5");
+            add_alias(&conn, "other", 7, "Name5");
+            if analyzed {
+                conn.execute_batch("ANALYZE").unwrap();
+            }
+            let mut work = Vec::new();
+            for (filter, expected) in [
+                (lookup(&[], &[]), vec![5_u128, 6]),
+                (lookup(&[], &["concept"]), vec![5]),
+                (lookup(&["dominant", "minor"], &[]), vec![5, 6]),
+            ] {
+                let (clause, count_params) = build_entity_where("dominant", &filter);
+                let count_sql = build_entity_count_query(&filter, &clause);
+                let (clause, mut page_params) = build_entity_where("dominant", &filter);
+                page_params.push(Box::new(10_i64));
+                page_params.push(Box::new(0_i64));
+                let page_sql = build_entity_page_query(
+                    ENTITY_SELECT_COLUMNS,
+                    &filter,
+                    &clause,
+                    "created_at DESC, id DESC",
+                    page_params.len() - 1,
+                    page_params.len(),
+                );
+                assert_eq!(
+                    values(&conn, &count_sql, &count_params),
+                    vec![vec![rusqlite::types::Value::Integer(expected.len() as i64)]],
+                    "count for {filter:?}"
+                );
+                let mut ids = values(&conn, &page_sql, &page_params)
+                    .into_iter()
+                    .map(|row| row[0].clone())
+                    .collect::<Vec<_>>();
+                ids.sort_by_key(|id| format!("{id:?}"));
+                assert_eq!(
+                    ids,
+                    expected
+                        .iter()
+                        .map(|i| rusqlite::types::Value::Text(Uuid::from_u128(*i).to_string()))
+                        .collect::<Vec<_>>(),
+                    "rows for {filter:?}"
+                );
+                for (sql, params) in [(&count_sql, &count_params), (&page_sql, &page_params)] {
+                    let (plan, steps) = plan_work(&conn, sql, params);
+                    eprintln!("name-or-alias size={size} analyzed={analyzed} vm_steps={steps} plan={plan:?}");
+                    assert!(seeks(&plan), "name and alias indexes required: {plan:?}");
+                    let control = correlated(sql);
+                    let (control_plan, control_steps) = plan_work(&conn, &control, params);
+                    eprintln!("name-or-alias control size={size} analyzed={analyzed} vm_steps={control_steps} plan={control_plan:?}");
+                    assert!(
+                        !seeks(&control_plan),
+                        "the correlated control must lose the index seeks: {control_plan:?}"
+                    );
+                    assert_eq!(values(&conn, sql, params), values(&conn, &control, params));
+                    work.push(steps);
+                }
+            }
+            observed.push(work);
+        }
+        for column in 0..observed[0].len() {
+            assert!(
+                observed[1][column] < observed[0][column] * 2,
+                "name-or-alias work must not track namespace growth: {observed:?}"
+            );
         }
     }
 }
@@ -584,7 +720,7 @@ async fn standalone_entity_reads_fallback_without_repair() {
     pool.writer()
         .unwrap()
         .conn()
-        .execute_batch(ENTITIES_DDL)
+        .execute_batch(&format!("{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}"))
         .unwrap();
     let external = Connection::open(&path).unwrap();
     seed_fallback_rows(&external);
@@ -601,7 +737,7 @@ async fn list_fallback_retries_once_and_preserves_unrecognized_sqlite_errors() {
     pool.writer()
         .unwrap()
         .conn()
-        .execute_batch(ENTITIES_DDL)
+        .execute_batch(&format!("{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}"))
         .unwrap();
     pool.writer()
         .unwrap()
@@ -1072,7 +1208,8 @@ fn seed_kind_cursor_rows(
     prefix: usize,
     matching_prefix: bool,
 ) -> (SeekCursor, Vec<Uuid>) {
-    conn.execute_batch(ENTITIES_DDL).unwrap();
+    conn.execute_batch(&format!("{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}"))
+        .unwrap();
     conn.execute_batch(include_str!("../../sql/021-attachments-a-stage.sql"))
         .unwrap();
     for i in 1..=prefix {
@@ -1422,7 +1559,7 @@ async fn count_free_kind_fallback_preserves_unrelated_errors_and_retries_once() 
     pool.writer()
         .unwrap()
         .conn()
-        .execute_batch(ENTITIES_DDL)
+        .execute_batch(&format!("{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}"))
         .unwrap();
     pool.writer()
         .unwrap()
@@ -1489,7 +1626,8 @@ async fn count_free_kind_fallback_preserves_unrelated_errors_and_retries_once() 
 }
 
 fn seed_type_group_rows(conn: &Connection) {
-    conn.execute_batch(ENTITIES_DDL).unwrap();
+    conn.execute_batch(&format!("{ENTITIES_DDL}\n{ENTITY_ALIASES_DDL}"))
+        .unwrap();
     conn.execute_batch(include_str!("../../sql/021-attachments-a-stage.sql"))
         .unwrap();
     // Rows 3, 6 and 9 are concepts; row 6 carries the column type, rows 3 and 9

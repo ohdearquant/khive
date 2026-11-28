@@ -87,10 +87,10 @@ impl Fixture {
         let before = self.stored().await;
         let error = self.dispatch(verb, params).await.expect_err("must refuse");
         assert_eq!(self.stored().await, before, "{verb}: stored rows changed");
-        let RuntimeError::InvalidInput(message) = error else {
-            panic!("{verb}: changed error type: {error:?}");
-        };
-        message
+        match error.refusal_source() {
+            RuntimeError::InvalidInput(message) => message.clone(),
+            error => panic!("{verb}: changed error type: {error:?}"),
+        }
     }
 }
 

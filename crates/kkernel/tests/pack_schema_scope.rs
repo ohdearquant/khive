@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 const CORE_TABLES: [&str; 4] = ["notes", "entities", "graph_edges", "events"];
 // ADR-017 (2026-09-12) mentions tool invalidation; #4137 tracks this shipped exception.
 const TOOL_INVALIDATION_SHA256: &str =
-    "c025d184512b437533e641e2e1c4427f585bd23aae23bd9359e76d3720f6b01e";
+    "0b03222ad9d5d0d7a707d5ae130282c53a6f7d16124e9b523f9c89c6168debe9";
 const TOOL_INVALIDATION_TRIGGER: &str = "tool_grants_invalidate_on_registry_insert";
 
 struct Declared {
@@ -39,11 +39,13 @@ fn declarations() -> Vec<Declared> {
         declared::<khive_pack_code::CodePack>(),
         declared::<khive_pack_comm::CommPack>(),
         declared::<khive_pack_exec::ExecPack>(),
+        declared::<khive_pack_forms::FormsPack>(),
         declared::<khive_pack_git::GitPack>(),
         declared::<khive_pack_gtd::GtdPack>(),
         declared::<khive_pack_kg::KgPack>(),
         declared::<khive_pack_knowledge::KnowledgePack>(),
         declared::<khive_pack_memory::MemoryPack>(),
+        declared::<khive_pack_operation::OperationPack>(),
         declared::<khive_pack_schedule::SchedulePack>(),
         declared::<khive_pack_session::SessionPack>(),
         declared::<khive_pack_template::TemplatePack>(),
@@ -81,6 +83,12 @@ fn refused_action(action: AuthAction<'_>, tool_batch: bool) -> Option<String> {
     if tool_batch {
         match action {
             AuthAction::CreateTrigger {
+                trigger_name,
+                table_name,
+            } if trigger_name == TOOL_INVALIDATION_TRIGGER && table_name == "entities" => {
+                return None
+            }
+            AuthAction::DropTrigger {
                 trigger_name,
                 table_name,
             } if trigger_name == TOOL_INVALIDATION_TRIGGER && table_name == "entities" => {
@@ -408,6 +416,8 @@ fn every_repository_pack_schema_stays_auxiliary() {
     let mut expected: BTreeSet<String> = RuntimeConfig::built_in_packs().into_iter().collect();
     expected.insert("template".into());
     expected.insert("charter".into());
+    expected.insert("forms".into());
+    expected.insert("operation".into());
     for (name, enabled) in [
         ("agent", cfg!(feature = "pack-agent")),
         ("telemetry", cfg!(feature = "pack-telemetry")),
@@ -419,7 +429,7 @@ fn every_repository_pack_schema_stays_auxiliary() {
             expected.insert(name.into());
         }
     }
-    let expected_count = 16
+    let expected_count = 18
         + [
             cfg!(feature = "pack-agent"),
             cfg!(feature = "pack-telemetry"),
@@ -622,6 +632,12 @@ fn tool_invalidation_exception_4137_is_byte_pinned_and_pack_scoped() {
     };
     assert!(refused_action(create, true).is_none());
     assert!(refused_action(create, false).is_some());
+    let drop = AuthAction::DropTrigger {
+        trigger_name: TOOL_INVALIDATION_TRIGGER,
+        table_name: "entities",
+    };
+    assert!(refused_action(drop, true).is_none());
+    assert!(refused_action(drop, false).is_some());
     for action in [
         AuthAction::CreateIndex {
             index_name: "forbidden",
@@ -634,6 +650,14 @@ fn tool_invalidation_exception_4137_is_byte_pinned_and_pack_scoped() {
         AuthAction::CreateTrigger {
             trigger_name: "another",
             table_name: "entities",
+        },
+        AuthAction::DropTrigger {
+            trigger_name: "another",
+            table_name: "entities",
+        },
+        AuthAction::DropTrigger {
+            trigger_name: TOOL_INVALIDATION_TRIGGER,
+            table_name: "notes",
         },
         AuthAction::Read {
             table_name: "notes",
@@ -648,6 +672,39 @@ fn tool_invalidation_exception_4137_is_byte_pinned_and_pack_scoped() {
             refused_action(action, true).is_some(),
             "exception must not permit {action:?}"
         );
+    }
+}
+
+#[test]
+fn tool_schema_scope_accepts_installed_trigger_replay() {
+    let tool = declared::<khive_pack_tool::ToolPack>();
+    let plan = tool.plan.unwrap();
+    let conn = scope_connection(true);
+    check_plan(&conn, tool.name, plan.statements, tool.columns, false).unwrap();
+    let body: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1 AND tbl_name='entities'",
+            [TOOL_INVALIDATION_TRIGGER],
+            |row| row.get(0),
+        )
+        .unwrap();
+    check_plan(&conn, tool.name, plan.statements, tool.columns, false).unwrap();
+    let replayed: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1 AND tbl_name='entities'",
+            [TOOL_INVALIDATION_TRIGGER],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(replayed, body);
+    let sql = include_str!("../../khive-pack-tool/sql/grant-invalidation.sql");
+    for (pack, statement) in [
+        ("other", sql.to_owned()),
+        ("tool", format!("{sql}\n-- changed")),
+    ] {
+        let error = check_statement(&conn, pack, &statement).unwrap_err();
+        assert!(error.contains("DropTrigger"), "{error}");
+        assert!(error.contains("core table entities"), "{error}");
     }
 }
 

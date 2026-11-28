@@ -173,6 +173,67 @@ async fn exec_preflight_writes_tool_check_decision_receipt() {
 }
 
 #[tokio::test]
+async fn exec_preflight_matches_registry_name_folding() {
+    for (stored_name, policy_name) in [("execshell", "ExecShell"), ("ExecShell", "execshell")] {
+        let f = Fixture::new();
+        f.call(
+            "tool.register",
+            json!({
+                "name": stored_name, "source": "exec:/bin/sh",
+                "side_effect": "read", "trust": "first_party"
+            }),
+        )
+        .await;
+        let policy = f
+            .call(
+                "tool.policy",
+                json!({
+                    "actor": "agent:fold", "tool": policy_name, "decision": "deny"
+                }),
+            )
+            .await;
+        let entity = khive_pack_tool::resolve_registered(&f.runtime, &f.token, policy_name)
+            .await
+            .unwrap();
+        assert_eq!(entity.name, stored_name);
+        let decision = preflight_policy(&f.runtime, &f.token, "agent:fold", &entity)
+            .await
+            .unwrap();
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.source, "policy");
+        assert_eq!(
+            decision.policy_id.as_deref(),
+            policy["policy"]["id"].as_str()
+        );
+        let events = f
+            .runtime
+            .list_events(
+                &f.token,
+                EventFilter {
+                    kinds: vec![EventKind::ToolCheckDecided],
+                    ..EventFilter::default()
+                },
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.items.len(), 1);
+        let data = &events.items[0].payload;
+        assert_eq!(data["tool"], stored_name);
+        assert_eq!(data["actor"], "agent:fold");
+        assert_eq!(data["caller_verb"], "exec.run");
+        assert_eq!(data["registered"], true);
+        assert_eq!(data["decision"], "deny");
+        assert_eq!(data["source"], "policy");
+        assert_eq!(data["id"], policy["policy"]["id"]);
+        assert!(!f.root.exists());
+    }
+}
+
+#[tokio::test]
 async fn denied_tool_never_starts_binary_digest() {
     let f = Fixture::new();
     let binary = f._dir.path().join("digest-probe");

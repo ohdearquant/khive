@@ -162,23 +162,12 @@ fn never_binding_exe(rendezvous: &Rendezvous) -> std::path::PathBuf {
 
 fn frame() -> DaemonRequestFrame {
     DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: "stats()".to_string(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "test".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: CFG.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     }
 }
 

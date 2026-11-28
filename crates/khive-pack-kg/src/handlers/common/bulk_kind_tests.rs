@@ -131,6 +131,42 @@ async fn bulk_registered_note_keeps_subtype_probe_before_note_fallback() {
     }
 }
 
+#[tokio::test]
+async fn bulk_create_returns_each_full_id_beside_the_id_agent_shortens() {
+    for atomic in [true, false] {
+        for verbose in [false, true] {
+            let response = registry(false)
+                .dispatch(
+                    "create",
+                    json!({"atomic":atomic,"verbose":verbose,"items":[
+                        {"kind":"concept","name":"first"},
+                        {"kind":"concept","name":"second"}]}),
+                )
+                .await
+                .unwrap();
+            let results = response["results"].as_array().unwrap();
+            assert_eq!(results.len(), 2, "{response}");
+            for row in results {
+                let full = row["result"]["full_id"].as_str().expect("full_id");
+                assert!(Uuid::parse_str(full).is_ok(), "{response}");
+                assert_eq!(row["result"]["id"].as_str(), Some(full), "{response}");
+            }
+            let shown = khive_runtime::presentation::present(
+                response,
+                khive_runtime::PresentationMode::Agent,
+                0,
+            );
+            for row in shown["results"].as_array().unwrap() {
+                let full = row["result"]["full_id"].as_str().expect("full_id");
+                let short = row["result"]["id"].as_str().expect("id");
+                assert!(Uuid::parse_str(full).is_ok(), "{shown}");
+                assert!(short.len() < full.len(), "{shown}");
+                assert!(full.starts_with(short), "{shown}");
+            }
+        }
+    }
+}
+
 async fn observed<T>(future: impl Future<Output = T>) -> (T, Vec<&'static str>) {
     let builds = Arc::new(Mutex::new(Vec::new()));
     let result = REGISTRY_BUILDS.scope(builds.clone(), future).await;

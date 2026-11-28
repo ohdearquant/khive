@@ -826,6 +826,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-pid-diagnostic-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-pid-diagnostic-")
+                    .tempdir()
+            })
             .unwrap();
         let home = root.path().join("home");
         let default = home.join(".khive");
@@ -884,6 +889,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-explicit-boot-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-explicit-boot-")
+                    .tempdir()
+            })
             .unwrap();
         let home = root.path().join("missing-home");
         let lock = root.path().join("boot.lock");
@@ -923,6 +933,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-explicit-missing-parent-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-explicit-missing-parent-")
+                    .tempdir()
+            })
             .unwrap();
         let home = root.path().join("missing-home");
         let parent = root.path().join("new").join("rendezvous");
@@ -955,6 +970,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-private-lock-default-rendezvous-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-private-lock-default-rendezvous-")
+                    .tempdir()
+            })
             .unwrap();
         let home = root.path().join("home");
         std::fs::create_dir(&home).unwrap();
@@ -985,6 +1005,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-selected-default-lock-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-selected-default-lock-")
+                    .tempdir()
+            })
             .unwrap();
         let home = root.path().join("home");
         let default = home.join(".khive");
@@ -1023,6 +1048,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-default-with-external-lock-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-default-with-external-lock-")
+                    .tempdir()
+            })
             .unwrap();
         let home = root.path().join("home");
         std::fs::create_dir(&home).unwrap();
@@ -1084,6 +1114,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-supplied-guard-default-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-supplied-guard-default-")
+                    .tempdir()
+            })
             .unwrap();
         let home = root.path().join("home");
         std::fs::create_dir(&home).unwrap();
@@ -1184,6 +1219,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-explicit-daemon-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-explicit-daemon-")
+                    .tempdir()
+            })
             .expect("private synthetic root");
         let home = root.path().join("home");
         let rendezvous = root.path().join("run");
@@ -1239,6 +1279,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-boot-unsafe-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-boot-unsafe-")
+                    .tempdir()
+            })
             .expect("private synthetic root");
         let unsafe_ancestor = root.path().join("unsafe");
         let home = unsafe_ancestor.join("home");
@@ -1309,6 +1354,11 @@ mod default_directory_repair_tests {
         let directory = tempfile::Builder::new()
             .prefix("khive-foreign-owner-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-foreign-owner-")
+                    .tempdir()
+            })
             .expect("private synthetic directory");
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
         let actual_owner = std::fs::metadata(directory.path()).unwrap().uid();
@@ -1352,6 +1402,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-default-swap-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-default-swap-")
+                    .tempdir()
+            })
             .expect("private synthetic directory");
         let directory = root.path().join("rendezvous");
         let original = root.path().join("original");
@@ -1392,6 +1447,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-default-symlink-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-default-symlink-")
+                    .tempdir()
+            })
             .expect("private synthetic directory");
         let directory = root.path().join("rendezvous");
         let target = root.path().join("target");
@@ -1425,6 +1485,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-default-before-open-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-default-before-open-")
+                    .tempdir()
+            })
             .expect("private synthetic directory");
         let directory = root.path().join("rendezvous");
         let original = root.path().join("original");
@@ -1466,6 +1531,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-default-chmod-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-default-chmod-")
+                    .tempdir()
+            })
             .expect("private synthetic directory");
         let directory = root.path().join("rendezvous");
         std::fs::create_dir(&directory).unwrap();
@@ -1503,6 +1573,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-default-read-only-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-default-read-only-")
+                    .tempdir()
+            })
             .expect("private synthetic directory");
         let directory = root.path().join("rendezvous");
         std::fs::create_dir(&directory).unwrap();
@@ -1531,6 +1606,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-dir-recovery-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-dir-recovery-")
+                    .tempdir()
+            })
             .unwrap();
         let directory = root.path().join("rendezvous");
         std::fs::create_dir(&directory).unwrap();
@@ -1566,6 +1646,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-lock-create-race-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-lock-create-race-")
+                    .tempdir()
+            })
             .unwrap();
         let lock = root.path().join("recovery.lock");
 
@@ -1597,6 +1682,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-lock-create-symlink-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-lock-create-symlink-")
+                    .tempdir()
+            })
             .unwrap();
         let lock = root.path().join("recovery.lock");
         let target = root.path().join("target");
@@ -1628,6 +1718,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-lock-failure-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-lock-failure-")
+                    .tempdir()
+            })
             .unwrap();
         for (label, fail_metadata, fail_chmod) in
             [("metadata", true, false), ("chmod", false, true)]
@@ -1669,6 +1764,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-lock-created-swap-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-lock-created-swap-")
+                    .tempdir()
+            })
             .unwrap();
         let lock = root.path().join("lock");
         let original = root.path().join("original");
@@ -1706,6 +1806,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-lock-mode-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-lock-mode-")
+                    .tempdir()
+            })
             .expect("private synthetic directory");
         std::env::set_var("HOME", root.path());
         std::env::set_var("KHIVE_PID", root.path().join("khived.pid"));
@@ -1729,6 +1834,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-lock-symlink-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-lock-symlink-")
+                    .tempdir()
+            })
             .expect("private synthetic directory");
         if crate::test_process::run_in_child() {
             return;
@@ -1755,6 +1865,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-foreign-lock-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-foreign-lock-")
+                    .tempdir()
+            })
             .expect("private synthetic directory");
         let lock = root.path().join("lock");
         std::fs::write(&lock, b"").unwrap();
@@ -1782,6 +1897,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-lock-swap-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-lock-swap-")
+                    .tempdir()
+            })
             .expect("private synthetic directory");
         let lock = root.path().join("lock");
         let original = root.path().join("original");
@@ -1814,6 +1934,11 @@ mod default_directory_repair_tests {
         let root = tempfile::Builder::new()
             .prefix("khive-lock-parent-swap-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-lock-parent-swap-")
+                    .tempdir()
+            })
             .expect("private synthetic directory");
         let directory = root.path().join("parent");
         let original = root.path().join("original");
@@ -1862,6 +1987,11 @@ mod default_directory_repair_tests {
         let home = tempfile::Builder::new()
             .prefix("khive-explicit-default-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("khive-explicit-default-")
+                    .tempdir()
+            })
             .expect("private synthetic home");
         std::env::set_var("HOME", home.path());
         let directory = home.path().join(".khive");
