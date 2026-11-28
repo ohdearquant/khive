@@ -17,14 +17,16 @@ use super::params::{self, Args};
 use super::views::{field_reply, nearest};
 use super::Ctx;
 use crate::store::{
-    aliases, form_key, invalid, is_general, label, pending_premise, pending_premises, prop,
+    aliases, document_type_key, field_name_key, form_key, invalid, is_general, is_system,
+    known_as_of, known_as_pairs, known_as_value, label, pending_premise, pending_premises, prop,
     prop_text, props, quoted_names, scalar, strings, type_of, wordings, Graph, Writes,
     GRAPH_RELATIONS,
 };
 use crate::text::normalize;
 use crate::vocab::{
-    self, COMPARISONS, FIELD, FIELD_VALUE, FORM, FORM_ISSUER, FORM_ITEM, FORM_RULE, FORM_SECTION,
-    FORM_SUBJECT, FORM_TERM, ITEM_KINDS, TERM_LISTS, VALUE_TYPES,
+    self, COMPARISONS, DOCUMENT_TYPE, FIELD, FIELD_VALUE, FORM, FORM_ISSUER, FORM_ITEM, FORM_RULE,
+    FORM_SECTION, FORM_SUBJECT, FORM_TERM, ITEM_KINDS, LINE_RELATIONS, ORIGINS, TERM_LISTS,
+    VALUE_TYPES,
 };
 
 /// The format tag of an export document, checked by replay.
@@ -64,6 +66,109 @@ struct FieldSpec {
     /// How the field's answers compare when a constraint holds two lines to
     /// match or differ; `exact` when not stated.
     comparison: Option<String>,
+    /// The field's names in vocabularies, as (vocabulary, name).
+    known_as: Vec<(String, String)>,
+}
+
+/// The operation pack's node types (ADR-222 section 2). A vocabulary may not
+/// be named after one (A2.5): the operation pack's names in a vocabulary are
+/// keyed `operation/<vocabulary>/...` beside its nodes' `operation/<node type>/...`.
+const RESERVED_VOCABULARIES: [&str; 14] = [
+    "operation_type",
+    "variant",
+    "slot",
+    "step_type",
+    "requirement",
+    "rule",
+    "named_condition",
+    "gap_code",
+    "act_type",
+    "status_word",
+    "purpose",
+    "confidence",
+    "vocabulary",
+    "frontier_kind",
+];
+
+fn known_as_spec(obj: &Args, field: &str) -> Result<Vec<(String, String)>, RuntimeError> {
+    let mut known_as: Vec<(String, String)> = Vec::new();
+    for entry in params::list(obj, "known_as")? {
+        let entry = params::entry(entry, "known_as")?;
+        let vocabulary = params::text(entry, "vocabulary")?;
+        let name = params::text(entry, "name")?;
+        // The key joins vocabulary and name with '/field/', so a '/' in the vocabulary
+        // could make two pairs one key.
+        if vocabulary.contains('/') {
+            return Err(invalid(format!(
+                "field \"{field}\" names vocabulary \"{vocabulary}\", which contains '/'; a vocabulary name has no '/'"
+            )));
+        }
+        if RESERVED_VOCABULARIES
+            .iter()
+            .any(|reserved| normalize(reserved) == normalize(&vocabulary))
+        {
+            return Err(invalid(format!(
+                "reserved_vocabulary: field \"{field}\" names vocabulary \"{vocabulary}\", which is an operation node type; name the vocabulary otherwise"
+            )));
+        }
+        let key = field_name_key(&vocabulary, &name);
+        if !known_as.iter().any(|(v, n)| field_name_key(v, n) == key) {
+            known_as.push((vocabulary, name));
+        }
+    }
+    Ok(known_as)
+}
+
+/// Refuse a name in a vocabulary that another field holds, in the store or
+/// earlier in this document, and stage the key of each name `field` does not
+/// hold yet (ADR-222 A2.5). `claimed` maps each key the document gives to the
+/// field it gives it to.
+async fn claim_known_as(
+    ctx: &Ctx<'_>,
+    graph: &Graph,
+    writes: &mut Writes,
+    claimed: &mut HashMap<String, String>,
+    field: Uuid,
+    field_name: &str,
+    names: &[(String, String)],
+) -> Result<(), RuntimeError> {
+    for (vocabulary, name) in names {
+        let key = field_name_key(vocabulary, name);
+        if let Some(other) = claimed.insert(key.clone(), field_name.to_owned()) {
+            return Err(invalid(format!(
+                "the document gives \"{name}\" in vocabulary \"{vocabulary}\" to fields \"{other}\" and \"{field_name}\"; a name in a vocabulary names one field"
+            )));
+        }
+        match ctx
+            .runtime
+            .get_entity_by_key(ctx.token, "concept", &key)
+            .await?
+        {
+            Some(holder) if holder.id == field => {}
+            Some(holder) => {
+                let held_by = graph
+                    .get(holder.id)
+                    .map_or_else(|| holder.name.clone(), |f| f.name.clone());
+                return Err(invalid(format!(
+                    "field \"{field_name}\" is known in vocabulary \"{vocabulary}\" as \"{name}\", which already names field \"{held_by}\""
+                )));
+            }
+            None => writes.add_key(field, key),
+        }
+    }
+    Ok(())
+}
+
+/// Only forms.load takes a field's names in vocabularies.
+fn refuse_known_as(spec: &FieldSpec) -> Result<(), RuntimeError> {
+    if spec.known_as.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "field \"{}\" gives known_as, which forms.load takes; load the field in a form document",
+            spec.name
+        )))
+    }
 }
 
 fn field_spec(obj: &Args) -> Result<FieldSpec, RuntimeError> {
@@ -88,6 +193,7 @@ fn field_spec(obj: &Args) -> Result<FieldSpec, RuntimeError> {
         .unwrap_or(false);
     refuse_exclusive_size(&name, exclusive, values.len())?;
     Ok(FieldSpec {
+        known_as: known_as_spec(obj, &name)?,
         definition: params::text(obj, "definition")?,
         aliases: params::string_list(obj, "aliases")?,
         comparison: params::opt_text(obj, "comparison")?
@@ -206,6 +312,9 @@ fn stage_field(
     if let Some(comparison) = &spec.comparison {
         properties.insert("comparison".to_owned(), json!(comparison));
     }
+    if !spec.known_as.is_empty() {
+        properties.insert("known_as".to_owned(), known_as_value(&spec.known_as));
+    }
     let field = writes.create_entity(FIELD, &spec.name, None, properties)?;
     let mut values = HashMap::new();
     let mut ordered = Vec::new();
@@ -245,7 +354,12 @@ struct ItemSpec {
     page: Value,
     order: Value,
     item_kind: String,
-    filled_by: String,
+    /// What the line does with its field: asks, states or requires.
+    relation: String,
+    /// Who writes the line; a stating line has nobody.
+    filled_by: Option<String>,
+    /// The id of the document type a requires line takes.
+    requires: Option<String>,
     section: Option<String>,
     widget: Option<Value>,
 }
@@ -256,15 +370,173 @@ fn item_spec(obj: &Args) -> Result<ItemSpec, RuntimeError> {
         Some(widget @ Value::Object(_)) => Some(widget.clone()),
         Some(_) => return Err(invalid("widget must be an object such as {name, rect}")),
     };
+    let label = params::text(obj, "label")?;
+    let item_kind = params::one_of(params::text(obj, "item_kind")?, "item_kind", &ITEM_KINDS)?;
+    let relation = params::one_of(
+        params::opt_text(obj, "relation")?.unwrap_or_else(|| "asks".to_owned()),
+        "relation",
+        &LINE_RELATIONS,
+    )?;
+    let requires = params::opt_text(obj, "document_type")?;
+    let given = |key: &str| obj.get(key).is_some_and(|v| !v.is_null());
+    match relation.as_str() {
+        "states" => {
+            // A stating line is a value every document of the type carries:
+            // nobody fills it in and nothing makes it necessary, so a document
+            // that says otherwise is refused rather than read past.
+            for (key, why) in [
+                ("filled_by", "no subject fills it in"),
+                ("necessity", "it has no necessity"),
+                ("group", "it belongs to no one_of group"),
+                (
+                    "known_to",
+                    "no subject holds its value apart from the document",
+                ),
+                ("document_type", "it takes no attached document"),
+            ] {
+                if given(key) {
+                    return Err(invalid(format!(
+                        "item \"{label}\" states its field, so {why}; drop {key}"
+                    )));
+                }
+            }
+            if !vocab::item_needs_field(&item_kind) {
+                return Err(invalid(format!(
+                    "item \"{label}\" states a field, so it is a text, choice or signature item, not {item_kind}"
+                )));
+            }
+        }
+        "requires" => {
+            if item_kind != "attachment" {
+                return Err(invalid(format!(
+                    "item \"{label}\" requires an attached document, so its item_kind is attachment"
+                )));
+            }
+            if requires.is_none() {
+                return Err(invalid(format!(
+                    "item \"{label}\" requires an attached document; name its type (document_type)"
+                )));
+            }
+        }
+        _ => {
+            if requires.is_some() {
+                return Err(invalid(format!(
+                    "item \"{label}\" names a document type, which only a requires line takes"
+                )));
+            }
+        }
+    }
+    let filled_by = match relation.as_str() {
+        "states" => None,
+        _ => Some(params::text(obj, "filled_by")?),
+    };
     Ok(ItemSpec {
-        label: params::text(obj, "label")?,
+        label,
         page: params::number(obj, "page")?,
         order: params::number(obj, "order")?,
-        item_kind: params::one_of(params::text(obj, "item_kind")?, "item_kind", &ITEM_KINDS)?,
-        filled_by: params::text(obj, "filled_by")?,
+        item_kind,
+        relation,
+        filled_by,
+        requires,
         section: params::opt_text(obj, "section")?,
         widget,
     })
+}
+
+/// A requires line takes a document of a loaded type other than its own
+/// form's. Refusing an unloaded target means two types that require each
+/// other cannot both load.
+fn check_requires(graph: &Graph, spec: &ItemSpec, own_type: &str) -> Result<(), RuntimeError> {
+    let Some(target) = &spec.requires else {
+        return Ok(());
+    };
+    if target == own_type {
+        return Err(invalid(format!(
+            "item \"{}\" requires a document of its own form's type \"{target}\"; a document is not attached to itself",
+            spec.label
+        )));
+    }
+    if graph.document_type_by_id(target).is_none() {
+        return Err(invalid(format!(
+            "item \"{}\" requires a document of type \"{target}\", which is not loaded; load a document of that type first",
+            spec.label
+        )));
+    }
+    Ok(())
+}
+
+/// A document type as a document declares it. A system is an outside
+/// system's record schema: it has no origin, since nobody brings it in, and
+/// its lines only state.
+struct TypeSpec {
+    id: String,
+    name: String,
+    origin: Option<String>,
+    system: bool,
+    issuer_class: Option<String>,
+}
+
+fn type_spec(doc: &Args) -> Result<Option<TypeSpec>, RuntimeError> {
+    let Some(obj) = params::object(doc, "document_type")? else {
+        return Ok(None);
+    };
+    let id = params::text(obj, "id")?;
+    let system = match obj.get("system") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(system)) => *system,
+        Some(_) => return Err(invalid("document_type.system must be true or false")),
+    };
+    let origin = params::opt_text(obj, "origin")?;
+    let origin = match (system, origin) {
+        (true, Some(_)) => {
+            return Err(invalid(format!(
+                "document type \"{id}\" is a system, so it has no origin; drop origin"
+            )))
+        }
+        (true, None) => None,
+        (false, None) => {
+            return Err(invalid(format!(
+                "document type \"{id}\" needs an origin, one of {}, or system: true",
+                ORIGINS.join(", ")
+            )))
+        }
+        (false, Some(origin)) => Some(params::one_of(origin, "origin", &ORIGINS)?),
+    };
+    Ok(Some(TypeSpec {
+        name: params::text(obj, "name")?,
+        issuer_class: params::opt_text(obj, "issuer_class")?,
+        id,
+        origin,
+        system,
+    }))
+}
+
+fn type_props(spec: &TypeSpec) -> Map<String, Value> {
+    let mut props = map([("document_type_id", json!(spec.id))]);
+    match &spec.origin {
+        Some(origin) => props.insert("origin".to_owned(), json!(origin)),
+        None => props.insert("system".to_owned(), json!(true)),
+    };
+    if let Some(issuer_class) = &spec.issuer_class {
+        props.insert("issuer_class".to_owned(), json!(issuer_class));
+    }
+    props
+}
+
+/// A system's record only states what it holds: nobody fills a line of it in
+/// and it attaches nothing.
+fn check_system_line(spec: &ItemSpec, system: Option<&str>) -> Result<(), RuntimeError> {
+    match system {
+        Some(own_type) if spec.relation != "states" => Err(invalid(format!(
+            "item \"{}\" {} its field, but document type \"{own_type}\" is a system, whose lines only state",
+            spec.label, spec.relation
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn is_minted(document_type: &Entity) -> bool {
+    prop(document_type, "minted").and_then(Value::as_bool) == Some(true)
 }
 
 fn item_key(form_key: &str, spec: &ItemSpec) -> String {
@@ -281,9 +553,17 @@ fn item_props(spec: &ItemSpec, form_key: &str) -> Map<String, Value> {
         ("page", spec.page.clone()),
         ("order", spec.order.clone()),
         ("item_kind", json!(spec.item_kind)),
-        ("filled_by", json!(spec.filled_by)),
         ("form_key", json!(form_key)),
     ]);
+    if let Some(filled_by) = &spec.filled_by {
+        props.insert("filled_by".to_owned(), json!(filled_by));
+    }
+    if spec.relation != "asks" {
+        props.insert("relation".to_owned(), json!(spec.relation));
+    }
+    if let Some(requires) = &spec.requires {
+        props.insert("document_type".to_owned(), json!(requires));
+    }
     if let Some(widget) = &spec.widget {
         props.insert("widget".to_owned(), widget.clone());
     }
@@ -309,6 +589,7 @@ fn relation_named(name: &str) -> Result<EdgeRelation, RuntimeError> {
 #[derive(Default)]
 struct Counts {
     forms: usize,
+    document_types: usize,
     issuers: usize,
     sections: usize,
     items: usize,
@@ -326,6 +607,7 @@ impl Counts {
     fn to_json(&self) -> Value {
         json!({
             "forms": self.forms,
+            "document_types": self.document_types,
             "issuers": self.issuers,
             "sections": self.sections,
             "items": self.items,
@@ -455,6 +737,80 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
     }
     let form = writes.create_entity(FORM, &title, None, form_properties)?;
     counts.forms = 1;
+
+    // Every revision belongs to a document type. A document that names none
+    // gets one minted from its form id and title, marked as minted so that a
+    // guessed origin never reads as a declared one; a later document that
+    // declares the type replaces the guess.
+    let declared_type = type_spec(doc)?;
+    let own_type = declared_type
+        .as_ref()
+        .map(|t| t.id.clone())
+        .unwrap_or_else(|| form_id.clone());
+    let (document_type, minted) = match (graph.document_type_by_id(&own_type), &declared_type) {
+        (Some(existing), Some(spec)) if is_minted(existing) => {
+            if spec.system {
+                // The forms of a minted type were loaded as forms to fill in.
+                return Err(invalid(format!(
+                    "document type \"{own_type}\" was minted for a form already loaded, so it cannot be declared a system"
+                )));
+            }
+            writes.update_entity(existing, Some(&spec.name), None, Some(type_props(spec)))?;
+            (existing.id, false)
+        }
+        (Some(existing), Some(spec)) => {
+            let origin = prop_text(existing, "origin");
+            let issuer_class = prop_text(existing, "issuer_class");
+            if normalize(&existing.name) != normalize(&spec.name)
+                // A system is the type with no origin, so this also
+                // compares the mark.
+                || origin != spec.origin
+                || issuer_class != spec.issuer_class
+            {
+                let origin_of = |origin: Option<&str>, system: bool| match (origin, system) {
+                    (_, true) => "system".to_owned(),
+                    (Some(origin), false) => format!("origin {origin}"),
+                    (None, false) => "origin none".to_owned(),
+                };
+                return Err(invalid(format!(
+                    "document type \"{own_type}\" is loaded as \"{}\" ({}, issuer class {}); the document declares \"{}\" ({}, issuer class {})",
+                    existing.name,
+                    origin_of(origin.as_deref(), is_system(existing)),
+                    issuer_class.as_deref().unwrap_or("none"),
+                    spec.name,
+                    origin_of(spec.origin.as_deref(), spec.system),
+                    spec.issuer_class.as_deref().unwrap_or("none")
+                )));
+            }
+            (existing.id, false)
+        }
+        (Some(existing), None) => (existing.id, is_minted(existing)),
+        (None, Some(spec)) => {
+            counts.document_types = 1;
+            let id = writes.create_entity(DOCUMENT_TYPE, &spec.name, None, type_props(spec))?;
+            (id, false)
+        }
+        (None, None) => {
+            counts.document_types = 1;
+            let id = writes.create_entity(
+                DOCUMENT_TYPE,
+                &title,
+                None,
+                map([
+                    ("document_type_id", json!(own_type)),
+                    ("origin", json!("applicant")),
+                    ("minted", json!(true)),
+                ]),
+            )?;
+            (id, true)
+        }
+    };
+    writes.link(document_type, EdgeRelation::Contains, form);
+    let own_system = match (graph.document_type_by_id(&own_type), &declared_type) {
+        (_, Some(spec)) => spec.system,
+        (Some(existing), None) => is_system(existing),
+        (None, None) => false,
+    };
 
     if let Some(issuer) = params::object(doc, "issuer")? {
         let name = params::text(issuer, "name")?;
@@ -610,6 +966,8 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
     let mut comparisons: HashMap<Uuid, String> = HashMap::new();
     // Each wording of a field left undecided, to the name the document gives it.
     let mut blocked: HashMap<String, String> = HashMap::new();
+    // Each name in a vocabulary the document gives, to the field it names.
+    let mut claimed: HashMap<String, String> = HashMap::new();
     for field in params::list(doc, "fields")? {
         let mut spec = field_spec(params::entry(field, "field")?)?;
         let folded = normalize(&spec.name);
@@ -624,6 +982,16 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
             [] => {
                 keep_free_aliases(&graph, &mut spec, &mut warnings);
                 let (id, values) = stage_field(&mut writes, &spec)?;
+                claim_known_as(
+                    ctx,
+                    &graph,
+                    &mut writes,
+                    &mut claimed,
+                    id,
+                    &spec.name,
+                    &spec.known_as,
+                )
+                .await?;
                 counts.fields += 1;
                 counts.values += values.len();
                 comparisons.insert(
@@ -666,6 +1034,30 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                     counts.aliases_added += added_aliases.len();
                     changed = true;
                 }
+                // A later document may give a reused field further names in
+                // vocabularies; the field keeps those it held.
+                let mut names = known_as_of(existing);
+                let before = names.len();
+                for (vocabulary, name) in &spec.known_as {
+                    let key = field_name_key(vocabulary, name);
+                    if !names.iter().any(|(v, n)| field_name_key(v, n) == key) {
+                        names.push((vocabulary.clone(), name.clone()));
+                    }
+                }
+                if names.len() > before {
+                    properties.insert("known_as".to_owned(), known_as_value(&names));
+                    changed = true;
+                }
+                claim_known_as(
+                    ctx,
+                    &graph,
+                    &mut writes,
+                    &mut claimed,
+                    existing.id,
+                    &existing.name,
+                    &spec.known_as,
+                )
+                .await?;
                 if changed {
                     writes.update_entity(existing, None, None, Some(properties))?;
                 }
@@ -708,6 +1100,12 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                     spec.name,
                     quoted_names(&owners)
                 ));
+                if !spec.known_as.is_empty() {
+                    warnings.push(format!(
+                        "field \"{}\" was not loaded, so its names in vocabularies were not recorded; load them with the field once it is decided",
+                        spec.name
+                    ));
+                }
                 None
             }
         };
@@ -751,6 +1149,8 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
     for item in params::list(doc, "items")? {
         let obj = params::entry(item, "item")?;
         let spec = item_spec(obj)?;
+        check_requires(&graph, &spec, &own_type)?;
+        check_system_line(&spec, own_system.then_some(own_type.as_str()))?;
         if !item_keys.insert(item_key(&key, &spec)) {
             return Err(invalid(format!(
                 "the document lists item \"{}\" at order {} twice",
@@ -784,7 +1184,8 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
             obj,
             &spec.label,
             &spec.item_kind,
-            &spec.filled_by,
+            &spec.relation,
+            spec.filled_by.as_deref(),
             &declared,
         )?);
         if let (Some(name), Some(None)) = (&field_name, &slot) {
@@ -796,7 +1197,8 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                 .unwrap_or_else(|| name.clone());
             item_properties.insert("field_pending".to_owned(), json!(waiting));
         }
-        if let Some(Some((field, _))) = &slot {
+        // A constraint holds lines someone fills in; a stating line is not one.
+        if let (Some(Some((field, _))), false) = (&slot, spec.relation == "states") {
             let folded = |key: &str| {
                 item_properties
                     .get(key)
@@ -1020,6 +1422,11 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
     Ok(json!({
         "loaded": true,
         "form": {"id": form.to_string(), "key": key},
+        "document_type": {
+            "id": document_type.to_string(),
+            "key": document_type_key(&own_type),
+            "minted": minted,
+        },
         "counts": counts.to_json(),
         "items": item_replies,
         "warnings": warnings,
@@ -1262,12 +1669,21 @@ pub(crate) async fn add_item(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runt
             .ok_or_else(|| invalid(format!("{key} has no section \"{section}\"")))?,
     };
 
+    let own_type = graph
+        .document_type_of(form.id)
+        .and_then(|t| prop_text(t, "document_type_id"))
+        .or_else(|| prop_text(form, "form_id"))
+        .unwrap_or_default();
+    let own_system = graph.document_type_of(form.id).is_some_and(is_system);
+    check_requires(&graph, &spec, &own_type)?;
+    check_system_line(&spec, own_system.then_some(own_type.as_str()))?;
     let mut properties = item_props(&spec, &key);
     properties.extend(line_props(
         item_obj,
         &spec.label,
         &spec.item_kind,
-        &spec.filled_by,
+        &spec.relation,
+        spec.filled_by.as_deref(),
         &declared_on(&graph.subjects_of(&key)),
     )?);
 
@@ -1299,6 +1715,7 @@ pub(crate) async fn add_item(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runt
         reply["alias_added"] = json!(added);
     } else if let Some(field) = field {
         let mut proposed = field_spec(field)?;
+        refuse_known_as(&proposed)?;
         let owners = graph.owners(&proposed.name, None);
         if !owners.is_empty() {
             reply["status"] = json!("match");
@@ -1385,6 +1802,7 @@ pub(crate) async fn same(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
         reply["aliases_added"] = json!(more);
     } else if let Some(new_field) = new_field {
         let mut proposed = field_spec(new_field)?;
+        refuse_known_as(&proposed)?;
         proposed.aliases.extend(further);
         let owners = graph.owners(&proposed.name, None);
         if !owners.is_empty() {
@@ -1491,6 +1909,7 @@ pub(crate) async fn split(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runtime
             values: Vec::new(),
             exclusive: false,
             comparison: prop_text(field, "comparison"),
+            known_as: Vec::new(),
         },
     )?;
     writes.link(item.id, EdgeRelation::VariantOf, narrow);
@@ -1619,6 +2038,12 @@ pub(crate) async fn replay(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runtim
                 .map(|k| id_of(k).map(|id| id.to_string()))
                 .collect::<Result<Vec<_>, _>>()?;
             properties.insert("means".to_owned(), json!(mapped));
+        }
+        // A field's names in vocabularies are keys as well as a property.
+        if entity_type == FIELD {
+            for (vocabulary, name) in known_as_pairs(properties.get("known_as")) {
+                writes.add_key(id_of(&key)?, field_name_key(&vocabulary, &name));
+            }
         }
         writes.create_entity_with_id(
             id_of(&key)?,

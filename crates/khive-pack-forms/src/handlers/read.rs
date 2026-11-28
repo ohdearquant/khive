@@ -13,13 +13,13 @@ use super::views::{field_reply, usage};
 use super::write::{DECISION, FORMAT, LOG_KEYS};
 use super::Ctx;
 use crate::store::{
-    aliases, definition, invalid, is_general, label, prop, prop_text, props, scalar, strings,
-    type_of, wordings, Graph,
+    aliases, definition, invalid, is_general, is_stating, is_system, label, prop, prop_text, props,
+    scalar, strings, type_of, wordings, Graph,
 };
 use crate::text::normalize;
 use crate::vocab::{
-    self, ALL_TYPES, FIELD, FIELD_VALUE, FORM, FORM_ISSUER, FORM_ITEM, FORM_RULE, FORM_SECTION,
-    FORM_SUBJECT, FORM_TERM, TERM_LISTS,
+    self, ALL_TYPES, DOCUMENT_TYPE, FIELD, FIELD_VALUE, FORM, FORM_ISSUER, FORM_ITEM, FORM_RULE,
+    FORM_SECTION, FORM_SUBJECT, FORM_TERM, TERM_LISTS,
 };
 
 const ANNOTATION_PAGE: u32 = 1000;
@@ -92,6 +92,8 @@ fn item_view(graph: &Graph, item: &Entity) -> Value {
         view[slot] = json!(target.name);
     }
     for key in [
+        "relation",
+        "document_type",
         "about",
         "known_to",
         "known_to_via",
@@ -188,6 +190,12 @@ fn find_node<'g>(graph: &'g Graph, spec: &str) -> Result<&'g Entity, RuntimeErro
         return graph
             .get(id)
             .ok_or_else(|| invalid(format!("no forms node has id {spec}")));
+    }
+    // A document type is named by its id: document_type:identity-document.
+    if let Some(id) = spec.strip_prefix("document_type:") {
+        return graph
+            .document_type_by_id(id)
+            .ok_or_else(|| invalid(format!("no document type \"{id}\" is loaded")));
     }
     if let Ok(found) = graph.find_form(spec).or_else(|_| graph.find_field(spec)) {
         return Ok(found);
@@ -404,6 +412,40 @@ pub(crate) async fn neighbourhood(ctx: &Ctx<'_>, params: Value) -> Result<Value,
                     })
                     .collect(),
             );
+            // Every line that states this field, with the document type it
+            // belongs to and whom it states it of (ADR-222 A2.8).
+            let mut stated_by: Vec<Value> = graph
+                .items_of_field(root.id)
+                .into_iter()
+                .filter_map(|i| graph.get(i))
+                .filter(|item| is_stating(item))
+                .filter_map(|item| {
+                    let form = graph.form_of(item)?;
+                    let key = graph.key(form.id)?;
+                    let document_type = graph.document_type_of(form.id);
+                    let about = prop_text(item, "about");
+                    let role = about.as_ref().and_then(|about| {
+                        graph
+                            .subjects_of(&key)
+                            .get(&normalize(about))
+                            .and_then(|s| prop_text(s, "role"))
+                    });
+                    Some(json!({
+                        "document_type": document_type.and_then(|t| prop_text(t, "document_type_id")),
+                        "system": document_type.is_some_and(is_system),
+                        "form": prop_text(form, "form_id"),
+                        "revision": prop_text(form, "revision"),
+                        "subject": about,
+                        "role": role,
+                    }))
+                })
+                .collect();
+            stated_by.sort_by_key(|row| {
+                ["document_type", "form", "revision", "subject"]
+                    .map(|key| row[key].as_str().unwrap_or_default().to_owned())
+            });
+            stated_by.dedup();
+            reply["stated_by"] = Value::Array(stated_by);
             reply["general"] = json!(names(
                 &graph,
                 &graph
@@ -470,6 +512,23 @@ pub(crate) async fn neighbourhood(ctx: &Ctx<'_>, params: Value) -> Result<Value,
                     })
                     .collect(),
             );
+        }
+        DOCUMENT_TYPE => {
+            let mut forms: Vec<&Entity> = graph
+                .out(root.id, EdgeRelation::Contains)
+                .into_iter()
+                .filter_map(|f| graph.get(f))
+                .filter(|f| type_of(f) == FORM)
+                .collect();
+            forms.sort_by_key(|f| graph.key(f.id));
+            reply["node"]["document_type_id"] = json!(prop_text(root, "document_type_id"));
+            reply["node"]["system"] = json!(is_system(root));
+            for key in ["origin", "issuer_class"] {
+                if let Some(value) = prop(root, key) {
+                    reply["node"][key] = value.clone();
+                }
+            }
+            reply["node"]["forms"] = Value::Array(forms.into_iter().map(cite).collect());
         }
         _ => {}
     }
@@ -580,9 +639,14 @@ pub(crate) async fn lint(ctx: &Ctx<'_>, _params: Value) -> Result<Value, Runtime
     let mut missing_source = Vec::new();
     for entity_type in ALL_TYPES {
         for node in graph.of_type(entity_type) {
+            // A stating line has nobody who fills it in, and a system has no origin.
             let missing: Vec<&str> = vocab::required_properties(entity_type)
                 .iter()
                 .copied()
+                .filter(|key| !(*key == "filled_by" && is_stating(node)))
+                .filter(|key| {
+                    !(*key == "origin" && entity_type == DOCUMENT_TYPE && is_system(node))
+                })
                 .filter(|key| !present(node, key))
                 .collect();
             if !missing.is_empty() {
@@ -604,7 +668,9 @@ pub(crate) async fn lint(ctx: &Ctx<'_>, _params: Value) -> Result<Value, Runtime
                             .any(|v| !graph.incoming(*v, EdgeRelation::VariantOf).is_empty())
                 }
                 FIELD_VALUE => graph.parent_field(node.id).is_some(),
-                FORM_ISSUER => !graph.out(node.id, EdgeRelation::Contains).is_empty(),
+                FORM_ISSUER | DOCUMENT_TYPE => {
+                    !graph.out(node.id, EdgeRelation::Contains).is_empty()
+                }
                 _ => true,
             };
             if !sourced {
@@ -612,6 +678,27 @@ pub(crate) async fn lint(ctx: &Ctx<'_>, _params: Value) -> Result<Value, Runtime
             }
         }
     }
+
+    // Two lists of what was guessed or not yet said, not of what is broken:
+    // a document type minted for a form that named none, and a form loaded
+    // before document types existed. Neither keeps the graph from being
+    // clean.
+    let minted_document_types: Vec<Value> = graph
+        .of_type(DOCUMENT_TYPE)
+        .into_iter()
+        .filter(|t| prop(t, "minted").and_then(Value::as_bool) == Some(true))
+        .map(|t| {
+            let mut entry = brief_of(t);
+            entry["document_type_id"] = json!(prop_text(t, "document_type_id"));
+            entry
+        })
+        .collect();
+    let forms_without_document_type: Vec<Value> = graph
+        .of_type(FORM)
+        .into_iter()
+        .filter(|f| graph.document_type_of(f.id).is_none())
+        .map(cite)
+        .collect();
 
     let report = json!({
         "unbound_items": unbound_items,
@@ -630,6 +717,8 @@ pub(crate) async fn lint(ctx: &Ctx<'_>, _params: Value) -> Result<Value, Runtime
         .is_some_and(|m| m.values().all(|v| v.as_array().is_some_and(Vec::is_empty)));
     let mut report = report;
     report["clean"] = json!(clean);
+    report["minted_document_types"] = json!(minted_document_types);
+    report["forms_without_document_type"] = json!(forms_without_document_type);
     Ok(report)
 }
 
