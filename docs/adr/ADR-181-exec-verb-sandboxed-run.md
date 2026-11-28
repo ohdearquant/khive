@@ -880,6 +880,9 @@ Amended by [Amendment 14](#amendment-14-2026-10-21-the-executables-bytes-the-mac
 and 5 with three items added, and acceptance arms 44, 45, 49 to 53, 56, 58, 59 and 60, with arms 61 to 67 added. No host
 turns networked runs on before Amendment 14 is accepted.
 
+Decision item 7 is replaced by [Amendment 19](#amendment-19-2026-11-27-toolrequest-creates-a-request-unless-a-grant-allows)
+item 1, which applies its rule to every registered row.
+
 This amendment provides the network declaration that a host needs to run adapters which reach a
 remote service under exec. It does not decide which registrations may declare it.
 
@@ -2067,3 +2070,66 @@ minted and the caller never saw its reference.
     delete of `dir` is refused naming `recursive`; `dir/`, `./dir` and `dir/../dir` with `recursive` are each
     refused by the path rule.
 99. **Compatibility.** A three-change reply from each verb equals today's reply plus the three fields.
+
+## Amendment 19 (2026-11-27): `tool.request` creates a request unless a grant allows
+
+**Status: Accepted 2026-11-27 (#6926).** It amends ADR-180's Approval fast path for every registered row, and replaces Amendment 13
+Decision item 7, whose rule it applies to every row instead of rows carrying `network` only. A call whose decision is
+`allow` from a grant is answered as today, and no decision changes.
+
+### Context
+
+A host that moves its working tools onto computers registers tools that only read, some of them with a tool profile
+(Amendment 17), and each such tool has to be able to obtain a grant.
+
+`tool.request` returns the decision without a request row whenever the decision is `allow`
+(`khive-pack-tool/src/handlers.rs:1285-1293`). A registration with `side_effect: "read"` and no policy row is allowed
+by default (`khive-pack-tool/src/policy.rs:1323-1327`), so `tool.request` answers it with `request_id: null`. A run of a
+tool with a profile is honoured only when a grant allows it (Amendment 17 item 5). A read tool with a profile is
+therefore refused `tool_profile_unhonoured:` on every run and has no way to ask for the grant that would let it run.
+Measured on a computer: such a tool was refused, `tool.request` for it returned no request id, and it ran only after
+it was registered with another side effect, which misstates what it does.
+
+Amendment 13 item 7 closed the same trap for rows carrying `network`. The tool pack has no code for that rule today
+(`khive-pack-tool/src` does not read `network`), so the trap is open for those rows as well.
+
+The tool pack does not read exec's configuration, so it cannot tell which rows have a profile, and narrowing the rule
+to them would need a read across packs. A call to `tool.request` is a caller asking for a grant, so the rule applies
+to every row.
+
+### Decision
+
+1. **A request is created unless a grant already allows.** `tool.request` inserts a request row and returns its id
+   whenever the decision is not `allow` with `source` `grant`: an `allow` from a policy row and an `allow` from the
+   side-effect default now create one, beside `ask` and `deny` as today. The row is the one the reference resolves to,
+   by name, id or prefix, as for every other `tool.request`. The request follows ADR-180's Approval contract
+   unchanged: it is created `requested` with a null pin, approval pins it, the self-grant refusal and the status
+   transitions apply, and `notify` is sent as for any other request. Each call inserts one row, as a call decided
+   `ask` does today; an open request for the same actor and tool is not reused.
+2. **A request changes no decision until it is granted.** No decision reads a request row: `tool.check`, `exec.run`
+   and every other caller of the decision see an open, denied or expired request as if it did not exist. A call
+   allowed by a policy row or by default stays allowed, from the same source, while the request is open and after it
+   is denied. A granted request decides as every grant does, ahead of policy rows (ADR-180 Amendment 4 item 7).
+3. **The reply names both.** The response carries the decision and its `source` as today, with `request_id`,
+   `status` and `notified` as for an `ask`, so the caller sees both that the call is allowed now and that a grant is
+   pending. A call whose decision is `allow` from a grant writes nothing and returns `request_id: null`.
+4. **The profile refusal names the next call.** Exec's `tool_profile_unhonoured:` reason for a run allowed other
+   than by a grant ends by naming `tool.request` with the tool's name as the call that asks for one.
+5. **Amendment 13 item 7.** Replaced by item 1. Arm 58 stands, with its first mutation control read as "restoring the
+   fast path for an `allow` that is not from a grant".
+
+### Acceptance
+
+100. **Default allow.** For a row registered `side_effect: "read"` with no policy row, `tool.check` returns `allow`
+     from `default`; `tool.request` returns `allow` from `default` with a non-null `request_id` and `status`
+     `requested`, and with `notify` set it sends the notice; `tool.check` afterwards still returns `allow` from
+     `default`. Mutation control: keeping the fast path for every `allow` turns this arm red.
+101. **Policy allow, then grant.** For a row allowed by a policy row, `tool.request` returns a request id and a
+     different actor grants it; `tool.check` then returns `allow` from `grant` with that grant's id, and a second
+     `tool.request` returns `request_id: null` and leaves the number of request rows unchanged. A second request on
+     a sibling row, denied instead, leaves that row's decision `allow` from `policy`. Mutation control: treating a
+     `requested` row as an active grant turns the first `tool.check` after the request red.
+102. **Profiled read tool.** For a row registered `side_effect: "read"` with a tool profile, a run is refused
+     `tool_profile_unhonoured:` with a reason naming `default` and `tool.request`; `tool.request` returns a request
+     id; after a different actor grants it, a run is honoured and its receipt's `tool_profile` names the tool.
+     Control: the same row with no profile runs from the default allow before any request.
