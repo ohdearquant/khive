@@ -335,6 +335,83 @@ async fn prebuilt_server_refuses_validator_bundle_before_validation_or_startup()
 }
 
 #[cfg(unix)]
+struct StandInRoute;
+
+#[cfg(unix)]
+impl khive_runtime::channel_send::ChannelSendRoute for StandInRoute {
+    fn send<'a>(
+        &'a self,
+        _runtime: &'a khive_runtime::KhiveRuntime,
+        _token: &'a khive_runtime::NamespaceToken,
+        _params: serde_json::Value,
+    ) -> khive_runtime::channel_send::ChannelSendFuture<'a> {
+        Box::pin(async { Ok(serde_json::Value::Null) })
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn prebuilt_server_with_pack_runtime_callbacks_requires_local_dispatch() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
+    std::env::remove_var("KHIVE_NO_DAEMON");
+    use clap::Parser;
+    use khive_runtime::{KhiveConfig, KhiveRuntime, RuntimeConfig, VerbRegistryBuilder};
+
+    let main_backend = Arc::new(khive_db::StorageBackend::memory().unwrap());
+    let default_runtime =
+        KhiveRuntime::from_backend(Arc::clone(&main_backend), RuntimeConfig::no_embeddings());
+    let mut routed_config = RuntimeConfig {
+        db_path: None,
+        ..RuntimeConfig::no_embeddings()
+    };
+    routed_config
+        .channel_send_routes
+        .register("stand_in", Arc::new(StandInRoute))
+        .unwrap();
+    let routed = Arc::new(KhiveRuntime::new(routed_config).unwrap());
+    let mut registry = VerbRegistryBuilder::new();
+    registry.register(khive_pack_kg::KgPack::new(default_runtime.clone()));
+    registry.register(khive_pack_comm::CommPack::new(routed.as_ref().clone()));
+    let multi = super::startup::MultiBackendRegistry {
+        registry: registry.build().unwrap(),
+        default_namespace: "local".into(),
+        config_id: "pack-callback-fixture".into(),
+        per_pack_runtimes: [
+            ("kg".into(), Arc::new(default_runtime.clone())),
+            ("comm".into(), routed),
+        ]
+        .into(),
+        main_backend,
+        default_runtime,
+    };
+    let server = super::server_build::build_server_from_multi_backend_registry(
+        multi,
+        &KhiveConfig::default(),
+        None,
+    );
+    let args = crate::args::Args::parse_from(["mcp", "--transport", "config-capture"]);
+    let result = super::serve_server_with_registrations(
+        server,
+        &args,
+        &crate::transport::TransportRegistry::new(),
+        None,
+        None,
+        ServeRegistrations::new(),
+    )
+    .await;
+    assert!(
+        result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.to_string().contains("KHIVE_NO_DAEMON=1")),
+        "the routed comm runtime must require local dispatch: {result:?}"
+    );
+}
+
+#[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn prebuilt_server_with_runtime_callbacks_requires_local_dispatch() {
@@ -365,17 +442,6 @@ async fn prebuilt_server_with_runtime_callbacks_requires_local_dispatch() {
         server.carries_process_local_callbacks(),
         "validators installed on RuntimeConfig are process-local callbacks"
     );
-    struct StandInRoute;
-    impl khive_runtime::channel_send::ChannelSendRoute for StandInRoute {
-        fn send<'a>(
-            &'a self,
-            _runtime: &'a khive_runtime::KhiveRuntime,
-            _token: &'a khive_runtime::NamespaceToken,
-            _params: serde_json::Value,
-        ) -> khive_runtime::channel_send::ChannelSendFuture<'a> {
-            Box::pin(async { Ok(serde_json::Value::Null) })
-        }
-    }
     let mut routed = khive_runtime::RuntimeConfig {
         db_path: None,
         ..khive_runtime::RuntimeConfig::no_embeddings()

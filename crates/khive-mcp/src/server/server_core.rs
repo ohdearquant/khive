@@ -97,6 +97,9 @@ pub struct KhiveMcpServer {
     /// [`Self::from_registry`]/[`Self::from_registry_with_meta`] without an
     /// explicit [`Self::with_runtime`] call (test-only construction paths).
     pub(super) runtime: Option<KhiveRuntime>,
+    /// Whether the assembled per-pack runtimes carry local callbacks.
+    #[cfg(unix)]
+    pub(super) per_pack_local_callbacks: bool,
     /// Runtime that owns the outbound `message` notes the delivery loops
     /// scan, claim, and mark — the comm pack's assigned runtime. Every one of
     /// those touches is deliberately non-wire (the generic verbs run on the
@@ -401,20 +404,40 @@ impl KhiveMcpServer {
     /// configuration validators or `comm.send` routes. Those callbacks exist
     /// only in this process, so its requests must not be forwarded to a daemon.
     ///
-    /// This reads the default runtime and, with a channel feature, the comm
-    /// outbox runtime. The standard builders derive every pack runtime from the
-    /// same configuration as those. A host that assembles its registry over
-    /// other runtimes carrying callbacks must select local dispatch itself.
+    /// The multi-backend builder checks the per-pack runtimes at construction.
+    /// The default runtime and comm outbox can also be attached separately.
     #[cfg(unix)]
     pub(crate) fn carries_process_local_callbacks(&self) -> bool {
-        let carries = |runtime: &KhiveRuntime| {
-            let config = runtime.config();
-            !config.channel_config_validators.is_empty() || !config.channel_send_routes.is_empty()
-        };
-        #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-        if self.channel_outbox_runtime.as_ref().is_some_and(carries) {
+        if self.per_pack_local_callbacks {
             return true;
         }
-        self.runtime.as_ref().is_some_and(carries)
+        #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+        if self
+            .channel_outbox_runtime
+            .as_ref()
+            .is_some_and(Self::runtime_carries_process_local_callbacks)
+        {
+            return true;
+        }
+        self.runtime
+            .as_ref()
+            .is_some_and(Self::runtime_carries_process_local_callbacks)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_per_pack_local_callbacks<'a>(
+        mut self,
+        runtimes: impl IntoIterator<Item = &'a KhiveRuntime>,
+    ) -> Self {
+        self.per_pack_local_callbacks = runtimes
+            .into_iter()
+            .any(Self::runtime_carries_process_local_callbacks);
+        self
+    }
+
+    #[cfg(unix)]
+    fn runtime_carries_process_local_callbacks(runtime: &KhiveRuntime) -> bool {
+        let config = runtime.config();
+        !config.channel_config_validators.is_empty() || !config.channel_send_routes.is_empty()
     }
 }
