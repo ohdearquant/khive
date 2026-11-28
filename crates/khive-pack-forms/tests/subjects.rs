@@ -5,6 +5,7 @@
 //! Form A declares a payer and a recipient and prints one identifier for each.
 //! Form B declares an owner, three held items that belong to the owner, and a
 //! postal address that the delivery choice "by post" brings into play.
+//! Form C, further down, holds pairs of its lines to match or to differ.
 
 use khive_pack_forms::FormsPack;
 use khive_runtime::{KhiveRuntime, PackRegistry, RuntimeConfig, VerbRegistry, VerbRegistryBuilder};
@@ -945,4 +946,401 @@ async fn an_answer_for_a_line_not_asked_holds_no_premise() {
         1,
         "{reply}"
     );
+}
+
+const C: &str = "SUBJ-C";
+
+/// Form C declares an owner, an account held at a receiver, and constraints
+/// across its lines: the holder's name twice, the account number twice, two
+/// tax numbers that must differ, and two banks compared by a caller's key.
+fn form_c() -> Value {
+    let by_owner = |label: &str, order: u32, about: &str, field: &str| {
+        let mut item = line(label, order, about, field);
+        item["filled_by"] = json!("owner");
+        item
+    };
+    let mut on_account = by_owner("Name on the account", 2, "account", "holder name");
+    on_account["known_to"] = json!("receiver");
+    let mut number = by_owner("Account number", 3, "account", "account number");
+    number["state"] = json!("given");
+    number["necessity"] = json!("required");
+    number["known_to"] = json!({"relation": "held at"});
+    let mut again = by_owner("Account number again", 4, "account", "account number");
+    again["state"] = json!("repeated");
+    json!({
+        "form_id": C,
+        "revision": "2026-03",
+        "title": "Account held at another party",
+        "source": source(3),
+        "terms": {
+            "kinds": ["party", "holding"],
+            "roles": ["owner", "holding", "receiver"],
+            "relations": ["held at"],
+            "purposes": [{"name": "account opening", "definition": "Opening an account for a party."}]
+        },
+        "purposes": ["account opening"],
+        "subjects": [
+            {"id": "owner", "kind": "party", "role": "owner"},
+            {"id": "account", "kind": "holding", "role": "holding", "relations": [{"relation": "held at", "to": "receiver"}]},
+            {"id": "receiver", "kind": "party", "role": "receiver"}
+        ],
+        "fields": [
+            {"name": "holder name", "definition": "The name an account is held under.", "value_type": "text", "comparison": "folded"},
+            {"name": "account number", "definition": "Number that identifies an account to the party holding it.", "value_type": "identifier", "comparison": "digits"},
+            {"name": "tax number", "definition": "Number a tax authority gives a party.", "value_type": "identifier", "comparison": "digits"},
+            {"name": "bank", "definition": "The institution an account is held at.", "value_type": "text", "comparison": "key"}
+        ],
+        "items": [
+            line("Holder name", 1, "owner", "holder name"),
+            on_account,
+            number,
+            again,
+            line("Owner's tax number", 5, "owner", "tax number"),
+            by_owner("Receiver's tax number", 6, "receiver", "tax number"),
+            by_owner("Bank", 7, "account", "bank"),
+            by_owner("Receiving bank", 8, "receiver", "bank")
+        ],
+        "constraints": [
+            {"must": "match", "text": "The name on the account is the holder's name", "lines": [{"subject": "owner", "field": "holder name"}, {"subject": "account", "field": "holder name"}]},
+            {"must": "match", "text": "Give the account number twice", "lines": [{"subject": "account", "field": "account number", "state": "given"}, {"subject": "account", "field": "account number", "state": "repeated"}]},
+            {"must": "differ", "text": "The receiver is not the owner", "lines": [{"subject": "owner", "field": "tax number"}, {"subject": "receiver", "field": "tax number"}]},
+            {"must": "match", "lines": [{"subject": "account", "field": "bank"}, {"subject": "receiver", "field": "bank"}]}
+        ]
+    })
+}
+
+/// Answers to every line of form C that meet its constraints, with the
+/// repeated account number as given.
+fn c_answers(repeated: &str) -> Value {
+    json!([
+        {"subject": "owner", "field": "holder name", "value": "Ada Lovelace"},
+        {"subject": "account", "field": "holder name", "value": "  ada   LOVELACE "},
+        {"subject": "account", "field": "account number", "state": "given", "value": "12-345"},
+        {"subject": "account", "field": "account number", "state": "repeated", "value": repeated},
+        {"subject": "owner", "field": "tax number", "value": "111-22"},
+        {"subject": "receiver", "field": "tax number", "value": "333 44"},
+        {"subject": "account", "field": "bank", "value": "First Bank", "key": "FB-1"},
+        {"subject": "receiver", "field": "bank", "value": "First Bank plc", "key": "FB-1"}
+    ])
+}
+
+fn item_labels(finding: &Value) -> Vec<Value> {
+    finding["lines"]
+        .as_array()
+        .expect("lines")
+        .iter()
+        .map(|l| l["item"].clone())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_8_a_must_match_pair_answered_differently_is_one_finding_naming_both_lines() {
+    let store = Store::new();
+    store.load(form_c()).await;
+
+    let agreed = store.check(&[C], c_answers("12 345")).await;
+    assert_eq!(agreed["findings"], json!([]), "{agreed}");
+    assert_eq!(agreed["constraints_unchecked"], json!([]), "{agreed}");
+    assert_eq!(agreed["consistent"], true, "{agreed}");
+
+    let reply = store.check(&[C], c_answers("12 346")).await;
+    assert_eq!(
+        reply["findings"].as_array().map(Vec::len),
+        Some(1),
+        "{reply}"
+    );
+    let unmet = kinds(&reply["findings"], "constraint_unmet");
+    assert_eq!(unmet.len(), 1, "{reply}");
+    assert_eq!(unmet[0]["must"], "match");
+    assert_eq!(unmet[0]["text"], "Give the account number twice");
+    assert_eq!(
+        item_labels(&unmet[0]),
+        [json!("Account number"), json!("Account number again")],
+        "{reply}"
+    );
+    assert_eq!(reply["consistent"], false);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_field_compares_its_answers_its_own_way() {
+    let store = Store::new();
+    store.load(form_c()).await;
+    let with = |index: usize, answer: Value| {
+        let mut answers = c_answers("12 345");
+        answers[index] = answer;
+        answers
+    };
+    let unmet = |reply: &Value| kinds(&reply["findings"], "constraint_unmet");
+
+    // Folded: case and spacing do not count, a different name does.
+    let reply = store
+        .check(
+            &[C],
+            with(
+                1,
+                json!({"subject": "account", "field": "holder name", "value": "Ada King"}),
+            ),
+        )
+        .await;
+    assert_eq!(unmet(&reply).len(), 1, "{reply}");
+    assert_eq!(
+        unmet(&reply)[0]["text"],
+        "The name on the account is the holder's name"
+    );
+
+    // Digits: the same digits under other punctuation are the same, so a
+    // pair that must differ is a finding.
+    let reply = store
+        .check(
+            &[C],
+            with(
+                5,
+                json!({"subject": "receiver", "field": "tax number", "value": "(111) 22"}),
+            ),
+        )
+        .await;
+    assert_eq!(unmet(&reply).len(), 1, "{reply}");
+    assert_eq!(unmet(&reply)[0]["must"], "differ");
+    assert!(
+        unmet(&reply)[0]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("are the same")),
+        "{reply}"
+    );
+
+    // Key: different wording under one key matches, a different key does not.
+    let reply = store
+        .check(
+            &[C],
+            with(
+                7,
+                json!({"subject": "receiver", "field": "bank", "value": "First Bank", "key": "FB-2"}),
+            ),
+        )
+        .await;
+    assert_eq!(unmet(&reply).len(), 1, "{reply}");
+    assert_eq!(
+        item_labels(&unmet(&reply)[0]),
+        [json!("Bank"), json!("Receiving bank")]
+    );
+
+    // Key: an answer that gives no key leaves the constraint unchecked.
+    let reply = store
+        .check(
+            &[C],
+            with(
+                7,
+                json!({"subject": "receiver", "field": "bank", "value": "First Bank"}),
+            ),
+        )
+        .await;
+    assert_eq!(unmet(&reply), Vec::<Value>::new(), "{reply}");
+    let unchecked = reply["constraints_unchecked"]
+        .as_array()
+        .expect("constraints_unchecked");
+    assert_eq!(unchecked.len(), 1, "{reply}");
+    assert!(
+        unchecked[0]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("gives no key")),
+        "{reply}"
+    );
+    assert_eq!(reply["consistent"], false);
+
+    // A line with no answer is reported missing, not compared.
+    let mut answers = c_answers("12 346");
+    answers.as_array_mut().expect("answers").remove(3);
+    let reply = store.check(&[C], answers).await;
+    assert_eq!(unmet(&reply), Vec::<Value>::new(), "{reply}");
+    assert_eq!(reply["constraints_unchecked"], json!([]), "{reply}");
+    let open = missing(&reply);
+    assert_eq!(open.len(), 1, "{reply}");
+    assert_eq!(open[0]["lines"][0]["label"], "Account number again");
+}
+
+/// The missing finding for the account number as first given.
+fn given_number_missing(reply: &Value) -> Vec<Value> {
+    missing_of(reply, "account", "account number")
+        .into_iter()
+        .filter(|f| f["state"] == "given")
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_constraint_names_two_printed_lines_that_compare_one_way() {
+    let store = Store::new();
+    let holder = json!({"subject": "owner", "field": "holder name"});
+    let cases = [
+        (
+            json!([{"must": "match", "lines": [{"subject": "receiver", "field": "holder name"}, holder]}]),
+            "which the form does not print",
+        ),
+        (
+            json!([{"must": "match", "lines": [holder, {"subject": "owner", "field": "tax number"}]}]),
+            "both lines of a constraint compare one way",
+        ),
+        (
+            json!([{"must": "match", "lines": [holder]}]),
+            "this one names 1",
+        ),
+        (
+            json!([{"must": "match", "lines": [holder, {"subject": "Owner", "field": "Holder  Name"}]}]),
+            "twice",
+        ),
+        (
+            json!([{"must": "equal", "lines": [holder, {"subject": "account", "field": "holder name"}]}]),
+            "must must be one of match, differ",
+        ),
+        (
+            json!([{"must": "match", "lines": [{"field": "holder name"}, holder]}]),
+            "without a subject",
+        ),
+        (
+            json!([{"must": "match", "lines": [{"subject": "bank", "field": "holder name"}, holder]}]),
+            "does not declare \"bank\"",
+        ),
+    ];
+    for (constraints, expected) in cases {
+        let mut document = form_c();
+        document["constraints"] = constraints;
+        let message = store
+            .refused("forms.load", json!({"document": document}))
+            .await;
+        assert!(message.contains(expected), "{expected}: {message}");
+    }
+    // Nothing of the refused documents stayed behind.
+    store.load(form_c()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn purposes_known_to_and_comparisons_are_checked_at_load() {
+    let store = Store::new();
+    let refused = |document: Value, expected: &'static str| {
+        let store = &store;
+        async move {
+            let message = store
+                .refused("forms.load", json!({"document": document}))
+                .await;
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
+    };
+
+    let mut document = form_c();
+    document["purposes"] = json!(["account closing"]);
+    refused(document, "which is not a loaded purpose").await;
+
+    let mut document = form_c();
+    document["items"][0]["known_to"] = json!({"relation": "held at"});
+    refused(document, "names no subject under that relation").await;
+
+    let mut document = form_c();
+    document["items"][0]["known_to"] = json!("bank");
+    refused(document, "(known_to)").await;
+
+    let mut document = form_c();
+    document["fields"][1]["comparison"] = json!("soundex");
+    refused(
+        document,
+        "comparison must be one of exact, folded, digits, key",
+    )
+    .await;
+
+    store.load(form_c()).await;
+    // A field compares one way on every form that prints it.
+    let mut revision = form_c();
+    revision["revision"] = json!("2026-04");
+    revision["source"] = source(4);
+    revision.as_object_mut().expect("document").remove("terms");
+    revision["fields"][1]["comparison"] = json!("exact");
+    refused(
+        revision,
+        "field \"account number\" compares its answers by \"digits\"; the document says \"exact\"",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_purpose_lists_its_forms_and_a_line_names_who_already_holds_its_value() {
+    let store = Store::new();
+    store.load(form_c()).await;
+
+    let purpose = store
+        .call(
+            "forms.neighbourhood",
+            json!({"node": "purpose:account opening"}),
+        )
+        .await;
+    assert_eq!(purpose["term"]["list"], "purpose", "{purpose}");
+    let forms = purpose["forms"].as_array().expect("forms");
+    assert_eq!(forms.len(), 1, "{purpose}");
+    assert_eq!(forms[0]["form_id"], C);
+
+    let form = store.call("forms.neighbourhood", json!({"node": C})).await;
+    assert_eq!(form["purposes"], json!(["account opening"]), "{form}");
+    assert_eq!(
+        form["constraints"].as_array().map(Vec::len),
+        Some(4),
+        "{form}"
+    );
+
+    // Named directly, and derived through the account's relation.
+    for (field, item) in [
+        ("holder name", "Name on the account"),
+        ("account number", "Account number"),
+    ] {
+        let reply = store
+            .call("forms.neighbourhood", json!({"node": field}))
+            .await;
+        let asked = reply["asked_of"]
+            .as_array()
+            .expect("asked_of")
+            .iter()
+            .find(|a| a["item"] == item)
+            .cloned()
+            .expect("the line");
+        assert_eq!(asked["known_to"], "receiver", "{reply}");
+    }
+
+    let reply = store.check(&[C], json!([])).await;
+    let open = given_number_missing(&reply);
+    assert_eq!(open.len(), 1, "{reply}");
+    assert_eq!(open[0]["filled_by"], "owner");
+    assert_eq!(open[0]["known_to"], "receiver");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn constraints_purposes_and_known_to_survive_export_and_replay() {
+    let store = Store::new();
+    store.load(form_c()).await;
+    let exported = store.call("forms.export", json!({})).await;
+
+    let empty = Store::new();
+    empty
+        .call("forms.replay", json!({"document": exported.clone()}))
+        .await;
+    let again = empty.call("forms.export", json!({})).await;
+    assert_eq!(again["nodes"], exported["nodes"]);
+    assert_eq!(again["edges"], exported["edges"]);
+    assert_eq!(again["log"], exported["log"]);
+
+    let reply = empty.check(&[C], c_answers("12 346")).await;
+    assert_eq!(
+        kinds(&reply["findings"], "constraint_unmet").len(),
+        1,
+        "{reply}"
+    );
+    let purpose = empty
+        .call(
+            "forms.neighbourhood",
+            json!({"node": "purpose:account opening"}),
+        )
+        .await;
+    assert_eq!(
+        purpose["forms"].as_array().map(Vec::len),
+        Some(1),
+        "{purpose}"
+    );
+    let open = given_number_missing(&empty.check(&[C], json!([])).await);
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0]["known_to"], "receiver");
 }
