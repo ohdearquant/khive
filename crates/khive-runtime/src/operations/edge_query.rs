@@ -91,7 +91,11 @@ impl KhiveRuntime {
         let truncation_check = compiled.truncation_check;
 
         warnings.extend(self.with_pack_edge_rules(|pack_rules| {
-            static_impossible_edge_pattern_warnings(language, &ast.pattern, pack_rules)
+            ast.patterns()
+                .flat_map(|pattern| {
+                    static_impossible_edge_pattern_warnings(language, pattern, pack_rules)
+                })
+                .collect::<Vec<_>>()
         }));
 
         // Convert QueryValue params (query-layer type) to SqlValue (storage-layer type)
@@ -875,7 +879,7 @@ impl KhiveRuntime {
         }
         if let Some(props) = patch.properties {
             crate::secret_gate::reject_reserved_secret_gate_property(Some(&props))?;
-            edge.metadata = Some(props);
+            edge.metadata = Self::merge_edge_properties(&edge.metadata, props);
         }
 
         // For symmetric relations, canonicalise endpoint order and check

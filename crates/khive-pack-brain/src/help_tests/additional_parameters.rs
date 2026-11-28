@@ -33,10 +33,19 @@ fn brain_emit_params_non_empty_with_target_and_signal() {
         !h.params.is_empty(),
         "brain.emit must have params (mirrors brain.feedback)"
     );
-    assert!(
-        h.params.iter().any(|p| p.name == "target_id" && p.required),
-        "brain.emit must have required target_id"
-    );
+    assert!(matches!(h.visibility, khive_types::Visibility::Subhandler));
+    assert_eq!(h.params.iter().filter(|p| p.name == "id").count(), 1);
+    assert!(!h.params.iter().any(|p| p.name == "target_id"));
+    let id = h.params.iter().find(|p| p.name == "id").unwrap();
+    assert!(id.required, "brain.emit must have required id");
+    assert_eq!(id.param_type, "uuid");
+    assert!(matches!(
+        id.resolution_mode,
+        khive_types::IdResolutionMode::UnscopedById
+    ));
+    assert!(id.description.contains("target_id"));
+    assert!(id.description.contains("both"));
+    assert!(id.description.contains("is rejected"));
     assert!(
         h.params.iter().any(|p| p.name == "signal" && p.required),
         "brain.emit must have required signal"

@@ -1538,3 +1538,150 @@ async fn size_composition_can_be_skipped_while_page_accounting_is_still_reported
     assert_eq!(skipped.page_accounting, Some(pages));
     assert!(skipped.page_accounting_error.is_none());
 }
+
+/// The per-request progress gate cannot outlive a failed fixture or panic.
+struct ReleaseDiagnosticGraphGate(Arc<crate::read_cancellation::DiagnosticGraphTestProbe>);
+
+impl Drop for ReleaseDiagnosticGraphGate {
+    fn drop(&mut self) {
+        self.0.release.store(true, Ordering::Release);
+    }
+}
+
+async fn await_diagnostic_graph_progress(
+    probe: &crate::read_cancellation::DiagnosticGraphTestProbe,
+) {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while !probe.entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fixture did not reach graph SQL progress");
+    assert!(
+        !probe.fail_safe.load(Ordering::Acquire),
+        "fixture gate expired"
+    );
+    assert!(
+        !probe.graph_returned.load(Ordering::Acquire),
+        "graph query returned before the control action"
+    );
+}
+
+fn assert_seeded_graph(report: &DbDiagnostics) {
+    let graph = report.graph_edge_integrity.as_ref().expect("graph report");
+    assert_eq!(graph.duplicate_edge_id_groups, 1);
+    assert_eq!(graph.graph_edges_rows, 2_001);
+    assert_eq!(graph.graph_edges_seq_rows, 2_000);
+    assert_eq!(graph.live_entities_carrying_merged_into, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn cancelling_inflight_graph_diagnostics_settles_its_standalone_connection() {
+    use crate::read_cancellation::{scope_test_diagnostic_graph_probe, DiagnosticGraphTestProbe};
+
+    let dir = tempfile::tempdir().expect("temporary diagnostic fixture");
+    let (pool, _) = seeded_pool(&dir);
+    {
+        let writer = pool.try_writer().expect("fixture writer");
+        writer
+            .conn()
+            .execute_batch(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<2000) \
+                 INSERT INTO graph_edges(namespace, id) SELECT 'local', printf('g%05d', x) FROM n; \
+                 INSERT INTO graph_edges_seq(edge_id) SELECT id FROM graph_edges; \
+                 INSERT INTO graph_edges(namespace, id) VALUES('other', 'g00001'); \
+                 INSERT INTO entities(id, deleted_at, merged_into) VALUES('source', NULL, 'target');",
+            )
+            .expect("seed nonempty graph fixture");
+    }
+    let pool = Arc::new(pool);
+    let baseline = collect_with_audit_append_failures_interruptibly(
+        Arc::clone(&pool),
+        BuildIdentity::from_env("test", None),
+        Duration::from_secs(30),
+        0,
+    )
+    .await
+    .expect("positive baseline diagnostic");
+    assert_seeded_graph(&baseline);
+
+    // The same gated query completes normally when explicitly released without
+    // cancellation. Replacing the cancellation action with release should
+    // fail the named typed-timeout assertion, not time out in the fixture.
+    for cancel in [false, true] {
+        let probe = Arc::new(DiagnosticGraphTestProbe::default());
+        let _release_on_drop = ReleaseDiagnosticGraphGate(Arc::clone(&probe));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let diagnostic_pool = Arc::clone(&pool);
+        let task_probe = Arc::clone(&probe);
+        let task = tokio::spawn(async move {
+            scope_test_diagnostic_graph_probe(
+                task_probe,
+                crate::scope_request_read_cancellation(cancel_rx, async move {
+                    collect_with_audit_append_failures_interruptibly(
+                        diagnostic_pool,
+                        BuildIdentity::from_env("test", None),
+                        Duration::from_secs(30),
+                        0,
+                    )
+                    .await
+                }),
+            )
+            .await
+        });
+        await_diagnostic_graph_progress(&probe).await;
+        if cancel {
+            cancel_tx.send(true).expect("cancel active graph query");
+        } else {
+            probe.release.store(true, Ordering::Release);
+        }
+        let result = tokio::time::timeout(Duration::from_secs(4), task)
+            .await
+            .expect("fixture worker failed to settle")
+            .expect("fixture task panicked");
+        assert!(
+            !probe.fail_safe.load(Ordering::Acquire),
+            "fixture gate expired"
+        );
+        assert!(
+            probe.graph_returned.load(Ordering::Acquire),
+            "graph never returned"
+        );
+        assert!(
+            probe.connection_dropped.load(Ordering::Acquire),
+            "standalone connection must drop before the worker exits"
+        );
+        assert!(
+            probe.worker_exited.load(Ordering::Acquire),
+            "worker did not exit"
+        );
+        if cancel {
+            assert!(
+                matches!(result, Err(StorageError::Timeout { .. })),
+                "cancelling the in-flight graph query must return a typed timeout"
+            );
+            assert!(
+                probe.interrupt_latched.load(Ordering::Acquire),
+                "cancellation must latch the registered SQLite interrupt"
+            );
+            assert!(
+                probe.progress_returned_stop.load(Ordering::Acquire),
+                "the in-flight graph progress callback must return the stop predicate"
+            );
+        } else {
+            assert!(!probe.interrupt_latched.load(Ordering::Acquire));
+            assert_seeded_graph(&result.expect("uncancelled semantic control"));
+        }
+    }
+    let after = collect_with_audit_append_failures_interruptibly(
+        Arc::clone(&pool),
+        BuildIdentity::from_env("test", None),
+        Duration::from_secs(30),
+        0,
+    )
+    .await
+    .expect("subsequent diagnostic after cancellation");
+    assert_seeded_graph(&after);
+}

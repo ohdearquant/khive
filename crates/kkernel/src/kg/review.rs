@@ -572,8 +572,8 @@ mod tests {
     fn parse(op: serde_json::Value) -> ChangeSet {
         let envelope = serde_json::json!({
             "schema_version": khive_changeset::CURRENT_SCHEMA_VERSION,
-            "producer": "lambda:atlas",
-            "producer_model_family": "family:atlas",
+            "producer": "lambda:bob",
+            "producer_model_family": "family:bob",
             "staged_at": 1_000_000_u64,
         });
         khive_changeset::from_ndjson(&format!("{}\n{}\n", envelope, op)).unwrap()
@@ -641,7 +641,7 @@ mod tests {
 
     #[test]
     fn same_family_gate_is_ineligible() {
-        let gate = evaluate_review_gate(true, true, "family:atlas", Some("family:atlas"));
+        let gate = evaluate_review_gate(true, true, "family:bob", Some("family:bob"));
         assert!(!gate.eligible);
         assert!(!gate.approval_ready);
         assert_eq!(gate.status, "ineligible_same_model_family");

@@ -348,7 +348,7 @@ async fn whole_ascii_signals_are_distinct_case_folded_and_stably_tied() {
 }
 
 #[tokio::test]
-async fn common_shortword_dilution_preserves_the_equal_count_limit() {
+async fn function_words_do_not_count_as_short_token_signals() {
     let store = fixture();
     seed(
         &store,
@@ -379,12 +379,12 @@ async fn common_shortword_dilution_preserves_the_equal_count_limit() {
             .search_with_options(req, options.clone())
             .await
             .unwrap();
-        assert_identity(&hits, &legacy_hits(&old, options.gather_mode));
         assert_eq!(
             ids(&hits),
-            vec![Uuid::from_u128(1), Uuid::from_u128(2)],
-            "of and 2 each contribute one point; no implicit numeral priority"
+            vec![Uuid::from_u128(2), Uuid::from_u128(1)],
+            "only 2 counts; the function word of must not tie the row that lacks 2"
         );
+        assert_fields_and_scores(&hits, &old, options.gather_mode);
     }
 }
 

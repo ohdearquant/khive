@@ -727,3 +727,224 @@ async fn email_delivery_without_policy_stops_permanently_without_smtp_or_restart
         "configuration refusal must preserve the queued note"
     );
 }
+
+#[cfg(feature = "channel-email")]
+async fn fixture_with_stored_email_tags(
+    recipient: &str,
+    policy: khive_runtime::OutboundEmailPolicy,
+    tags: &[&str],
+) -> (KhiveMcpServer, KhiveRuntime, uuid::Uuid) {
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        actor_id: Some("actor:outbox-supervision".into()),
+        brain_profile: None,
+        packs: vec!["kg".into(), "comm".into()],
+        ..RuntimeConfig::no_embeddings()
+    })
+    .unwrap()
+    .with_outbound_email_policy(policy);
+    let server = KhiveMcpServer::new(runtime.clone()).unwrap();
+    let sent = server
+        .verb_registry_clone()
+        .dispatch(
+            "comm.send",
+            json!({
+                "to": recipient,
+                "subject": "delivery state",
+                "content": "pending supervised delivery",
+                "tags": tags
+            }),
+        )
+        .await
+        .unwrap();
+    let id = sent["full_id"].as_str().unwrap().parse().unwrap();
+    (server, runtime, id)
+}
+
+#[cfg(feature = "channel-email")]
+async fn run_stored_email_to_terminal_delivery(
+    server: KhiveMcpServer,
+    runtime: KhiveRuntime,
+    id: uuid::Uuid,
+) -> (Arc<ScriptedChannel>, serde_json::Value) {
+    let channel = Arc::new(ScriptedChannel::new("email", [Outcome::Delivered]));
+    let health = HealthReporter::default();
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn(supervise(
+        email_registration_with_policy(runtime.clone(), channel.clone()),
+        server,
+        cancellation.clone(),
+        health,
+    ));
+    let terminal = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let props = properties(&runtime, id).await;
+            if props["delivery"] == "delivered" || props["delivery"] == "failed" {
+                break props;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("tagged email supervisor must stop after cancellation")
+        .unwrap();
+    let props = terminal.expect("tagged email must reach a terminal delivery state");
+    (channel, props)
+}
+
+#[cfg(feature = "channel-email")]
+async fn assert_stored_list_footer_delivery(default_footer: Result<&str, &str>) {
+    let policy = khive_runtime::OutboundEmailPolicy::configured_for_tests(
+        vec!["maintainer@example.com".into()],
+        vec!["actor:outbox-supervision".into()],
+        5,
+    )
+    .unwrap()
+    .with_external_footer_for_tests(default_footer)
+    .with_list_footer_for_tests(Ok("List notice: {unsubscribe}"));
+    let (server, runtime, id) = fixture_with_stored_email_tags(
+        "email:external@example.net",
+        policy.clone(),
+        &["unrelated", "traffic:list"],
+    )
+    .await;
+    assert_eq!(
+        properties(&runtime, id).await["tags"],
+        json!(["unrelated", "traffic:list"])
+    );
+    let (channel, props) = run_stored_email_to_terminal_delivery(server, runtime, id).await;
+    assert_eq!(props["delivery"], "delivered", "{props}");
+    assert_eq!(channel.sends.load(Ordering::SeqCst), 1);
+    let captured = channel.captured.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let envelope = &captured[0];
+    let header = envelope
+        .list_unsubscribe
+        .as_deref()
+        .expect("external list message must carry List-Unsubscribe");
+    let token = header
+        .strip_prefix("<mailto:sender@example.com?subject=unsubscribe%20")
+        .and_then(|value| value.strip_suffix('>'))
+        .expect("list header must carry the sender mailbox and token");
+    assert_eq!(
+        policy.verify_unsubscribe_token(token).as_deref(),
+        policy.recipient_key("external@example.net").as_deref()
+    );
+    assert_eq!(
+        envelope.content,
+        format!(
+            "pending supervised delivery\n\nList notice: To unsubscribe, send an email to sender@example.com with the subject: unsubscribe {token}"
+        )
+    );
+    assert!(!envelope.content.contains("{unsubscribe}"));
+}
+
+#[cfg(feature = "channel-email")]
+#[tokio::test]
+async fn external_list_email_renders_stored_list_footer() {
+    assert_stored_list_footer_delivery(Ok("Default notice: {unsubscribe}")).await;
+}
+
+#[cfg(feature = "channel-email")]
+#[tokio::test]
+async fn external_list_email_renders_when_default_footer_is_unavailable() {
+    assert_stored_list_footer_delivery(Err("KHIVE_EMAIL_EXTERNAL_FOOTER_FILE could not be read"))
+        .await;
+}
+
+#[cfg(feature = "channel-email")]
+#[tokio::test]
+async fn external_list_email_missing_footer_after_admission_fails_before_smtp() {
+    let admitted = khive_runtime::OutboundEmailPolicy::configured_for_tests(
+        vec!["maintainer@example.com".into()],
+        vec!["actor:outbox-supervision".into()],
+        5,
+    )
+    .unwrap()
+    .with_list_footer_for_tests(Ok("List notice: {unsubscribe}"));
+    let (server, runtime, id) =
+        fixture_with_stored_email_tags("email:external@example.net", admitted, &["traffic:list"])
+            .await;
+    let admitted_props = properties(&runtime, id).await;
+    assert_eq!(admitted_props["tags"], json!(["traffic:list"]));
+    assert!(admitted_props.get("delivery").is_none(), "{admitted_props}");
+    // The stored message was admitted while its list footer was available.
+    // A fresh legacy constructor has a valid default footer and a missing list footer.
+    let runtime = runtime.with_outbound_email_policy(
+        khive_runtime::OutboundEmailPolicy::configured_for_tests(
+            vec!["maintainer@example.com".into()],
+            vec!["actor:outbox-supervision".into()],
+            5,
+        )
+        .unwrap()
+        .with_external_footer_for_tests(Ok("Default notice: {unsubscribe}")),
+    );
+    let (channel, props) = run_stored_email_to_terminal_delivery(server, runtime.clone(), id).await;
+    assert_eq!(props["delivery"], "failed", "{props}");
+    let last_error = props["last_error"].as_str().unwrap();
+    assert!(last_error.contains("footer is unavailable"), "{last_error}");
+    assert!(
+        last_error.contains("KHIVE_EMAIL_LIST_FOOTER_FILE is not set"),
+        "{last_error}"
+    );
+    assert_eq!(channel.sends.load(Ordering::SeqCst), 0);
+    assert!(channel.captured.lock().unwrap().is_empty());
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    assert!(runtime
+        .list_undelivered_outbound_messages(&token, Some("email:"), 200)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[cfg(feature = "channel-email")]
+#[tokio::test]
+async fn external_email_requires_an_exact_stored_list_tag() {
+    let policy = khive_runtime::OutboundEmailPolicy::configured_for_tests(
+        vec!["maintainer@example.com".into()],
+        vec!["actor:outbox-supervision".into()],
+        5,
+    )
+    .unwrap()
+    .with_external_footer_for_tests(Ok("Default notice: {unsubscribe}"));
+    let (server, runtime, id) = fixture_with_stored_email_tags(
+        "email:external@example.net",
+        policy,
+        &["Traffic:list", "traffic:list-extra", "prefix:traffic:list"],
+    )
+    .await;
+    let (channel, props) = run_stored_email_to_terminal_delivery(server, runtime, id).await;
+    assert_eq!(props["delivery"], "delivered", "{props}");
+    assert_eq!(channel.sends.load(Ordering::SeqCst), 1);
+    let captured = channel.captured.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert!(captured[0]
+        .content
+        .contains("\n\nDefault notice: To unsubscribe, send an email to sender@example.com"));
+    assert!(!captured[0].content.contains("List notice:"));
+    assert!(!captured[0].content.contains("{unsubscribe}"));
+}
+
+#[cfg(feature = "channel-email")]
+#[tokio::test]
+async fn policy_recipient_list_tag_carries_no_external_footer() {
+    let policy = khive_runtime::OutboundEmailPolicy::configured_for_tests(
+        vec!["maintainer@example.com".into()],
+        vec!["actor:outbox-supervision".into()],
+        5,
+    )
+    .unwrap();
+    let (server, runtime, id) =
+        fixture_with_stored_email_tags("email:maintainer@example.com", policy, &["traffic:list"])
+            .await;
+    let (channel, props) = run_stored_email_to_terminal_delivery(server, runtime, id).await;
+    assert_eq!(props["delivery"], "delivered", "{props}");
+    assert_eq!(channel.sends.load(Ordering::SeqCst), 1);
+    let captured = channel.captured.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert!(captured[0].list_unsubscribe.is_none());
+    assert_eq!(captured[0].content, "pending supervised delivery");
+}

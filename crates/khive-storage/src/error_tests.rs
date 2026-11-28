@@ -37,6 +37,109 @@ fn writer_task_request_state_display_is_stable() {
 }
 
 #[test]
+fn issued_commit_unknown_keeps_reply_source_and_never_implies_retry() {
+    let error = StorageError::WriteOutcomeUnknown {
+        source: Box::new(FakeSource("reply was lost".into())),
+    };
+    assert!(StdError::source(&error).unwrap().is::<FakeSource>());
+    assert_eq!(
+        error.writer_request_state(),
+        Some(WriterTaskRequestState::SideEffectsUnknown)
+    );
+    assert!(error.is_write_outcome_unknown());
+    assert!(!error.is_retryable());
+    assert_eq!(error.capability(), None);
+
+    let error = error.with_sqlite_write_failure(SqliteWriteFailure {
+        stage: SqliteWriteStage::Commit,
+        primary_code: 10,
+        extended_code: 10,
+        settlement_unknown: true,
+    });
+    assert!(error.is_write_outcome_unknown());
+    assert_eq!(
+        error.writer_request_state(),
+        Some(WriterTaskRequestState::SideEffectsUnknown)
+    );
+    assert!(!error.is_retryable());
+    let rolled_back = StorageError::WriterTaskRequestFailed {
+        request_state: WriterTaskRequestState::TransactionRolledBack,
+        source: Box::new(error),
+    };
+    assert_eq!(
+        rolled_back.writer_request_state(),
+        Some(WriterTaskRequestState::TransactionRolledBack)
+    );
+    assert!(
+        !rolled_back.is_write_outcome_unknown(),
+        "outer rollback proof owns finality"
+    );
+}
+
+#[test]
+fn strict_routing_refusals_preserve_owner_source_and_retry_policy() {
+    for (source, retryable) in [
+        (
+            StorageError::Pool {
+                operation: "open".into(),
+                message: "unavailable".into(),
+            },
+            true,
+        ),
+        (StorageError::WriterTaskNoRuntime, false),
+    ] {
+        let error = StorageError::WriterOwnerUnavailable {
+            operation: "create".into(),
+            source: Box::new(source),
+        };
+        let cause_box = StdError::source(&error)
+            .expect("owner refusal must retain its public source")
+            .downcast_ref::<Box<StorageError>>()
+            .expect("owner refusal source must retain its typed storage box");
+        let cause = cause_box.as_ref();
+        let StorageError::WriterOwnerUnavailable { operation, source } = &error else {
+            unreachable!("fixture constructs an owner-unavailable refusal")
+        };
+        assert_eq!(operation.as_ref(), "create");
+        assert!(
+            std::ptr::eq(cause_box, source),
+            "public source must be the exact stored owner-cause box"
+        );
+        match cause {
+            StorageError::Pool { operation, message } => {
+                assert_eq!(operation.as_ref(), "open");
+                assert_eq!(message, "unavailable");
+            }
+            StorageError::WriterTaskNoRuntime => assert!(
+                matches!(source.as_ref(), StorageError::WriterTaskNoRuntime),
+                "public NoRuntime cause must retain the stored NoRuntime identity"
+            ),
+            other => panic!("unexpected owner cause: {other:?}"),
+        }
+        assert_eq!(cause.is_retryable(), retryable);
+        assert_eq!(error.is_retryable(), retryable);
+        assert_eq!(
+            error.writer_request_state(),
+            Some(WriterTaskRequestState::NotStarted)
+        );
+        assert!(!error.is_write_outcome_unknown());
+        assert_eq!(
+            matches!(cause, StorageError::WriterTaskNoRuntime),
+            !retryable
+        );
+    }
+    let error = StorageError::WriterRouteViolation {
+        operation: "transaction".into(),
+    };
+    assert_eq!(
+        error.writer_request_state(),
+        Some(WriterTaskRequestState::NotStarted)
+    );
+    assert!(!error.is_retryable());
+    assert!(StdError::source(&error).is_none());
+}
+
+#[test]
 fn writer_task_busy_is_retryable_without_claiming_queue_rejection() {
     let error = StorageError::WriterTaskBusy { timeout_ms: 175 };
     assert!(error.is_retryable());
@@ -183,3 +286,30 @@ fn driver_err_sql(operation: &'static str, message: &str) -> StorageError {
 }
 
 include!("error_tests/unique_constraint_classification_tests.rs");
+
+#[test]
+fn secret_key_error_is_typed_notes_metadata_without_retry_or_raw_input() {
+    let key = format!("ghp_{}", "A".repeat(40));
+    let error = crate::note::validate_note_key_for_store(&key, "assign_note_key_if_unset")
+        .expect_err("a credential key must be refused");
+    assert_eq!(error.capability(), Some(StorageCapability::Notes));
+    assert!(!error.is_retryable(), "secret refusal is not transient");
+    let StorageError::SecretDetected {
+        capability,
+        operation,
+        matched,
+    } = &error
+    else {
+        panic!("expected typed secret refusal, got {error:?}");
+    };
+    assert_eq!(*capability, StorageCapability::Notes);
+    assert_eq!(operation.as_ref(), "assign_note_key_if_unset");
+    assert_eq!(matched.detector, "github-token");
+    assert_eq!(matched.trigger, None);
+    assert_eq!(matched.location.as_deref(), Some("note.key"));
+    assert_eq!(matched.masked, "ghp_AA...44chars");
+    assert_eq!(error.to_string(), format!("write blocked: {matched}"));
+    assert!(!error.to_string().contains(&key));
+    assert!(!format!("{error:?}").contains(&key));
+    assert!(StdError::source(&error).is_none());
+}

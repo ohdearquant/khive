@@ -98,11 +98,13 @@ fn packs() -> Vec<(&'static str, &'static [HandlerDef])> {
         ("code", khive_pack_code::CodePack::HANDLERS),
         ("comm", khive_pack_comm::CommPack::HANDLERS),
         ("exec", khive_pack_exec::ExecPack::HANDLERS),
+        ("forms", khive_pack_forms::FormsPack::HANDLERS),
         ("git", khive_pack_git::GitPack::HANDLERS),
         ("gtd", khive_pack_gtd::GtdPack::HANDLERS),
         ("kg", khive_pack_kg::KgPack::HANDLERS),
         ("knowledge", khive_pack_knowledge::KnowledgePack::HANDLERS),
         ("memory", khive_pack_memory::MemoryPack::HANDLERS),
+        ("operation", khive_pack_operation::OperationPack::HANDLERS),
         ("schedule", khive_pack_schedule::SchedulePack::HANDLERS),
         ("session", khive_pack_session::SessionPack::HANDLERS),
         ("tool", khive_pack_tool::ToolPack::HANDLERS),
@@ -121,8 +123,10 @@ fn packs() -> Vec<(&'static str, &'static [HandlerDef])> {
 /// each paired with whether this build links it. A deployment that links one
 /// turns it on by configuration, with no rebuild, so its descriptions reach
 /// callers and belong in this scan.
-const PACKS_OUTSIDE_THE_SHIPPED_SET: [(&str, bool); 4] = [
+const PACKS_OUTSIDE_THE_SHIPPED_SET: [(&str, bool); 6] = [
     ("charter", true),
+    ("forms", true),
+    ("operation", true),
     ("agent", cfg!(feature = "pack-agent")),
     ("telemetry", cfg!(feature = "pack-telemetry")),
     ("web", cfg!(feature = "pack-web")),

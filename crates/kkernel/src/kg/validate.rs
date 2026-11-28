@@ -1,11 +1,10 @@
 //! `kkernel kg validate` — structural and configurable rule-pass validation.
 
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use khive_rule_evaluator::{edge_source_id, edge_target_id, record_prefix};
+use khive_rule_evaluator::{edge_source_id, edge_target_id, record_prefix, NdjsonSource};
 use khive_runtime::pack::{PackRegistry, VerbRegistryBuilder};
 use khive_runtime::{KhiveRuntime, RuntimeConfig};
 use khive_storage::EdgeRelation;
@@ -14,6 +13,17 @@ use khive_types::EdgeEndpointRule;
 use super::types::{
     OutputFormat, RuleResult, ValidateArgs, ValidationReport, ValidationSummary, Violation,
 };
+
+mod cohorts;
+mod fixes;
+mod render;
+
+use cohorts::RuleCohorts;
+use fixes::apply_fixes;
+use render::render_validation;
+
+#[cfg(test)]
+use fixes::fix_sort_order;
 
 /// Taxonomy sets derived from the loaded pack registry; `pub(super)` so
 /// `kg::commit` (ADR-102) can reuse them. See
@@ -178,9 +188,12 @@ fn run_validation(args: &ValidateArgs) -> Result<ValidationRun> {
         &rules_path,
         &taxonomy,
     )?;
+    if args.fix {
+        report.ensure_unique_ids("original")?;
+    }
     let mut fixes = args.fix.then(FixSummary::default);
     if args.fix
-        && report.rules.iter().any(|rule| {
+        && report.rules().any(|rule| {
             rule.id == "sort-order"
                 && !rule.passed
                 && rule.violations.iter().any(|violation| violation.fixable)
@@ -195,27 +208,16 @@ fn run_validation(args: &ValidateArgs) -> Result<ValidationRun> {
             &rules_path,
             &taxonomy,
         )?;
-        let mut fixed = FixedCounts::default();
-        for (before, after) in report.rules.iter().zip(&final_report.rules) {
-            if before.id == "sort-order"
-                && before.violations.iter().any(|violation| violation.fixable)
-                && before.id == after.id
-                && before.severity == after.severity
-                && !before.passed
-                && after.passed
-            {
-                match before.severity {
-                    "error" => fixed.errors += 1,
-                    "warning" => fixed.warnings += 1,
-                    "info" => fixed.info += 1,
-                    _ => {}
-                }
-            }
-        }
+        let fixed = report
+            .fixed_counts_after(&final_report)
+            .context("reconciling rule identities after --fix (files may already have changed)")?;
         fixes = Some(FixSummary { files, fixed });
         report = final_report;
     }
-    Ok(ValidationRun { report, fixes })
+    Ok(ValidationRun {
+        report: report.into_report(),
+        fixes,
+    })
 }
 
 fn collect_validation_report(
@@ -225,30 +227,31 @@ fn collect_validation_report(
     notes_path: &Path,
     rules_path: &Path,
     taxonomy: &KgTaxonomy,
-) -> Result<ValidationReport> {
+) -> Result<RuleCohorts> {
     let entities = count_ndjson_lines(entities_path).unwrap_or(0);
     let edges = count_ndjson_lines(edges_path).unwrap_or(0);
     let notes = count_ndjson_lines(notes_path).unwrap_or(0);
 
-    let mut rule_results: Vec<RuleResult> =
-        structural_checks(entities_path, edges_path, notes_path, taxonomy);
+    let structural = structural_checks(entities_path, edges_path, notes_path, taxonomy);
+    let configurable = if !args.no_rules && rules_path.exists() {
+        configurable_rule_checks(entities_path, edges_path, notes_path, rules_path)?
+    } else {
+        Vec::new()
+    };
 
-    if !args.no_rules && rules_path.exists() {
-        let configurable =
-            configurable_rule_checks(entities_path, edges_path, notes_path, rules_path)?;
-        rule_results.extend(configurable);
-    }
-
-    let errors: usize = rule_results
+    let errors: usize = structural
         .iter()
+        .chain(&configurable)
         .filter(|r| r.severity == "error" && !r.passed)
         .count();
-    let warnings: usize = rule_results
+    let warnings: usize = structural
         .iter()
+        .chain(&configurable)
         .filter(|r| r.severity == "warning" && !r.passed)
         .count();
-    let info: usize = rule_results
+    let info: usize = structural
         .iter()
+        .chain(&configurable)
         .filter(|r| r.severity == "info" && !r.passed)
         .count();
 
@@ -268,10 +271,7 @@ fn collect_validation_report(
         passed,
     };
 
-    Ok(ValidationReport {
-        rules: rule_results,
-        summary,
-    })
+    Ok(RuleCohorts::new(structural, configurable, summary))
 }
 
 fn count_ndjson_lines(path: &Path) -> Option<usize> {
@@ -306,9 +306,13 @@ fn check_required_input_files(
     notes_path: &Path,
 ) -> RuleResult {
     let mut violations = Vec::new();
-    for path in [entities_path, edges_path] {
+    for (path, source) in [
+        (entities_path, NdjsonSource::Entities),
+        (edges_path, NdjsonSource::Edges),
+    ] {
         if let Err(error) = std::fs::read_to_string(path) {
             violations.push(Violation {
+                source: Some(source),
                 entity_id: None,
                 entity_name: None,
                 entity_kind: None,
@@ -328,6 +332,7 @@ fn check_required_input_files(
         Ok(_) => {
             if let Err(error) = std::fs::read_to_string(notes_path) {
                 violations.push(Violation {
+                    source: Some(NdjsonSource::Notes),
                     entity_id: None,
                     entity_name: None,
                     entity_kind: None,
@@ -343,6 +348,7 @@ fn check_required_input_files(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => violations.push(Violation {
+            source: Some(NdjsonSource::Notes),
             entity_id: None,
             entity_name: None,
             entity_kind: None,
@@ -364,8 +370,22 @@ fn check_required_input_files(
     }
 }
 
-fn schema_violation(file: &str, line_no: usize, message: impl std::fmt::Display) -> Violation {
+fn ndjson_file_name(source: NdjsonSource) -> &'static str {
+    match source {
+        NdjsonSource::Entities => "entities.ndjson",
+        NdjsonSource::Edges => "edges.ndjson",
+        NdjsonSource::Notes => "notes.ndjson",
+    }
+}
+
+fn schema_violation(
+    source: NdjsonSource,
+    line_no: usize,
+    message: impl std::fmt::Display,
+) -> Violation {
+    let file = ndjson_file_name(source);
     Violation {
+        source: Some(source),
         entity_id: None,
         entity_name: None,
         entity_kind: None,
@@ -403,7 +423,7 @@ fn check_schema_compliance(
                         .collect();
                     if !missing.is_empty() {
                         violations.push(schema_violation(
-                            "entities.ndjson",
+                            NdjsonSource::Entities,
                             line_no,
                             format!("missing required field(s): {}", missing.join(", ")),
                         ));
@@ -411,7 +431,7 @@ fn check_schema_compliance(
                 }
                 Err(e) => {
                     violations.push(schema_violation(
-                        "entities.ndjson",
+                        NdjsonSource::Entities,
                         line_no,
                         format!("invalid JSON: {e}"),
                     ));
@@ -440,7 +460,7 @@ fn check_schema_compliance(
                     }
                     if !missing.is_empty() {
                         violations.push(schema_violation(
-                            "edges.ndjson",
+                            NdjsonSource::Edges,
                             line_no,
                             format!("missing required field(s): {}", missing.join(", ")),
                         ));
@@ -448,7 +468,7 @@ fn check_schema_compliance(
                 }
                 Err(e) => {
                     violations.push(schema_violation(
-                        "edges.ndjson",
+                        NdjsonSource::Edges,
                         line_no,
                         format!("invalid JSON: {e}"),
                     ));
@@ -474,7 +494,7 @@ fn check_schema_compliance(
                             .collect();
                         if !missing.is_empty() {
                             violations.push(schema_violation(
-                                "notes.ndjson",
+                                NdjsonSource::Notes,
                                 line_no,
                                 format!("missing required field(s): {}", missing.join(", ")),
                             ));
@@ -482,7 +502,7 @@ fn check_schema_compliance(
                     }
                     Err(e) => {
                         violations.push(schema_violation(
-                            "notes.ndjson",
+                            NdjsonSource::Notes,
                             line_no,
                             format!("invalid JSON: {e}"),
                         ));
@@ -503,6 +523,7 @@ fn check_schema_compliance(
 fn check_valid_kinds(
     records_path: &Path,
     valid_kinds: &HashSet<String>,
+    source: NdjsonSource,
     rule_id: &str,
     kind_label: &str,
 ) -> RuleResult {
@@ -529,6 +550,7 @@ fn check_valid_kinds(
                             name.as_deref(),
                         );
                         violations.push(Violation {
+                            source: Some(source),
                             entity_id: if id.is_empty() { None } else { Some(id) },
                             entity_name: name,
                             entity_kind: Some(kind_str.to_string()),
@@ -563,6 +585,7 @@ pub(super) fn check_valid_entity_kinds(
     check_valid_kinds(
         entities_path,
         valid_kinds,
+        NdjsonSource::Entities,
         "valid-entity-kinds",
         "entity_kind",
     )
@@ -576,7 +599,13 @@ pub(super) fn check_valid_note_kinds(
     notes_path: &Path,
     valid_kinds: &HashSet<String>,
 ) -> RuleResult {
-    check_valid_kinds(notes_path, valid_kinds, "valid-note-kinds", "note_kind")
+    check_valid_kinds(
+        notes_path,
+        valid_kinds,
+        NdjsonSource::Notes,
+        "valid-note-kinds",
+        "note_kind",
+    )
 }
 
 fn check_valid_edge_relations(edges_path: &Path) -> RuleResult {
@@ -613,6 +642,7 @@ fn check_valid_edge_relations(edges_path: &Path) -> RuleResult {
                             format!("[{id_display}] ")
                         };
                         violations.push(Violation {
+                            source: Some(NdjsonSource::Edges),
                             entity_id: if edge_id.is_empty() {
                                 None
                             } else {
@@ -652,6 +682,7 @@ fn check_no_duplicate_uuids(entities_path: &Path) -> RuleResult {
                 if let Some(id) = v.get("id").and_then(|i| i.as_str()) {
                     if !seen.insert(id.to_string()) {
                         violations.push(Violation {
+                            source: Some(NdjsonSource::Entities),
                             entity_id: Some(id.to_string()),
                             entity_name: v.get("name").and_then(|n| n.as_str()).map(str::to_string),
                             entity_kind: v.get("kind").and_then(|k| k.as_str()).map(str::to_string),
@@ -691,6 +722,7 @@ fn check_sort_order(entities_path: &Path, edges_path: &Path) -> RuleResult {
         sorted.sort();
         if ids != sorted {
             violations.push(Violation {
+                source: Some(NdjsonSource::Entities),
                 entity_id: None,
                 entity_name: None,
                 entity_kind: None,
@@ -719,6 +751,7 @@ fn check_sort_order(entities_path: &Path, edges_path: &Path) -> RuleResult {
         sorted.sort();
         if keys != sorted {
             violations.push(Violation {
+                source: Some(NdjsonSource::Edges),
                 entity_id: None,
                 entity_name: None,
                 entity_kind: None,
@@ -788,6 +821,7 @@ fn check_referential_integrity(
                     if let Some(id) = id {
                         if !known_ids.contains(id) {
                             violations.push(Violation {
+                                source: Some(NdjsonSource::Edges),
                                 entity_id: Some(id.to_string()),
                                 entity_name: None,
                                 entity_kind: None,
@@ -982,240 +1016,6 @@ fn check_citation_date_lint(
         cfg,
         chrono::Utc::now(),
     )
-}
-
-fn apply_fixes(repo: &Path) -> Result<Vec<SortFix>> {
-    let kg_dir = repo.join(".khive/kg");
-    let mut fixes = Vec::new();
-    for (file, order) in [
-        ("entities.ndjson", SortOrder::Field("id")),
-        ("edges.ndjson", SortOrder::Edges),
-    ] {
-        let moved = match order {
-            SortOrder::Field(key) => fix_sort_order(&kg_dir.join(file), key)?,
-            SortOrder::Edges => sort_ndjson(&kg_dir.join(file), order)?,
-        };
-        if moved > 0 {
-            fixes.push(SortFix { file, moved });
-        }
-    }
-    Ok(fixes)
-}
-
-fn fix_sort_order(path: &Path, sort_key: &str) -> Result<usize> {
-    sort_ndjson(path, SortOrder::Field(sort_key))
-}
-
-#[derive(Clone, Copy)]
-enum SortOrder<'a> {
-    Field(&'a str),
-    Edges,
-}
-
-/// Count nonblank record positions changed by the stable sort, not inversions.
-/// Keep canonical serialization on rewrites and leave unchanged files byte-identical.
-fn sort_ndjson(path: &Path, order: SortOrder<'_>) -> Result<usize> {
-    if !path.exists() {
-        return Ok(0);
-    }
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut lines: Vec<(usize, serde_json::Value)> = Vec::new();
-    for (idx, line) in content.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value = serde_json::from_str(line).with_context(|| {
-            format!(
-                "{} line {}: refusing to apply --fix over malformed JSON; run `kg validate` for details",
-                path.display(),
-                idx + 1
-            )
-        })?;
-        lines.push((lines.len(), value));
-    }
-    lines.sort_by(|(_, a), (_, b)| match order {
-        SortOrder::Field(key) => {
-            let ak = a.get(key).and_then(|value| value.as_str()).unwrap_or("");
-            let bk = b.get(key).and_then(|value| value.as_str()).unwrap_or("");
-            ak.cmp(bk)
-        }
-        SortOrder::Edges => {
-            let ak = (
-                edge_source_id(a).unwrap_or(""),
-                edge_target_id(a).unwrap_or(""),
-                a.get("relation")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or(""),
-            );
-            let bk = (
-                edge_source_id(b).unwrap_or(""),
-                edge_target_id(b).unwrap_or(""),
-                b.get("relation")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or(""),
-            );
-            ak.cmp(&bk)
-        }
-    });
-    let moved = lines
-        .iter()
-        .enumerate()
-        .filter(|(position, (original, _))| position != original)
-        .count();
-    if moved > 0 {
-        let out = lines
-            .iter()
-            .map(|(_, value)| serde_json::to_string(value).expect("serialize JSON value"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(path, out + "\n").with_context(|| format!("write {}", path.display()))?;
-    }
-    Ok(moved)
-}
-
-fn render_validation(
-    run: &ValidationRun,
-    args: &ValidateArgs,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> Result<()> {
-    match args.format {
-        OutputFormat::Json => {
-            let json =
-                serde_json::to_string_pretty(&run.report).expect("serialize ValidationReport");
-            writeln!(stdout, "{json}")?;
-        }
-        OutputFormat::Github => write_github_format(stdout, &run.report)?,
-        OutputFormat::Text => write_text_format(stdout, run, args.verbose, args.quiet)?,
-    }
-    if !matches!(args.format, OutputFormat::Text) {
-        if let Some(fixes) = &run.fixes {
-            if !args.quiet {
-                write_fix_details(stderr, fixes)?;
-            }
-            write_summary(stderr, &run.report, Some(fixes))?;
-        }
-    }
-    Ok(())
-}
-
-fn write_fix_details(output: &mut dyn Write, fixes: &FixSummary) -> std::io::Result<()> {
-    for fix in &fixes.files {
-        writeln!(
-            output,
-            "  ~ sort-order: re-sorted {} ({} lines moved)",
-            fix.file, fix.moved
-        )?;
-    }
-    Ok(())
-}
-
-fn write_text_format(
-    output: &mut dyn Write,
-    run: &ValidationRun,
-    verbose: bool,
-    quiet: bool,
-) -> std::io::Result<()> {
-    let report = &run.report;
-    if !quiet {
-        let mut structural_sort_seen = false;
-        for r in &report.rules {
-            if r.id == "sort-order" && !structural_sort_seen {
-                structural_sort_seen = true;
-                if let Some(fixes) = &run.fixes {
-                    if !fixes.files.is_empty() {
-                        write_fix_details(output, fixes)?;
-                        if r.passed {
-                            continue;
-                        }
-                    }
-                }
-            }
-            let symbol = if r.passed {
-                "\u{2713}"
-            } else if r.severity == "error" {
-                "\u{2717}"
-            } else {
-                "\u{26a0}"
-            };
-            if r.violations.is_empty() {
-                writeln!(output, "  {symbol} {}", r.id)?;
-            } else {
-                writeln!(
-                    output,
-                    "  {symbol} {}: {} violation(s)",
-                    r.id,
-                    r.violations.len()
-                )?;
-                let shown = if verbose {
-                    r.violations.len()
-                } else {
-                    2.min(r.violations.len())
-                };
-                for v in &r.violations[..shown] {
-                    let prefix = record_prefix(v.entity_id.as_deref(), v.entity_name.as_deref());
-                    // Include record identifier when not already in the message.
-                    if prefix.is_empty() || v.message.starts_with(prefix.trim()) {
-                        writeln!(output, "    - {}", v.message)?;
-                    } else {
-                        writeln!(output, "    - {}{}", prefix, v.message)?;
-                    }
-                }
-                if !verbose && r.violations.len() > 2 {
-                    writeln!(
-                        output,
-                        "    + {} more (run with --verbose)",
-                        r.violations.len() - 2
-                    )?;
-                }
-            }
-        }
-    }
-    write_summary(output, report, run.fixes.as_ref())
-}
-
-fn write_summary(
-    output: &mut dyn Write,
-    report: &ValidationReport,
-    fixes: Option<&FixSummary>,
-) -> std::io::Result<()> {
-    let s = &report.summary;
-    let empty = if s.empty { "; empty graph" } else { "" };
-    if let Some(fixes) = fixes {
-        writeln!(
-            output,
-            "\nSummary: {} error(s) fixed, {} error(s) unfixable, {} warning(s) fixed, {} warning(s) unfixable, {} info(s) fixed, {} info(s) unfixable, {} entities, {} edges{empty}",
-            fixes.fixed.errors, s.errors, fixes.fixed.warnings, s.warnings,
-            fixes.fixed.info, s.info, s.entities, s.edges
-        )
-    } else {
-        writeln!(
-            output,
-            "\nSummary: {} error(s), {} warning(s), {} entities, {} edges{empty}",
-            s.errors, s.warnings, s.entities, s.edges
-        )
-    }
-}
-
-fn write_github_format(output: &mut dyn Write, report: &ValidationReport) -> std::io::Result<()> {
-    if report.summary.empty {
-        writeln!(
-            output,
-            "::notice ::Empty graph: no entity, edge, or note records read"
-        )?;
-    }
-    for r in &report.rules {
-        for v in &r.violations {
-            let level = if r.severity == "error" {
-                "error"
-            } else {
-                "warning"
-            };
-            writeln!(output, "::{level} ::{}", v.message)?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

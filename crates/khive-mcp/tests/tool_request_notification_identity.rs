@@ -154,6 +154,7 @@ fn identity(process_ref: Option<&str>) -> RequestIdentity {
         visible_namespaces: vec!["caller-visible".into()],
         process_ref: process_ref.map(str::to_owned),
         request_id: Some(731),
+        ..Default::default()
     }
 }
 

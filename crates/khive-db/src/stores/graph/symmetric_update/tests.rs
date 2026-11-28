@@ -1,5 +1,6 @@
 use super::*;
 use crate::pool::{ConnectionPool, PoolConfig, WalCeilingPolicy};
+use crate::test_hooks::TestHooks;
 use khive_storage::{GraphStore, WriterTaskRequestState};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::types::Value;
@@ -251,7 +252,7 @@ async fn revision_overflow_refuses_before_any_conflict_probe() {
             .writer()
             .unwrap()
             .conn()
-            .authorizer(Some(|context: AuthContext<'_>| {
+            .test_authorizer(Some(|context: AuthContext<'_>| {
                 if matches!(
                     context.action,
                     AuthAction::Read {
@@ -275,7 +276,7 @@ async fn revision_overflow_refuses_before_any_conflict_probe() {
             .writer()
             .unwrap()
             .conn()
-            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
             .unwrap();
         assert!(
             matches!(error, StorageError::Driver {

@@ -14,6 +14,7 @@ use super::matrix::{generated_wired_acceptance_matrix, MatrixCaseKind};
 use super::outcome::{FailureClass, FinalizerOutcome, ManifestFault};
 use crate::curation::EntityPatch;
 use crate::operations::EntityClaimSpec;
+use crate::secret_gate::property_context::{AtomRole, PathSegment, PropertyContext};
 use crate::{
     EntityCandidateAdmission, EntityCandidateContext, EntityCandidateMutation,
     EntityCandidateOrigin, EntityCreateSpec, KhiveRuntime, NamespaceToken, RuntimeConfig,
@@ -71,6 +72,40 @@ impl Fixture {
         )
     }
 
+    fn install_properties(
+        &self,
+        properties: &Value,
+        selections: &[(AtomRole, Vec<PathSegment>)],
+    ) -> impl Drop {
+        let snapshot = TestOnlyManifestFixture::property_snapshot(
+            &serde_json::to_string(properties).unwrap(),
+            selections,
+        )
+        .unwrap();
+        fixture::install(self.ns(), snapshot)
+    }
+
+    async fn assert_property_admitted(
+        &self,
+        entity: &Entity,
+        properties: &Value,
+        role: AtomRole,
+        path: &[PathSegment],
+        verb: &str,
+        family: &str,
+    ) {
+        let context = PropertyContext::new(properties).unwrap();
+        let digest = digest_to_hex(context.atom(role, path).unwrap().digest());
+        self.assert_admitted_digest(
+            entity,
+            verb,
+            RuntimeFieldScope::JsonPropertiesContextV2,
+            family,
+            digest,
+        )
+        .await;
+    }
+
     fn spec(&self, name: &str, description: Option<&str>) -> EntityCreateSpec {
         EntityCreateSpec {
             kind: "concept".into(),
@@ -79,6 +114,7 @@ impl Fixture {
             description: description.map(str::to_owned),
             properties: Some(json!({"purpose": "fixture"})),
             tags: vec![],
+            aliases: Vec::new(),
         }
     }
 
@@ -97,6 +133,7 @@ impl Fixture {
                 description,
                 properties,
                 vec![],
+                &crate::EntityAliasChange::default(),
             )
             .await
             .map(|(entity, _, _)| entity)
@@ -154,6 +191,24 @@ impl Fixture {
         scope: RuntimeFieldScope,
         family: &str,
     ) {
+        self.assert_admitted_digest(
+            entity,
+            verb,
+            scope,
+            family,
+            digest_to_hex(&scoped_digest(scope, &self.value)),
+        )
+        .await;
+    }
+
+    async fn assert_admitted_digest(
+        &self,
+        entity: &Entity,
+        verb: &str,
+        scope: RuntimeFieldScope,
+        family: &str,
+        expected_digest: String,
+    ) {
         let stored = self
             .runtime
             .get_entity(&self.token, entity.id)
@@ -196,6 +251,7 @@ impl Fixture {
         let field_scope = match scope {
             RuntimeFieldScope::NameDescription => "name-description",
             RuntimeFieldScope::JsonProperties => "json-properties",
+            RuntimeFieldScope::JsonPropertiesContextV2 => "json-properties-context-v2",
             RuntimeFieldScope::Tags => "tags",
             _ => panic!("entity fixture scope"),
         };
@@ -203,7 +259,7 @@ impl Fixture {
             event.payload,
             json!({
                 "mechanism": "content-sha256-manifest-v1",
-                "digest_sha256": digest_to_hex(&scoped_digest(scope, &self.value)),
+                "digest_sha256": expected_digest,
                 "field_scope": field_scope,
                 "manifest_id": TestOnlyManifestFixture::for_scope(scope).snapshot().manifest_id(),
                 "canonical_verb": verb,
@@ -622,7 +678,8 @@ async fn excluded_atomic_prepare_and_admin_update_keep_legacy_refusal() {
         EntityPatch {
             description: Some(Some(f.value.clone())),
             ..Default::default()
-        }
+        },
+        &crate::EntityAliasChange::default(),
     )
     .await
     .is_err());
@@ -648,14 +705,30 @@ async fn excluded_atomic_prepare_and_admin_update_keep_legacy_refusal() {
 
 #[tokio::test]
 async fn structured_properties_and_tags_use_their_exact_field_scope() {
-    for scope in [RuntimeFieldScope::JsonProperties, RuntimeFieldScope::Tags] {
+    for scope in [
+        RuntimeFieldScope::JsonPropertiesContextV2,
+        RuntimeFieldScope::Tags,
+    ] {
         let f = Fixture::new();
-        let _manifest = f.install(scope);
-        let properties = if scope == RuntimeFieldScope::JsonProperties {
+        let properties = if scope == RuntimeFieldScope::JsonPropertiesContextV2 {
             json!({"purpose": "fixture", "nested": {"credential": f.value}})
         } else {
             json!({"purpose": "fixture"})
         };
+        let path = vec![
+            PathSegment::Key("nested".into()),
+            PathSegment::Key("credential".into()),
+        ];
+        let snapshot = if scope == RuntimeFieldScope::JsonPropertiesContextV2 {
+            TestOnlyManifestFixture::property_snapshot(
+                &serde_json::to_string(&properties).unwrap(),
+                &[(AtomRole::Value, path.clone())],
+            )
+            .unwrap()
+        } else {
+            TestOnlyManifestFixture::for_scope(scope).snapshot()
+        };
+        let _manifest = fixture::install(f.ns(), snapshot);
         let tags = if scope == RuntimeFieldScope::Tags {
             vec![f.value.clone()]
         } else {
@@ -669,13 +742,26 @@ async fn structured_properties_and_tags_use_their_exact_field_scope() {
                 None,
                 "scoped",
                 None,
-                Some(properties),
+                Some(properties.clone()),
                 tags,
+                &crate::EntityAliasChange::default(),
             )
             .await
             .unwrap();
-        f.assert_admitted(&entity, "create", scope, "entity.create")
+        if scope == RuntimeFieldScope::JsonPropertiesContextV2 {
+            f.assert_property_admitted(
+                &entity,
+                &properties,
+                AtomRole::Value,
+                &path,
+                "create",
+                "entity.create",
+            )
             .await;
+        } else {
+            f.assert_admitted(&entity, "create", scope, "entity.create")
+                .await;
+        }
     }
 }
 
@@ -1220,7 +1306,9 @@ async fn carried_reserved_property_cannot_be_laundered_by_an_admitted_update() {
 #[cfg(unix)]
 #[tokio::test]
 async fn events_split_reads_the_success_audit_committed_on_the_main_unit() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let _registry = crate::events_split::TestRegistryGuard::new(directory.path());
     let namespace = Namespace::parse(&format!("manifest-{}", Uuid::new_v4())).unwrap();
     let runtime = KhiveRuntime::new_for_test(RuntimeConfig {
@@ -1328,7 +1416,11 @@ async fn empty_manifest_update_preserves_patch_scanning_and_nonempty_scans_final
         .await
         .unwrap_err();
     assert!(matches!(error, crate::RuntimeError::SecretDetected(_)));
-    let _manifest = f.install(RuntimeFieldScope::JsonProperties);
+    let properties = json!({"credential": f.value});
+    let _manifest = f.install_properties(
+        &properties,
+        &[(AtomRole::Value, vec![PathSegment::Key("credential".into())])],
+    );
     // The description is not allowlisted by this snapshot. A harmless patch
     // must not convert an unmatched carried secret into an admitted record.
     assert!(f
@@ -1439,6 +1531,7 @@ async fn invoke_declared_route(
                 spec.description.as_deref(),
                 spec.properties,
                 spec.tags,
+                &crate::EntityAliasChange::default(),
             )
             .await
             .map(|(entity, _, _)| entity),
@@ -2168,4 +2261,489 @@ async fn direct_admission_refuses_attachment_state_but_preserves_clean_legacy_ha
         serde_json::to_value(clean).unwrap()
     );
     f.assert_empty().await;
+}
+
+fn property_key(value: &str) -> PathSegment {
+    PathSegment::Key(value.into())
+}
+
+#[tokio::test]
+async fn contextual_properties_refuse_across_empty_nonempty_and_direct_write_routes() {
+    for nonempty in [false, true] {
+        let f = Fixture::new();
+        let snapshot = if nonempty {
+            TestOnlyManifestFixture::new().snapshot()
+        } else {
+            super::manifest::ManifestSnapshot::empty()
+        };
+        let _manifest = fixture::install(f.ns(), snapshot);
+        let scalar = "0123456789abcdef".repeat(2);
+        assert!(
+            crate::secret_gate::check(&scalar).is_ok(),
+            "the fixture requires property ancestry"
+        );
+        let properties = json!({"purpose":"fixture", "secret":{"value":scalar}});
+        assert!(
+            matches!(
+                f.create("context create", None, Some(properties.clone()))
+                    .await,
+                Err(crate::RuntimeError::SecretDetected(_))
+            ),
+            "create must apply contextual properties admission"
+        );
+        let mut bad = f.spec("context bulk", None);
+        bad.properties = Some(properties.clone());
+        assert!(
+            matches!(
+                f.runtime
+                    .create_many(&f.token, vec![f.spec("clean first", None), bad])
+                    .await,
+                Err(crate::RuntimeError::SecretDetected(_))
+            ),
+            "bulk must refuse and preserve atomicity"
+        );
+        assert!(
+            matches!(
+                f.runtime
+                    .claim_entity_if_absent(
+                        &f.token,
+                        EntityClaimSpec {
+                            id: Uuid::new_v4(),
+                            kind: "concept".into(),
+                            entity_type: None,
+                            name: "context claim".into(),
+                            description: None,
+                            properties: Some(properties.clone()),
+                            tags: vec!["identity".into()],
+                            identity_tag: "identity".into(),
+                        }
+                    )
+                    .await,
+                Err(crate::RuntimeError::SecretDetected(_))
+            ),
+            "claim must apply contextual properties admission"
+        );
+        for origin in [
+            EntityCandidateOrigin::CodeIngest,
+            EntityCandidateOrigin::CodeFindingsIngest,
+        ] {
+            let context = EntityCandidateContext::new(f.ns(), origin);
+            assert!(
+                matches!(
+                    context.check_properties(Some(&properties)),
+                    Err(crate::RuntimeError::SecretDetected(_))
+                ),
+                "direct preflight must use the same owning context"
+            );
+            let candidate = Entity::new(f.ns(), "concept", "direct context")
+                .with_properties(properties.clone());
+            assert!(
+                matches!(
+                    context.prepare(candidate),
+                    Err(crate::RuntimeError::SecretDetected(_))
+                ),
+                "final direct candidate must recheck its exact properties"
+            );
+        }
+        f.assert_empty().await;
+        let original = f
+            .create("clean update", None, Some(json!({"purpose":"fixture"})))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                f.runtime
+                    .update_entity_with_embedding_report(
+                        &f.token,
+                        original.id,
+                        EntityPatch {
+                            properties: Some(properties),
+                            ..Default::default()
+                        }
+                    )
+                    .await,
+                Err(crate::RuntimeError::SecretDetected(_))
+            ),
+            "ordinary update must scan the contextual patch"
+        );
+        assert_eq!(
+            serde_json::to_value(f.runtime.get_entity(&f.token, original.id).await.unwrap())
+                .unwrap(),
+            serde_json::to_value(original).unwrap(),
+            "refused update changed the stored record"
+        );
+        assert_eq!(f.count("entities").await, 1);
+        assert_eq!(f.count("fts_entities").await, 1);
+        assert!(f.exemptions().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn context_bound_properties_commit_on_create_update_bulk_and_captured_direct_routes() {
+    for route in ["create", "update", "bulk", "direct"] {
+        let f = Fixture::new();
+        let properties = json!({"purpose":"fixture", "credential":f.value});
+        let path = vec![property_key("credential")];
+        let manifest = f.install_properties(&properties, &[(AtomRole::Value, path.clone())]);
+        let (entity, verb, family) = match route {
+            "create" => (
+                f.create("context admitted", None, Some(properties.clone()))
+                    .await
+                    .unwrap(),
+                "create",
+                "entity.create",
+            ),
+            "update" => {
+                let old = f
+                    .create("context updated", None, Some(json!({"purpose":"fixture"})))
+                    .await
+                    .unwrap();
+                let (entity, _) = f
+                    .runtime
+                    .update_entity_with_expected_version_and_embedding_report(
+                        &f.token,
+                        old.id,
+                        EntityPatch {
+                            properties: Some(properties.clone()),
+                            ..Default::default()
+                        },
+                        Some(old.version),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(entity.version, old.version + 1);
+                (entity, "update", "entity.update")
+            }
+            "bulk" => {
+                let mut spec = f.spec("context bulk admitted", None);
+                spec.properties = Some(properties.clone());
+                let mut rows = f
+                    .runtime
+                    .create_many(&f.token, vec![f.spec("clean peer", None), spec])
+                    .await
+                    .unwrap();
+                assert_eq!(rows.len(), 2);
+                assert!(rows[0]
+                    .properties
+                    .as_ref()
+                    .unwrap()
+                    .get("khive:secret_gate")
+                    .is_none());
+                (rows.remove(1), "create", "entity.bulk")
+            }
+            "direct" => {
+                let context =
+                    EntityCandidateContext::new(f.ns(), EntityCandidateOrigin::CodeIngest);
+                context.check_properties(Some(&properties)).unwrap();
+                drop(manifest);
+                let _empty = fixture::install(f.ns(), super::manifest::ManifestSnapshot::empty());
+                assert!(
+                    matches!(
+                        EntityCandidateContext::new(f.ns(), EntityCandidateOrigin::CodeIngest)
+                            .check_properties(Some(&properties)),
+                        Err(crate::RuntimeError::SecretDetected(_))
+                    ),
+                    "a later context must see the refreshed empty snapshot"
+                );
+                let candidate = Entity::new(f.ns(), "concept", "captured property context")
+                    .with_properties(properties.clone());
+                let prepared = context.prepare(candidate).unwrap();
+                let result = f
+                    .runtime
+                    .try_commit_manifest_entity_candidate(
+                        &f.token,
+                        prepared,
+                        EntityCandidateMutation::CreateIfAbsent,
+                    )
+                    .await
+                    .unwrap();
+                let EntityCandidateAdmission::Committed(entity) = result else {
+                    panic!("captured property snapshot did not commit")
+                };
+                (entity, "code.ingest", "entity.create")
+            }
+            _ => unreachable!(),
+        };
+        f.assert_property_admitted(&entity, &properties, AtomRole::Value, &path, verb, family)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn property_manifest_scans_unmatched_atoms_before_and_after_a_matching_atom() {
+    for selected in ["a", "z"] {
+        let f = Fixture::new();
+        let properties = json!({"purpose":"fixture", "a":f.value, "z":f.value});
+        let _manifest = f.install_properties(
+            &properties,
+            &[(AtomRole::Value, vec![property_key(selected)])],
+        );
+        assert!(
+            matches!(
+                f.create("unmatched peer", None, Some(properties)).await,
+                Err(crate::RuntimeError::SecretDetected(_))
+            ),
+            "a match must never skip an unmatched earlier or later source atom"
+        );
+        f.assert_empty().await;
+    }
+}
+
+#[tokio::test]
+async fn property_manifest_counts_one_atom_once_but_refuses_two_distinct_identities() {
+    let f = Fixture::new();
+    let escaped: String = f
+        .value
+        .chars()
+        .map(|c| format!("\\u{:04x}", c as u32))
+        .collect();
+    let atom = format!(r#"{{"raw":"{}","encoded":"{}"}}"#, f.value, escaped);
+    let properties = json!({"purpose":"fixture", "payload":atom});
+    let context = PropertyContext::new(&properties).unwrap();
+    let scanned = context
+        .scan_atoms()
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|scanned| {
+            scanned
+                .atom
+                .identifies(AtomRole::Value, &[property_key("payload")])
+        })
+        .unwrap();
+    assert!(
+        scanned.matches.len() >= 2,
+        "fixture must exercise multiple refusing views of one atom"
+    );
+    let _manifest = f.install_properties(
+        &properties,
+        &[(AtomRole::Value, vec![property_key("payload")])],
+    );
+    let entity = f
+        .create("one identity", None, Some(properties.clone()))
+        .await
+        .expect("multiple views of one source atom must commit exactly once");
+    f.assert_property_admitted(
+        &entity,
+        &properties,
+        AtomRole::Value,
+        &[property_key("payload")],
+        "create",
+        "entity.create",
+    )
+    .await;
+
+    for with_tag in [false, true] {
+        let f = Fixture::new();
+        let properties = if with_tag {
+            json!({"purpose":"fixture", "a":f.value})
+        } else {
+            json!({"purpose":"fixture", "a":f.value, "z":f.value})
+        };
+        let mut selections = vec![(AtomRole::Value, vec![property_key("a")])];
+        if !with_tag {
+            selections.push((AtomRole::Value, vec![property_key("z")]));
+        }
+        let properties_snapshot = TestOnlyManifestFixture::property_snapshot(
+            &serde_json::to_string(&properties).unwrap(),
+            &selections,
+        )
+        .unwrap();
+        let snapshot = if with_tag {
+            TestOnlyManifestFixture::combine(&[
+                properties_snapshot,
+                TestOnlyManifestFixture::for_scope(RuntimeFieldScope::Tags).snapshot(),
+            ])
+        } else {
+            properties_snapshot
+        };
+        let _manifest = fixture::install(f.ns(), snapshot);
+        let tags = if with_tag {
+            vec![f.value.clone()]
+        } else {
+            vec![]
+        };
+        let error = f
+            .runtime
+            .create_entity_with_post_commit_report(
+                &f.token,
+                "concept",
+                None,
+                "two identities",
+                None,
+                Some(properties),
+                tags,
+                &crate::EntityAliasChange::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::RuntimeError::InvalidInput(ref message) if message.contains("multiple candidate matches")),
+            "distinct source identities must fail the single-match contract: {error}"
+        );
+        assert!(fixture::outcomes(f.ns()).iter().any(|outcome| matches!(
+            outcome,
+            FinalizerOutcome::ManifestInvalid(ManifestFault::MultipleMatches)
+        )));
+        f.assert_empty().await;
+    }
+}
+
+#[tokio::test]
+async fn exempt_property_key_keeps_credential_ancestry_for_unmatched_descendants() {
+    let f = Fixture::new();
+    let label = format!("secret-{}", f.value);
+    let scalar = "0123456789abcdef".repeat(2);
+    assert!(crate::secret_gate::check(&scalar).is_ok());
+    let properties = json!({"purpose":"fixture", (label.clone()):{"value":scalar}});
+    let _manifest =
+        f.install_properties(&properties, &[(AtomRole::Key, vec![property_key(&label)])]);
+    let error = f
+        .create("key does not waive child", None, Some(properties))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::RuntimeError::SecretDetected(ref matched) if matched.detector == "hex-credential-token"),
+        "an exempt key must retain context without exempting descendants: {error}"
+    );
+    f.assert_empty().await;
+}
+
+#[tokio::test]
+async fn legacy_property_entries_are_inert_for_keys_roots_arrays_and_match_counts() {
+    for shape in ["key", "root", "array", "object"] {
+        let f = Fixture::new();
+        let _manifest = f.install(RuntimeFieldScope::JsonProperties);
+        let properties = match shape {
+            "key" => json!({(f.value.clone()):false}),
+            "root" => json!(f.value),
+            "array" => json!([f.value]),
+            _ => json!({"credential":f.value}),
+        };
+        let context = EntityCandidateContext::new(f.ns(), EntityCandidateOrigin::CodeIngest);
+        assert!(
+            matches!(
+                context.check_properties(Some(&properties)),
+                Err(crate::RuntimeError::SecretDetected(_))
+            ),
+            "legacy json-properties entries must be inert during preflight for every source atom"
+        );
+        assert!(
+            matches!(
+                f.create("legacy property", None, Some(properties)).await,
+                Err(crate::RuntimeError::SecretDetected(_))
+            ),
+            "legacy entries must not rescue a stored write"
+        );
+        f.assert_empty().await;
+    }
+    let f = Fixture::new();
+    let snapshot = TestOnlyManifestFixture::combine(&[
+        TestOnlyManifestFixture::for_scope(RuntimeFieldScope::JsonProperties).snapshot(),
+        TestOnlyManifestFixture::for_scope(RuntimeFieldScope::Tags).snapshot(),
+    ]);
+    let _manifest = fixture::install(f.ns(), snapshot);
+    let (entity, _, _) = f
+        .runtime
+        .create_entity_with_post_commit_report(
+            &f.token,
+            "concept",
+            None,
+            "legacy does not count",
+            None,
+            Some(json!({"purpose":"fixture"})),
+            vec![f.value.clone()],
+            &crate::EntityAliasChange::default(),
+        )
+        .await
+        .unwrap();
+    f.assert_admitted(&entity, "create", RuntimeFieldScope::Tags, "entity.create")
+        .await;
+    let error = f
+        .runtime
+        .create_entity_with_post_commit_report(
+            &f.token,
+            "concept",
+            None,
+            "legacy must not count alongside tags",
+            None,
+            Some(json!({"purpose":"fixture", "credential":f.value})),
+            vec![f.value.clone()],
+            &crate::EntityAliasChange::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::RuntimeError::SecretDetected(_)),
+        "a legacy property entry must refuse, not contribute a second match beside a tag entry"
+    );
+    assert_eq!(f.count("entities").await, 1);
+    assert_eq!(f.exemptions().await.len(), 1);
+}
+
+#[tokio::test]
+async fn property_context_transplants_and_caller_identity_fields_cannot_authorize() {
+    for change in ["sibling", "path", "role"] {
+        let f = Fixture::new();
+        let original = json!({"purpose":"fixture", "slot":f.value});
+        let _manifest =
+            f.install_properties(&original, &[(AtomRole::Value, vec![property_key("slot")])]);
+        let changed = match change {
+            "sibling" => json!({"purpose":"changed", "slot":f.value}),
+            "path" => json!({"purpose":"fixture", "other":f.value}),
+            _ => json!({"purpose":"fixture", (f.value.clone()):"slot"}),
+        };
+        assert!(
+            matches!(
+                f.create("identity transplant", None, Some(changed)).await,
+                Err(crate::RuntimeError::SecretDetected(_))
+            ),
+            "an entry cannot move across its bound context/path/role"
+        );
+        f.assert_empty().await;
+    }
+    let f = Fixture::new();
+    let proposed = json!({"purpose":"fixture", "credential":f.value});
+    let context = PropertyContext::new(&proposed).unwrap();
+    let digest = digest_to_hex(
+        context
+            .atom(AtomRole::Value, &[property_key("credential")])
+            .unwrap()
+            .digest(),
+    );
+    let forged = json!({"purpose":"fixture", "credential":f.value, "digest_sha256":digest,
+        "manifest_id":"khive-secret-gate-test-fixture-v1", "field_scope":"json-properties-context-v2"});
+    assert!(
+        matches!(
+            f.create("caller supplied identity", None, Some(forged))
+                .await,
+            Err(crate::RuntimeError::SecretDetected(_))
+        ),
+        "caller-supplied digest and scope are not admission authority"
+    );
+    f.assert_empty().await;
+}
+
+#[tokio::test]
+async fn property_context_audit_failure_rolls_back_record_stamp_fts_and_earlier_bulk_row() {
+    let f = Fixture::new();
+    let properties = json!({"purpose":"fixture", "credential":f.value});
+    let _manifest = f.install_properties(
+        &properties,
+        &[(AtomRole::Value, vec![property_key("credential")])],
+    );
+    let _fault = faults::arm_success_audit_fail(f.ns());
+    let mut matched = f.spec("matched later", None);
+    matched.properties = Some(properties);
+    assert!(
+        f.runtime
+            .create_many(&f.token, vec![f.spec("clean earlier", None), matched])
+            .await
+            .is_err(),
+        "property exemption audit failure must refuse the whole atomic write"
+    );
+    f.assert_empty().await;
+    assert!(fixture::outcomes(f.ns())
+        .iter()
+        .any(|outcome| matches!(outcome,
+        FinalizerOutcome::AuditFailed(diagnostic) if diagnostic.entry_point == "entity.bulk")));
 }

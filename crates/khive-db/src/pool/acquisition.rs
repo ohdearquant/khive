@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use khive_storage::error::StorageError;
 use khive_storage::StorageCapability;
-use rusqlite::Connection;
 
 use crate::error::SqliteError;
+use crate::ProgressConn;
 
 use super::{
     deny_retired_writer, pool_exhausted_error, CheckpointGuard, ConnectionPool, ReaderAdmission,
@@ -263,17 +263,21 @@ impl ConnectionPool {
     /// settlement. Raw connection access is crate-private.
     #[track_caller]
     pub fn writer(&self) -> Result<WriterGuard<'_>, SqliteError> {
-        self.writer_checkout(false)
+        self.writer_checkout(false, super::write_units::LogicalWriteOwner::Request)
     }
 
     /// Checkpoint ownership setup changes only SQLite's checkpoint policy.
     /// Its bounded checkout must remain available below the write reserve.
     pub(super) fn writer_for_checkpoint_operation(&self) -> Result<WriterGuard<'_>, SqliteError> {
-        self.writer_checkout(true)
+        self.writer_checkout(true, super::write_units::LogicalWriteOwner::Checkpoint)
     }
 
     #[track_caller]
-    fn writer_checkout(&self, checkpoint_bypass: bool) -> Result<WriterGuard<'_>, SqliteError> {
+    fn writer_checkout(
+        &self,
+        checkpoint_bypass: bool,
+        logical_owner: super::write_units::LogicalWriteOwner,
+    ) -> Result<WriterGuard<'_>, SqliteError> {
         if !checkpoint_bypass {
             self.write_admission.ensure_settled()?;
         }
@@ -281,7 +285,8 @@ impl ConnectionPool {
         let volume_lease = if checkpoint_bypass {
             None
         } else {
-            self.write_admission.acquire()?
+            self.write_admission
+                .acquire(crate::disk_guard::LeaseClass::Pooled)?
         };
         let Some(guard) = self.writer.try_lock_for(self.config.checkout_timeout) else {
             self.writer_acquisition_counters
@@ -320,8 +325,24 @@ impl ConnectionPool {
             origin: self.origin(),
             pool: self,
             admission: self.write_admission.as_ref(),
+            logical_owner,
             _volume_lease: volume_lease,
         })
+    }
+
+    pub(super) fn writer_for_core_migration(&self) -> Result<WriterGuard<'_>, SqliteError> {
+        self.writer_checkout(false, super::write_units::LogicalWriteOwner::CoreMigration)
+    }
+
+    pub(crate) fn writer_for_schema(&self) -> Result<WriterGuard<'_>, SqliteError> {
+        self.writer_checkout(false, super::write_units::LogicalWriteOwner::Schema)
+    }
+
+    pub(crate) fn writer_for_attachment_cutover(&self) -> Result<WriterGuard<'_>, SqliteError> {
+        self.writer_checkout(
+            false,
+            super::write_units::LogicalWriteOwner::AttachmentCutover,
+        )
     }
 
     /// Non-panicking writer checkout.
@@ -334,9 +355,31 @@ impl ConnectionPool {
     }
 
     #[track_caller]
+    pub(crate) fn schema_writer_until_for_admitted_operation<C>(
+        &self,
+        should_stop: C,
+    ) -> Result<Option<WriterGuard<'_>>, SqliteError>
+    where
+        C: Fn() -> bool,
+    {
+        self.writer_until_for_owner(should_stop, super::write_units::LogicalWriteOwner::Schema)
+    }
+
+    #[cfg(test)]
     pub(crate) fn writer_until_for_admitted_operation<C>(
         &self,
         should_stop: C,
+    ) -> Result<Option<WriterGuard<'_>>, SqliteError>
+    where
+        C: Fn() -> bool,
+    {
+        self.writer_until_for_owner(should_stop, super::write_units::LogicalWriteOwner::Request)
+    }
+
+    fn writer_until_for_owner<C>(
+        &self,
+        should_stop: C,
+        logical_owner: super::write_units::LogicalWriteOwner,
     ) -> Result<Option<WriterGuard<'_>>, SqliteError>
     where
         C: Fn() -> bool,
@@ -345,7 +388,9 @@ impl ConnectionPool {
         if should_stop() {
             return Ok(None);
         }
-        let volume_lease = self.write_admission.acquire()?;
+        let volume_lease = self
+            .write_admission
+            .acquire(crate::disk_guard::LeaseClass::Pooled)?;
         let started = Instant::now();
         loop {
             if should_stop() {
@@ -378,6 +423,7 @@ impl ConnectionPool {
                     origin: self.origin(),
                     pool: self,
                     admission: self.write_admission.as_ref(),
+                    logical_owner,
                     _volume_lease: volume_lease,
                 }));
             }
@@ -435,9 +481,9 @@ impl ConnectionPool {
         Ok(CheckpointGuard { guard })
     }
 
-    pub(crate) fn retire_pooled_writer(&self, conn: &Connection) {
+    pub(crate) fn retire_pooled_writer(&self, conn: &mut ProgressConn) {
         self.pooled_writer_retired.store(true, Ordering::Release);
-        if let Err(error) = conn.authorizer(Some(deny_retired_writer)) {
+        if let Err(error) = conn.with_mut(|conn| conn.authorizer(Some(deny_retired_writer))) {
             tracing::error!(target: "khive_db::pool",
                 %error,
                 "failed to install the retired pooled-writer quarantine authorizer"

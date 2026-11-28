@@ -2,6 +2,26 @@
 
 use super::{async_trait, daemon, RequestParams};
 
+/// Refusal for a request frame with no attributed actor (absent, empty or
+/// `local`) on a daemon in strict attributed-actor mode. Nothing was
+/// dispatched, so nothing committed.
+fn anonymous_actor_refusal() -> daemon::DaemonDispatchError {
+    let reason = khive_types::RefusalReason::AnonymousActor.as_str();
+    let message = "strict attributed-actor mode is on for this daemon and the request \
+                   carries no attributed actor; send the request with this caller's actor \
+                   id (KHIVE_ACTOR, --actor or [actor] id)";
+    daemon::DaemonDispatchError::new(
+        message,
+        Some(serde_json::json!({
+            "kind": "permission_denied",
+            "code": "anonymous_actor",
+            "reason": reason,
+            "message": message,
+            "domain_disposition": khive_runtime::DomainDisposition::NotCommitted.as_str(),
+        })),
+    )
+}
+
 #[async_trait]
 impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
     fn plan(&self, ops: &str) -> String {
@@ -56,6 +76,25 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
                 })),
             ));
         }
+        if khive_request::parse_request(&ops)
+            .is_ok_and(|parsed| parsed.ops.iter().any(|op| op.tool == "bridge.share"))
+        {
+            let message = "bridge.share is answered only by the stdio bridge and kkernel exec; \
+                           nothing was sent";
+            return Err(daemon::DaemonDispatchError::new(
+                message.to_string(),
+                Some(serde_json::json!({ "kind": "invalid_input", "message": message })),
+            ));
+        }
+        // Strict attributed-actor mode is checked when the server is built and
+        // on the exec client, against their own actor. A daemon serves each
+        // frame under the frame's actor instead, so the same policy is applied
+        // to that actor here, before anything dispatches.
+        if let Some(identity) = identity.as_ref() {
+            if self.strict_mode_refuses_actor(identity.actor_id.as_deref()) {
+                return Err(anonymous_actor_refusal());
+            }
+        }
         let params = RequestParams {
             plan: None,
             ops,
@@ -84,6 +123,12 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
 
     fn events_readiness(&self) -> Option<khive_runtime::events_split::EventsReadiness> {
         self.events_readiness_gate()
+    }
+
+    fn background_resources(
+        &self,
+    ) -> Option<khive_runtime::resource_admission::BackgroundDomainControl> {
+        crate::server::KhiveMcpServer::background_resources_control(self)
     }
 
     async fn warm_all(&self) {

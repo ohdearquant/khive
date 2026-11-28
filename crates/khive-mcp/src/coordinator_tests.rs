@@ -24,8 +24,8 @@ pub struct MockCoordinator {
     pub last_search_request: std::sync::Mutex<Option<ValidatedSearchRequest>>,
     /// The `limit` value `fan_out_search` was last called with (MCP-AUD-003).
     pub last_limit: std::sync::atomic::AtomicU32,
-    /// The `extra_visible` slice `fan_out_search` was last called with
-    /// (MAJ-3 visibility-scope regression coverage).
+    /// The `extra_visible` slice passed to `fan_out_search`, preserving
+    /// the caller's resolved extra read-visibility scope.
     pub last_extra_visible: std::sync::Mutex<Vec<Namespace>>,
 }
 
@@ -143,9 +143,34 @@ impl CoordinatorService for MockCoordinator {
     ) -> Result<CoordSearchResult, RuntimeError> {
         // This fake only renders observation notes; message membership is
         // exercised by the concrete coordinator's integration scenarios.
-        Ok(self
-            .fan_out_search(request, token.gate_namespace(), extra_visible)
-            .await)
+        self.fan_out_search(request, token.gate_namespace(), extra_visible)
+            .await
+    }
+
+    async fn fan_out_note_search_scoped_with_count(
+        &self,
+        request: &ValidatedSearchRequest,
+        token: &NamespaceToken,
+        args: &serde_json::Value,
+        extra_visible: &[Namespace],
+    ) -> Result<(CoordSearchResult, u64), RuntimeError> {
+        // This routing-only fixture contains exactly one active observation
+        // candidate when nonempty, and no excluded candidates otherwise. Real
+        // hydration/backend-sum semantics are tested by the concrete service.
+        let selector = request.note_status().ok_or_else(|| {
+            RuntimeError::Internal("note routing fixture requires a note selector".into())
+        })?;
+        let mut result = self
+            .fan_out_search_scoped(request, token, args, extra_visible)
+            .await?;
+        let count =
+            if selector == khive_storage::note::NoteStatusSelector::Archived && !self.empty_hits {
+                result.note_hits.clear();
+                1
+            } else {
+                0
+            };
+        Ok((result, count))
     }
 
     async fn locate(&self, _id: Uuid) -> Option<BackendId> {
@@ -180,7 +205,7 @@ impl CoordinatorService for MockCoordinator {
         request: &ValidatedSearchRequest,
         _namespace: &Namespace,
         extra_visible: &[Namespace],
-    ) -> CoordSearchResult {
+    ) -> Result<CoordSearchResult, RuntimeError> {
         self.search_called
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.last_limit
@@ -189,7 +214,7 @@ impl CoordinatorService for MockCoordinator {
         *self.last_extra_visible.lock().unwrap() = extra_visible.to_vec();
         let id = Uuid::from_u128(1);
         let is_note = request.substrate() == SearchSubstrate::Note;
-        CoordSearchResult {
+        Ok(CoordSearchResult {
             entity_hits: if is_note || self.empty_hits {
                 vec![]
             } else {
@@ -269,7 +294,7 @@ impl CoordinatorService for MockCoordinator {
             note_updated_at: std::collections::HashMap::from([(id, 1_700_000_000_000_000)]),
             note_versions: std::collections::HashMap::from([(id, 1)]),
             note_names: std::collections::HashMap::from([(id, Some("note result".to_string()))]),
-        }
+        })
     }
 
     fn is_single_backend(&self) -> bool {
@@ -641,11 +666,11 @@ async fn multi_backend_search_forwards_the_complete_validated_filter_contract() 
 
     for (ops, expected_substrate) in [
         (
-            r#"search(kind="concept", query="typed entity", limit=4, entity_kind="concept", entity_type="theorem", properties={"tier":"hot"}, tags=["reviewed"], min_score=0.25)"#,
+            r#"search(kind="concept", query="typed entity", limit=4, entity_kind="concept", entity_type="theorem", properties={"tier":"hot"}, tags=["reviewed"], min_score=0.25, created_after="1970-01-01T00:00:01.000000001Z", created_before="1970-01-01T00:00:02Z")"#,
             SearchSubstrate::Entity,
         ),
         (
-            r#"search(kind="observation", query="typed note", limit=5, note_kind="observation", include_superseded=true, properties={"status":"open"}, tags=["urgent"], min_score=0.5)"#,
+            r#"search(kind="observation", query="typed note", limit=5, note_kind="observation", include_superseded=true, properties={"status":"open"}, tags=["urgent"], min_score=0.5, created_after="1970-01-01T00:00:01.000000001Z", created_before="1970-01-01T00:00:02Z")"#,
             SearchSubstrate::Note,
         ),
     ] {
@@ -670,6 +695,11 @@ async fn multi_backend_search_forwards_the_complete_validated_filter_contract() 
             .clone()
             .expect("coordinator must receive a validated request");
         assert_eq!(captured.substrate(), expected_substrate);
+        assert!(captured.has_created_range());
+        assert!(!captured.matches_created_at(1_000_000));
+        assert!(captured.matches_created_at(1_000_001));
+        assert!(captured.matches_created_at(2_000_000));
+        assert!(!captured.matches_created_at(2_000_001));
         match expected_substrate {
             SearchSubstrate::Entity => {
                 assert_eq!(captured.query(), "typed entity");
@@ -730,6 +760,56 @@ async fn multi_backend_search_rejects_filters_for_the_wrong_substrate() {
                 .contains("only valid when kind resolves"),
             "error must explain the substrate mismatch: {entry}"
         );
+        assert!(!coord
+            .search_called
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn multi_backend_search_created_range_errors_match_handler_and_never_dispatch() {
+    for ops in [
+        r#"search(kind="entity", query="x", created_after="invalid")"#,
+        r#"search(kind="note", query="x", created_before=42)"#,
+        r#"search(kind="entity", query="x", created_after="1970-01-01T00:00:02Z", created_before="1970-01-01T00:00:01Z")"#,
+        r#"search(kind="entity", query="x", created_after="1970-01-01T00:00:01.0000000001Z")"#,
+        r#"search(kind="note", query="x", created_before="1970-01-01T00:00:01.0000000000Z")"#,
+        r#"search(kind="note", query="x", created_after="1970-01-01T00:00:01.0000000002Z", created_before="1970-01-01T00:00:01.0000000001Z")"#,
+    ] {
+        let coord = MockCoordinator::multi_backend();
+        let (registry, _) = make_registry();
+        let handler = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg");
+        let (registry, _) = make_registry();
+        let coordinated = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+        let mut errors = Vec::new();
+        for server in [&handler, &coordinated] {
+            let raw = server
+                .dispatch_request_local(RequestParams {
+                    plan: None,
+                    ops: ops.into(),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                })
+                .await
+                .expect("validation remains a per-op failure");
+            let response: Value = serde_json::from_str(&raw).unwrap();
+            let entry = &response["results"][0];
+            assert_eq!(entry["ok"], false, "{ops}: {entry}");
+            let diagnostic = if ops.contains("created_before=42") {
+                "expected a string"
+            } else {
+                "created_"
+            };
+            assert!(entry["error"].to_string().contains(diagnostic));
+            errors.push(entry["error"].clone());
+        }
+        assert_eq!(errors[0], errors[1], "{ops}");
         assert!(!coord
             .search_called
             .load(std::sync::atomic::Ordering::SeqCst));
@@ -1748,4 +1828,393 @@ async fn multi_backend_link_admission_still_precedes_parameter_validation() {
         1
     );
     assert!(!coord.link_called.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+// Signed ADR-130 Am8 r2 transport fixtures. These use the routing mock's
+// explicit one-active-note population, not a fake production count fallback.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn note_disclosure_coordinator_single_parallel_chain_and_partial_empty() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "status-fixture")
+            .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+        for (selector, count, expected_len) in [("active", 0, 1), ("archived", 1, 0), ("any", 0, 1)] {
+            let mut expected_result_bytes = None;
+            for ops in [
+                json!([{"tool":"search","args":{"kind":"note","query":"x","note_status":selector}}]).to_string(),
+                json!([{"tool":"search","args":{"kind":"note","query":"x","note_status":selector}}, {"tool":"stats","args":{}}]).to_string(),
+                format!("search(kind=\"note\", query=\"x\", note_status=\"{selector}\") | stats()"),
+            ] {
+                let response = server.dispatch_request_local(RequestParams {
+                    ops, presentation: Some("verbose".into()), format: Some("json".into()),
+                    ..Default::default()
+                }).await.unwrap();
+                let response: Value = serde_json::from_str(&response).unwrap();
+                let entry = &response["results"][0];
+                assert_eq!(entry["ok"], true, "{entry}");
+                assert_eq!(entry["note_status"], selector);
+                assert_eq!(entry["note_status_dropped"].as_u64(), Some(count));
+                assert_eq!(entry["result"].as_array().unwrap().len(), expected_len);
+                let expected_rows = if expected_len == 0 { json!([]) } else {
+                    let ranking = khive_pack_kg::handlers::search_rank_fields(
+                        Default::default(), khive_runtime::RankScoreKind::Vector,
+                        khive_runtime::SearchSignals::default(),
+                    );
+                    let mut row = json!({
+                        "id": Uuid::from_u128(1).to_string(), "kind": "observation",
+                        "note_kind": "observation", "name": "note result", "source": "vector",
+                        "title": "note result", "snippet": null,
+                        "created_at": khive_runtime::micros_to_iso(1_700_000_000_000_000),
+                        "updated_at": khive_runtime::micros_to_iso(1_700_000_000_000_000), "version": 1,
+                    });
+                    row.as_object_mut().unwrap().extend(ranking.as_object().unwrap().clone());
+                    json!([row])
+                };
+                assert_eq!(serde_json::to_vec(&entry["result"]).unwrap(),
+                    serde_json::to_vec(&expected_rows).unwrap(), "canonical mock hit array must remain byte-identical");
+                let bytes = serde_json::to_vec(&entry["result"]).unwrap();
+                if let Some(expected) = &expected_result_bytes { assert_eq!(&bytes, expected); }
+                else { expected_result_bytes = Some(bytes); }
+                for sibling in response["results"].as_array().unwrap().iter().skip(1) {
+                    assert!(sibling.get("note_status").is_none());
+                    assert!(sibling.get("note_status_dropped").is_none());
+                }
+                assert!(response.get("note_status").is_none());
+                assert!(response.get("note_status_dropped").is_none());
+            }
+        }
+        let response = server.dispatch_request_local(RequestParams {
+            ops: json!([
+                {"tool":"search","args":{"kind":"entity","query":"x"}},
+                {"tool":"search","args":{"help":true}},
+                {"tool":"search","args":{"kind":"note","query":"x","note_status":"invalid"}}
+            ]).to_string(), presentation: Some("verbose".into()), format: Some("json".into()),
+            ..Default::default()
+        }).await.unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        for entry in response["results"].as_array().unwrap() {
+            assert!(entry.get("note_status").is_none());
+            assert!(entry.get("note_status_dropped").is_none());
+        }
+        assert_eq!(response["results"][2]["ok"], false);
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::degraded_multi_backend("missing-status-leg");
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "status-fixture")
+            .with_coordinator(coord as Arc<dyn CoordinatorService>);
+        for selector in ["active", "archived"] {
+            let response = server.dispatch_request_local(RequestParams {
+                ops: json!([{"tool":"search","args":{"kind":"note","query":"x","note_status":selector}}]).to_string(),
+                presentation: Some("verbose".into()), format: Some("json".into()), ..Default::default()
+            }).await.unwrap();
+            let response: Value = serde_json::from_str(&response).unwrap();
+            let entry = &response["results"][0];
+            if selector == "active" {
+                assert_eq!(entry["ok"], true);
+                assert_eq!(entry["status"], "partial");
+                assert_eq!(entry["note_status"], "active");
+                assert_eq!(entry["note_status_dropped"].as_u64(), Some(0));
+            } else {
+                assert_eq!(entry["ok"], false);
+                assert_eq!(entry["error"]["kind"], "search_incomplete");
+                assert!(entry.get("note_status").is_none());
+                assert!(entry.get("note_status_dropped").is_none());
+                assert!(entry.pointer("/error/search/note_status").is_none());
+                assert!(entry.pointer("/error/search/note_status_dropped").is_none());
+            }
+        }
+    }).await.expect("coordinator note transport fixture exceeded async budget");
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn coordinator_note_disclosure_all_presentations_format_result_only() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (registry, _runtime) = make_registry();
+        let coord = MockCoordinator::multi_backend();
+        let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "status-fixture")
+            .with_coordinator(coord as Arc<dyn CoordinatorService>);
+        for (selector, count) in [("active", 0_u64), ("archived", 1), ("any", 0)] {
+            let ops = json!([{"tool":"search","args":{"kind":"note","query":"x","note_status":selector}}]).to_string();
+            for (name, presentation) in [
+                ("agent", khive_runtime::PresentationMode::Agent),
+                ("human", khive_runtime::PresentationMode::Human),
+                ("verbose", khive_runtime::PresentationMode::Verbose),
+            ] {
+                let json_response = server.dispatch_request_local(RequestParams {
+                    ops: ops.clone(), presentation: Some(name.into()), format: Some("json".into()),
+                    ..Default::default()
+                }).await.unwrap();
+                let json_response: Value = serde_json::from_str(&json_response).unwrap();
+                let json_entry = &json_response["results"][0];
+                for (format_name, format) in [
+                    ("json", khive_runtime::OutputFormat::Json),
+                    ("auto", khive_runtime::OutputFormat::Auto),
+                    ("table", khive_runtime::OutputFormat::Table),
+                ] {
+                    let response = server.dispatch_request_local(RequestParams {
+                        ops: ops.clone(), presentation: Some(name.into()), format: Some(format_name.into()),
+                        ..Default::default()
+                    }).await.unwrap();
+                    let response: Value = serde_json::from_str(&response).unwrap();
+                    let entry = &response["results"][0];
+                    assert_eq!(entry["ok"], true);
+                    assert_eq!(entry["note_status"], selector);
+                    assert_eq!(entry["note_status_dropped"].as_u64(), Some(count));
+                    let mut expected = json_entry.clone();
+                    if format != khive_runtime::OutputFormat::Json {
+                        expected["result"] = Value::String(khive_runtime::presentation::render_format_with_note_content(
+                            json_entry["result"].clone(), format, presentation,
+                            khive_runtime::presentation::NoteContentScope::None,
+                        ));
+                        assert!(!entry["result"].as_str().unwrap().contains("note_status"));
+                    }
+                    let mut actual = entry.clone();
+                    // Execution counters are measured per request, independently of presentation.
+                    expected.as_object_mut().unwrap().remove("usage");
+                    actual.as_object_mut().unwrap().remove("usage");
+                    assert_eq!(actual, expected, "{name}/{format_name}");
+                }
+            }
+        }
+    }).await.expect("coordinator presentation fixture exceeded async budget");
+}
+
+#[derive(Clone, Copy)]
+enum DefaultSearchOutcome {
+    Answer,
+    OrdinaryFailure,
+    StoppedRead,
+}
+
+// Deliberately implements neither scoped method: these tests exercise the
+// trait defaults rather than an override on the existing routing mock.
+struct DefaultSearchCoordinator {
+    inner: Arc<MockCoordinator>,
+    outcome: DefaultSearchOutcome,
+    calls: std::sync::atomic::AtomicUsize,
+    forwarded: std::sync::Mutex<Option<(ValidatedSearchRequest, Namespace, Vec<Namespace>)>>,
+}
+
+impl DefaultSearchCoordinator {
+    fn new(outcome: DefaultSearchOutcome) -> Self {
+        Self {
+            inner: MockCoordinator::multi_backend(),
+            outcome,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            forwarded: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait]
+impl CoordinatorService for DefaultSearchCoordinator {
+    async fn locate(&self, id: Uuid) -> Option<BackendId> {
+        self.inner.locate(id).await
+    }
+
+    fn record_created(&self, id: Uuid, backend_id: BackendId) {
+        self.inner.record_created(id, backend_id);
+    }
+
+    fn primary_backend_id(&self) -> Option<BackendId> {
+        self.inner.primary_backend_id()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn link(
+        &self,
+        namespace: &Namespace,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+        weight: f64,
+        metadata: Option<Value>,
+        resurrect: bool,
+    ) -> Result<CoordLinkResult, CoordError> {
+        self.inner
+            .link(
+                namespace, source_id, target_id, relation, weight, metadata, resurrect,
+            )
+            .await
+    }
+
+    async fn fan_out_search(
+        &self,
+        request: &ValidatedSearchRequest,
+        namespace: &Namespace,
+        extra_visible: &[Namespace],
+    ) -> Result<CoordSearchResult, RuntimeError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.forwarded.lock().unwrap() =
+            Some((request.clone(), namespace.clone(), extra_visible.to_vec()));
+        match self.outcome {
+            DefaultSearchOutcome::Answer => {
+                self.inner
+                    .fan_out_search(request, namespace, extra_visible)
+                    .await
+            }
+            DefaultSearchOutcome::OrdinaryFailure => Err(RuntimeError::InvalidInput(
+                "default search ordinary refusal".into(),
+            )),
+            DefaultSearchOutcome::StoppedRead => {
+                Err(RuntimeError::Storage(khive_storage::StorageError::Timeout {
+                    operation: "search".into(),
+                })
+                .before_requested_write())
+            }
+        }
+    }
+
+    fn is_single_backend(&self) -> bool {
+        self.inner.is_single_backend()
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn default_scoped_search_preserves_result_and_error_provenance() {
+    let (registry, runtime) = make_registry();
+    let namespace = Namespace::parse("default-search").unwrap();
+    let extra_visible = vec![
+        Namespace::parse("shared-a").unwrap(),
+        Namespace::parse("shared-b").unwrap(),
+    ];
+    let token = runtime
+        .authorize_with_visibility(namespace.clone(), extra_visible.clone())
+        .unwrap();
+    let args = json!({"kind":"entity", "query":"candidate", "limit":7, "tags":["retained"]});
+    let request = ValidatedSearchRequest::from_value(args.clone(), &registry).unwrap();
+    for outcome in [
+        DefaultSearchOutcome::Answer,
+        DefaultSearchOutcome::OrdinaryFailure,
+        DefaultSearchOutcome::StoppedRead,
+    ] {
+        let coordinator = DefaultSearchCoordinator::new(outcome);
+        let result = coordinator
+            .fan_out_search_scoped(&request, &token, &args, &extra_visible)
+            .await;
+        assert_eq!(
+            coordinator.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            *coordinator.forwarded.lock().unwrap(),
+            Some((request.clone(), namespace.clone(), extra_visible.clone()))
+        );
+        match outcome {
+            DefaultSearchOutcome::Answer => {
+                let answer =
+                    result.unwrap_or_else(|error| panic!("default entity search: {error}"));
+                let id = Uuid::from_u128(1);
+                assert_eq!(answer.entity_hits.len(), 1);
+                let hit = &answer.entity_hits[0];
+                assert_eq!(hit.entity_id, id);
+                assert_eq!(hit.title.as_deref(), Some("entity result"));
+                assert_eq!(hit.source, SearchSource::Both);
+                assert_eq!(hit.rank_score_kind, khive_runtime::RankScoreKind::Rrf);
+                assert_eq!(hit.signals, khive_runtime::SearchSignals::default());
+                assert!(answer.note_hits.is_empty());
+                assert!(!answer.partial);
+                assert_eq!(answer.per_backend.len(), 1);
+                assert_eq!(answer.per_backend[0].backend_id, BackendId::main());
+                assert!(answer.per_backend[0].error.is_none());
+                assert_eq!(answer.entity_kinds[&id], "concept");
+                assert_eq!(answer.entity_created_at[&id], 1_700_000_000_000_000);
+                assert_eq!(answer.entity_updated_at[&id], 1_700_000_000_000_000);
+                assert_eq!(answer.entity_versions[&id], 1);
+                assert_eq!(answer.note_names[&id].as_deref(), Some("note result"));
+            }
+            DefaultSearchOutcome::OrdinaryFailure => {
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("ordinary refusal became success"),
+                };
+                assert!(
+                    matches!(error.refusal_source(), RuntimeError::InvalidInput(message) if message == "default search ordinary refusal")
+                );
+                assert_eq!(
+                    error.to_string(),
+                    "invalid input: default search ordinary refusal"
+                );
+                assert_eq!(error.batch_write_disposition(), None);
+            }
+            DefaultSearchOutcome::StoppedRead => {
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("stopped read became success"),
+                };
+                assert!(
+                    matches!(error.refusal_source(), RuntimeError::Storage(khive_storage::StorageError::Timeout { operation }) if operation == "search")
+                );
+                assert_eq!(
+                    error.batch_write_disposition(),
+                    Some(khive_runtime::error::DomainDisposition::NotCommitted)
+                );
+                assert_eq!(
+                    error.to_string(),
+                    RuntimeError::Storage(khive_storage::StorageError::Timeout {
+                        operation: "search".into()
+                    })
+                    .to_string()
+                );
+            }
+        }
+    }
+    registry.shutdown_audit_batch().await.unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn default_scoped_note_search_refuses_without_forwarding() {
+    let (registry, runtime) = make_registry();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let args = json!({"kind":"note", "query":"candidate"});
+    let request = ValidatedSearchRequest::from_value(args.clone(), &registry).unwrap();
+    let coordinator = DefaultSearchCoordinator::new(DefaultSearchOutcome::Answer);
+    let result = coordinator
+        .fan_out_search_scoped(&request, &token, &args, &[])
+        .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("unsupported note search became success"),
+    };
+    assert!(
+        matches!(error.refusal_source(), RuntimeError::InvalidInput(message) if message == "this coordinator does not support scoped note search; use comm.inbox for messages")
+    );
+    assert_eq!(error.batch_write_disposition(), None);
+    assert_eq!(
+        coordinator.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(coordinator.forwarded.lock().unwrap().is_none());
+    registry.shutdown_audit_batch().await.unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn default_note_count_search_remains_unsupported() {
+    let (registry, runtime) = make_registry();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let args = json!({"kind":"note", "query":"candidate"});
+    let request = ValidatedSearchRequest::from_value(args.clone(), &registry).unwrap();
+    let coordinator = DefaultSearchCoordinator::new(DefaultSearchOutcome::Answer);
+    let result = coordinator
+        .fan_out_note_search_scoped_with_count(&request, &token, &args, &[])
+        .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("unsupported note count became success"),
+    };
+    assert!(
+        matches!(error.refusal_source(), RuntimeError::Internal(message) if message == "this coordinator does not support note search status disclosure")
+    );
+    assert_eq!(error.batch_write_disposition(), None);
+    assert_eq!(
+        coordinator.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(coordinator.forwarded.lock().unwrap().is_none());
+    registry.shutdown_audit_batch().await.unwrap();
 }

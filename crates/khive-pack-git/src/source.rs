@@ -41,6 +41,16 @@ pub enum DigestSource {
 /// - Anything else is treated as a local path: it must be absolute and must
 ///   contain a `.git` entry; arbitrary directory walking is not performed.
 pub fn parse_source(raw: &str) -> Result<DigestSource, String> {
+    let source = parse_source_syntax(raw)?;
+    if let DigestSource::Local(path) = &source {
+        require_git_entry(path)?;
+    }
+    Ok(source)
+}
+
+/// [`parse_source`] without the filesystem read: the source's form is checked,
+/// and a local path is not yet known to hold a repository.
+pub fn parse_source_syntax(raw: &str) -> Result<DigestSource, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("source must not be empty".to_string());
@@ -81,13 +91,59 @@ pub fn parse_source(raw: &str) -> Result<DigestSource, String> {
             "source {trimmed:?} is neither an https:// URL nor an absolute local path (relative paths are rejected)"
         ));
     }
-    let path = PathBuf::from(trimmed);
-    if !path.join(".git").exists() {
-        return Err(format!(
-            "local path {trimmed:?} does not contain a .git entry"
-        ));
+    Ok(DigestSource::Local(PathBuf::from(trimmed)))
+}
+
+/// Refuse a local source with no `.git` entry (a directory, or a worktree's
+/// `gitdir:` pointer file).
+pub fn require_git_entry(path: &Path) -> Result<(), String> {
+    if path.join(".git").exists() {
+        Ok(())
+    } else {
+        Err(format!(
+            "local path {:?} does not contain a .git entry",
+            path.display().to_string()
+        ))
     }
-    Ok(DigestSource::Local(path))
+}
+
+/// Admit a parsed source only when `[git_digest]` names it: a local path whose
+/// resolved form, symlinks included, lies under a resolved `local_roots` entry,
+/// or a remote whose identity equals a `remotes` entry's. Every refusal is the
+/// same message, so it says nothing about what exists outside the lists.
+pub fn admit_digest_source(
+    source: &DigestSource,
+    policy: &khive_runtime::GitDigestSectionConfig,
+) -> Result<(), String> {
+    let (admitted, display) = match source {
+        DigestSource::Local(path) => {
+            let admitted = std::fs::canonicalize(path)
+                .map(|resolved| {
+                    policy
+                        .local_roots
+                        .iter()
+                        .filter_map(|root| std::fs::canonicalize(root).ok())
+                        .any(|root| resolved.starts_with(root))
+                })
+                .unwrap_or(false);
+            (admitted, path.display().to_string())
+        }
+        DigestSource::Remote { canonical, .. } => {
+            let identity = canonical_remote_identity(canonical);
+            let admitted = policy
+                .remotes
+                .iter()
+                .any(|remote| canonical_remote_identity(remote) == identity);
+            (admitted, redact_repo_url(canonical))
+        }
+    };
+    if admitted {
+        Ok(())
+    } else {
+        Err(format!(
+            "source {display:?} is not a configured git.digest source"
+        ))
+    }
 }
 
 /// `true` for scp-like SSH shorthand (`[user@]host:path`, e.g.
@@ -99,13 +155,11 @@ fn is_scp_shorthand(s: &str) -> bool {
 
 /// Split `[user@]host:path` shorthand into `(host, path)`, or `None` when
 /// `s` doesn't have that shape. A bracketed IPv6 host (`git@[::1]:path` or
-/// the bare `[::1]:path`) is handled by locating the `[...]` span and
-/// requiring the very next character to be `:` -- naively taking the first
-/// `:` in the string (as the plain-host branch below does) would land on a
-/// colon INSIDE the address instead of the host/path separator, which is
-/// what let a bracketed-IPv6 SCP origin fall through to `local:<path>`
-/// instead of converging with its remote slug (ADR-088 Amendment 2
-/// round-2 finding). For a plain (non-bracketed) host, the segment
+/// the bare `[::1]:path`) uses the colon immediately after the `[...]` span
+/// as its host/path separator. Colons inside the address are not separators,
+/// so bracketed-IPv6 SCP origins converge with their remote slug rather
+/// than a local-path identity (ADR-088 Amendment 2).
+/// For a plain (non-bracketed) host, the segment
 /// (whatever precedes the first `:`, minus any `user@` prefix) must
 /// contain no `/` -- this is what keeps a local path with an embedded
 /// colon, e.g. `local/path:with-colon`, from being misparsed as SCP

@@ -306,3 +306,150 @@ async fn create_kind_alias_refusals_mask_values_without_entity_or_note_writes() 
     );
     assert_eq!(snapshot(&registry).await, before);
 }
+
+// Same synthetic detector value as the existing sk-proj fixture; split source
+// literals avoid presenting a credential-shaped literal to repository scanners.
+const BULK_SECRET: &str = concat!(
+    "sk-proj-",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+);
+
+fn bulk_items() -> Value {
+    json!([
+        {"kind": "note", "content": "Bulk refusal first healthy observation."},
+        {"kind": "note", "content": "Bulk refusal second healthy observation."}
+    ])
+}
+
+async fn bulk_refusal_case(field: &str, expected_type: &str) {
+    // Real unpaused Tokio time. One outer budget covers fixture startup await,
+    // every dispatch and every full snapshot; timeout is failure, never a kill.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let registry = tokio::task::spawn_blocking(fixture)
+            .await
+            .expect("isolated public registry fixture startup");
+        create_and_get(
+            &registry,
+            entity_args("Bulk refusal baseline concept"),
+            "concept",
+        )
+        .await;
+        create_and_get(
+            &registry,
+            note_args("Bulk refusal baseline observation."),
+            "observation",
+        )
+        .await;
+        let seeded = snapshot(&registry).await;
+
+        // Positive control through the SAME public verb and actual bulk arm.
+        // Its two durable notes must move the observer used by every refusal.
+        let healthy = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "note", "items": bulk_items(), "atomic": true, "verbose": false
+                }),
+            )
+            .await
+            .expect("healthy public bulk create must reach commit");
+        assert_eq!(healthy["attempted"], 2);
+        assert_eq!(healthy["created"], 2);
+        assert_eq!(healthy["skipped"], 0);
+        assert_eq!(healthy["failed"], 0);
+        let results = healthy["results"].as_array().expect("actual bulk results");
+        assert_eq!(results.len(), 2);
+        for (index, row) in results.iter().enumerate() {
+            assert_eq!(row["index"], index);
+            assert_eq!(row["ok"], true);
+            let id = row["result"]["id"].as_str().expect("actual bulk note id");
+            let stored = registry
+                .dispatch("get", json!({"id": id}))
+                .await
+                .expect("actual bulk note readback");
+            assert_eq!(stored["kind"], "observation");
+            assert_eq!(stored["content"], bulk_items()[index]["content"]);
+        }
+        let before = snapshot(&registry).await;
+        assert_eq!(before.entities, seeded.entities);
+        assert_eq!(
+            before.notes.len(),
+            seeded.notes.len() + 2,
+            "healthy bulk write must move the refusal observer"
+        );
+        assert_eq!(before.records.len(), seeded.records.len() + 2);
+        for record in &seeded.records {
+            assert!(
+                before.records.contains(record),
+                "bulk positive control preserves seeded records"
+            );
+        }
+
+        let mut values = vec![
+            Value::Null,
+            json!(17),
+            json!("benign quote\"slash\\line\n"),
+            json!({"benign": "quote\"slash\\line\n"}),
+            json!(BULK_SECRET),
+            json!({"nested": {"credential": BULK_SECRET}}),
+        ];
+        if field == "items" {
+            // Arrays are valid for items; a boolean is not.
+            values.push(json!(false));
+        } else {
+            // Booleans are valid for atomic/verbose; an array is not.
+            values.push(json!([BULK_SECRET]));
+        }
+        for value in values {
+            let shown = value.to_string();
+            let hidden = shown.contains(BULK_SECRET).then_some(BULK_SECRET);
+            let expected = format!(
+                "create: `{field}` must be {expected_type}; got {}",
+                shown.replace(BULK_SECRET, MASK)
+            );
+            let mut args = json!({
+                "kind": "note", "items": bulk_items(), "atomic": true, "verbose": false
+            });
+            // Later malformed options also pin the existing parse order. The
+            // earlier exact field diagnostic, not a schema/gate error, must win.
+            if field == "items" {
+                args["atomic"] = json!({"later": BULK_SECRET});
+                args["verbose"] = json!([BULK_SECRET]);
+            } else if field == "atomic" {
+                args["verbose"] = json!([BULK_SECRET]);
+            }
+            args[field] = value;
+            let error = registry
+                .dispatch("create", args)
+                .await
+                .expect_err("wrong bulk option type must refuse before item preparation");
+            assert_invalid_input(error, &expected, hidden);
+            assert_eq!(
+                snapshot(&registry).await,
+                before,
+                "bulk option refusal must preserve seeded entity/note populations and full records"
+            );
+        }
+    })
+    .await
+    .expect("bulk refusal fixture exceeded its unpaused wall-clock budget");
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn create_bulk_items_refusal_masks_before_any_domain_write() {
+    bulk_refusal_case("items", "an array").await;
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn create_bulk_atomic_refusal_masks_before_any_domain_write() {
+    bulk_refusal_case("atomic", "a boolean").await;
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn create_bulk_verbose_refusal_masks_before_any_domain_write() {
+    bulk_refusal_case("verbose", "a boolean").await;
+}

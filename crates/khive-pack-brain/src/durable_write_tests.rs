@@ -268,3 +268,127 @@ async fn feedback_fails_closed_when_brain_persistence_fails() {
         "no brain_event_log row must be committed when the snapshot upsert fails"
     );
 }
+
+/// Judgments credited to a named profile survive the profile's archival and a
+/// restart. Archiving commits its own snapshot, newer than every row in the
+/// brain event log, so the cold load restores the state the live path left
+/// and replays nothing.
+#[tokio::test]
+async fn judgments_survive_archive_and_restart() {
+    const PROFILE: &str = "archived-after-judgment-v1";
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let target = create_test_entity(&rt, &token).await;
+
+    pack.dispatch(
+        "brain.create_profile",
+        json!({"name": PROFILE, "consumer_kind": "recall"}),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("brain.create_profile");
+    pack.dispatch(
+        "brain.activate",
+        json!({"profile_id": PROFILE}),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("brain.activate");
+    let before = pack.snapshot().profile_states[PROFILE].total_events;
+
+    for signal in ["useful", "not_useful"] {
+        pack.dispatch(
+            "brain.feedback",
+            json!({"target_id": target, "signal": signal, "served_by_profile_id": PROFILE}),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("brain.feedback");
+    }
+    // A judgment commits its brain event row and its snapshot at the same
+    // instant, so the replay tail after that snapshot holds no row, the
+    // judgment's own included.
+    {
+        let sql = rt.sql();
+        let (_, judged_at) = crate::persist::load_latest_snapshot(
+            sql.as_ref(),
+            "local",
+            crate::ENTITY_CACHE_CAPACITY,
+        )
+        .await
+        .expect("load the snapshot of the last judgment")
+        .expect("the namespace has a snapshot");
+        let tail = crate::persist::load_events_since(sql.as_ref(), "local", judged_at)
+            .await
+            .expect("load the rows after the last judgment's snapshot");
+        assert!(
+            tail.events.is_empty(),
+            "the last judgment's own row replays on top of its snapshot"
+        );
+    }
+    for verb in ["brain.deactivate", "brain.archive"] {
+        pack.dispatch(verb, json!({"profile_id": PROFILE}), &registry, &token)
+            .await
+            .expect(verb);
+    }
+
+    let live = pack.snapshot();
+    assert_eq!(
+        live.profiles[PROFILE].lifecycle,
+        khive_brain_core::ProfileLifecycle::Archived
+    );
+    assert!(
+        live.profile_states[PROFILE].total_events > before,
+        "the judgments must reach the named profile's state"
+    );
+
+    let sql = rt.sql();
+    let (_, snapshot_at) =
+        crate::persist::load_latest_snapshot(sql.as_ref(), "local", crate::ENTITY_CACHE_CAPACITY)
+            .await
+            .expect("load the latest snapshot")
+            .expect("the namespace has a snapshot");
+    let tail = crate::persist::load_events_since(sql.as_ref(), "local", snapshot_at)
+        .await
+        .expect("load the rows after the snapshot");
+    assert!(
+        tail.events.is_empty(),
+        "no brain event row is newer than the archive snapshot"
+    );
+    let log = crate::persist::load_events_since(sql.as_ref(), "local", 0)
+        .await
+        .expect("load the whole brain event log");
+    assert_eq!(
+        log.events
+            .iter()
+            .filter(|event| event.verb == "brain.feedback")
+            .count(),
+        2,
+        "both judgments are in the brain event log"
+    );
+
+    drop(pack);
+    let pack2 = crate::BrainPack::new(rt.clone());
+    pack2
+        .ensure_loaded(&token)
+        .await
+        .expect("ensure_loaded on fresh pack");
+    let restored = pack2.snapshot();
+
+    assert_eq!(
+        restored.profiles[PROFILE].lifecycle,
+        khive_brain_core::ProfileLifecycle::Archived
+    );
+    assert_eq!(
+        restored.profiles[PROFILE].total_events,
+        live.profiles[PROFILE].total_events
+    );
+    assert_eq!(
+        restored.profile_states[PROFILE], live.profile_states[PROFILE],
+        "the restored state of the archived profile differs from the live state"
+    );
+}

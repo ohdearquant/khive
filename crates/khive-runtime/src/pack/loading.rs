@@ -147,6 +147,11 @@ pub enum PackLoadError {
         /// The dependency that is missing from the requested pack list.
         dep: String,
     },
+    /// Multiple declared dependencies are absent from the requested pack list.
+    MissingDependencies {
+        /// Missing `(requiring pack, required pack)` pairs in selection/declaration order.
+        missing: Vec<(String, String)>,
+    },
     /// A declared pack contributed no top-level verbs without explicitly
     /// declaring itself vocabulary/ontology-only.
     NoPublicVerbs {
@@ -165,6 +170,16 @@ impl std::fmt::Display for PackLoadError {
                 "pack {pack:?} requires {dep:?}, which is not in the requested pack list; \
                  add --pack {dep} before --pack {pack}"
             ),
+            PackLoadError::MissingDependencies { missing } => {
+                write!(f, "missing pack dependencies: ")?;
+                for (index, (pack, dep)) in missing.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, "; ")?;
+                    }
+                    write!(f, "pack {pack:?} requires {dep:?}")?;
+                }
+                write!(f, "; add all missing packs to the requested pack list")
+            }
             PackLoadError::NoPublicVerbs { pack } => write!(
                 f,
                 "declared pack {pack:?} registers no public verbs; if this pack is \
@@ -253,16 +268,21 @@ impl PackRegistry {
                 return Err(PackLoadError::DuplicatePack(name.clone()));
             }
         }
+        let mut missing = Vec::new();
         for name in names {
             let factory = factory_for(name).unwrap(); // All names were validated above.
             for &dep in factory.requires() {
                 if !requested.contains(dep) {
-                    return Err(PackLoadError::MissingDependency {
-                        pack: name.clone(),
-                        dep: dep.to_string(),
-                    });
+                    missing.push((name.clone(), dep.to_string()));
                 }
             }
+        }
+        if missing.len() == 1 {
+            let (pack, dep) = missing.remove(0);
+            return Err(PackLoadError::MissingDependency { pack, dep });
+        }
+        if !missing.is_empty() {
+            return Err(PackLoadError::MissingDependencies { missing });
         }
         Ok(())
     }
@@ -347,6 +367,7 @@ impl PackRegistry {
         builder.with_gate(runtime.config().gate.clone());
         builder.with_default_namespace(runtime.config().default_namespace.as_str());
         builder.with_visible_namespaces(runtime.config().visible_namespaces.clone());
+        builder.with_owned_namespaces(runtime.config().owned_namespaces.clone());
         builder.with_actor_id(runtime.config().actor_id.clone());
         if audit_store == IngestAuditStore::Attach {
             if runtime.is_read_only() {
@@ -476,3 +497,7 @@ impl PackRegistry {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "loading_tests.rs"]
+mod tests;

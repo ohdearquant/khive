@@ -109,6 +109,9 @@ fn open_claimed_store_file(
 /// Walk an already-canonical absolute parent path one component at a time.
 /// A newly planted ancestor symlink cannot redirect the claim before the
 /// sidecar is opened; each later component is relative to the held directory.
+/// Ancestors are opened search-only: passing through a directory needs search
+/// permission, not the right to list it, and a sandbox can grant the first
+/// without the second. The claimed directory itself keeps a read handle.
 #[cfg(unix)]
 fn open_claimed_directory(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::path::Component;
@@ -119,13 +122,18 @@ fn open_claimed_directory(path: &std::path::Path) -> std::io::Result<std::fs::Fi
             "claimed store directory must be absolute",
         ));
     }
-    let mut directory = std::fs::File::open("/")?;
-    for component in path.components() {
+    let mut directory = khive_fs::fd_relative::open_search_root()?;
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
         match component {
             Component::RootDir => {}
             Component::Normal(name) => {
                 check_store_entry_name(name)?;
-                directory = khive_fs::fd_relative::open_dir_at(&directory, name)?;
+                directory = if components.peek().is_some() {
+                    khive_fs::fd_relative::open_search_dir_at(&directory, name)?
+                } else {
+                    khive_fs::fd_relative::open_dir_at(&directory, name)?
+                };
             }
             _ => {
                 return Err(std::io::Error::new(

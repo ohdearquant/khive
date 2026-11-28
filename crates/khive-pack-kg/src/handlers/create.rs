@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use khive_runtime::operations::dependency_kind_inference_hint;
 use khive_runtime::{
-    run_atomic_unit, runtime_error_value, AtomicOpPlan, AtomicRunOutcome, DomainDisposition,
-    EntityCreateSpec, KhiveRuntime, KindHook, NamespaceToken, NoteCreateSpec, RuntimeError,
-    VerbRegistry,
+    entity_key_conflict, run_atomic_unit, runtime_error_value, AtomicRunOutcome, DomainDisposition,
+    EntityAliasChange, EntityCreateSpec, KeyedEntityCreate, KeyedEntityReload, KhiveRuntime,
+    KindHook, NamespaceToken, NoteCreateSpec, RuntimeError, VerbRegistry,
 };
 use khive_storage::note::Note;
 use khive_storage::Entity;
@@ -21,6 +21,29 @@ use super::common::{
     BulkKindContext, CreateParams, KindSpec,
 };
 use crate::KgPack;
+
+/// Rounds of a keyed create under `on_key: "update"` whose holder moves
+/// between the create's read and the reload's before the create gives up.
+const KEYED_RELOAD_ATTEMPTS: usize = 3;
+
+/// A keyed entity create whose holder already carries the payload: the
+/// holder's id with `created: false` where the caller may list the kind,
+/// otherwise `key_conflict` naming no holder.
+fn keyed_replay(
+    registry: &VerbRegistry,
+    token: &NamespaceToken,
+    kind: &str,
+    key: &str,
+    entity: &khive_storage::Entity,
+) -> Result<Value, RuntimeError> {
+    if registry.allows_entity_key_disclosure(token, kind) {
+        return Ok(json!({
+            "id": entity.id.to_string(),
+            "created": false,
+        }));
+    }
+    Err(entity_key_conflict(key, None))
+}
 
 pub(super) fn add_embedding_truncation_warning(response: &mut Value, truncated: bool) {
     if !truncated {
@@ -68,12 +91,25 @@ fn optional_singleton_kind_alias(
     }
 }
 
+#[path = "create_keyed_bulk.rs"]
+mod keyed_bulk;
+
+use keyed_bulk::ItemAnswer;
+#[cfg(test)]
+pub(super) use keyed_bulk::KEYED_BULK_UNIT_TEST_BARRIER;
+
+#[derive(Clone)]
 struct PreparedBulkEntity {
     spec: EntityCreateSpec,
     args: Value,
     hook: Option<Arc<dyn KindHook>>,
+    /// ADR-221 section 1: the item's caller key and whether it carries
+    /// `on_key: "update"`.
+    key: Option<String>,
+    on_key: bool,
 }
 
+#[derive(Clone)]
 struct PreparedBulkNote {
     spec: NoteCreateSpec,
     args: Value,
@@ -84,6 +120,7 @@ struct PreparedBulkNote {
 /// normalization and shared-field validation, still awaiting the
 /// runtime-owned admission checks (kind, secret gate, owned-identity
 /// derivation) each substrate's own prepare-plan call applies.
+#[derive(Clone)]
 enum PreparedBulkItem {
     Entity {
         prepared: PreparedBulkEntity,
@@ -92,6 +129,25 @@ enum PreparedBulkItem {
         normalized: Option<Value>,
     },
     Note(PreparedBulkNote),
+}
+
+impl PreparedBulkItem {
+    fn is_keyed(&self) -> bool {
+        matches!(self, Self::Entity { prepared, .. } if prepared.key.is_some())
+    }
+
+    /// ADR-221 section 3: the requested aliases this entity item does not
+    /// store because they equal its name.
+    fn aliases_not_stored(&self) -> Vec<String> {
+        match self {
+            Self::Entity { prepared, .. }
+                if prepared.spec.aliases.contains(&prepared.spec.name) =>
+            {
+                vec![prepared.spec.name.clone()]
+            }
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// One entity or note item, already committed, paired with what its own
@@ -132,8 +188,10 @@ impl BulkWrite {
         }
     }
 
-    /// This item's `results[idx].result` value: an id/kind/created summary
-    /// always, replaced by the full committed record when `verbose`.
+    /// This item's `results[idx].result` value: an id/full_id/kind/created
+    /// summary always, replaced by the full committed record when `verbose`.
+    /// `full_id` is the whole UUID that agent presentation never shortens, so
+    /// a caller can chain it into a verb that takes no prefix.
     fn ok_result(&self, verbose: bool) -> Result<Value, RuntimeError> {
         let (id, kind, full) = match self {
             BulkWrite::Entity { entity, .. } => (
@@ -155,15 +213,129 @@ impl BulkWrite {
         };
         Ok(match full {
             Some(Value::Object(mut record)) => {
+                record.insert("full_id".to_string(), json!(id.to_string()));
                 record.insert("created".to_string(), json!(true));
                 Value::Object(record)
             }
-            _ => json!({"id": id, "kind": kind, "created": true}),
+            _ => json!({"id": id, "full_id": id.to_string(), "kind": kind, "created": true}),
         })
     }
 }
 
+/// List the requested aliases a create did not store because they equal the
+/// entity's name (ADR-221 section 3). Absent when every alias was stored.
+pub(super) fn add_aliases_not_stored(response: &mut Value, not_stored: Vec<String>) {
+    if !not_stored.is_empty() {
+        response["aliases_not_stored"] = json!(not_stored);
+    }
+}
+
+/// Append one item's committed answer to a bulk response's lists.
+fn push_bulk_answer(
+    idx: usize,
+    mut answer: ItemAnswer,
+    aliases_not_stored: Vec<String>,
+    results: &mut Vec<Value>,
+    entity_type_normalized: &mut Vec<Value>,
+    entities: &mut Vec<Value>,
+) {
+    add_aliases_not_stored(&mut answer.result, aliases_not_stored);
+    results.push(json!({
+        "index": idx,
+        "ok": true,
+        "result": answer.result,
+    }));
+    if let Some(mut applied) = answer.normalized {
+        if let Some(obj) = applied.as_object_mut() {
+            obj.insert("index".to_string(), json!(idx));
+        }
+        entity_type_normalized.push(applied);
+    }
+    if let Some(record) = answer.record {
+        entities.push(record);
+    }
+}
+
 impl KgPack {
+    /// `create` under `on_key: "update"` when the key's holder carries a
+    /// different payload (ADR-221 section 1). The update gate is asked for
+    /// the holder only now that the payloads differ; a caller who may not
+    /// update it gets `key_conflict`, under the same disclosure rule as a
+    /// create without `on_key`. `None` when the key no longer names
+    /// `holder_id`, so the caller judges the create again.
+    #[allow(clippy::too_many_arguments)]
+    async fn reload_held_key(
+        &self,
+        token: &NamespaceToken,
+        registry: &VerbRegistry,
+        kind: &str,
+        key: &str,
+        holder_id: uuid::Uuid,
+        entity_type: Option<&str>,
+        name: &str,
+        description: Option<&str>,
+        properties: Option<Value>,
+        tags: Vec<String>,
+        aliases: &[String],
+    ) -> Result<Option<Value>, RuntimeError> {
+        let alias_change = EntityAliasChange::replace(aliases)?;
+        let holder = self.runtime.get_entity(token, holder_id).await?;
+        super::update::refuse_pack_registry_row(&holder, "create")?;
+        let update_args = json!({
+            "id": holder_id.to_string(),
+            "kind": kind,
+            "name": name,
+            "description": description,
+            "entity_type": entity_type,
+            "properties": properties,
+            "tags": tags,
+            "aliases": aliases,
+        });
+        keyed_bulk::authorize_key_reload(
+            registry,
+            token,
+            kind,
+            key,
+            (holder_id, true),
+            update_args,
+        )
+        .await?;
+        let reload = self
+            .runtime
+            .reload_keyed_entity(
+                token,
+                kind,
+                key,
+                holder_id,
+                entity_type,
+                name,
+                description,
+                properties,
+                tags,
+                &alias_change,
+            )
+            .await?;
+        match reload {
+            KeyedEntityReload::Updated { entity, report } => {
+                let mut response = normalize_entity_timestamps(to_json(&entity)?);
+                response["created"] = json!(false);
+                response["updated"] = json!(true);
+                add_aliases_not_stored(&mut response, alias_change.not_stored(name));
+                add_embedding_truncation_warning(&mut response, report.embedding.any_truncated());
+                response["indexing"] = to_json(&report.indexing)?;
+                if !report.post_commit_degradations.is_empty() {
+                    response["post_commit_degradations"] =
+                        to_json(&report.post_commit_degradations)?;
+                }
+                Ok(Some(response))
+            }
+            KeyedEntityReload::Replayed { entity } => {
+                keyed_replay(registry, token, kind, key, &entity).map(Some)
+            }
+            KeyedEntityReload::Moved => Ok(None),
+        }
+    }
+
     async fn prepare_create_fields(
         &self,
         kind: &str,
@@ -174,6 +346,18 @@ impl KgPack {
         kind_resolution: (&VerbRegistry, Option<&BulkKindContext>),
     ) -> Result<(CreateParams, Option<Value>), RuntimeError> {
         let (registry, context) = kind_resolution;
+        // ADR-221 section 2: aliases name entities only, and each one is
+        // validated and secret-gated before any record is read.
+        if let Some(aliases) = &fields.aliases {
+            if fields.kind != "entity" {
+                return Err(RuntimeError::InvalidInput(
+                    "aliases apply only to entities".into(),
+                ));
+            }
+            for alias in aliases {
+                khive_runtime::validate_entity_alias(alias)?;
+            }
+        }
         // Callers establish the shared field types and canonical kind first.
         // Owners may then normalize values before semantic validation; both
         // singleton and bulk creation pass through this same boundary.
@@ -195,12 +379,34 @@ impl KgPack {
                 )));
             }
         }
-        if fields.kind != "note"
-            && (fields.key.is_some() || fields.embed.is_some() || fields.fence.is_some())
-        {
+        if fields.kind != "note" && (fields.embed.is_some() || fields.fence.is_some()) {
             return Err(RuntimeError::InvalidInput(
-                "key, embed and fence apply only to notes".into(),
+                "embed and fence apply only to notes".into(),
             ));
+        }
+        if fields.kind != "note" && fields.kind != "entity" && fields.key.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "key applies only to notes and entities".into(),
+            ));
+        }
+        // ADR-221 section 1: judged on the request's shape alone, so one
+        // request is valid or invalid whether or not its key is held.
+        if let Some(on_key) = fields.on_key.as_deref() {
+            if on_key != "update" {
+                return Err(RuntimeError::InvalidInput(
+                    "on_key accepts only \"update\"".into(),
+                ));
+            }
+            if fields.kind != "entity" || fields.key.is_none() {
+                return Err(RuntimeError::InvalidInput(
+                    "on_key applies only to a keyed entity create".into(),
+                ));
+            }
+            if fields.edges.is_some() {
+                return Err(RuntimeError::InvalidInput(
+                    "on_key cannot be combined with edges, embed or fence".into(),
+                ));
+            }
         }
         let normalized = if fields.kind == "entity" {
             if fields.embedding_content.is_some() {
@@ -267,6 +473,9 @@ impl KgPack {
             if let Some(value) = &entry.tags {
                 args["tags"] = json!(value);
             }
+            if let Some(value) = &entry.aliases {
+                args["aliases"] = json!(value);
+            }
             args
         } else {
             Value::Null
@@ -285,6 +494,8 @@ impl KgPack {
             edges: None,
             embedding_content: None,
             key: None,
+            on_key: None,
+            aliases: entry.aliases,
             embed: None,
             fence: None,
         };
@@ -315,9 +526,12 @@ impl KgPack {
                     description: fields.description,
                     properties: fields.properties,
                     tags: fields.tags.unwrap_or_default(),
+                    aliases: fields.aliases.unwrap_or_default(),
                 },
                 args,
                 hook,
+                key: None,
+                on_key: false,
             },
             normalized,
         ))
@@ -372,6 +586,8 @@ impl KgPack {
             edges: None,
             embedding_content: None,
             key: None,
+            on_key: None,
+            aliases: None,
             embed: None,
             fence: None,
         };
@@ -438,6 +654,23 @@ impl KgPack {
                         "items[{idx}]: content, note_kind and salience apply only to note items"
                     )));
                 }
+                // ADR-221 section 1: judged on the item's shape alone, as
+                // the singleton create judges it.
+                let key = entry.key.take();
+                let on_key = match entry.on_key.take().as_deref() {
+                    None => false,
+                    Some("update") if key.is_some() => true,
+                    Some("update") => {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "items[{idx}]: on_key applies only to a keyed entity item"
+                        )));
+                    }
+                    Some(_) => {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "items[{idx}]: on_key accepts only \"update\""
+                        )));
+                    }
+                };
                 let canonical = reconcile_specific(
                     specific,
                     entry.entity_kind.as_deref(),
@@ -458,7 +691,7 @@ impl KgPack {
                     )
                     .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}]: {e}")))?;
                 }
-                let (prepared, normalized) = self
+                let (mut prepared, normalized) = self
                     .prepare_bulk_entity(
                         canonical,
                         entity_type.as_deref(),
@@ -471,18 +704,30 @@ impl KgPack {
                     .map_err(|error| {
                         RuntimeError::InvalidInput(format!("items[{idx}]: {error}"))
                     })?;
+                prepared.key = key;
+                prepared.on_key = on_key;
                 Ok(PreparedBulkItem::Entity {
                     prepared,
                     normalized,
                 })
             }
             KindSpec::Note { specific } => {
+                if entry.key.is_some() || entry.on_key.is_some() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "items[{idx}]: key and on_key apply only to entity items of a bulk create"
+                    )));
+                }
                 if entry.entity_kind.is_some()
                     || entry.entity_type.is_some()
                     || entry.description.is_some()
                 {
                     return Err(RuntimeError::InvalidInput(format!(
                         "items[{idx}]: entity_kind, entity_type and description apply only to entity items"
+                    )));
+                }
+                if entry.aliases.is_some() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "items[{idx}]: aliases apply only to entity items"
                     )));
                 }
                 let canonical = reconcile_specific(
@@ -525,55 +770,23 @@ impl KgPack {
     /// item's row, FTS document, or edge is written; a confirmed rollback
     /// likewise leaves no successful item receipt: the whole call becomes
     /// this method's single `Err`, never a partial `results` array.
+    ///
+    /// Keyed entity items are judged in item order inside the same unit
+    /// (ADR-221 section 1): a key an earlier item used is judged against that
+    /// item's payload, and a unit that rolls back because a key's holder
+    /// moved is judged again from a fresh read.
     async fn commit_bulk_atomic(
         &self,
         token: &NamespaceToken,
+        registry: &VerbRegistry,
         attempted: usize,
         verbose: bool,
         prepared: Vec<Result<PreparedBulkItem, RuntimeError>>,
     ) -> Result<Value, RuntimeError> {
-        let mut plans: Vec<AtomicOpPlan> = Vec::with_capacity(attempted);
-        let mut writes: Vec<BulkWrite> = Vec::with_capacity(attempted);
-        for item in prepared {
-            match item? {
-                PreparedBulkItem::Entity {
-                    prepared,
-                    normalized,
-                } => {
-                    let PreparedBulkEntity { spec, args, hook } = prepared;
-                    let idx = writes.len();
-                    let (entity, plan) = self
-                        .runtime
-                        .prepare_bulk_entity_plan(token, spec)
-                        .await
-                        .map_err(|error| {
-                        RuntimeError::InvalidInput(format!("items[{idx}]: {error}"))
-                    })?;
-                    plans.push(plan);
-                    writes.push(BulkWrite::Entity {
-                        hook,
-                        args,
-                        entity,
-                        normalized,
-                    });
-                }
-                PreparedBulkItem::Note(prepared) => {
-                    let PreparedBulkNote { spec, args, hook } = prepared;
-                    let idx = writes.len();
-                    let (note, plan) = self
-                        .runtime
-                        .prepare_bulk_note_plan(token, spec)
-                        .await
-                        .map_err(|error| {
-                            RuntimeError::InvalidInput(format!("items[{idx}]: {error}"))
-                        })?;
-                    plans.push(plan);
-                    writes.push(BulkWrite::Note { hook, args, note });
-                }
-            }
-        }
-
-        if plans.is_empty() {
+        let items = prepared
+            .into_iter()
+            .collect::<Result<Vec<PreparedBulkItem>, RuntimeError>>()?;
+        if items.is_empty() {
             return to_json(&json!({
                 "attempted": 0,
                 "created": 0,
@@ -582,66 +795,43 @@ impl KgPack {
                 "results": Value::Array(vec![]),
             }));
         }
-
-        match run_atomic_unit(self.runtime.sql().as_ref(), plans).await {
-            Ok(AtomicRunOutcome::Committed { .. }) => {
-                for write in &writes {
-                    write.after_create(&self.runtime).await;
-                }
-                let mut results = Vec::with_capacity(writes.len());
-                let mut entity_type_normalized: Vec<Value> = Vec::new();
-                let mut entities: Vec<Value> = Vec::new();
-                for (idx, write) in writes.into_iter().enumerate() {
-                    results.push(json!({
-                        "index": idx,
-                        "ok": true,
-                        "result": write.ok_result(verbose)?,
-                    }));
-                    if let BulkWrite::Entity {
-                        entity, normalized, ..
-                    } = write
-                    {
-                        if let Some(mut applied) = normalized {
-                            if let Some(obj) = applied.as_object_mut() {
-                                obj.insert("index".to_string(), json!(idx));
-                            }
-                            entity_type_normalized.push(applied);
-                        }
-                        if verbose {
-                            entities.push(
-                                serde_json::to_value(&entity)
-                                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?,
-                            );
-                        }
-                    }
-                }
-                let created = results.len();
-                let mut resp = json!({
-                    "attempted": attempted,
-                    "created": created,
-                    "skipped": 0,
-                    "failed": 0,
-                    "results": results,
-                });
-                if !entity_type_normalized.is_empty() {
-                    resp["entity_type_normalized"] = Value::Array(entity_type_normalized);
-                }
-                if verbose && !entities.is_empty() {
-                    resp["entities"] = Value::Array(entities);
-                }
-                to_json(&resp)
-            }
-            Ok(AtomicRunOutcome::RolledBack {
-                failed_op_index,
-                failure,
-            }) => Err(RuntimeError::Internal(format!(
-                "create: atomic bulk batch rolled back at item index {failed_op_index}: {failure:?}"
-            ))),
-            Err(e) => Err(RuntimeError::Internal(format!(
-                "create: atomic bulk batch failed: {}",
-                e.0
-            ))),
+        let answers = self
+            .commit_keyed_bulk(token, registry, verbose, &items)
+            .await
+            .map_err(keyed_bulk::KeyedBulkFailure::into_atomic_error)?;
+        let mut results = Vec::with_capacity(answers.len());
+        let mut entity_type_normalized: Vec<Value> = Vec::new();
+        let mut entities: Vec<Value> = Vec::new();
+        let (mut created, mut updated) = (0usize, 0usize);
+        for ((idx, answer), item) in answers.into_iter().enumerate().zip(&items) {
+            created += usize::from(answer.created);
+            updated += usize::from(answer.updated);
+            push_bulk_answer(
+                idx,
+                answer,
+                item.aliases_not_stored(),
+                &mut results,
+                &mut entity_type_normalized,
+                &mut entities,
+            );
         }
+        let mut resp = json!({
+            "attempted": attempted,
+            "created": created,
+            "skipped": 0,
+            "failed": 0,
+            "results": results,
+        });
+        if updated > 0 {
+            resp["updated"] = json!(updated);
+        }
+        if !entity_type_normalized.is_empty() {
+            resp["entity_type_normalized"] = Value::Array(entity_type_normalized);
+        }
+        if verbose && !entities.is_empty() {
+            resp["entities"] = Value::Array(entities);
+        }
+        to_json(&resp)
     }
 
     /// One `atomic: false` item's own commit: admission (kind, secret gate,
@@ -662,7 +852,9 @@ impl KgPack {
                 prepared,
                 normalized,
             } => {
-                let PreparedBulkEntity { spec, args, hook } = prepared;
+                let PreparedBulkEntity {
+                    spec, args, hook, ..
+                } = prepared;
                 let (entity, plan) = self
                     .runtime
                     .prepare_bulk_entity_plan(token, spec)
@@ -712,9 +904,13 @@ impl KgPack {
     /// admitted and committed independently, in index order. A failure at
     /// any stage is that item's own indexed `results` entry and never
     /// blocks a valid sibling item.
+    ///
+    /// A keyed entity item is judged alone against the store, after every
+    /// earlier item committed, so the request is judged in item order.
     async fn commit_bulk_best_effort(
         &self,
         token: &NamespaceToken,
+        registry: &VerbRegistry,
         attempted: usize,
         verbose: bool,
         prepared: Vec<Result<PreparedBulkItem, RuntimeError>>,
@@ -724,34 +920,47 @@ impl KgPack {
         let mut entity_type_normalized: Vec<Value> = Vec::new();
         let mut entities: Vec<Value> = Vec::new();
         let mut created = 0usize;
+        let mut updated = 0usize;
 
         for (idx, item) in prepared.into_iter().enumerate() {
-            match self.commit_bulk_item(token, item).await {
-                Ok(write) => {
-                    created += 1;
-                    results.push(json!({
-                        "index": idx,
-                        "ok": true,
-                        "result": write.ok_result(verbose)?,
-                    }));
-                    if let BulkWrite::Entity {
-                        entity, normalized, ..
-                    } = &write
+            let not_stored = item
+                .as_ref()
+                .map(PreparedBulkItem::aliases_not_stored)
+                .unwrap_or_default();
+            let outcome = match item {
+                Ok(item) if item.is_keyed() => {
+                    match self
+                        .commit_keyed_bulk(token, registry, verbose, std::slice::from_ref(&item))
+                        .await
                     {
-                        if let Some(applied) = normalized {
-                            let mut applied = applied.clone();
-                            if let Some(obj) = applied.as_object_mut() {
-                                obj.insert("index".to_string(), json!(idx));
-                            }
-                            entity_type_normalized.push(applied);
-                        }
-                        if verbose {
-                            entities.push(
-                                serde_json::to_value(entity)
-                                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?,
-                            );
-                        }
+                        Ok(mut answers) => answers.pop().ok_or_else(|| {
+                            (
+                                RuntimeError::Internal(
+                                    "create: keyed bulk item answered nothing".into(),
+                                ),
+                                DomainDisposition::Unknown,
+                            )
+                        }),
+                        Err(failure) => Err(failure.into_item_error()),
                     }
+                }
+                item => match self.commit_bulk_item(token, item).await {
+                    Ok(write) => Ok(ItemAnswer::of_write(&write, verbose)?),
+                    Err(failure) => Err(failure),
+                },
+            };
+            match outcome {
+                Ok(answer) => {
+                    created += usize::from(answer.created);
+                    updated += usize::from(answer.updated);
+                    push_bulk_answer(
+                        idx,
+                        answer,
+                        not_stored,
+                        &mut results,
+                        &mut entity_type_normalized,
+                        &mut entities,
+                    );
                 }
                 Err((error, disposition)) => {
                     // `errors[].error` keeps its existing string form; the
@@ -778,6 +987,9 @@ impl KgPack {
             "errors": error_list,
             "results": results,
         });
+        if updated > 0 {
+            resp["updated"] = json!(updated);
+        }
         if !entity_type_normalized.is_empty() {
             resp["entity_type_normalized"] = Value::Array(entity_type_normalized);
         }
@@ -807,6 +1019,8 @@ impl KgPack {
             "annotates",
             "embedding_content",
             "key",
+            "on_key",
+            "aliases",
             "embed",
             "fence",
             "skip_dedup_check",
@@ -843,12 +1057,17 @@ impl KgPack {
         // `atomic: false` is that item's own indexed failure rather than a
         // failure of the entire call; see `prepare_bulk_item`.
         if params.get("items").is_some() {
-            if ["key", "embed", "fence"]
+            if ["key", "aliases", "embed", "fence"]
                 .iter()
                 .any(|field| params.get(*field).is_some())
             {
                 return Err(RuntimeError::InvalidInput(
-                    "key, embed and fence apply only to singleton notes".into(),
+                    "a top-level key, aliases, embed or fence does not apply to a bulk create; an entity item carries its own key and aliases".into(),
+                ));
+            }
+            if params.get("on_key").is_some() {
+                return Err(RuntimeError::InvalidInput(
+                    "a top-level on_key does not apply to a bulk create; set it on each entity item".into(),
                 ));
             }
             if params.get("embedding_content").is_some() {
@@ -860,7 +1079,11 @@ impl KgPack {
                 Value::Array(items) => items.clone(),
                 other => {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "create: `items` must be an array; got {other}"
+                        "create: `items` must be an array; got {}",
+                        khive_runtime::secret_gate::mask_for_redaction_surface(
+                            khive_runtime::secret_gate::RedactionSurface::GateProbe,
+                            &other.to_string(),
+                        )
                     )));
                 }
             };
@@ -875,7 +1098,11 @@ impl KgPack {
                 Some(Value::Bool(b)) => *b,
                 Some(other) => {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "create: `atomic` must be a boolean; got {other}"
+                        "create: `atomic` must be a boolean; got {}",
+                        khive_runtime::secret_gate::mask_for_redaction_surface(
+                            khive_runtime::secret_gate::RedactionSurface::GateProbe,
+                            &other.to_string(),
+                        )
                     )));
                 }
             };
@@ -884,7 +1111,11 @@ impl KgPack {
                 Some(Value::Bool(b)) => *b,
                 Some(other) => {
                     return Err(RuntimeError::InvalidInput(format!(
-                        "create: `verbose` must be a boolean; got {other}"
+                        "create: `verbose` must be a boolean; got {}",
+                        khive_runtime::secret_gate::mask_for_redaction_surface(
+                            khive_runtime::secret_gate::RedactionSurface::GateProbe,
+                            &other.to_string(),
+                        )
                     )));
                 }
             };
@@ -900,10 +1131,10 @@ impl KgPack {
             }
 
             return if atomic {
-                self.commit_bulk_atomic(token, attempted, verbose, prepared)
+                self.commit_bulk_atomic(token, registry, attempted, verbose, prepared)
                     .await
             } else {
-                self.commit_bulk_best_effort(token, attempted, verbose, prepared)
+                self.commit_bulk_best_effort(token, registry, attempted, verbose, prepared)
                     .await
             };
         }
@@ -1051,18 +1282,93 @@ impl KgPack {
                 let canonical = sub_kind.clone().expect("entity_kind canonicalized above");
                 let name = p.name.expect("entity fields validated during preparation");
                 let tags = p.tags.unwrap_or_default();
-                let (entity, embedding_report, degradations) = self
-                    .runtime
-                    .create_entity_with_post_commit_report(
-                        token,
-                        &canonical,
-                        p.entity_type.as_deref(),
-                        &name,
-                        p.description.as_deref(),
-                        p.properties,
-                        tags,
-                    )
-                    .await?;
+                let alias_list = p.aliases.unwrap_or_default();
+                let aliases = EntityAliasChange::replace(&alias_list)?;
+                let (entity, embedding_report, degradations) = match p.key.as_deref() {
+                    None => {
+                        self.runtime
+                            .create_entity_with_post_commit_report(
+                                token,
+                                &canonical,
+                                p.entity_type.as_deref(),
+                                &name,
+                                p.description.as_deref(),
+                                p.properties,
+                                tags,
+                                &aliases,
+                            )
+                            .await?
+                    }
+                    // ADR-221 section 1: a keyed entity create answers as a
+                    // keyed note create does. A replay writes nothing and
+                    // returns before hooks, dedup and requested edges run.
+                    Some(key) => {
+                        let mut attempts = 0;
+                        loop {
+                            attempts += 1;
+                            match self
+                                .runtime
+                                .create_keyed_entity_with_post_commit_report(
+                                    token,
+                                    &canonical,
+                                    key,
+                                    p.entity_type.as_deref(),
+                                    &name,
+                                    p.description.as_deref(),
+                                    p.properties.clone(),
+                                    tags.clone(),
+                                    &aliases,
+                                )
+                                .await?
+                            {
+                                KeyedEntityCreate::Created {
+                                    entity,
+                                    embedding,
+                                    degradations,
+                                } => break (entity, embedding, degradations),
+                                KeyedEntityCreate::Replayed { entity } => {
+                                    return keyed_replay(registry, token, &canonical, key, &entity);
+                                }
+                                KeyedEntityCreate::Conflict { existing_id }
+                                    if p.on_key.is_some() =>
+                                {
+                                    if let Some(response) = self
+                                        .reload_held_key(
+                                            token,
+                                            registry,
+                                            &canonical,
+                                            key,
+                                            existing_id,
+                                            p.entity_type.as_deref(),
+                                            &name,
+                                            p.description.as_deref(),
+                                            p.properties.clone(),
+                                            tags.clone(),
+                                            &alias_list,
+                                        )
+                                        .await?
+                                    {
+                                        return Ok(response);
+                                    }
+                                    // The key moved between the two reads:
+                                    // judge the create again from the top.
+                                    if attempts >= KEYED_RELOAD_ATTEMPTS {
+                                        return Err(RuntimeError::Internal(format!(
+                                            "keyed entity reload: the holder of key {key:?} \
+                                             changed during {KEYED_RELOAD_ATTEMPTS} attempts"
+                                        )));
+                                    }
+                                }
+                                KeyedEntityCreate::Conflict { existing_id } => {
+                                    let disclosed = registry
+                                        .allows_entity_key_disclosure(token, &canonical)
+                                        .then_some(existing_id);
+                                    return Err(entity_key_conflict(key, disclosed));
+                                }
+                            }
+                        }
+                    }
+                };
                 let id = entity.id;
                 let mut entity_json = normalize_entity_timestamps(to_json(&entity)?);
                 if let Some(applied) = entity_type_normalized {
@@ -1070,6 +1376,13 @@ impl KgPack {
                         obj.insert("entity_type_normalized".to_string(), applied);
                     }
                 }
+                // A fresh keyed create says so, as a keyed note create does.
+                if p.key.is_some() {
+                    if let Some(obj) = entity_json.as_object_mut() {
+                        obj.insert("created".to_string(), json!(true));
+                    }
+                }
+                add_aliases_not_stored(&mut entity_json, aliases.not_stored(&name));
                 (
                     entity_json,
                     id,

@@ -70,6 +70,28 @@ pub(super) fn collect_op_failures(
         .collect()
 }
 
+pub(super) fn response_budget_refusal_count(parsed: &serde_json::Value) -> usize {
+    parsed
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .map(|results| {
+            results
+                .iter()
+                .filter(|entry| {
+                    entry.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
+                        && ["code", "kind"].into_iter().any(|field| {
+                            entry
+                                .get("error")
+                                .and_then(|error| error.get(field))
+                                .and_then(serde_json::Value::as_str)
+                                == Some("response_budget_exceeded")
+                        })
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 pub(super) fn retain_failure_detail(
     mode: OpsFileReportMode,
     failure: serde_json::Value,
@@ -110,6 +132,7 @@ pub(super) fn ops_file_summary(
     succeeded: usize,
     failed: usize,
     aborted: usize,
+    response_budget_refused: usize,
     failures: Vec<serde_json::Value>,
     failure_details_omitted: usize,
 ) -> serde_json::Value {
@@ -126,6 +149,9 @@ pub(super) fn ops_file_summary(
             "aborted": aborted,
         }),
     };
+    if response_budget_refused > 0 {
+        summary["response_budget_refused"] = serde_json::json!(response_budget_refused);
+    }
     if !failures.is_empty() {
         summary["failures"] = serde_json::Value::Array(failures);
     }
@@ -464,6 +490,7 @@ where
     let mut total_succeeded: usize = 0;
     let mut total_failed: usize = 0;
     let mut total_aborted: usize = 0;
+    let mut total_response_budget_refused: usize = 0;
     let mut failures: Vec<serde_json::Value> = Vec::new();
     let mut failure_details_omitted = 0_usize;
     // Preflight the destination before the first chunk can commit. Rows then
@@ -570,6 +597,8 @@ where
             total_succeeded += chunk_succeeded;
             total_failed += chunk_failed;
             total_aborted += chunk_aborted;
+            total_response_budget_refused = total_response_budget_refused
+                .saturating_add(response_budget_refusal_count(&parsed));
             confirmed_ops += chunk_len;
             committed_chunks.push(chunk_number);
             dispatched_chunk = None;
@@ -634,6 +663,7 @@ where
                 total_succeeded,
                 total_failed,
                 total_aborted,
+                total_response_budget_refused,
                 failures,
                 failure_details_omitted,
             );
@@ -656,6 +686,7 @@ where
         total_succeeded,
         total_failed,
         total_aborted,
+        total_response_budget_refused,
         failures,
         failure_details_omitted,
     );
@@ -689,6 +720,11 @@ where
         );
         summary
     };
+    if total_response_budget_refused > 0 {
+        anyhow::bail!(
+            "response budget refused {total_response_budget_refused} op(s) across this ops-file invocation (see printed summary above)"
+        );
+    }
     if total > 0 && total_succeeded == 0 {
         match report_mode {
             OpsFileReportMode::LegacyNoSave => anyhow::bail!(

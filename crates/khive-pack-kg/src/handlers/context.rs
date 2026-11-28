@@ -69,16 +69,11 @@ fn note_snippet(content: &str) -> Option<String> {
     Some(out)
 }
 
-fn context_profile_enabled() -> bool {
+fn context_profile_enabled(runtime: &khive_runtime::KhiveRuntime) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let enabled = std::env::var("KHIVE_CONTEXT_PROFILE").is_ok();
-        khive_runtime::config_ledger::record_config_locked(
-            "KHIVE_CONTEXT_PROFILE",
-            enabled.to_string(),
-        );
-        enabled
-    })
+    let enabled = *ENABLED.get_or_init(|| std::env::var("KHIVE_CONTEXT_PROFILE").is_ok());
+    runtime.record_config_locked("KHIVE_CONTEXT_PROFILE", || enabled.to_string());
+    enabled
 }
 
 fn plog(call_id: u64, stage: &str, us: u128) {
@@ -449,7 +444,7 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let call_id = CONTEXT_CALL_ID.fetch_add(1, Ordering::Relaxed);
-        let prof = context_profile_enabled();
+        let prof = context_profile_enabled(&self.runtime);
         let mailbox_view = self
             .runtime
             .authorize_mailbox_view(token, "context", None, &params)?;
@@ -588,9 +583,6 @@ impl KgPack {
 
         // ---- Stage 2: expansion ----
         let t2 = if prof { Some(Instant::now()) } else { None };
-        // Anchors seed the visited set so an anchor already shown at the top
-        // level never also appears inside another anchor's neighbor list.
-        let mut visited: HashSet<Uuid> = anchor_ids.iter().copied().collect();
         let anchor_id_set: HashSet<Uuid> = anchor_ids.iter().copied().collect();
         let mut seen_anchor_edge_ids = HashSet::new();
         let mut anchor_edge_records = Vec::new();
@@ -605,6 +597,11 @@ impl KgPack {
         };
 
         for &anchor in &anchor_ids {
+            // Each anchor owns its visited set (ADR-089 Amendment: one visited set per
+            // anchor), so a node several anchors reach is listed under each of them.
+            // The anchors seed it so an anchor shown at the top level never also
+            // appears inside an anchor's neighbor list.
+            let mut visited: HashSet<Uuid> = anchor_id_set.clone();
             let mut recs: Vec<NeighborRecord> = Vec::new();
             let mut hop1_parents: Vec<Uuid> = Vec::new();
 

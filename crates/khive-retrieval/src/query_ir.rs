@@ -3,8 +3,12 @@
 //! Composable IR tree representing how sub-queries are structured, filtered, and fused,
 //! separate from the Query struct which captures what to search.
 
+use khive_fusion::{FusionStrategy, FusionStrategyError};
 use khive_score::DeterministicScore;
 use serde::{Deserialize, Serialize};
+
+/// Candidates requested per hybrid search leaf before fusion.
+pub const HYBRID_CANDIDATE_MULTIPLIER: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // Core IR node
@@ -23,7 +27,8 @@ pub enum QueryNode {
     Vector {
         /// Pre-computed query embedding.
         embedding: Vec<f32>,
-        /// Number of results to return.
+        /// Logical requested limit; raw Collect adapters may retain existing provider overfetch.
+        /// Scalar executors enforce this as a strict returned-row bound.
         top_k: usize,
         /// Optional minimum similarity threshold.
         min_score: Option<DeterministicScore>,
@@ -33,7 +38,8 @@ pub enum QueryNode {
     Keyword {
         /// Query text.
         text: String,
-        /// Number of results to return.
+        /// Logical requested limit; raw Collect adapters may retain existing provider overfetch.
+        /// Scalar executors enforce this as a strict returned-row bound.
         top_k: usize,
         /// Optional minimum relevance threshold.
         min_score: Option<DeterministicScore>,
@@ -47,6 +53,14 @@ pub enum QueryNode {
         strategy: FuseStrategy,
         /// Number of results after fusion.
         top_k: usize,
+    },
+
+    /// Collect ordered raw child streams without fusion, ranking or deduplication.
+    ///
+    /// Only valid at the root of an executed collection plan.
+    Collect {
+        /// Independently executed children in declared slot order.
+        children: Vec<QueryNode>,
     },
 
     /// Filter the results of a sub-query.
@@ -79,7 +93,7 @@ pub enum QueryNode {
 
 /// Fusion strategy for combining sub-query result lists.
 ///
-/// Mirrors [`FusionStrategy`](crate::FusionStrategy) at the IR level
+/// Mirrors [`FusionStrategy`] at the IR level
 /// so that the query plan is self-contained and serialisable without depending
 /// on runtime fusion internals.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,8 +115,60 @@ pub enum FuseStrategy {
         weights: Vec<f64>,
     },
 
+    /// Weighted Reciprocal Rank Fusion over ordered children, without weight normalization.
+    WeightedRrf {
+        /// Smoothing constant (must be at least one at execution).
+        k: usize,
+        /// One finite, strictly positive weight per ordered child.
+        weights: Vec<f64>,
+    },
+
     /// Union with max-score-per-document semantics.
     Union,
+
+    /// Return only vector results.
+    VectorOnly,
+
+    /// Return only keyword results.
+    KeywordOnly,
+
+    /// A named custom strategy resolved by the executor.
+    Custom {
+        /// Strategy identifier.
+        name: String,
+        /// Opaque parameters preserved for the executor.
+        params: serde_json::Value,
+    },
+}
+
+impl From<FusionStrategy> for FuseStrategy {
+    fn from(strategy: FusionStrategy) -> Self {
+        match strategy {
+            FusionStrategy::Rrf { k } => Self::Rrf { k },
+            FusionStrategy::Weighted { weights } => Self::Weighted { weights },
+            FusionStrategy::WeightedRrf { k, weights } => Self::WeightedRrf { k, weights },
+            FusionStrategy::Union => Self::Union,
+            FusionStrategy::VectorOnly => Self::VectorOnly,
+            FusionStrategy::KeywordOnly => Self::KeywordOnly,
+            FusionStrategy::Custom { name, params } => Self::Custom { name, params },
+        }
+    }
+}
+
+impl TryFrom<FuseStrategy> for FusionStrategy {
+    type Error = FusionStrategyError;
+
+    fn try_from(strategy: FuseStrategy) -> Result<Self, Self::Error> {
+        match strategy {
+            FuseStrategy::Rrf { k } => Self::try_rrf(k),
+            FuseStrategy::Weighted { weights } => Self::try_weighted(weights),
+            FuseStrategy::WeightedRrf { k, weights } => Self::try_weighted_rrf(k, weights),
+            FuseStrategy::Union => Ok(Self::Union),
+            FuseStrategy::VectorOnly => Ok(Self::VectorOnly),
+            FuseStrategy::KeywordOnly => Ok(Self::KeywordOnly),
+            FuseStrategy::Custom { name, params } => Self::try_custom(name, params),
+        }
+    }
 }
 
 /// Predicate for post-retrieval filtering.
@@ -170,9 +236,9 @@ impl QueryNode {
         }
     }
 
-    /// Create a hybrid query (vector + keyword with RRF fusion, `top_k * 3` candidates each).
+    /// Create a hybrid query (vector + keyword with RRF fusion, `top_k * 4` candidates each).
     pub fn hybrid(embedding: Vec<f32>, text: impl Into<String>, top_k: usize) -> Self {
-        let candidate_k = top_k.saturating_mul(3);
+        let candidate_k = top_k.saturating_mul(HYBRID_CANDIDATE_MULTIPLIER as usize);
         QueryNode::Fuse {
             children: vec![
                 QueryNode::vector(embedding, candidate_k),
@@ -220,6 +286,7 @@ impl QueryNode {
             QueryNode::Keyword { top_k: 0, .. } => true,
             QueryNode::Keyword { text, .. } if text.is_empty() => true,
             QueryNode::Fuse { children, .. } if children.is_empty() => true,
+            QueryNode::Collect { children } => children.iter().all(Self::is_empty),
             QueryNode::Filter { child, .. } => child.is_empty(),
             QueryNode::Rerank { child, .. } => child.is_empty(),
             _ => false,
@@ -233,7 +300,9 @@ impl QueryNode {
     pub fn leaf_count(&self) -> usize {
         match self {
             QueryNode::Vector { .. } | QueryNode::Keyword { .. } => 1,
-            QueryNode::Fuse { children, .. } => children.iter().map(|c| c.leaf_count()).sum(),
+            QueryNode::Fuse { children, .. } | QueryNode::Collect { children } => {
+                children.iter().map(|c| c.leaf_count()).sum()
+            }
             QueryNode::Filter { child, .. } | QueryNode::Rerank { child, .. } => child.leaf_count(),
             QueryNode::Empty => 0,
         }
@@ -248,6 +317,9 @@ impl QueryNode {
             QueryNode::Vector { top_k, .. } => *top_k,
             QueryNode::Keyword { top_k, .. } => *top_k,
             QueryNode::Fuse { top_k, .. } => *top_k,
+            QueryNode::Collect { children } => children
+                .iter()
+                .fold(0usize, |total, child| total.saturating_add(child.top_k())),
             QueryNode::Filter { child, predicate } => match predicate {
                 FilterPredicate::TopK(k) => *k,
                 _ => child.top_k(),
@@ -264,7 +336,7 @@ impl QueryNode {
         match self {
             QueryNode::Empty => 0,
             QueryNode::Vector { .. } | QueryNode::Keyword { .. } => 1,
-            QueryNode::Fuse { children, .. } => {
+            QueryNode::Fuse { children, .. } | QueryNode::Collect { children } => {
                 1 + children.iter().map(|c| c.depth()).max().unwrap_or(0)
             }
             QueryNode::Filter { child, .. } | QueryNode::Rerank { child, .. } => 1 + child.depth(),

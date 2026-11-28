@@ -202,6 +202,158 @@ fn render_fix_report(run: &ValidationRun, args: &ValidateArgs) -> (String, Strin
 }
 
 #[test]
+fn github_annotations_locate_malformed_records_without_ids() {
+    let tmp = TempDir::new().unwrap();
+    let kg_dir = make_kg_dir(&tmp);
+    let files = ["entities.ndjson", "edges.ndjson", "notes.ndjson"];
+    for file in files {
+        std::fs::write(kg_dir.join(file), "{\n").unwrap();
+    }
+    let mut args = fix_report_args(&tmp);
+    args.fix = false;
+    args.format = OutputFormat::Github;
+    let run = run_validation(&args).unwrap();
+    let (annotations, stderr) = render_fix_report(&run, &args);
+    assert!(stderr.is_empty());
+    assert_eq!(annotations.lines().count(), 3, "{annotations}");
+    for file in files {
+        assert!(
+            annotations.lines().any(|line| line.starts_with(&format!(
+                "::error file=.khive/kg/{file}::{file} line 1: invalid JSON:"
+            ))),
+            "{annotations}"
+        );
+    }
+}
+
+#[test]
+fn github_annotations_use_evaluated_inputs_instead_of_record_ids_or_messages() {
+    let tmp = TempDir::new().unwrap();
+    let kg_dir = make_kg_dir(&tmp);
+    std::fs::write(
+        kg_dir.join("entities.ndjson"),
+        concat!(
+            "{\"id\":\"entity-source\",\"kind\":\"concept\",\"name\":\"Source\",\"description\":\"present\"}\n",
+            "{\"id\":\"shared\",\"kind\":\"concept\",\"name\":\"Target\",\"properties\":{\"year\":9999}}\n"
+        ),
+    )
+    .unwrap();
+    write_edges_canonical(&kg_dir, &[("entity-source", "shared", "annotates")]);
+    std::fs::write(
+        kg_dir.join("notes.ndjson"),
+        "{\"id\":\"shared\",\"kind\":\"reference\",\"content\":\"Citation\",\"properties\":{\"year\":9999}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        kg_dir.join("rules.toml"),
+        r#"
+[[rules]]
+id = "entity-description"
+severity = "error"
+kind = "entity"
+require_field = "description"
+message = "notes.ndjson is mentioned by an entity"
+
+[[rules]]
+id = "edge-caption"
+severity = "warning"
+kind = "edge"
+require_field = "caption"
+message = "entities.ndjson is mentioned by an edge"
+
+[edge_endpoint_types]
+enabled = true
+severity = "error"
+
+[citation_date_lint]
+enabled = true
+severity = "warning"
+"#,
+    )
+    .unwrap();
+    let mut args = fix_report_args(&tmp);
+    args.fix = false;
+    args.no_rules = false;
+    args.format = OutputFormat::Github;
+    let run = run_validation(&args).unwrap();
+    let (annotations, stderr) = render_fix_report(&run, &args);
+    assert!(stderr.is_empty());
+    assert_eq!(annotations.lines().count(), 5, "{annotations}");
+    assert!(annotations.contains(
+        "::error file=.khive/kg/entities.ndjson::notes.ndjson is mentioned by an entity\n"
+    ));
+    assert!(annotations.contains(
+        "::warning file=.khive/kg/edges.ndjson::entities.ndjson is mentioned by an edge\n"
+    ));
+    let endpoint = &run
+        .report
+        .rules
+        .iter()
+        .find(|rule| rule.id == "edge-endpoint-types")
+        .unwrap()
+        .violations[0];
+    assert_eq!(endpoint.entity_id.as_deref(), Some("entity-source"));
+    assert!(annotations
+        .lines()
+        .any(|line| line == format!("::error file=.khive/kg/edges.ndjson::{}", endpoint.message)));
+    let citations: Vec<_> = annotations
+        .lines()
+        .filter(|line| line.contains("property \"year\""))
+        .collect();
+    assert_eq!(citations.len(), 2, "{annotations}");
+    for file in ["entities.ndjson", "notes.ndjson"] {
+        assert!(citations
+            .iter()
+            .any(|line| line.starts_with(&format!("::warning file=.khive/kg/{file}::"))));
+    }
+
+    args.format = OutputFormat::Json;
+    let (json, _) = render_fix_report(&run, &args);
+    let report: serde_json::Value = serde_json::from_str(&json).unwrap();
+    for rule in report["rules"].as_array().unwrap() {
+        for violation in rule["violations"].as_array().unwrap() {
+            assert_eq!(violation.as_object().unwrap().len(), 7);
+            assert!(violation.get("source").is_none());
+        }
+    }
+}
+
+#[test]
+fn github_annotations_keep_unbound_findings_and_empty_notice() {
+    let tmp = TempDir::new().unwrap();
+    let kg_dir = make_kg_dir(&tmp);
+    write_entities(&kg_dir, &[]);
+    write_edges(&kg_dir, &[]);
+    std::fs::write(
+        kg_dir.join("rules.toml"),
+        r#"
+[[rules]]
+id = "bad-severity"
+severity = "erorr"
+kind = "entity"
+require_field = "description"
+message = "unused"
+"#,
+    )
+    .unwrap();
+    let mut args = fix_report_args(&tmp);
+    args.fix = false;
+    args.no_rules = false;
+    args.format = OutputFormat::Github;
+    let run = run_validation(&args).unwrap();
+    let (annotations, stderr) = render_fix_report(&run, &args);
+    assert!(stderr.is_empty());
+    assert_eq!(
+        annotations,
+        concat!(
+            "::notice ::Empty graph: no entity, edge, or note records read\n",
+            "::error ::Rule \"bad-severity\": invalid severity \"erorr\"; ",
+            "must be \"error\", \"warning\", or \"info\"\n"
+        )
+    );
+}
+
+#[test]
 fn validate_fix_reports_moved_entities_and_post_fix_status() {
     let tmp = TempDir::new().unwrap();
     let kg_dir = make_kg_dir(&tmp);
@@ -422,7 +574,7 @@ fn validate_without_fix_preserves_files_strict_status_and_report_formats() {
     let (annotations, stderr) = render_fix_report(&run, &args);
     assert_eq!(
         annotations,
-        "::warning ::entities.ndjson is not sorted by UUID; run `kkernel kg validate --fix`\n"
+        "::warning file=.khive/kg/entities.ndjson::entities.ndjson is not sorted by UUID; run `kkernel kg validate --fix`\n"
     );
     assert!(stderr.is_empty());
     args.strict = true;
@@ -559,4 +711,190 @@ message = "Concept {id} missing description"
         "retain the passed configured rule row"
     );
     assert!(stderr.is_empty());
+}
+
+fn pairing_rule(id: &str, severity: &'static str, passed: bool, fixable: bool) -> RuleResult {
+    RuleResult {
+        id: id.to_string(),
+        severity,
+        passed,
+        violations: if passed {
+            Vec::new()
+        } else {
+            vec![Violation {
+                source: None,
+                entity_id: None,
+                entity_name: None,
+                entity_kind: None,
+                rule_id: id.to_string(),
+                severity,
+                message: "pairing fixture".to_string(),
+                fixable,
+            }]
+        },
+    }
+}
+
+fn pairing_cohorts(structural: Vec<RuleResult>, configurable: Vec<RuleResult>) -> RuleCohorts {
+    RuleCohorts::new(
+        structural,
+        configurable,
+        ValidationSummary {
+            errors: 0,
+            warnings: 0,
+            info: 0,
+            entities: 2,
+            edges: 0,
+            empty: false,
+            passed: true,
+        },
+    )
+}
+
+#[test]
+fn fix_counts_pair_reordered_rules_by_id_without_reordering_report() {
+    let before = pairing_cohorts(
+        vec![
+            pairing_rule("sort-order", "warning", false, true),
+            pairing_rule("stable", "info", true, false),
+        ],
+        Vec::new(),
+    );
+    let after = pairing_cohorts(
+        vec![
+            pairing_rule("stable", "info", true, false),
+            pairing_rule("sort-order", "warning", true, false),
+        ],
+        Vec::new(),
+    );
+
+    let fixed = before.fixed_counts_after(&after).unwrap();
+    assert_eq!(fixed.warnings, 1);
+    assert_eq!(fixed.errors, 0);
+    assert_eq!(fixed.info, 0);
+    let report = after.into_report();
+    let ids: Vec<_> = report.rules.iter().map(|rule| rule.id.as_str()).collect();
+    assert_eq!(ids, ["stable", "sort-order"]);
+}
+
+#[test]
+fn fix_counts_reject_a_rule_missing_from_final_run() {
+    let before = pairing_cohorts(
+        vec![pairing_rule("sort-order", "warning", false, true)],
+        Vec::new(),
+    );
+    let after = pairing_cohorts(Vec::new(), Vec::new());
+    let error = before.fixed_counts_after(&after).unwrap_err().to_string();
+    assert!(error.contains("sort-order"), "{error}");
+    assert!(error.contains("structural"), "{error}");
+    assert!(error.contains("missing from final run"), "{error}");
+}
+
+#[test]
+fn fix_counts_reject_a_rule_missing_from_original_run() {
+    let before = pairing_cohorts(Vec::new(), Vec::new());
+    let after = pairing_cohorts(
+        vec![pairing_rule("sort-order", "warning", true, false)],
+        Vec::new(),
+    );
+    let error = before.fixed_counts_after(&after).unwrap_err().to_string();
+    assert!(error.contains("sort-order"), "{error}");
+    assert!(error.contains("missing from original run"), "{error}");
+}
+
+#[test]
+fn fix_counts_reject_changed_severity() {
+    let before = pairing_cohorts(
+        vec![pairing_rule("sort-order", "warning", false, true)],
+        Vec::new(),
+    );
+    let after = pairing_cohorts(
+        vec![pairing_rule("sort-order", "error", true, false)],
+        Vec::new(),
+    );
+    let error = before.fixed_counts_after(&after).unwrap_err().to_string();
+    assert!(error.contains("sort-order"), "{error}");
+    assert!(error.contains("changed severity"), "{error}");
+    assert!(
+        error.contains("warning") && error.contains("error"),
+        "{error}"
+    );
+}
+
+#[test]
+fn fix_counts_reject_duplicate_final_source_identities() {
+    let before = pairing_cohorts(
+        vec![pairing_rule("repeat", "warning", true, false)],
+        Vec::new(),
+    );
+    let after = pairing_cohorts(
+        vec![
+            pairing_rule("repeat", "warning", true, false),
+            pairing_rule("repeat", "warning", true, false),
+        ],
+        Vec::new(),
+    );
+    let error = before.fixed_counts_after(&after).unwrap_err().to_string();
+    assert!(error.contains("repeat"), "{error}");
+    assert!(error.contains("final structural[0]"), "{error}");
+    assert!(error.contains("final structural[1]"), "{error}");
+}
+
+#[test]
+fn validate_fix_refuses_same_cohort_duplicates_before_writes_but_plain_validate_keeps_them() {
+    let tmp = TempDir::new().unwrap();
+    let kg_dir = make_kg_dir(&tmp);
+    write_entities(&kg_dir, &[("b", "concept", "B"), ("a", "concept", "A")]);
+    write_edges(&kg_dir, &[]);
+    let rules = r#"[[rules]]
+id = "repeat"
+severity = "warning"
+kind = "entity"
+require_field = "description"
+[[rules]]
+id = "repeat"
+severity = "warning"
+kind = "entity"
+require_field = "description"
+"#;
+    std::fs::write(kg_dir.join("rules.toml"), rules).unwrap();
+    let entities_before = std::fs::read(kg_dir.join("entities.ndjson")).unwrap();
+    let edges_before = std::fs::read(kg_dir.join("edges.ndjson")).unwrap();
+    let rules_before = std::fs::read(kg_dir.join("rules.toml")).unwrap();
+    let mut args = fix_report_args(&tmp);
+    args.no_rules = false;
+
+    let error = run_validation(&args).unwrap_err().to_string();
+    assert!(error.contains("duplicate rule id"), "{error}");
+    assert!(error.contains("repeat"), "{error}");
+    assert!(error.contains("original configurable[0]"), "{error}");
+    assert!(error.contains("original configurable[1]"), "{error}");
+    assert_eq!(
+        std::fs::read(kg_dir.join("entities.ndjson")).unwrap(),
+        entities_before
+    );
+    assert_eq!(
+        std::fs::read(kg_dir.join("edges.ndjson")).unwrap(),
+        edges_before
+    );
+    assert_eq!(
+        std::fs::read(kg_dir.join("rules.toml")).unwrap(),
+        rules_before
+    );
+
+    args.fix = false;
+    let plain = run_validation(&args).unwrap();
+    assert_eq!(
+        plain
+            .report
+            .rules
+            .iter()
+            .filter(|rule| rule.id == "repeat")
+            .count(),
+        2
+    );
+    assert_eq!(
+        std::fs::read(kg_dir.join("entities.ndjson")).unwrap(),
+        entities_before
+    );
 }

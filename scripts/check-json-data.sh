@@ -20,6 +20,18 @@
 #                          unless a known lockfile (matched by file name at any
 #                          depth, so a nested package's lockfile is admitted) or a
 #                          benchmark-results path
+#   Merge commits (default mode only): a merge stages every path the merged-in
+#   branch changed, so data the default branch already carries would be refused
+#   a second time. While MERGE_HEAD exists, a staged path is skipped only when its
+#   staged blob is the very blob a merge head carries AND that merge head is the
+#   remote default branch (refs/remotes/origin/HEAD) or an ancestor of it. Each
+#   merge head of an octopus merge is judged on its own, never as a group: a side
+#   branch committed with the guard bypassed does not become trusted by being
+#   merged alongside the default branch. A path edited during the merge no longer
+#   matches the head's blob and is checked as usual. When origin/HEAD is not set,
+#   or does not resolve to a commit, nothing is skipped (fail closed); there is no
+#   guess at a branch name. --all is unaffected.
+#
 #   Extensions match case-insensitively (DATA.JSONL is JSONL), and file lists are
 #   read NUL-delimited so a non-ASCII name reaches the rules as named instead of
 #   in git's C-quoted form, which ends in a quote and matched no extension. A name
@@ -146,6 +158,55 @@ EOF
 MODE=tree
 fail=0
 
+# Merge heads whose content is already part of the remote default branch, one full
+# object name per line. Empty outside a merge and whenever the default branch
+# cannot be resolved. A string rather than an array for the same bash 3.2 reason
+# as EXEMPTIONS above.
+TRUSTED_HEADS=''
+
+# Fills TRUSTED_HEADS. Every failure returns with it still empty, which means
+# "trust nothing": the guard only ever skips a path on positive evidence.
+load_trusted_merge_heads() {
+  local gitdir mfile ref default head
+  git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 || return 0
+  # The per-worktree git directory, so a linked worktree reads its own MERGE_HEAD.
+  gitdir=$(git rev-parse --absolute-git-dir 2>/dev/null) || return 0
+  mfile="$gitdir/MERGE_HEAD"
+  [ -f "$mfile" ] || return 0
+  ref=$(git symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null) || return 0
+  default=$(git rev-parse -q --verify "${ref}^{commit}" 2>/dev/null) || return 0
+  # An octopus merge lists one head per line; each is judged separately.
+  while IFS= read -r head || [ -n "$head" ]; do
+    case "$head" in
+      ''|*[!0-9a-f]*) continue ;;
+    esac
+    head=$(git rev-parse -q --verify "${head}^{commit}" 2>/dev/null) || continue
+    if git merge-base --is-ancestor "$head" "$default" 2>/dev/null; then
+      TRUSTED_HEADS="${TRUSTED_HEADS}${head}
+"
+    fi
+  done < "$mfile"
+}
+
+# True when the staged blob for <path> is identical to the blob of <path> at a
+# trusted merge head. Both object names start with ':' or a hex object id, so the
+# path is only ever a tree path and cannot be read as an option or pathspec magic.
+staged_path_trusted() {
+  local p="$1" staged h
+  [ -n "$TRUSTED_HEADS" ] || return 1
+  staged=$(git rev-parse -q --verify ":0:$p" 2>/dev/null) || return 1
+  [ -n "$staged" ] || return 1
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    if [ "$(git rev-parse -q --verify "$h:$p" 2>/dev/null)" = "$staged" ]; then
+      return 0
+    fi
+  done <<EOF
+$TRUSTED_HEADS
+EOF
+  return 1
+}
+
 # Byte size of the object the mode judges: the staged blob in pre-commit mode, the
 # working-tree file in --all mode. Prints nothing and returns non-zero when unreadable.
 object_bytes() {
@@ -162,6 +223,15 @@ check_file() {
   local base lower bytes size_kb ceiling_kb
   base="$(basename -- "$f")"
   lower="$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')"
+
+  # During a merge, content that is byte-identical to what the remote default
+  # branch already carries is not new data. Only the names the rules below act on
+  # pay for the lookup.
+  if [ "$MODE" = staged ] && [ -n "$TRUSTED_HEADS" ]; then
+    case "$(basename -- "$lower")" in
+      *.jsonl|*.ndjson|*.json) staged_path_trusted "$f" && return 0 ;;
+    esac
+  fi
 
   # The extension decides the rule, so it is matched case-folded; the lockfile
   # names and exemption regexes below still match the path as tracked.
@@ -234,6 +304,7 @@ if [ "${1:-}" = "--all" ]; then
 else
   # Pre-commit mode: staged files only, judged from the index
   MODE=staged
+  load_trusted_merge_heads
   while IFS= read -r -d '' f; do
     check_file "$f"
   done < <(git diff --cached --name-only -z --diff-filter=ACMR)

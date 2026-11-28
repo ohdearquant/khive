@@ -44,9 +44,11 @@ mod note_curation;
 mod note_merge;
 mod note_merge_guard;
 pub(crate) mod note_reindex;
+mod outbound_health;
 mod outbound_messages;
 
 pub use note_merge_guard::{GuardedNoteMerge, MergeAssertion, NoteMergeGuard};
+pub use outbound_health::OutboundHealthSummary;
 
 /// Restrict an outbox scan before its SQL page bound is applied. A held row
 /// for another or unconfigured channel must not consume a channel's page.
@@ -72,15 +74,15 @@ mod types_and_guards;
 
 use types_and_guards::{
     append_merge_event_in_transaction, edge_row_budget_bytes, map_merge_entity_storage_error,
-    map_merge_note_storage_error, EmbeddingModelPlan, EntityMergeRefusal, EntityMergeValidation,
-    MergeEventContext, MergeSqlError, MergeTxBudget,
+    map_merge_note_storage_error, merge_key_conflict_error, EmbeddingModelPlan, EntityMergeRefusal,
+    EntityMergeValidation, MergeEventContext, MergeSqlError, MergeTxBudget,
 };
 pub use types_and_guards::{
     entity_merge_guard_compared_values, entity_merge_guard_error,
     entity_merge_guard_refusal_message, validate_entity_merge_floor, ContentMergeStrategy,
     EdgeListFilter, EdgePatch, EntityDedupMergePolicy, EntityMergeGuard, EntityPatch,
-    MergeEdgeConflictPreimage, MergeEdgePreimage, MergeSummary, MergeTxBudgetReport, MergeTxLimits,
-    NotePatch, NoteUpdatePolicy,
+    MergeEdgeConflictPreimage, MergeEdgePreimage, MergeKey, MergeKeyConflict, MergeKeyMove,
+    MergeSummary, MergeTxBudgetReport, MergeTxLimits, NotePatch, NoteUpdatePolicy,
 };
 pub(crate) use types_and_guards::{
     normalize_note_update_tags, stale_edge_snapshot_error, stale_entity_snapshot_error,
@@ -93,6 +95,8 @@ mod merge_sql;
 use merge_sql::{merge_entity_sql, merge_note_sql};
 
 mod entity_curation;
+mod entity_pending_index;
+pub use entity_pending_index::{EntityIndexFailure, EntityIndexReport, EntityUpdateReport};
 mod merge_edges;
 
 use merge_edges::{

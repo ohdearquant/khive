@@ -35,8 +35,16 @@ impl KhiveMcpServer {
             // of rejecting it or silently stamping writes under its own actor.
             actor_id: self.actor_id().map(str::to_string),
             process_ref: khive_runtime::process_ref_from_env(),
+            client_cwd: khive_runtime::client_cwd_from_process(),
             visible_namespaces: self
                 .visible_namespaces()
+                .iter()
+                .map(|ns| ns.as_str().to_string())
+                .collect(),
+            // ADR-021 Delta 1: the caller's own owned-namespace declaration
+            // travels with its identity, omitted from the wire when empty.
+            owned_namespaces: self
+                .owned_namespaces()
                 .iter()
                 .map(|ns| ns.as_str().to_string())
                 .collect(),
@@ -192,6 +200,9 @@ impl KhiveMcpServer {
             // A scheduled action is scoped exactly to its event namespace;
             // it never inherits the daemon's broader read visibility.
             visible_namespaces: Vec::new(),
+            // Nor does it carry an owned-namespace declaration: ownership is
+            // read from the configured caller, not from an event's namespace.
+            owned_namespaces: Vec::new(),
             request_id: None,
         };
         self.dispatch_request_inner(p, true, Some(identity), DispatchOrigin::Local)
@@ -299,6 +310,13 @@ impl KhiveMcpServer {
                 "bridge.diagnostics is available only on the stdio bridge".into(),
             ));
         }
+        if parsed.ops.iter().any(|op| op.tool == "bridge.share") {
+            return Err(invalid_request_error(
+                "bridge.share is answered only by the stdio bridge and kkernel exec; nothing was \
+                 sent"
+                    .into(),
+            ));
+        }
         validate_request_overrides(&p, parsed.ops.len())?;
         let ParsedDispatchPolicy {
             strict_refusals,
@@ -313,6 +331,11 @@ impl KhiveMcpServer {
                     process_ref: khive_runtime::process_ref_from_env(),
                     visible_namespaces: self
                         .visible_namespaces()
+                        .iter()
+                        .map(|ns| ns.as_str().to_string())
+                        .collect(),
+                    owned_namespaces: self
+                        .owned_namespaces()
                         .iter()
                         .map(|ns| ns.as_str().to_string())
                         .collect(),

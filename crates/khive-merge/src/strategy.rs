@@ -106,6 +106,8 @@ mod tests {
 
     fn entity(id: Uuid, name: &str) -> ExportedEntity {
         ExportedEntity {
+            keys: Vec::new(),
+            aliases: Vec::new(),
             id,
             kind: "concept".into(),
             name: name.into(),

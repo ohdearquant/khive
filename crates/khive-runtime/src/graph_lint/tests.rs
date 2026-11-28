@@ -1012,7 +1012,9 @@ async fn committed_question_receipt_survives_post_commit_reindex_failure() {
 
 #[tokio::test]
 async fn annotation_target_is_resolved_from_separate_events_store() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let event_path = directory.path().join("events.db");
     let runtime = KhiveRuntime::new_for_test(RuntimeConfig {
         db_path: None,

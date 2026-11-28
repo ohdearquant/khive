@@ -120,7 +120,9 @@ async fn explicit_daemon_policy_refuses_offset_overflow_before_filesystem_access
 
 #[test]
 fn direct_events_registry_requires_equal_effective_disk_policy() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let db = root.path().join("events.db");
     let locks = root.path().join("locks");
     let policy = khive_db::EffectiveDiskGuardConfig {
@@ -178,7 +180,9 @@ fn direct_events_registry_requires_equal_effective_disk_policy() {
 
 #[test]
 fn writable_direct_events_open_requires_a_volume_lock_directory() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let db = root.path().join("events.db");
     let writable = direct_backend_with_policies(
         &db,
@@ -231,7 +235,9 @@ fn supervisor_carries_captured_disk_policy_and_lock_path_verbatim() {
 
 #[test]
 fn secondary_runtime_events_inherit_actual_main_disk_policy_and_lock_directory() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let main_policy = khive_db::EffectiveDiskGuardConfig {
         reserve_bytes: 123,
         guard_deadline_ms: 250,

@@ -10,8 +10,13 @@ use crate::TokenFilter;
 pub struct LowercaseFilter;
 
 impl TokenFilter for LowercaseFilter {
-    fn apply(&self, token: String) -> Option<String> {
-        Some(token.to_lowercase())
+    fn apply(&self, mut token: String) -> Option<String> {
+        if token.is_ascii() {
+            token.make_ascii_lowercase();
+            Some(token)
+        } else {
+            Some(token.to_lowercase())
+        }
     }
 }
 

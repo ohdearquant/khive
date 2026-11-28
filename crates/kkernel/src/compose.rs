@@ -52,6 +52,7 @@ pub fn compose_registry_with_extra_packs(
     builder.with_gate(default_runtime.config().gate.clone());
     builder.with_default_namespace(default_runtime.config().default_namespace.as_str());
     builder.with_visible_namespaces(default_runtime.config().visible_namespaces.clone());
+    builder.with_owned_namespaces(default_runtime.config().owned_namespaces.clone());
     builder.with_actor_id(default_runtime.config().actor_id.clone());
 
     PackRegistry::register_packs_with_runtimes_with_extra_factories(

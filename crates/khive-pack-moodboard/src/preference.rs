@@ -1,6 +1,6 @@
 //! Governed pairwise-preference feature, training, calibration, and FANN model contracts.
 //!
-//! `lattice-fann` 0.12.0's `BackpropTrainer` optimizes MSE.  This module therefore
+//! `lattice-fann` 0.15.0's `BackpropTrainer` optimizes MSE.  This module therefore
 //! fits the Bradley--Terry logistic objective directly in deterministic `f64`,
 //! then materializes the learned zero-intercept 10 -> 1 linear head as a FANN
 //! network.  FANN owns the persisted binary representation and every served

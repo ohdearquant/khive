@@ -1,0 +1,24 @@
+[package]
+name = "khive-subject"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Source-blind declaration extraction with validated subject ontology contracts"
+
+[dependencies]
+khive-types = { version = "0.24.0", path = "../khive-types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+khive-runtime = { version = "0.24.0", path = "../khive-runtime" }
+khive-pack-kg = { version = "0.24.0", path = "../khive-pack-kg" }
+khive-pack-formal = { version = "0.24.0", path = "../khive-pack-formal" }
+tokio = { workspace = true }

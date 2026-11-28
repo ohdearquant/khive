@@ -55,7 +55,7 @@ fn waiter(
     let join = std::thread::spawn(move || {
         let deadline = Instant::now() + timeout;
         entered_tx.send(std::thread::current().id()).unwrap();
-        let held = acquire_process_slot(owned_key, deadline, Location::caller())?;
+        let held = acquire_process_slot(owned_key, deadline, timeout, Location::caller())?;
         acquired.send(number).unwrap();
         released.recv_timeout(OBSERVE).expect("release held waiter");
         drop(held);
@@ -76,14 +76,19 @@ fn next(acquired: &Receiver<usize>, number: usize, waiter: Waiter) {
     waiter.join.join().unwrap().unwrap();
 }
 
-fn assert_timeout(error: &LeaseRefusal) {
+fn assert_timeout(error: &LeaseRefusal, timeout: Duration) {
+    let expected = format!(
+        "volume lease deadline expired while waiting for in-process slot \
+         (configured budget: {} ms)",
+        timeout.as_millis()
+    );
     assert!(
         matches!(
             error,
             LeaseRefusal::TimedOut(SqliteError::CapacityUnavailable {
                 phase: CapacityUnavailablePhase::LockContended,
                 message,
-            }) if message == "timed out waiting for in-process volume lease"
+            }) if message == &expected
         ),
         "unexpected refusal: {error:?}"
     );
@@ -96,8 +101,13 @@ fn assert_empty(key: &ProcessSlotKey) {
 #[test]
 fn queued_waiters_keep_arrival_order_ahead_of_a_later_request() {
     let key = key(101);
-    let held =
-        acquire_process_slot(key.clone(), Instant::now() + OBSERVE, Location::caller()).unwrap();
+    let held = acquire_process_slot(
+        key.clone(),
+        Instant::now() + OBSERVE,
+        OBSERVE,
+        Location::caller(),
+    )
+    .unwrap();
     let (tx, rx) = mpsc::channel();
     let first = waiter(&key, 0, OBSERVE, &tx);
     let second = waiter(&key, 1, OBSERVE, &tx);
@@ -117,8 +127,13 @@ fn queued_waiters_keep_arrival_order_ahead_of_a_later_request() {
 #[test]
 fn expired_head_is_removed_and_its_successor_can_acquire() {
     let key = key(102);
-    let held =
-        acquire_process_slot(key.clone(), Instant::now() + OBSERVE, Location::caller()).unwrap();
+    let held = acquire_process_slot(
+        key.clone(),
+        Instant::now() + OBSERVE,
+        OBSERVE,
+        Location::caller(),
+    )
+    .unwrap();
     let (tx, rx) = mpsc::channel();
     let head = waiter(&key, 0, Duration::from_secs(2), &tx);
     let successor = waiter(&key, 1, OBSERVE, &tx);
@@ -128,7 +143,7 @@ fn expired_head_is_removed_and_its_successor_can_acquire() {
         .join()
         .unwrap()
         .expect_err("head times out while held");
-    assert_timeout(&error);
+    assert_timeout(&error, Duration::from_secs(2));
     assert_eq!(queued(&key), [successor.id]);
     assert!(rx.try_recv().is_err());
     drop(held);
@@ -139,8 +154,13 @@ fn expired_head_is_removed_and_its_successor_can_acquire() {
 #[test]
 fn expired_middle_preserves_the_order_of_remaining_waiters() {
     let key = key(103);
-    let held =
-        acquire_process_slot(key.clone(), Instant::now() + OBSERVE, Location::caller()).unwrap();
+    let held = acquire_process_slot(
+        key.clone(),
+        Instant::now() + OBSERVE,
+        OBSERVE,
+        Location::caller(),
+    )
+    .unwrap();
     let (tx, rx) = mpsc::channel();
     let first = waiter(&key, 0, OBSERVE, &tx);
     let middle = waiter(&key, 1, Duration::from_secs(2), &tx);
@@ -151,7 +171,7 @@ fn expired_middle_preserves_the_order_of_remaining_waiters() {
         .join()
         .unwrap()
         .expect_err("middle times out while held");
-    assert_timeout(&error);
+    assert_timeout(&error, Duration::from_secs(2));
     assert_eq!(queued(&key), [first.id, last.id]);
     drop(held);
     next(&rx, 0, first);
@@ -162,13 +182,23 @@ fn expired_middle_preserves_the_order_of_remaining_waiters() {
 #[test]
 fn reentry_and_expired_arrival_do_not_change_the_waiting_queue() {
     let key = key(104);
-    let held =
-        acquire_process_slot(key.clone(), Instant::now() + OBSERVE, Location::caller()).unwrap();
+    let held = acquire_process_slot(
+        key.clone(),
+        Instant::now() + OBSERVE,
+        OBSERVE,
+        Location::caller(),
+    )
+    .unwrap();
     let (tx, rx) = mpsc::channel();
     let follower = waiter(&key, 0, OBSERVE, &tx);
-    let error = acquire_process_slot(key.clone(), Instant::now() + OBSERVE, Location::caller())
-        .err()
-        .expect("same-thread re-entry refuses");
+    let error = acquire_process_slot(
+        key.clone(),
+        Instant::now() + OBSERVE,
+        OBSERVE,
+        Location::caller(),
+    )
+    .err()
+    .expect("same-thread re-entry refuses");
     match error {
         LeaseRefusal::Refused(SqliteError::VolumeLeaseReentry {
             holder_site,
@@ -180,18 +210,28 @@ fn reentry_and_expired_arrival_do_not_change_the_waiting_queue() {
         }
         other => panic!("re-entry must remain a distinct refusal: {other:?}"),
     }
-    let error = acquire_process_slot(key.clone(), Instant::now(), Location::caller())
-        .err()
-        .expect("expired deadline retains precedence over re-entry");
-    assert_timeout(&error);
+    let error = acquire_process_slot(
+        key.clone(),
+        Instant::now(),
+        Duration::ZERO,
+        Location::caller(),
+    )
+    .err()
+    .expect("expired deadline retains precedence over re-entry");
+    assert_timeout(&error, Duration::ZERO);
     assert_eq!(queued(&key), [follower.id]);
     drop(held);
     next(&rx, 0, follower);
     assert_empty(&key);
-    let error = acquire_process_slot(key.clone(), Instant::now(), Location::caller())
-        .err()
-        .expect("expired deadline cannot acquire an empty slot");
-    assert_timeout(&error);
+    let error = acquire_process_slot(
+        key.clone(),
+        Instant::now(),
+        Duration::ZERO,
+        Location::caller(),
+    )
+    .err()
+    .expect("expired deadline cannot acquire an empty slot");
+    assert_timeout(&error, Duration::ZERO);
     assert_empty(&key);
 }
 
@@ -203,12 +243,19 @@ fn detached_volume_lease_preserves_the_queue_until_cross_thread_release() {
     let locks = dir.path().join("locks");
     let slot_key = ProcessSlotKey::new(identity.key, &locks);
     let held = identity.acquire_classified(OBSERVE, &locks).unwrap();
+    let error = identity
+        .acquire_classified(Duration::ZERO, &locks)
+        .err()
+        .expect("an expired deadline must refuse before same-thread re-entry");
+    assert_timeout(&error, Duration::ZERO);
+    assert!(queued(&slot_key).is_empty());
     let detached = held.detach_from_thread();
     let error = identity
         .acquire_classified(Duration::from_millis(30), &locks)
         .err()
         .expect("original thread must contend after detach, not re-enter");
-    assert_timeout(&error);
+    assert_timeout(&error, Duration::from_millis(30));
+    assert!(queued(&slot_key).is_empty());
     let (entered_tx, entered_rx) = mpsc::channel();
     let (acquired_tx, acquired_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();

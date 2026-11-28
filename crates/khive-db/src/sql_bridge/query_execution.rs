@@ -15,7 +15,7 @@ use super::{
 /// transaction is rolled back; a call that succeeded fails with
 /// `InvalidInput`.
 pub(super) fn settle_pooled_call<T>(
-    guard: &crate::pool::PooledAutocommitWriteUnit<'_>,
+    guard: &mut crate::pool::PooledAutocommitWriteUnit<'_>,
     operation: &'static str,
     result: khive_storage::types::StorageResult<T>,
 ) -> khive_storage::types::StorageResult<T> {
@@ -73,6 +73,33 @@ pub(super) fn execute_prepared_query(
         rows.push(row_to_sql_row(row, col_count, &col_names));
     }
     Ok(rows)
+}
+
+/// Consume rows as they are stepped, retaining no owned row collection here.
+pub(super) fn execute_prepared_query_consume(
+    mut stmt: rusqlite::Statement<'_>,
+    mut consumer: Box<dyn khive_storage::SqlRowConsumer>,
+    mut ensure_active: impl FnMut() -> khive_storage::types::StorageResult<()>,
+    operation: &'static str,
+) -> khive_storage::types::StorageResult<Box<dyn khive_storage::SqlRowConsumer>> {
+    let col_count = stmt.column_count();
+    let col_names: Vec<String> = (0..col_count)
+        .map(|i| stmt.column_name(i).unwrap_or("").to_string())
+        .collect();
+    let mut raw_rows = stmt.raw_query();
+    loop {
+        ensure_active()?;
+        let Some(row) = raw_rows
+            .next()
+            .map_err(|error| map_rusqlite_err(error, operation))?
+        else {
+            break;
+        };
+        ensure_active()?;
+        consumer.push_row(row_to_sql_row(row, col_count, &col_names))?;
+        ensure_active()?;
+    }
+    Ok(consumer)
 }
 
 pub(super) fn execute_prepared_query_row(

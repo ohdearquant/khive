@@ -2680,3 +2680,7 @@ mod tests;
 
 #[cfg(test)]
 include!("source_ingest/entity_mutation_tests.rs");
+
+#[cfg(test)]
+#[path = "source_ingest/workspace_parity_tests.rs"]
+mod workspace_parity_tests;

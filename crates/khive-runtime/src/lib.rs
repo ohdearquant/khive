@@ -16,6 +16,11 @@ pub mod atomic_message;
 pub mod atomic_plan;
 pub mod atomic_prepare;
 pub mod atomic_runner;
+pub mod attachment_cutover;
+pub use attachment_cutover::{
+    coordinate_attachment_cutover, coordinate_empty_secondary_attachment_cutover,
+    legacy_preference_model_count, require_secondary_attachment_empty,
+};
 pub mod audit_batch;
 pub mod audit_error;
 pub mod backend_handle;
@@ -34,6 +39,7 @@ pub mod config_ledger;
 pub mod context;
 pub mod cost_unit;
 pub mod credentials;
+pub mod node_pins;
 mod visibility_receipts;
 pub use visibility_receipts::AuthenticatedVisibilityReceipt;
 pub mod curation;
@@ -50,6 +56,7 @@ mod error_projection;
 mod event_actor_scope;
 mod event_cursor_walk;
 mod event_page;
+mod event_plane_read;
 mod event_store_guard;
 pub mod events_split;
 mod fence_identity;
@@ -58,7 +65,13 @@ pub mod fusion;
 pub mod graph_traversal;
 pub mod hooks;
 mod index_repair;
+#[cfg(feature = "native-rerank")]
+pub mod native_reranker;
 pub use index_repair::IndexRepairReport;
+pub mod channel_section;
+#[cfg(test)]
+mod channel_section_tests;
+pub mod channel_send;
 pub mod graph_lint;
 pub mod input_schema;
 pub mod keyed_memory;
@@ -98,6 +111,7 @@ pub mod reference_resolution;
 pub mod reference_ring;
 pub mod registry;
 pub mod resource;
+pub mod resource_admission;
 pub mod retrieval;
 pub mod runtime;
 pub mod search_audit;
@@ -140,15 +154,19 @@ pub use blob::{
     DEFAULT_BLOB_HYDRATION_BYTES,
 };
 pub use build_info::{BuildInfo, BUILD_INFO, BUILD_VERSION};
-pub use config::{ann_fresh_tail_enabled_from_env, process_ref_from_env, WalCeilingSource};
+pub use config::{
+    ann_fresh_tail_enabled_from_env, client_cwd_from_process, process_ref_from_env,
+    WalCeilingSource,
+};
 pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};
 pub use curation::{
     entity_embedding_text, entity_fts_document, entity_merge_guard_compared_values,
     entity_merge_guard_error, entity_merge_guard_refusal_message, note_embedding_text,
     note_fts_document, validate_entity_merge_floor, ContentMergeStrategy, EdgeListFilter,
     EdgePatch, EntityDedupMergePolicy, EntityMergeGuard, EntityPatch, GuardedNoteMerge,
-    MergeAssertion, MergeEdgeConflictPreimage, MergeEdgePreimage, MergeSummary,
-    MergeTxBudgetReport, MergeTxLimits, NoteMergeGuard, NotePatch, NoteUpdatePolicy,
+    MergeAssertion, MergeEdgeConflictPreimage, MergeEdgePreimage, MergeKey, MergeKeyConflict,
+    MergeKeyMove, MergeSummary, MergeTxBudgetReport, MergeTxLimits, NoteMergeGuard, NotePatch,
+    NoteUpdatePolicy,
 };
 #[cfg(unix)]
 pub use daemon::{acquire_recovery_lock, pid_path, run_daemon, socket_path, DaemonDispatch};
@@ -163,10 +181,15 @@ pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderP
 pub use embedding::{EmbeddingModelRecord, EmbeddingModelStatus};
 pub use embedding_reranker::{EmbeddingCosineReranker, EmbeddingRerankHit};
 pub use engine_config::{
-    config_from_env, resolve_wal_ceiling, BackendConfig, BackendKind, BlobConfig,
-    BrainSectionConfig, CodeMapConfig, ConfigError, EngineConfig, GateSectionConfig,
-    GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig, ResolvedWalCeiling,
-    StorageSectionConfig,
+    config_from_env, read_computer_key, resolve_wal_ceiling, BackendConfig, BackendKind,
+    BlobConfig, BrainSectionConfig, CodeIngestSectionConfig, CodeMapConfig, ComputerEndpoint,
+    ComputerKey, ComputerKeyError, ComputerKeyRefusal, ComputerSectionConfig, ConfigError,
+    EngineConfig, GateSectionConfig, GitDigestSectionConfig, GitRepoAccess, GitWriteEntryConfig,
+    GitWriteSectionConfig, KhiveConfig, KnowledgeSectionConfig, PackConfig, ResolvedWalCeiling,
+    ShareSectionConfig, ShareTargetConfig, StorageSectionConfig, COMMAND_RUNNING_PACKS,
+    COMPUTER_ROUTABLE_PACKS, DEFAULT_COMPUTER_CALL_TIMEOUT_S, DEFAULT_SHARE_FILES,
+    DEFAULT_SHARE_TOTAL_BYTES, MAX_COMPUTER_CALL_TIMEOUT_S, MAX_COMPUTER_KEY_BYTES,
+    MAX_SHARE_FILES, MAX_SHARE_FILE_BYTES, MAX_SHARE_TOTAL_BYTES,
 };
 pub use error::{
     fts_text_leg_or_err, AdmissionFailureContext, AuditObligationFailure, AuditObligationReason,
@@ -187,6 +210,9 @@ pub use event_cursor_walk::{visit_events_cursor_walk, EventCursorWalkError};
 pub use event_page::{
     page_budget_exceeded_error, row_exceeds_budget_error, EventReadPageRequest, EventReadPageResult,
 };
+#[cfg(any(test, feature = "test-internals"))]
+#[doc(hidden)]
+pub use event_plane_read::test_support_exports as event_plane_read_test_support;
 pub use event_store_guard::EventAttribution;
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
@@ -206,6 +232,8 @@ pub use khive_storage::types::TraversalOptions;
 pub use khive_storage::{EventObservation, EventView, ObservationRole, ReferentKind};
 pub use khive_types::namespace::Namespace;
 pub use mailbox_view::MailboxView;
+#[cfg(feature = "native-rerank")]
+pub use native_reranker::RuntimeRerankDocumentResolver;
 pub use note_create::{effective_create_tags, EffectiveCreateTags};
 pub use objectives::{
     AmplifiedDecayAwareSalienceObjective, DecayAwareSalienceObjective, GraphProximityObjective,
@@ -220,9 +248,13 @@ pub use operations::{
 };
 pub use operations::{
     base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,
-    hex_prefix_to_uuid_pattern, merge_entry_metadata, uuid_prefix_bounds, ConditionalInsertStage,
-    EdgeEndpointKind, EntityCreateSpec, LinkSpec, NoteCreateSpec, NoteSearchHit, NoteSearchOutcome,
-    PostCommitDegradation, PrefixScope, QueryResult, Resolved,
+    entity_carries_create_payload, entity_key_add_plans, entity_key_conflict,
+    hex_prefix_to_uuid_pattern, keyed_replay_assertion_plan, merge_entry_metadata,
+    same_create_payload, uuid_prefix_bounds, validate_entity_alias, ConditionalInsertStage,
+    EdgeEndpointKind, EntityAliasChange, EntityAliasReport, EntityCreateSpec, EntityKeyAdd,
+    KeyedEntityCreate, KeyedEntityReload, LinkSpec, NoteCreateSpec, NoteSearchHit,
+    NoteSearchOutcome, PendingEntityId, PostCommitDegradation, PrefixScope, QueryResult, Resolved,
+    ENTITY_KEY_ADD_HELD_LABEL, ENTITY_KEY_ADD_LIVE_LABEL,
 };
 pub use pack::{
     resolve_explicit_namespace, ChannelIngestCapability, DispatchHook, HandlerDef,
@@ -233,7 +265,7 @@ pub use pack::{
     VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder, VerifiedActor,
     Visibility, AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
 };
-pub use params::deser_params;
+pub use params::{deser_params, integer_params_from_whole_floats};
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
 pub use preference_verification::{LegacyPreferenceVerifier, VerifiedModelNetworkAttachment};
@@ -243,6 +275,7 @@ pub use presentation::{
 };
 pub use reference_resolution::{
     resolve_reference, resolve_reference_with_entity_type, ReferenceCandidate, ReferenceResolution,
+    EXACT_NAME_CONFIDENCE,
 };
 pub use reference_ring::{ReferenceRing, RingEntry};
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
@@ -250,9 +283,10 @@ pub use resource::{cpu_delta_us, process_resource_usage, ProcessResourceUsage};
 pub use retrieval::{HybridSearchOutcome, RankScoreKind, SearchHit, SearchSignals, SearchSource};
 pub use runtime::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
-    parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
-    BackendId, EntityTypeValidatorFn, KhiveRuntime, NamedVectorIdentity, NamespaceToken,
-    NoteMutationHookFn, NoteWriteValidatorFn, OpenedDiagnosticBackend, RuntimeConfig,
+    parse_pack_list, resolve_db_anchor, resolve_project_actor_id,
+    resolve_project_requires_attributed_actor, runtime_config_from_khive_config, BackendId,
+    EntityTypeValidatorFn, KhiveRuntime, NamedVectorIdentity, NamespaceToken, NoteMutationHookFn,
+    NoteWriteValidatorFn, OpenedDiagnosticBackend, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
 pub use secret_gate_finalizer::{

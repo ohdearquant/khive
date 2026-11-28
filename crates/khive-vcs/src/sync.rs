@@ -16,6 +16,7 @@ use chrono::Utc;
 use khive_runtime::pack::{PackRegistry, VerbRegistryBuilder};
 use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
 use khive_runtime::{entity_fts_document, KhiveRuntime, RuntimeConfig};
+use khive_storage::entity::EntityAlias;
 use khive_storage::types::Edge;
 use khive_storage::LinkId;
 use khive_types::{EdgeRelation, Pack};
@@ -24,7 +25,9 @@ use uuid::Uuid;
 
 use crate::error::VcsError;
 use crate::hash::snapshot_id_for_archive;
-use crate::types::SnapshotId;
+use crate::types::{
+    legacy_snapshot_coverage, SnapshotCoverage, SnapshotId, SnapshotIdentity, KG_V1_COVERAGE,
+};
 
 #[cfg(test)]
 #[path = "remote_cache_perf_tests.rs"]
@@ -32,6 +35,18 @@ mod remote_cache_perf_tests;
 #[cfg(test)]
 #[path = "remote_cache_recovery_tests.rs"]
 mod remote_cache_recovery_tests;
+
+#[cfg(test)]
+#[path = "remote_snapshot_identity_tests.rs"]
+mod remote_snapshot_identity_tests;
+
+#[cfg(test)]
+#[path = "ndjson_export_tests.rs"]
+mod ndjson_export_tests;
+
+#[cfg(test)]
+#[path = "sync_names_tests.rs"]
+mod sync_names_tests;
 
 /// Per-record entity shape in NDJSON sources.
 #[derive(Debug, Serialize, Deserialize)]
@@ -47,6 +62,10 @@ struct NdjsonEntity {
     properties: Option<serde_json::Value>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    aliases: Vec<EntityAlias>,
     #[serde(default)]
     created_at: Option<String>,
     #[serde(default)]
@@ -72,6 +91,143 @@ struct NdjsonEdge {
 
 fn default_weight() -> f64 {
     1.0
+}
+
+/// Write canonical ADR-020 entity records, each terminated by LF.
+///
+/// The input is borrowed and unchanged. Empty input emits no bytes. This
+/// writer flushes buffered bytes but does not publish or sync a file; an
+/// error can leave partial bytes in the caller's sink.
+pub fn write_entities_ndjson<W: Write + ?Sized>(
+    records: &[ExportedEntity],
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let mut sorted: Vec<_> = records.iter().collect();
+    sorted.sort_by_key(|record| record.id);
+    let mut writer = BufWriter::new(writer);
+    for record in sorted {
+        write_export_ndjson_record(&mut writer, &ExportNdjsonEntity(record))?;
+    }
+    writer.flush()
+}
+
+/// Write canonical ADR-020 edge records, each terminated by LF.
+///
+/// Rows are ordered by their stored source, target and canonical relation
+/// string. Invalid weights are refused before any edge bytes are emitted.
+/// Structural graph validation remains the sync reader's responsibility.
+pub fn write_edges_ndjson<W: Write + ?Sized>(
+    records: &[ExportedEdge],
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let mut sorted = Vec::with_capacity(records.len());
+    for record in records {
+        if !khive_types::validate_edge_weight(record.weight) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "edge {}: weight {} must be finite and in [0.0, 1.0]",
+                    record.edge_id, record.weight
+                ),
+            ));
+        }
+        sorted.push((record, record.relation.as_str()));
+    }
+    sorted.sort_by(|a, b| (a.0.source, a.0.target, a.1).cmp(&(b.0.source, b.0.target, b.1)));
+    let mut writer = BufWriter::new(writer);
+    for (record, relation) in sorted {
+        write_export_ndjson_record(&mut writer, &ExportNdjsonEdge { record, relation })?;
+    }
+    writer.flush()
+}
+
+fn write_export_ndjson_record<W: Write + ?Sized, T: Serialize>(
+    writer: &mut W,
+    record: &T,
+) -> std::io::Result<()> {
+    serde_json::to_writer(&mut *writer, record).map_err(|error| {
+        let kind = error.io_error_kind().unwrap_or(ErrorKind::InvalidData);
+        std::io::Error::new(kind, error)
+    })?;
+    writer.write_all(b"\n")
+}
+
+// These wire adapters retain provenance and ADR-020 field order. The snapshot
+// hash's canonical archive adapters intentionally have a different projection.
+struct ExportNdjsonEntity<'a>(&'a ExportedEntity);
+
+impl Serialize for ExportNdjsonEntity<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let record = self.0;
+        let mut tags: Vec<_> = record.tags.iter().map(String::as_str).collect();
+        tags.sort_unstable();
+        // ADR-221 section 4: keys and aliases follow tags, sorted, and are
+        // omitted when empty so a record without them is unchanged.
+        let mut keys: Vec<_> = record.keys.iter().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut aliases: Vec<_> = record.aliases.iter().collect();
+        aliases.sort_unstable();
+        let len = 8
+            + usize::from(record.entity_type.is_some())
+            + usize::from(!keys.is_empty())
+            + usize::from(!aliases.is_empty());
+        let mut map = serializer.serialize_map(Some(len))?;
+        map.serialize_entry("id", &record.id)?;
+        map.serialize_entry("kind", &record.kind)?;
+        if let Some(entity_type) = &record.entity_type {
+            map.serialize_entry("entity_type", entity_type)?;
+        }
+        map.serialize_entry("name", &record.name)?;
+        map.serialize_entry("description", &record.description)?;
+        map.serialize_entry(
+            "properties",
+            &record.properties.as_ref().map(crate::hash::SortedValue),
+        )?;
+        map.serialize_entry("tags", &tags)?;
+        if !keys.is_empty() {
+            map.serialize_entry("keys", &keys)?;
+        }
+        if !aliases.is_empty() {
+            map.serialize_entry("aliases", &aliases)?;
+        }
+        map.serialize_entry("created_at", &record.created_at.to_rfc3339())?;
+        map.serialize_entry("updated_at", &record.updated_at.to_rfc3339())?;
+        map.end()
+    }
+}
+
+struct ExportNdjsonEdge<'a> {
+    record: &'a ExportedEdge,
+    relation: &'a str,
+}
+
+impl Serialize for ExportNdjsonEdge<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let record = self.record;
+        let mut map = serializer.serialize_map(Some(8))?;
+        map.serialize_entry("edge_id", &record.edge_id)?;
+        map.serialize_entry("source", &record.source)?;
+        map.serialize_entry("target", &record.target)?;
+        map.serialize_entry("relation", self.relation)?;
+        map.serialize_entry("weight", &record.weight)?;
+        map.serialize_entry(
+            "properties",
+            &record.properties.as_ref().map(crate::hash::SortedValue),
+        )?;
+        map.serialize_entry("created_at", &record.created_at.to_rfc3339())?;
+        map.serialize_entry("updated_at", &record.updated_at.to_rfc3339())?;
+        map.end()
+    }
 }
 
 /// Parse a present RFC3339 timestamp exactly; only absence uses `fallback`.
@@ -179,22 +335,52 @@ pub struct RemoteSyncReport {
     pub meta_path: String,
     /// Canonical SHA-256 content hash of the fetched archive (`sha256:<hex>`).
     pub content_hash: String,
+    /// Record classes covered by the fetched snapshot; v1 excludes notes.
+    pub coverage: SnapshotCoverage,
     /// `true` when `repin` was requested — the caller should write
     /// `content_hash` back to `schema.yaml` as the new `pin` value.
     pub repinned: bool,
 }
 
 /// Metadata written to `.khive/kg/remotes/<name>/meta.json`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MetaJson {
     /// ISO-8601 timestamp of when the fetch completed.
+    #[serde(default)]
     fetched_at: String,
     /// Git ref that was resolved.
+    #[serde(default)]
     git_ref: String,
     /// Git commit SHA resolved from `git_ref` at fetch time.
+    #[serde(default)]
     commit_sha: String,
-    /// Canonical content hash of the fetched archive.
-    content_hash: String,
+    content_hash: SnapshotId,
+    #[serde(default = "legacy_snapshot_coverage")]
+    coverage: SnapshotCoverage,
+}
+
+/// Read the identity recorded in `.khive/kg/remotes/<name>/meta.json`.
+///
+/// Unknown top-level fields and malformed coverage are rejected.
+/// Legacy metadata without coverage reports [`KG_V1_COVERAGE`]. The recorded hash
+/// is preserved, not recomputed; this reads a coverage claim without verifying
+/// the cache contents or enabling imports of additional record classes.
+pub fn read_remote_snapshot_identity(
+    repo_root: &Path,
+    name: &RemoteName,
+) -> Result<SnapshotIdentity> {
+    let path = repo_root
+        .join(".khive/kg/remotes")
+        .join(name.as_str())
+        .join("meta.json");
+    let file = File::open(&path).with_context(|| format!("reading {}", path.display()))?;
+    let meta: MetaJson =
+        serde_json::from_reader(file).with_context(|| format!("decoding {}", path.display()))?;
+    Ok(SnapshotIdentity {
+        content_hash: meta.content_hash,
+        coverage: meta.coverage,
+    })
 }
 
 /// Fetch a remote KG archive, verify SHA-256, populate `.khive/kg/remotes/`, write `meta.json`.
@@ -308,7 +494,8 @@ pub async fn run_sync_remote(
         fetched_at: Utc::now().to_rfc3339(),
         git_ref: remote.git_ref.clone(),
         commit_sha,
-        content_hash: actual_hash.as_str().to_string(),
+        content_hash: actual_hash.clone(),
+        coverage: KG_V1_COVERAGE,
     };
 
     let remotes_root = repo_root.join(".khive/kg/remotes");
@@ -334,6 +521,7 @@ pub async fn run_sync_remote(
         cache_dir: cache_dir.to_string_lossy().into_owned(),
         meta_path: cache_dir.join("meta.json").to_string_lossy().into_owned(),
         content_hash: actual_hash.as_str().to_string(),
+        coverage: meta.coverage,
         repinned: repin,
     })
 }
@@ -908,6 +1096,8 @@ fn build_kg_archive(
                 description: e.description.clone(),
                 properties: e.properties.clone(),
                 tags: e.tags.clone(),
+                keys: e.keys.clone(),
+                aliases: e.aliases.clone(),
                 created_at: parse_timestamp(e.created_at.as_deref(), now)
                     .with_context(|| format!("entity {} invalid created_at", e.id))?,
                 updated_at: parse_timestamp(e.updated_at.as_deref(), now)
@@ -1023,6 +1213,8 @@ fn validate_ndjson_records(entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> R
         if e.name.trim().is_empty() {
             bail!("entity {i} ({}): name must be a non-blank name", e.id);
         }
+        khive_runtime::portability::validate_entity_names(e.id, &e.name, &e.keys, &e.aliases)
+            .map_err(|error| anyhow!("entity {i} ({}): {error}", e.id))?;
 
         if !entity_ids.insert(e.id) {
             bail!("entity {i}: duplicate entity id {}", e.id);
@@ -1046,6 +1238,13 @@ fn validate_ndjson_records(entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> R
         }
         prev_entity_key = Some(key);
     }
+    // ADR-221 section 4: one key names one entity of its kind.
+    khive_runtime::portability::validate_archive_key_uniqueness(
+        entities
+            .iter()
+            .map(|e| (e.id, e.kind.as_str(), e.keys.as_slice())),
+    )
+    .map_err(|error| anyhow!("{error}"))?;
 
     let mut edge_ids: HashSet<Uuid> = HashSet::with_capacity(edges.len());
     let mut triples: HashSet<(Uuid, Uuid, EdgeRelation)> = HashSet::with_capacity(edges.len());
@@ -1643,17 +1842,23 @@ async fn upsert_entities(
     for chunk in records.chunks(SYNC_CHUNK_SIZE) {
         let mut entities_chunk = Vec::with_capacity(chunk.len());
         let mut docs_chunk = Vec::with_capacity(chunk.len());
+        let mut names_chunk = Vec::new();
         for r in chunk {
             let fallback = Utc::now();
             let created_at = parse_ts_micros(r.created_at.as_deref(), fallback)
                 .with_context(|| format!("entity {} invalid created_at", r.id))?;
             let updated_at = parse_ts_micros(r.updated_at.as_deref(), fallback)
                 .with_context(|| format!("entity {} invalid updated_at", r.id))?;
+            let mut aliases = r.aliases.clone();
+            aliases.sort();
             let entity = khive_storage::entity::Entity {
                 entity_type: r.entity_type.clone(),
                 description: r.description.clone(),
                 properties: r.properties.clone(),
                 tags: r.tags.clone(),
+                // The text document indexes the aliases the rebuilt store
+                // holds: exactly the snapshot's (ADR-221 section 4).
+                aliases,
                 ..khive_storage::entity::Entity::minimal(
                     r.id,
                     namespace,
@@ -1663,6 +1868,9 @@ async fn upsert_entities(
                     updated_at,
                 )
             };
+            if !r.keys.is_empty() || !r.aliases.is_empty() {
+                names_chunk.push((r.id, r.kind.clone(), r.keys.clone(), r.aliases.clone()));
+            }
             khive_runtime::secret_gate::reject_reserved_secret_gate_property(
                 entity.properties.as_ref(),
             )
@@ -1688,6 +1896,13 @@ async fn upsert_entities(
             ));
         }
         count += summary.affected as usize;
+
+        // Keys and aliases of the chunk's rows, in one transaction. The
+        // rebuilt store holds none before, so they end as the snapshot's.
+        runtime
+            .write_snapshot_entity_names(&token, names_chunk)
+            .await
+            .context("write entity keys and aliases")?;
 
         // FTS docs — one BEGIN IMMEDIATE / COMMIT per chunk.
         // Vectors are intentionally skipped: they are local-only derived state
@@ -1875,6 +2090,8 @@ async fn issue2673_sync_upserts_advance_destination_entity_version() {
     let id = Uuid::new_v4();
     for version in 1..=3 {
         let record = NdjsonEntity {
+            keys: Vec::new(),
+            aliases: Vec::new(),
             id,
             kind: "concept".into(),
             entity_type: None,
@@ -1905,6 +2122,8 @@ async fn direct_entity_upsert_refuses_reserved_properties_before_storage() {
     let token = runtime.authorize(khive_types::Namespace::local()).unwrap();
     let id = Uuid::new_v4();
     let record = NdjsonEntity {
+        keys: Vec::new(),
+        aliases: Vec::new(),
         id,
         kind: "concept".into(),
         entity_type: None,

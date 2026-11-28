@@ -435,6 +435,22 @@ dispatches share the same pack instance and wake immediately.
 
 ## `handlers.rs::handle_read`
 
+`mark` defaults to true. The descriptions below of marking and its acknowledgements
+apply to omission or `mark=true`. The single-ID opt-out
+`comm.read(id=..., mark=false)` uses the same target validation and returns the
+fetched message without changing its properties, `updated_at`, or unread inbox
+membership. `mark=false` with `ids` is refused, including an empty array, and
+non-boolean `mark` values are invalid parameters. A successful fetch returns the
+existing short `id`, canonical `full_id`, `status: "success"`, the fetched
+`properties`, and its actual `read` state: only stored JSON boolean true means
+read. Missing or non-boolean read values report false without rewriting properties.
+With the default `body=true`, the usual message and attachment metadata is added.
+With `body=false`, only that compact fetched-state response is returned, without
+expanded message fields or an attachment lookup. Neither response acknowledges a
+mark. The response describes the fetched snapshot; concurrent changes are not
+prevented. The verb remains a declaration/write operation with normal dispatch
+auditing, so this does not promise zero database writes.
+
 Fetches a message and marks it as read. Rejects `read()` on outbound messages — "read" is a
 recipient action; marking an outbound (sent) message as read corrupts the
 read/unread invariant and has no semantic meaning to the sender.

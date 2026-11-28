@@ -2205,3 +2205,396 @@ stays visible. This is bounded diagnostic hygiene, not detection of every secret
   former retains the demonstrated bare-value leakage; the latter removes parameter metadata needed
   to repair a request. Existing ordinary preview behavior and the stated heuristic residuals remain
   deliberate limits.
+
+## Amendment 9 (2026-11-16): contextual property scanning and note-key write admission
+
+**Status**: Accepted 2026-11-16 (#6725).
+
+Originating issues: [#6562](https://github.com/ohdearquant/khive/issues/6562) and
+[#6273](https://github.com/ohdearquant/khive/issues/6273).
+
+Amendment 8 is proposed separately in
+[#6261](https://github.com/ohdearquant/khive/pull/6261). This amendment does not
+depend on it, and the gap between Amendments 7 and 9 is intended whether Amendment 8
+lands later or not at all.
+
+This amendment must be accepted before dependent implementation merges. It does not
+change the status of the base ADR or earlier amendments.
+
+### Context and scope
+
+Decision §2 explicitly requires reconsidering per-string property exemptions when
+property detection becomes key-aware. Scanning a property key and its value as
+independent strings loses the owning-key context already defined for JSON content
+by the structured scalar attribution amendment. A value under `password`, nested
+under a credential container, or inside its array must reach that same contextual
+rule. Changing only the basic JSON walker is insufficient: the runtime finalizer
+also constructs property candidates for admission.
+
+Note keys have a separate write-admission gap. The keyed `memory.remember` guard
+introduced by #6276 already checks a key before replay lookup and remains in force.
+Generic keyed note creation, atomic creation and direct key assignment must enforce
+the same scalar detector. A runtime-only guard cannot protect a direct store call.
+
+This amendment changes property-context admission and incoming note-key writes. It
+preserves the host-trust and nonauthentication limits of this ADR and
+[ADR-096](ADR-096-warm-daemon-per-request-identity.md), authorization through the
+existing Gate, and the admission-capable versus reservation-only route distinction.
+It creates no database migration, legacy-key rewrite, new admission-capable route,
+manifest activation mechanism or public API for supplying trusted scan results.
+Existing mask-only surfaces remain mask-only.
+
+### 1. Canonical property context and source atoms
+
+Construct one immutable context from the actual parsed `serde_json::Value` that is
+to be checked. The context is the complete property tree, not a caller-supplied
+rendering, digest or path. Serialize it once using this compatibility profile:
+
+- Recursively sort object members by decoded key UTF-8 bytes in ascending order,
+  independently of the map implementation and input member order.
+- Preserve array order. Emit no insignificant whitespace.
+- Preserve decoded Unicode scalar values, without case folding or Unicode
+  normalization. Use the default compact string escaping of `serde_json` 1.0.150
+  for both keys and string values.
+- Use that version's typed `Number` serialization. Do not collapse integer and
+  floating representations or introduce alternate rounding. `1` and `1.0` remain
+  distinct context bytes. Emit `null`, `true` and `false` normally.
+
+This profile fixes the bytes used for both contextual coordinates and identity. A
+serialization dependency change that alters them requires an explicit contract
+version change; silently changing digests is not permitted. Alternate outer-wire
+escape spellings that parse to the same value have the same canonical context.
+
+Every object key and every string value is a separate **source atom**. An atom
+records its original decoded UTF-8 bytes, key or string-value role, and typed path
+through the property tree. A key atom and the value at that key share the path but
+have different roles. Nulls, booleans and numbers affect the context identity but
+are not string-value atoms; their object keys are still scanned. Root strings and
+strings in root arrays remain atoms even without an owning credential label.
+
+Enumerate atoms in the established key-before-value traversal. Basic
+`check_json`/`check_json_at` and the runtime finalizer's property checks and final
+candidate scan must consume the same contextual candidate construction. Empty and
+test-only nonempty manifest snapshots may change authorized lookup, never which
+atoms or detector views are checked. Reuse the existing structured-scalar traversal
+and detector semantics rather than adding a second ancestry algorithm. The shared
+context is not reserialized for each leaf.
+
+### 2. Owning labels, arrays and decoded views
+
+The existing
+[structured scalar rule](../../crates/khive-runtime/docs/api/secret_gate.md#structured-scalar-trigger-context-2026-09-15-2756)
+defines label attribution. Decode an owning key before applying the existing
+trigger matcher. A matching child key supplies its own label; otherwise a
+credential-shaped ancestor remains applicable through objects and arrays within
+the existing byte radius. A benign child does not erase that ancestor. Scalar
+array elements retain the enclosing label. Objects in arrays apply the same rule
+to their own keys and inherited container label. A sibling key, path, diagnostic or
+value does not supply context to another atom.
+
+Object keys retain their standalone checks and their role as label evidence for
+descendant string values. Keys containing quotes, newlines, braces, punctuation or
+Unicode are JSON keys, never raw text inserted into a fabricated key/value
+wrapper. An unlabelled root string or root-array element retains its standalone
+detector behavior. Traversal reaches every depth under the existing bounds; this
+is not an unlimited-distance ancestor rule.
+
+Preserve the existing standalone raw and decoded-string checks on every key and
+string value, including detector ordering, fragment recovery and the eight-level
+escaped-JSON limit. Existing content-text scans retain their original-byte
+coordinates and behavior, including #2756 and #6100. The property repair adds
+owning context; it does not replace those checks or relax any refusal they produce.
+Canonical property serialization does not consume an escaped-string decoding level.
+
+The added contextual pass requires **origin-preserving decoded views**. This is new
+implementation work: the current escaped-string helper returns decoded strings
+without their source spans. Track monotone origin intervals while serializing each
+source string and through each subsequent escape-decoding layer. Every emitted
+Unicode scalar, including all its UTF-8 bytes, maps to the full contributing source
+interval. A simple escape maps to its complete spelling; a surrogate pair maps to
+both escapes. Compose the maps through nested views back to the one canonical
+property byte sequence.
+
+For inherited property context, the candidate start is the earliest canonical
+origin byte contributing to its first byte. Its end covers all contributing bytes.
+The label endpoint follows the existing convention: the byte position of the
+owning key's closing quote, immediately after its encoded content. Compute:
+
+```text
+label_distance = canonical_candidate_start.saturating_sub(canonical_label_end)
+owning context applies only when label_distance <= 120
+```
+
+Decoding contraction or expansion, nested decoding, array serialization and
+recovery of a later valid fragment must not reset this distance. Recovered spans
+retain their original positions. Quotes inserted only to validate a fragment carry
+no label authority. Invalid escapes continue to separate spans; they cannot join
+credentials. Missing or ambiguous origin evidence must refuse with a sanitized
+mapping failure instead of guessing a coordinate.
+
+This added attribution is distinct from the existing standalone scan of a decoded
+view. A benign inner key cannot cancel a still-in-range outer property label. An
+inner credential label still activates the existing standalone rule when the
+outer key is benign or its inherited label is out of range. No new reconstruction
+across separate source atoms is introduced.
+
+### 3. Context-bound property exemption identity
+
+Add the exact runtime-owned field scope `json-properties-context-v2` to the closed
+scope set under manifest document `schema_version: 1`. Its suffix versions property
+identity, not the document schema or the global digest domain. Existing document
+fields, `algorithm: sha256`, corpus-identity requirements, malformed-document
+handling and failure taxonomy remain unchanged.
+
+Only the new identity can authorize a property atom, including a key, an unlabelled
+root string or a root-array string. Well-formed legacy `json-properties` entries
+remain parse-valid but **inert for all property admission**. They neither authorize
+an atom nor contribute to distinct-match counts. They do not invalidate an
+otherwise valid mixed document or disable its entries in other scopes. Unknown
+scopes, malformed entries and conflicting duplicates remain document faults. No
+legacy entry is silently migrated.
+
+The other scope spellings and identities are unchanged: `record-content`,
+`name-description`, `tags` and `code-source`. The old `json-properties` spelling and
+historical digest vectors also remain unchanged; their preservation grants no
+property-admission fallback. The global prefix stays `khive-secret-gate-v1` followed
+by one NUL byte.
+
+Use the following exact framing. `||` denotes byte concatenation; `SHA256` returns
+32 bytes, not their hexadecimal rendering. All lengths, segment counts and indices
+are unsigned 64-bit big-endian integers. Lengths count UTF-8 bytes, not characters;
+overflow refuses rather than truncates.
+
+```text
+D = ASCII("khive-secret-gate-v1") || 0x00
+S = ASCII("json-properties-context-v2") || 0x00
+C = complete canonical property bytes
+A = original decoded source atom UTF-8 bytes
+
+context_digest = SHA256(D || S || 0x01 || u64be(len(C)) || C)
+atom_digest = SHA256(D || S || 0x02 || context_digest || role ||
+                     encoded_path || u64be(len(A)) || A)
+
+role = 0x00 for an object-key atom; 0x01 for a string-value atom
+encoded_path = u64be(segment_count) || encoded_segment_0 || ...
+object-key segment = 0x00 || u64be(len(key_utf8)) || key_utf8
+array-index segment = 0x01 || u64be(zero_based_index)
+```
+
+The root path has zero segments. An empty key is one zero-length key segment and
+therefore differs from the root. Key `"0"` differs from array index zero. For an
+object key and its value, the path includes that key and the role distinguishes
+them. The atom digest always uses the original source atom, never its decoded
+intermediate view. Unframed key/value concatenation, display-string paths and
+caller-chosen origins are not equivalent encodings.
+
+The new manifest entry stores the atom digest under the new scope using the
+existing full-digest representation. Its full-context binding intentionally
+invalidates reuse after an unrelated sibling edit, even when detector behavior
+would be unchanged. This conservative loss of reuse is not whole-document
+exemption authority.
+
+These literal atom-digest vectors pin framing and typed context. Each string value
+shown has atom bytes `v`, except the last row, whose atom bytes are `x`, newline,
+`y`. The listed canonical JSON is compact; the last row encodes the newline as
+`\n` and the key as literal UTF-8 `é`.
+
+| Canonical context   | Atom role and path | Atom SHA-256                                                       |
+| ------------------- | ------------------ | ------------------------------------------------------------------ |
+| `"v"`               | value, root        | `6baa9872cfb3f833c9d30bd33b7068806836662c69fa7dac9e15255deed80a08` |
+| `{"":"v"}`          | value, key `""`    | `de069468674f0725d5bcc394de90455f872bc545056a5eda6d952c0dd2c1b455` |
+| `{"0":"v"}`         | value, key `"0"`   | `6d642df340b229234d9e1d1afe43edb1a7ab96cd0335fe207dcdaff3b2082355` |
+| `["v"]`             | value, index 0     | `eaab483f55046f48186f1f1b331cedb8cfb969291e6e550c52b376ff8e78639b` |
+| `{"v":"v"}`         | key, key `"v"`     | `cfbb041d6ed6f465e0e4d43ecb9f56ad3eec484a5684c1d18d36dd3370b769fb` |
+| `{"v":"v"}`         | value, key `"v"`   | `3f7a18463fa2df89b139cad73fe170c73762853ff505da04c54a845d6165ecc9` |
+| `{"k":"v","n":1}`   | value, key `"k"`   | `84fd13741dab27225ac85f2234fe7597e55262d4894f2681fc30019170b58beb` |
+| `{"k":"v","n":1.0}` | value, key `"k"`   | `9efc8e124fc41049943b01e0639cab31305d83f41649817dd70cf6c40d1de0a4` |
+| `{"é":"x\ny"}`      | value, key `"é"`   | `ae3bdf06c0415acf49966579a6f1b087684d35d95fbb7313c8be30df987388c9` |
+
+These are contract vectors, not evidence that an implementation or serializer has
+passed them. Builder and runtime must independently reach the same bytes through
+their actual parsing and canonicalization paths.
+
+### 4. Complete scanning before exemption acceptance
+
+Capture the existing one immutable manifest snapshot per record. Runtime constructs
+and seals the context, atom roles and typed paths and recomputes digests from the
+actual candidate bytes. Caller-supplied matched IDs, atom IDs, scopes, digests,
+paths, actors, namespaces or verbs have no eligibility authority. Such names in
+ordinary JSON are scanned data. The reserved runtime stamp remains reserved.
+
+A matching entry is tentative and local to its source atom. It cannot skip a later
+raw, contextual or decoded-view check of that atom, skip another atom, or authorize
+the record. Before accepting any exemption, complete every required check across
+all atoms and reject every unmatched refusal or invalid mapping/manifest condition.
+A refusal may fail fast; acceptance may not. Preserve the existing detector-metadata
+contract and field/traversal refusal order, without inventing a new global error
+precedence.
+
+Raw, contextual and decoded views of one atom share one identity. Two distinct
+active identities retain the existing `MultipleMatches` refusal, including a
+property identity and a match in another field scope. Inert legacy property entries
+do not count. Different roles or array positions remain distinct even when their
+atom bytes are identical.
+
+An exempt key remains in the immutable context as a label for its descendants;
+its exemption never covers those descendants. Do not mask or remove exempt atoms
+before rescanning. A whole-document first-match result followed by filtering is
+not a complete per-atom scan. The existing atomic record/stamp/success-event
+transaction and rollback guarantees remain unchanged.
+
+Production remains limited to an absent or exact-empty v1 manifest. Nonempty
+fixtures remain test-only and are not evidence of operator adjudication. This
+amendment does not satisfy or waive the separate nonempty-manifest activation
+rung, enable note exemption consumption, or change the reserved stamp value.
+
+### 5. One pure detector below runtime and direct note-key enforcement
+
+Introduce a **new** `khive-storage::secret_scan` module in the existing storage
+crate. Move the canonical pure scalar detector and its coupled escaped-string,
+masking and digest machinery there without a new crate or a database-to-runtime
+dependency. Preserve existing runtime public APIs through adapters/reexports and
+preserve existing scalar detector behavior, constants, masks and digest outputs.
+The runtime retains property-context composition, field attribution, manifest
+capture and eligibility, reserved-property policy, and finalization authority.
+The pure engine may evaluate supplied contextual scalar evidence; it cannot create
+manifest authority or perform storage, authorization or runtime initialization.
+
+Incoming note keys use the same scalar detector on their **exact raw key bytes**.
+`note.key` is diagnostic location metadata, never a string prepended to the key.
+Do not scan a fabricated `key=...` or other trigger wrapper. There is no note-key
+manifest exemption. Safe refusal metadata must not expose the submitted credential
+through display, debug output or a raw path/key echo.
+
+The write paths have these independent obligations:
+
+1. Generic keyed note creation scans before holder lookup or an exact-payload
+   replay can return. A later creation-only check cannot replace this guard.
+2. Atomic note preparation scans the incoming `AtomicNoteOptions.key` before it
+   can persist, including new keyed creation through `stream.batch`. Preserve
+   enclosing atomicity, shape validation, fences and creation-only ordering.
+3. Direct `assign_note_key_if_unset` uses the shared write-only store validator
+   before database access or mutation, including its core/runtime wrappers and
+   default trait path. The actual SQL store must enforce the rule without a
+   configured runtime, injected callback or caller compliance.
+4. Preserve #6276's existing keyed `memory.remember` pre-replay check and tests.
+
+Keep `note_key_is_valid` and `validate_memory_key` shape-only where they serve reads,
+lookups, fences and existing-key selectors. Preserve the 512-byte UTF-8 limit and
+NUL refusal, existing key-conflict behavior, and lawful ordinary keys. Do not
+rewrite or delete stored keys, scan an unrelated lookup as a new assignment, or
+change legacy-key readability. A privileged raw database path does not make an
+application store assignment exempt from this write contract.
+
+### 6. Typed refusal and Rust compatibility
+
+Add a typed `StorageError::SecretDetected` carrying the safe shared `SecretMatch`
+and the storage capability/operation metadata. It is a notes-capability refusal
+and is not retryable. Its display is `write blocked: {matched}`, using only the
+existing safe match representation. For the same scalar and location, direct
+storage and runtime retain the same detector, trigger, masked excerpt and refusal
+text; indexed batch attribution remains intact.
+
+Use a manual `From<StorageError> for RuntimeError` conversion. Map the new secret
+variant to the existing `RuntimeError::SecretDetected`. Wrap every ordinary storage
+variant as before, explicitly preserving the cause annotation:
+
+```rust
+#[error("storage: {0}")]
+Storage(#[source] khive_storage::StorageError),
+```
+
+Removing `#[from]` alone is insufficient: it would lose the derived ordinary
+`Error::source()` chain. Preserve direct construction of the wrapper and verify
+its source independently of its display text.
+
+`StorageError` is public and exhaustive. Adding this variant is a breaking Rust
+API change and is scheduled for **0.21.0**, with a **Breaking (Rust crates)**
+changelog entry and the required downstream exhaustive-match updates. Do not add
+`#[non_exhaustive]` as a workaround or substitute a string-only `InvalidInput`
+refusal. The implementation must preserve public runtime detector imports and
+explain the new shared type's crate location. No wire or stored schema migration
+is introduced by this error variant.
+
+### 7. Acceptance and discriminating controls
+
+Acceptance covers actual property writes and direct storage, not only helper
+outputs or scanner-derived expected values. Retain the existing detector corpus,
+#2756, #6100, escaped-string depth/recovery tests, #6276 and mask-only behavior.
+Use synthetic inputs with independently established outcomes and populated storage
+snapshots where writes are reachable.
+
+1. **Owning context.** Flat and nested credential keys, inherited `secret` to benign
+   `digest`, scalar arrays and arrays of objects refuse the intended candidates.
+   An unrelated sibling path, quoted refusal or array object does not label a
+   benign candidate. Remove owning, inherited and array context separately; use
+   an independent must-admit sibling witness for context leakage.
+2. **Mapped radius.** Pair canonical-origin distances 120 and 121 while the decoded
+   local distance is within 120 in both. First establish that standalone scanning
+   admits the isolated boundary fixture, so another detector cannot hide the
+   mutation. Include nested escapes, surrogate/Unicode origins, recovered later
+   spans, outer credential with benign inner key, and benign outer key with an
+   inner credential. Dropping origin propagation, resetting distance and dropping
+   the inherited label are distinct controls. Mapping/setup failures are not
+   semantic evidence. Include one sorted-sibling pair: a long sibling key that sorts
+   between a credential container key and its nested value moves that value beyond
+   120 canonical bytes, so the existing radius limit is recorded as applying in the
+   canonical key order.
+3. **Every consumer.** Exercise basic property checks and the finalizer's actual
+   property and final-candidate paths with empty and valid test-only nonempty
+   snapshots. Changing only one walker must fail another consumer's assertion.
+   Retain raw key/value fixed-prefix and escaped-value refusals.
+4. **Exact identity.** Check the literal vectors and live builder/runtime parity
+   for roots, empty keys, key `"0"` versus index zero, key/value roles, Unicode,
+   newlines, typed numbers and equivalent wire escapes. Independently omit context,
+   path, role and index binding to demonstrate transplant refusal. Quoted and
+   newline keys cannot create new labels through a constructed wrapper.
+5. **Complete matching.** A valid first match cannot conceal an unmatched later
+   secret, in either traversal order. Multiple views of one atom count once; two
+   independently valid atom identities refuse. An exempt key cannot exempt its
+   descendant. Caller-asserted IDs or hashes cannot authorize a mismatching atom.
+   Do not derive expected results from the implementation's first-match helper.
+6. **Legacy and activation.** Legacy property entries are inert for keys and all
+   string atoms, including unlabelled roots/arrays. A valid mixed document retains
+   unrelated old-scope behavior and does not falsely count a legacy property entry.
+   Preserve other scopes' exact vectors, production-empty enforcement and existing
+   reservation/stamp/audit rollback. No successful record, stamp or exemption event
+   may survive a required refusal.
+7. **Incoming keys.** Exercise direct SQL-store assignment, wrappers, generic
+   create/replay, atomic/new stream keys and the existing memory route. Pin typed
+   refusal, safe location/display/debug output, unchanged complete stored rows and
+   enclosing rollback. Separately bypass the direct-store guard, pre-replay guard
+   and atomic preparation guard; no one route substitutes for another. Lawful
+   high-entropy ordinary keys must not be rejected through fabricated label text.
+   Inventory every in-repo producer of note keys. One key of each generated grammar,
+   including `git.commit:<40-hex commit sha>`, is a must-admit witness through the
+   direct store path and through its runtime route; a grammar the detector refuses
+   is resolved in the same change.
+8. **Compatibility.** Verify read/fence shape behavior and legacy-key access without
+   rewriting data. Verify the new typed conversion and an ordinary non-secret
+   storage error whose `Error::source()` identifies the underlying `StorageError`;
+   display or wrapper-kind assertions alone do not prove that chain. Check all
+   relevant exhaustive matches, crate features and existing runtime imports.
+
+For each required negative control, retain a pristine named positive, a buildable
+production mutation that reaches its own semantic assertion, exact restoration
+and the restored named positive. Compilation, fixture, SQL setup, mapping failures,
+zero selected tests, unrelated panics and timeouts are not semantic reds. Run the
+shared relevant suites and lints on the integrated revision. Record Linux and
+macOS evidence separately; one platform's results do not establish the other's.
+No execution outcome is asserted by this amendment text.
+
+### 8. Sequencing and consequences
+
+Accept this amendment as a separate documentation change before any dependent
+implementation merges. Refresh the implementation base and intersecting changes
+before assigning its exact source scope. Deliver property context and remaining
+key-write enforcement as one coherent implementation bundle with shared validation;
+keep their independent refusal and compatibility obligations visible.
+
+The stronger property identity reduces exemption reuse after harmless context
+edits by design. A single-entry hit still grants no record-wide, path-wide or
+subtree-wide permission. The new storage layer is reusable by direct stores without
+making storage responsible for runtime exemption policy. Existing heuristic
+limits, trust assumptions, nonempty-manifest activation gates and unrelated
+reserved-property or masking work remain explicit and unchanged.

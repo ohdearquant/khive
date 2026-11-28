@@ -159,3 +159,27 @@ fn unicode_word_basic() {
 fn unicode_word_empty() {
     assert!(UnicodeWordTokenizer.tokenize("").is_empty());
 }
+
+#[test]
+fn cjk_preserves_multibyte_spans_around_supplementary_cjk() {
+    let tokenizer = CjkCharTokenizer;
+    assert_eq!(
+        tokenizer.tokenize("é𠀀😀中naïve"),
+        vec!["é", "𠀀", "😀", "中", "naïve"]
+    );
+    assert_eq!(tokenizer.tokenize("中𠀀가é"), vec!["中", "𠀀", "가", "é"]);
+}
+
+#[test]
+fn cjk_preserves_unicode_whitespace_and_edge_punctuation_in_spans() {
+    let tokenizer = CjkCharTokenizer;
+    assert_eq!(
+        tokenizer.tokenize(" \u{2003}...é!中𠀀\u{2009}world,\tnaïve... "),
+        vec!["é", "中", "𠀀", "world", "naïve"]
+    );
+    assert_eq!(
+        tokenizer.tokenize(" \u{2003}...é!\u{2009}naïve,\t😀... "),
+        vec!["é", "naïve", "😀"]
+    );
+    assert!(tokenizer.tokenize("\t \u{2003}\u{2009}\n").is_empty());
+}

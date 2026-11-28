@@ -115,7 +115,30 @@ pub(super) async fn entity(
         merged_into: optional_id(&row, "merged_into")?,
         merge_event_id: optional_id(&row, "merge_event_id")?,
         content_ref: optional_text(&row, "content_ref")?,
+        aliases: khive_db::stores::entity::parse_entity_aliases(&text(&row, "aliases")?)
+            .map_err(|_| invalid("aliases"))?,
     }))
+}
+
+/// The keys `entity_id` holds, read inside the writer's transaction.
+pub(super) async fn held_keys(
+    writer: &mut dyn SqlWriter,
+    namespace: &str,
+    entity_id: Uuid,
+) -> Result<Vec<String>, StorageError> {
+    let rows = writer
+        .query_all(
+            SqlStatement::new(
+                khive_db::stores::entity::ENTITY_HELD_KEYS_SQL,
+                vec![
+                    SqlValue::Text(namespace.to_owned()),
+                    SqlValue::Text(entity_id.to_string()),
+                ],
+            )
+            .labelled("canonical-held-keys"),
+        )
+        .await?;
+    rows.iter().map(|row| text(row, "key")).collect()
 }
 
 pub(super) async fn note(

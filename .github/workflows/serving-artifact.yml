@@ -3,7 +3,7 @@ name: Serving artifact
 # Builds the kkernel binary a deployment serves, per platform, and publishes it
 # beside its sha256 so a consumer pins the binary by digest instead of by
 # version string (a version string does not identify a build; a digest does).
-# Nothing here touches npm or crates.io; release.yml owns publishing.
+# This workflow does not publish crates; scripts/publish.sh owns crates.io publishing.
 #
 # Two ways in:
 #   - workflow_dispatch with `ref`: build that ref. The release is named

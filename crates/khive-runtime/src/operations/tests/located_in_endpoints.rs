@@ -42,7 +42,7 @@ async fn link_concept_located_in_concept_allowed_other_base_kinds_rejected() {
     );
 
     let page = rt
-        .create_entity(&tok, "document", None, "Atlas page", None, None, vec![])
+        .create_entity(&tok, "document", None, "Example page", None, None, vec![])
         .await
         .unwrap();
     let concept_to_doc = rt

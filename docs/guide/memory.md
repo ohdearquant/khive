@@ -48,6 +48,35 @@ proven for session recall once a key is configured and the same `key` is replaye
 | `source_id`    | uuid   | none                             | Entity or note this memory annotates                                      |
 | `key`          | string | none                             | Stable identity for an exact keyed replay                                 |
 
+### Reserved properties
+
+The `properties` object stores caller metadata. These names are reserved; use
+the replacement below instead of placing them inside `properties`.
+
+| Reserved name | Replacement                                                                                                                      |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `memory_type` | use the top-level `memory_type` parameter                                                                                        |
+| `tags`        | use the top-level `tags` parameter                                                                                               |
+| `attribution` | omit `attribution`; the runtime sets it for anonymous callers                                                                    |
+| `supersedes`  | use a `memory.apply_batch` row with `action="supersede"`, or `link(relation="supersedes")` from the new memory to the old memory |
+
+For two existing memory rows, link the new memory to the old memory using the
+new memory's namespace, which the caller must be allowed to write:
+
+```text
+link(
+    source_id="<new_memory_id>",
+    target_id="<old_memory_id>",
+    relation="supersedes",
+    namespace="<new_memory_namespace>"
+)
+```
+
+The old memory stays stored. `memory.apply_batch` can create the replacement and
+its edge together using a `supersede` row; its default `dry_run=true` previews
+the requested writes. See [batch memory rewrites](../adr/ADR-021-memory-pack.md#amendment-batch-apply-for-memory-rewrites-2026-11-02)
+for the row fields and validation rules.
+
 ### Salience calibration
 
 Salience determines how prominently a memory surfaces during recall. Use these
@@ -169,6 +198,35 @@ An unreadable provenance store is an availability failure, not evidence of a
 legacy identity. Refusals do not mint new fences or replace the held memory.
 Eventual recall remains available. A failure after a new write committed has a
 different disposition; do not interpret every receipt error as a failed write.
+
+## Browsing current memories
+
+Use an opt-in structural filter to browse memories that have no visible live
+incoming `supersedes` edge:
+
+```text
+request(ops="list(kind=\"memory\", tags=[\"pinned\"], exclude_superseded=true, after=\"\", limit=20)")
+```
+
+`kind="note", note_kind="memory"` accepts the same option. Omission or false
+keeps the existing list behavior. A stored `status="active"` does not mean that
+a memory has no successor: this filter changes only the returned view, and
+`get` still returns the stored older memory.
+
+An incoming edge suppresses its target even if the successor is outside the
+requested tags or page. Only edges in the request's visible namespaces count.
+Soft-deleting the successor leaves its live edge in place and keeps the older
+memory excluded; restoring the successor changes nothing. Removing the edge
+lifts that edge's suppression. Other live incoming edges can still exclude it.
+This option tests graph edges, not the legacy `properties.supersedes` values
+that recall also considers, and it does not reproduce recall's ranking.
+
+Pass each non-null `next_after` into the next request with the same filters.
+A scan that reaches its 10,000-row ceiling returns `scan_incomplete: true` and
+`has_more: true`; its cursor advances past scanned excluded rows even when the
+page is empty. Offset mode may reach the same ceiling without making progress,
+so use cursor mode to continue. See the [list reference](api-reference.md#list--assertive)
+for keyed pagination, limits and live-walk semantics.
 
 ## Scoring formula
 

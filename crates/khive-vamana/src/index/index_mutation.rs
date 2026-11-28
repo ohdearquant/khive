@@ -338,10 +338,6 @@ impl VamanaIndex {
             return Ok(Vec::new());
         }
 
-        // GAP-1 resolution: promote Mmap to Owned before the compaction rebuild.
-        // Only reached when there are tombstones to compact.
-        self.ensure_owned()?;
-
         let m = self.num_vectors - self.tombstone_count;
 
         // Build old→new and new→old remap tables.
@@ -357,7 +353,8 @@ impl VamanaIndex {
         }
         debug_assert_eq!(new_ord as usize, m);
 
-        // Build compacted vector store (always Owned after consolidation).
+        // Read the old storage directly, including mappings, and allocate only
+        // the compacted vector store. No writes to the old storage are needed.
         let old_vecs = self.vectors.as_slice()?;
         let mut new_vecs: Vec<f32> = Vec::with_capacity(m * self.dimensions);
         for &old in &new_to_old {

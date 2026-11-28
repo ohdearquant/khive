@@ -604,13 +604,13 @@ async fn serial_ops_file_preserves_order_save_rows_and_strict_failure() {
         .map(|line| serde_json::from_str(line).expect("JSON result row"))
         .collect();
     assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0]["tool"], "reader_probe");
+    assert_eq!(rows[0]["tool"], "ops_file_concurrency_probe.reader_probe");
     assert_eq!(rows[0]["ok"], true);
     assert_eq!(rows[0]["result"]["sequence"], 0);
-    assert_eq!(rows[1]["tool"], "reader_probe");
+    assert_eq!(rows[1]["tool"], "ops_file_concurrency_probe.reader_probe");
     assert_eq!(rows[1]["ok"], false);
     assert_eq!(rows[1]["reason"], "strict-op-failure");
-    assert_eq!(rows[2]["tool"], "reader_probe");
+    assert_eq!(rows[2]["tool"], "ops_file_concurrency_probe.reader_probe");
     assert_eq!(rows[2]["ok"], true);
     assert_eq!(rows[2]["result"]["sequence"], 2);
 }
@@ -624,7 +624,7 @@ async fn serial_dispatch_consumes_the_preflighted_stable_snapshot() {
         serde_json::to_writer(
             source.as_file_mut(),
             &serde_json::json!({
-                "tool": "reader_probe",
+                "tool": "ops_file_concurrency_probe.reader_probe",
                 "args": {"sequence": sequence},
             }),
         )
@@ -2491,9 +2491,8 @@ async fn atomic_delete_unknown_field_rejected_well_formed_succeeds() {
 }
 
 /// `link`: a typo'd key (`relatoin` for `relation`) must be rejected
-/// before any write; a well-formed link still succeeds. (Distinct from
-/// the Leo-accepted `target_backend` conflict-arm deferral — out of
-/// scope here.)
+/// before any write; a well-formed link still succeeds. Validation of the
+/// `target_backend` conflict arm remains deferred and is out of scope here.
 #[tokio::test]
 async fn atomic_link_unknown_field_rejected_well_formed_succeeds() {
     if crate::test_process::run_in_child() {

@@ -30,8 +30,10 @@ it occupies multiple UTF-8 bytes.
 ## CJK helpers and `ScriptProfile`
 
 `is_cjk_char` covers unified ideographs (including extensions A/B and compatibility), Hiragana,
-Katakana, and Hangul. `contains_cjk` returns true when more than 15% of characters are CJK; exactly
-15% is false. It computes the ratio in `f64`. `contains_cjk_f32` keeps the memory pack's existing
+Katakana, Hangul, and the three ideographic letters of the CJK Symbols and Punctuation block
+(U+3005 iteration mark, U+3006 closing mark, U+3007 ideographic zero). The block's punctuation
+and brackets are not CJK characters here. `contains_cjk` returns true when more than 15% of
+characters are CJK; exactly 15% is false. It computes the ratio in `f64`. `contains_cjk_f32` keeps the memory pack's existing
 `f32` ratio at its public `scoring::contains_cjk` path. Both use the same character counts, but
 can differ near the threshold because of rounding; choose the precision required by the caller.
 

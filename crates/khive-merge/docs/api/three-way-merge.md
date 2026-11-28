@@ -6,20 +6,21 @@
 
 The function accepts a common `base` archive, the local `ours` archive, the remote `theirs` archive, and a `SnapshotMergeStrategy`. All inputs are borrowed and the result owns either a merged archive or its conflicts.
 
-Every strategy first validates four input invariants:
+Every strategy first validates five input invariants:
 
 1. all archives have the same namespace;
 2. every edge weight is finite;
-3. entity IDs and edge IDs are unique within each archive; and
-4. semantic edge keys `(source, target, relation)` are unique within each archive.
+3. entity IDs and edge IDs are unique within each archive;
+4. semantic edge keys `(source, target, relation)` are unique within each archive; and
+5. no archive places one entity key, under one kind, on more than one entity.
 
-Namespace, weight, duplicate-entity, and duplicate-edge-key failures have dedicated `MergeError` variants. A duplicate edge ID or another invariant failure is reported as `MergeError::Internal`.
+Namespace, weight, duplicate-entity, duplicate-edge-key, and duplicate-entity-key failures have dedicated `MergeError` variants. A duplicate edge ID or another invariant failure is reported as `MergeError::Internal`.
 
 ## Automatic strategy
 
 `SnapshotMergeStrategy::Auto` follows this order:
 
-1. classify and merge entities;
+1. classify and merge entities, then report any key the merged entities share as `KeyConflict`, and any key the merge would carry to another kind as `KindConflict`;
 2. classify and merge edges;
 3. validate all merged edge endpoints against the merged entity IDs;
 4. return `MergeResult::Conflicts` when any entity, edge, or dangling conflict exists; otherwise
@@ -29,7 +30,7 @@ The conflict result does not include a provisional archive. The lower-level enti
 
 ## Ours and theirs strategies
 
-`Ours` and `Theirs` are last-write-wins shortcuts. They select the preferred branch's versions and retain additions unique to the other branch. An opposing-only edge whose durable ID is already held by a preferred edge is dropped and reported as `EdgeIdentityCollision`; the shortcut does not return `Clean` with duplicate edge IDs. The result is sorted and timestamped, then checked for archive uniqueness and dangling endpoints. A dangling edge also produces `Conflicts`.
+`Ours` and `Theirs` are last-write-wins shortcuts. They select the preferred branch's versions and retain additions unique to the other branch. An opposing-only edge whose durable ID is already held by a preferred edge is dropped and reported as `EdgeIdentityCollision`; the shortcut does not return `Clean` with duplicate edge IDs. A key that the preferred branch's entities and the other branch's additions place on two entities is reported as `KeyConflict`, and a key carried to another kind as `KindConflict`, rather than resolved by the preference. The result is sorted and timestamped, then checked for archive uniqueness and dangling endpoints. A dangling edge also produces `Conflicts`.
 
 `apply_theirs` is defined by swapping the branch arguments to `apply_ours`, which keeps the two shortcut policies symmetric. The low-level `apply_ours`/`apply_theirs` helpers return only the composed archive; call `three_way_merge` to receive collision and dangling-edge conflicts.
 

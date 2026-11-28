@@ -6392,6 +6392,7 @@ async fn failed_created_event_reports_committed_entity_and_note_ids() {
             None,
             None,
             vec![],
+            &crate::EntityAliasChange::default(),
         )
         .await
         .expect("event telemetry failure must not conceal a committed entity");
@@ -7742,6 +7743,7 @@ async fn create_many_empty_and_invalid_batches_preserve_pending_fts_failure() {
         description: None,
         properties: None,
         tags: vec![],
+        aliases: Vec::new(),
     };
     let _arm = arm_fts_fail_many_scoped(&ns);
     assert!(rt.create_many(&tok, vec![]).await.unwrap().is_empty());
@@ -7816,6 +7818,7 @@ async fn bulk_entity_paths_preserve_rows_fts_order_and_defer_embeddings() {
                 description: Some(format!("glimmerneedle{index}")),
                 properties: Some(serde_json::json!({"ordinal":index,"enabled":true})),
                 tags: vec![format!("tag-{index}")],
+                aliases: Vec::new(),
             })
             .collect();
         let entities = if batch {
@@ -7930,6 +7933,7 @@ async fn create_many_persists_all_entities() {
             description: Some(format!("desc {i}")),
             properties: None,
             tags: vec!["bulk-test".into()],
+            aliases: Vec::new(),
         })
         .collect();
 
@@ -7956,6 +7960,7 @@ async fn create_many_empty_name_rejects_atomically() {
             description: None,
             properties: None,
             tags: vec![],
+            aliases: Vec::new(),
         },
         EntityCreateSpec {
             kind: "concept".into(),
@@ -7964,6 +7969,7 @@ async fn create_many_empty_name_rejects_atomically() {
             description: None,
             properties: None,
             tags: vec![],
+            aliases: Vec::new(),
         },
     ];
 
@@ -7999,6 +8005,7 @@ async fn create_many_secret_refusal_names_the_record_and_field() {
         description: None,
         properties: None,
         tags: vec![],
+        aliases: Vec::new(),
     };
 
     let err = rt
@@ -8108,6 +8115,7 @@ async fn create_many_rejects_unknown_entity_type_when_validator_installed() {
         description: None,
         properties: None,
         tags: vec![],
+        aliases: Vec::new(),
     }];
 
     let result = rt.create_many(&tok, bad_spec).await;
@@ -8150,6 +8158,7 @@ async fn create_many_accepts_valid_entity_type_via_validator() {
         description: None,
         properties: None,
         tags: vec![],
+        aliases: Vec::new(),
     }];
 
     let entities = rt.create_many(&tok, specs).await.unwrap();
@@ -8180,6 +8189,7 @@ async fn create_many_fts_failure_rolls_back_both_substrates() {
             description: None,
             properties: None,
             tags: vec![],
+            aliases: Vec::new(),
         },
         EntityCreateSpec {
             kind: "concept".into(),
@@ -8188,6 +8198,7 @@ async fn create_many_fts_failure_rolls_back_both_substrates() {
             description: None,
             properties: None,
             tags: vec![],
+            aliases: Vec::new(),
         },
     ];
 
@@ -8372,6 +8383,7 @@ async fn create_many_fts_failure_injections_for_distinct_namespaces_do_not_overw
                 description: None,
                 properties: None,
                 tags: vec![],
+                aliases: Vec::new(),
             }],
         ),
         rt_b.create_many(
@@ -8383,6 +8395,7 @@ async fn create_many_fts_failure_injections_for_distinct_namespaces_do_not_overw
                 description: None,
                 properties: None,
                 tags: vec![],
+                aliases: Vec::new(),
             }],
         ),
     );
@@ -8414,6 +8427,7 @@ async fn create_many_mid_batch_storage_failure_rolls_back_both_substrates() {
             description: None,
             properties: None,
             tags: vec![],
+            aliases: Vec::new(),
         },
         EntityCreateSpec {
             kind: "concept".into(),
@@ -8422,6 +8436,7 @@ async fn create_many_mid_batch_storage_failure_rolls_back_both_substrates() {
             description: None,
             properties: None,
             tags: vec![],
+            aliases: Vec::new(),
         },
     ];
 
@@ -8486,6 +8501,7 @@ async fn create_many_fts_partial_failure_injections_for_distinct_namespaces_do_n
                 description: None,
                 properties: None,
                 tags: vec![],
+                aliases: Vec::new(),
             }],
         ),
         rt_b.create_many(
@@ -8497,6 +8513,7 @@ async fn create_many_fts_partial_failure_injections_for_distinct_namespaces_do_n
                 description: None,
                 properties: None,
                 tags: vec![],
+                aliases: Vec::new(),
             }],
         ),
     );
@@ -10761,20 +10778,28 @@ async fn update_note_fans_out_to_all_registered_models() {
 #[tokio::test]
 async fn get_entity_cross_namespace_succeeds() {
     let rt = rt();
-    // Create under "lambda:leo".
-    let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+    // Create under "lambda:alice".
+    let alice_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:alice").unwrap());
     let entity = rt
-        .create_entity(&leo_tok, "concept", None, "Peer-Entity", None, None, vec![])
+        .create_entity(
+            &alice_tok,
+            "concept",
+            None,
+            "Peer-Entity",
+            None,
+            None,
+            vec![],
+        )
         .await
         .unwrap();
-    assert_eq!(entity.namespace, "lambda:leo");
+    assert_eq!(entity.namespace, "lambda:alice");
 
     // Read from "local" — must succeed (no namespace gate on by-ID get).
     let local_tok = NamespaceToken::local();
     let fetched = rt.get_entity(&local_tok, entity.id).await;
     assert!(
         fetched.is_ok(),
-        "get_entity from local token must find lambda:leo entity; got {:?}",
+        "get_entity from local token must find lambda:alice entity; got {:?}",
         fetched
     );
     assert_eq!(fetched.unwrap().id, entity.id);
@@ -10783,10 +10808,10 @@ async fn get_entity_cross_namespace_succeeds() {
 #[tokio::test]
 async fn update_entity_cross_namespace_succeeds() {
     let rt = rt();
-    let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+    let alice_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:alice").unwrap());
     let entity = rt
         .create_entity(
-            &leo_tok,
+            &alice_tok,
             "concept",
             None,
             "Peer-Entity-Update",
@@ -10806,7 +10831,7 @@ async fn update_entity_cross_namespace_succeeds() {
     let result = rt.update_entity(&local_tok, entity.id, patch).await;
     assert!(
         result.is_ok(),
-        "update_entity from local token must succeed on lambda:leo entity; got {:?}",
+        "update_entity from local token must succeed on lambda:alice entity; got {:?}",
         result
     );
     assert_eq!(result.unwrap().name, "Peer-Entity-Updated");
@@ -10815,10 +10840,10 @@ async fn update_entity_cross_namespace_succeeds() {
 #[tokio::test]
 async fn delete_entity_cross_namespace_succeeds() {
     let rt = rt();
-    let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+    let alice_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:alice").unwrap());
     let entity = rt
         .create_entity(
-            &leo_tok,
+            &alice_tok,
             "concept",
             None,
             "Peer-Entity-Delete",
@@ -10834,7 +10859,7 @@ async fn delete_entity_cross_namespace_succeeds() {
     let deleted = rt.delete_entity(&local_tok, entity.id, false).await;
     assert!(
         deleted.is_ok(),
-        "delete_entity from local token must succeed on lambda:leo entity; got {:?}",
+        "delete_entity from local token must succeed on lambda:alice entity; got {:?}",
         deleted
     );
     assert!(
@@ -10846,10 +10871,10 @@ async fn delete_entity_cross_namespace_succeeds() {
 #[tokio::test]
 async fn namespace_preserved_on_entity_after_cross_namespace_get() {
     let rt = rt();
-    let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
+    let alice_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:alice").unwrap());
     let entity = rt
         .create_entity(
-            &leo_tok,
+            &alice_tok,
             "concept",
             None,
             "NS-Preserved",
@@ -10860,11 +10885,11 @@ async fn namespace_preserved_on_entity_after_cross_namespace_get() {
         .await
         .unwrap();
 
-    // The namespace column on the fetched record must still say "lambda:leo".
+    // The namespace column on the fetched record must still say "lambda:alice".
     let local_tok = NamespaceToken::local();
     let fetched = rt.get_entity(&local_tok, entity.id).await.unwrap();
     assert_eq!(
-        fetched.namespace, "lambda:leo",
+        fetched.namespace, "lambda:alice",
         "namespace column must be preserved; not overwritten with caller's namespace"
     );
 }
@@ -13089,6 +13114,7 @@ async fn create_many_rejects_reserved_secret_gate_key_atomically() {
             description: None,
             properties: None,
             tags: vec![],
+            aliases: Vec::new(),
         },
         EntityCreateSpec {
             kind: "concept".to_string(),
@@ -13097,6 +13123,7 @@ async fn create_many_rejects_reserved_secret_gate_key_atomically() {
             description: None,
             properties: Some(reserved_key_props()),
             tags: vec![],
+            aliases: Vec::new(),
         },
     ];
     let err = rt

@@ -43,14 +43,15 @@ tokio::task_local! {
     static CAPTURE: std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 }
 
-/// Whether `KHIVE_SEARCH_PROFILE` is set, read once and recorded in the config ledger.
+/// Whether `KHIVE_SEARCH_PROFILE` is set, read once and reported through tracing.
 pub(super) fn enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         let enabled = std::env::var("KHIVE_SEARCH_PROFILE").is_ok();
-        khive_runtime::config_ledger::record_config_locked(
-            "KHIVE_SEARCH_PROFILE",
-            enabled.to_string(),
+        tracing::info!(
+            target: "khive::config_lock",
+            name = "KHIVE_SEARCH_PROFILE",
+            value = enabled,
         );
         enabled
     })

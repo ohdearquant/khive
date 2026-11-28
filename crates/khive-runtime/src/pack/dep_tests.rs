@@ -291,3 +291,41 @@ fn test_pack_deps_no_deps() {
     assert_eq!(reg.pack_requires("no_deps_a").unwrap(), &[] as &[&str]);
     assert_eq!(reg.pack_requires("no_deps_b").unwrap(), &[] as &[&str]);
 }
+
+#[test]
+fn test_pack_deps_all_missing_pairs_both_build_paths() {
+    for metadata in [false, true] {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(MemoryDepPack);
+        builder.register(ADepPack);
+        let result = if metadata {
+            builder.build_metadata().map(|_| ())
+        } else {
+            builder.build().map(|_| ())
+        };
+        let error =
+            result.expect_err("both missing dependency pairs must refuse either build path");
+        let RuntimeError::MissingPackDependencies(aggregate) = &error else {
+            panic!("expected aggregate missing dependencies, metadata={metadata}, got {error:?}");
+        };
+        let pairs: Vec<_> = aggregate
+            .missing
+            .iter()
+            .map(|missing| (missing.from.as_str(), missing.requires.as_str()))
+            .collect();
+        assert_eq!(
+            pairs.as_slice(),
+            &[("memory_dep", "kg_dep"), ("pack_a", "pack_b")],
+            "metadata={metadata}"
+        );
+        assert_eq!(
+            error.to_string(),
+            concat!(
+                "missing pack dependencies: ",
+                "pack 'memory_dep' requires 'kg_dep', but 'kg_dep' is not in the loaded pack set; ",
+                "pack 'pack_a' requires 'pack_b', but 'pack_b' is not in the loaded pack set"
+            ),
+            "metadata={metadata}"
+        );
+    }
+}

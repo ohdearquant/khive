@@ -9,7 +9,18 @@ use serde_json::{json, Value};
 const SOURCE: &str = "https://example.invalid/refused-include/repo";
 
 fn fixture() -> VerbRegistry {
-    let runtime = KhiveRuntime::memory().expect("private memory runtime");
+    let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".to_string()],
+        brain_profile: None,
+        actor_id: None,
+        git_digest: khive_runtime::GitDigestSectionConfig {
+            local_roots: vec![std::env::temp_dir()],
+            remotes: vec!["https://example.invalid/refused-include/repo".to_string()],
+        },
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("private memory runtime");
     assert!(runtime.backend().pool().canonical_path().is_none());
     assert!(runtime.default_embedder_name().is_empty());
     let mut builder = VerbRegistryBuilder::new();

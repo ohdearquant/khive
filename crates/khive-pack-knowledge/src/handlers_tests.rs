@@ -423,7 +423,7 @@ async fn resolve_compose_type_weights_keeps_nonlocal_namespace_for_profile_read(
 /// `knowledge_compose` binding resolves at Tier 2 — not just namespace-scoped
 /// bindings, which the sibling `..._at_tier2` test above already covers.
 ///
-/// Binds `compose-tuned-actor-v1` by `actor="leo"` only, leaving namespace as
+/// Binds `compose-tuned-actor-v1` by `actor="casey"` only, leaving namespace as
 /// the wildcard `"*"`. Before #700 (call sites passed `actor=None`), this
 /// binding could never match — `resolve_compose_type_weights` would fall
 /// through to Tier 3 and return the untuned default weights, where
@@ -462,7 +462,7 @@ async fn resolve_compose_type_weights_reads_bound_profile_weights_via_actor_bind
         brain_profile: None,
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
-        actor_id: Some("leo".to_string()),
+        actor_id: Some("casey".to_string()),
         exec: Default::default(),
         ..khive_runtime::RuntimeConfig::no_embeddings()
     })
@@ -477,7 +477,7 @@ async fn resolve_compose_type_weights_reads_bound_profile_weights_via_actor_bind
     let token = rt.authorize(Namespace::local()).expect("authorize local");
     assert_eq!(
         token.actor().id,
-        "leo",
+        "casey",
         "test setup: token must carry the configured actor"
     );
 
@@ -516,13 +516,13 @@ async fn resolve_compose_type_weights_reads_bound_profile_weights_via_actor_bind
         .dispatch(
             "brain.bind",
             json!({
-                "actor": "leo",
+                "actor": "casey",
                 "profile_id": "compose-tuned-actor-v1",
                 "consumer_kind": "knowledge_compose"
             }),
         )
         .await
-        .expect("bind compose-tuned-actor-v1 for actor=leo");
+        .expect("bind compose-tuned-actor-v1 for actor=casey");
 
     // KnowledgePack with brain_profile=None → Tier 1 is skipped.
     let pack = KnowledgePack::new(rt.clone());
