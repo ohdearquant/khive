@@ -149,24 +149,31 @@ const P_TOOL: ParamDef = ParamDef {
     resolution_mode: IdResolutionMode::NotApplicable,
 };
 
-pub static TOOL_HANDLERS: [HandlerDef; 14] = [
+pub static TOOL_HANDLERS: [HandlerDef; 15] = [
     HandlerDef {
         name: "tool.register",
-        description: "Register one tool, skill, plugin or verb in the registry, with its capabilities, side-effect class and trust origin. Idempotent by name.",
+        description: "Create a registry object or update supplied fields on its existing name. Returns created, updated and unchanged for the registry row; capability links are additive and may change when the row is unchanged.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
             ParamDef { name: "name", param_type: "string", required: true, description: "Unique registry name.", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "kind", param_type: "string", required: false, description: "tool (default), skill, plugin or verb.", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "description", param_type: "string", required: false, description: "What it does; indexed for discovery.", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "schema", param_type: "object", required: false, description: "Callable contract (for example an MCP inputSchema).", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "source", param_type: "string", required: false, description: "Where it is installed, for example mcp:<server>, skills:<dir>, khive:<pack>.", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "side_effect", param_type: "string", required: false, description: "read, write, egress or irreversible (default write).", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "trust", param_type: "string", required: false, description: "first_party, marketplace or external (default external).", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "kind", param_type: "string", required: false, description: "tool, skill, plugin or verb. Defaults to tool on creation; equal, omitted or null preserves an existing kind. A different kind requires registering a new name.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "description", param_type: "string", required: false, description: "What it does; indexed for discovery. Omitted or null preserves the stored description.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "schema", param_type: "object", required: false, description: "Callable contract (for example an MCP inputSchema). Replaces the whole stored schema; {} clears its members. Omitted or null preserves it.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "source", param_type: "string", required: false, description: "Where it is installed, for example mcp:<server>, skills:<dir>, khive:<pack>. Equal, omitted or null preserves the stored source. A different source requires registering a new name.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "side_effect", param_type: "string", required: false, description: "read, write, egress or irreversible. Defaults to write on creation; omitted or null preserves the stored class. Corrections cannot move earlier in the listed order; an absent or unknown stored class cannot become read.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "trust", param_type: "string", required: false, description: "first_party, marketplace or external. Defaults to external on creation; omitted or null preserves the stored origin. Corrections cannot move earlier in the listed order; an absent or unknown stored origin can become only external.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "capabilities", param_type: "array of string", required: false, description: "Capability concept names this object implements; created when absent.", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "tags", param_type: "array of string", required: false, description: "Extra tags.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "tags", param_type: "array of string", required: false, description: "Extra tags to add, retaining existing tags.", resolution_mode: IdResolutionMode::NotApplicable },
             P_NAMESPACE,
         ],
+    },
+    HandlerDef {
+        name: "tool.unregister",
+        description: "Soft-delete one registry object in the selected write namespace and atomically retire its literal non-pattern exact-name policies and local pinned or exact-name unpinned grants. Shared rules and foreign grants stay stored; foreign pins become inactive. An already-retired row is unchanged. Returns retired, full_id, name_retired, policies_retired, grants_revoked and post_commit_degradations; this does not uninstall an executable or deny every future request for the name. The name is retired for good: registering it again in this namespace is refused, so a registration whose source needs correcting is registered under a new name (name_retired is always true).",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[P_TOOL, P_NAMESPACE],
     },
     HandlerDef {
         name: "tool.ingest",
@@ -203,19 +210,24 @@ pub static TOOL_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "tool.list",
-        description: "List registry objects, optionally by kind.",
+        description: "List registry objects, optionally by kind and by source. Supplying after starts or continues insertion-sequence cursor paging; otherwise offset pagination is used. With include_decision=true each row also carries the caller's policy decision, as tool.describe reports it.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
             ParamDef { name: "kind", param_type: "string", required: false, description: "tool, skill, plugin or verb.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "limit", param_type: "integer", required: false, description: "Page size (default 100).", resolution_mode: IdResolutionMode::NotApplicable },
-            ParamDef { name: "offset", param_type: "integer", required: false, description: "Page offset.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "offset", param_type: "integer", required: false, description: "Page offset; used when after is omitted or null.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "after", param_type: "string", required: false, description: "Full UUID returned as next_after to continue cursor paging, or an empty string to start. When supplied, offset is ignored.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "source", param_type: "string", required: false, description: "Only rows whose source equals this value, for example mcp:example. Not together with source_prefix.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "source_prefix", param_type: "string", required: false, description: "Only rows whose source starts with this text, case-sensitive, for example mcp: for every MCP server. Not together with source.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "include_decision", param_type: "boolean", required: false, description: "When true, each row carries decision, the policy decision for actor (allow, deny or ask, with its source). Default false.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "actor", param_type: "string", required: false, description: "Actor label the decisions are evaluated for (defaults to the caller's actor). Only with include_decision=true.", resolution_mode: IdResolutionMode::NotApplicable },
             P_NAMESPACE,
         ],
     },
     HandlerDef {
         name: "tool.check",
-        description: "Policy decision for an actor calling a tool: allow, deny or ask, with its source (grant, policy or the side-effect default).",
+        description: "Policy decision for an actor calling a tool: allow, deny or ask, with its source (grant, policy or the side-effect default). Credential screening checks the actor and tool fields copied into the decision receipt; standard MCP plugin identifiers are screened by namespace and callable-name component.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[P_TOOL, P_ACTOR, P_NAMESPACE],
@@ -308,11 +320,12 @@ pub static TOOL_HANDLERS: [HandlerDef; 14] = [
     },
     HandlerDef {
         name: "tool.policies",
-        description: "List policy rows with correction history and retirement metadata; retired rows never decide a check.",
+        description: "List policy rows with correction history and retirement metadata; pass policy_id to retrieve an exact row beyond the listing limit. Retired rows never decide a check.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
             ParamDef { name: "actor", param_type: "string", required: false, description: "Optional actor value to match against stored policy patterns. Omit to apply no actor filter within the request namespace.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "policy_id", param_type: "string", required: false, description: "Exact policy row ID, such as the policy_id returned by tool.check.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "limit", param_type: "integer", required: false, description: "Page size (default 100).", resolution_mode: IdResolutionMode::NotApplicable },
             P_NAMESPACE,
         ],

@@ -594,6 +594,223 @@ fn apply_without_a_backup_refuses_before_any_write() {
     assert_eq!(fixture.ids(), before);
 }
 
+/// The same file named relative to the process's working directory, so resolving it depends on where the
+/// process runs, as a path given on the command line would.
+fn relative_to_cwd(path: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().expect("working directory");
+    let absolute = std::fs::canonicalize(path).expect("canonical path");
+    let mut relative = PathBuf::new();
+    for _ in cwd.components().skip(1) {
+        relative.push("..");
+    }
+    relative.push(absolute.strip_prefix("/").expect("absolute path"));
+    assert!(relative.is_relative());
+    relative
+}
+
+#[test]
+fn a_backup_taken_through_a_relative_path_records_the_absolute_source() {
+    let fixture = Fixture::new();
+    fixture.insert(
+        &Uuid::new_v4().to_string(),
+        "audit",
+        "whoami",
+        OLD_US,
+        &envelope("whoami", "allow").to_string(),
+        false,
+    );
+    let plan = plan(&fixture);
+    let target = PruneTarget {
+        events_db: relative_to_cwd(&fixture.events),
+        edge_dbs: vec![fixture.main.clone()],
+    };
+    let dest = fixture.root.join("relative-backup.db");
+    let receipt = events_prune::backup(&target, &plan, &dest).expect("backup");
+    assert!(receipt.source.is_absolute(), "{}", receipt.source.display());
+    assert_eq!(
+        receipt.source,
+        std::fs::canonicalize(&fixture.events).unwrap()
+    );
+}
+
+#[test]
+fn a_receipt_with_a_relative_source_refuses_before_any_apply_mutation() {
+    let fixture = Fixture::new();
+    for verb in ["comm.inbox", "whoami"] {
+        fixture.insert(
+            &Uuid::new_v4().to_string(),
+            "audit",
+            verb,
+            OLD_US,
+            &envelope(verb, "allow").to_string(),
+            false,
+        );
+    }
+    let plan = plan(&fixture);
+    let receipt_file = fixture.backup(&plan, "backup.db");
+    let mut stored: Value = serde_json::from_slice(&std::fs::read(&receipt_file).unwrap()).unwrap();
+    // A receipt written before sources were recorded absolute: the path still resolves to this very store
+    // from the test's working directory, so only the relative form itself can refuse it.
+    stored["source"] = json!(relative_to_cwd(&fixture.events));
+    std::fs::write(&receipt_file, serde_json::to_vec(&stored).unwrap()).unwrap();
+    fixture.checkpoint();
+    let before = (
+        std::fs::read(&fixture.events).unwrap(),
+        fixture.rows_except(&BTreeSet::new()),
+    );
+    let options = fixture.options(&plan.digest, receipt_file, "relative-state");
+    let error = events_prune::apply_at(&fixture.target(), &options, RUN_STARTED_US + 1)
+        .expect_err("a relative receipt source must refuse");
+    assert!(matches!(error, PruneError::NoBackup(_)), "{error}");
+    assert!(error.to_string().contains("relative path"), "{error}");
+    assert!(
+        !options.state_dir.exists(),
+        "refusal must not create apply state"
+    );
+    assert_eq!(std::fs::read(&fixture.events).unwrap(), before.0);
+    assert_eq!(fixture.rows_except(&BTreeSet::new()), before.1);
+}
+
+#[test]
+fn a_backup_of_another_store_refuses_before_any_apply_mutation() {
+    let source = Fixture::new();
+    let other = Fixture::new();
+    let mut candidates = BTreeSet::new();
+    for verb in ["comm.inbox", "whoami", "knowledge.get"] {
+        let id = Uuid::new_v4().to_string();
+        for fixture in [&source, &other] {
+            fixture.insert(
+                &id,
+                "audit",
+                verb,
+                OLD_US,
+                &envelope(verb, "allow").to_string(),
+                false,
+            );
+        }
+        if verb != "knowledge.get" {
+            candidates.insert(id);
+        }
+    }
+    let source_plan = plan(&source);
+    let other_plan = plan(&other);
+    assert_eq!(source_plan.candidates, 2);
+    assert_eq!(source_plan.selected, other_plan.selected);
+    assert_eq!(source_plan.digest, other_plan.digest);
+    assert_eq!(source_plan.cutoff_us, other_plan.cutoff_us);
+    let receipt = source.backup(&source_plan, "backup.db");
+    let options = other.options(&other_plan.digest, receipt.clone(), "wrong-store-state");
+    let snapshots: Vec<_> = [&source, &other]
+        .into_iter()
+        .map(|fixture| {
+            fixture.checkpoint();
+            (
+                std::fs::read(&fixture.events).unwrap(),
+                std::fs::read(&fixture.main).unwrap(),
+                fixture.rows_except(&BTreeSet::new()),
+            )
+        })
+        .collect();
+    let error = events_prune::apply_at(&other.target(), &options, RUN_STARTED_US + 1)
+        .expect_err("matching candidates cannot authorize a backup of another store");
+    assert!(matches!(error, PruneError::NoBackup(_)), "{error}");
+    assert_eq!(error.exit_code(), 5);
+    let message = error.to_string();
+    for path in [&source.events, &other.events] {
+        assert!(message.contains(path.to_str().unwrap()), "{message}");
+    }
+    assert!(
+        !options.state_dir.exists(),
+        "refusal must not create apply state"
+    );
+    for (fixture, (events, main, rows)) in [&source, &other].into_iter().zip(snapshots) {
+        assert_eq!(std::fs::read(&fixture.events).unwrap(), events);
+        assert_eq!(std::fs::read(&fixture.main).unwrap(), main);
+        assert_eq!(fixture.rows_except(&BTreeSet::new()), rows);
+    }
+
+    let retained = source.rows_except(&candidates);
+    let report = events_prune::apply_at(
+        &source.target(),
+        &source.options(&source_plan.digest, receipt, "source-state"),
+        RUN_STARTED_US + 1,
+    )
+    .expect("the same verified receipt must authorize its own source");
+    assert_eq!(report.removed, 2);
+    assert_eq!(source.rows_except(&BTreeSet::new()), retained);
+    assert_eq!(
+        other.ids().len(),
+        3,
+        "applying the source cannot prune the other store"
+    );
+}
+
+#[test]
+fn receipt_source_and_apply_target_accept_canonical_path_aliases() {
+    for alias_is_source in [false, true] {
+        let fixture = Fixture::new();
+        fixture.generic("comm.inbox", OLD_US);
+        let plan = plan(&fixture);
+        let child = fixture.root.join("path-alias");
+        std::fs::create_dir(&child).unwrap();
+        let alias = child.join("..").join(fixture.events.file_name().unwrap());
+        assert_ne!(alias, fixture.events, "the spellings must actually differ");
+        assert_eq!(
+            alias.canonicalize().unwrap(),
+            fixture.events.canonicalize().unwrap()
+        );
+        let mut backup_target = fixture.target();
+        let mut apply_target = fixture.target();
+        if alias_is_source {
+            backup_target.events_db = alias;
+        } else {
+            apply_target.events_db = alias;
+        }
+        let backup = fixture.root.join("backup.db");
+        let receipt = events_prune::backup(&backup_target, &plan, &backup).unwrap();
+        assert_eq!(
+            receipt.source,
+            backup_target.events_db.canonicalize().unwrap()
+        );
+        let report = events_prune::apply_at(
+            &apply_target,
+            &fixture.options(&plan.digest, events_prune::receipt_path(&backup), "state"),
+            RUN_STARTED_US + 1,
+        )
+        .expect("either supplied path may canonically name the backed-up source");
+        assert_eq!(report.removed, 1);
+        assert!(fixture.ids().is_empty());
+    }
+}
+
+#[test]
+fn an_unresolvable_receipt_source_refuses_before_any_apply_mutation() {
+    let fixture = Fixture::new();
+    fixture.generic("comm.inbox", OLD_US);
+    let plan = plan(&fixture);
+    let receipt_path = fixture.backup(&plan, "backup.db");
+    let mut receipt: events_prune::BackupReceipt =
+        serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    receipt.source = fixture.root.join("missing-events.db");
+    std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    let options = fixture.options(&plan.digest, receipt_path, "state");
+    fixture.checkpoint();
+    let before = std::fs::read(&fixture.events).unwrap();
+    let rows = fixture.rows_except(&BTreeSet::new());
+    let error = events_prune::apply_at(&fixture.target(), &options, RUN_STARTED_US + 1)
+        .expect_err("a receipt source must resolve before apply");
+    assert!(matches!(error, PruneError::NoBackup(_)), "{error}");
+    assert_eq!(error.exit_code(), 5);
+    let message = error.to_string();
+    for path in [&receipt.source, &fixture.events] {
+        assert!(message.contains(path.to_str().unwrap()), "{message}");
+    }
+    assert_eq!(std::fs::read(&fixture.events).unwrap(), before);
+    assert_eq!(fixture.rows_except(&BTreeSet::new()), rows);
+    assert!(!options.state_dir.exists());
+    assert!(!receipt.source.exists());
+}
+
 #[test]
 fn a_changed_candidate_set_refuses_with_a_digest_mismatch_before_any_write() {
     let fixture = Fixture::new();

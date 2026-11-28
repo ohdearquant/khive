@@ -770,8 +770,10 @@ const PAYLOAD_TIMESTAMP_FIELDS: &[&str] = &["trigger_at", "due"];
 /// `thread_id` are explicit stable references rather than prefix searches;
 /// `outbound_ref` is the exact correlation key consumed by `comm.delivered`;
 /// `parent_id` is the explicit ancestry reference consumed by `propose`;
-/// `session_id` is an exact event-list filter; and `project_id` is the exact
-/// provenance anchor required by git issue and pull-request creation.
+/// `session_id` is an exact event-list filter; `project_id` is the exact
+/// provenance anchor required by git issue and pull-request creation; and
+/// `share_id` names a share recorded on another machine, where no prefix
+/// search of this store reaches it.
 const ROUND_TRIP_FULL_UUID_FIELDS: &[&str] = &[
     "context_entity_id",
     "thread_id",
@@ -779,6 +781,7 @@ const ROUND_TRIP_FULL_UUID_FIELDS: &[&str] = &[
     "parent_id",
     "session_id",
     "project_id",
+    "share_id",
 ];
 
 /// Score field names that are truncated to 3 significant figures in Agent mode.

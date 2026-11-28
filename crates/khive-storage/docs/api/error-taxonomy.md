@@ -4,18 +4,48 @@
 storage capability trait. This document covers the classifier predicates whose
 full rationale does not fit inline in the rustdoc contract.
 
+## Incoming note-key refusal (0.21.0)
+
+`SecretDetected { capability, operation, matched }` is a deterministic write
+refusal. Incoming note-key assignment uses `StorageCapability::Notes`, the
+assignment operation name, and the shared safe
+`khive_storage::secret_scan::SecretMatch`, owned through `Box<SecretMatch>` so
+this payload does not enlarge every storage and enclosing runtime error.
+`is_retryable()` returns `false`.
+Display is `write blocked: {matched}`; neither display nor debug carries the
+submitted credential. `note.key` is location metadata, not text prepended to the
+key for detection. The write-only validator scans exact input through the same
+scalar and escaped-string checks used by runtime, before looking up any row.
+
+This is a **breaking Rust API change in 0.21.0** because `StorageError` is public
+and exhaustive. Downstream exhaustive matches must add the new variant. The
+enum remains exhaustive; no wire or stored-schema migration accompanies it.
+
+Runtime retains its existing public secret-detector imports and maps this storage
+variant to `RuntimeError::SecretDetected`, moving the match out of its box and
+preserving the existing runtime payload type, match and refusal text.
+Every ordinary storage error remains wrapped by `RuntimeError::Storage` with its
+typed `Error::source()` chain intact. Direct construction of that wrapper also
+retains the source. The pure scanner now lives in storage; property context,
+exemption authority and record finalization remain runtime responsibilities.
+
+`note_key_is_valid` and read/fence validators remain shape-only. Existing keys
+remain readable and usable as fence selectors without rewriting stored data.
+Incoming keys have no manifest exemption. See
+[ADR-115 Amendment 9](../../../../docs/adr/ADR-115-secret-gate-content-manifest-exemption.md#amendment-9-2026-11-16-contextual-property-scanning-and-note-key-write-admission).
+
 ## Capacity admission
 
 `CapacityFloor` refuses a write that would violate the sampled free-space floor.
 It is not automatically retryable. `CapacityUnavailable` identifies the step
 that could not establish admission safety:
 
-| Phase            | Meaning                                                        | `is_retryable()` |
-| ---------------- | -------------------------------------------------------------- | ---------------- |
-| `identity`       | The physical volume could not be resolved or verified           | `false`          |
-| `lock`           | The cooperative lease could not be attempted or was refused     | `false`          |
-| `lock_contended` | The guard deadline elapsed while waiting for the volume lease   | `true`           |
-| `probe`          | Available capacity could not be established                     | `false`          |
+| Phase            | Meaning                                                       | `is_retryable()` |
+| ---------------- | ------------------------------------------------------------- | ---------------- |
+| `identity`       | The physical volume could not be resolved or verified         | `false`          |
+| `lock`           | The cooperative lease could not be attempted or was refused   | `false`          |
+| `lock_contended` | The guard deadline elapsed while waiting for the volume lease | `true`           |
+| `probe`          | Available capacity could not be established                   | `false`          |
 
 Only lease contention is transient: a retry can acquire the released lease and
 then sample capacity again. Each attempt remains bounded by
@@ -86,6 +116,45 @@ whether the writer seam terminated. MCP serializes that context with stable
 `writer_task_request_failed` / `writer_task_terminated` code and stage fields plus
 `request_state`, `task_terminated`, and `retryable`. The events socket protocol carries the same
 request-failed versus task-terminated disposition and reconstructs the matching storage variant.
+
+### Lost replies and strict routing (ADR-135 F6)
+
+`WriteOutcomeUnknown { source }` means this request issued COMMIT but lost its
+reply without retaining a known failure. It serializes as `write_outcome_unknown`,
+with `request_state: side_effects_unknown`, `task_terminated: false`, and
+`retryable: false`. The source retains the reply-channel error. A lost reply does
+not establish that the writer stopped, and ordinary callers must not replay a
+write merely because they did not receive its result.
+
+The writer keeps request-local COMMIT and completion evidence. A retained typed
+failure takes precedence over the lost notification, including a proven rollback
+or native SQLite failure. Enqueueing or starting a closure is not evidence that
+COMMIT was issued. Loss without either settlement or COMMIT evidence retains the
+historical conservative `WriterTaskTerminated`/`SideEffectsUnknown` result.
+Top-level VACUUM does not issue the enclosing COMMIT and cannot acquire the new
+classification merely by completing its callback. Native FULL retains
+`sqlite_disk_full` precedence and its exact codes.
+
+Strict routing has two pre-execution refusals:
+
+| Variant                                        | Wire code                  | Retry policy                                                                         |
+| ---------------------------------------------- | -------------------------- | ------------------------------------------------------------------------------------ |
+| `WriterOwnerUnavailable { operation, source }` | `writer_owner_unavailable` | The original typed source decides; `Pool` is retryable, `WriterTaskNoRuntime` is not |
+| `WriterRouteViolation { operation }`           | `writer_route_violation`   | Not retryable; the caller must use the authorized writer route                       |
+
+Both report `request_state: not_started`, `task_terminated: false`, and a
+`not_committed` disposition for that operation. They do not change default routing
+or explicit compatibility mode. Closed lifecycle authority and its permitted
+operations are documented in the database pool API; lease classes and operation
+names do not confer that authority.
+
+`writer_request_state()` follows native wrappers while preserving the outer
+request's finality. `is_write_outcome_unknown()` recognizes only the new typed
+lost-reply outcome, including a native wrapper, without relabeling historical
+unknown outcomes. These added public enum variants require downstream exhaustive
+matches to classify them explicitly. Internal audit recovery may replay only
+under its existing idempotent append contract; this does not make ordinary unknown
+writes retryable.
 
 A terminal operation or COMMIT failure caused by native SQLite FULL retains its
 primary and extended codes in `sqlite_full_codes`. Other terminal outcomes carry

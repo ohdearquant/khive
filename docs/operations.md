@@ -93,8 +93,19 @@ effect of listing backends.
   `reindex`/`mcp` do. `kg export`/`import`/`status`/`fetch` take `--namespace` directly with no
   config-file fallback at all.
 - **`~/.khive/.env`**: loaded once at process start via `dotenvy` before argument parsing
-  (`main.rs:198-215`). Real environment variables always win over the file; a missing file is not
-  an error.
+  (`load_khive_dotenv` in `crates/kkernel/src/cli.rs`). Real environment variables always win over
+  the file; a missing file is not an error. The file is not loaded at all when `KHIVE_ACTOR` or
+  `KHIVE_NAMESPACE` in the process environment, or any `--actor` or `--namespace` argument
+  (including one after `--`, such as the daemon arguments of `kkernel supervisor launch`, so the
+  supervisor never holds the values its daemon would inherit), names an `agent:` actor (any case, leading whitespace ignored), or when `KHIVE_LOAD_DOTENV` is `0`,
+  `false`, `no`, `off` or an unrecognized value (an empty value counts as unset); when the file
+  exists, startup prints one line naming the reason. The check runs before config discovery, so an
+  agent identity set only in a config file does not trigger it: such a launch sets
+  `KHIVE_LOAD_DOTENV=0`. A daemon that a client starts on demand inherits the client's environment
+  but not its arguments, so an agent client that names itself only with `--actor` or `--namespace`
+  also sets `KHIVE_LOAD_DOTENV=0`. This keeps the values out of an agent server's environment only:
+  a process that can read the file still gets them, so an agent's filesystem sandbox must deny that
+  path.
 
 ---
 
@@ -106,6 +117,12 @@ effect of listing backends.
 `format: "khive-kg"`, `version: "0.1"`, `namespace`, `exported_at`, and `entities`/`edges` arrays:
 metadata and data live in one file, unlike `kg fetch`'s cache (which writes a separate `meta.json`
 sidecar; see below). Export always includes edges; there is no entities-only mode.
+
+Each entity record carries `keys`, the keys it holds as plain strings under its own kind, and
+`aliases`, each with its `origin`; both are omitted when empty (ADR-221 section 4). Import adds them
+to an entity that is already stored and removes none. A key that another live entity holds refuses
+the import with `import_key_conflict`; under `--on-conflict skip` that entity is skipped instead
+and counted in `entities_key_conflict_skipped`.
 
 ```bash
 kkernel kg export /tmp/my-namespace.khive-kg.json --db ~/.khive/khive.db --namespace my-project
@@ -455,6 +472,9 @@ pack owns it, exactly like the MCP `request` tool:
 kkernel exec 'knowledge.import(path="/path/to/atlas-markdown", format="atlas_md")' --db ~/.khive/khive.db
 kkernel exec 'stats()' --config /absolute/path/to/config.toml
 ```
+
+The path must lie under a directory listed in `import_roots` in the config's `[knowledge]` section;
+with none listed, the verb refuses every path.
 
 See §3 below for `exec`'s general resolution rules, and the `knowledge` pack's own docs for
 `import`'s argument shape; that handler lives outside `kkernel` (in the pack crate), not in this

@@ -8,6 +8,7 @@ const FILTERED_SCAN_CAP: u32 = 500;
 
 use std::time::Instant;
 
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -152,6 +153,32 @@ pub struct ValidatedSearchRequest {
     min_score: f64,
     min_rank_score: DeterministicScore,
     order_by: SearchOrder,
+    created_after: Option<DateTime<Utc>>,
+    created_before: Option<DateTime<Utc>>,
+}
+
+fn parse_created_bound(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<DateTime<Utc>>, RuntimeError> {
+    value
+        .map(|value| {
+            // Chrono silently discards fractional digits after the ninth. Refuse them
+            // before parsing so a lower bound cannot admit an earlier stored instant.
+            if value.split_once('.').is_some_and(|(_, fraction)| {
+                fraction.bytes().take_while(u8::is_ascii_digit).count() > 9
+            }) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "{field} supports at most 9 fractional-second digits"
+                )));
+            }
+            DateTime::parse_from_rfc3339(value)
+                .map(|time| time.with_timezone(&Utc))
+                .map_err(|error| {
+                    RuntimeError::InvalidInput(format!("{field} must be RFC 3339: {error}"))
+                })
+        })
+        .transpose()
 }
 
 impl ValidatedSearchRequest {
@@ -172,6 +199,16 @@ impl ValidatedSearchRequest {
         };
         let note_status_present = params.get("note_status").is_some();
         let p: SearchParams = deser(params)?;
+        let created_after = parse_created_bound(p.created_after.as_deref(), "created_after")?;
+        let created_before = parse_created_bound(p.created_before.as_deref(), "created_before")?;
+        if created_after
+            .zip(created_before)
+            .is_some_and(|(after, before)| after > before)
+        {
+            return Err(RuntimeError::InvalidInput(
+                "created_after must not be later than created_before".into(),
+            ));
+        }
         let text_mode = match p.text_mode.as_deref() {
             None | Some("all_terms") => TextQueryMode::Plain,
             Some("any_term") => TextQueryMode::AnyTerm,
@@ -288,6 +325,8 @@ impl ValidatedSearchRequest {
                     min_score,
                     min_rank_score,
                     order_by,
+                    created_after,
+                    created_before,
                 })
             }
             KindSpec::Note { specific } => {
@@ -322,6 +361,8 @@ impl ValidatedSearchRequest {
                     min_score,
                     min_rank_score,
                     order_by,
+                    created_after,
+                    created_before,
                 })
             }
             KindSpec::Edge => Err(RuntimeError::InvalidInput(
@@ -419,6 +460,22 @@ impl ValidatedSearchRequest {
         self.order_by
     }
 
+    /// Whether an inclusive creation-time bound was supplied.
+    pub fn has_created_range(&self) -> bool {
+        self.created_after.is_some() || self.created_before.is_some()
+    }
+
+    /// Test the stored microsecond timestamp against the full-precision input bounds.
+    pub fn matches_created_at(&self, created_at: i64) -> bool {
+        if !self.has_created_range() {
+            return true;
+        }
+        DateTime::from_timestamp_micros(created_at).is_some_and(|at| {
+            self.created_after.is_none_or(|after| at >= after)
+                && self.created_before.is_none_or(|before| at <= before)
+        })
+    }
+
     /// Bounded backend candidate window used to preserve filtered-result recall.
     pub fn candidate_limit(&self) -> u32 {
         // A time order widens the window for the same reason a filter does: it
@@ -426,6 +483,7 @@ impl ValidatedSearchRequest {
         // the top `limit` scored hits would answer "the most recent of the most
         // relevant few" instead of the question asked.
         if self.properties.is_some()
+            || self.has_created_range()
             || !self.tags.is_empty()
             || self.source.is_some()
             || self.order_by != SearchOrder::Score
@@ -554,31 +612,35 @@ impl KgPack {
                 // retrieval pass and this caller-visible metadata fetch.
                 hits.retain(|hit| entity_meta.contains_key(&hit.entity_id));
 
-                let mut filtered_hits =
-                    if props_filter.is_some() || tag_filter.is_some() || source_filter.is_some() {
-                        let kept = hits.into_iter().filter(|h| {
-                            if source_filter.is_some_and(|source| h.source != source) {
-                                return false;
-                            }
-                            let Some(meta) = entity_meta.get(&h.entity_id) else {
-                                return false;
-                            };
-                            props_filter.is_none_or(|pf| props_match(meta.properties.as_ref(), pf))
-                                && tag_filter
-                                    .is_none_or(|wanted| tags_match_any(&meta.tags, wanted))
-                        });
-                        if request.order_by() == SearchOrder::Score {
-                            // Score order imposes the caller limit as candidates
-                            // stream past the filters, as it always has.
-                            kept.take(request.limit() as usize).collect::<Vec<_>>()
-                        } else {
-                            // A time order has to see every candidate that passed
-                            // the filters before it can pick the most recent ones.
-                            kept.collect::<Vec<_>>()
+                let mut filtered_hits = if props_filter.is_some()
+                    || tag_filter.is_some()
+                    || source_filter.is_some()
+                    || request.has_created_range()
+                {
+                    let kept = hits.into_iter().filter(|h| {
+                        if source_filter.is_some_and(|source| h.source != source) {
+                            return false;
                         }
+                        let Some(meta) = entity_meta.get(&h.entity_id) else {
+                            return false;
+                        };
+                        request.matches_created_at(meta.created_at)
+                            && props_filter
+                                .is_none_or(|pf| props_match(meta.properties.as_ref(), pf))
+                            && tag_filter.is_none_or(|wanted| tags_match_any(&meta.tags, wanted))
+                    });
+                    if request.order_by() == SearchOrder::Score {
+                        // Score order imposes the caller limit as candidates
+                        // stream past the filters, as it always has.
+                        kept.take(request.limit() as usize).collect::<Vec<_>>()
                     } else {
-                        hits
-                    };
+                        // A time order has to see every candidate that passed
+                        // the filters before it can pick the most recent ones.
+                        kept.collect::<Vec<_>>()
+                    }
+                } else {
+                    hits
+                };
 
                 if request.order_by() != SearchOrder::Score {
                     apply_time_order(&mut filtered_hits, request.limit() as usize, |h| {
@@ -685,46 +747,49 @@ impl KgPack {
                         .is_some_and(|note| mailbox.permits_message_note(token, note))
                 });
 
-                let mut filtered_hits: Vec<_> =
-                    if props_filter.is_some() || tag_filter.is_some() || source_filter.is_some() {
-                        let kept = hits.into_iter().filter(|h| {
-                            if source_filter.is_some_and(|source| h.source != source) {
-                                return false;
-                            }
-                            let Some(note) = note_meta.get(&h.note_id) else {
-                                return false;
-                            };
-                            let props = &note.properties;
-                            let props_ok =
-                                props_filter.is_none_or(|pf| props_match(props.as_ref(), pf));
-                            let tags_ok = tag_filter.is_none_or(|wanted| {
-                                let note_tags: Vec<String> = props
-                                    .as_ref()
-                                    .and_then(|p| p.get("tags"))
-                                    .and_then(Value::as_array)
-                                    .map(|arr| {
-                                        arr.iter()
-                                            .filter_map(Value::as_str)
-                                            .map(str::to_owned)
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                tags_match_any(&note_tags, wanted)
-                            });
-                            props_ok && tags_ok
-                        });
-                        if request.order_by() == SearchOrder::Score {
-                            // Score order imposes the caller limit as candidates
-                            // stream past the filters, as it always has.
-                            kept.take(request.limit() as usize).collect()
-                        } else {
-                            // A time order has to see every candidate that passed
-                            // the filters before it can pick the most recent ones.
-                            kept.collect()
+                let mut filtered_hits: Vec<_> = if props_filter.is_some()
+                    || tag_filter.is_some()
+                    || source_filter.is_some()
+                    || request.has_created_range()
+                {
+                    let kept = hits.into_iter().filter(|h| {
+                        if source_filter.is_some_and(|source| h.source != source) {
+                            return false;
                         }
+                        let Some(note) = note_meta.get(&h.note_id) else {
+                            return false;
+                        };
+                        let props = &note.properties;
+                        let props_ok =
+                            props_filter.is_none_or(|pf| props_match(props.as_ref(), pf));
+                        let tags_ok = tag_filter.is_none_or(|wanted| {
+                            let note_tags: Vec<String> = props
+                                .as_ref()
+                                .and_then(|p| p.get("tags"))
+                                .and_then(Value::as_array)
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(Value::as_str)
+                                        .map(str::to_owned)
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            tags_match_any(&note_tags, wanted)
+                        });
+                        request.matches_created_at(note.created_at) && props_ok && tags_ok
+                    });
+                    if request.order_by() == SearchOrder::Score {
+                        // Score order imposes the caller limit as candidates
+                        // stream past the filters, as it always has.
+                        kept.take(request.limit() as usize).collect()
                     } else {
-                        hits
-                    };
+                        // A time order has to see every candidate that passed
+                        // the filters before it can pick the most recent ones.
+                        kept.collect()
+                    }
+                } else {
+                    hits
+                };
 
                 if request.order_by() != SearchOrder::Score {
                     apply_time_order(&mut filtered_hits, request.limit() as usize, |h| {

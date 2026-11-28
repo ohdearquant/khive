@@ -3,15 +3,21 @@ use std::{future::Future, pin::Pin, task::Poll};
 use khive_storage::{await_request_read_phase, ensure_request_read_active};
 use tokio::sync::Semaphore;
 
+use super::plan::{
+    execute_leaf, finish_collect, CollectedPlanOutcome, CollectionPlan, CollectionSlot,
+    ExecutedLeaf, LeafExecutionContext, LeafKind, LeafSlot, PreparedLeaf,
+};
 use super::types::*;
+use crate::QueryNode;
 
 type Job<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 type ArmError<A> = ExecutorError<<A as ExecutorArm>::Error, <A as ExecutorArm>::Evidence>;
-type Slot<A> = (
-    usize,
-    Vec<Scored<<A as ExecutorArm>::Id, <A as ExecutorArm>::Label>>,
-    ArmReport<<A as ExecutorArm>::Evidence, <A as ExecutorArm>::Error>,
-);
+type Slot<A> = ExecutedLeaf<
+    <A as ExecutorArm>::Id,
+    <A as ExecutorArm>::Label,
+    <A as ExecutorArm>::Evidence,
+    <A as ExecutorArm>::Error,
+>;
 type Group<A> = (Vec<Slot<A>>, Option<<A as ExecutorArm>::Evidence>);
 
 #[derive(Clone, Copy)]
@@ -68,24 +74,6 @@ async fn join_jobs<T: Send, E: Send, D: Send>(
     .await
 }
 
-fn skipped<A: ExecutorArm + ?Sized>(
-    slot: usize,
-    spec: &ArmSpec<'_, A>,
-    preparation: Option<A::Evidence>,
-) -> Slot<A> {
-    (
-        slot,
-        Vec::new(),
-        ArmReport {
-            key: spec.key.to_owned(),
-            requested: spec.candidate_limit,
-            returned: 0,
-            preparation,
-            state: ArmState::Skipped,
-        },
-    )
-}
-
 async fn search_slot<A: ExecutorArm + ?Sized>(
     operation: &'static str,
     slot: usize,
@@ -94,66 +82,33 @@ async fn search_slot<A: ExecutorArm + ?Sized>(
     preparation: Option<A::Evidence>,
     permits: &Semaphore,
 ) -> Result<Slot<A>, ArmError<A>> {
-    let Some(input) = input.filter(|_| !spec.scope.namespaces.is_empty()) else {
-        return Ok(skipped(slot, spec, preparation));
+    let node = match input.filter(|_| !spec.scope.namespaces.is_empty()) {
+        None => QueryNode::Empty,
+        Some(ArmInput::Text { query, .. }) => {
+            QueryNode::keyword(*query, spec.candidate_limit as usize)
+        }
+        Some(ArmInput::Vector {
+            input: VectorInput::Embedding(embedding),
+            ..
+        }) => QueryNode::vector(embedding.to_vec(), spec.candidate_limit as usize),
+        Some(ArmInput::Vector {
+            input: VectorInput::Text(_),
+            ..
+        }) => return Err(ExecutorError::MissingVectorPreparer { slot }),
     };
-    let permit = await_request_read_phase(operation, permits.acquire())
-        .await
-        .map_err(ExecutorError::RequestStopped)?
-        .expect("executor-owned semaphore is never closed");
-    let result = await_request_read_phase(
-        operation,
-        spec.adapter.search(ArmRequest {
-            scope: SearchScope {
-                namespaces: spec.scope.namespaces,
-                filter: spec.scope.filter,
-            },
-            input,
-            candidate_limit: spec.candidate_limit,
-        }),
+    execute_leaf(
+        LeafExecutionContext { operation, permits },
+        LeafSlot(slot),
+        spec,
+        PreparedLeaf { node, preparation },
     )
     .await
-    .map_err(ExecutorError::RequestStopped)?;
-    drop(permit);
-    let (hits, state) = match result {
-        Ok(completion) => {
-            if completion.hits.len() > spec.candidate_limit as usize {
-                return Err(ExecutorError::Protocol {
-                    slot: Some(slot),
-                    message: "arm exceeded its candidate limit",
-                });
-            }
-            (
-                completion.hits,
-                ArmState::Completed {
-                    route: completion.route,
-                    evidence: completion.evidence,
-                },
-            )
-        }
-        Err(ArmFailure::Ordinary(error)) => match spec.failure {
-            FailurePolicy::Required => return Err(ExecutorError::Arm { slot, error }),
-            FailurePolicy::TolerateOrdinary => (Vec::new(), ArmState::Failed(error)),
-        },
-        Err(ArmFailure::Fatal(error)) => return Err(ExecutorError::Arm { slot, error }),
-        Err(ArmFailure::Unavailable(evidence)) => match spec.failure {
-            FailurePolicy::Required => return Err(ExecutorError::Unavailable { slot, evidence }),
-            FailurePolicy::TolerateOrdinary => (Vec::new(), ArmState::Unavailable(evidence)),
-        },
-    };
-    let report = ArmReport {
-        key: spec.key.to_owned(),
-        requested: spec.candidate_limit,
-        returned: hits.len(),
-        preparation,
-        state,
-    };
-    Ok((slot, hits, report))
 }
 
 async fn vector_group<A: ExecutorArm + ?Sized>(
     request: &ExecutorRequest<'_, A>,
     permits: &Semaphore,
+    active: &[bool],
 ) -> Result<Group<A>, ArmError<A>> {
     let operation = request.operation;
     let mut jobs: Vec<Job<'_, Slot<A>, ArmError<A>>> = Vec::new();
@@ -166,7 +121,7 @@ async fn vector_group<A: ExecutorArm + ?Sized>(
             .filter_map(|(position, &slot)| {
                 let spec = &request.arms[slot];
                 spec.input.as_ref().and_then(|input| {
-                    (!spec.scope.namespaces.is_empty()).then_some((
+                    (active[slot] && !spec.scope.namespaces.is_empty()).then_some((
                         position,
                         ArmRequest {
                             scope: SearchScope {
@@ -181,14 +136,13 @@ async fn vector_group<A: ExecutorArm + ?Sized>(
             })
             .collect();
         if selected.is_empty() {
-            return Ok((
-                request
-                    .vector_slots
-                    .iter()
-                    .map(|&slot| skipped(slot, &request.arms[slot], None))
-                    .collect(),
-                None,
-            ));
+            let mut slots = Vec::new();
+            for &slot in request.vector_slots {
+                slots.push(
+                    search_slot(operation, slot, &request.arms[slot], None, None, permits).await?,
+                );
+            }
+            return Ok((slots, None));
         }
         let expected = selected.len();
         let prepared = await_request_read_phase(
@@ -211,9 +165,11 @@ async fn vector_group<A: ExecutorArm + ?Sized>(
             let Some(input) = spec
                 .input
                 .as_ref()
-                .filter(|_| !spec.scope.namespaces.is_empty())
+                .filter(|_| active[slot] && !spec.scope.namespaces.is_empty())
             else {
-                jobs.push(Box::pin(async move { Ok(skipped(slot, spec, None)) }));
+                jobs.push(Box::pin(search_slot(
+                    operation, slot, spec, None, None, permits,
+                )));
                 continue;
             };
             let prepared = prepared.next().expect("preparation count was validated");
@@ -223,7 +179,7 @@ async fn vector_group<A: ExecutorArm + ?Sized>(
                     evidence,
                 } = prepared;
                 let Some(embedding) = embedding else {
-                    return Ok(skipped(slot, spec, Some(evidence)));
+                    return search_slot(operation, slot, spec, None, Some(evidence), permits).await;
                 };
                 let ArmInput::Vector {
                     engine,
@@ -250,7 +206,7 @@ async fn vector_group<A: ExecutorArm + ?Sized>(
                 operation,
                 slot,
                 spec,
-                spec.input.as_ref(),
+                spec.input.as_ref().filter(|_| active[slot]),
                 None,
                 permits,
             )));
@@ -264,45 +220,56 @@ async fn vector_group<A: ExecutorArm + ?Sized>(
 pub(super) async fn collect<A: ExecutorArm + ?Sized>(
     request: &ExecutorRequest<'_, A>,
     policy: ArmErrorPolicy,
-) -> Result<CollectedArms<A::Id, A::Label, A::Evidence, A::Error>, ArmError<A>> {
+    active: &[bool],
+) -> Result<CollectedPlanOutcome<A::Id, A::Label, A::Evidence, A::Error>, ArmError<A>> {
     let operation = request.operation;
+    let declared = CollectionPlan::new(
+        request
+            .arms
+            .iter()
+            .enumerate()
+            .map(|(slot, spec)| CollectionSlot {
+                slot: LeafSlot(slot),
+                key: spec.key.to_owned(),
+                kind: if request.vector_slots.contains(&slot) {
+                    LeafKind::Vector
+                } else {
+                    LeafKind::Keyword
+                },
+            })
+            .collect(),
+    )
+    .map_err(ExecutorError::Invalid)?;
     let permits = Semaphore::new(request.max_in_flight.get());
     let mut groups: Vec<Job<'_, Group<A>, ArmError<A>>> = Vec::new();
     for (slot, spec) in request.arms.iter().enumerate() {
         if !request.vector_slots.contains(&slot) {
             let permits = &permits;
             groups.push(Box::pin(async move {
-                search_slot(operation, slot, spec, spec.input.as_ref(), None, permits)
-                    .await
-                    .map(|slot| (vec![slot], None))
+                search_slot(
+                    operation,
+                    slot,
+                    spec,
+                    spec.input.as_ref().filter(|_| active[slot]),
+                    None,
+                    permits,
+                )
+                .await
+                .map(|slot| (vec![slot], None))
             }));
         }
     }
     if !request.vector_slots.is_empty() {
-        groups.push(Box::pin(vector_group(request, &permits)));
+        groups.push(Box::pin(vector_group(request, &permits, active)));
     }
     let completed = join_jobs(operation, groups, policy).await?;
-    let mut slots: Vec<Option<Slot<A>>> = (0..request.arms.len()).map(|_| None).collect();
+    let mut slots = Vec::new();
     let mut vector_preparation = None;
     for (group_slots, evidence) in completed {
         if evidence.is_some() {
             vector_preparation = evidence;
         }
-        for value in group_slots {
-            let slot = value.0;
-            slots[slot] = Some(value);
-        }
+        slots.extend(group_slots);
     }
-    let mut arms = Vec::with_capacity(slots.len());
-    let mut reports = Vec::with_capacity(slots.len());
-    for slot in slots {
-        let (_, hits, report) = slot.expect("each validated plan slot was scheduled once");
-        arms.push(hits);
-        reports.push(report);
-    }
-    Ok(CollectedArms {
-        arms,
-        reports,
-        vector_preparation,
-    })
+    finish_collect(&declared, slots, vector_preparation)
 }

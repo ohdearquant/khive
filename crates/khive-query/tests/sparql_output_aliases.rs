@@ -428,3 +428,329 @@ fn ordinary_gql_result_column_names_remain_exact() {
         ]
     );
 }
+
+#[test]
+fn typed_return_paths_preserve_public_ast_output_labels() {
+    use khive_query::ast::{OrderDirection, OrderItem, PropertyRef};
+
+    let conn = fixture();
+    for (id, label) in [("node-a", "start"), ("node-b", "middle"), ("node-z", "end")] {
+        conn.execute(
+            "UPDATE entities SET properties = ?1 WHERE id = ?2",
+            rusqlite::params![format!(r#"{{"Label":"{label}"}}"#), id],
+        )
+        .unwrap();
+    }
+    for (id, rank) in [("edge-a", 1), ("edge-next", 2), ("edge-z", 3)] {
+        conn.execute(
+            "UPDATE graph_edges SET metadata = ?1 WHERE id = ?2",
+            rusqlite::params![format!(r#"{{"rank":{{"Value":{rank}}}}}"#), id],
+        )
+        .unwrap();
+    }
+    for recursive in [false, true] {
+        for [start, edge, end] in [
+            ["123", "789", "456"],
+            [
+                "Left, AS \"Source\"",
+                "Link AS , \"Edge\"",
+                "Right, AS \"Target\"",
+            ],
+        ] {
+            let mut query = with_edge_binding(path_query(recursive));
+            for (element, label) in query.pattern.elements.iter_mut().zip([start, edge, end]) {
+                match element {
+                    PatternElement::Node(node) => node.variable = Some(label.into()),
+                    PatternElement::Edge(edge) => edge.variable = Some(label.into()),
+                }
+            }
+            query.return_items = vec![
+                ReturnItem::Path(start.into(), PropertyRef::JsonPath(vec!["Label".into()])),
+                ReturnItem::Path(end.into(), PropertyRef::JsonPath(vec!["Label".into()])),
+                ReturnItem::Path(
+                    edge.into(),
+                    PropertyRef::MetadataPath(vec!["rank".into(), "Value".into()]),
+                ),
+            ];
+            query.order_by = vec![OrderItem {
+                variable: edge.into(),
+                property: PropertyRef::MetadataPath(vec!["rank".into(), "Value".into()]),
+                direction: OrderDirection::Asc,
+            }];
+            let mut columns = vec![
+                format!("{start}_properties_Label"),
+                format!("{end}_properties_Label"),
+                format!("{edge}_metadata_rank_Value"),
+            ];
+            let mut expected = vec![
+                vec![text("start"), text("middle"), Value::Integer(1)],
+                vec![text("start"), text("end"), Value::Integer(3)],
+            ];
+            if recursive {
+                columns.extend(["_depth".into(), "_total_weight".into()]);
+                for row in &mut expected {
+                    row.extend([Value::Integer(1), Value::Real(2.0)]);
+                }
+                expected.insert(
+                    1,
+                    vec![
+                        text("start"),
+                        text("end"),
+                        Value::Integer(2),
+                        Value::Integer(2),
+                        Value::Real(3.0),
+                    ],
+                );
+            }
+            let columns: Vec<_> = columns.iter().map(String::as_str).collect();
+            assert_eq!(
+                run(&conn, &query, &columns),
+                expected,
+                "recursive={recursive}, start={start}"
+            );
+        }
+    }
+}
+
+#[test]
+fn typed_return_paths_case_distinct_labels_order_by_their_own_values() {
+    let conn = fixture();
+    for (id, rank) in [("node-a", 100), ("node-b", 30), ("node-z", 10)] {
+        conn.execute(
+            "UPDATE entities SET properties = ?1 WHERE id = ?2",
+            rusqlite::params![format!(r#"{{"rank":{rank}}}"#), id],
+        )
+        .unwrap();
+    }
+    for range in ["", "*0..2", "*1..2"] {
+        for container in [false, true] {
+            let end_projection = if container {
+                "A.properties"
+            } else {
+                "A.properties.rank"
+            };
+            let projection = if container {
+                format!("a.properties, {end_projection}, a.properties.rank")
+            } else {
+                format!("a.properties.rank, {end_projection}")
+            };
+            let base =
+                format!("MATCH (a {{name: 'Source'}})-[:extends{range}]->(A) RETURN {projection}");
+            let mut columns = if container {
+                vec!["a_properties", "A_properties", "a_properties_rank"]
+            } else {
+                vec!["a_properties_rank", "A_properties_rank"]
+            };
+            let recursive = !range.is_empty();
+            if recursive {
+                columns.extend(["_depth", "_total_weight"]);
+            }
+            let row = |rank: i64, depth: i64, weight: f64| {
+                let end = if container {
+                    text(&format!(r#"{{"rank":{rank}}}"#))
+                } else {
+                    Value::Integer(rank)
+                };
+                let mut cells = if container {
+                    vec![text(r#"{"rank":100}"#), end, Value::Integer(100)]
+                } else {
+                    vec![Value::Integer(100), end]
+                };
+                if recursive {
+                    cells.extend([Value::Integer(depth), Value::Real(weight)]);
+                }
+                cells
+            };
+            let mut automatic = vec![row(10, 1, 2.0), row(30, 1, 2.0)];
+            if recursive {
+                automatic.push(row(10, 2, 3.0));
+            }
+            if range == "*0..2" {
+                automatic.insert(0, row(100, 0, 0.0));
+            }
+            // Fixed paths retain their existing hidden identity order before projected ties.
+            if recursive {
+                assert_eq!(run(&conn, &gql::parse(&base).unwrap(), &columns), automatic);
+            }
+            let mut ordered = vec![row(10, 1, 2.0), row(30, 1, 2.0)];
+            if recursive {
+                ordered.insert(1, row(10, 2, 3.0));
+            }
+            if range == "*0..2" {
+                ordered.push(row(100, 0, 0.0));
+            }
+            let query = gql::parse(&format!("{base} ORDER BY A.properties.rank")).unwrap();
+            assert_eq!(run(&conn, &query, &columns), ordered, "{base}");
+        }
+    }
+}
+
+#[test]
+fn typed_return_paths_case_distinct_metric_labels_keep_total_weight_order() {
+    let conn = fixture();
+    conn.execute_batch(
+        "DELETE FROM graph_edges WHERE id = 'edge-z';
+         UPDATE graph_edges SET weight = 0.25 WHERE id = 'edge-a';
+         UPDATE graph_edges SET weight = 0.5 WHERE id = 'edge-next';
+         UPDATE entities SET properties = '{\"label\":\"end\"}' WHERE id = 'node-z';
+         INSERT INTO entities VALUES
+             ('node-c', 'local', 'concept', NULL, 'Other', NULL, '{}', 25, 26, NULL);
+         INSERT INTO graph_edges VALUES
+             ('edge-other', 'local', 'node-a', 'node-c', 'extends', 0.75, '{}', 1, 1, NULL),
+             ('edge-final', 'local', 'node-c', 'node-z', 'extends', 0.25, '{}', 1, 1, NULL);",
+    )
+    .unwrap();
+    let columns = [
+        "_TOTAL_weight",
+        "b_properties_label",
+        "_depth",
+        "_total_weight",
+    ];
+    let expected = vec![
+        vec![
+            Value::Real(0.25),
+            text("end"),
+            Value::Integer(2),
+            Value::Real(1.0),
+        ],
+        vec![
+            Value::Real(0.5),
+            text("end"),
+            Value::Integer(2),
+            Value::Real(0.75),
+        ],
+    ];
+    for min in [0, 1] {
+        let input = format!("MATCH (a {{name: 'Source'}})-[_TOTAL:extends*{min}..2]->(b {{name: 'Zulu'}}) RETURN _TOTAL.weight, b.properties.label");
+        assert_eq!(
+            run(&conn, &gql::parse(&input).unwrap(), &columns),
+            expected,
+            "implicit total weight order must not resolve to the case-distinct edge weight label"
+        );
+        let page = gql::parse(&format!("{input} SKIP 1 LIMIT 1")).unwrap();
+        assert_eq!(run(&conn, &page, &columns), expected[1..]);
+    }
+}
+
+#[test]
+fn grouped_case_distinct_labels_order_by_selected_values() {
+    let conn = fixture();
+    for (id, rank) in [("node-a", 100), ("node-b", 30), ("node-z", 10)] {
+        conn.execute(
+            "UPDATE entities SET properties = ?1 WHERE id = ?2",
+            rusqlite::params![format!(r#"{{"rank":{rank}}}"#), id],
+        )
+        .unwrap();
+    }
+    for range in ["", "*0..2", "*1..2"] {
+        for container in [false, true] {
+            let returned = if container {
+                "a.properties, A.properties, a.properties.rank"
+            } else {
+                "a.properties.rank, A.properties.rank"
+            };
+            for grouped in [false, true] {
+                let projection = if grouped {
+                    format!("{returned}, count(A)")
+                } else {
+                    format!("DISTINCT {returned}")
+                };
+                let base = format!(
+                    "MATCH (a {{name: 'Source'}})-[:extends{range}]->(A) RETURN {projection}"
+                );
+                let mut columns = if container {
+                    vec!["a_properties", "A_properties", "a_properties_rank"]
+                } else {
+                    vec!["a_properties_rank", "A_properties_rank"]
+                };
+                if grouped {
+                    columns.push("count_A");
+                }
+                let make_row = |rank: i64, count: i64| {
+                    let end = if container {
+                        text(&format!(r#"{{"rank":{rank}}}"#))
+                    } else {
+                        Value::Integer(rank)
+                    };
+                    let mut row = if container {
+                        vec![text(r#"{"rank":100}"#), end, Value::Integer(100)]
+                    } else {
+                        vec![Value::Integer(100), end]
+                    };
+                    if grouped {
+                        row.push(Value::Integer(count));
+                    }
+                    row
+                };
+                let mut ordered = vec![
+                    make_row(10, if range.is_empty() { 1 } else { 2 }),
+                    make_row(30, 1),
+                ];
+                if range == "*0..2" {
+                    ordered.push(make_row(100, 1));
+                }
+                let explicit = gql::parse(&format!("{base} ORDER BY A.properties.rank")).unwrap();
+                assert_eq!(run(&conn, &explicit, &columns), ordered, "{base}");
+                // Numeric projected values have the same natural tie order; whole JSON text
+                // uses its own BINARY value ordering and is tested by explicit derived order.
+                if !container {
+                    assert_eq!(run(&conn, &gql::parse(&base).unwrap(), &columns), ordered);
+                }
+                ordered.reverse();
+                let desc = gql::parse(&format!("{base} ORDER BY A.properties.rank DESC")).unwrap();
+                assert_eq!(run(&conn, &desc, &columns), ordered);
+            }
+        }
+    }
+}
+
+#[test]
+fn count_public_ast_labels_remain_quoted_and_sparql_defaults_to_bag_results() {
+    let conn = fixture();
+    for recursive in [false, true] {
+        for labels in [
+            ["123", "789", "456"],
+            [
+                "left, AS \"source\"",
+                "link AS , \"edge\"",
+                "right, AS \"target\"",
+            ],
+        ] {
+            let mut query = with_edge_binding(path_query(recursive));
+            assert!(
+                !query.distinct,
+                "SPARQL constructor must retain ordinary semantics"
+            );
+            for (element, label) in query.pattern.elements.iter_mut().zip(labels) {
+                match element {
+                    PatternElement::Node(node) => node.variable = Some(label.into()),
+                    PatternElement::Edge(edge) => edge.variable = Some(label.into()),
+                }
+            }
+            query.return_items = labels
+                .into_iter()
+                .map(|label| ReturnItem::Count(label.into()))
+                .collect();
+            let owned_columns = labels.map(|label| format!("count_{label}"));
+            let columns = owned_columns.iter().map(String::as_str).collect::<Vec<_>>();
+            assert_eq!(
+                run(&conn, &query, &columns),
+                vec![vec![Value::Integer(if recursive { 3 } else { 2 }); 3]]
+            );
+        }
+    }
+    conn.execute(
+        "UPDATE entities SET name = 'same' WHERE id IN ('node-b', 'node-z')",
+        [],
+    )
+    .unwrap();
+    let mut query = path_query(false);
+    assert!(!query.distinct);
+    query.return_items = vec![ReturnItem::Property("456".into(), "name".into())];
+    assert_eq!(
+        run(&conn, &query, &["456_name"]),
+        vec![vec![text("same")], vec![text("same")]]
+    );
+    query.distinct = true;
+    assert_eq!(run(&conn, &query, &["456_name"]), vec![vec![text("same")]]);
+}

@@ -49,9 +49,12 @@ fn isolated(name: &str, cases: &[&str]) -> Option<String> {
         return Some(std::env::var("KHIVE_SUCCESS_AUDIT_CASE").unwrap());
     }
     for case in cases {
+        // /tmp keeps the socket path short; where /tmp is closed, as in a
+        // sandboxed run, the process's own temporary directory takes its place.
         let directory = tempfile::Builder::new()
             .prefix("kh-as-")
             .tempdir_in("/tmp")
+            .or_else(|_| tempfile::Builder::new().prefix("kh-as-").tempdir())
             .unwrap();
         let log = directory.path().join("output");
         let output = std::fs::File::create(&log).unwrap();

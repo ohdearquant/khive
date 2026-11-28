@@ -106,9 +106,15 @@ pub(crate) struct ReadParams {
     pub ids: Option<Vec<String>>,
     #[serde(default = "read_body_by_default")]
     pub body: bool,
+    #[serde(default = "read_mark_by_default")]
+    pub mark: bool,
 }
 
 fn read_body_by_default() -> bool {
+    true
+}
+
+fn read_mark_by_default() -> bool {
     true
 }
 

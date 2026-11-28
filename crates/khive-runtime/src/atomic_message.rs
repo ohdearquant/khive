@@ -558,6 +558,9 @@ pub(crate) async fn prepare_atomic_note_requests(
             properties.as_ref(),
             &record,
         )?;
+        if let Some(key) = options.key {
+            crate::secret_gate::check_at(key, &record, "key")?;
+        }
 
         let ns = spec.token.namespace().as_str();
         let mut note = Note::new(ns, spec.kind, spec.content);

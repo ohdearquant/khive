@@ -864,3 +864,78 @@ async fn oversized_truncated_loose_blob_prioritizes_the_declared_size_limit() {
     );
     assert_eq!(fixture.store.puts.load(Ordering::SeqCst), before);
 }
+
+#[tokio::test]
+async fn a_repeat_checkout_writes_only_the_blobs_the_store_lacks() {
+    let fixture = Fixture::new(&[
+        ("kept", b"kept\n", 0o644),
+        ("changed", b"before\n", 0o644),
+        ("removed", b"removed\n", 0o755),
+    ]);
+    let puts = || fixture.store.puts.load(Ordering::SeqCst);
+    let before_first = puts();
+    let first = checkout(&fixture.runtime, &fixture.repo, "HEAD")
+        .await
+        .unwrap();
+    assert_eq!(
+        puts() - before_first,
+        4,
+        "a first checkout writes its three blobs and the manifest"
+    );
+
+    std::fs::write(fixture.repo.join("changed"), b"after\n").unwrap();
+    std::fs::remove_file(fixture.repo.join("removed")).unwrap();
+    std::fs::write(fixture.repo.join("added"), b"added\n").unwrap();
+    std::fs::write(fixture.repo.join("copy"), b"kept\n").unwrap();
+    fixture.git(&["add", "--all"], None);
+    fixture.git(
+        &[
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "second",
+        ],
+        None,
+    );
+    let before_second = puts();
+    let second = checkout(&fixture.runtime, &fixture.repo, "HEAD")
+        .await
+        .unwrap();
+    assert_eq!(
+        puts() - before_second,
+        3,
+        "only the two new blob contents and the manifest are written; the unchanged file and \
+         the new path holding known bytes are not"
+    );
+    let entries = tree::load(&fixture.runtime, &second.tree).await.unwrap();
+    let paths = entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, ["added", "changed", "copy", "kept"]);
+    for entry in &entries {
+        let reference = ContentRef::from_hex(&entry.content_ref).unwrap();
+        let stored = fixture
+            .store
+            .get_bounded_verified(&reference, MAX_BLOB_WHOLE_BYTES)
+            .await
+            .unwrap();
+        let native = fixture.git(&["cat-file", "blob", &format!("HEAD:{}", entry.path)], None);
+        assert_eq!(stored, native, "a skipped write must name the same bytes");
+    }
+
+    let before_again = puts();
+    let again = checkout(&fixture.runtime, &fixture.repo, &first.commit)
+        .await
+        .unwrap();
+    assert_eq!(again.tree, first.tree);
+    assert_eq!(
+        puts() - before_again,
+        1,
+        "a checkout of a commit whose blobs are all stored writes only the manifest"
+    );
+}

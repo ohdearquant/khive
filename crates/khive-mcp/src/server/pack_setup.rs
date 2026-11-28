@@ -133,11 +133,16 @@ impl KhiveMcpServer {
             pool,
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
+            catalog_verbosity: crate::args::CatalogVerbosity::Full,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
             #[cfg(unix)]
             events_readiness: Arc::new(std::sync::OnceLock::new()),
             #[cfg(unix)]
             bridge_executable: None,
+            #[cfg(unix)]
+            computer: None,
+            #[cfg(unix)]
+            share: Default::default(),
             stdio_bridge: false,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: Some(runtime.clone()),
