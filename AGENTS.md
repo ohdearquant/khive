@@ -246,7 +246,7 @@ and match the serve. Unjudged preserves their grade/dedup budget: a later eligib
 `useful`, `not_useful`, or `wrong` auto-feedback judgment using that pair commits
 exactly once. Manual `brain.feedback` keeps its existing provenance rules.
 
-### Comm pack — 15 verbs (`comm.` prefix)
+### Comm pack — 16 verbs (`comm.` prefix)
 
 | Verb                      | What it does                                                                                                                                         | When to use                                                 |
 | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
@@ -261,10 +261,18 @@ exactly once. Manual `brain.feedback` keeps its existing provenance rules.
 | `comm.thread`             | Retrieve full conversation thread                                                                                                                    | Read the whole conversation                                 |
 | `comm.health`             | Bounded heartbeat-first channel and quarantine-backlog snapshot with nominal cadence and advisory staleness (no args)                                | Check channel polls and parked messages                     |
 | `comm.probe`              | Read-only poll for new inbound message metadata and stale unread count                                                                               | Cheap wake-up check without a full inbox scan               |
+| `comm.quiet`              | Defer background warm and maintenance work cooperatively for `ttl_secs` (integer 1–300)                                                              | Request a bounded quiet window                              |
 | `comm.suppression_add`    | Add an email suppression entry (address, exact domain, or recipient key); requires `scope`, `kind`, `value`, `source`                                | Record an opt-out or operator block                         |
 | `comm.suppression_list`   | List live suppression entries, optionally filtered by `scope` and `kind`                                                                             | Audit what is currently suppressed                          |
 | `comm.suppression_remove` | Remove one suppression entry by full UUID; a non-empty `reason` is required, and opt-out sources also need later authenticated same-address evidence | Lift a block with an audit trail                            |
 | `comm.withheld_body`      | Read a delivered withheld external message's original bytes, base64-encoded; open to its recipient actor and the maintainer, every call audited      | Recover what a screening rule withheld                      |
+
+`comm.quiet(ttl_secs=30)` returns `{quiet_until: "<RFC3339 UTC>"}`. Requests
+combine by the later monotonic deadline, so a shorter request cannot shorten an
+active window. `comm.health.resource.quiet_until` is always present and becomes
+null on expiry. This is process-wide cooperative deferral; in-flight work,
+foreground requests, finalization and shutdown continue. See the
+[channel health and quiet reference](crates/khive-pack-comm/docs/api/channel-health.md#commquiet--bounded-background-deferral).
 
 **Inbox shape (ADR-057).** `comm.inbox` is scannable: each entry carries top-level `from`, `to`,
 `subject`, `read`, `direction`, and a derived `preview` (whitespace-collapsed, truncated to 80

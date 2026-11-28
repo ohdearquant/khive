@@ -19,7 +19,7 @@
 //!
 //! This test walks every `HandlerDef` across every pack registered in the
 //! `inventory` (i.e. linked into this test binary) and asserts:
-//!   1. A name without a dot must be in the kg-substrate allowlist.
+//!   1. A name without a dot must belong to kg and be in its substrate allowlist.
 //!   2. A name with exactly one dot must have a prefix equal to `Pack::NAME`
 //!      (validated via `all_handlers_with_names`), or, for the kg pack only,
 //!      a documented sub-namespace.
@@ -118,12 +118,12 @@ fn violations(handlers: &[(String, String)]) -> Vec<String> {
         let dot_count = verb_name.chars().filter(|&c| c == '.').count();
 
         match dot_count {
-            // No dot — must be an allowed kg substrate verb.
+            // No dot — must be owned by kg and be an allowed substrate verb.
             0 => {
-                if !KG_SUBSTRATE_VERBS.contains(&verb_name.as_str()) {
+                if pack_name != "kg" || !KG_SUBSTRATE_VERBS.contains(&verb_name.as_str()) {
                     violations.push(format!(
-                        "pack={pack_name:?} verb={verb_name:?}: bare name is not in the \
-                         kg-substrate allowlist. Add `{pack_name}.` prefix."
+                        "pack={pack_name:?} verb={verb_name:?}: bare name requires ownership \
+                         by kg and membership in the kg-substrate allowlist."
                     ));
                 }
             }
@@ -272,5 +272,53 @@ fn kg_pack_exposes_bare_verbs_or_a_documented_sub_namespace() {
         undocumented.is_empty(),
         "kg dotted names must use {KG_SUB_NAMESPACES:?} (ADR-174 section 2) or \
          exactly kg.proposal_cleanup (ADR-046 C1); found: {undocumented:?}"
+    );
+}
+
+#[test]
+fn foreign_pack_cannot_borrow_kg_bare_or_another_pack_prefix() {
+    let live = build_full_registry();
+    assert!(
+        violations(&live).is_empty(),
+        "control: the live registry must pass before decoys are judged"
+    );
+    for (owner, verb) in [("kg", "create"), ("memory", "memory.recall")] {
+        assert!(
+            live.iter()
+                .any(|(pack, name)| pack == owner && name == verb),
+            "control: {owner:?} must own {verb:?} in the live registry"
+        );
+    }
+
+    for decoy in [("probe", "create"), ("probe", "memory.recall")] {
+        let mut handlers = live.clone();
+        handlers.push((decoy.0.to_string(), decoy.1.to_string()));
+        let found = violations(&handlers);
+        assert_eq!(
+            found.len(),
+            1,
+            "decoy {decoy:?} must produce exactly one violation; got {found:?}"
+        );
+        assert!(
+            found[0].contains(&format!("pack={:?}", decoy.0)),
+            "the violation must name the decoy pack: {found:?}"
+        );
+        assert!(
+            found[0].contains(&format!("verb={:?}", decoy.1)),
+            "the violation must name the decoy verb: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn runtime_kg_bare_allowlist_matches_namespace_contract() {
+    let mut runtime = VerbRegistryBuilder::kg_substrate_verbs_for_test().to_vec();
+    let mut contract = KG_SUBSTRATE_VERBS.to_vec();
+    runtime.sort_unstable();
+    contract.sort_unstable();
+    // Compare vectors so duplicate entries cannot disappear in a set conversion.
+    assert_eq!(
+        runtime, contract,
+        "runtime public ownership and the authoritative kg bare allowlist must agree"
     );
 }

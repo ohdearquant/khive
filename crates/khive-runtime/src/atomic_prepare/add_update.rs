@@ -207,10 +207,54 @@ pub(crate) fn validate_import_entity_record(
     Ok(())
 }
 
+/// The plan of a canonical change-set create that names a key or aliases
+/// (ADR-221 sections 1 and 2). The aliases are projected onto `entity` before
+/// its row and text document are built, so both carry them, and they are
+/// written in the same unit. The key claim runs first under an exactly-one
+/// guard, so a key another live entity took after preparation rolls the whole
+/// change set back.
+pub(crate) fn canonical_entity_create_plan(
+    entity: &mut khive_storage::Entity,
+    key: Option<&str>,
+    aliases: &crate::EntityAliasChange,
+) -> RuntimeResult<AtomicOpPlan> {
+    let at = entity.created_at;
+    let (_, alias_statements, _) =
+        crate::operations::apply_entity_alias_change(entity, aliases, at, None);
+    let mut plan = add_entity_record_plan(entity, true)?;
+    if let Some(key) = key {
+        plan.statements.insert(
+            0,
+            PlanStatement {
+                statement: khive_db::stores::entity::entity_key_claim_statement(
+                    &entity.namespace,
+                    &entity.kind,
+                    key,
+                    entity.id,
+                    at,
+                ),
+                guard: Some(AffectedRowGuard::exactly(1)),
+            },
+        );
+    }
+    plan.statements
+        .extend(crate::operations::unguarded_alias_statements(
+            alias_statements,
+        ));
+    Ok(AtomicOpPlan::AddEntity(plan))
+}
+
 fn add_entity_plan(
     entity: &khive_storage::Entity,
     insert_if_absent: bool,
 ) -> RuntimeResult<AtomicOpPlan> {
+    add_entity_record_plan(entity, insert_if_absent).map(AtomicOpPlan::AddEntity)
+}
+
+fn add_entity_record_plan(
+    entity: &khive_storage::Entity,
+    insert_if_absent: bool,
+) -> RuntimeResult<AddEntityPlan> {
     // Keep the check at the write owner as well as the callers' early validation
     // boundaries, which preserve their established refusal order.
     crate::secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
@@ -232,13 +276,13 @@ fn add_entity_plan(
         });
     }
 
-    Ok(AtomicOpPlan::AddEntity(AddEntityPlan {
+    Ok(AddEntityPlan {
         entity_id: entity.id,
         statements,
         post_commit: PostCommitEffect::ReindexEntity {
             entity_id: entity.id,
         },
-    }))
+    })
 }
 
 /// Build the prepared plan for an `AddNote` proposal change. Mirrors
@@ -388,11 +432,20 @@ pub(super) fn reject_inapplicable_update_fields(
             } else {
                 None
             };
-            (bad, "name, description, tags, properties, entity_type")
+            (
+                bad,
+                "name, description, tags, properties, entity_type, add_aliases, remove_aliases, keep_old_name",
+            )
         }
         "note" => {
             let bad = if o.contains_key("description") {
                 Some("description")
+            } else if present("add_aliases") {
+                Some("add_aliases")
+            } else if present("remove_aliases") {
+                Some("remove_aliases")
+            } else if present("keep_old_name") {
+                Some("keep_old_name")
             } else if present("relation") {
                 Some("relation")
             } else if present("weight") {
@@ -423,6 +476,12 @@ pub(super) fn reject_inapplicable_update_fields(
                 Some("content")
             } else if present("tags") {
                 Some("tags")
+            } else if present("add_aliases") {
+                Some("add_aliases")
+            } else if present("remove_aliases") {
+                Some("remove_aliases")
+            } else if present("keep_old_name") {
+                Some("keep_old_name")
             } else if o.contains_key("salience") {
                 Some("salience")
             } else if o.contains_key("decay_factor") {
@@ -766,6 +825,23 @@ pub async fn prepare_update(
         ));
     }
 
+    // ADR-221 section 2: every alias is validated and secret-gated before
+    // the target is read, as the kg update handler does.
+    let keep_old_name = match obj(args)?.get("keep_old_name") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(keep)) => *keep,
+        Some(_) => {
+            return Err(RuntimeError::InvalidInput(
+                "keep_old_name must be a boolean".into(),
+            ))
+        }
+    };
+    let aliases = crate::EntityAliasChange::update(
+        &optional_alias_list(args, "add_aliases")?,
+        &optional_alias_list(args, "remove_aliases")?,
+    )?
+    .keeping_old_name(keep_old_name);
+
     match runtime.resolve_by_id(token, id).await? {
         Some(Resolved::Entity(entity)) => {
             match &expected_kind {
@@ -798,7 +874,7 @@ pub async fn prepare_update(
                 }
             }
             refuse_pack_registry_tags(&entity.tags, "update")?;
-            // Decide step lives in curation.rs's `prepare_update_entity` —
+            // Decide step lives in curation.rs's `prepare_update_entity_with_previous_name` —
             // the SAME function canonical `update_entity` calls. Only the
             // arg-extraction (raw JSON -> `EntityPatch`) and the plan-shape
             // wiring are atomic-path-specific: the domain object becomes a
@@ -828,7 +904,7 @@ pub async fn prepare_update(
                 Some(AtomicUpdateKind::Entity { entity_type, .. }) => entity_type.as_deref(),
                 _ => None,
             };
-            prepare_update_entity_plan_with_version_and_type(
+            prepare_update_entity_record_with_version_and_type(
                 runtime,
                 token,
                 id,
@@ -839,10 +915,13 @@ pub async fn prepare_update(
                     tags,
                     entity_type,
                 },
+                &[],
+                &aliases,
                 expected_version,
                 required_entity_type,
             )
             .await
+            .map(|(_, plan)| plan)
         }
         Some(Resolved::Note(note)) => {
             // Patch application lives in curation.rs's
@@ -887,14 +966,16 @@ pub async fn prepare_update(
 
 /// Build an entity update plan from a typed patch. Proposal changesets use
 /// this entry point to preserve the typed patch directly, without translating
-/// it through raw verb parameters.
+/// it through raw verb parameters. `aliases` carries the caller's choice of
+/// whether a rename keeps the old name (ADR-221 section 3).
 pub async fn prepare_update_entity_plan(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     id: Uuid,
     patch: crate::curation::EntityPatch,
+    aliases: &crate::EntityAliasChange,
 ) -> RuntimeResult<AtomicOpPlan> {
-    prepare_update_entity_plan_with_version(runtime, token, id, patch, None).await
+    prepare_update_entity_plan_with_version(runtime, token, id, patch, aliases, None).await
 }
 
 pub(super) async fn prepare_update_entity_plan_with_version_and_type(
@@ -902,6 +983,7 @@ pub(super) async fn prepare_update_entity_plan_with_version_and_type(
     token: &NamespaceToken,
     id: Uuid,
     patch: crate::curation::EntityPatch,
+    aliases: &crate::EntityAliasChange,
     expected_version: Option<i64>,
     required_entity_type: Option<&str>,
 ) -> RuntimeResult<AtomicOpPlan> {
@@ -910,6 +992,8 @@ pub(super) async fn prepare_update_entity_plan_with_version_and_type(
         token,
         id,
         patch,
+        &[],
+        aliases,
         expected_version,
         required_entity_type,
     )
@@ -917,16 +1001,32 @@ pub(super) async fn prepare_update_entity_plan_with_version_and_type(
     .map(|(_, plan)| plan)
 }
 
+/// An `add_aliases` or `remove_aliases` list: absent or `null` is empty.
+fn optional_alias_list(args: &Value, field: &str) -> RuntimeResult<Vec<String>> {
+    let invalid = || RuntimeError::InvalidInput(format!("{field} must be an array of strings"));
+    match obj(args)?.get(field) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned).ok_or_else(invalid))
+            .collect(),
+        Some(_) => Err(invalid()),
+    }
+}
+
 /// Return the canonical prepared record together with the plan bound to it.
 ///
 /// Import uses this projection for endpoint validation without applying the
 /// patch or invoking kind hooks again. Its version remains the captured row
 /// revision; applying the plan advances the persisted revision once.
+/// `aliases` carries the caller's choice of whether a rename keeps the old
+/// name (ADR-221 section 3).
 pub(crate) async fn prepare_update_entity_record(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     id: Uuid,
     patch: crate::curation::EntityPatch,
+    aliases: &crate::EntityAliasChange,
     expected_version: Option<i64>,
 ) -> RuntimeResult<(khive_storage::Entity, AtomicOpPlan)> {
     prepare_update_entity_record_with_version_and_type(
@@ -934,24 +1034,68 @@ pub(crate) async fn prepare_update_entity_record(
         token,
         id,
         patch,
+        &[],
+        aliases,
         expected_version,
         None,
     )
     .await
 }
 
+/// The update a keyed reload joins to a bulk create's unit (ADR-221
+/// section 1): `patch` applied, then the caller property keys in
+/// `remove_properties` dropped and the caller aliases replaced by `aliases`,
+/// bound to `expected_version` so a holder that changed since it was read
+/// rolls the unit back. The returned record's version is the captured one;
+/// applying the plan advances it once.
+pub(crate) async fn prepare_keyed_reload_entity_record(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    patch: crate::curation::EntityPatch,
+    remove_properties: &[&str],
+    expected_version: i64,
+    aliases: &crate::EntityAliasChange,
+) -> RuntimeResult<(khive_storage::Entity, AtomicOpPlan)> {
+    prepare_update_entity_record_with_version_and_type(
+        runtime,
+        token,
+        id,
+        patch,
+        remove_properties,
+        aliases,
+        Some(expected_version),
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn prepare_update_entity_record_with_version_and_type(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     id: Uuid,
     patch: crate::curation::EntityPatch,
+    remove_properties: &[&str],
+    aliases: &crate::EntityAliasChange,
     expected_version: Option<i64>,
     required_entity_type: Option<&str>,
 ) -> RuntimeResult<(khive_storage::Entity, AtomicOpPlan)> {
     crate::entity_write::validate_expected_version(expected_version)?;
+    let alias_only = patch.is_empty() && remove_properties.is_empty() && !aliases.is_empty();
     let explicit_entity_type_patch = patch.entity_type.is_some();
-    let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
-        runtime.prepare_update_entity(token, id, patch).await?;
+    let (
+        (
+            mut entity,
+            mut reindex_required,
+            mut changed_fields,
+            expected_updated_at,
+            expected_deleted_at,
+        ),
+        previous_name,
+    ) = runtime
+        .prepare_update_entity_with_previous_name(token, id, patch, remove_properties)
+        .await?;
     if required_entity_type.is_some_and(|expected| {
         (explicit_entity_type_patch || entity.entity_type.is_some())
             && entity.entity_type.as_deref() != Some(expected)
@@ -959,6 +1103,33 @@ async fn prepare_update_entity_record_with_version_and_type(
         return Err(RuntimeError::InvalidInput(
             "kind subtype contradicts the requested entity_type update".into(),
         ));
+    }
+    // ADR-221 section 2: the alias change lands on the row whose name is
+    // final, and reindexes the entity as a name change does.
+    let updated_at = entity.updated_at;
+    let (aliases_changed, alias_statements, _) = crate::operations::apply_entity_alias_change(
+        &mut entity,
+        aliases,
+        updated_at,
+        Some(&previous_name),
+    );
+    if aliases_changed {
+        reindex_required = true;
+        changed_fields.push("aliases");
+    }
+    // An update that asks only for alias changes and changes none writes
+    // nothing: the plan only asserts the row is still the one read.
+    if alias_only
+        && !aliases_changed
+        && expected_version.is_none_or(|expected| expected == entity.version)
+    {
+        entity.updated_at = expected_updated_at;
+        entity.deleted_at = expected_deleted_at;
+        let plan = crate::canonical_apply::unchanged_entity_assertion_plan(
+            &entity,
+            "alias-noop-assertion",
+        );
+        return Ok((entity, plan));
     }
     let mut statements = vec![PlanStatement {
         statement: entity_replace_if_unchanged_statement(
@@ -968,6 +1139,9 @@ async fn prepare_update_entity_record_with_version_and_type(
         ),
         guard: Some(AffectedRowGuard::exactly(1)),
     }];
+    statements.extend(crate::operations::unguarded_alias_statements(
+        alias_statements,
+    ));
     statements.extend(event_append_statements(
         token,
         &entity.namespace,
@@ -975,11 +1149,7 @@ async fn prepare_update_entity_record_with_version_and_type(
         EventKind::EntityUpdated,
         SubstrateKind::Entity,
         id,
-        serde_json::json!({
-            "id": id,
-            "namespace": &entity.namespace,
-            "changed_fields": changed_fields,
-        }),
+        crate::operations::entity_updated_payload(&entity, &changed_fields, Some(&previous_name)),
     )?);
     let post_commit = if reindex_required {
         PostCommitEffect::ReindexEntity { entity_id: id }

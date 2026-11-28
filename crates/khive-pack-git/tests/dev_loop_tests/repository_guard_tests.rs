@@ -33,6 +33,9 @@ async fn amendment12_arm5_program_is_unknown_on_every_repository_verb() {
             "git.update_ref" => {
                 vec![json!({"repo":f.repo,"branch":"work","to":f.base,"expected":f.base})]
             }
+            "git.branch_delete" => {
+                vec![json!({"repo":f.repo,"name":"work","expected":f.base})]
+            }
             "git.commit" => vec![
                 f.commit_params(&manifest),
                 json!({"repo":f.repo,"paths":["a.txt"],"message":"legacy program control"}),
@@ -57,6 +60,15 @@ async fn amendment12_arm5_program_is_unknown_on_every_repository_verb() {
                     json!({"repo":f.repo,"number":1,"method":"squash","subject":"Program control","body":"","expected_head":f.base}),
                 ]
             }
+            "git.pr_state" => vec![json!({"repo":f.repo,"number":1})],
+            "git.pr_list" | "git.issue_list" => vec![json!({"repo":f.repo})],
+            "git.issue" => vec![json!({"repo":f.repo,"number":1})],
+            "git.check_log" => vec![json!({"repo":f.repo,"check_run":1})],
+            "git.pr_edit" => vec![
+                json!({"repo":f.repo,"number":1,"title":"Program control","expected_head":f.base}),
+            ],
+            "git.pr_close" => vec![json!({"repo":f.repo,"number":1,"expected_head":f.base})],
+            "git.fetch" => vec![json!({"repo":f.repo,"ref":"work"})],
             "git.receipts" | "git.gates" | "git.status" | "git.log" => {
                 vec![json!({"repo":f.repo})]
             }
@@ -198,4 +210,86 @@ async fn arm14_ref_move_race_preserves_rival_with_atomic_compare() {
         .expect_err("CAS_CONTROL_COMPARE_MUST_REFUSE")
         .to_string();
     f.refusal_receipt(&error).await;
+}
+
+/// ADR-182 Amendment 24 arm 126: a scoped tree, and a tree edited from one, refuses
+/// `scoped_tree` before any git command runs, and the whole tree of the same entries commits.
+#[tokio::test]
+#[serial_test::serial(git_dev_loop_env)]
+async fn amendment24_arm126_scoped_trees_refuse_before_any_git_command() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+
+    let f = Fixture::new(true, true).await;
+    f.policy("git.commit", "allow").await;
+    let whole = f
+        .tree(&[("a.txt", b"scoped\n", 644), ("docs/b.txt", b"b\n", 644)])
+        .await;
+    let entries = tree::load_tree(&f.rt, &whole)
+        .await
+        .expect("whole tree")
+        .entries;
+    let scope = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+    // A scope that covers every entry is still a scope: only a whole tree commits.
+    let covering = tree::store_tree(&f.rt, &entries, Some(&scope(&["a.txt", "docs"])))
+        .await
+        .expect("covering scoped tree");
+    let partial = tree::store_tree(&f.rt, &entries[..1], Some(&scope(&["a.txt"])))
+        .await
+        .expect("partial scoped tree");
+    let edited = f
+        .call(
+            "exec.tree_put",
+            json!({"tree":partial, "edits":[{"path":"a.txt","content":"edited\n"}]}),
+        )
+        .await;
+    assert_eq!(edited["scope"], json!(["a.txt"]), "{edited}");
+    let edited = edited["tree"].as_str().expect("edited tree").to_string();
+
+    let bin = f.dir.path().join("git-marker");
+    std::fs::create_dir(&bin).expect("marker directory");
+    let marker = f.dir.path().join("git-ran");
+    executable(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\nprintf ran > {marker}\nexec {git} \"$@\"\n",
+            marker = quoted(&marker),
+            git = quoted(&f.git),
+        ),
+    );
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").expect("PATH"),
+    ));
+    let refs = f.git_bytes(&["show-ref"]);
+    let objects = f.git_bytes(&["count-objects", "-v"]);
+    let cases = [
+        ("covering", &covering, json!(["a.txt", "docs"])),
+        ("partial", &partial, json!(["a.txt"])),
+        ("edited", &edited, json!(["a.txt"])),
+    ];
+    let mut errors = Vec::new();
+    {
+        let _env = EnvGuard::set(&[("PATH", std::env::join_paths(paths).expect("marker PATH"))]);
+        for (label, manifest, _) in &cases {
+            errors.push((*label, f.err("git.commit", f.commit_params(manifest)).await));
+        }
+    }
+    assert!(
+        !marker.exists(),
+        "a scoped tree must be refused before any git command runs"
+    );
+    for ((label, error), (_, _, expected)) in errors.iter().zip(&cases) {
+        let receipt = f.refusal_receipt(error).await;
+        assert_eq!(receipt["reason"], "scoped_tree", "{label}: {receipt}");
+        assert_eq!(receipt["result"]["scope"], *expected, "{label}: {receipt}");
+    }
+    assert_eq!(f.git_bytes(&["show-ref"]), refs);
+    assert_eq!(f.git_bytes(&["count-objects", "-v"]), objects);
+
+    // Control: the whole tree of the same entries commits.
+    let result = f.call("git.commit", f.commit_params(&whole)).await;
+    assert!(result["sha"].is_string(), "{result}");
+    assert_ne!(f.git_bytes(&["show-ref"]), refs);
 }

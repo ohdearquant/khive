@@ -3,7 +3,8 @@ use std::io::Write;
 use anyhow::Result;
 
 use super::{
-    record_prefix, FixSummary, OutputFormat, ValidateArgs, ValidationReport, ValidationRun,
+    ndjson_file_name, record_prefix, FixSummary, OutputFormat, ValidateArgs, ValidationReport,
+    ValidationRun,
 };
 
 pub(super) fn render_validation(
@@ -144,7 +145,16 @@ fn write_github_format(output: &mut dyn Write, report: &ValidationReport) -> std
             } else {
                 "warning"
             };
-            writeln!(output, "::{level} ::{}", v.message)?;
+            if let Some(source) = v.source {
+                writeln!(
+                    output,
+                    "::{level} file=.khive/kg/{}::{}",
+                    ndjson_file_name(source),
+                    v.message
+                )?;
+            } else {
+                writeln!(output, "::{level} ::{}", v.message)?;
+            }
         }
     }
     Ok(())

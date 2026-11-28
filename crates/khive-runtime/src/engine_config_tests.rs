@@ -2377,6 +2377,84 @@ branches = []
     );
 }
 
+// ADR-108 Amendment 2: a read entry names a repository and no branches, and a
+// row with no `access` key keeps its write meaning.
+#[test]
+fn test_git_write_read_entry_parses_and_access_defaults_to_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_toml(
+        &dir,
+        r#"
+[[git_write.allowed]]
+repo = "/abs/read"
+access = "read"
+
+[[git_write.allowed]]
+repo = "/abs/write"
+branches = ["main"]
+"#,
+    );
+    let cfg = KhiveConfig::load(Some(&path))
+        .expect("no error")
+        .expect("file found");
+    assert_eq!(cfg.git_write.allowed[0].access, GitRepoAccess::Read);
+    assert!(cfg.git_write.allowed[0].branches.is_empty());
+    assert_eq!(cfg.git_write.allowed[1].access, GitRepoAccess::Write);
+}
+
+#[test]
+fn test_git_write_read_entry_with_branches_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_toml(
+        &dir,
+        r#"
+[[git_write.allowed]]
+repo = "/abs/path"
+access = "read"
+branches = ["main"]
+"#,
+    );
+    let err = KhiveConfig::load(Some(&path)).expect_err("a read entry names no branches");
+    assert!(
+        matches!(config_error_root(&err), ConfigError::InvalidGitWriteEntry { ref reason, .. } if reason == "a read entry names no branches"),
+        "expected InvalidGitWriteEntry, got {err:?}"
+    );
+}
+
+// Omitting `branches` on a write entry is the empty list, refused as before.
+#[test]
+fn test_git_write_write_entry_without_branches_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_toml(
+        &dir,
+        r#"
+[[git_write.allowed]]
+repo = "/abs/path"
+access = "write"
+"#,
+    );
+    let err = KhiveConfig::load(Some(&path)).expect_err("a write entry needs branches");
+    assert!(
+        matches!(config_error_root(&err), ConfigError::InvalidGitWriteEntry { ref reason, .. } if reason == "branches must not be empty"),
+        "expected InvalidGitWriteEntry, got {err:?}"
+    );
+}
+
+#[test]
+fn test_git_write_unknown_access_rejected() {
+    let parsed: Result<KhiveConfig, _> = toml::from_str(
+        r#"
+[[git_write.allowed]]
+repo = "/abs/path"
+access = "admin"
+"#,
+    );
+    assert!(
+        parsed.is_err(),
+        "an access other than read or write must not parse"
+    );
+}
+
 #[test]
 fn git_actor_mapping_and_resolver_defaults_parse_without_resolution() {
     let cfg: KhiveConfig = toml::from_str(
@@ -2472,6 +2550,74 @@ credential = "not-an-accepted-field""#
 }
 
 #[test]
+fn git_repository_author_is_optional_and_refuses_an_invalid_identity_at_load() {
+    let row = |author: Option<(&str, &str)>| GitWriteSectionConfig {
+        repositories: BTreeMap::from([(
+            "/repo".to_string(),
+            GitWriteRepositoryConfig {
+                remote: "https://github.com/example/repo".to_string(),
+                slug: "example/repo".to_string(),
+                visibility: "private".to_string(),
+                merge_refusals: vec![],
+                author: author.map(|(name, email)| GitWriteAuthorConfig {
+                    name: name.to_string(),
+                    email: email.to_string(),
+                }),
+            },
+        )]),
+        ..Default::default()
+    };
+    row(None).validate_dev_loop().unwrap();
+    row(Some(("Example Author", "author@example.invalid")))
+        .validate_dev_loop()
+        .unwrap();
+    for (name, email) in [
+        ("", "author@example.invalid"),
+        ("Example Author", "  "),
+        ("Example <Author>", "author@example.invalid"),
+        ("Example Author", "author@example.invalid\n"),
+    ] {
+        assert!(matches!(
+            row(Some((name, email))).validate_dev_loop(),
+            Err(ConfigError::InvalidGitWriteConfig { key, .. })
+                if key == "repositories./repo.author"
+        ));
+    }
+    let parsed: GitWriteRepositoryConfig = toml::from_str(
+        r#"remote = "https://github.com/example/repo"
+slug = "example/repo"
+visibility = "private"
+author = { name = "Example Author", email = "author@example.invalid" }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        parsed.author,
+        Some(GitWriteAuthorConfig {
+            name: "Example Author".to_string(),
+            email: "author@example.invalid".to_string(),
+        })
+    );
+    let absent: GitWriteRepositoryConfig = toml::from_str(
+        r#"remote = "https://github.com/example/repo"
+slug = "example/repo"
+visibility = "private""#,
+    )
+    .unwrap();
+    assert_eq!(absent.author, None);
+    assert!(
+        !toml::to_string(&absent).unwrap().contains("author"),
+        "an absent author writes nothing back"
+    );
+    assert!(toml::from_str::<GitWriteRepositoryConfig>(
+        r#"remote = "https://github.com/example/repo"
+slug = "example/repo"
+visibility = "private"
+author = { name = "Example Author", email = "author@example.invalid", credential_ref = "ref" }"#
+    )
+    .is_err());
+}
+
+#[test]
 fn git_repository_merge_refusals_accept_only_the_two_named_entries() {
     let row = |refusals: &[&str]| GitWriteSectionConfig {
         repositories: BTreeMap::from([(
@@ -2481,6 +2627,7 @@ fn git_repository_merge_refusals_accept_only_the_two_named_entries() {
                 slug: "example/repo".to_string(),
                 visibility: "private".to_string(),
                 merge_refusals: refusals.iter().map(|entry| entry.to_string()).collect(),
+                author: None,
             },
         )]),
         ..Default::default()
@@ -2950,4 +3097,155 @@ fn a_malformed_cwd_config_beside_a_database_anchored_tier_names_no_file_in_use()
     );
     assert_eq!(in_use, None);
     assert!(text.contains("(in use: none)"), "{text}");
+}
+
+#[test]
+fn knowledge_import_roots_parse_closed_and_absolute() {
+    let parsed: KhiveConfig =
+        toml::from_str("[knowledge]\nimport_roots = [\"/srv/atlas\"]\n").unwrap();
+    assert_eq!(
+        parsed.knowledge.import_roots,
+        vec![PathBuf::from("/srv/atlas")]
+    );
+    parsed.validate().expect("an absolute root validates");
+    assert!(KhiveConfig::default().knowledge.import_roots.is_empty());
+
+    let unknown = toml::from_str::<KhiveConfig>("[knowledge]\nimport_root = [\"/srv\"]\n");
+    assert!(unknown.is_err(), "a misspelled key fails to parse");
+
+    let relative: KhiveConfig =
+        toml::from_str("[knowledge]\nimport_roots = [\"atlas\"]\n").unwrap();
+    let error = relative.validate().expect_err("a relative root is refused");
+    assert!(
+        error.to_string().contains("knowledge.import_roots"),
+        "{error}"
+    );
+}
+
+#[test]
+fn git_digest_sources_parse_closed_and_checked() {
+    let parsed: KhiveConfig = toml::from_str(
+        "[git_digest]\nlocal_roots = [\"/srv/repos\"]\nremotes = [\"https://example.com/org/a\"]\n",
+    )
+    .unwrap();
+    parsed
+        .validate()
+        .expect("absolute roots and https remotes validate");
+    assert_eq!(
+        parsed.git_digest.local_roots,
+        vec![PathBuf::from("/srv/repos")]
+    );
+    assert!(KhiveConfig::default().git_digest == GitDigestSectionConfig::default());
+
+    assert!(toml::from_str::<KhiveConfig>("[git_digest]\nroots = []\n").is_err());
+
+    let relative: KhiveConfig =
+        toml::from_str("[git_digest]\nlocal_roots = [\"repos\"]\n").unwrap();
+    let error = relative.validate().expect_err("a relative root is refused");
+    assert!(
+        error.to_string().contains("git_digest.local_roots"),
+        "{error}"
+    );
+
+    let ssh: KhiveConfig =
+        toml::from_str("[git_digest]\nremotes = [\"ssh://example.com/a\"]\n").unwrap();
+    let error = ssh.validate().expect_err("a non-https remote is refused");
+    assert!(
+        error.to_string().contains("git_digest.remotes")
+            && error.to_string().contains("is not an https:// URL"),
+        "{error}"
+    );
+
+    for broad in [
+        "https://github.com/ohdearquant",
+        "https://github.com/ohdearquant/",
+        "https://github.com",
+        "https://github.com/ohdearquant/*",
+        "https://github.com/*/khive",
+        "https://github.com//khive",
+        "https://github.com/ohdearquant/khive?all",
+    ] {
+        let parsed: KhiveConfig =
+            toml::from_str(&format!("[git_digest]\nremotes = [{broad:?}]\n")).unwrap();
+        let error = parsed
+            .validate()
+            .expect_err("an entry naming more or less than one repository is refused");
+        assert!(
+            error.to_string().contains("does not name one repository"),
+            "{broad}: {error}"
+        );
+    }
+    for exact in [
+        "https://github.com/ohdearquant/khive",
+        "https://github.com/ohdearquant/khive.git",
+        "https://github.com/ohdearquant/khive/",
+        "https://gitlab.example/group/subgroup/repo",
+    ] {
+        let parsed: KhiveConfig =
+            toml::from_str(&format!("[git_digest]\nremotes = [{exact:?}]\n")).unwrap();
+        parsed
+            .validate()
+            .unwrap_or_else(|error| panic!("{exact} names one repository: {error}"));
+    }
+}
+
+#[test]
+fn git_digest_remote_with_userinfo_is_refused_without_echoing_it() {
+    let user = "digest-reader";
+    let password = ["pw", "7Kq2", "xZ9m"].concat();
+    let refuse_without_echo = |remote: &str| {
+        let parsed: KhiveConfig =
+            toml::from_str(&format!("[git_digest]\nremotes = [{remote:?}]\n")).unwrap();
+        let error = parsed
+            .validate()
+            .expect_err("an entry carrying userinfo is refused")
+            .to_string();
+        assert!(error.contains("git_digest.remotes"), "{error}");
+        assert!(!error.contains(user), "the refusal echoes the user name");
+        assert!(
+            !error.contains(&password),
+            "the refusal echoes the password"
+        );
+        error
+    };
+    for remote in [
+        format!("https://{user}@github.com/ohdearquant/khive"),
+        format!("https://{user}:{password}@github.com/ohdearquant/khive"),
+        format!("ssh://{user}:{password}@example.com/org/a"),
+        // No scheme, a one-slash scheme, and a password holding `#` or `?`:
+        // each still carries userinfo before its host.
+        format!("{user}:{password}@github.com/ohdearquant/khive"),
+        format!("https:/{user}:{password}@github.com/ohdearquant/khive"),
+        format!("https://{user}:{password}#1@github.com/ohdearquant/khive"),
+        format!("https://{user}:{password}?1@github.com/ohdearquant/khive"),
+        format!(" https://{user}:{password}@github.com/ohdearquant/khive"),
+        "git@github.com:ohdearquant/khive".to_owned(),
+    ] {
+        let error = refuse_without_echo(&remote);
+        assert!(
+            error.contains("user name or password"),
+            "{remote:?} is refused as carrying userinfo: {error}"
+        );
+    }
+    // A password holding `/` ends the authority before the `@`, so the userinfo
+    // reading misses it; the refusal still never quotes an entry holding an `@`.
+    refuse_without_echo(&format!("https://{user}:{password}/x@github.com"));
+    // An `@` past the host belongs to the path and does not count as userinfo.
+    let parsed: KhiveConfig =
+        toml::from_str("[git_digest]\nremotes = [\"https://example.com/org/a@b\"]\n").unwrap();
+    parsed.validate().expect("an @ in the path is not userinfo");
+}
+
+#[test]
+fn code_ingest_roots_parse_closed_and_absolute() {
+    let parsed: KhiveConfig = toml::from_str("[code_ingest]\nroots = [\"/srv/code\"]\n").unwrap();
+    parsed.validate().expect("absolute roots validate");
+    assert_eq!(parsed.code_ingest.roots, vec![PathBuf::from("/srv/code")]);
+    assert!(KhiveConfig::default().code_ingest == CodeIngestSectionConfig::default());
+
+    assert!(toml::from_str::<KhiveConfig>("[code_ingest]\nimport_roots = []\n").is_err());
+
+    let relative: KhiveConfig = toml::from_str("[code_ingest]\nroots = [\"code\"]\n").unwrap();
+    let error = relative.validate().expect_err("a relative root is refused");
+    assert!(error.to_string().contains("code_ingest.roots"), "{error}");
 }

@@ -6,12 +6,18 @@ use std::collections::BTreeMap;
 
 use khive_changeset::{
     ChangeSet, CreateOp, CreateTarget, DeleteOp, DeletePreimage, EdgePatch, EdgePreimage,
-    EntityCreateFields, EntityPatch, EntityPreimage, Envelope, LinkOp, MergeOp, MergePreimage,
-    NoteCreateFields, NotePatch, NotePreimage, Op, UpdateOp, UpdatePatch, UpdatePreimage,
+    EntityCreateFields, EntityPatch, EntityPreimage, EntityRecord, Envelope, LinkOp, MergeOp,
+    MergePreimage, NoteCreateFields, NotePatch, NotePreimage, Op, UpdateOp, UpdatePatch,
+    UpdatePreimage,
 };
 use khive_types::{
     Entity, EntityKind, Header, Id128, Link, Namespace, Note, NoteStatus, Timestamp,
 };
+
+fn boxed(row: impl Into<EntityRecord>) -> Box<EntityRecord> {
+    Box::new(row.into())
+}
+use khive_types::{EntityAlias, EntityAliasOrigin};
 use proptest::prelude::*;
 
 fn entity_kind_strategy() -> impl Strategy<Value = EntityKind> {
@@ -105,6 +111,8 @@ proptest! {
                 description: None,
                 properties: BTreeMap::new(),
                 tags,
+                key: None,
+                aliases: vec![],
             }),
         });
         let cs = ChangeSet::new(envelope, vec![op]);
@@ -173,6 +181,7 @@ proptest! {
                     properties: None,
                     tags: None,
                     entity_type: None,
+                    aliases: None,
                 }),
                 UpdatePreimage::Entity(EntityPreimage {
                     name: preimage_name,
@@ -180,6 +189,7 @@ proptest! {
                     properties: None,
                     tags: None,
                     entity_type: None,
+                    aliases: None,
                 }),
             )
             .unwrap(),
@@ -250,7 +260,7 @@ proptest! {
         let op = Op::Delete(DeleteOp {
             target_id,
             hard: false,
-            preimage: DeletePreimage::Entity(Box::new(sample_entity(target_id, kind))),
+            preimage: DeletePreimage::Entity(boxed(sample_entity(target_id, kind))),
         });
         let cs = ChangeSet::new(envelope, vec![op]);
         assert_roundtrips_byte_identical(&cs);
@@ -293,8 +303,8 @@ proptest! {
             into_id,
             from_id,
             preimage: MergePreimage {
-                into: Box::new(sample_entity(into_id, kind)),
-                from: Box::new(sample_entity(from_id, kind)),
+                into: boxed(sample_entity(into_id, kind)),
+                from: boxed(sample_entity(from_id, kind)),
                 incident_edges: vec![incident],
             },
         });
@@ -318,6 +328,8 @@ proptest! {
                         description: None,
                         properties: BTreeMap::new(),
                         tags: vec![],
+                        key: None,
+                        aliases: vec![],
                     }),
                 })
             })
@@ -369,7 +381,7 @@ fn probe_rejects_delete_preimage_with_mismatched_record_id() {
     let op = Op::Delete(DeleteOp {
         target_id,
         hard: false,
-        preimage: DeletePreimage::Entity(Box::new(sample_entity(
+        preimage: DeletePreimage::Entity(boxed(sample_entity(
             wrong_preimage_id,
             EntityKind::Concept,
         ))),
@@ -424,6 +436,7 @@ fn entity_type_op(patch_type: Option<Option<String>>, preimage_type: Option<Opti
             properties: None,
             tags: None,
             entity_type: patch_type,
+            aliases: None,
         }),
         UpdatePreimage::Entity(EntityPreimage {
             name: None,
@@ -431,6 +444,7 @@ fn entity_type_op(patch_type: Option<Option<String>>, preimage_type: Option<Opti
             properties: None,
             tags: None,
             entity_type: preimage_type,
+            aliases: None,
         }),
     )
     .expect("congruent entity_type pair must construct");
@@ -478,6 +492,7 @@ fn update_entity_type_congruence_rejects_mismatched_preimage() {
                 properties: None,
                 tags: None,
                 entity_type: Some(Some("algorithm".to_string())),
+                aliases: None,
             }),
             UpdatePreimage::Entity(EntityPreimage {
                 name: None,
@@ -485,6 +500,7 @@ fn update_entity_type_congruence_rejects_mismatched_preimage() {
                 properties: None,
                 tags: None,
                 entity_type: None,
+                aliases: None,
             }),
         )
         .is_err(),
@@ -500,6 +516,7 @@ fn update_entity_type_congruence_rejects_mismatched_preimage() {
                 properties: None,
                 tags: None,
                 entity_type: None,
+                aliases: None,
             }),
             UpdatePreimage::Entity(EntityPreimage {
                 name: None,
@@ -507,6 +524,7 @@ fn update_entity_type_congruence_rejects_mismatched_preimage() {
                 properties: None,
                 tags: None,
                 entity_type: Some(Some("algorithm".to_string())),
+                aliases: None,
             }),
         )
         .is_err(),
@@ -582,4 +600,104 @@ fn edge_constructor_preserves_preimage_diagnostic_precedence() {
         edge_weight_update(Some(1.5), Some(-0.5)).unwrap_err(),
         "UpdateOp edge preimage weight must be finite and in [0.0, 1.0], got -0.5"
     );
+}
+
+fn alias_patch(aliases: Option<Vec<EntityAlias>>) -> UpdatePatch {
+    UpdatePatch::Entity(EntityPatch {
+        name: None,
+        description: None,
+        properties: None,
+        tags: None,
+        entity_type: None,
+        aliases,
+    })
+}
+
+fn alias_preimage(aliases: Option<Vec<EntityAlias>>) -> UpdatePreimage {
+    UpdatePreimage::Entity(EntityPreimage {
+        name: None,
+        description: None,
+        properties: None,
+        tags: None,
+        entity_type: None,
+        aliases,
+    })
+}
+
+fn held_alias(alias: &str, origin: EntityAliasOrigin) -> EntityAlias {
+    EntityAlias {
+        alias: alias.into(),
+        origin,
+    }
+}
+
+#[test]
+fn an_alias_set_on_one_side_only_or_naming_an_alias_twice_is_refused() {
+    let id = Id128::from_u128(1);
+    let one = vec![held_alias("a", EntityAliasOrigin::Caller)];
+    let twice = vec![
+        held_alias("a", EntityAliasOrigin::Caller),
+        held_alias("a", EntityAliasOrigin::Rename),
+    ];
+    for (patch, preimage) in [(Some(one.clone()), None), (None, Some(one.clone()))] {
+        let error = UpdateOp::new(id, alias_patch(patch), alias_preimage(preimage)).unwrap_err();
+        assert!(error.contains("`aliases`"), "{error}");
+    }
+    for (patch, preimage) in [(twice.clone(), one.clone()), (one.clone(), twice)] {
+        let error = UpdateOp::new(id, alias_patch(Some(patch)), alias_preimage(Some(preimage)))
+            .unwrap_err();
+        assert!(error.contains("\"a\" more than once"), "{error}");
+    }
+    let decoded: Result<UpdateOp, _> = serde_json::from_value(serde_json::json!({
+        "target_id": id,
+        "patch": {"target": "entity", "aliases": [
+            {"alias": "a", "origin": "caller"},
+            {"alias": "a", "origin": "merge"}
+        ]},
+        "preimage": {"target": "entity", "aliases": []}
+    }));
+    assert!(decoded.is_err(), "decoding runs the same check");
+    // An empty set clears every alias.
+    UpdateOp::new(id, alias_patch(Some(vec![])), alias_preimage(Some(one))).unwrap();
+}
+
+#[test]
+fn keyed_creates_and_records_with_aliases_roundtrip_byte_identical() {
+    let mut record = EntityRecord::new(sample_entity(Id128::from_u128(7), EntityKind::Concept));
+    record.keys = vec!["doi:10.1/x".into()];
+    record.aliases = vec![held_alias("x", EntityAliasOrigin::Rename)];
+    let cs = ChangeSet::new(
+        Envelope::new("agent:proptest", "family:test", Timestamp::from_secs(1)),
+        vec![
+            Op::Create(CreateOp {
+                id: Id128::from_u128(8),
+                namespace: Namespace::local(),
+                target: CreateTarget::Entity(EntityCreateFields {
+                    entity_kind: EntityKind::Concept,
+                    entity_type: None,
+                    name: "y".into(),
+                    description: None,
+                    properties: BTreeMap::new(),
+                    tags: vec![],
+                    key: Some("isbn:1".into()),
+                    aliases: vec!["why".into()],
+                }),
+            }),
+            Op::Delete(DeleteOp {
+                target_id: Id128::from_u128(7),
+                hard: false,
+                preimage: DeletePreimage::Entity(boxed(record)),
+            }),
+        ],
+    );
+    let text = khive_changeset::to_ndjson(&cs).expect("serialize");
+    for expected in [
+        r#""key":"isbn:1""#,
+        r#""aliases":["why"]"#,
+        r#""keys":["doi:10.1/x"]"#,
+        r#""aliases":[{"alias":"x","origin":"rename"}]"#,
+    ] {
+        assert!(text.contains(expected), "{expected} missing from {text}");
+    }
+    assert_roundtrips_byte_identical(&cs);
 }

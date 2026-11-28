@@ -4,7 +4,9 @@
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{NamespaceToken, ReferenceResolution, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    NamespaceToken, ReferenceResolution, RuntimeError, VerbRegistry, EXACT_NAME_CONFIDENCE,
+};
 
 use super::common::{deser, resolve_kind_spec, KindSpec};
 use super::params::ResolveParams;
@@ -60,6 +62,7 @@ impl KgPack {
             )
             .await?;
             let mut redirected_from = Vec::new();
+            let mut matched_alias = None;
             if matches!(&resolution, ReferenceResolution::NotFound) {
                 let id = if let Ok(id) = Uuid::parse_str(nl_ref.trim()) {
                     Some(id)
@@ -88,6 +91,17 @@ impl KgPack {
             } else if let ReferenceResolution::Resolved { id, confidence } = &resolution {
                 resolution = match followed_entity(&self.runtime, registry, token, *id).await? {
                     Some((entity, chain)) => {
+                        // ADR-221 section 2: only a stage-3 hit can come
+                        // through an alias, and it names the entity it
+                        // matched, never a redirect target.
+                        let trimmed = nl_ref.trim();
+                        if *confidence == EXACT_NAME_CONFIDENCE
+                            && chain.is_empty()
+                            && entity.name != trimmed
+                            && entity.aliases.iter().any(|held| held.alias == trimmed)
+                        {
+                            matched_alias = Some(trimmed.to_string());
+                        }
                         redirected_from = chain;
                         ReferenceResolution::Resolved {
                             id: entity.id,
@@ -98,6 +112,9 @@ impl KgPack {
                 };
             }
             let mut result = render_resolution(nl_ref, resolution);
+            if let Some(alias) = matched_alias {
+                result["matched_alias"] = json!(alias);
+            }
             if !redirected_from.is_empty() {
                 let effective_id = result["id"]
                     .as_str()

@@ -61,28 +61,61 @@ fn variable_length_return_start_only_joins_end_entity() {
 }
 
 #[test]
-fn variable_length_trailing_pattern_unsupported() {
+fn variable_length_trailing_pattern_compiles() {
     let q = parse(
         QueryLanguage::Gql,
-        "MATCH (a)-[:extends*1..3]->(b)-[:implements]->(c) RETURN b",
+        "MATCH (a {name: 'root'})-[:extends*1..3]->(b)-[:implements]->(c {name: 'attachment'}) RETURN a.name, b.name, c.name",
     )
     .unwrap();
-    let err = compile(&q, &opts()).unwrap_err();
-    assert!(
-        matches!(err, QueryError::Unsupported(_)),
-        "expected Unsupported, got {err:?}"
-    );
+    let compiled = compile(&q, &opts()).unwrap();
+    for name in ["root", "attachment"] {
+        assert!(compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, QueryValue::Text(s) if s == name)));
+    }
+    for alias in ["a_name", "b_name", "c_name"] {
+        assert!(compiled.sql.contains(&format!("AS \"{alias}\"")));
+    }
 }
 
 #[test]
-fn variable_length_mixed_chain_unsupported() {
+fn variable_length_mixed_chain_compiles() {
     let q = parse(
         QueryLanguage::Gql,
-        "MATCH (a)-[:extends]->(b)-[:implements*1..2]->(c) RETURN c",
+        "MATCH (a {name: 'prefix'})-[:extends]->(b)-[:implements*1..2]->(c {name: 'leaf'}) RETURN a.name, b.name, c.name",
     )
     .unwrap();
-    let err = compile(&q, &opts()).unwrap_err();
-    assert!(matches!(err, QueryError::Unsupported(_)), "got {err:?}");
+    let compiled = compile(&q, &opts()).unwrap();
+    for name in ["prefix", "leaf"] {
+        assert!(compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, QueryValue::Text(s) if s == name)));
+    }
+    for alias in ["a_name", "b_name", "c_name"] {
+        assert!(compiled.sql.contains(&format!("AS \"{alias}\"")));
+    }
+}
+
+#[test]
+fn explicit_bounded_sparql_mixed_paths_compile_through_shared_ast() {
+    let query = parse(
+        QueryLanguage::Sparql,
+        "SELECT ?a ?c WHERE { ?a :extends{1,2} ?b . ?b :implements ?c . }",
+    )
+    .unwrap();
+    assert_eq!(query.pattern.edges().count(), 2);
+    assert!(query.pattern.has_variable_length());
+    let result = compile(&query, &opts()).unwrap();
+    for relation in ["extends", "implements"] {
+        assert!(result
+            .params
+            .iter()
+            .any(|p| matches!(p, QueryValue::Text(s) if s == relation)));
+    }
+    assert!(result.sql.contains("AS \"a_id\""));
+    assert!(result.sql.contains("AS \"c_id\""));
 }
 
 // --- SPARQL ---

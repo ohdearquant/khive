@@ -34,6 +34,10 @@ fn proposal_cleanup_mcp_visibility_and_help() {
         return;
     }
     let home = tempfile::tempdir().unwrap();
+    // The child's environment is cleared, so it gets a private temporary
+    // directory rather than falling back to /tmp.
+    let temporary = home.path().join("tmp");
+    std::fs::create_dir(&temporary).unwrap();
     let output_path = home.path().join("child-output");
     let output = std::fs::File::create(&output_path).unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
@@ -51,6 +55,7 @@ fn proposal_cleanup_mcp_visibility_and_help() {
         .env("KHIVE_NO_DAEMON", "1")
         .env("KHIVE_TEST_HARNESS", "1")
         .env("HOME", home.path())
+        .env("TMPDIR", &temporary)
         .env("USERPROFILE", home.path())
         .env("XDG_CONFIG_HOME", home.path().join("config"))
         .env("XDG_CACHE_HOME", home.path().join("cache"))

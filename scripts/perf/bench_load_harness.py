@@ -48,6 +48,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import functools
+import inspect
 import json
 import math
 import os
@@ -59,6 +61,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 
@@ -215,32 +218,37 @@ class OpOutcome:
         self.error = error
 
 
-def _timed_call(proc, verb, args) -> OpOutcome:
+def _timed_call(proc, verb, args, request_id=None, accept=None) -> OpOutcome:
     t0 = time.perf_counter_ns()
     try:
-        bpd._call_verb(proc, verb, args)
+        result = bpd._call_verb(proc, verb, args, request_id=request_id)
         elapsed_us = (time.perf_counter_ns() - t0) // 1000
+        if accept is not None and not accept(result):
+            return OpOutcome(verb, False, elapsed_us, f"unexpected result: {json.dumps(result)[:300]}")
         return OpOutcome(verb, True, elapsed_us)
     except Exception as exc:
         elapsed_us = (time.perf_counter_ns() - t0) // 1000
         return OpOutcome(verb, False, elapsed_us, str(exc))
 
 
-def _op_recall(proc, tenant, i):
-    return _timed_call(proc, "memory.recall", {"query": random.choice(_RECALL_PHRASES), "limit": 5})
+def _op_recall(proc, tenant, i, request_id=None):
+    return _timed_call(proc, "memory.recall", {"query": random.choice(_RECALL_PHRASES), "limit": 5},
+                       request_id)
 
 
-def _op_knowledge_search(proc, tenant, i):
-    return _timed_call(proc, "knowledge.search", {"query": random.choice(_RECALL_PHRASES), "limit": 5})
+def _op_knowledge_search(proc, tenant, i, request_id=None):
+    return _timed_call(proc, "knowledge.search", {"query": random.choice(_RECALL_PHRASES), "limit": 5},
+                       request_id)
 
 
-def _op_knowledge_compose(proc, tenant, i):
+def _op_knowledge_compose(proc, tenant, i, request_id=None):
     return _timed_call(
-        proc, "knowledge.compose", {"query": random.choice(_COMPOSE_PHRASES), "max_tokens": 1500}
+        proc, "knowledge.compose", {"query": random.choice(_COMPOSE_PHRASES), "max_tokens": 1500},
+        request_id,
     )
 
 
-def _op_remember(proc, tenant, i):
+def _op_remember(proc, tenant, i, request_id=None):
     return _timed_call(
         proc,
         "memory.remember",
@@ -250,10 +258,11 @@ def _op_remember(proc, tenant, i):
             "salience": 0.3,
             "decay_factor": 0.02,
         },
+        request_id,
     )
 
 
-def _op_create_entity(proc, tenant, i):
+def _op_create_entity(proc, tenant, i, request_id=None):
     return _timed_call(
         proc,
         "create",
@@ -263,7 +272,71 @@ def _op_create_entity(proc, tenant, i):
             "name": f"loadharness-concept-tenant{tenant}-{i}-{uuid.uuid4().hex[:8]}",
             "description": "load-harness synthetic concept for concurrency probing",
         },
+        request_id,
     )
+
+
+# The writer sink reports drops only in its heartbeat (default every 5 minutes). A kept sink directory shortens it and
+# the run waits two heartbeats after the last arrival, so the drop counter covers every row the run enqueued. The
+# extra second covers the daemon's shutdown after the last heartbeat, which the heartbeat period does not bound.
+SINK_HEARTBEAT_MS = 1000
+SINK_SETTLE_S = 2 * SINK_HEARTBEAT_MS / 1000 + 1.0
+
+# The daemon reads these names in crates/khive-db/src/timeout_sink.rs; a test compares them with that file.
+ATTEMPT_LOG_ENV = "KHIVE_WRITER_ATTEMPT_LOG"
+SINK_DIR_ENV = "KHIVE_WRITER_TIMEOUT_SINK_DIR"
+SINK_HEARTBEAT_ENV = "KHIVE_WRITER_TIMEOUT_SINK_HEARTBEAT_MS"
+
+# A drain timeout is a load reading only if both the worker and the original scratch daemon are still running.
+# f7_sweep.py reads a failed run as a reading only when every error is this one.
+DRAIN_TIMEOUT_CRASH = "open-loop drain exceeded --worker-timeout"
+
+# The F7 transaction shapes (ADR-135 F7, #6743), one verb each. Every one is a write.
+BULK_INGEST_MEMBERS = 100
+
+
+def _op_audit_append(proc, tenant, i, request_id=None):
+    # One immutable row appended to a per-tenant log; no embedding.
+    return _timed_call(
+        proc, "stream.append",
+        {"stream": f"f7-audit-t{tenant}", "record": {"tenant": tenant, "i": i, "event": "load-harness audit"},
+         "embed": False},
+        request_id,
+    )
+
+
+def _op_read_receipt(proc, tenant, i, request_id=None, fixtures=None):
+    # Marks one unread inbound message of the tenant's actor, each message once.
+    try:
+        message_id = fixtures["receipts"].popleft()
+    except (TypeError, KeyError, IndexError):
+        return OpOutcome("comm.mark_read", False, 0, "read-receipt fixture pool exhausted")
+    return _timed_call(proc, "comm.mark_read", {"ids": [message_id]}, request_id,
+                       accept=lambda result: isinstance(result, dict) and result.get("marked_count") == 1)
+
+
+def _op_one_row_mutation(proc, tenant, i, request_id=None, fixtures=None):
+    # Rewrites the description of the worker's own fixture entity, so the update re-embeds one row.
+    return _timed_call(
+        proc, "update",
+        {"id": fixtures["entity_id"], "description": f"load-harness mutation i={i} {uuid.uuid4().hex[:8]}"},
+        request_id,
+    )
+
+
+def _op_comm_send(proc, tenant, i, request_id=None):
+    return _timed_call(
+        proc, "comm.send",
+        {"to": f"tenant_{tenant}_peer", "content": f"load-harness message tenant={tenant} i={i}"},
+        request_id,
+    )
+
+
+def _op_bulk_ingest(proc, tenant, i, request_id=None):
+    members = [{"op": "append", "stream": f"f7-ingest-t{tenant}", "record": {"i": i, "member": member}}
+               for member in range(BULK_INGEST_MEMBERS)]
+    return _timed_call(proc, "stream.batch", {"ops": members, "atomic": True}, request_id,
+                       accept=lambda result: isinstance(result, dict) and result.get("committed") is True)
 
 
 # weighted read-heavy op menu (recall-dominant), steady write fraction
@@ -274,24 +347,83 @@ _OP_MENU = [
     (_op_remember, 0.15),
     (_op_create_entity, 0.10),
 ]
-_OP_MENU_WEIGHTS_SUM = sum(w for _, w in _OP_MENU)
 _OP_NAMES = {
     _op_recall: "memory.recall",
     _op_knowledge_search: "knowledge.search",
     _op_knowledge_compose: "knowledge.compose",
     _op_remember: "memory.remember",
     _op_create_entity: "create",
+    _op_audit_append: "stream.append",
+    _op_read_receipt: "comm.mark_read",
+    _op_one_row_mutation: "update",
+    _op_comm_send: "comm.send",
+    _op_bulk_ingest: "stream.batch",
 }
+_F7_SHAPES = [_op_audit_append, _op_read_receipt, _op_one_row_mutation, _op_comm_send, _op_bulk_ingest]
+# --mix names: the default read-heavy menu, each F7 shape alone, and the five shapes in equal parts.
+MIXES = {
+    "read-heavy": _OP_MENU,
+    "audit-append": [(_op_audit_append, 1.0)],
+    "read-receipt": [(_op_read_receipt, 1.0)],
+    "one-row-mutation": [(_op_one_row_mutation, 1.0)],
+    "comm-send": [(_op_comm_send, 1.0)],
+    "bulk-ingest": [(_op_bulk_ingest, 1.0)],
+    "f7": [(fn, 1.0) for fn in _F7_SHAPES],
+}
+_WRITE_OPS = {"memory.remember", "create", "stream.append", "comm.mark_read", "update", "comm.send", "stream.batch"}
 
 
-def _pick_op():
-    r = random.uniform(0, _OP_MENU_WEIGHTS_SUM)
+def _pick_op(menu=_OP_MENU):
+    r = random.uniform(0, sum(w for _, w in menu))
     upto = 0.0
-    for fn, w in _OP_MENU:
+    for fn, w in menu:
         upto += w
         if r <= upto:
             return fn
-    return _OP_MENU[-1][0]
+    return menu[-1][0]
+
+
+def plan_arrivals(menu, operations, pick=_pick_op):
+    """Draw every arrival's op before the run, so fixtures can be sized to the plan."""
+    return [pick(menu) for _ in range(operations)]
+
+
+def _page_inbox_ids(proc):
+    ids, offset = [], 0
+    while True:
+        page = bpd._call_verb(proc, "comm.inbox", {"limit": 200, "offset": offset, "fields": ["id"]})
+        ids.extend(message["id"] for message in page.get("messages", []))
+        if not page.get("has_more"):
+            return ids
+        offset = page["next_offset"]
+
+
+def _prepare_fixtures(proc, tenant, idx, planned, receipt_pool):
+    """Create the rows the planned arrivals act on, before arrival zero.
+
+    `planned` counts arrivals per op over the whole run. Any worker of a tenant may serve any of them, so the
+    tenant's first worker fills the tenant's shared receipt pool with one unread message per planned receipt.
+    """
+    fixtures = {}
+    if planned.get("update"):
+        created = bpd._call_verb(proc, "create", {
+            "kind": "concept", "name": f"f7-fixture-t{tenant}-w{idx}-{uuid.uuid4().hex[:8]}",
+            "description": "load-harness one-row mutation fixture",
+        })
+        fixtures["entity_id"] = created["id"]
+    if planned.get("comm.mark_read"):
+        fixtures["receipts"] = receipt_pool
+        if idx == 0:
+            wanted = planned["comm.mark_read"]
+            for n in range(wanted):
+                bpd._call_verb(proc, "comm.send", {"to": f"tenant_{tenant}_actor", "content": f"receipt fixture {n}",
+                                                   "self_send": True})
+            ids = _page_inbox_ids(proc)
+            if len(ids) != wanted:
+                raise RuntimeError(f"read-receipt fixtures: sent {wanted} messages to tenant {tenant}, "
+                                   f"its inbox lists {len(ids)} unread")
+            receipt_pool.extend(ids)
+    return fixtures
 
 
 def _attribution_probe(proc, tenant) -> dict:
@@ -365,6 +497,7 @@ class WorkerResult:
         self.attribution: dict | None = None
         self.crashed: str | None = None
         self.stderr_path: str | None = None
+        self.fixtures: dict | None = None
 
 
 def _spawn_worker_proc(binary, tenant, base_env, log_level, stderr_path):
@@ -411,23 +544,83 @@ def _run_worker(binary, tenant, idx, base_env, log_level, tmpdir, ops_per_worker
     return result
 
 
-def _execute_arrival(worker, fn, sequence, clock):
+# An arrival's request id is (run prefix << REQUEST_ID_SEQUENCE_BITS) | sequence, so ids are unique within a run
+# and two runs with different random prefixes never share one. The server's per-attempt writer rows carry the id.
+REQUEST_ID_SEQUENCE_BITS = 20
+
+
+def new_request_id_prefix(rng=random):
+    return rng.randrange(1, 1 << 32)
+
+
+def arrival_request_id(prefix, sequence):
+    if prefix is None:
+        return None
+    if not 0 <= sequence < (1 << REQUEST_ID_SEQUENCE_BITS):
+        raise ValueError(f"arrival sequence {sequence} does not fit {REQUEST_ID_SEQUENCE_BITS} bits")
+    return (prefix << REQUEST_ID_SEQUENCE_BITS) | sequence
+
+
+def arrival_schedule(operations, rate, burst_size=0, burst_every_s=0.0):
+    """Offsets from arrival zero for every arrival, each with the burst it belongs to (None for a steady arrival).
+
+    Steady arrivals keep `rate`; every `burst_every_s` seconds `burst_size` more arrive at the same instant, ahead of
+    the steady arrival due then. The schedule ends at `operations` arrivals, so bursts shorten the run.
+    """
+    if burst_size < 0 or (burst_size and not (math.isfinite(burst_every_s) and burst_every_s > 0)):
+        raise ValueError("a burst needs a positive size and a positive interval")
+    out, steady, burst = [], 0, 1
+    while len(out) < operations:
+        due = steady / rate
+        if burst_size and burst * burst_every_s <= due:
+            out.extend([(burst * burst_every_s, burst)] * min(burst_size, operations - len(out)))
+            burst += 1
+            continue
+        out.append((due, None))
+        steady += 1
+    return out
+
+
+@functools.lru_cache(maxsize=None)
+def _takes_fixtures(fn):
+    params = inspect.signature(fn).parameters
+    return "fixtures" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _execute_arrival(worker, fn, sequence, clock, request_id=None):
     proc, result = worker
     started = clock()
+    kwargs = {"request_id": request_id}
+    # A worker holds fixtures for the whole mix; only the ops that declare the parameter are handed them.
+    if result.fixtures is not None and _takes_fixtures(fn):
+        kwargs["fixtures"] = result.fixtures
     try:
-        outcome = fn(proc, result.tenant, sequence)
+        outcome = fn(proc, result.tenant, sequence, **kwargs)
     except Exception as exc:
         outcome = OpOutcome(_OP_NAMES[fn], False, (clock() - started) * 1_000_000, repr(exc))
     return outcome, started, clock()
 
 
+def _utc_text(seconds):
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds)) + f".{int(seconds % 1 * 1000):03d}Z"
+
+
 def _drive_open_loop(workers, pool, rate, operations, drain_timeout, *,
-                     pick_op=_pick_op, clock=time.monotonic, sleep=time.sleep):
+                     pick_op=_pick_op, clock=time.monotonic, sleep=time.sleep, request_id_prefix=None,
+                     menu=_OP_MENU, wall_clock=time.time, schedule=None):
     if (not math.isfinite(rate) or rate <= 0 or operations < 0
             or not math.isfinite(drain_timeout) or drain_timeout < 0):
         raise ValueError("arrival rate must be finite and positive; operation count and drain timeout nonnegative")
+    if request_id_prefix is not None and operations > (1 << REQUEST_ID_SEQUENCE_BITS):
+        raise ValueError(f"at most {1 << REQUEST_ID_SEQUENCE_BITS} arrivals carry request ids in one run")
     started = clock()
-    offered_duration = operations / rate
+    started_wall = wall_clock()
+    if schedule is None:
+        offered_duration = operations / rate
+    else:
+        if len(schedule) != operations:
+            raise ValueError("the arrival schedule must hold one entry per operation")
+        offered_duration = schedule[-1][0] + 1 / rate if schedule else 0.0
     records = []
     pending = {}
     idle = list(range(len(workers)))
@@ -448,11 +641,14 @@ def _drive_open_loop(workers, pool, rate, operations, drain_timeout, *,
             del pending[future]
 
     for sequence in range(operations):
-        scheduled = started + sequence / rate
+        offset, burst = (sequence / rate, None) if schedule is None else schedule[sequence]
+        scheduled = started + offset
         sleep(max(0.0, scheduled - clock()))
         reap()
         fn = pick_op()
-        record = dict(sequence=sequence, op=_OP_NAMES[fn], scheduled_s=scheduled - started,
+        request_id = arrival_request_id(request_id_prefix, sequence)
+        record = dict(sequence=sequence, request_id=request_id, op=_OP_NAMES[fn], burst=burst,
+                      scheduled_s=scheduled - started,
                       offered_s=clock() - started, started_s=None, finished_s=None,
                       tenant=None, worker=None, latency_us=None, state="outstanding", error=None)
         records.append(record)
@@ -463,7 +659,7 @@ def _drive_open_loop(workers, pool, rate, operations, drain_timeout, *,
         slot = idle.pop(0)
         record.update(tenant=workers[slot][1].tenant, worker=workers[slot][1].idx)
         try:
-            future = pool.submit(_execute_arrival, workers[slot], fn, sequence, clock)
+            future = pool.submit(_execute_arrival, workers[slot], fn, sequence, clock, request_id)
             pending[future] = (slot, record)
         except Exception as exc:
             idle.append(slot)
@@ -477,29 +673,33 @@ def _drive_open_loop(workers, pool, rate, operations, drain_timeout, *,
             break
         sleep(min(0.01, drain_deadline - clock()))
     finished = clock()
+    finished_wall = wall_clock()
     observed_duration = max(offered_duration, finished - started)
     counts = {state: sum(row["state"] == state for row in records)
               for state in ("completed", "failed", "refused", "outstanding")}
     counts["submitted"] = len(records)
     by_class = {}
-    for fn, weight in _OP_MENU:
+    weights_sum = sum(w for _, w in menu)
+    for fn, weight in menu:
         op = _OP_NAMES[fn]
         rows = [row for row in records if row["op"] == op]
         by_class[op] = {
             "submitted": len(rows),
             **{state: sum(row["state"] == state for row in rows)
                for state in ("completed", "failed", "refused", "outstanding")},
-            "configured_offered_rate_per_s": rate * weight / _OP_MENU_WEIGHTS_SUM,
+            "configured_offered_rate_per_s": rate * weight / weights_sum,
             "offered_rate_per_s": len(rows) / offered_duration if offered_duration else 0.0,
             "achieved_rate_per_s": sum(row["state"] == "completed" for row in rows) / observed_duration
             if observed_duration else 0.0,
         }
     return {
         "mode": "open-loop", "configured_rate_per_s": rate,
+        "request_id_prefix": request_id_prefix, "request_id_sequence_bits": REQUEST_ID_SEQUENCE_BITS,
         "status": "drain_timeout" if counts["outstanding"] else "drained",
         "max_in_flight": len(workers), "overflow_policy": "refuse immediately; no client queue",
         "counts": counts, "classes": by_class, "records": records,
         "offered_duration_s": offered_duration, "observed_duration_s": observed_duration,
+        "window_utc": {"start": _utc_text(started_wall), "end": _utc_text(max(finished_wall, started_wall + observed_duration))},
         "measurement_stop_monotonic_s": finished,
         "drain_timeout_s": drain_timeout,
         "warmup_boundary": {
@@ -512,7 +712,8 @@ def _drive_open_loop(workers, pool, rate, operations, drain_timeout, *,
             "os_page_cache": "uncontrolled",
         },
         "write_workload": {
-            "classes": ["memory.remember", "create"],
+            "classes": [_OP_NAMES[fn] for fn, _ in menu if _OP_NAMES[fn] in _WRITE_OPS],
+            "bulk_ingest_members": BULK_INGEST_MEMBERS if any(fn is _op_bulk_ingest for fn, _ in menu) else None,
             "backpressure": "client capacity refusal; daemon errors remain failed outcomes",
             "residency_mode": "one shared warmed daemon",
             "embedding_status": "mode-selected daemon embedder; no text-only write override",
@@ -522,7 +723,8 @@ def _drive_open_loop(workers, pool, rate, operations, drain_timeout, *,
     }
 
 
-def _prepare_open_worker(binary, tenant, idx, base_env, log_level, tmpdir, proc_registry, stop):
+def _prepare_open_worker(binary, tenant, idx, base_env, log_level, tmpdir, proc_registry, stop,
+                         planned=None, receipt_pool=None):
     result = WorkerResult(tenant, idx)
     result.stderr_path = os.path.join(tmpdir, f"worker-t{tenant}-w{idx}.stderr.log")
     proc = _spawn_worker_proc(binary, tenant, base_env, log_level, result.stderr_path)
@@ -533,6 +735,8 @@ def _prepare_open_worker(binary, tenant, idx, base_env, log_level, tmpdir, proc_
         bpd._handshake(proc)
         if idx == 0:
             result.attribution = _attribution_probe(proc, tenant)
+        if planned and (planned.get("update") or planned.get("comm.mark_read")):
+            result.fixtures = _prepare_fixtures(proc, tenant, idx, planned, receipt_pool)
     except BaseException:
         with contextlib.suppress(Exception):
             proc.kill()
@@ -542,24 +746,41 @@ def _prepare_open_worker(binary, tenant, idx, base_env, log_level, tmpdir, proc_
 
 
 def _run_open_workers(binary, jobs, base_env, log_level, tmpdir, proc_registry,
-                      operations, rate, worker_timeout):
+                      operations, rate, worker_timeout, *, daemon_pid, menu=_OP_MENU, schedule=None):
+    plan = plan_arrivals(menu, operations)
+    planned = Counter(_OP_NAMES[fn] for fn in plan)
+    receipt_pools = {tenant: deque() for tenant, _ in jobs}
     pool = ThreadPoolExecutor(max_workers=len(jobs))
     stop = threading.Event()
     workers = []
     try:
         futures = [pool.submit(_prepare_open_worker, binary, tenant, idx, base_env,
-                               log_level, tmpdir, proc_registry, stop) for tenant, idx in jobs]
+                               log_level, tmpdir, proc_registry, stop, planned, receipt_pools[tenant])
+                   for tenant, idx in jobs]
         setup_deadline = time.monotonic() + worker_timeout
         for future in futures:
             workers.append(future.result(timeout=max(0.0, setup_deadline - time.monotonic())))
-        arrival = _drive_open_loop(workers, pool, rate, operations, worker_timeout)
+        arrival = _drive_open_loop(workers, pool, rate, operations, worker_timeout,
+                                   request_id_prefix=new_request_id_prefix(),
+                                   pick_op=iter(plan).__next__, menu=menu, schedule=schedule)
         if arrival["counts"]["outstanding"]:
-            # Kill pipes before joining threads so a wedged MCP read can finish.
+            # Check both processes before teardown closes the worker pipes.
+            current_daemon_pid, _ = _read_pid_file(base_env["KHIVE_PID"])
+            daemon_live = (
+                current_daemon_pid == daemon_pid and _pid_alive(daemon_pid) and _argv_is_khive_daemon(daemon_pid)
+            )
             outstanding = {(row["tenant"], row["worker"]) for row in arrival["records"]
                            if row["state"] == "outstanding"}
-            for _, result in workers:
-                if (result.tenant, result.idx) in outstanding:
-                    result.crashed = "open-loop drain exceeded --worker-timeout"
+            for proc, result in workers:
+                if (result.tenant, result.idx) not in outstanding:
+                    continue
+                code = proc.poll()
+                if code is not None:
+                    result.crashed = f"worker process exited ({code}) with arrivals outstanding"
+                elif not daemon_live:
+                    result.crashed = f"scratch daemon (pid {daemon_pid}) could not be verified alive at the drain timeout"
+                else:
+                    result.crashed = DRAIN_TIMEOUT_CRASH
         return [result for _, result in workers], arrival
     finally:
         stop.set()
@@ -579,6 +800,10 @@ def _run_open_workers(binary, jobs, base_env, log_level, tmpdir, proc_registry,
 
 
 # ── main driver ────────────────────────────────────────────────────────────────
+
+
+def format_worker_error(tenant, worker, detail):
+    return f"tenant={tenant} worker={worker}: {detail}"
 
 
 def _resolve_binary(mode: str) -> str:
@@ -627,6 +852,17 @@ def main() -> int:
     ap.add_argument("--worker-timeout", type=float, default=120.0)
     ap.add_argument("--arrival-rate", type=float, default=None,
                     help="open-loop total operations/second; refuses arrivals when all worker connections are busy")
+    ap.add_argument("--mix", choices=sorted(MIXES), default="read-heavy",
+                    help="named op mix; every mix but read-heavy needs --arrival-rate (fixtures are sized to the "
+                         "open-loop plan)")
+    ap.add_argument("--burst-size", type=int, default=0,
+                    help="open loop: this many extra arrivals at the same instant every --burst-every seconds")
+    ap.add_argument("--burst-every", type=float, default=0.0)
+    ap.add_argument("--sink-dir", default=None,
+                    help="directory for the daemon's writer sink files (KHIVE_WRITER_TIMEOUT_SINK_DIR); kept after the run")
+    ap.add_argument("--writer-attempt-log", action="store_true",
+                    help="set KHIVE_WRITER_ATTEMPT_LOG=1 on the daemon: one writer_attempt row per writer attempt; needs "
+                         "--sink-dir. Without it the variable is removed from the spawned environment")
     ap.add_argument("--log-level", default="warn")
     ap.add_argument(
         "--packs",
@@ -648,6 +884,13 @@ def main() -> int:
         or not math.isfinite(args.worker_timeout) or args.worker_timeout <= 0
     ):
         ap.error("open-loop rate, workers, tenants and timeout must be finite/positive; ops-per-worker nonnegative")
+    if args.burst_size and (args.arrival_rate is None or args.burst_size < 0
+                            or not math.isfinite(args.burst_every) or args.burst_every <= 0):
+        ap.error("--burst-size needs --arrival-rate and a positive --burst-every")
+    if args.writer_attempt_log and not args.sink_dir:
+        ap.error("--writer-attempt-log needs --sink-dir, so the attempt rows land where the report reads them")
+    if args.mix != "read-heavy" and args.arrival_rate is None:
+        ap.error(f"--mix {args.mix} needs --arrival-rate: its fixtures are sized to the open-loop arrival plan")
 
     if args.workers % args.tenants != 0:
         print(
@@ -696,6 +939,13 @@ def main() -> int:
     base_env["KHIVE_WRITE_QUEUE"] = "1"
     base_env["KHIVE_CONFIG"] = scratch_config_path
     base_env.pop("KHIVE_NO_DAEMON", None)
+    base_env.pop(ATTEMPT_LOG_ENV, None)
+    if args.sink_dir:
+        pathlib.Path(args.sink_dir).mkdir(parents=True, exist_ok=True)
+        base_env[SINK_DIR_ENV] = str(pathlib.Path(args.sink_dir).resolve())
+        base_env[SINK_HEARTBEAT_ENV] = str(SINK_HEARTBEAT_MS)
+    if args.writer_attempt_log:
+        base_env[ATTEMPT_LOG_ENV] = "1"
 
     report: dict = {
         "meta": {
@@ -743,6 +993,10 @@ def main() -> int:
             time.sleep(0.1)
         bpd.assert_daemon_engaged(sock_path, pid_path_file, db_path, label="loadharness-bootstrap")
         mbc.require_all_audit_success_rows(bootstrap_proc)
+        if args.arrival_rate is not None:
+            daemon_pid, _ = _read_pid_file(pid_path_file)
+            if daemon_pid is None or daemon_pid <= 0:
+                raise RuntimeError("scratch daemon PID unavailable after bootstrap")
         print("[ok] bootstrap daemon engagement confirmed", flush=True)
 
         try:
@@ -775,7 +1029,21 @@ def main() -> int:
             worker_results, report["arrival"] = _run_open_workers(
                 binary, jobs, base_env, args.log_level, tmpdir, worker_procs,
                 args.workers * args.ops_per_worker, args.arrival_rate, args.worker_timeout,
+                daemon_pid=daemon_pid,
+                menu=MIXES[args.mix],
+                schedule=arrival_schedule(args.workers * args.ops_per_worker, args.arrival_rate,
+                                          args.burst_size, args.burst_every) if args.burst_size else None,
             )
+            if args.burst_size:
+                report["arrival"]["burst"] = {"size": args.burst_size, "every_s": args.burst_every}
+            report["arrival"]["mix"] = args.mix
+            report["arrival"]["writer_attempt_log"] = args.writer_attempt_log
+            report["arrival"]["sink_dir"] = base_env.get(SINK_DIR_ENV)
+            if args.sink_dir:
+                time.sleep(SINK_SETTLE_S)
+                report["arrival"]["sink_heartbeat_ms"] = SINK_HEARTBEAT_MS
+                report["arrival"]["sink_settle_s"] = SINK_SETTLE_S
+                report["arrival"]["sink_settled_at"] = _utc_text(time.time())
         else:
             with ThreadPoolExecutor(max_workers=args.workers) as pool:
                 futures = {
@@ -817,7 +1085,7 @@ def main() -> int:
 
         # ── aggregate ──
         crashed = [r for r in worker_results if r.crashed]
-        report["smoke_errors"] = [f"tenant={r.tenant} worker={r.idx}: {r.crashed}" for r in crashed]
+        report["smoke_errors"] = [format_worker_error(r.tenant, r.idx, r.crashed) for r in crashed]
 
         all_outcomes: list[OpOutcome] = []
         for r in worker_results:

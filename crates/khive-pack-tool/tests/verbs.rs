@@ -38,6 +38,248 @@ impl Fixture {
     }
 }
 
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn tool_policy_matches_registry_name_folding() {
+    for (stored_name, policy_name) in [("fold-shell", "FOLD-SHELL"), ("FOLD-SHELL", "fold-shell")] {
+        let f = fixture();
+        let registered = f
+            .call(
+                "tool.register",
+                json!({"name":stored_name,"side_effect":"read"}),
+            )
+            .await;
+        let id = s(&registered["tool"], "full_id");
+        let policy = f
+            .call(
+                "tool.policy",
+                json!({"actor":"agent:fold","tool":policy_name,"decision":"deny"}),
+            )
+            .await;
+        for reference in [stored_name, policy_name, id.as_str()] {
+            let checked = f
+                .call("tool.check", json!({"actor":"agent:fold","tool":reference}))
+                .await;
+            assert_eq!(checked["registered"], true);
+            assert_eq!(checked["tool"], stored_name);
+            assert_eq!(checked["decision"], "deny");
+            assert_eq!(checked["source"], "policy");
+            assert_eq!(checked["policy_id"], policy["policy"]["id"]);
+        }
+        let different_actor = f
+            .call(
+                "tool.check",
+                json!({"actor":"Agent:fold","tool":stored_name}),
+            )
+            .await;
+        assert_eq!(different_actor["source"], "default");
+        assert_eq!(different_actor["decision"], "allow");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn tool_prefix_policy_matches_registry_name_folding() {
+    let f = fixture();
+    for name in ["Exec.Shell", "Exec.Other"] {
+        f.call("tool.register", json!({"name":name,"side_effect":"read"}))
+            .await;
+    }
+    let policy = f
+        .call(
+            "tool.policy",
+            json!({"actor":"agent:prefix","tool":"eXeC.sh*","decision":"deny"}),
+        )
+        .await;
+    let checked = f
+        .call(
+            "tool.check",
+            json!({"actor":"agent:prefix","tool":"EXEC.SHELL"}),
+        )
+        .await;
+    assert_eq!(checked["decision"], "deny");
+    assert_eq!(checked["source"], "policy");
+    assert_eq!(checked["policy_id"], policy["policy"]["id"]);
+    for (actor, name) in [
+        ("agent:prefix", "Exec.Other"),
+        ("Agent:prefix", "Exec.Shell"),
+    ] {
+        let checked = f
+            .call("tool.check", json!({"actor":actor,"tool":name}))
+            .await;
+        assert_eq!(checked["source"], "default");
+        assert_eq!(checked["decision"], "allow");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn tool_policy_name_folding_keeps_decision_order() {
+    for reverse in [false, true] {
+        let f = fixture();
+        f.call(
+            "tool.register",
+            json!({"name":"fOlDsHeLl","side_effect":"read"}),
+        )
+        .await;
+        let mut definitions = [
+            ("FoldShell", "allow"),
+            ("foldshell", "ask"),
+            ("FOLDSHELL", "deny"),
+        ];
+        if reverse {
+            definitions.reverse();
+        }
+        let mut rows = std::collections::BTreeMap::new();
+        for (name, decision) in definitions {
+            let row = f
+                .call(
+                    "tool.policy",
+                    json!({"actor":"agent:tie","tool":name,"decision":decision,"note":"original"}),
+                )
+                .await["policy"]
+                .clone();
+            rows.insert(decision, row);
+        }
+        let ids: std::collections::BTreeSet<_> = rows.values().map(|row| s(row, "id")).collect();
+        assert_eq!(
+            ids.len(),
+            3,
+            "case-distinct policy rows retain their identities"
+        );
+        let checked = f
+            .call(
+                "tool.check",
+                json!({"actor":"agent:tie","tool":"fOlDsHeLl"}),
+            )
+            .await;
+        assert_eq!(checked["decision"], "deny");
+        assert_eq!(checked["policy_id"], rows["deny"]["id"]);
+
+        let corrected = f
+            .call(
+                "tool.policy",
+                json!({"actor":"agent:tie","tool":"FoldShell","decision":"allow","note":"revised"}),
+            )
+            .await["policy"]
+            .clone();
+        assert_eq!(corrected["id"], rows["allow"]["id"]);
+        assert_eq!(corrected["created_at"], rows["allow"]["created_at"]);
+        assert_eq!(corrected["history"].as_array().unwrap().len(), 1);
+        assert_eq!(corrected["history"][0]["decision"], "allow");
+        assert_eq!(corrected["history"][0]["note"], "original");
+        let policies = f
+            .call("tool.policies", json!({"actor":"agent:tie","limit":10}))
+            .await;
+        let policies = policies["policies"].as_array().unwrap();
+        assert_eq!(policies.len(), 3);
+        assert!(policies.iter().any(|row| row == &rows["deny"]));
+        assert!(policies.iter().any(|row| row == &rows["ask"]));
+
+        for (removed, expected) in [("deny", "ask"), ("ask", "allow")] {
+            f.call(
+                "tool.policy_delete",
+                json!({"actor":"agent:tie","tool":rows[removed]["tool"]}),
+            )
+            .await;
+            let checked = f
+                .call(
+                    "tool.check",
+                    json!({"actor":"agent:tie","tool":"fOlDsHeLl"}),
+                )
+                .await;
+            assert_eq!(checked["source"], "policy");
+            assert_eq!(checked["decision"], expected);
+            assert_eq!(checked["policy_id"], rows[expected]["id"]);
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn tool_name_folding_preserves_nul_suffixes() {
+    let f = fixture();
+    let mut ids = std::collections::BTreeSet::new();
+    for name in ["Exec\0Shell", "Exec\0Other", "Exec", "éTool"] {
+        let registered = f
+            .call("tool.register", json!({"name":name,"side_effect":"read"}))
+            .await;
+        ids.insert(s(&registered["tool"], "full_id"));
+    }
+    assert_eq!(ids.len(), 4);
+    for (actor, pattern) in [
+        ("agent:exact", "eXEC\0sHELL"),
+        ("agent:prefix", "eXEC\0sH*"),
+    ] {
+        let policy = f
+            .call(
+                "tool.policy",
+                json!({"actor":actor,"tool":pattern,"decision":"deny"}),
+            )
+            .await;
+        let checked = f
+            .call("tool.check", json!({"actor":actor,"tool":"exec\0shell"}))
+            .await;
+        assert_eq!(checked["tool"], "Exec\0Shell");
+        assert_eq!(checked["source"], "policy");
+        assert_eq!(checked["decision"], "deny");
+        assert_eq!(checked["policy_id"], policy["policy"]["id"]);
+        for name in ["Exec\0Other", "Exec"] {
+            let checked = f
+                .call("tool.check", json!({"actor":actor,"tool":name}))
+                .await;
+            assert_eq!(checked["source"], "default");
+            assert_eq!(checked["decision"], "allow");
+        }
+    }
+    f.call(
+        "tool.policy",
+        json!({"actor":"agent:unicode","tool":"Étool","decision":"deny"}),
+    )
+    .await;
+    let checked = f
+        .call(
+            "tool.check",
+            json!({"actor":"agent:unicode","tool":"éTool"}),
+        )
+        .await;
+    assert_eq!(checked["source"], "default");
+    assert_eq!(checked["decision"], "allow");
+}
+
+#[tokio::test]
+async fn tool_check_accepts_long_mcp_plugin_identifier_suffix() {
+    let f = fixture();
+    let tool = "mcp__plugin_sk_live_sk_live__get_tool_name";
+    let checked = f
+        .call("tool.check", json!({"actor":"agent:plugin","tool":tool}))
+        .await;
+    assert_eq!(checked["tool"], tool);
+    assert_eq!(checked["registered"], false);
+}
+
+#[tokio::test]
+async fn tool_check_accepts_short_mcp_plugin_identifier_control() {
+    let f = fixture();
+    let tool = "mcp__plugin_sk_live_sk_live__x";
+    let checked = f
+        .call("tool.check", json!({"actor":"agent:plugin","tool":tool}))
+        .await;
+    assert_eq!(checked["tool"], tool);
+    assert_eq!(checked["registered"], false);
+}
+
+#[tokio::test]
+async fn tool_check_still_screens_credentials_in_mcp_plugin_name_component() {
+    let f = fixture();
+    let payload = "A".repeat(22);
+    let tool = format!("mcp__plugin_namespace_namespace__sk_live_{payload}");
+    let error = f
+        .call_err("tool.check", json!({"actor":"agent:plugin","tool":tool}))
+        .await;
+    assert!(error.contains("tool.check.tool"), "{error}");
+}
+
 fn s(v: &Value, key: &str) -> String {
     v.get(key)
         .and_then(Value::as_str)
@@ -95,6 +337,170 @@ async fn wide_list_limit_clamps_before_narrowing() {
         .call("tool.list", json!({"limit": 4_294_967_296_u64}))
         .await;
     assert_eq!(listed["count"], json!(3), "{listed}");
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn tool_list_cursor_walk_survives_unregistering_an_earlier_row() {
+    let f = fixture();
+    for name in ["t000", "t001", "t002"] {
+        f.call("tool.register", json!({"name": name})).await;
+    }
+
+    let first = f
+        .call("tool.list", json!({"kind":"tool", "limit":2, "after":""}))
+        .await;
+    assert_eq!(first["count"], json!(2), "{first}");
+    assert_eq!(first["tools"][0]["name"], json!("t000"), "{first}");
+    assert_eq!(first["tools"][1]["name"], json!("t001"), "{first}");
+    let after = first["next_after"]
+        .as_str()
+        .expect("first page has a continuation cursor")
+        .to_owned();
+
+    f.call("tool.unregister", json!({"tool":"t000"})).await;
+
+    let second = f
+        .call(
+            "tool.list",
+            json!({"kind":"tool", "limit":2, "after":after}),
+        )
+        .await;
+    assert_eq!(second["count"], json!(1), "{second}");
+    assert_eq!(second["tools"][0]["name"], json!("t002"), "{second}");
+    assert!(second["next_after"].is_null(), "{second}");
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn tool_list_filters_by_source_and_reports_decisions() {
+    let f = fixture();
+    for (name, source) in [
+        ("src_alpha", "mcp:alpha"),
+        ("src_alphabet", "mcp:alphabet"),
+        ("src_beta", "mcp:beta"),
+        ("src_skill", "skills:local"),
+    ] {
+        f.call(
+            "tool.register",
+            json!({"name": name, "source": source, "side_effect": "read"}),
+        )
+        .await;
+    }
+    f.call(
+        "tool.register",
+        json!({"name": "src_none", "side_effect": "read"}),
+    )
+    .await;
+    f.call(
+        "tool.policy",
+        json!({"actor":"agent:lister","tool":"src_beta","decision":"deny"}),
+    )
+    .await;
+    let names = |listed: &Value| -> Vec<String> {
+        let mut names: Vec<String> = listed["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|row| row["name"].as_str().expect("row name").to_owned())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let exact = f.call("tool.list", json!({"source":"mcp:alpha"})).await;
+    assert_eq!(names(&exact), ["src_alpha"], "{exact}");
+    assert!(exact["tools"][0].get("decision").is_none(), "{exact}");
+    assert!(exact.get("actor").is_none(), "{exact}");
+
+    let prefixed = f
+        .call(
+            "tool.list",
+            json!({"source_prefix":"mcp:", "include_decision":true, "actor":"agent:lister"}),
+        )
+        .await;
+    assert_eq!(
+        names(&prefixed),
+        ["src_alpha", "src_alphabet", "src_beta"],
+        "{prefixed}"
+    );
+    assert_eq!(prefixed["actor"], "agent:lister", "{prefixed}");
+    for row in prefixed["tools"].as_array().expect("tools array") {
+        let expected = if row["name"] == "src_beta" {
+            "deny"
+        } else {
+            "allow"
+        };
+        assert_eq!(row["decision"]["decision"], expected, "{row}");
+    }
+
+    let other_case = f.call("tool.list", json!({"source_prefix":"MCP:"})).await;
+    assert_eq!(other_case["count"], json!(0), "{other_case}");
+
+    let first = f
+        .call(
+            "tool.list",
+            json!({"source_prefix":"mcp:", "limit":2, "after":""}),
+        )
+        .await;
+    assert_eq!(names(&first), ["src_alpha", "src_alphabet"], "{first}");
+    let after = first["next_after"]
+        .as_str()
+        .expect("first filtered page has a continuation cursor")
+        .to_owned();
+    let second = f
+        .call(
+            "tool.list",
+            json!({"source_prefix":"mcp:", "limit":2, "after":after}),
+        )
+        .await;
+    assert_eq!(names(&second), ["src_beta"], "{second}");
+    assert!(second["next_after"].is_null(), "{second}");
+
+    let both = f
+        .call_err(
+            "tool.list",
+            json!({"source":"mcp:alpha", "source_prefix":"mcp:"}),
+        )
+        .await;
+    assert!(both.contains("not both"), "{both}");
+    let stray_actor = f
+        .call_err("tool.list", json!({"actor":"agent:lister"}))
+        .await;
+    assert!(stray_actor.contains("include_decision"), "{stray_actor}");
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn tool_list_offset_pagination_remains_supported() {
+    let f = fixture();
+    for name in ["t000", "t001", "t002"] {
+        f.call("tool.register", json!({"name": name})).await;
+    }
+
+    let first = f
+        .call("tool.list", json!({"kind":"tool", "limit":2, "offset":0}))
+        .await;
+    let second = f
+        .call("tool.list", json!({"kind":"tool", "limit":2, "offset":2}))
+        .await;
+    assert_eq!(first["count"], json!(2), "{first}");
+    assert_eq!(first["offset"], json!(0), "{first}");
+    assert_eq!(second["count"], json!(1), "{second}");
+    assert_eq!(second["offset"], json!(2), "{second}");
+
+    let mut names: Vec<String> = first["tools"]
+        .as_array()
+        .expect("first page tools")
+        .iter()
+        .chain(second["tools"].as_array().expect("second page tools"))
+        .map(|row| row["name"].as_str().expect("tool name").to_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["t000".to_owned(), "t001".to_owned(), "t002".to_owned()]
+    );
 }
 
 // Arm 2: capabilities are created once and linked with implements edges.

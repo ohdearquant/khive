@@ -51,10 +51,17 @@ fn budget_refusals_survive_daemon_and_rmcp() {
 
     // A short private path also fits Unix socket limits on macOS. Only the
     // child receives HOME and daemon-path overrides; the parent is untouched.
+    // Where /tmp is closed, as in a sandboxed run, the process's own
+    // temporary directory takes its place.
     let dir = tempfile::Builder::new()
         .prefix("kh-ep-")
         .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("kh-ep-").tempdir())
         .unwrap();
+    // The child's environment is cleared, so it is handed a temporary directory of
+    // its own; without one it falls back to /tmp, which a sandboxed run closes.
+    let temporary = dir.path().join("tmp");
+    std::fs::create_dir(&temporary).unwrap();
     let output_path = dir.path().join("child-output.txt");
     let output = std::fs::File::create(&output_path).unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
@@ -78,6 +85,7 @@ fn budget_refusals_survive_daemon_and_rmcp() {
         .env("XDG_CACHE_HOME", dir.path().join("cache"))
         .env("APPDATA", dir.path().join("config"))
         .env("LOCALAPPDATA", dir.path().join("cache"))
+        .env("TMPDIR", &temporary)
         .env("KHIVE_SOCKET", dir.path().join("s"))
         .env("KHIVE_PID", dir.path().join("p"))
         .env("KHIVE_LOCK", dir.path().join("l"))

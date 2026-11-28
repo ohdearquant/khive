@@ -132,6 +132,7 @@ async fn submit_delta(args: &ApplyArgs, delta: &str) -> Result<String> {
         namespace: config.default_namespace.as_str().to_owned(),
         actor_id: config.actor_id.clone(),
         process_ref: khive_runtime::process_ref_from_env(),
+        client_cwd: khive_runtime::client_cwd_from_process(),
         visible_namespaces: config
             .visible_namespaces
             .iter()
