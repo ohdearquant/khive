@@ -14,17 +14,39 @@ pub enum QueryValue {
     Blob(Vec<u8>),
 }
 
-/// A parsed query: pattern, predicates, projections, row offset, and optional row limit.
+/// A parsed query: pattern, predicates, projections, ordering, offset, and optional limit.
 #[derive(Debug, Clone)]
 pub struct GqlQuery {
+    /// Required first path; single-path queries leave `additional_patterns` empty.
     pub pattern: MatchPattern,
+    /// Connected canonical paths following commas in GQL's MATCH clause.
+    pub additional_patterns: Vec<MatchPattern>,
     pub where_clause: WhereExpr,
     pub return_items: Vec<ReturnItem>,
+    /// Deduplicate requested result values after grouping and before pagination.
+    pub distinct: bool,
+    /// Caller ordering followed by the compiler's deterministic tie order.
+    ///
+    /// An empty vector uses identity/traversal order for ordinary queries,
+    /// and returned-value order for distinct or grouped queries.
+    pub order_by: Vec<OrderItem>,
     /// Number of deterministically ordered matches to skip before returning rows.
     ///
     /// GQL supplies this through `SKIP`; SPARQL currently always sets it to zero.
     pub offset: usize,
     pub limit: Option<usize>,
+}
+
+impl GqlQuery {
+    /// Iterate every MATCH path in textual order, including the required first path.
+    pub fn patterns(&self) -> impl Iterator<Item = &MatchPattern> {
+        std::iter::once(&self.pattern).chain(self.additional_patterns.iter())
+    }
+
+    /// Mutably iterate every MATCH path in textual order.
+    pub fn patterns_mut(&mut self) -> impl Iterator<Item = &mut MatchPattern> {
+        std::iter::once(&mut self.pattern).chain(self.additional_patterns.iter_mut())
+    }
 }
 
 /// A WHERE expression tree that preserves AND/OR grouping.
@@ -36,12 +58,15 @@ pub enum WhereExpr {
     Or(Box<WhereExpr>, Box<WhereExpr>),
     /// A single scalar condition.
     Condition(Condition),
+    /// Absence of one fixed canonical path correlated to outer node bindings.
+    /// Additional names are local to this block, not outer scalar conditions.
+    NotExists(MatchPattern),
     /// Always-true — used when there is no WHERE clause.
     True,
 }
 
 impl WhereExpr {
-    /// Iterate all leaf conditions in the expression tree (depth-first).
+    /// Iterate outer scalar conditions depth-first, skipping scoped absence paths.
     pub fn conditions(&self) -> impl Iterator<Item = &Condition> {
         let mut stack = vec![self];
         let mut out: Vec<&Condition> = Vec::new();
@@ -52,13 +77,13 @@ impl WhereExpr {
                     stack.push(r);
                     stack.push(l);
                 }
-                WhereExpr::True => {}
+                WhereExpr::True | WhereExpr::NotExists(_) => {}
             }
         }
         out.into_iter()
     }
 
-    /// Mutable walk — applies `f` to every leaf condition.
+    /// Apply `f` to each outer scalar condition, skipping scoped absence paths.
     pub fn for_each_condition_mut(&mut self, f: &mut impl FnMut(&mut Condition)) {
         match self {
             WhereExpr::Condition(c) => f(c),
@@ -66,28 +91,32 @@ impl WhereExpr {
                 l.for_each_condition_mut(f);
                 r.for_each_condition_mut(f);
             }
-            WhereExpr::True => {}
+            WhereExpr::True | WhereExpr::NotExists(_) => {}
         }
     }
 
-    /// Return `true` when the expression has no conditions (is always-true).
+    /// Return `true` only for the explicit always-true expression.
     pub fn is_true(&self) -> bool {
         matches!(self, WhereExpr::True)
     }
 }
 
-/// A single item in the RETURN clause — either a bound variable or a property projection.
+/// A bound variable, property, typed JSON path, or binding count in RETURN.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReturnItem {
     Variable(String),
     Property(String, String),
+    /// A named path below node properties or canonical edge metadata.
+    Path(String, PropertyRef),
+    /// Count matched rows for a binding; a null zero-hop edge contributes zero.
+    Count(String),
 }
 
 impl ReturnItem {
     /// Returns the variable name bound to this return item.
     pub fn variable(&self) -> &str {
         match self {
-            Self::Variable(v) | Self::Property(v, _) => v,
+            Self::Variable(v) | Self::Property(v, _) | Self::Path(v, _) | Self::Count(v) => v,
         }
     }
 }
@@ -115,9 +144,9 @@ impl MatchPattern {
         })
     }
 
-    /// Returns whether any edge permits more than one hop.
+    /// Returns whether any edge needs traversal rather than exactly one fixed hop.
     pub fn has_variable_length(&self) -> bool {
-        self.edges().any(|e| e.max_hops > 1)
+        self.edges().any(|e| e.min_hops != 1 || e.max_hops != 1)
     }
 }
 
@@ -159,13 +188,35 @@ pub enum EdgeDirection {
     Both,
 }
 
-/// A field or JSON-property path referenced by a WHERE condition.
+/// A field or JSON path referenced by a WHERE condition or ORDER BY term.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PropertyRef {
     /// A dedicated field on the bound substrate, such as `name` or `created_at`.
     Field(String),
     /// A path below the bound record's JSON `properties` object.
     JsonPath(Vec<String>),
+    /// A path below a canonical edge's JSON `metadata` object.
+    MetadataPath(Vec<String>),
+}
+
+/// One validated field or JSON path in GQL's `ORDER BY` clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderItem {
+    /// Binding whose value supplies this ordering term.
+    pub variable: String,
+    /// Dedicated scalar field or nonempty explicit JSON path.
+    pub property: PropertyRef,
+    /// Ascending or descending SQLite value order, without coercion.
+    pub direction: OrderDirection,
+}
+
+/// Direction of a caller-supplied ordering term.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderDirection {
+    /// Ascending order, with null values first.
+    Asc,
+    /// Descending order, with null values last.
+    Desc,
 }
 
 /// A predicate in the WHERE clause: `variable.field op value` or

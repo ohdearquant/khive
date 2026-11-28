@@ -140,6 +140,7 @@ async fn apply_worker_applies_add_edge_changeset() {
         target: Id128::from_u128(e2.id.as_u128()),
         relation: khive_types::EdgeRelation::Extends,
         weight: Some(1.0),
+        metadata: None,
     };
 
     seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;

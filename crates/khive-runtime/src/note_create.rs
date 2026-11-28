@@ -94,6 +94,9 @@ pub(crate) async fn prepare_note_create_classified(
     annotates: &[Uuid],
     publication: KeyPublication,
 ) -> Result<(PreparedAtomicNotes, Vec<Uuid>), NoteCreatePrepareError> {
+    if let Some(key) = options.key {
+        crate::secret_gate::check_at(key, "note", "key")?;
+    }
     for target in annotates {
         if !runtime.substrate_exists_by_id(spec.token, *target).await? {
             return Err(NoteCreatePrepareError::MissingAnnotation(*target));
@@ -168,3 +171,7 @@ pub(crate) async fn prepare_note_create_classified(
     }
     Ok((prepared, annotation_ids))
 }
+
+#[cfg(test)]
+#[path = "note_create_tests.rs"]
+mod tests;

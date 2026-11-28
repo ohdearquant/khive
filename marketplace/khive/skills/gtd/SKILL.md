@@ -39,6 +39,15 @@ request(ops="[
 request(ops="gtd.tasks(status=\"inbox\", assignee=\"agent:docs\", limit=25)")
 ```
 
+Read each page as either a bare array or an object's `tasks` array.
+`has_more: true` means repeat the same filters with `offset` increased by
+the number of returned tasks. Collect all pages before changing statuses;
+otherwise removing items from the filtered queue can shift later offsets.
+Separate calls are not one snapshot, so concurrent changes can still move
+page boundaries. A clamp or excluded-status object without `has_more`
+is exhausted. A short-page loop must accept both shapes and compare against
+the effective limit (1–200), not the requested limit.
+
 For each inbox item, decide: `next` (committed, actionable), `active` (starting now),
 `waiting` (blocked, name the blocker), `someday` (no commitment), `done` (already complete),
 or `cancelled`. Batch the decisions once you have read the whole list:
@@ -75,6 +84,10 @@ request(ops="[
 ]")
 ```
 
+`gtd.next` is a bounded selection: it truncates at its effective limit
+without `has_more`. A full result does not establish the queue's depth.
+Follow `gtd.tasks` continuation when reviewing an entire status list.
+
 ### 4. Advance: transition as reality changes
 
 Promote to active when you start real work:
@@ -109,8 +122,9 @@ audit append must be reconciled.
 
 ### 6. Weekly planning pass
 
-Snapshot all lists in one batch (active/next/waiting/someday), then make decisions in a
-second pass. For active: park or finish anything that has not moved in days. For next: keep
+Read the first pages in one batch (active/next/waiting/someday), then follow
+each list's continuation before making decisions in a second pass. These
+reads are not a shared snapshot. For active: park or finish anything that has not moved in days. For next: keep
 only what you will touch this week, defer the rest to someday. For someday: promote real
 commitments, cancel what you would not pull forward. End by checking that `gtd.next` is small
 enough to scan and concrete enough to act on.

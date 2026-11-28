@@ -18,6 +18,10 @@ const PR_MERGE: &str = include_str!("fixtures/pr_merge.charter");
 
 const PR: &str = "acme/widgets#7";
 
+mod refused_values_tests {
+    include!("workflows_tests/refused_values.rs");
+}
+
 struct Fixture {
     runtime: KhiveRuntime,
     registry: VerbRegistry,
@@ -844,12 +848,9 @@ async fn observations_and_starts_are_checked_against_the_registry() {
                 "charter.observe",
                 base("pull_request.opened"),
                 Some(khive_runtime::RequestIdentity {
-                    owned_namespaces: Vec::new(),
                     namespace: "local".to_owned(),
                     actor_id: Some(actor.to_owned()),
-                    visible_namespaces: vec![],
-                    process_ref: None,
-                    request_id: None,
+                    ..Default::default()
                 }),
             )
             .await
@@ -2456,12 +2457,9 @@ async fn charter_waiting_only_returns_phases_owed_to_the_caller() {
     f.publish_review_set().await;
     f.start_review().await;
     let identity = khive_runtime::RequestIdentity {
-        owned_namespaces: Vec::new(),
         namespace: "local".to_owned(),
         actor_id: Some("actor-5".to_owned()),
-        visible_namespaces: vec![],
-        process_ref: None,
-        request_id: None,
+        ..Default::default()
     };
 
     let unfiltered = f
@@ -2543,12 +2541,10 @@ async fn charter_start_rejects_a_subject_owned_by_an_unseen_namespace() {
     )
     .await;
     let identity = khive_runtime::RequestIdentity {
-        owned_namespaces: Vec::new(),
         namespace: "team_a".to_owned(),
         actor_id: Some("actor-1".to_owned()),
         visible_namespaces: vec![],
-        process_ref: None,
-        request_id: None,
+        ..Default::default()
     };
 
     let result = f
@@ -2583,12 +2579,10 @@ async fn charter_observe_rejects_a_subject_outside_visible_namespaces() {
         .await;
     let run_id = started["run_id"].as_str().unwrap().to_owned();
     let identity = khive_runtime::RequestIdentity {
-        owned_namespaces: Vec::new(),
         namespace: "team_a".to_owned(),
         actor_id: Some("actor-1".to_owned()),
         visible_namespaces: vec![],
-        process_ref: None,
-        request_id: None,
+        ..Default::default()
     };
 
     let result = f
@@ -2642,12 +2636,9 @@ async fn every_run_view_reports_recording_only_assurance() {
 async fn charter_request_id_reuse_in_another_namespace_is_a_conflict() {
     let f = Fixture::new();
     let identity = |namespace: &str| khive_runtime::RequestIdentity {
-        owned_namespaces: Vec::new(),
         namespace: namespace.to_owned(),
         actor_id: Some("actor-1".to_owned()),
-        visible_namespaces: vec![],
-        process_ref: None,
-        request_id: None,
+        ..Default::default()
     };
     let first = f
         .registry
@@ -2678,12 +2669,9 @@ async fn waiting_as(f: &Fixture, actor: &str, params: Value) -> Value {
             "charter.waiting",
             params,
             Some(khive_runtime::RequestIdentity {
-                owned_namespaces: Vec::new(),
                 namespace: "local".to_owned(),
                 actor_id: Some(actor.to_owned()),
-                visible_namespaces: vec![],
-                process_ref: None,
-                request_id: None,
+                ..Default::default()
             }),
         )
         .await

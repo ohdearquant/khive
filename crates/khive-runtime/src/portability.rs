@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use khive_storage::entity::EntityAlias;
 use khive_storage::types::{EdgeFilter, LinkId, PageRequest};
 use khive_storage::{EdgeRelation, EntityFilter};
 use khive_types::{EntityKind, ImportKindPolicy};
@@ -23,6 +24,8 @@ pub use conflicts::{
     ImportConflictMode, ImportConflictSummary, ImportOptions, ImportPolicySkipCause,
     ImportPolicySkippedEdge,
 };
+mod names;
+pub use names::{import_key_conflict, validate_archive_key_uniqueness, validate_entity_names};
 
 /// Parse an optional archive timestamp, using `fallback` only when absent.
 ///
@@ -72,6 +75,14 @@ pub struct ExportedEntity {
     pub properties: Option<serde_json::Value>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// The caller keys the entity holds, as plain strings under its own
+    /// kind, sorted (ADR-221 section 4). Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+    /// The entity's aliases with the origin that wrote each, sorted by
+    /// alias. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<EntityAlias>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -199,6 +210,9 @@ impl KhiveRuntime {
             )
             .await?;
 
+        // ADR-221 section 4: each entity carries the keys it holds, as plain
+        // strings under its own kind, and its aliases with their origins.
+        let mut namespace_keys = self.namespace_keys(token).await?;
         let entities: Vec<ExportedEntity> = entity_page
             .items
             .into_iter()
@@ -207,7 +221,24 @@ impl KhiveRuntime {
                     DateTime::from_timestamp_micros(e.created_at).unwrap_or_else(Utc::now);
                 let updated_at =
                     DateTime::from_timestamp_micros(e.updated_at).unwrap_or_else(Utc::now);
-                ExportedEntity {
+                let mut keys = Vec::new();
+                for row in namespace_keys.rows.remove(&e.id).unwrap_or_default() {
+                    if !row.held {
+                        continue;
+                    }
+                    if row.kind != e.kind {
+                        return Err(RuntimeError::Internal(format!(
+                            "entity {} holds a key under kind {:?}, not its own kind {:?}; \
+                             the archive cannot carry it",
+                            e.id, row.kind, e.kind
+                        )));
+                    }
+                    keys.push(row.key);
+                }
+                keys.sort();
+                let mut aliases = e.aliases;
+                aliases.sort();
+                Ok(ExportedEntity {
                     id: e.id,
                     kind: e.kind.to_string(),
                     entity_type: e.entity_type,
@@ -215,11 +246,13 @@ impl KhiveRuntime {
                     description: e.description,
                     properties: e.properties,
                     tags: e.tags,
+                    keys,
+                    aliases,
                     created_at,
                     updated_at,
-                }
+                })
             })
-            .collect();
+            .collect::<RuntimeResult<_>>()?;
 
         let source_ids: Vec<Uuid> = entities.iter().map(|e| e.id).collect();
         let edges = if source_ids.is_empty() {
@@ -279,7 +312,9 @@ impl KhiveRuntime {
     ///
     /// If `target_namespace` is `None`, the archive's own namespace is used.
     ///
-    /// - Entities: upserted by ID; existing records are overwritten.
+    /// - Entities: upserted by ID; existing records are overwritten. A stored
+    ///   entity keeps its keys and aliases and gains the archive's; a key
+    ///   another live entity holds refuses the import before any write.
     /// - Edges: upserted; existing records are overwritten.
     /// - Validation: `format != "khive-kg"` or unsupported version → `InvalidInput`.
     ///   Invalid edge relations are caught at JSON deserialization time.
@@ -364,7 +399,14 @@ impl KhiveRuntime {
                     entity.id
                 )));
             }
+            validate_entity_names(entity.id, &entity.name, &entity.keys, &entity.aliases)?;
         }
+        validate_archive_key_uniqueness(
+            archive
+                .entities
+                .iter()
+                .map(|entity| (entity.id, entity.kind.as_str(), entity.keys.as_slice())),
+        )?;
         for (index, edge) in archive.edges.iter().enumerate() {
             let record = format!("edge[{index}]");
             crate::operations::validate_edge_weight(edge.weight)?;
@@ -399,15 +441,37 @@ impl KhiveRuntime {
         let ns = token.namespace().as_str().to_owned();
 
         let store = self.entities(token)?;
+        // ADR-221 section 4: before the first write, every archive key is
+        // free or already held by the entity carrying it, and no archive
+        // entity changes the kind of a stored entity whose rows hold keys.
+        let namespace_keys = self.namespace_keys(token).await?;
+        for ee in &archive.entities {
+            for key in &ee.keys {
+                let holder = namespace_keys.holders.get(&(ee.kind.clone(), key.clone()));
+                if holder.is_some_and(|holder| *holder != ee.id) {
+                    return Err(import_key_conflict(ee.id, &ee.kind, key));
+                }
+            }
+            if namespace_keys
+                .rows
+                .get(&ee.id)
+                .is_some_and(|rows| rows.iter().any(|row| row.kind != ee.kind))
+            {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "archive entity {} changes the kind of an entity that holds keys",
+                    ee.id
+                )));
+            }
+        }
         let mut entities_imported = 0usize;
         let mut embedding_truncation = crate::retrieval::EmbeddingTruncationReport::default();
         for page in archive
             .entities
             .chunks(crate::retrieval::EMBEDDING_BATCH_PAGE_SIZE)
         {
-            let entities: Vec<khive_storage::entity::Entity> = page
-                .iter()
-                .map(|ee| khive_storage::entity::Entity {
+            let mut entities = Vec::with_capacity(page.len());
+            for ee in page {
+                let mut entity = khive_storage::entity::Entity {
                     entity_type: ee.entity_type.clone(),
                     description: ee.description.clone(),
                     properties: ee.properties.clone(),
@@ -420,11 +484,23 @@ impl KhiveRuntime {
                         ee.created_at.timestamp_micros(),
                         ee.updated_at.timestamp_micros(),
                     )
-                })
-                .collect();
+                };
+                // A stored row keeps its aliases and keys; the archive's are
+                // added to them (ADR-221 section 4).
+                if let Some(stored) = store
+                    .get_entity(ee.id)
+                    .await?
+                    .filter(|stored| stored.namespace == ns)
+                {
+                    entity.aliases = stored.aliases;
+                }
+                let named = namespace_keys.named_by(ee.id, &ee.kind);
+                let writes = names::archive_name_writes(&mut entity, &ee.keys, &ee.aliases, &named);
+                entities.push((entity, writes));
+            }
             let texts: Vec<String> = entities
                 .iter()
-                .map(crate::curation::entity_embedding_text)
+                .map(|(entity, _)| crate::curation::entity_embedding_text(entity))
                 .collect();
             let mut embeddings: Vec<HashMap<String, crate::retrieval::DocumentEmbeddingOutcome>> =
                 (0..entities.len()).map(|_| HashMap::new()).collect();
@@ -447,8 +523,12 @@ impl KhiveRuntime {
                     }
                 }
             }
-            for (entity, outcomes) in entities.into_iter().zip(embeddings) {
-                store.upsert_entity(entity.clone()).await?;
+            for ((entity, writes), outcomes) in entities.into_iter().zip(embeddings) {
+                if writes.statements.is_empty() {
+                    store.upsert_entity(entity.clone()).await?;
+                } else {
+                    self.upsert_archive_entity(&entity, writes).await?;
+                }
                 // Publish each record through the same guarded FTS/vector writer
                 // as an ordinary reindex, including its best-effort model failures.
                 embedding_truncation.merge(
@@ -686,6 +766,8 @@ mod tests {
             entities: names
                 .into_iter()
                 .map(|name| ExportedEntity {
+                    keys: Vec::new(),
+                    aliases: Vec::new(),
                     id: Uuid::new_v4(),
                     kind: "concept".to_string(),
                     entity_type: None,
@@ -928,6 +1010,8 @@ mod tests {
             namespace: "local".to_string(),
             exported_at: Utc::now(),
             entities: vec![ExportedEntity {
+                keys: Vec::new(),
+                aliases: Vec::new(),
                 id: Uuid::new_v4(),
                 kind: "concept".to_string(),
                 entity_type: None,
@@ -965,6 +1049,8 @@ mod tests {
             exported_at: Utc::now(),
             entities: vec![
                 ExportedEntity {
+                    keys: Vec::new(),
+                    aliases: Vec::new(),
                     id: valid_id,
                     kind: "concept".to_string(),
                     entity_type: None,
@@ -976,6 +1062,8 @@ mod tests {
                     updated_at: Utc::now(),
                 },
                 ExportedEntity {
+                    keys: Vec::new(),
+                    aliases: Vec::new(),
                     id: Uuid::new_v4(),
                     kind: "concept".to_string(),
                     entity_type: None,
@@ -1194,6 +1282,8 @@ mod tests {
             namespace: "local".to_string(),
             exported_at: Utc::now(),
             entities: vec![ExportedEntity {
+                keys: Vec::new(),
+                aliases: Vec::new(),
                 id: Uuid::new_v4(),
                 kind: "concept".to_string(),
                 entity_type: None,
@@ -1222,6 +1312,49 @@ mod tests {
         );
     }
 
+    /// ADR-115 Amendment 1 section 3 on the keyed import route: an archive
+    /// entity that carries keys and aliases is written with them in one
+    /// transaction, and the reserved property is refused before that write.
+    #[tokio::test]
+    async fn keyed_import_entity_with_reserved_secret_gate_property_is_rejected() {
+        let rt = make_rt().await;
+        let tok = NamespaceToken::local();
+        let archive = KgArchive {
+            format: "khive-kg".to_string(),
+            version: "0.1".to_string(),
+            namespace: "local".to_string(),
+            exported_at: Utc::now(),
+            entities: vec![ExportedEntity {
+                keys: vec!["reserved-keyed-import".to_string()],
+                aliases: Vec::new(),
+                id: Uuid::new_v4(),
+                kind: "concept".to_string(),
+                entity_type: None,
+                name: "ReservedKeyedImport".to_string(),
+                description: None,
+                properties: Some(serde_json::json!({
+                    "khive:secret_gate": "exempted:content-sha256-manifest-v1"
+                })),
+                tags: vec![],
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }],
+            edges: vec![],
+        };
+
+        let err = rt.import_kg(&archive, &tok).await.unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate") && msg.contains("runtime-owned")),
+            "expected a reservation rejection, got {err:?}"
+        );
+
+        let entities = rt.list_entities(&tok, None, None, 100, 0).await.unwrap();
+        assert!(
+            !entities.iter().any(|e| e.name == "ReservedKeyedImport"),
+            "rejected keyed archive import must not create the entity"
+        );
+    }
+
     /// ADR-115 Amendment 1 §3: an archive edge carrying the reserved
     /// `khive:secret_gate` property key is rejected in the same deterministic
     /// pre-write pass as entities — edge metadata is a properties-bearing
@@ -1233,6 +1366,8 @@ mod tests {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let mk = |id: Uuid, name: &str| ExportedEntity {
+            keys: Vec::new(),
+            aliases: Vec::new(),
             id,
             kind: "concept".to_string(),
             entity_type: None,
@@ -1288,6 +1423,8 @@ mod tests {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let mk = |id: Uuid, name: &str| ExportedEntity {
+            keys: Vec::new(),
+            aliases: Vec::new(),
             id,
             kind: "concept".to_string(),
             entity_type: None,
@@ -1373,6 +1510,8 @@ mod tests {
             namespace: "local".to_string(),
             exported_at: Utc::now(),
             entities: vec![ExportedEntity {
+                keys: Vec::new(),
+                aliases: Vec::new(),
                 id: real.id,
                 kind: "concept".to_string(),
                 entity_type: None,
@@ -1429,6 +1568,8 @@ mod tests {
             namespace: "local".to_string(),
             exported_at: Utc::now(),
             entities: vec![ExportedEntity {
+                keys: Vec::new(),
+                aliases: Vec::new(),
                 id: real.id,
                 kind: "concept".to_string(),
                 entity_type: None,
@@ -1494,6 +1635,8 @@ mod tests {
             exported_at: Utc::now(),
             entities: vec![
                 ExportedEntity {
+                    keys: Vec::new(),
+                    aliases: Vec::new(),
                     id: a.id,
                     kind: "concept".to_string(),
                     entity_type: None,
@@ -1505,6 +1648,8 @@ mod tests {
                     updated_at: Utc::now(),
                 },
                 ExportedEntity {
+                    keys: Vec::new(),
+                    aliases: Vec::new(),
                     id: b.id,
                     kind: "concept".to_string(),
                     entity_type: None,
@@ -1516,6 +1661,8 @@ mod tests {
                     updated_at: Utc::now(),
                 },
                 ExportedEntity {
+                    keys: Vec::new(),
+                    aliases: Vec::new(),
                     id: c.id,
                     kind: "concept".to_string(),
                     entity_type: None,
@@ -1630,6 +1777,8 @@ mod tests {
             exported_at: Utc::now(),
             entities: vec![
                 ExportedEntity {
+                    keys: Vec::new(),
+                    aliases: Vec::new(),
                     id: e1.id,
                     kind: "concept".to_string(),
                     entity_type: None,
@@ -1641,6 +1790,8 @@ mod tests {
                     updated_at: Utc::now(),
                 },
                 ExportedEntity {
+                    keys: Vec::new(),
+                    aliases: Vec::new(),
                     id: e2.id,
                     kind: "concept".to_string(),
                     entity_type: None,
@@ -1908,6 +2059,8 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         ExportedEntity {
+            keys: Vec::new(),
+            aliases: Vec::new(),
             id,
             kind: "document".into(),
             entity_type: None,

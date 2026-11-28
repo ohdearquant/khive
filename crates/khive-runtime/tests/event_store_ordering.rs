@@ -218,6 +218,7 @@ fn forwarding_query_events_preserves_created_at_then_id_desc() {
     let dir = tempfile::Builder::new()
         .prefix("evord-")
         .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("evord-").tempdir())
         .unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("events.sock");

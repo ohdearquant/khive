@@ -636,7 +636,7 @@ impl StorageBackend {
         statements: &[&'static str],
         additions: &[khive_types::PackColumnAddition],
     ) -> Result<(), SqliteError> {
-        let writer = self.pool.writer()?;
+        let writer = self.pool.writer_for_schema()?;
         writer.transaction(|conn| {
             pack_schema::add_missing_columns(conn, additions)?;
             for &stmt in statements {
@@ -736,7 +736,7 @@ impl StorageBackend {
         }
         // Cutover work is schema work whoever calls it: its leases are migration class.
         let _class = crate::disk_guard::lease_class_scope(crate::disk_guard::LeaseClass::Migration);
-        let mut writer = self.pool.writer()?;
+        let mut writer = self.pool.writer_for_attachment_cutover()?;
         let admission = self.pool.write_admission();
         writer.conn_mut().with_mut(|conn| {
             crate::migrations::stage_attachment_cutover_with_admission(conn, &admission)
@@ -756,7 +756,7 @@ impl StorageBackend {
             ));
         }
         let _class = crate::disk_guard::lease_class_scope(crate::disk_guard::LeaseClass::Migration);
-        let mut writer = self.pool.writer()?;
+        let mut writer = self.pool.writer_for_attachment_cutover()?;
         let admission = self.pool.write_admission();
         writer.conn_mut().with_mut(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -802,7 +802,7 @@ impl StorageBackend {
             ));
         }
         let _class = crate::disk_guard::lease_class_scope(crate::disk_guard::LeaseClass::Migration);
-        let mut writer = self.pool.writer()?;
+        let mut writer = self.pool.writer_for_attachment_cutover()?;
         let admission = self.pool.write_admission();
         writer.conn_mut().with_mut(|conn| {
             crate::migrations::finalize_attachment_cutover_with_admission(conn, &admission)
@@ -909,11 +909,13 @@ impl StorageBackend {
     ) -> Result<crate::pool::PooledAutocommitWriteUnit<'_>, SqliteError> {
         let context = khive_storage::capture_request_read_context();
         let Some(operation) = context.store_acquisition_operation() else {
-            return self.pool.autocommit_write_unit();
+            return self.pool.writer_for_schema()?.admit_autocommit();
         };
         let writer = self
             .pool
-            .writer_until_for_admitted_operation(|| context.blocking_stop_reason().is_some())?
+            .schema_writer_until_for_admitted_operation(|| {
+                context.blocking_stop_reason().is_some()
+            })?
             .ok_or_else(|| {
                 SqliteError::RequestReadStopped(khive_storage::StorageError::Timeout {
                     operation: operation.into(),
@@ -1203,7 +1205,7 @@ impl StorageBackend {
         key_version: &str,
         dimensions: u32,
     ) -> Result<(), SqliteError> {
-        let writer = self.pool.autocommit_write_unit()?;
+        let writer = self.pool.writer_for_schema()?.admit_autocommit()?;
         writer
             .conn()
             .execute_batch(crate::migrations::EMBEDDING_MODELS_DDL)
@@ -1269,7 +1271,7 @@ impl StorageBackend {
         if self.sparse_tables_ready.lock().contains(model_key) {
             return Ok(());
         }
-        let writer = self.pool.autocommit_write_unit()?;
+        let writer = self.pool.writer_for_schema()?.admit_autocommit()?;
         if !self.sparse_tables_ready.lock().contains(model_key) {
             sparse::ensure_sparse_schema(writer.conn(), model_key)
                 .map_err(SqliteError::Rusqlite)?;
@@ -1449,7 +1451,7 @@ impl StorageBackend {
                 )));
             }
         } else if !self.text_tables_ready.lock().contains(&table) {
-            let writer = self.pool.autocommit_write_unit()?;
+            let writer = self.pool.writer_for_schema()?.admit_autocommit()?;
             // A concurrent caller may have proven this table while this one
             // waited for the writer.
             if !self.text_tables_ready.lock().contains(&table) {

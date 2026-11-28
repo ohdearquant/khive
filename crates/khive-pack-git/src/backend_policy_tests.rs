@@ -127,6 +127,7 @@ async fn authoritative_tool_backend_case(stale_decision: &str, current_decision:
             allowed: vec![GitWriteEntryConfig {
                 repo: repo.display().to_string(),
                 branches: vec!["*".into()],
+                access: Default::default(),
             }],
             ..Default::default()
         },

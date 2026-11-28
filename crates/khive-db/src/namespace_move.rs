@@ -498,7 +498,9 @@ pub fn disposition(table: &namespace_census::NamespaceTable) -> Option<TableDisp
         "ann_consumer_watermark" | "ann_consumer_pending" => ConsumerWatermark,
         "note_streams" => RefusedBySchema,
 
-        "pending_entity_indexes" => SubjectKeyed {
+        // An entity's keys follow the entity. The held-key index is partial, so
+        // a target that already holds the key refuses by constraint.
+        "pending_entity_indexes" | "entity_keys" | "entity_aliases" => SubjectKeyed {
             subject_column: "entity_id",
         },
         "brain_profile_snapshots" | "brain_event_log" => NamespaceScopedAggregate,

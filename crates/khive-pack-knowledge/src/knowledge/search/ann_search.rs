@@ -114,7 +114,7 @@ async fn merge_fresh_tail_for_search(
     }
 }
 
-/// Search the loaded ANN slot, waiting a bounded time when its warm is in flight.
+/// Search the loaded ANN slot, waiting a bounded time for an in-flight warm outside quiet windows.
 pub(super) async fn search_ann_with_warm_wait(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -140,13 +140,14 @@ pub(super) async fn search_ann_with_warm_wait(
             source_exhausted: tail.source_exhausted,
         };
     }
-    if vamana::wait_ready(
-        ann,
-        key,
-        vamana::warm_wait_timeout_ms(),
-        vamana::ANN_WARM_WAIT_POLL_MS,
-    )
-    .await
+    if khive_runtime::resource_admission::quiet_until().is_none()
+        && vamana::wait_ready(
+            ann,
+            key,
+            vamana::warm_wait_timeout_ms(),
+            vamana::ANN_WARM_WAIT_POLL_MS,
+        )
+        .await
     {
         let loaded = vamana::search_loaded_with_seq(ann, key, query_embedding, k).await;
         let availability = if loaded.is_some() {

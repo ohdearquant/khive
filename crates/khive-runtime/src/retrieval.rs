@@ -12,6 +12,7 @@ use crate::embedder_registry::with_embedding_admission;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 use khive_retrieval::hybrid::{combine_leg_first_appearance, fuse_labelled, HitLabel};
+use khive_retrieval::HYBRID_CANDIDATE_MULTIPLIER as CANDIDATE_MULTIPLIER;
 use khive_score::DeterministicScore;
 use khive_storage::types::{
     PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorRecord,
@@ -66,9 +67,6 @@ pub fn arm_backfill_reader_fail() {
 /// rank 1 ≈ 0.091, rank 10 ≈ 0.050, spread ≈ 0.041 — 20× better discrimination,
 /// which dedup-before-create needs at graph sizes of 50–2700 entities.
 const RRF_K: usize = 10;
-
-/// Candidates pulled per path before fusion. Higher = better recall, more work.
-const CANDIDATE_MULTIPLIER: u32 = 4;
 
 /// Advisory emitted by write verbs when only the embedding input was bounded.
 pub const EMBEDDING_INPUT_TRUNCATED_WARNING: &str =

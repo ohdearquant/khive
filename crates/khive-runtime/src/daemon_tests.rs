@@ -426,23 +426,12 @@ impl DaemonDispatch for MockDispatch {
 
 fn base_request_frame(config_id: &str) -> DaemonRequestFrame {
     DaemonRequestFrame {
-        owned_namespaces: Vec::new(),
-        plan: false,
         ops: String::new(),
-        presentation: None,
-        presentation_per_op: None,
         namespace: "local".to_string(),
-        actor_id: None,
-        process_ref: None,
-        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        format: None,
-        format_per_op: None,
         from_wire: false,
-        request_id: None,
+        ..Default::default()
     }
 }
 
@@ -463,6 +452,73 @@ async fn round_trip<D: DaemonDispatch>(
     let raw = read_frame(&mut client).await.expect("read response frame");
     handle.await.expect("handle_conn task panicked");
     serde_json::from_slice(&raw).expect("decode response frame")
+}
+
+/// Send one probe through `handle_conn` and return the supervisor claim the
+/// daemon echoed, if any. The echo is an extra field on the probe payload, so
+/// the response is read as raw JSON rather than as a `DaemonResponseFrame`.
+async fn probe_supervisor_claim() -> Option<String> {
+    let mut probe = base_request_frame("idle-test");
+    probe.probe_only = true;
+    let (mut client, server) = UnixStream::pair().expect("unix stream pair");
+    let handle = tokio::spawn(handle_conn(
+        server,
+        demand_retirement_tests::dispatcher(None),
+    ));
+    write_frame(&mut client, &serde_json::to_vec(&probe).unwrap())
+        .await
+        .expect("write probe frame");
+    let raw = read_frame(&mut client).await.expect("read probe response");
+    handle.await.expect("handle_conn task panicked");
+    let response: serde_json::Value = serde_json::from_slice(&raw).expect("decode probe response");
+    assert_eq!(response["ok"], true, "{response}");
+    response["supervisor_claim"].as_str().map(str::to_owned)
+}
+
+#[tokio::test]
+#[serial]
+async fn private_socket_claim_echo_reads_only_the_socket_marker() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    let root = crate::test_process::private_tempdir_builder()
+        .prefix("kh-claim-")
+        .tempdir()
+        .unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(home.join(".khive")).unwrap();
+    let socket = root.path().join("s");
+    std::env::set_var("HOME", &home);
+    std::env::set_var("KHIVE_SOCKET", &socket);
+    std::env::set_var("KHIVE_PID", root.path().join("p"));
+    std::env::remove_var("KHIVE_SUPERVISOR_MARKER");
+    let pid = std::process::id();
+    let global_claim = uuid::Uuid::new_v4().to_string();
+    let private_claim = uuid::Uuid::new_v4().to_string();
+    let global_marker = home.join(".khive").join("khived.supervisor");
+    let private_marker = root.path().join("s.supervisor-marker");
+
+    // The default socket's marker names this process and the claim it holds,
+    // but this daemon serves a private socket, so that marker is not its own.
+    std::fs::write(
+        &global_marker,
+        format!("default.job\n{pid}\n60\n{global_claim}\n"),
+    )
+    .unwrap();
+    std::env::set_var(SUPERVISOR_CLAIM_ENV, &global_claim);
+    assert_eq!(probe_supervisor_claim().await, None);
+
+    std::fs::write(
+        &private_marker,
+        format!("private.job\n{pid}\n60\n{private_claim}\n"),
+    )
+    .unwrap();
+    std::env::set_var(SUPERVISOR_CLAIM_ENV, &private_claim);
+    assert_eq!(probe_supervisor_claim().await, Some(private_claim));
+    assert_eq!(
+        std::fs::read_to_string(&global_marker).unwrap(),
+        format!("default.job\n{pid}\n60\n{global_claim}\n")
+    );
 }
 
 #[tokio::test]

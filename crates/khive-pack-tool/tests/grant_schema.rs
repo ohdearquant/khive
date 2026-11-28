@@ -118,12 +118,19 @@ async fn tool_schema_preserves_legacy_decisions_and_current_pins_on_reapply() {
     write(&rt, "UPDATE tool_grants SET registry_id='approved-id', definition_digest='approved-digest' WHERE status='granted'", vec![]).await;
     let pinned = rows(&rt, "SELECT * FROM tool_grants ORDER BY id").await;
     let schema = rows(&rt, "PRAGMA schema_version").await;
+    let definitions_sql =
+        "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema ORDER BY type, name";
+    let definitions = rows(&rt, definitions_sql).await;
     install(&rt).unwrap();
     assert_eq!(
         rows(&rt, "SELECT * FROM tool_grants ORDER BY id").await,
         pinned
     );
-    assert_eq!(rows(&rt, "PRAGMA schema_version").await, schema);
+    assert_eq!(
+        rows(&rt, "PRAGMA schema_version").await,
+        json!([[schema[0][0].as_i64().unwrap() + 2]])
+    );
+    assert_eq!(rows(&rt, definitions_sql).await, definitions);
 }
 
 #[tokio::test]
@@ -247,7 +254,7 @@ async fn tool_schema_backfills_markers_without_approving_legacy_rows() {
         rows(&rt, markers).await,
         json!([
             ["all", "a", 100],
-            ["case-prefix", null, null],
+            ["case-prefix", "a", 100],
             ["exact", "exact-id", 200],
             ["foreign", null, null],
             ["future", null, null],

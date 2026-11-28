@@ -54,3 +54,28 @@ retains the originating operation; spawned background tasks do not inherit the s
 Explicitly deferred transactional producers can carry an owned attribution snapshot.
 Reusable token-scoped event stores do not retain an operation position between calls.
 No argument values or argument digests are added by these fields.
+
+## Client working directory (anonymous rows)
+
+An audit row the runtime's verb dispatcher writes for the anonymous caller (`anonymous:local`)
+carries one more top-level payload field when the request reached the daemon with a
+`client_cwd` frame field (khive-runtime `docs/api/daemon.md`):
+
+```json
+{ "client_cwd": { "path": "/home/dev/scratch", "cut": false } }
+```
+
+- `path` is the directory the client process reported, as text, with every control (`Cc`),
+  format (`Cf`), line separator (`Zl`) and paragraph separator (`Zp`) character removed, then
+  cut at a character boundary to 512 bytes. `cut` is `true` when that cut removed anything.
+- Only anonymous rows carry it. A row for an attributed actor never does, whatever the client
+  sent: its actor already says who called.
+- It is attribution only. It reaches no gate decision, token, record or verb result.
+- It is absent when the client did not send the field (an older client, or a frame built
+  without it) and on rows written by a process dispatching in place, without the daemon.
+
+The value is a path on the machine where the client ran, which can name a person or a project.
+It is stored with the event and read the way that event's actor scope allows: through the
+caller-scoped event reads, the anonymous caller itself, and with `all_actors=true` a caller
+listed in the serving runtime's `brain.fleet_readers`; and by anyone who can read the store
+file directly.

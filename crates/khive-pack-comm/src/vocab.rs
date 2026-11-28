@@ -61,7 +61,7 @@ const CHANNEL_SLUG_PARAM: ParamDef = ParamDef {
     resolution_mode: IdResolutionMode::NotApplicable,
 };
 
-pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
+pub(crate) static COMM_HANDLERS: [HandlerDef; 21] = [
     HandlerDef {
         name: "comm.suppression_add",
         description: "Add a suppression entry for an email address, exact domain, or recipient key. Address values are normalized with the shared email recipient normalizer; domain values are ASCII-lowercased and match that domain only.",
@@ -268,7 +268,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "comm.inbox",
-        description: "List and page through the caller's filtered inbound or sent messages, optionally waiting for a new matching message. Defaults to the inbound inbox. comm.send returns the outbound message ID; the recipient row has a different inbound ID and properties.outbound_ref links back to the outbound ID. comm.read takes the inbound ID.",
+        description: "Fetch and page through the caller's filtered inbound or sent messages without marking them read, optionally waiting for a new matching message. Defaults to the inbound inbox. comm.send returns the outbound message ID; the recipient row has a different inbound ID and properties.outbound_ref links back to the outbound ID. comm.read takes the inbound ID.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -402,7 +402,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "comm.read",
-        description: "Fetch one or up to 500 inbound messages and mark them read. Successful results include subject, content, and routing fields by default; body=false keeps the existing acknowledgement-only response. Mark writes are best-effort: each result carries status=success|failed|unknown (failed and unknown results add no message body; unknown means the write's execution seam terminated after the request was accepted, so it may already have applied — re-check with comm.inbox before deciding whether to re-issue; re-issuing is safe, marking read is idempotent), and bulk responses carry status=success|partial|failed|unknown.",
+        description: "Fetch one or up to 500 inbound messages and mark them read by default. With a single id, mark=false fetches without marking and reports the stored read state; ids with mark=false is refused even when empty. Successful results include subject, content, and routing fields by default; body=false omits those fields without changing the requested marking behavior. Mark writes are best-effort: each result carries status=success|failed|unknown (failed and unknown results add no message body; unknown means the write's execution seam terminated after the request was accepted, so it may already have applied — re-check with comm.inbox before deciding whether to re-issue; re-issuing is safe, marking read is idempotent), and bulk responses carry status=success|partial|failed|unknown.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[
@@ -410,28 +410,35 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
                 name: "id",
                 param_type: "string",
                 required: false,
-                description: "Short 8-char prefix or full UUID of one inbound message to mark read. Mutually exclusive with `ids`.",
+                description: "Short 8-char prefix or full UUID of one inbound message to fetch, marking it unless mark=false. Mutually exclusive with `ids`.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "ids",
                 param_type: "array of string",
                 required: false,
-                description: "One to 500 inbound message ids to mark read in one operation. Mutually exclusive with `id`; all targets are validated before mutation and duplicate resolved ids are updated once.",
+                description: "One to 500 inbound message ids to mark read in one operation. Mutually exclusive with `id`; mark=false is not supported, even for an empty array. All targets are validated before mutation and duplicate resolved ids are updated once.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "mark",
+                param_type: "boolean",
+                required: false,
+                description: "Defaults to true. Set false with a single id to fetch without marking read; the stored read state, properties, updated_at, and unread membership are unchanged. Not supported with ids, even when empty.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "body",
                 param_type: "boolean",
                 required: false,
-                description: "Defaults to true. Set false to retain the prior acknowledgement-only response without top-level subject, content, or routing fields; the read mark is still attempted.",
+                description: "Defaults to true. Set false to omit expanded message fields and attachment lookup. With mark=true the read mark is still attempted; with mark=false the compact response reports the fetched state without acknowledging a mark.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
     },
     HandlerDef {
         name: "comm.mark_read",
-        description: "Mark up to 500 inbound messages as read; use comm.inbox or comm.thread to retrieve content. Best-effort responses carry status=success|partial|failed; atomic=true provides all-or-nothing mutation.",
+        description: "Mark up to 500 inbound messages as read without returning message content; use comm.inbox or comm.thread to retrieve content. Best-effort responses carry status=success|partial|failed; atomic=true provides all-or-nothing mutation.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[
@@ -491,7 +498,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
     },
     HandlerDef {
         name: "comm.thread",
-        description: "Retrieve all messages in a conversation thread, ordered chronologically.",
+        description: "Fetch all messages in a conversation thread without marking them read, ordered chronologically.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -810,6 +817,26 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
         ],
     },
     HandlerDef {
+        name: "comm.quiet",
+        description: "Defer opted-in background warm and maintenance work in this process. \
+                      Requires integer ttl_secs in 1..=300. Repeated requests retain the later \
+                      deadline; a shorter request cannot shorten an active interval. Returns \
+                      quiet_until, the effective UTC deadline also reported by comm.health. \
+                      Expiry uses a monotonic clock. This cooperative, non-durable request \
+                      applies across namespaces in this process, not other processes. It does \
+                      not interrupt in-flight work or delay foreground dispatch, finalization, \
+                      shutdown, channel polling, or freshness watchers.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Directive,
+        params: &[ParamDef {
+            name: "ttl_secs",
+            param_type: "integer",
+            required: true,
+            description: "Quiet duration in seconds, from 1 through 300 inclusive. Renewals retain the later deadline.",
+            resolution_mode: IdResolutionMode::NotApplicable,
+        }],
+    },
+    HandlerDef {
         name: "comm.health",
         // MAINTENANCE, deliberately kept out of the description: the surface and its
         // namespace resolution are specified in khive #606, #877, #917, #1383 and #1472,
@@ -851,7 +878,9 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 20] = [
                        non-local `namespace=` scope returns that namespace's rows once an \
                        authorized per-tenant writer has run. Without a heartbeat it may still \
                        return quarantine-only channel evidence while the local poll loop is \
-                       actively heartbeating under \"local\".",
+                       actively heartbeating under \"local\". The process-level resource object \
+                       always includes quiet_until: the active comm.quiet UTC deadline, or null \
+                       after monotonic expiry or when no quiet request is active.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[],

@@ -845,11 +845,22 @@ fn top_level_request_returning_with_open_transaction_reports_side_effects_unknow
                 })
         }),
         reply: reply_tx,
+        receipt: Arc::new(ReplyReceipt::default()),
         top_level: true,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
         lease_class: Default::default(),
-        telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
+        telemetry: WriteTelemetry::new(
+            None,
+            "test".to_string(),
+            0,
+            None,
+            SubmitLabels::None,
+            WriteTelemetryOptions {
+                attempt_log: false,
+                top_level: false,
+            },
+        ),
         admission: None,
     };
 
@@ -898,11 +909,22 @@ fn commit_failure_with_failed_rollback_reports_side_effects_unknown() {
             Ok(affected)
         }),
         reply: reply_tx,
+        receipt: Arc::new(ReplyReceipt::default()),
         top_level: false,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
         lease_class: Default::default(),
-        telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
+        telemetry: WriteTelemetry::new(
+            None,
+            "test".to_string(),
+            0,
+            None,
+            SubmitLabels::None,
+            WriteTelemetryOptions {
+                attempt_log: false,
+                top_level: false,
+            },
+        ),
         admission: None,
     };
 
@@ -1058,11 +1080,22 @@ fn operation_failure_with_failed_rollback_reports_side_effects_unknown() {
             ))
         }),
         reply: reply_tx,
+        receipt: Arc::new(ReplyReceipt::default()),
         top_level: false,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
         lease_class: Default::default(),
-        telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
+        telemetry: WriteTelemetry::new(
+            None,
+            "test".to_string(),
+            0,
+            None,
+            SubmitLabels::None,
+            WriteTelemetryOptions {
+                attempt_log: false,
+                top_level: false,
+            },
+        ),
         admission: None,
     };
 
@@ -1109,11 +1142,22 @@ fn wrapped_panic_with_failed_rollback_reports_side_effects_unknown() {
             panic!("intentional panic after illicit commit");
         }),
         reply: reply_tx,
+        receipt: Arc::new(ReplyReceipt::default()),
         top_level: false,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,
         lease_class: Default::default(),
-        telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None, SubmitLabels::None),
+        telemetry: WriteTelemetry::new(
+            None,
+            "test".to_string(),
+            0,
+            None,
+            SubmitLabels::None,
+            WriteTelemetryOptions {
+                attempt_log: false,
+                top_level: false,
+            },
+        ),
         admission: None,
     };
 
@@ -1388,8 +1432,10 @@ async fn closed_receiver_rejects_all_send_surfaces_as_not_started() {
         backend_key: None,
         db: "test".to_string(),
         slow_write_threshold: None,
+        attempt_log: false,
         enqueue_timeout: Duration::from_secs(5),
         admission_metrics: WriterAdmissionMetrics::new(),
+        strict_routing: false,
     };
     let send_result = handle.send(|_conn| Ok::<(), StorageError>(())).await;
     assert_writer_task_terminal_state(send_result, WriterTaskRequestState::NotStarted);
@@ -1416,8 +1462,10 @@ async fn accepted_request_lost_reply_is_side_effects_unknown() {
         backend_key: None,
         db: "test".to_string(),
         slow_write_threshold: None,
+        attempt_log: false,
         enqueue_timeout: Duration::from_secs(5),
         admission_metrics: WriterAdmissionMetrics::new(),
+        strict_routing: false,
     };
     let request_ran = Arc::new(AtomicBool::new(false));
     let request_ran_in_op = Arc::clone(&request_ran);
@@ -1494,8 +1542,17 @@ fn writer_stage_sample_attributes_body_and_commit_at_boundaries() {
         micros: std::sync::atomic::AtomicU64::new(0),
     });
     let body_clock = Arc::clone(&clock);
-    let mut telemetry =
-        WriteTelemetry::new(key.clone(), "test".into(), 0, None, SubmitLabels::None);
+    let mut telemetry = WriteTelemetry::new(
+        key.clone(),
+        "test".into(),
+        0,
+        None,
+        SubmitLabels::None,
+        WriteTelemetryOptions {
+            attempt_log: false,
+            top_level: false,
+        },
+    );
     telemetry.test_clock = Some(clock);
     let (reply_tx, mut reply_rx) = oneshot::channel();
     let request = WriteRequest {
@@ -1508,6 +1565,7 @@ fn writer_stage_sample_attributes_body_and_commit_at_boundaries() {
                 })
         }),
         reply: reply_tx,
+        receipt: Arc::new(ReplyReceipt::default()),
         top_level: false,
         checkpoint_bypass: false,
         vacuum_copy_headroom: false,

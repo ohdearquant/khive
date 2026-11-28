@@ -94,6 +94,83 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn tool_policies_lookup_by_policy_id_finds_row_beyond_page_limit() {
+    let f = Fixture::new(true);
+    let first_page = f.policy("svc:a", "t.first", "allow").await;
+    let target = f.policy("svc:a", "t.last", "deny").await;
+    let target_id = target["id"].as_str().unwrap();
+
+    // Put the last-created row beyond the first page deterministically.
+    f.write(
+        "UPDATE tool_policy SET created_at=?1 WHERE id=?2",
+        vec![
+            SqlValue::Integer(2),
+            SqlValue::Text(first_page["id"].as_str().unwrap().into()),
+        ],
+    )
+    .await;
+    f.write(
+        "UPDATE tool_policy SET created_at=?1 WHERE id=?2",
+        vec![SqlValue::Integer(1), SqlValue::Text(target_id.into())],
+    )
+    .await;
+
+    let check = f.check("svc:a", "t.last").await;
+    assert_eq!(check["policy_id"], target["id"]);
+    let page = f
+        .call("tool.policies", json!({"actor":"svc:a", "limit":1}))
+        .await;
+    assert_eq!(page["count"], 1);
+    assert_eq!(page["policies"][0]["id"], first_page["id"]);
+
+    let exact = f
+        .call(
+            "tool.policies",
+            json!({"actor":"svc:a", "policy_id":check["policy_id"], "limit":1}),
+        )
+        .await;
+    assert_eq!(exact["count"], 1);
+    assert_eq!(exact["policies"][0]["id"], target["id"]);
+    assert_eq!(exact["policies"][0]["tool"], "t.last");
+
+    let help = f.registry.describe_verb("tool.policies").unwrap();
+    assert_eq!(
+        help["input_schema"]["properties"]["policy_id"]["type"],
+        "string"
+    );
+}
+
+#[tokio::test]
+async fn tool_policies_without_policy_id_preserves_actor_and_limit_behavior() {
+    let f = Fixture::new(true);
+    let older = f.policy("svc:a", "t.old", "deny").await;
+    let latest = f.policy("svc:a", "t.latest", "allow").await;
+    f.policy("svc:b", "t.other", "allow").await;
+    f.write(
+        "UPDATE tool_policy SET created_at=?1 WHERE id=?2",
+        vec![
+            SqlValue::Integer(1),
+            SqlValue::Text(older["id"].as_str().unwrap().into()),
+        ],
+    )
+    .await;
+    f.write(
+        "UPDATE tool_policy SET created_at=?1 WHERE id=?2",
+        vec![
+            SqlValue::Integer(2),
+            SqlValue::Text(latest["id"].as_str().unwrap().into()),
+        ],
+    )
+    .await;
+
+    let listed = f
+        .call("tool.policies", json!({"actor":"svc:a", "limit":1}))
+        .await;
+    assert_eq!(listed["count"], 1);
+    assert_eq!(listed["policies"][0]["id"], latest["id"]);
+}
+
+#[tokio::test]
 async fn malformed_policy_timestamps_cannot_fall_through_to_read_allow() {
     for column in ["created_at", "updated_at", "deleted_at"] {
         let f = Fixture::new(true);

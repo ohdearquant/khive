@@ -31,16 +31,26 @@ impl Fixture {
         let root = tempfile::Builder::new()
             .prefix("exec-recall-drain-")
             .tempdir_in("/tmp")
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("exec-recall-drain-")
+                    .tempdir()
+            })
             .expect("isolated scratch directory");
         let path = root.path().to_path_buf();
         std::fs::create_dir_all(path.join("home")).unwrap();
         std::fs::create_dir_all(path.join("tmp")).unwrap();
         let config = path.join("khive.toml");
         // No [[backends]]: --db supplies the single writable scratch backend.
-        // This follows the no-backends exec fixture and enables no-embed recall.
+        // `engines = []` declares zero embedding engines. `no_embed` on a pack
+        // empties only that pack's registry: writes routed to the core runtime
+        // still embed with the main runtime's models, and the child (cleared
+        // environment, scratch HOME) would load a model inside the request
+        // deadline. With no engine, remember and recall run text-only.
         std::fs::write(
             &config,
-            "[runtime]\npacks = [\"kg\", \"memory\", \"brain\"]\n\
+            "engines = []\n\
+             [runtime]\npacks = [\"kg\", \"memory\", \"brain\"]\n\
              [display]\ntimezone = \"UTC\"\n\
              [packs.kg]\nbackend = \"main\"\nno_embed = true\n\
              [packs.memory]\nbackend = \"main\"\nno_embed = true\n\
@@ -109,6 +119,13 @@ impl Fixture {
         let results = envelope["results"].as_array().expect("operation receipts");
         assert_eq!(results.len(), 1, "one operation: {envelope}");
         assert_eq!(results[0]["ok"], true, "{tool}: {envelope}");
+        // No operation may reach an embedding model: the fixture's result
+        // must not depend on a model load on the runner.
+        assert_eq!(
+            results[0]["usage"]["embed_calls"].as_u64().unwrap_or(0),
+            0,
+            "{tool} embedded: {envelope}"
+        );
         results[0]["result"].clone()
     }
 

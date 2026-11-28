@@ -1,16 +1,16 @@
-/// help=true on `recall` returns a schema envelope including the `query` param.
+/// help=true on `memory.recall` returns a schema envelope including the `query` param.
 #[tokio::test]
 async fn test_help_true_returns_schema_for_recall() {
     let invocations = Arc::new(AtomicUsize::new(0));
     let reg = build_help_registry(invocations.clone());
 
     let result = reg
-        .dispatch("recall", serde_json::json!({ "help": true }))
+        .dispatch("memory.recall", serde_json::json!({ "help": true }))
         .await
         .expect("help=true must succeed for recall");
 
-    assert_eq!(result["verb"], "recall");
-    assert_eq!(result["pack"], "helptest");
+    assert_eq!(result["verb"], "memory.recall");
+    assert_eq!(result["pack"], "memory");
 
     let params = result["params"]
         .as_array()

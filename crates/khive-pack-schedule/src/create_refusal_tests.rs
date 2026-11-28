@@ -97,6 +97,52 @@ async fn singleton_scheduled_event_refusal_matches_create_dispatch() {
     }
 }
 
+#[tokio::test]
+async fn invalid_dsl_refusal_masks_caller_text_quoted_by_the_parser() {
+    use khive_runtime::secret_gate::{mask_for_redaction_surface, RedactionSurface};
+
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("fixture-schedule-owner".into()));
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(crate::SchedulePack::new(runtime.clone()));
+    let registry = builder.build().expect("real KG and schedule registry");
+
+    // A bareword value: the parser's refusal quotes it back.
+    let secret = ["ghp", "_", &"Ab3dE5gH7jK9mN1pQ2rS".repeat(2)[..36]].concat();
+    assert!(
+        !mask_for_redaction_surface(RedactionSurface::GateProbe, &secret).contains(&secret),
+        "canonical masker recognizes the fixture"
+    );
+    let action = format!("create(kind=\"note\", content={secret})");
+    let parse_error = khive_request::parse_request(&action)
+        .expect_err("a bareword value is malformed DSL")
+        .to_string();
+    assert!(
+        parse_error.contains(&secret),
+        "the parser quotes the bareword: {parse_error}"
+    );
+
+    let reason = invalid_input_reason(
+        registry
+            .dispatch(
+                "schedule.schedule",
+                json!({"action": action, "at": "2099-06-01T09:00:00Z"}),
+            )
+            .await
+            .expect_err("malformed DSL is refused before scheduling"),
+    );
+    assert!(
+        reason.starts_with("schedule.action: invalid DSL ("),
+        "{reason}"
+    );
+    assert!(
+        !reason.contains(&secret),
+        "the refusal echoes caller text the parser quoted"
+    );
+    assert!(reason.contains("***MASKED***"), "{reason}");
+}
+
 fn singleton_alias_action(params: &Value) -> String {
     let args = params
         .as_object()

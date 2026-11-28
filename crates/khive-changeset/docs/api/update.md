@@ -12,7 +12,7 @@ The operation's fields are private so this constructor is the only in-memory con
 
 `UpdatePatch` is tagged by `target` and selects entity, note, or edge fields. An absent field means unchanged. Nullable mutable fields use `Option<Option<T>>`: outer `None` means unchanged, `Some(None)` means explicitly clear to JSON `null`, and `Some(Some(value))` means set.
 
-`EntityPatch` can change name, nullable description, nullable `entity_type`, properties, and tags. `NotePatch` can change content, nullable salience/decay factor, properties, and tags. `EdgePatch` can change relation and weight.
+`EntityPatch` can change name, nullable description, nullable `entity_type`, properties, tags, and `aliases`. `aliases` is the entity's whole alias set after the update, each entry `{"alias", "origin"}` with origin `caller`, `rename` or `merge`; it is absolute, not a list of additions or removals, and the apply writes the set as given, origins included, so a change set is a trusted carrier of origins. An alias set that names one alias twice is refused. An update that renames an entity onto an alias it holds must carry the alias set, and that set may not hold the new name. `NotePatch` can change content, nullable salience/decay factor, properties, and tags. `EdgePatch` can change relation and weight.
 
 An edge patch weight, when present, must be finite and within `[0.0, 1.0]`.
 Both custom deserialization and `UpdateOp::new` enforce this constraint, including
@@ -23,7 +23,7 @@ and an omitted weight preserve their existing NDJSON representation.
 
 ## `UpdatePreimage`
 
-The preimage is tagged with the same `target` discriminant. `EntityPreimage`, `NotePreimage`, and `EdgePreimage` mirror their patch fields one-for-one: presence means the corresponding field is touched and the value is what existed at staging time.
+The preimage is tagged with the same `target` discriminant. `EntityPreimage`, `NotePreimage`, and `EdgePreimage` mirror their patch fields one-for-one: presence means the corresponding field is touched and the value is what existed at staging time. A captured alias set is compared with the live set as a set, so order does not matter but origins do.
 
 Captured note salience must be finite and within `[0.0, 1.0]`. Captured note decay factor must be finite and non-negative. Captured edge weight must be finite and within `[0.0, 1.0]`. Values outside those ranges could not represent a valid previously live record and are rejected.
 

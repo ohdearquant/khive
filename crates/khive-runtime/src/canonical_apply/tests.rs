@@ -1,5 +1,7 @@
 use super::*;
 use khive_changeset::{EntityPatch, EntityPreimage, Envelope, UpdatePreimage};
+use khive_storage::entity::{EntityAlias, EntityAliasOrigin};
+use khive_storage::{SqlStatement, SqlValue};
 use khive_types::{Namespace, Timestamp};
 
 struct Fixture {
@@ -34,6 +36,8 @@ fn entity_create(id: Uuid, name: &str) -> Op {
             description: None,
             properties: Default::default(),
             tags: Vec::new(),
+            key: None,
+            aliases: vec![],
         }),
     })
 }
@@ -47,6 +51,7 @@ fn rename(id: Uuid, old: &str, new: &str) -> Op {
                 entity_type: None,
                 properties: None,
                 tags: None,
+                aliases: None,
             }),
             UpdatePreimage::Entity(EntityPreimage {
                 name: Some(old.into()),
@@ -54,6 +59,7 @@ fn rename(id: Uuid, old: &str, new: &str) -> Op {
                 entity_type: None,
                 properties: None,
                 tags: None,
+                aliases: None,
             }),
         )
         .unwrap(),
@@ -157,6 +163,483 @@ async fn unchanged_entity_update_is_a_no_op_and_replays_without_a_new_revision()
         .unwrap();
     assert_eq!(version(rt, &token).await, created + 1);
     assert_eq!(events.count_events(updated()).await.unwrap(), 1);
+}
+
+fn keyed_create(id: Uuid, name: &str, key: Option<&str>, aliases: &[&str]) -> Op {
+    let Op::Create(mut create) = entity_create(id, name) else {
+        unreachable!("entity_create builds a create")
+    };
+    let CreateTarget::Entity(fields) = &mut create.target else {
+        unreachable!("entity_create builds an entity create")
+    };
+    fields.key = key.map(str::to_owned);
+    fields.aliases = aliases.iter().map(|alias| (*alias).to_owned()).collect();
+    Op::Create(create)
+}
+
+fn alias(name: &str, origin: EntityAliasOrigin) -> EntityAlias {
+    EntityAlias {
+        alias: name.into(),
+        origin,
+    }
+}
+
+/// An update of the alias set, renaming from `old` to `new` when they differ.
+fn alias_update(
+    id: Uuid,
+    old: &str,
+    new: &str,
+    before: Vec<EntityAlias>,
+    after: Vec<EntityAlias>,
+) -> Op {
+    let renamed = old != new;
+    Op::Update(
+        UpdateOp::new(
+            id128(id),
+            UpdatePatch::Entity(EntityPatch {
+                name: renamed.then(|| new.into()),
+                description: None,
+                entity_type: None,
+                properties: None,
+                tags: None,
+                aliases: Some(after),
+            }),
+            UpdatePreimage::Entity(EntityPreimage {
+                name: renamed.then(|| old.into()),
+                description: None,
+                entity_type: None,
+                properties: None,
+                tags: None,
+                aliases: Some(before),
+            }),
+        )
+        .unwrap(),
+    )
+}
+
+fn entity_delete(row: &Entity, keys: &[&str], aliases: Vec<EntityAlias>) -> Op {
+    Op::Delete(DeleteOp {
+        target_id: id128(row.id),
+        hard: false,
+        preimage: khive_changeset::DeletePreimage::Entity(Box::new(
+            khive_changeset::EntityRecord {
+                entity: projection::entity(row).unwrap(),
+                keys: keys.iter().map(|key| (*key).to_owned()).collect(),
+                aliases,
+            },
+        )),
+    })
+}
+
+async fn apply(rt: &KhiveRuntime, token: &NamespaceToken, ops: Vec<Op>) -> crate::AtomicRunOutcome {
+    let plans = prepare_canonical_changeset(rt, &registry(), token, &changeset(ops))
+        .await
+        .unwrap();
+    crate::run_atomic_unit(rt.sql().as_ref(), plans)
+        .await
+        .unwrap()
+}
+
+async fn refusal(rt: &KhiveRuntime, token: &NamespaceToken, ops: Vec<Op>) -> (usize, String) {
+    match prepare_canonical_changeset(rt, &registry(), token, &changeset(ops)).await {
+        Err(RuntimeError::CanonicalAdmission { op_index, source }) => {
+            (op_index, source.to_string())
+        }
+        Err(other) => panic!("expected an admission refusal, got {other:?}"),
+        Ok(_) => panic!("expected an admission refusal, the change set was prepared"),
+    }
+}
+
+async fn entity_row(rt: &KhiveRuntime, token: &NamespaceToken, id: Uuid) -> Option<Entity> {
+    rt.entities(token).unwrap().get_entity(id).await.unwrap()
+}
+
+async fn insert_alias(rt: &KhiveRuntime, token: &NamespaceToken, id: Uuid, name: &str) {
+    rt.sql()
+        .writer()
+        .await
+        .unwrap()
+        .execute(khive_db::stores::entity::entity_alias_insert_statement(
+            token.namespace().as_str(),
+            id,
+            name,
+            EntityAliasOrigin::Caller,
+            1,
+        ))
+        .await
+        .unwrap();
+}
+
+fn sorted_aliases(row: &Entity) -> Vec<EntityAlias> {
+    let mut aliases = row.aliases.clone();
+    aliases.sort();
+    aliases
+}
+
+/// ADR-221 sections 1 and 2: a canonical create claims its key and writes its
+/// caller aliases in the unit that writes the row; an alias equal to the name
+/// is not stored.
+#[tokio::test]
+async fn a_keyed_create_claims_its_key_and_writes_its_aliases() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let a = Uuid::new_v4();
+    let create = keyed_create(a, "name", Some("k1"), &["nick", "name"]);
+    assert!(matches!(
+        apply(rt, &token, vec![create]).await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    let holder = rt
+        .get_entity_by_key(&token, "concept", "k1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(holder.id, a);
+    assert_eq!(
+        sorted_aliases(&holder),
+        vec![alias("nick", EntityAliasOrigin::Caller)]
+    );
+}
+
+/// Two creates in one change set taking one key refuse the whole set as
+/// `key_conflict` before anything is written.
+#[tokio::test]
+async fn two_creates_taking_one_key_refuse_the_whole_change_set() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let ops = vec![
+        keyed_create(a, "a", Some("k1"), &[]),
+        keyed_create(b, "b", Some("k1"), &[]),
+    ];
+    let (op_index, message) = refusal(rt, &token, ops).await;
+    assert_eq!(op_index, 1);
+    assert!(message.contains("key_conflict"), "{message}");
+    assert!(message.contains("\"k1\""), "{message}");
+    assert!(entity_row(rt, &token, a).await.is_none());
+    assert!(entity_row(rt, &token, b).await.is_none());
+}
+
+/// A key a live entity holds refuses the create, naming the key and not the
+/// holder; a delete of the holder earlier in the same change set releases it.
+#[tokio::test]
+async fn a_held_key_refuses_a_create_unless_an_earlier_delete_releases_it() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let (h, b) = (Uuid::new_v4(), Uuid::new_v4());
+    assert!(matches!(
+        apply(rt, &token, vec![keyed_create(h, "holder", Some("k1"), &[])]).await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    let (op_index, message) =
+        refusal(rt, &token, vec![keyed_create(b, "b", Some("k1"), &[])]).await;
+    assert_eq!(op_index, 0);
+    assert!(message.contains("key_conflict"), "{message}");
+    assert!(!message.contains(&h.to_string()), "{message}");
+    let holder = entity_row(rt, &token, h).await.unwrap();
+    let ops = vec![
+        entity_delete(&holder, &["k1"], Vec::new()),
+        keyed_create(b, "b", Some("k1"), &[]),
+    ];
+    assert!(matches!(
+        apply(rt, &token, ops).await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    let holder = rt
+        .get_entity_by_key(&token, "concept", "k1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(holder.id, b);
+}
+
+/// The delete record's keys and aliases are compared with the live row's.
+#[tokio::test]
+async fn a_delete_whose_record_differs_in_keys_or_aliases_is_refused() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let h = Uuid::new_v4();
+    let create = keyed_create(h, "holder", Some("k1"), &["nick"]);
+    assert!(matches!(
+        apply(rt, &token, vec![create]).await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    let row = entity_row(rt, &token, h).await.unwrap();
+    let held = sorted_aliases(&row);
+    for (field, op) in [
+        ("keys", entity_delete(&row, &[], held.clone())),
+        ("aliases", entity_delete(&row, &["k1"], Vec::new())),
+    ] {
+        assert!(matches!(apply(rt, &token, vec![op]).await,
+            crate::AtomicRunOutcome::RolledBack{failure:AtomicOpFailure::PreimageMismatch{field_path,..},..} if field_path==field));
+        assert!(entity_row(rt, &token, h).await.is_some());
+    }
+    assert!(matches!(
+        apply(rt, &token, vec![entity_delete(&row, &["k1"], held)]).await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    assert!(entity_row(rt, &token, h).await.is_none());
+}
+
+/// A change that carries the alias set writes exactly that set, with the
+/// origins it names, and an alias set naming the entity's name is refused.
+#[tokio::test]
+async fn an_alias_set_update_writes_exactly_that_set_with_its_origins() {
+    use EntityAliasOrigin::{Caller, Rename};
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let a = Uuid::new_v4();
+    assert!(matches!(
+        apply(rt, &token, vec![keyed_create(a, "old", None, &["nick"])]).await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    let after = vec![alias("handle", Caller), alias("old", Rename)];
+    let op = alias_update(a, "old", "new", vec![alias("nick", Caller)], after.clone());
+    assert!(matches!(
+        apply(rt, &token, vec![op]).await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    let row = entity_row(rt, &token, a).await.unwrap();
+    assert_eq!(row.name, "new");
+    assert_eq!(sorted_aliases(&row), after);
+    let op = alias_update(
+        a,
+        "new",
+        "handle",
+        after.clone(),
+        vec![alias("handle", Caller)],
+    );
+    let (op_index, message) = refusal(rt, &token, vec![op]).await;
+    assert_eq!(op_index, 0);
+    assert!(message.contains("equals the entity's name"), "{message}");
+    assert_eq!(
+        sorted_aliases(&entity_row(rt, &token, a).await.unwrap()),
+        after
+    );
+}
+
+async fn alias_rows(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+) -> Vec<(String, String, i64)> {
+    let mut reader = rt.sql().reader().await.unwrap();
+    let rows = reader
+        .query_all(SqlStatement::new(
+            "SELECT alias, origin, created_at FROM entity_aliases \
+             WHERE namespace = ?1 AND entity_id = ?2 ORDER BY alias",
+            vec![
+                SqlValue::Text(token.namespace().as_str().to_owned()),
+                SqlValue::Text(id.to_string()),
+            ],
+        ))
+        .await
+        .unwrap();
+    rows.iter()
+        .map(|row| {
+            (
+                row.text("alias").unwrap().to_owned(),
+                row.text("origin").unwrap().to_owned(),
+                row.i64("created_at").unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// An alias-set update writes only the difference: an alias it keeps with the
+/// same origin keeps its row and its time, an alias whose origin changes is
+/// written again, and a dropped alias is gone.
+#[tokio::test]
+async fn an_alias_set_update_keeps_the_time_of_an_unchanged_alias() {
+    use EntityAliasOrigin::{Caller, Rename};
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let a = Uuid::new_v4();
+    assert!(matches!(
+        apply(rt, &token, vec![entity_create(a, "name")]).await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    insert_alias(rt, &token, a, "kept").await;
+    insert_alias(rt, &token, a, "moved").await;
+    insert_alias(rt, &token, a, "dropped").await;
+
+    let before = vec![
+        alias("dropped", Caller),
+        alias("kept", Caller),
+        alias("moved", Caller),
+    ];
+    let after = vec![
+        alias("added", Caller),
+        alias("kept", Caller),
+        alias("moved", Rename),
+    ];
+    let op = alias_update(a, "name", "name", before, after.clone());
+    assert!(matches!(
+        apply(rt, &token, vec![op]).await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+
+    assert_eq!(
+        sorted_aliases(&entity_row(rt, &token, a).await.unwrap()),
+        after
+    );
+    let rows = alias_rows(rt, &token, a).await;
+    let names: Vec<&str> = rows.iter().map(|(alias, _, _)| alias.as_str()).collect();
+    assert_eq!(names, ["added", "kept", "moved"]);
+    assert_eq!(rows[1], ("kept".to_owned(), "caller".to_owned(), 1));
+    assert_eq!(rows[2].1, "rename");
+    assert_ne!(rows[2].2, 1, "an origin change writes the alias again");
+    assert_ne!(rows[0].2, 1);
+}
+
+/// ADR-221 section 2: an alias never equals its entity's name. A rename onto
+/// a held alias is refused, naming the alias and the entity, unless the change
+/// carries the alias set; with it the set is written and the alias is gone.
+#[tokio::test]
+async fn a_rename_onto_a_held_alias_needs_the_alias_set_in_the_change() {
+    use EntityAliasOrigin::{Caller, Rename};
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let a = Uuid::new_v4();
+    assert!(matches!(
+        apply(rt, &token, vec![entity_create(a, "old")]).await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    insert_alias(rt, &token, a, "new").await;
+
+    let (op_index, message) = refusal(rt, &token, vec![rename(a, "old", "new")]).await;
+    assert_eq!(op_index, 0);
+    assert!(message.contains("\"new\""), "{message}");
+    assert!(message.contains(&a.to_string()), "{message}");
+    let row = entity_row(rt, &token, a).await.unwrap();
+    assert_eq!(row.name, "old");
+    assert_eq!(sorted_aliases(&row), vec![alias("new", Caller)]);
+
+    let op = alias_update(
+        a,
+        "old",
+        "new",
+        vec![alias("new", Caller)],
+        vec![alias("old", Rename)],
+    );
+    assert!(matches!(
+        apply(rt, &token, vec![op]).await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    let row = entity_row(rt, &token, a).await.unwrap();
+    assert_eq!(row.name, "new");
+    assert_eq!(sorted_aliases(&row), vec![alias("old", Rename)]);
+}
+
+fn secret_shaped_alias() -> String {
+    const ALPHANUMERIC: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let candidate: String = (0..48)
+        .map(|index| char::from(ALPHANUMERIC[(index * 17 + 11) % ALPHANUMERIC.len()]))
+        .collect();
+    format!("secret value: {candidate}")
+}
+
+async fn secret_refusal(rt: &KhiveRuntime, token: &NamespaceToken, ops: Vec<Op>) -> usize {
+    match prepare_canonical_changeset(rt, &registry(), token, &changeset(ops)).await {
+        Err(RuntimeError::CanonicalAdmission { op_index, source }) => {
+            assert!(
+                matches!(
+                    source.as_ref(),
+                    RuntimeError::SecretDetected(found)
+                        if found.location.as_deref() == Some("entity.aliases")
+                ),
+                "{source:?}"
+            );
+            op_index
+        }
+        Err(other) => panic!("expected an admission refusal, got {other:?}"),
+        Ok(_) => panic!("expected an admission refusal, the change set was prepared"),
+    }
+}
+
+/// ADR-221 section 2: every alias in a change is scanned by the secret gate
+/// before any write. A secret-shaped alias in an update's alias set, or in a
+/// create's aliases, refuses the change set at the alias field and leaves the
+/// stored aliases as they were.
+#[tokio::test]
+async fn a_secret_shaped_alias_is_refused_before_any_write() {
+    use EntityAliasOrigin::Caller;
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let secret = secret_shaped_alias();
+    assert!(
+        matches!(
+            crate::secret_gate::check(&secret),
+            Err(RuntimeError::SecretDetected(_))
+        ),
+        "fixture alias must trip the detector on its own"
+    );
+    let a = Uuid::new_v4();
+    assert!(matches!(
+        apply(rt, &token, vec![keyed_create(a, "name", None, &["nick"])]).await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+
+    let op = alias_update(
+        a,
+        "name",
+        "name",
+        vec![alias("nick", Caller)],
+        vec![alias("nick", Caller), alias(&secret, Caller)],
+    );
+    assert_eq!(secret_refusal(rt, &token, vec![op]).await, 0);
+    assert_eq!(
+        sorted_aliases(&entity_row(rt, &token, a).await.unwrap()),
+        vec![alias("nick", Caller)]
+    );
+
+    let b = Uuid::new_v4();
+    let create = keyed_create(b, "other", None, &["fine", &secret]);
+    assert_eq!(secret_refusal(rt, &token, vec![create]).await, 0);
+    assert!(entity_row(rt, &token, b).await.is_none());
+}
+
+/// The writer checks the rename again: an alias equal to the new name that
+/// appeared after preparation rolls the change set back.
+#[tokio::test]
+async fn a_held_alias_taken_after_preparation_rolls_the_rename_back() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let a = Uuid::new_v4();
+    assert!(matches!(
+        apply(rt, &token, vec![entity_create(a, "old")]).await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    let plans = prepare_canonical_changeset(
+        rt,
+        &registry(),
+        &token,
+        &changeset(vec![rename(a, "old", "new")]),
+    )
+    .await
+    .unwrap();
+    insert_alias(rt, &token, a, "new").await;
+    assert!(matches!(
+        crate::run_atomic_unit(rt.sql().as_ref(), plans)
+            .await
+            .unwrap(),
+        crate::AtomicRunOutcome::RolledBack { .. }
+    ));
+    let row = entity_row(rt, &token, a).await.unwrap();
+    assert_eq!(row.name, "old");
+    assert_eq!(
+        sorted_aliases(&row),
+        vec![alias("new", EntityAliasOrigin::Caller)]
+    );
 }
 
 #[tokio::test]
@@ -291,7 +774,7 @@ async fn delete_ignores_only_updated_at_and_keeps_ordinary_delete_effects() {
         target_id: id128(id),
         hard: false,
         preimage: khive_changeset::DeletePreimage::Entity(Box::new(
-            projection::entity(&row).unwrap(),
+            projection::entity(&row).unwrap().into(),
         )),
     });
     let plans = prepare_canonical_changeset(rt, &registry(), &token, &changeset(vec![op]))
@@ -448,8 +931,8 @@ fn schema_count_and_merge_are_checked_before_preparation() {
         into_id: into.header.id,
         from_id: from.header.id,
         preimage: khive_changeset::MergePreimage {
-            into: Box::new(into),
-            from: Box::new(from),
+            into: Box::new(into.into()),
+            from: Box::new(from.into()),
             incident_edges: Vec::new(),
         },
     });
@@ -656,7 +1139,7 @@ async fn restore_refuses_the_whole_changeset_before_preparation() {
     let restore = Op::Restore(
         khive_changeset::RestoreOp::new(
             record.header.id,
-            khive_changeset::DeletePreimage::Entity(Box::new(record)),
+            khive_changeset::DeletePreimage::Entity(Box::new(record.into())),
         )
         .unwrap(),
     );

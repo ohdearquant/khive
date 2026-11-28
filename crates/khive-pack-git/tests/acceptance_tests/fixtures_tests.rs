@@ -1,5 +1,16 @@
 fn rt() -> KhiveRuntime {
-    KhiveRuntime::memory().expect("memory runtime")
+    KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".to_string()],
+        brain_profile: None,
+        actor_id: None,
+        git_digest: khive_runtime::GitDigestSectionConfig {
+            local_roots: vec![std::env::temp_dir()],
+            remotes: vec!["https://github.com/fixture/repository".to_string()],
+        },
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("memory runtime")
 }
 
 fn list_items(response: &Value) -> &[Value] {
