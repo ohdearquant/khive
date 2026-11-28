@@ -11,17 +11,27 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 async fn seed_tasks(runtime: &KhiveRuntime, count: u32) -> Vec<Uuid> {
+    seed_tasks_with(runtime, count, |_, _| {}).await
+}
+
+async fn seed_tasks_with(
+    runtime: &KhiveRuntime,
+    count: u32,
+    mut configure: impl FnMut(u32, &mut Value),
+) -> Vec<Uuid> {
     let mut notes: Vec<Note> = (0..count)
         .map(|index| {
             let mut note = Note::new("local", "task", format!("page content {index}"));
             note.id = Uuid::from_u128((u128::from(index) + 1) << 96);
             note.name = Some(format!("page-task-{index:03}"));
-            note.properties = Some(json!({
+            let mut properties = json!({
                 "status": "next",
                 "priority": "p2",
                 "assignee": "page-reader",
                 "description": format!("stored description {index}"),
-            }));
+            });
+            configure(index, &mut properties);
+            note.properties = Some(properties);
             note.created_at = 1_000_000 + i64::from(index);
             note.updated_at = note.created_at;
             note
@@ -96,6 +106,90 @@ fn assert_complete(response: &Value, expected: &[Uuid]) {
             .expect("an exhausted unclamped page remains an array"),
         expected,
     );
+}
+
+#[tokio::test]
+async fn compact_tasks_keep_page_ids_and_order_under_40_kb() {
+    let runtime = rt();
+    let fixture = pack(runtime.clone());
+    let description = "é".repeat(256);
+    let history = json!([{"from":"inbox","to":"next","note":"transition detail ".repeat(64)}]);
+    let ids = seed_tasks_with(&runtime, 201, |index, properties| {
+        if index == 0 {
+            properties.as_object_mut().unwrap().remove("description");
+            return;
+        }
+        properties["description"] = json!(description);
+        properties["transition_history"] = history.clone();
+        properties["tags"] = json!(["triage"]);
+    })
+    .await;
+
+    let args = json!({"status":"next","assignee":"page-reader","limit":200});
+    let full = fixture.dispatch("gtd.tasks", args.clone()).await.unwrap();
+    assert_continued(&full, &ids[..200]);
+    let mut explicit_default_args = args.clone();
+    explicit_default_args["compact"] = json!(false);
+    let explicit_default = fixture
+        .dispatch("gtd.tasks", explicit_default_args)
+        .await
+        .unwrap();
+    let agent_json = |value| {
+        let mode = PresentationMode::Agent;
+        render_format(present(value, mode, 0), OutputFormat::Json, mode)
+    };
+    let full_wire = agent_json(full.clone());
+    assert_eq!(full_wire, agent_json(explicit_default));
+    assert!(full_wire.len() > 40_000);
+
+    let mut compact_args = args;
+    compact_args["compact"] = json!(true);
+    let compact = fixture
+        .dispatch("gtd.tasks", compact_args.clone())
+        .await
+        .unwrap();
+    assert_keys(&compact, &["tasks", "has_more"]);
+    assert_eq!(compact["has_more"], true);
+    let wire = agent_json(compact);
+    assert!(wire.len() < 40_000, "compact page was {} bytes", wire.len());
+    let compact: Value = serde_json::from_str(&wire).unwrap();
+    let full: Value = serde_json::from_str(&full_wire).unwrap();
+    let rows = compact["tasks"].as_array().unwrap();
+    assert_eq!(rows.len(), 200);
+    for (row, full) in rows.iter().zip(full["tasks"].as_array().unwrap()) {
+        assert_keys(
+            row,
+            &[
+                "id",
+                "title",
+                "status",
+                "priority",
+                "assignee",
+                "tags",
+                "updated_at",
+                "description_length",
+            ],
+        );
+        for field in [
+            "id",
+            "title",
+            "status",
+            "priority",
+            "assignee",
+            "updated_at",
+        ] {
+            assert_eq!(row[field], full[field]);
+        }
+        assert_eq!(row["tags"], json!(["triage"]));
+        assert_eq!(row["description_length"], description.len());
+    }
+
+    compact_args["offset"] = json!(200);
+    let last = fixture.dispatch("gtd.tasks", compact_args).await.unwrap();
+    let last = last.as_array().expect("exhausted compact page is an array");
+    assert_eq!(last.len(), 1);
+    assert_eq!(last[0]["description_length"], 0);
+    assert_eq!(last[0]["tags"], json!([]));
 }
 
 #[tokio::test]

@@ -88,6 +88,14 @@ without a `has_more` marker. Its limit-clamp report is not a completeness
 signal. Use paged `gtd.tasks` for inventory, with its different ordering and
 dependency diagnostics.
 
+## Compact task pages
+
+Pass `gtd.tasks(compact=true)` to request `id`, `title`, `status`, `priority`,
+`assignee`, `tags`, `updated_at`, and `description_length` for each task. The
+description length counts UTF-8 bytes and is zero when there is no stored
+description. Compact pages use the same filters, task order, and continuation
+metadata as default pages. Omit `compact` or pass `compact=false` for full rows.
+
 ## `fetch_all_matching_tasks` — bounded single-snapshot scan (issue #772, #825)
 
 Fetches every `task` note matching `property_filters` in a single bounded
@@ -126,7 +134,7 @@ Dependency scheduling reads `properties.depends_on`. To change blockers, use
 an empty array clears the scheduling dependencies. Targets must be live task notes
 in the dependent task's namespace, and self-dependencies and cycles are refused.
 
-Every task returned by `gtd.tasks` carries `dependency_state`, `actionable`,
+Every full row returned by `gtd.tasks` carries `dependency_state`, `actionable`,
 and `blocked_by`. A dependency state is `ready` when every blocker is done,
 `blocked` when at least one live blocker is still pending, and `broken` when a
 blocker is cancelled, soft-deleted, missing after hard deletion, malformed, or
