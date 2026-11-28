@@ -17,7 +17,8 @@ use uuid::Uuid;
 
 use crate::text::normalize;
 use crate::vocab::{
-    self, FIELD, FIELD_VALUE, FORM, FORM_ISSUER, FORM_ITEM, FORM_RULE, FORM_SECTION,
+    self, FIELD, FIELD_VALUE, FORM, FORM_ISSUER, FORM_ITEM, FORM_RULE, FORM_SECTION, FORM_SUBJECT,
+    FORM_TERM,
 };
 
 const ENTITY_PAGE: u32 = 500;
@@ -308,6 +309,12 @@ impl Graph {
                 prop_text(e, "source_page")?,
                 normalize(&prop_text(e, "text").unwrap_or_else(|| e.name.clone()))
             ),
+            FORM_SUBJECT => format!(
+                "{}/subject:{}",
+                prop_text(e, "form_key")?,
+                normalize(&prop_text(e, "subject_id")?)
+            ),
+            FORM_TERM => format!("term:{}:{}", prop_text(e, "list")?, normalize(&e.name)),
             _ => return None,
         })
     }
@@ -459,6 +466,24 @@ impl Graph {
             }
         }
         items
+    }
+
+    /// The subjects one form revision declares, by folded id.
+    pub(crate) fn subjects_of(&self, form_key: &str) -> HashMap<String, &Entity> {
+        self.of_type(FORM_SUBJECT)
+            .into_iter()
+            .filter(|s| prop_text(s, "form_key").as_deref() == Some(form_key))
+            .filter_map(|s| prop_text(s, "subject_id").map(|id| (normalize(&id), s)))
+            .collect()
+    }
+
+    /// The loaded terms of one list, by folded name.
+    pub(crate) fn terms(&self, list: &str) -> HashMap<String, &Entity> {
+        self.of_type(FORM_TERM)
+            .into_iter()
+            .filter(|t| prop_text(t, "list").as_deref() == Some(list))
+            .map(|t| (normalize(&t.name), t))
+            .collect()
     }
 }
 
