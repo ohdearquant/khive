@@ -14,7 +14,7 @@ The pack is linked into the server and selected by name (`--pack forms`, beside 
 | `forms.split` | Record that one label names two things: rename, add, and a general field over both. |
 | `forms.resolve` | Find the field a wording means, from the exact wording down to its initials and its words; a shared wording resolves as ambiguous, and a miss names the nearest fields. |
 | `forms.neighbourhood` | Read one node with its typed edges. |
-| `forms.terms` | List the loaded kinds, roles, relations and counting qualifiers, each with its definition and aliases, and whether a relation carries. |
+| `forms.terms` | List the loaded kinds, roles, relations, purposes and counting qualifiers, each with its definition and aliases, and whether a relation carries. |
 | `forms.subjects` | List the subjects one form revision declares; the revision loaded last unless one is named. |
 | `forms.check` | Check a set of forms and answers against the printed rules. |
 | `forms.lint` | List nodes that break the store's invariants. |
@@ -36,6 +36,10 @@ An outside system that holds values about a subject, such as a permit portal, is
 ## Subjects and lines
 
 A field is role-free: `legal name`, never "the applicant's legal name". Whose value a line asks for is a subject the form revision declares: a party or a thing, with a kind and a role from term lists the caller loads (`terms` in the document), an optional qualifier, an optional row count (`repeats`, from 1 to 100) and named relations to other subjects of the same form. A subject belongs to its revision and is never merged with another form's.
+
+`forms.neighbourhood` on a field lists under `stated_by` every line that states the field, each with its document type, whether that type is a system, its form and revision, and the subject and role it states it of. `document_type:<id>` names a document type as a node; the reply gives its system mark, origin, issuer class and the forms it contains.
+
+A field may be known by other names in vocabularies (`known_as: [{vocabulary, name}]` on a field of `forms.load`). Each name is held as the key `forms/<vocabulary>/field/<name>` on the field, written with the load, so one name in one vocabulary names one field: a second field given it is refused, while the same name in another vocabulary is accepted. A vocabulary may not be named after an operation node type (`reserved_vocabulary`). Export and replay keep the names.
 
 A term may carry aliases (`{name, definition?, aliases?}`). A name or an alias resolves to its term, so a later document that names a loaded term by any of its wordings means that term and adds its further wordings as aliases; a term whose wordings name two loaded terms of one list is refused. Subjects are stored under the canonical names. Two more lists sit beside kinds, roles and relations: `counting_qualifiers`, the qualifiers that only count ("first", "second", "additional"), compared after folding case and spaces; and `carrying_relations`, the relations by which one subject carries another ("belongs to"), each a relation listed in the same document or loaded before it. `forms.neighbourhood` on a term shows its aliases and whether it carries.
 

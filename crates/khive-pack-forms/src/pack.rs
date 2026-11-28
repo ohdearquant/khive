@@ -111,7 +111,7 @@ pub(crate) static FORMS_HANDLERS: [HandlerDef; 12] = [
     },
     HandlerDef {
         name: "forms.terms",
-        description: "List the namespace's term lists, as forms.load takes them: kinds, roles, relations and counting_qualifiers. Each term comes with its definition, its aliases, and whether it is a relation by which one subject carries another (carries). Writes nothing.",
+        description: "List the namespace's term lists, as forms.load takes them: kinds, roles, relations, purposes and counting_qualifiers. Each term comes with its definition, its aliases, and whether it is a relation by which one subject carries another (carries). Writes nothing.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[],
