@@ -7,6 +7,7 @@
 
 mod definition;
 mod frontier;
+mod graph;
 mod pack;
 mod resolve;
 mod schema;

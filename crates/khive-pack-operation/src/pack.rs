@@ -159,6 +159,10 @@ impl Pack for OperationPack {
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &OPERATION_HANDLERS;
+    const EDGE_RULES: &'static [khive_types::EdgeEndpointRule] =
+        &crate::graph::OPERATION_EDGE_RULES;
+    const ENTITY_TYPES: &'static [khive_types::EntityTypeDef] =
+        &crate::graph::OPERATION_ENTITY_TYPES;
     /// Slots name their kinds, roles and relations from the forms pack's term lists, and
     /// resolve reads a form's subjects there.
     const REQUIRES: &'static [&'static str] = &["forms"];
