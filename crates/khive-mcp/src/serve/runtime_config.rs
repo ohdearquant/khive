@@ -2,6 +2,8 @@
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
+use anyhow::Context as _;
+
 use khive_runtime::{
     config_from_env, parse_pack_list, runtime_config_from_khive_config, BackendConfig, BackendId,
     BackendKind, BlobHydrator, KhiveConfig, KhiveRuntime, Namespace, OpenedDiagnosticBackend,
@@ -10,6 +12,7 @@ use khive_runtime::{
 
 #[cfg(unix)]
 use super::preflight_events_socket_for_boot;
+use super::storage_topology::read_applied_schema_version;
 #[cfg(doc)]
 use super::{build_server, validate_db_override_against_backends};
 use super::{
@@ -59,6 +62,9 @@ pub(super) async fn build_single_backend_runtime_with_max_readers(
         crate::attachment_cutover::legacy_preference_verifier(),
     )
     .await?;
+    if daemon_claims.is_some() {
+        prepare_daemon_serving_schemas(Arc::clone(&backend), "backend main").await?;
+    }
 
     let runtime = KhiveRuntime::from_prepared_backend(backend, config)?
         .with_outbound_email_policy(email_policy)
@@ -116,6 +122,35 @@ pub(super) async fn prepare_core_schema_for_boot(
     .await
     .map_err(|error| anyhow::anyhow!("{label}: schema preparation task panicked: {error}"))?
     .map_err(|error| anyhow::anyhow!("{label}: schema preparation: {error}"))
+}
+
+/// Prepare the stores a daemon will serve before its listener binds.
+pub(super) async fn prepare_daemon_serving_schemas(
+    backend: Arc<StorageBackend>,
+    label: &str,
+) -> anyhow::Result<()> {
+    let preparing = Arc::clone(&backend);
+    let result = tokio::task::spawn_blocking(
+        khive_db::WriteClassContext::migration().wrap_blocking(move || {
+            preparing
+                .prepare_serving_store_schemas()
+                .context("prepare serving store schemas")?;
+            preparing
+                .check_serving_forced_indexes()
+                .context("check forced serving indexes")
+                .map(|_| ())
+        }),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("{label}: serving schema readiness task failed: {error}"))?;
+    if let Err(error) = result {
+        let version = read_applied_schema_version(backend.sql().as_ref())
+            .await
+            .map(|version| version.to_string())
+            .unwrap_or_else(|_| "unknown".to_owned());
+        anyhow::bail!("{label} schema version {version}: {error:#}");
+    }
+    Ok(())
 }
 
 /// Resolve and install blob hydration on an already prepared runtime.

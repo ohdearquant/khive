@@ -11,6 +11,7 @@ use khive_runtime::{
 use super::mcp_max_readers;
 #[cfg(unix)]
 use super::preflight_events_socket_for_boot;
+use super::runtime_config::prepare_daemon_serving_schemas;
 use super::{
     build_registry_for_multi_backend_inner,
     build_registry_for_multi_backend_inner_with_max_readers, canonical_backend_path,
@@ -1262,12 +1263,16 @@ pub(super) async fn prepare_configured_storage_topology(
             unique_secondary.push((backend_name.to_string(), Arc::clone(backend)));
         }
     }
+    let serving_daemon = purpose == StorageTopologyPurpose::Serving && daemon_claims.is_some();
     for (backend_name, backend) in unique_secondary {
         crate::attachment_cutover::coordinate_empty_secondary_attachment_cutover(
-            backend,
+            Arc::clone(&backend),
             &backend_name,
         )
         .await?;
+        if serving_daemon {
+            prepare_daemon_serving_schemas(backend, &format!("backend {backend_name}")).await?;
+        }
     }
 
     // Only now may main advance. In particular, a zero-ref V20 main must not
@@ -1322,6 +1327,9 @@ pub(super) async fn prepare_configured_storage_topology(
         crate::attachment_cutover::legacy_preference_verifier(),
     )
     .await?;
+    if serving_daemon {
+        prepare_daemon_serving_schemas(Arc::clone(&main_backend), "backend main").await?;
+    }
 
     Ok(PreparedStorageTopology {
         base_config,
