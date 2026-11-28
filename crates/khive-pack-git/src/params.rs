@@ -160,6 +160,7 @@ arguments!(Init {
 arguments!(Checkout {
     repo,
     r#ref,
+    paths,
     session_id
 });
 arguments!(Diff {

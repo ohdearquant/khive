@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `forms.terms` lists the loaded terms with their aliases, and `forms.subjects` lists the subjects
   of one form revision. A term may carry aliases, and two more term lists, `counting_qualifiers`
   and `carrying_relations`, sit beside kinds, roles and relations.
+- `operation.define` publishes step types on their own, and a step of an operation type may pin
+  one by id and version. A step may name the values it requires and produces and take a value
+  another step produces; a step that requires a value comes after the step that produces it.
 - The `forms` pack records what kind of document each form revision is. A `document_type` node
   (`id`, `name`, `origin` of `applicant`, `third_party` or `work`, optional `issuer_class`)
   contains its revisions; `forms.load` takes it as `document_type` and mints one, marked `minted`,
