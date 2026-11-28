@@ -163,6 +163,11 @@ pub(crate) fn is_stating(item: &Entity) -> bool {
     line_relation(item) == "states"
 }
 
+/// Whether a document type is an outside system's record schema.
+pub(crate) fn is_system(document_type: &Entity) -> bool {
+    prop(document_type, "system").and_then(Value::as_bool) == Some(true)
+}
+
 pub(crate) fn quoted_names(entities: &[&Entity]) -> String {
     entities
         .iter()

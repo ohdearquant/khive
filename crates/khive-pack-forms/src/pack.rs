@@ -101,11 +101,11 @@ pub(crate) static FORMS_HANDLERS: [HandlerDef; 12] = [
     },
     HandlerDef {
         name: "forms.neighbourhood",
-        description: "Show what surrounds a form, a field or any forms node: the typed nodes and edges within depth, each with its source. A form also gets its sections and items in printed order, its rules and its related forms by relation; a field gets every item that asks for it, whom each line on a form with subjects asks it of, its general and narrower fields and its values. A form also lists the subjects it declares; a subject gets the fields its lines ask for; a term gets every subject that names it, with its form and the fields asked of it.",
+        description: "Show what surrounds a form, a field or any forms node: the typed nodes and edges within depth, each with its source. A form also gets its sections and items in printed order, its rules and its related forms by relation; a field gets every item that asks for it, whom each line on a form with subjects asks it of, its general and narrower fields and its values. A form also lists the subjects it declares; a subject gets the fields its lines ask for; a term gets every subject that names it, with its form and the fields asked of it. A field also lists under stated_by every line that states it, each with its document type, whether that type is a system, its form and revision, and the subject and role it states it of. A document type, named document_type:<id>, gets whether it is a system and the forms it contains.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
-            param("node", "string", true, "A node id, a form (form_id or form_id@revision), a field name, or a term as kind:<name>, role:<name> or relation:<name>."),
+            param("node", "string", true, "A node id, a form (form_id or form_id@revision), a field name, or a term as kind:<name>, role:<name> or relation:<name>, or a document type as document_type:<id>."),
             param("depth", "integer", false, "Edges to follow outward: 1 to 3, default 1."),
         ],
     },

@@ -17,7 +17,7 @@ use super::params::{self, Args};
 use super::views::{field_reply, nearest};
 use super::Ctx;
 use crate::store::{
-    aliases, document_type_key, form_key, invalid, is_general, label, pending_premise,
+    aliases, document_type_key, form_key, invalid, is_general, is_system, label, pending_premise,
     pending_premises, prop, prop_text, props, quoted_names, scalar, strings, type_of, wordings,
     Graph, Writes, GRAPH_RELATIONS,
 };
@@ -413,10 +413,6 @@ fn type_props(spec: &TypeSpec) -> Map<String, Value> {
         props.insert("issuer_class".to_owned(), json!(issuer_class));
     }
     props
-}
-
-fn is_system(document_type: &Entity) -> bool {
-    prop(document_type, "system").and_then(Value::as_bool) == Some(true)
 }
 
 /// A system's record only states what it holds: nobody fills a line of it in

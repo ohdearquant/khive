@@ -40,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `document_type` with `system: true` in place of an `origin`. Every line of a system's record
   states its field; an asking or requiring line on one is refused at `forms.load` and
   `forms.add_item` (#6904, ADR-222 Amendment 1).
+- `forms.neighbourhood` takes a document type as `document_type:<id>` and gives its node whether
+  the type is a system and the forms it contains. On a field it adds `stated_by`: every line that
+  states the field, with its document type, form, revision, subject and role (ADR-222 Amendment 2).
 - `git.pr_list` and `git.issue_list` list the pull requests or issues of a configured repository
   in the requested state (`open` unless `closed` or `all` is named), newest created first, one
   hundred to a page for at most ten pages, and say in `truncated` whether more matched.

@@ -681,3 +681,70 @@ async fn export_and_replay_keep_the_system_mark() {
         .await;
     assert!(message.contains("is a system"), "{message}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_field_lists_the_lines_that_state_it_and_a_document_type_is_a_node() {
+    let store = Store::with_both().await;
+    store.load(portal_record(PORTAL, 3)).await;
+
+    // The application asks for the legal name; only the two stating lines are listed.
+    let name = store
+        .call("forms.neighbourhood", json!({"node": NAME}))
+        .await;
+    assert_eq!(
+        name["stated_by"],
+        json!([
+            {"document_type": IDENTITY_TYPE, "system": false, "form": IDENTITY, "revision": "2026-01", "subject": "holder", "role": "holder"},
+            {"document_type": PORTAL_TYPE, "system": true, "form": PORTAL, "revision": "2026-01", "subject": "holder", "role": "holder"}
+        ]),
+        "{name}"
+    );
+    let birth = store
+        .call("forms.neighbourhood", json!({"node": BIRTH}))
+        .await;
+    assert_eq!(
+        birth["stated_by"].as_array().map(Vec::len),
+        Some(1),
+        "{birth}"
+    );
+    assert_eq!(birth["stated_by"][0]["form"], IDENTITY, "{birth}");
+
+    let portal = store
+        .call(
+            "forms.neighbourhood",
+            json!({"node": format!("document_type:{PORTAL_TYPE}")}),
+        )
+        .await;
+    assert_eq!(portal["node"]["type"], "document_type", "{portal}");
+    assert_eq!(portal["node"]["system"], true, "{portal}");
+    assert_eq!(portal["node"]["forms"][0]["form_id"], PORTAL, "{portal}");
+    assert_eq!(
+        portal["node"]["forms"].as_array().map(Vec::len),
+        Some(1),
+        "{portal}"
+    );
+
+    let identity = store
+        .call(
+            "forms.neighbourhood",
+            json!({"node": format!("document_type:{IDENTITY_TYPE}")}),
+        )
+        .await;
+    assert_eq!(identity["node"]["system"], false, "{identity}");
+    assert_eq!(identity["node"]["origin"], "third_party", "{identity}");
+    assert_eq!(
+        identity["node"]["forms"][0]["form_id"], IDENTITY,
+        "{identity}"
+    );
+
+    let message = store
+        .refused(
+            "forms.neighbourhood",
+            json!({"node": "document_type:no-such-type"}),
+        )
+        .await;
+    assert!(
+        message.contains("no document type \"no-such-type\" is loaded"),
+        "{message}"
+    );
+}

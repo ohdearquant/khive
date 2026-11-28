@@ -13,8 +13,8 @@ use super::views::{field_reply, usage};
 use super::write::{DECISION, FORMAT, LOG_KEYS};
 use super::Ctx;
 use crate::store::{
-    aliases, definition, invalid, is_general, is_stating, label, prop, prop_text, props, scalar,
-    strings, type_of, wordings, Graph,
+    aliases, definition, invalid, is_general, is_stating, is_system, label, prop, prop_text, props,
+    scalar, strings, type_of, wordings, Graph,
 };
 use crate::text::normalize;
 use crate::vocab::{
@@ -190,6 +190,12 @@ fn find_node<'g>(graph: &'g Graph, spec: &str) -> Result<&'g Entity, RuntimeErro
         return graph
             .get(id)
             .ok_or_else(|| invalid(format!("no forms node has id {spec}")));
+    }
+    // A document type is named by its id: document_type:identity-document.
+    if let Some(id) = spec.strip_prefix("document_type:") {
+        return graph
+            .document_type_by_id(id)
+            .ok_or_else(|| invalid(format!("no document type \"{id}\" is loaded")));
     }
     if let Ok(found) = graph.find_form(spec).or_else(|_| graph.find_field(spec)) {
         return Ok(found);
@@ -406,6 +412,40 @@ pub(crate) async fn neighbourhood(ctx: &Ctx<'_>, params: Value) -> Result<Value,
                     })
                     .collect(),
             );
+            // Every line that states this field, with the document type it
+            // belongs to and whom it states it of (ADR-222 A2.8).
+            let mut stated_by: Vec<Value> = graph
+                .items_of_field(root.id)
+                .into_iter()
+                .filter_map(|i| graph.get(i))
+                .filter(|item| is_stating(item))
+                .filter_map(|item| {
+                    let form = graph.form_of(item)?;
+                    let key = graph.key(form.id)?;
+                    let document_type = graph.document_type_of(form.id);
+                    let about = prop_text(item, "about");
+                    let role = about.as_ref().and_then(|about| {
+                        graph
+                            .subjects_of(&key)
+                            .get(&normalize(about))
+                            .and_then(|s| prop_text(s, "role"))
+                    });
+                    Some(json!({
+                        "document_type": document_type.and_then(|t| prop_text(t, "document_type_id")),
+                        "system": document_type.is_some_and(is_system),
+                        "form": prop_text(form, "form_id"),
+                        "revision": prop_text(form, "revision"),
+                        "subject": about,
+                        "role": role,
+                    }))
+                })
+                .collect();
+            stated_by.sort_by_key(|row| {
+                ["document_type", "form", "revision", "subject"]
+                    .map(|key| row[key].as_str().unwrap_or_default().to_owned())
+            });
+            stated_by.dedup();
+            reply["stated_by"] = Value::Array(stated_by);
             reply["general"] = json!(names(
                 &graph,
                 &graph
@@ -472,6 +512,23 @@ pub(crate) async fn neighbourhood(ctx: &Ctx<'_>, params: Value) -> Result<Value,
                     })
                     .collect(),
             );
+        }
+        DOCUMENT_TYPE => {
+            let mut forms: Vec<&Entity> = graph
+                .out(root.id, EdgeRelation::Contains)
+                .into_iter()
+                .filter_map(|f| graph.get(f))
+                .filter(|f| type_of(f) == FORM)
+                .collect();
+            forms.sort_by_key(|f| graph.key(f.id));
+            reply["node"]["document_type_id"] = json!(prop_text(root, "document_type_id"));
+            reply["node"]["system"] = json!(is_system(root));
+            for key in ["origin", "issuer_class"] {
+                if let Some(value) = prop(root, key) {
+                    reply["node"][key] = value.clone();
+                }
+            }
+            reply["node"]["forms"] = Value::Array(forms.into_iter().map(cite).collect());
         }
         _ => {}
     }
