@@ -193,8 +193,8 @@ fleet_readers = []
 # [embed.fields] warn and are ignored. [[engines]] below controls providers.
 #
 # [embed]
+# Write-time embedding continues with either value. Boolean only, default true.
 # auto_embed = true
-# Boolean only (default true). Parsed here; automatic suppression is not wired yet.
 # batch_size = 128
 # Positive integer only; zero, negative and non-integer values are refused.
 # Used by kkernel reindex: --batch-size wins, omission defaults to 128, maximum 500.

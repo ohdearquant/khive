@@ -57,7 +57,9 @@ pub struct GitWritePolicyEntry {
 pub fn repo_access(verb: &str) -> GitRepoAccess {
     match verb {
         "git.checkout" | "git.diff" | "git.reconcile" | "git.status" | "git.log" | "git.gates"
-        | "git.pr_state" | "git.issue" | "git.check_log" => GitRepoAccess::Read,
+        | "git.pr_state" | "git.pr_list" | "git.issue" | "git.issue_list" | "git.check_log" => {
+            GitRepoAccess::Read
+        }
         _ => GitRepoAccess::Write,
     }
 }

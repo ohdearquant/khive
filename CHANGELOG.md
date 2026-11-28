@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a pull request. Terminal escapes and control and format characters are removed from the text and
   `text_altered` says when that changed anything; the text is returned as untrusted data. It is a
   read: a `[[git_write.allowed]]` row with `access = "read"` admits it, and it writes no receipt.
+- `git.pr_list` and `git.issue_list` list the pull requests or issues of a configured repository
+  in the requested state (`open` unless `closed` or `all` is named), newest created first, one
+  hundred to a page for at most ten pages, and say in `truncated` whether more matched.
+  `git.issue_list` omits the pull requests the platform lists among issues and counts them.
+  Hidden characters are removed from titles, refs, labels and logins and `text_altered` says so;
+  the text is returned as untrusted data. Both are reads, admitted by a row with
+  `access = "read"`, and write no receipt.
 
 ### Breaking (Rust crates)
 
@@ -238,7 +245,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dimensions` and `device` values still select no provider, vector size or hardware:
   `[[engines]]` controls providers. A differing model name, dimensions that disagree with the
   default engine's declared dimensions, or any supplied device produces a startup warning;
-  agreement is silent. Unknown `[embed]` and `[embed.fields]` keys still warn and load (#6537).
+  agreement is silent. `embed.auto_embed = false` and non-default `embed.fields.include` selectors
+  are validated and accepted with a warning. Write-time embedding continues and entity vectors
+  use their usual inputs. Unknown `[embed]` and `[embed.fields]` keys still warn and load (#6537).
 
 ### Breaking (Rust crates)
 

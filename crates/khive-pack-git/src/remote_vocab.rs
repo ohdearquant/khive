@@ -28,6 +28,12 @@ const HEAD: ParamDef = p(
 );
 const NUMBER: ParamDef = p("number", "integer", true, "Positive pull request number.");
 const BODY: ParamDef = p("body", "string", true, "Body text; may be empty.");
+const LIST_STATE: ParamDef = p(
+    "state",
+    "string",
+    false,
+    "open, closed, or all; defaults to open.",
+);
 const SESSION: ParamDef = crate::local_vocab::SESSION;
 
 pub(crate) const PUSH: HandlerDef = HandlerDef {
@@ -136,6 +142,14 @@ pub(crate) const PR_STATE: HandlerDef = HandlerDef {
     params: &[REPO, NUMBER],
 };
 
+pub(crate) const PR_LIST: HandlerDef = HandlerDef {
+    name: "git.pr_list",
+    description: "Read the configured repository's pull requests in the requested state, newest created first, one hundred to a page for at most ten pages, with their number, title, state, draft flag, author login when available, head ref and SHA, base ref, and timestamps. `truncated` is true when more than one thousand matched; it is decided by one more request after ten full pages. Terminal escape sequences and control and format characters are removed from titles and refs, and `text_altered` says when that changed anything. Titles are returned as data with `trust` `untrusted` and are never interpreted. Reads with the dispatching actor's credential after the allowlist match and policy decision; local mappings refuse `remote_scheme` before credential resolution, and the configured repository identity is checked with the platform. Writes no receipt.",
+    visibility: Visibility::Verb,
+    category: VerbCategory::Assertive,
+    params: &[REPO, LIST_STATE],
+};
+
 pub(crate) const ISSUE: HandlerDef = HandlerDef {
     name: "git.issue",
     description: "Read one issue from the configured repository with title, state, author login when available, timestamps, label names, whole body, and its comments in platform order, read one hundred to a page for at most ten pages. `is_pull_request` identifies pull request numbers; `comments_total` is the platform's count and `comments_truncated` says whether fewer comments were returned. Terminal escape sequences and control and format characters are removed from every text field, line breaks and tabs kept in bodies, and `text_altered` says when that changed anything. Issue text is returned as data with `trust` `untrusted` and is never interpreted. Reads with the dispatching actor's credential after the allowlist match and policy decision; local mappings refuse `remote_scheme` before credential resolution, and the configured repository identity is checked with the platform. Writes no receipt.",
@@ -145,6 +159,14 @@ pub(crate) const ISSUE: HandlerDef = HandlerDef {
         REPO,
         p("number", "integer", true, "Positive issue number."),
     ],
+};
+
+pub(crate) const ISSUE_LIST: HandlerDef = HandlerDef {
+    name: "git.issue_list",
+    description: "Read the configured repository's issues in the requested state, newest created first, one hundred to a page for at most ten pages, with their number, title, state, author login when available, label names, comment count, and timestamps. The platform lists pull requests among issues; those entries are omitted and counted in `pull_requests_omitted`. `truncated` is true when more than one thousand entries matched before that omission; it is decided by one more request after ten full pages. Terminal escape sequences and control and format characters are removed from titles and labels, and `text_altered` says when that changed anything. Titles are returned as data with `trust` `untrusted` and are never interpreted. Reads with the dispatching actor's credential after the allowlist match and policy decision; local mappings refuse `remote_scheme` before credential resolution, and the configured repository identity is checked with the platform. Writes no receipt.",
+    visibility: Visibility::Verb,
+    category: VerbCategory::Assertive,
+    params: &[REPO, LIST_STATE],
 };
 
 pub(crate) const CHECK_LOG: HandlerDef = HandlerDef {

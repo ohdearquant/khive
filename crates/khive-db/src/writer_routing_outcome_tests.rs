@@ -306,6 +306,51 @@ async fn strict_memory_sql_and_atomic_refuse_while_default_still_writes() {
 }
 
 #[tokio::test]
+async fn strict_read_only_sql_and_atomic_refuse_before_writer_initialization() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("read-only.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE existing_data (value INTEGER)")
+        .unwrap();
+    drop(conn);
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            read_only: true,
+            write_queue_enabled: Some(true),
+            write_routing_strict: true,
+            ..PoolConfig::for_test()
+        })
+        .unwrap(),
+    );
+    let bridge = crate::sql_bridge::SqlBridge::new(Arc::clone(&pool), true);
+    assert!(pool.write_queue_active());
+    assert_eq!(pool.writer_task_spawn_count(), 0);
+
+    let result = bridge.writer().await;
+    assert!(matches!(
+        result,
+        Err(StorageError::Pool { operation, message })
+            if operation == "writer" && message == "backend is read-only"
+    ));
+    assert_eq!(pool.writer_task_spawn_count(), 0);
+    assert!(!pool.writer_task_join_was_stored());
+
+    let result = bridge
+        .atomic_unit(Box::new(|_| {
+            Box::pin(async { panic!("a read-only unit must refuse before running its operation") })
+        }))
+        .await;
+    assert!(matches!(
+        result,
+        Err(StorageError::Pool { operation, message })
+            if operation == "atomic_unit" && message == "backend is read-only"
+    ));
+    assert_eq!(pool.writer_task_spawn_count(), 0);
+    assert!(!pool.writer_task_join_was_stored());
+}
+
+#[tokio::test]
 async fn strict_stopped_owner_refuses_before_queue_acceptance() {
     let (tx, rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(1);
     let writer = WriterTaskHandle {
