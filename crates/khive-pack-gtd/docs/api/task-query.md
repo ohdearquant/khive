@@ -68,7 +68,7 @@ For a known nonempty object page, a chained read can select
 or presence of a row is unknown, inspect the page before issuing a separate
 call with the chosen identifier. Indexing an object directly with `$prev[0]`
 produces a `substitution_error` with reason `path_wrong_type`; see the
-[exact diagnostic and source references](../../../../docs/adr/ADR-019-gtd-pack.md#amendment-8-proposed-2026-11-13-disclose-task-page-continuation-6549).
+[exact diagnostic and source references](../../../../docs/adr/ADR-019-gtd-pack.md#amendment-8-2026-11-13-disclose-task-page-continuation-6549).
 
 Continuation describes matching live task rows, including blocked or broken
 tasks. Dependency diagnostics annotate these rows; they do not remove tasks
@@ -87,6 +87,14 @@ at most its effective limit by priority and truncates further candidates
 without a `has_more` marker. Its limit-clamp report is not a completeness
 signal. Use paged `gtd.tasks` for inventory, with its different ordering and
 dependency diagnostics.
+
+## Compact task pages
+
+Pass `gtd.tasks(compact=true)` to request `id`, `title`, `status`, `priority`,
+`assignee`, `tags`, `updated_at`, and `description_length` for each task. The
+description length counts UTF-8 bytes and is zero when there is no stored
+description. Compact pages use the same filters, task order, and continuation
+metadata as default pages. Omit `compact` or pass `compact=false` for full rows.
 
 ## `fetch_all_matching_tasks` — bounded single-snapshot scan (issue #772, #825)
 
@@ -126,7 +134,7 @@ Dependency scheduling reads `properties.depends_on`. To change blockers, use
 an empty array clears the scheduling dependencies. Targets must be live task notes
 in the dependent task's namespace, and self-dependencies and cycles are refused.
 
-Every task returned by `gtd.tasks` carries `dependency_state`, `actionable`,
+Every full row returned by `gtd.tasks` carries `dependency_state`, `actionable`,
 and `blocked_by`. A dependency state is `ready` when every blocker is done,
 `blocked` when at least one live blocker is still pending, and `broken` when a
 blocker is cancelled, soft-deleted, missing after hard deletion, malformed, or
@@ -171,10 +179,9 @@ The query path batches live blocker reads and probes only unresolved ids for a
 soft-deleted row. A hard-deleted blocker therefore classifies as `missing`,
 while a tombstone classifies as `soft_deleted` without resurrecting it.
 
-## Proposed additive `gtd.tasks` filters (#2678)
+## Additive `gtd.tasks` filters (#2678)
 
-This section implements the proposed ADR-019 Amendment 3; its contract approval
-is pending. `gtd.tasks` additionally accepts:
+This section implements ADR-019 Amendment 3. `gtd.tasks` additionally accepts:
 
 - `tags`: array of strings, using SQLite `NOCASE` tag membership (ASCII
   case-insensitive, not general Unicode case folding). Missing, null, or empty

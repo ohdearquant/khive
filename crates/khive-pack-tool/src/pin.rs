@@ -172,7 +172,7 @@ pub(crate) async fn invalidating_registration<R: SqlReader + ?Sized>(
     pattern: &str,
 ) -> Result<Option<(String, i64)>, StorageError> {
     let prefix = pattern.strip_suffix('*').map_or(SqlValue::Null, |prefix| {
-        SqlValue::Blob(prefix.as_bytes().to_vec())
+        SqlValue::Blob(prefix.to_ascii_lowercase().into_bytes())
     });
     let row = reader
         .query_row(SqlStatement {
@@ -180,7 +180,7 @@ pub(crate) async fn invalidating_registration<R: SqlReader + ?Sized>(
               WHERE namespace = ?1 AND kind = ?5 AND deleted_at IS NULL \
                 AND EXISTS (SELECT 1 FROM json_each(entities.tags) WHERE lower(value) = ?4) \
                 AND (CAST(lower(name) AS BLOB) = ?2 \
-                     OR (?3 IS NOT NULL AND substr(CAST(name AS BLOB), 1, length(?3)) = ?3)) \
+                     OR (?3 IS NOT NULL AND substr(CAST(lower(name) AS BLOB), 1, length(?3)) = ?3)) \
               ORDER BY (CAST(lower(name) AS BLOB) = ?2) DESC, created_at, id LIMIT 1"
                 .into(),
             params: vec![

@@ -137,6 +137,51 @@ pub(super) fn accepted_entity_relations_description(
     }
 }
 
+fn endpoint_label(endpoint: &EndpointKind) -> String {
+    match endpoint {
+        EndpointKind::EntityOfKind(kind) => (*kind).to_owned(),
+        EndpointKind::EntityOfType { kind, entity_type } => format!("{kind}:{entity_type}"),
+        EndpointKind::NoteOfKind(kind) => format!("note:{kind}"),
+    }
+}
+
+/// Every endpoint pair the loaded contract admits for `relation`, written
+/// `source -> target`: the base allowlist's kind pairs (`*` = any kind) and
+/// the loaded packs' rules, a typed endpoint as `kind:entity_type`. Pack
+/// declarations for `annotates` and the special relations are left out for
+/// the reason [`accepted_entity_relations_for_entities`] gives.
+pub fn allowed_pairs_for_relation_description(
+    rules: &[EdgeEndpointRule],
+    relation: EdgeRelation,
+) -> String {
+    let mut pairs: Vec<String> = BASE_ENTITY_ENDPOINT_RULES
+        .iter()
+        .filter(|(_src, rule_relation, _tgt)| *rule_relation == relation)
+        .map(|(src, _relation, tgt)| format!("{src} -> {tgt}"))
+        .collect();
+    if relation != EdgeRelation::Annotates && !crate::pack::is_special_relation(relation) {
+        pairs.extend(
+            rules
+                .iter()
+                .filter(|rule| rule.relation == relation)
+                .map(|rule| {
+                    format!(
+                        "{} -> {}",
+                        endpoint_label(&rule.source),
+                        endpoint_label(&rule.target)
+                    )
+                }),
+        );
+    }
+    pairs.sort();
+    pairs.dedup();
+    if pairs.is_empty() {
+        "none".to_string()
+    } else {
+        pairs.join(", ")
+    }
+}
+
 /// Hint-only counterpart to [`accepted_pack_relations_for_entities`] that
 /// matches via [`pattern_endpoint_matches`] instead of [`endpoint_matches`],
 /// so an absent `entity_type` is treated as unconstrained rather than an

@@ -23,26 +23,27 @@ An always-machine-readable copy of this page is at
 | `gtd`       | 8     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 6     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 17    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
-| `comm`      | 15    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
+| `comm`      | 16    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 21    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 7     | `KHIVE_PACKS=kg,session`                   | Yes                 |
-| `git`       | 17    | `KHIVE_PACKS=kg,git`                       | Yes                 |
+| `git`       | 26    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 4     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 | `blob`      | 9     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
-| `tool`      | 14    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
+| `tool`      | 15    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
 | `exec`      | 9     | `KHIVE_PACKS=kg,exec`                      | Yes                 |
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
-`kkernel git-ingest` CLI drive. Its seventeen verbs are `git.digest` (read/ingest), `git.ingest_cursor` (a read of the
+`kkernel git-ingest` CLI drive. Its 26 verbs are `git.digest` (read/ingest), `git.ingest_cursor` (a read of the
 stored ingest cursor and checkpoint for one project and source kind), the four
 write verbs `git.commit` / `git.branch` / `git.update_ref` / `git.push` (ADR-108) that shell to system git
 with hardened, allowlisted argv construction, the three read verbs `git.status` /
 `git.log` / `git.init`, and the dev-loop verbs `git.checkout` /
 `git.diff` / `git.gates` / `git.receipts` / `git.reconcile` / `git.pr_open` / `git.pr_review` /
-`git.pr_merge` (ADR-182). Initial remote cache setup failures and terminal refetch/reclone
+`git.pr_merge` / `git.pr_state` / `git.pr_list` / `git.issue` / `git.issue_list` / `git.fetch` / `git.pr_edit` / `git.pr_close` /
+`git.check_log` / `git.branch_delete` (ADR-182). Initial remote cache setup failures and terminal refetch/reclone
 cache failures in `git.digest` return `RemoteFetchError` in-process. On the MCP `request`
 wire, the failed `tool: "git.digest"` result carries
 `error: {kind: "remote_fetch_error", remote, message, domain_disposition}`. `remote`
@@ -279,9 +280,19 @@ fresh insert under a supplied key returns the full note object with `created: tr
 so the two outcomes are distinguishable without a second round trip. A create without `key` keeps
 its existing response shape and carries no `created` field.
 
+An entity create may carry `aliases`, other exact names the entity answers to in `resolve` and
+text search. Aliases are a set: order and repeats do not matter. Each is non-empty, at most 512
+UTF-8 bytes, without U+0000, and passes the secret gate before any key lookup. An alias equal to
+the entity's name is not stored; the response, or the bulk item's result, lists it in
+`aliases_not_stored`. Aliases on a note, or a top-level `aliases` beside `items`, are refused.
+Entity reads return `aliases`, each `{alias, origin}` with origin `caller`, `rename` or `merge`,
+and omit the field when the entity has none.
+
 | Param               | Type            | Required    | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ------------------- | --------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `key`               | string          | no          | Singleton notes only. At most 512 UTF-8 bytes, no U+0000. See the exact-replay behavior described above.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `key`               | string          | no          | Singleton notes and entities, and a bulk entity item's own field. At most 512 UTF-8 bytes, no U+0000. An entity key is scoped to the base entity kind and released when the entity is deleted. See the exact-replay behavior described above; `on_key` sets what a differing entity replay does.                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `on_key`            | string          | no          | Keyed entity creates, singleton or a bulk entity item's own field; the one value is `"update"`. A held key with a different payload updates the holder to the request's payload and answers `created: false, updated: true` in place of `key_conflict`. The request replaces the holder's name, description, entity type, tags, properties and caller aliases; an optional field it leaves out is cleared. Needs update permission on the holder. Cannot be combined with `edges`, `embed` or fences.                                                                                                                                                                                                        |
+| `aliases`           | array\<string\> | no          | Entities only, singleton or as a bulk entity item's own field: other exact names of the entity, described above.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `kind`              | string          | conditional | Substrate (`entity`\|`note`) or granular kind (`concept`, `document`, `observation`, …). Required for the singleton path; not required when `items` is present.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `name`              | string          | no          | Entity name (singleton).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `entity_kind`       | string          | no          | concept\|document\|dataset\|project\|person\|org\|artifact\|service\|resource (when `kind="entity"`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
@@ -394,6 +405,7 @@ can still return `entity_type: null`. This fallback is specific to `list`, not
 | `entity_kind`                | string                   | no       | Filter when `kind="entity"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `entity_type`                | string                   | no       | Filter by type field when `kind="entity"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `note_kind`                  | string                   | no       | Filter when `kind="note"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `exclude_superseded`         | bool                     | no       | Default false; memory lists only. Exclude targets of visible live incoming `supersedes` edges before pagination.                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `tags`                       | array\<string\>          | no       | Case-insensitive OR-match over entity tags or note `properties.tags`; valid for `kind="entity"` and `kind="note"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `source_id` / `target_id`    | uuid                     | no       | Edge endpoint filters, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `relations`                  | array\<string\>          | no       | Edge relation filter, `kind="edge"` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
@@ -413,6 +425,33 @@ can still return `entity_type: null`. This fallback is specific to `list`, not
 request(ops="list(kind=\"entity\", entity_kind=\"concept\", limit=20)")
 ```
 
+`exclude_superseded=true` is valid only for `kind="memory"` or
+`kind="note", note_kind="memory"`. It removes a memory with a live incoming
+`supersedes` edge in any namespace visible to the request, using the memory
+backend. The successor need not match the list's filters or page. A soft-deleted
+successor still suppresses through its live edge; restoring that successor does
+not change suppression. Removing the edge lifts its effect. Hidden edges,
+outgoing edges, other relations and soft-deleted edges do not trigger the filter.
+This is a graph-only view, without recall's additional legacy
+`properties.supersedes` interpretation or ranking. It changes no stored rows,
+status, `get` results or default lists, and exposes no successor identities or
+new hidden-edge count. Omission or false retains existing behavior; supplying
+the option on another kind is refused, even when false. Null and non-booleans
+are refused.
+
+This filter runs before matching-row offset, limit, lookahead and continuation
+selection in ordinary, insertion-cursor and keyed pagination. Keyed listing
+keeps its primary-namespace note scope while checking edges in the request's
+full visible namespace set. Each call scans at most 10,000 raw rows in batches
+of at most 200. A capped scan reports `scan_incomplete: true` and `has_more: true`,
+including an empty page; insertion and keyed cursors return the last permitted
+scanned boundary. Continue with that cursor and unchanged filters. An incomplete
+offset page is not proof of exhaustion and cannot guarantee forward progress,
+because it rescans from the beginning; use a cursor walk beyond the scan ceiling.
+No full-page, total-count or cross-page/edge-read snapshot guarantee is implied.
+Cancellation and graph-read failures refuse the operation rather than returning
+an unfiltered or apparently complete page.
+
 `parse_content=true` replaces only a note's returned `content` field with its JSON value:
 objects, arrays, numbers, booleans, strings, and null are supported. Omission or false preserves
 the existing string representation, including whitespace and escapes. Parsing is a read projection;
@@ -426,6 +465,13 @@ Invalid JSON under `parse_content=true` returns `invalid_input`, naming the note
 `content` field; it does not fall back to a string and is distinct from the existing missing-note
 refusal. One invalid returned note refuses its list operation. Both verbs reject
 unknown fields by name; older servers without `parse_content` explicitly reject that parameter.
+
+Entity and note offset pages are ordered newest first by `created_at`. Entities
+that share a `created_at` follow `id` descending, notes `id` ascending, so
+`list(kind="entity", entity_type="...", limit=1)` returns the newest entity of a
+type. A note listing by `key_prefix` has its own order and is not covered here.
+Cursor mode does not follow this order: it walks the insertion sequence, oldest
+first, as described below.
 
 Offset-mode responses always use `{"items": [...], "requested_limit": N,
 "effective_limit": M, "limit_clamped": bool}`. The shape is identical whether or not the
@@ -529,31 +575,47 @@ request(ops="stats()")
 ### `update` — Declaration
 
 Patch entity, note, or edge fields. Field set depends on substrate: entities accept
-`name`/`description`/`properties`/`tags`; notes accept
+`name`/`description`/`properties`/`tags`/`add_aliases`/`remove_aliases`/`keep_old_name`; notes accept
 `name`/`content`/`salience`/`decay_factor`/`properties`/`tags`; edges accept
 `relation`/`weight`/`properties`.
 
 Entity/note text updates use the same full-source storage and bounded embedding contract as
 singleton `create`; a successful response includes `warnings` when embedding actually truncated.
 
-| Param          | Type            | Required | Notes                                                                             |
-| -------------- | --------------- | -------- | --------------------------------------------------------------------------------- |
-| `id`           | uuid            | yes      | Record to patch.                                                                  |
-| `kind`         | string          | no       | Substrate hint (`entity`\|`note`\|`edge`); omit to resolve from the UUID.         |
-| `name`         | string          | no       | Entities and notes.                                                               |
-| `description`  | string          | no       | Entities only.                                                                    |
-| `content`      | string          | no       | Notes only (body text).                                                           |
-| `salience`     | number          | no       | Notes only, 0.0–1.0.                                                              |
-| `decay_factor` | number          | no       | Notes only, >= 0.                                                                 |
-| `relation`     | string          | no       | Edges only, one of the 20 canonical relations.                                    |
-| `weight`       | number          | no       | Edges only, 0.0–1.0.                                                              |
-| `properties`   | object          | no       | Shallow-merged in.                                                                |
-| `tags`         | array\<string\> | no       | Entities and notes: replaces the tag list; omission preserves it, `[]` clears it. |
+| Param            | Type            | Required | Notes                                                                             |
+| ---------------- | --------------- | -------- | --------------------------------------------------------------------------------- |
+| `id`             | uuid            | yes      | Record to patch.                                                                  |
+| `kind`           | string          | no       | Substrate hint (`entity`\|`note`\|`edge`); omit to resolve from the UUID.         |
+| `name`           | string          | no       | Entities and notes.                                                               |
+| `description`    | string          | no       | Entities only.                                                                    |
+| `content`        | string          | no       | Notes only (body text).                                                           |
+| `salience`       | number          | no       | Notes only, 0.0–1.0.                                                              |
+| `decay_factor`   | number          | no       | Notes only, >= 0.                                                                 |
+| `relation`       | string          | no       | Edges only, one of the 20 canonical relations.                                    |
+| `weight`         | number          | no       | Edges only, 0.0–1.0.                                                              |
+| `properties`     | object          | no       | Shallow-merged in.                                                                |
+| `tags`           | array\<string\> | no       | Entities and notes: replaces the tag list; omission preserves it, `[]` clears it. |
+| `add_aliases`    | array\<string\> | no       | Entities only: aliases to add, as a set.                                          |
+| `remove_aliases` | array\<string\> | no       | Entities only: caller aliases to remove.                                          |
+| `keep_old_name`  | bool            | no       | Entities only, default true: keep the old name as a `rename` alias.               |
 
 Note tags remain stored and returned in `properties.tags`. Updating that property directly
 also replaces the list. When a request supplies both `tags` and `properties.tags`, top-level
 `tags` wins, including `tags=[]`; tags are never unioned. Other properties are shallow-merged
 as usual.
+
+`add_aliases` and `remove_aliases` apply to entities. An alias the entity already holds, of any
+origin, is left as it is; one equal to the entity's name after the update is not stored and is
+listed in `aliases_not_stored`. `remove_aliases` removes caller aliases only: anything it did not
+remove, a rename or merge alias included, is listed in `aliases_not_removed`, which is not an
+error. One alias in both lists is refused. An update that renames an entity to one of its caller
+aliases removes that alias. A change to the aliases reindexes the entity.
+
+An entity update that changes the name keeps the old name as an alias of origin `rename`, so
+`resolve` still finds the entity by it. `keep_old_name=false` stores no alias, as a split that
+hands the old name to another entity needs. Either way an alias the entity holds equal to the new
+name is removed whatever its origin, and the `entity_updated` event names `previous_name` and
+`name`.
 
 An unfenced note update whose normalized patch equals the stored value is a no-op: the stored row
 comes back with `unchanged: true`, and `version` and `updated_at` do not move. A note update that
@@ -589,7 +651,8 @@ stale search entry; use the returned id to reconcile it instead of repeating the
 
 Deduplicate two entities or notes. Returns `{kept_id, removed_id, edges_rewired,
 edges_contract_skipped, edge_conflict_preimages, properties_merged,
-tags_unioned, content_appended, dry_run}` — chain with `$prev.kept_id`, **not**
+tags_unioned, content_appended, dry_run, aliases_added, keys_moved, keys_rewritten,
+keys_already_held, key_conflicts}` — chain with `$prev.kept_id`, **not**
 `$prev.id` (merge has no top-level `id` field). When rewiring collides with an
 existing edge natural key, `edge_conflict_preimages` records the surviving edge
 id, the complete dropped edge, and any incident annotation edges removed by the
@@ -606,6 +669,18 @@ that fails it is refused with a conflict error naming the check in
 from_value, detail}` — so a dry run predicts the floor rather than failing on
 it. Every `dry_run` response carries `would_merge`.
 
+An entity merge also carries names and keys to the kept entity; on a note merge these fields are
+empty. `aliases_added` lists the names added as `merge` aliases: the merged-away entity's name and
+aliases, and the kept entity's previous name when the merge takes the other name. No alias equal
+to the kept name is stored. `keys_moved` lists each key moved to the kept entity as
+`{kind, key, from_kind}`, and `keys_rewritten` counts those whose kind changed, which only a forced
+merge of two kinds does. `keys_already_held` lists the `{kind, key}` pairs the kept entity already
+held; their rows on the merged-away entity are dropped. A key that another live entity holds under
+the kept entity's kind refuses the merge with a conflict error naming `merge_key_conflict` in
+`details.reason` and the keys in `details.conflicting_keys`, each with `existing_id` only when the
+caller may list that entity, and nothing is written. Under `dry_run=true` the same keys come back
+in `key_conflicts`, with `would_merge: false` and `refused_by: "merge_key_conflict"`.
+
 | Param     | Type | Required | Notes                                                                        |
 | --------- | ---- | -------- | ---------------------------------------------------------------------------- |
 | `into_id` | uuid | yes      | Entity that survives the merge (canonical).                                  |
@@ -621,23 +696,24 @@ request(ops="merge(into_id=\"<canonical-uuid>\", from_id=\"<dup-uuid>\")")
 
 Hybrid FTS + vector search with RRF fusion.
 
-| Param                | Type    | Required | Notes                                                                                                                                                               |
-| -------------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `kind`               | string  | yes      | Substrate or granular kind to search.                                                                                                                               |
-| `query`              | string  | yes      | Free-text query.                                                                                                                                                    |
-| `text_mode`          | string  | no       | KG entity/note lexical matching: `all_terms` (default, including null) or `any_term`; does not change the vector arm.                                               |
-| `limit`              | integer | no       | Default 10.                                                                                                                                                         |
-| `entity_kind`        | string  | no       | Entity-substrate searches only.                                                                                                                                     |
-| `entity_type`        | string  | no       | Entity-substrate searches only.                                                                                                                                     |
-| `note_kind`          | string  | no       | Note-substrate searches only.                                                                                                                                       |
-| `include_superseded` | bool    | no       | Note-substrate searches only; default false excludes notes targeted by a `supersedes` edge.                                                                         |
-| `properties`         | object  | no       | Match records whose properties contain all listed key=value pairs, applied before result truncation inside a bounded candidate window.                              |
-| `tags`               | array   | no       | OR-match against tags; entity tags matched at the SQL level, note tags read from `properties.tags`.                                                                 |
-| `min_rank_score`     | number  | no       | Inclusive deterministic rank floor in [0,1], default 0; applied after fusion and modifiers, before the final limit. Strategy/query-local, not calibrated relevance. |
-| `min_score`          | number  | no       | Deprecated exact alias of `min_rank_score` in v0.8. Supplying both names is invalid, even when equal.                                                               |
-| `order_by`           | string  | no       | `score` (default), `created_at`, or `updated_at`; timestamps sort newest first after the rank floor, within the bounded candidate window.                           |
-| `created_after`      | string  | no       | Inclusive RFC 3339 lower bound on record `created_at`; at most nine fractional-second digits.                                                                       |
-| `created_before`     | string  | no       | Inclusive RFC 3339 upper bound on record `created_at`; at most nine fractional-second digits. Must not precede `created_after`.                                     |
+| Param                | Type    | Required | Notes                                                                                                                                                                        |
+| -------------------- | ------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kind`               | string  | yes      | Substrate or granular kind to search.                                                                                                                                        |
+| `query`              | string  | yes      | Free-text query.                                                                                                                                                             |
+| `text_mode`          | string  | no       | KG entity/note lexical matching: `all_terms` (default, including null) or `any_term`; does not change the vector arm.                                                        |
+| `limit`              | integer | no       | Default 10.                                                                                                                                                                  |
+| `entity_kind`        | string  | no       | Entity-substrate searches only.                                                                                                                                              |
+| `entity_type`        | string  | no       | Entity-substrate searches only.                                                                                                                                              |
+| `note_kind`          | string  | no       | Note-substrate searches only.                                                                                                                                                |
+| `include_superseded` | bool    | no       | Note-substrate searches only; default false excludes notes targeted by a `supersedes` edge.                                                                                  |
+| `properties`         | object  | no       | Match records whose properties contain all listed key=value pairs, applied before result truncation inside a bounded candidate window.                                       |
+| `tags`               | array   | no       | OR-match against tags; entity tags matched at the SQL level, note tags read from `properties.tags`.                                                                          |
+| `min_rank_score`     | number  | no       | Inclusive deterministic rank floor in [0,1], default 0; applied after fusion and modifiers, before the final limit. Strategy/query-local, not calibrated relevance.          |
+| `min_score`          | number  | no       | Deprecated exact alias of `min_rank_score` in v0.8. Supplying both names is invalid, even when equal.                                                                        |
+| `order_by`           | string  | no       | `score` (default), `created_at`, or `updated_at`; timestamps sort newest first after the rank floor, within the bounded candidate window.                                    |
+| `created_after`      | string  | no       | Inclusive RFC 3339 lower bound on record `created_at`; at most nine fractional-second digits.                                                                                |
+| `created_before`     | string  | no       | Inclusive RFC 3339 upper bound on record `created_at`; at most nine fractional-second digits. Must not precede `created_after`.                                              |
+| `follow`             | string  | no       | Edge relation to follow outward from each hit; adds `followed` (summary neighbor rows of the targets) and `followed_truncated` (more than 100 targets). Single-backend only. |
 
 ```
 request(ops="search(kind=\"entity\", query=\"knowledge graph runtime\", limit=10)")
@@ -650,6 +726,14 @@ contradiction is rejected. Entity-only fields on a note search and note-only
 fields on an entity search are also rejected explicitly; they are never
 ignored. `properties` must be an object and `tags` must be an array of strings.
 The same validated request is used for single- and multi-backend execution.
+
+`follow` names one edge relation, such as `instance_of`, to follow outward from
+each hit. Every hit then carries `followed`, the targets its outgoing edges of
+that relation reach, as the rows `neighbors(projection="summary")` returns, read
+with the same visibility and mailbox rules. `followed_truncated` is true when a
+hit has more than 100 such targets. A symmetric relation is followed both ways,
+as `neighbors` follows it. A multi-backend search refuses `follow`; call
+`neighbors` on each hit there.
 
 Creation-time bounds apply to both entities and notes, independently of `order_by`,
 and combine with kind, tags and entity-type filters. Omitted or null bounds are
@@ -851,16 +935,16 @@ Immediate graph neighbors. For an anchor that is not a memory row, a call withou
 Each returned hit includes `origin_id`, the resolved queried node. This lets
 batch callers verify that every result is associated with the submitted root.
 
-| Param            | Type            | Required | Notes                                                                                                                                                                                        |
-| ---------------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`             | uuid            | yes      | Node whose neighbors to return. The legacy `node_id` input alias is still accepted.                                                                                                          |
-| `direction`      | string          | no       | `outgoing`\|`incoming`\|`both` (default `both`).                                                                                                                                             |
-| `relations`      | array\<string\> | no       | Restrict to these relation types.                                                                                                                                                            |
-| `min_weight`     | number          | no       | Exclude edges below this weight.                                                                                                                                                             |
-| `limit`          | integer         | no       | Page size, capped at 1000; explicit values report `requested_limit`, `effective_limit`, `limit_clamped` and switch the response to the page shape. Default: every neighbor, as a bare array. |
-| `after`          | string          | no       | Opaque cursor from a previous page's `next_after`; `""` starts a cursor walk. Requires an explicit `limit`. Order is weight descending, then neighbor id, then edge id.                      |
-| `neighbor_kinds` | array\<string\> | no       | Keep only neighbors of these entity or note kinds, applied before the limit.                                                                                                                 |
-| `projection`     | string          | no       | `edge` (edge identity and endpoints only), `summary` (neighbor identity and metadata), or `record` (full hit, default).                                                                      |
+| Param            | Type            | Required | Notes                                                                                                                                                                                                                                                                                                                                                                               |
+| ---------------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`             | uuid            | yes      | Node whose neighbors to return. The legacy `node_id` input alias is still accepted.                                                                                                                                                                                                                                                                                                 |
+| `direction`      | string          | no       | `outgoing`\|`incoming`\|`both` (default `both`).                                                                                                                                                                                                                                                                                                                                    |
+| `relations`      | array\<string\> | no       | Restrict to these relation types.                                                                                                                                                                                                                                                                                                                                                   |
+| `min_weight`     | number          | no       | Exclude edges below this weight.                                                                                                                                                                                                                                                                                                                                                    |
+| `limit`          | integer         | no       | Page size, capped at 1000; explicit values report `requested_limit`, `effective_limit`, `limit_clamped` and switch the response to the page shape. Default: every neighbor, as a bare array.                                                                                                                                                                                        |
+| `after`          | string          | no       | Opaque cursor from a previous page's `next_after`; `""` starts a cursor walk. Requires an explicit `limit`. Order is weight descending, then neighbor id, then edge id.                                                                                                                                                                                                             |
+| `neighbor_kinds` | array\<string\> | no       | Keep only neighbors of these entity or note kinds, applied before the limit.                                                                                                                                                                                                                                                                                                        |
+| `projection`     | string          | no       | `edge` (edge identity and endpoints only), `summary` (neighbor identity and metadata), `record` (full hit, default), or `full` (the record hit plus the neighbor's `properties` and `description` and the edge's `edge_metadata`, each `null` when absent; a note neighbor in another visible namespace has `null` properties, since notes are read in the caller's own namespace). |
 
 ```
 request(ops="neighbors(id=\"<uuid>\", direction=\"both\")")
@@ -883,7 +967,9 @@ Response shape:
 ]
 ```
 
-Flat rows, one per edge: never the neighbor's full entity/note record. `name`, `kind`, and
+Flat rows, one per edge: never the neighbor's full entity/note record, except that
+`projection="full"` adds the neighbor's `properties` and `description` (a note has properties and
+no description) and the edge's `edge_metadata`. `name`, `kind`, and
 `entity_type` are filled in by a batch entity+note lookup performed after the graph query, and
 are **omitted from the JSON entirely (not `null`)** when that lookup can't resolve the neighbor
 id (a dangling/bogus id that never matched an entity or note row). Soft-deleted entity neighbors
@@ -1001,11 +1087,13 @@ Response shape:
 
 GQL or SPARQL pattern matching (read-only). Write-shaped input (SPARQL
 INSERT/DELETE/LOAD/WITH…DELETE, GQL/Cypher CREATE/DELETE/DETACH DELETE/SET/MERGE) is
-rejected — use `create`/`update`/`link`/`merge`/`delete` to mutate the graph. Queries
-that mix fixed-length and variable-length chains are not compiled in one call; split
-them into separate `query()` calls. GQL string equality uses SQLite `COLLATE NOCASE`,
+rejected — use `create`/`update`/`link`/`merge`/`delete` to mutate the graph. A single canonical path may combine fixed steps with bounded variable-length segments.
+The sum of variable-segment maximum hop counts must not exceed 10; fixed steps do not
+contribute to that sum or to the returned traversal metrics. GQL string equality uses SQLite `COLLATE NOCASE`,
 so `WHERE e.name = "LoRA"` matches both `LoRA` and ASCII case variants such as `lora`.
-GQL results have a deterministic identity order. When a response has `has_more: true`,
+GQL results have a deterministic order. Ordinary queries retain identity or traversal
+tie-breakers; grouped and `RETURN DISTINCT` results break ties by returned values,
+without hidden identities or traversal metrics. When a response has `has_more: true`,
 repeat the same query with `SKIP` set to its `next_offset`; keep `page_size` unchanged.
 SPARQL `OFFSET` is not part of the supported dialect.
 
@@ -1020,7 +1108,9 @@ request(ops="query(query=\"MATCH (c:concept)-[:extends]->(d:concept) RETURN c, d
 ```
 
 For an exhaustive audit, omit query-text `LIMIT` so the server can report whether another
-page exists. An explicit `LIMIT` at or below `page_size` is a terminal caller-chosen bound.
+page exists. Query-text `LIMIT` counts rows after `SKIP`: `SKIP 10 LIMIT 3` returns up to
+three rows starting at offset 10. An explicit `LIMIT` at or below `page_size` is a terminal
+caller-chosen bound.
 
 ```text
 request(ops="query(query=\"MATCH (a)-[r:depends_on]->(b) RETURN a, r, b\", page_size=500)")
@@ -1043,14 +1133,20 @@ Reuse the returned `full_id` as `parent_id` in a subsequent proposal request. Th
 field has nested objects and cannot be expressed in function-call DSL form; use JSON form (whose
 operations do not support `$prev`).
 
-| Param         | Type            | Required | Notes                                                                                                                                                                                                                                                                                           |
-| ------------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `title`       | string          | yes      | Non-empty short title.                                                                                                                                                                                                                                                                          |
-| `description` | string          | yes      | Non-empty full description.                                                                                                                                                                                                                                                                     |
-| `changeset`   | object          | yes      | Discriminated by `kind`: `add_entity`, `update_entity`, `add_edge`, `add_note`, `merge_entities`, `supersede_entity`, `compound` (nested `steps`). Every nested identifier is a full UUID; prefixes are rejected because resolution could miss, be ambiguous, or change stable proposal intent. |
-| `reviewers`   | array\<string\> | no       | Actor IDs requested as reviewers.                                                                                                                                                                                                                                                               |
-| `expiry`      | integer         | no       | Expiry timestamp, microseconds since epoch.                                                                                                                                                                                                                                                     |
-| `parent_id`   | uuid            | no       | Full UUID of the parent proposal. Prefixes are rejected because ancestry is an explicit stable reference; responses preserve it canonically.                                                                                                                                                    |
+| Param         | Type            | Required | Notes                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `title`       | string          | yes      | Non-empty short title.                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `description` | string          | yes      | Non-empty full description.                                                                                                                                                                                                                                                                                                                                                                                             |
+| `changeset`   | object          | yes      | Discriminated by `kind`: `add_entity`, `update_entity`, `add_edge`, `retire_edge`, `supersede_edge`, `add_note`, `merge_entities`, `supersede_entity`, `compound` (nested `steps`; one step only for now, and a compound with more than one step at any depth is refused). Every nested identifier is a full UUID; prefixes are rejected because resolution could miss, be ambiguous, or change stable proposal intent. |
+| `reviewers`   | array\<string\> | no       | Actor IDs requested as reviewers.                                                                                                                                                                                                                                                                                                                                                                                       |
+| `expiry`      | integer         | no       | Expiry timestamp, microseconds since epoch.                                                                                                                                                                                                                                                                                                                                                                             |
+| `parent_id`   | uuid            | no       | Full UUID of the parent proposal. Prefixes are rejected because ancestry is an explicit stable reference; responses preserve it canonically.                                                                                                                                                                                                                                                                            |
+
+`retire_edge` (`source`, `target`, `relation`) soft-deletes the live edge with that key when the
+proposal is applied; `restore` on the edge's id brings it back. For a symmetric relation either
+endpoint order names the edge, and an apply that finds no live edge fails without writing.
+`supersede_edge` (`old`: `{source, target, relation}`, `new`: the `add_edge` fields) retires `old`
+and adds `new` in one unit, both or neither; `new` must name a different edge than `old`.
 
 ```
 request(ops="[{\"tool\":\"propose\",\"args\":{\"title\":\"Add GQE\",\"description\":\"Register the GQE concept\",\"changeset\":{\"kind\":\"add_entity\",\"entity\":{\"kind\":\"concept\",\"name\":\"GQE\"}}}}]")
@@ -1104,10 +1200,15 @@ preparation. Canonical properties replace the whole map. See
 
 Resolve natural-language references to ids. Each ref in `refs` is resolved through:
 (1) id-string passthrough (UUID or 8+ hex prefix) via the existing by-ID path; (2) this
-actor's recently-referenced ring; (3) a case-sensitive exact match on `entities.name`;
+actor's recently-referenced ring; (3) a case-sensitive exact match on an entity's name or on
+an alias it holds;
 (4) hybrid search over the namespace. Returns one of
 `Resolved{id,confidence}` | `Ambiguous{candidates}` | `NotFound` per ref — never a
 silent pick among close candidates. Read-only: performs no mutation.
+
+A single stage-3 match through an alias adds `matched_alias` to the `Resolved` result. An entity
+that matches by name and by alias counts once, and several matching entities return `Ambiguous`
+over exactly that set.
 
 A resolved id consumed by an entity merge follows the transitive `merged_into`
 chain. Its result contains the live kept `id` and `redirected_from: [old_id, ...]`;
@@ -1117,7 +1218,7 @@ Cycles and overlong chains fail with `redirect cycle detected` and
 
 | Param   | Type            | Required | Notes                                                                                                           |
 | ------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------- |
-| `refs`  | array\<string\> | yes      | Natural-language references to resolve (UUID, hex prefix, exact entity name, or free text).                     |
+| `refs`  | array\<string\> | yes      | Natural-language references to resolve (UUID, hex prefix, exact entity name or alias, or free text).            |
 | `kind`  | string          | no       | Restricts the exact-name and hybrid-search stages to an entity kind. No effect on the id-string or ring stages. |
 | `limit` | integer         | no       | Max candidates returned per ref from the stage 4 hybrid-search fallback. Default 5, max 20.                     |
 
@@ -1516,19 +1617,41 @@ request(ops="gtd.complete(id=\"<task-id>\", result=\"shipped in PR #600\")")
 
 ### `gtd.tasks` — Assertive
 
-List tasks filtered by status, assignee, priority.
+List tasks filtered by status, assignee, priority, tags, context and duplicate reference.
+With neither `status` nor `duplicate_of`, the default selects open statuses and the
+legacy missing/non-text `inbox` fallback, excluding terminal and unrecognized statuses.
 
 Each task reports `dependency_state` (`ready`, `blocked`, or `broken`), `actionable`,
 and a `blocked_by` array whose entries carry a `state` of `pending`, `cancelled`,
 `soft_deleted`, `missing`, `invalid`, `different_namespace`, or `wrong_kind`.
 
-| Param      | Type    | Required | Notes                                                                                              |
-| ---------- | ------- | -------- | -------------------------------------------------------------------------------------------------- |
-| `status`   | string  | no       | `inbox`\|`next`\|`waiting`\|`someday`\|`active`\|`done`\|`cancelled` (aliases as in `gtd.assign`). |
-| `assignee` | string  | no       | Filter by assignee.                                                                                |
-| `priority` | string  | no       | `p0`\|`p1`\|`p2`\|`p3`.                                                                            |
-| `limit`    | integer | no       | Default 20.                                                                                        |
-| `offset`   | integer | no       | Default 0.                                                                                         |
+| Param               | Type            | Required | Notes                                                                                                                                          |
+| ------------------- | --------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `status`            | string          | no       | `inbox`\|`next`\|`waiting`\|`someday`\|`active`\|`done`\|`cancelled` (aliases as in `gtd.assign`).                                             |
+| `assignee`          | string          | no       | Filter by assignee.                                                                                                                            |
+| `priority`          | string          | no       | `p0`\|`p1`\|`p2`\|`p3`.                                                                                                                        |
+| `tags`              | array\<string\> | no       | SQLite `NOCASE` membership (ASCII case-insensitive). Omitted, null or empty adds no restriction.                                               |
+| `tag_mode`          | string          | no       | `any` (default, including null) or `all`; with no tags, either adds no restriction.                                                            |
+| `context_entity_id` | uuid            | no       | Full UUID only; compares its canonical spelling with the stored context reference, without an entity lookup. Omitted/null adds no restriction. |
+| `duplicate_of`      | uuid            | no       | Kept task UUID or unique 8+ hex prefix. Defaults to `status="cancelled"` when status is omitted; an explicit status overrides that default.    |
+| `limit`             | integer         | no       | Default 50; clamped to 1–200. A requested zero selects one row without an upper-limit clamp report.                                            |
+| `offset`            | integer         | no       | Default 0. Advance by the number of returned tasks, keeping the same filters.                                                                  |
+
+Filters apply before pagination in stable `created_at DESC, id ASC` order. See
+[task-query.md](../../crates/khive-pack-gtd/docs/api/task-query.md) for filter,
+namespace, retained-reference and dependency semantics.
+
+An incomplete page returns `{tasks: [...], has_more: true}`. An exhausted ordinary
+page returns an array, even when it is exactly full. A limit above 200 produces an
+object with `tasks`, `requested_limit`, `effective_limit` and `limit_clamped: true`;
+it includes `has_more: true` only if another matching row exists. An empty default
+page may instead include `filter_excluded` and `hint` when a matching task was
+excluded by status. No `has_more: false` field is added.
+
+Accept either a bare array or an object's `tasks` array, and continue when
+`has_more` is true. An object or a full page alone does not establish continuation.
+Successive offset pages use separate snapshots; concurrent changes can shift later
+pages. Blocked and broken tasks remain in the page with their diagnostics.
 
 ```
 request(ops="gtd.tasks(status=\"active\", assignee=\"agent:docs\")")
@@ -1666,7 +1789,14 @@ Recall memory notes with decay-aware hybrid ranking. Each hit carries resolved
 | `full_content`      | bool    | no       | Default true; false truncates content to 200 chars.                     |
 | `tags`              | array   | no       | Filter by `properties.tags`.                                            |
 | `tag_mode`          | string  | no       | `any` (default, OR) or `all` (AND).                                     |
+| `prefer_tags`       | array   | no       | Memories with any of these tags rank first; others fill the rest.       |
 | `namespace`         | string  | no       | Exact-match read scope; absent uses the caller's visible namespace set. |
+| `label`             | string  | no       | Caller tag stored on the `RecallExecuted` event; see below.             |
+
+`label` names the purpose of a recall (for example `hook` or `wake`) so a caller can
+count its recalls by purpose with `brain.event_counts`. It does not change ranking or
+results. It must be 1 to 128 characters with no control characters and no leading or
+trailing whitespace; anything else is refused before the recall runs.
 
 Each result carries `namespace` (where the memory is stored), `tags` (`[]` when none) and
 `properties` (the stored object, including `memory_type` and `tags`; `{}` when none).
@@ -1865,6 +1995,11 @@ only `counts_by_verb_and_actor_page_scoped` is emitted; the complete-looking
 cross key is absent. Existing marginal field names are unchanged. Limits count
 event rows, not distinct group cells, so a denser cross cannot trigger a separate
 cap. An occupied-cell count cannot exceed the number of events aggregated.
+
+`counts_by_label: {<label>: <count>}` counts `RecallExecuted` events by the `label`
+the recall was called with. Events of other kinds and recalls without a label are
+not counted there, and the key is absent when no matching event carries a label.
+When `truncated=true` it is emitted as `counts_by_label_page_scoped` instead.
 
 For a dispatch-audit census, request `kind="audit"` with the cross. That filter
 is applied before the existing event cap; the special unfiltered audit/non-audit
@@ -2184,7 +2319,7 @@ request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha2
 
 ---
 
-## `comm` pack — 15 verbs
+## `comm` pack — 16 verbs
 
 Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
 
@@ -2463,11 +2598,41 @@ permanently purges it. There is deliberately no automatic "release as trusted" p
 Generic message `create`/`update` mutations cannot set `channel_kind`, `channel_slug`, or
 `quarantined`; those transport-owned fields are established only by `comm.ingest`.
 
+The process-level `resource.quiet_until` is always present: the active quiet
+window's RFC3339 UTC deadline, or null after monotonic expiry. It is shared
+across namespaces in the executing process.
+
 No parameters.
 
 ```
 request(ops="comm.health()")
 ```
+
+### `comm.quiet` — Directive
+
+Request a process-wide cooperative quiet window for background warm and
+maintenance work. Ordinary caller write policy applies.
+
+| Param      | Type    | Required | Notes                                                                                 |
+| ---------- | ------- | -------- | ------------------------------------------------------------------------------------- |
+| `ttl_secs` | integer | yes      | 1 through 300, inclusive. Invalid or unknown parameters refuse before changing state. |
+
+```
+request(ops="comm.quiet(ttl_secs=30)")
+```
+
+Canonical dispatch applies its normal integer normalization: a whole-valued
+JSON number such as `1.0` is accepted; `1.5` is refused.
+
+Returns `{quiet_until: "<RFC3339 UTC deadline>"}`. Renewals keep the later
+monotonic deadline; shorter requests cannot revoke an active window.
+`comm.health.resource.quiet_until` is always present and becomes null on expiry.
+The deadline spans namespaces in the executing process, is not durable and does
+not coordinate other daemons. It is checked at background supervisor entry,
+before KG/Knowledge background embedding and before Knowledge snapshot warming.
+Foreground work, in-flight work, finalization, shutdown and channel delivery
+continue. Normal audit failure after handler execution does not roll back the
+deadline. See the [full quiet contract](../../crates/khive-pack-comm/docs/api/channel-health.md#commquiet--bounded-background-deferral).
 
 ### `comm.suppression_add` — Commissive
 
@@ -2886,6 +3051,17 @@ Validate and ingest atlas markdown file(s) with canonical-frontmatter or stable 
 request(ops="knowledge.import(path=\"/path/to/atlas/rope.md\")")
 ```
 
+The verb reads only under the directories listed in `import_roots` in the `[knowledge]` section of
+the config. The requested path is resolved, symlinks included, and must lie under a resolved root.
+With no roots configured, every path is refused. A path outside every root, or one that cannot be
+resolved, gives one message, `import path is not under a configured import root`, so a refusal says
+nothing about what exists outside the roots.
+
+```toml
+[knowledge]
+import_roots = ["/srv/atlas"]
+```
+
 Leading delimiter-bounded YAML frontmatter is metadata rather than body content. Its agreeing
 `id`/`atlas_id`/`atlas-id` aliases take identity precedence; `name`/`title`, `tags`, nested
 `properties`, and other metadata map into atom fields. Without a canonical ID, directory slugs use
@@ -3150,12 +3326,12 @@ sandbox semantics.
 
 ### `exec.tree`, `exec.tree_get`, `exec.tree_put`, `exec.tree_diff`
 
-| Verb             | Parameters                                                      | Result                           |
-| ---------------- | --------------------------------------------------------------- | -------------------------------- |
-| `exec.tree`      | `entries: [{path, ref, mode}]`                                  | `{tree}`                         |
-| `exec.tree_get`  | `tree`                                                          | `{tree, entries}`                |
-| `exec.tree_put`  | `tree`, nonempty `edits: [{path, ref\|content\|delete, mode?}]` | `{tree, base, entries, changed}` |
-| `exec.tree_diff` | `base`, `head`                                                  | `{base, head, changed}`          |
+| Verb             | Parameters                                                                                    | Result                           |
+| ---------------- | --------------------------------------------------------------------------------------------- | -------------------------------- |
+| `exec.tree`      | `entries: [{path, ref, mode}]`                                                                | `{tree}`                         |
+| `exec.tree_get`  | `tree`                                                                                        | `{tree, entries}`                |
+| `exec.tree_put`  | `tree`, nonempty `edits: [{path, ref\|content\|delete, mode?, recursive?}]`, `changed_limit?` | `{tree, base, entries, changed}` |
+| `exec.tree_diff` | `base`, `head`, `changed_limit?`                                                              | `{base, head, changed}`          |
 
 Entry modes are decimal `644` (file), `755` (executable file) or `120000`
 (symlink). A symlink's blob holds its literal target bytes, without an added
@@ -3171,6 +3347,20 @@ Retargeting a link or switching between a symlink and a file is `modified`.
 Unsupported modes, duplicate edit paths and deletion of a missing path refuse
 the call without publishing a new tree.
 
+An edit `{path, delete: true, recursive: true}` removes every entry under the
+directory `path`, matched by path component (`dir` never removes `dir2`); a link
+under it is removed as an entry and not followed. It refuses when nothing is
+under the directory, when the path is a file, and beside any other edit under
+it. A plain delete of a directory refuses and names `recursive`.
+
+The change list of `exec.tree_put`, `exec.tree_diff`, `exec.run`,
+`exec.receipt` and `exec.runs` is bounded: at most `changed_limit` changes
+(default 1000, at most 10,000; a larger value refuses) and 262,144 bytes of its
+JSON-lines form, one bound across a whole `exec.runs` reply. Beside it,
+`changed_count` is the full length, `changed_truncated` says whether the reply
+was cut, and `changed_ref` names a blob holding the full list as JSON lines,
+read in slices with `blob.get` and `range`. See ADR-181 Amendment 18.
+
 `exec.run` materializes real symlinks, including absolute or escaping targets.
 Seatbelt constrains access to resolved targets; `declared_write_paths` names
 tree-relative paths and does not expand sandbox access. Capture records link
@@ -3184,11 +3374,11 @@ This does not change the separate `git.checkout` symlink-refusal contract.
 
 ---
 
-## `git` pack — 17 verbs
+## `git` pack — 26 verbs
 
 The entries below cover the ingest and write surface; the dev-loop verbs
 (`git.checkout`, `git.diff`, `git.gates`, `git.receipts`, `git.reconcile`, `git.status`,
-`git.log`, `git.init`, `git.pr_open`, `git.pr_review`, `git.pr_merge`) are specified in
+`git.log`, `git.init`, `git.pr_open`, `git.pr_review`, `git.pr_merge`, `git.pr_state`, `git.pr_list`, `git.issue`, `git.issue_list`, `git.fetch`, `git.pr_edit`, `git.pr_close`, `git.check_log`, `git.branch_delete`) are specified in
 ADR-182 and its amendments.
 
 Git-history ingester plus a hardened write surface (ADR-088,
@@ -3218,6 +3408,21 @@ resolving or auto-creating the repo-anchor
 
 ```
 request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")
+```
+
+The verb reads only the sources the config's `[git_digest]` section names. A local path is
+resolved, symlinks included, and must lie under a resolved `local_roots` entry; a remote must
+name the same repository as a `remotes` entry once the trailing `/` and `.git` are removed and
+the host is lowercased. Each `remotes` entry is a full `https://host/owner/repo` URL and admits
+only that repository; configuration validation refuses an owner, a host or a pattern. Both
+lists are empty by default, which refuses every source. Every source outside the lists gives one
+message, `source ... is not a configured git.digest source`,
+and that check runs before the path is read.
+
+```toml
+[git_digest]
+local_roots = ["/srv/repos"]
+remotes = ["https://github.com/org/repo"]
 ```
 
 The result includes `writes_refused`, a per-call count of record writes blocked by the
@@ -3320,7 +3525,18 @@ at most one `*` wildcard.
 [[git_write.allowed]]
 repo = "/abs/path/repo"
 branches = ["main", "feat/*", "release-*"]
+
+[[git_write.allowed]]
+repo = "/abs/path/other"
+access = "read"
 ```
+
+A row with `access = "read"` names a repository and no branches (ADR-108 Amendment 2). It
+admits the verbs that change neither the repository nor its remote: `git.checkout`,
+`git.diff`, `git.status`, `git.log`, `git.gates`, `git.pr_state`, `git.pr_list`, `git.issue`,
+`git.issue_list`, `git.check_log` and `git.reconcile`. Every
+other verb refuses on it with `repo_read_only`. A row without `access` is a write row, which
+also admits every read.
 
 | Verb         | Param     | Type            | Required | Notes                                                                                                                                                                          |
 | ------------ | --------- | --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -3424,6 +3640,18 @@ becomes known.
 
 ```
 request(ops="code.ingest(path=\"/repo/crates/my-crate\")")
+```
+
+The verb reads and writes only under the roots the config's `[code_ingest]` section names. The
+source `path` is resolved, symlinks included, and must lie under a resolved `roots` entry; an
+explicit `db` must have its nearest existing ancestor directory under one as well. The list is
+empty by default, which refuses every call. A path outside every root and one that cannot be
+resolved give one message, `path ... is not under a configured code.ingest root` (or `db ...`),
+and that check runs before the source is read or the target is created.
+
+```toml
+[code_ingest]
+roots = ["/srv/code"]
 ```
 
 The argument object is closed: unknown names are rejected before filesystem or database access.
@@ -3645,7 +3873,7 @@ request(ops="blob.commit(upload_id=\"<32-char-hex>\")")
 - [ADR-016: request DSL](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)
 - [ADR-002: Closed Edge Ontology](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md)
 
-## `tool` pack — 14 verbs
+## `tool` pack — 15 verbs
 
 Registry objects are `project` entities typed `tool`, `skill`, `plugin` or `verb`, tagged
 `tool-registry`; capabilities are `concept` entities typed `capability` joined by `implements` edges
@@ -3673,7 +3901,10 @@ caller's `decision`.
 ### `tool.describe` / `tool.list` — Assertive
 
 `tool.describe(tool, actor)` returns the full object with `schema`, `capabilities` and `decision`;
-`tool.list(kind, limit=100, offset=0)` pages the registry.
+`tool.list(kind, limit=100, offset=0)` pages the registry. `source` keeps rows whose source equals the value
+and `source_prefix` rows whose source starts with it (case-sensitive, for example `mcp:`); the two do not
+combine. With `include_decision=true` each row carries `decision` for `actor` (default the caller), as
+`tool.describe` reports it, and the response names the `actor`.
 
 ### `tool.check` — Assertive
 

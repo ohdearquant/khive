@@ -1,9 +1,9 @@
 //! Email channel startup and shared ingest authorization and quarantine handling.
 
 #[cfg(all(doc, feature = "channel-email"))]
-use super::{channel_loop_plan, spawn_email_channel_loops_if_daemon};
+use super::{channel_loop_plan, spawn_email_channel_loops_if_daemon_registered};
 #[cfg(feature = "channel-email")]
-use super::{channel_outbox_loop, channel_poll_loop, KhiveMcpServer};
+use super::{channel_outbox_loop_registered, channel_poll_loop_registered, KhiveMcpServer};
 #[cfg(all(test, feature = "channel-email"))]
 use super::{EMAIL_POLL_TEST_CHANNEL, EMAIL_POLL_TEST_SHUTDOWN};
 
@@ -22,8 +22,16 @@ pub(super) fn email_poll_shutdown_token(
 #[cfg(feature = "channel-email")]
 pub(super) struct PreparedEmailChannelLoops {
     channel: std::sync::Arc<khive_channel_email::EmailChannel>,
+    registered: std::sync::Arc<dyn khive_channel::Channel>,
     ingest_namespace: String,
     default_inbound_actor: String,
+}
+
+#[cfg(feature = "channel-email")]
+impl PreparedEmailChannelLoops {
+    pub(super) fn registered_channel(&self) -> std::sync::Arc<dyn khive_channel::Channel> {
+        self.registered.clone()
+    }
 }
 
 #[cfg(all(test, feature = "channel-email"))]
@@ -108,8 +116,15 @@ pub(super) fn prepare_email_channel_loops(
             "email channel admits external inbound mail as untrusted"
         );
     }
+    let channel = Arc::new(email_ch);
+    let registered: Arc<dyn khive_channel::Channel> = channel.clone();
+    #[cfg(test)]
+    let registered = EMAIL_POLL_TEST_CHANNEL
+        .with(|channel| channel.borrow_mut().take())
+        .unwrap_or(registered);
     Ok(Some(PreparedEmailChannelLoops {
-        channel: Arc::new(email_ch),
+        channel,
+        registered,
         ingest_namespace,
         default_inbound_actor: email_default_inbound_actor_from_env(),
     }))
@@ -119,24 +134,18 @@ pub(super) fn prepare_email_channel_loops(
 /// feature is enabled and `KHIVE_EMAIL_*` config resolves. Non-fatal: logs a
 /// warning and returns on incomplete config. Only call this with the
 /// role-and-runtime admission returned by [`channel_loop_plan`] — use
-/// [`spawn_email_channel_loops_if_daemon`], which both serve entrypoints call.
+/// [`spawn_email_channel_loops_if_daemon_registered`], which both serve entrypoints call.
 #[cfg(feature = "channel-email")]
-pub(super) fn spawn_email_channel_loops(
+pub(super) fn spawn_email_channel_loops_registered(
     server: &KhiveMcpServer,
     admission: crate::server::ChannelLoopAdmission,
     prepared: PreparedEmailChannelLoops,
+    ch_registry: std::sync::Arc<khive_channel::ChannelRegistry>,
 ) {
-    use khive_channel::ChannelRegistry;
-    use std::sync::Arc;
     let email_ch = prepared.channel;
-    let mut ch_registry = ChannelRegistry::new();
-    let dyn_ch: Arc<dyn khive_channel::Channel> = email_ch.clone();
-    #[cfg(test)]
-    let dyn_ch = EMAIL_POLL_TEST_CHANNEL
-        .with(|channel| channel.borrow_mut().take())
-        .unwrap_or(dyn_ch);
-    ch_registry.register(dyn_ch);
-    let ch_registry = Arc::new(ch_registry);
+    let registered = prepared.registered;
+    let selected_keys = vec![(registered.kind().to_owned(), registered.slug())];
+    let outbox_channels = ch_registry.clone();
     let verb_reg = server.verb_registry_clone();
     let runtime = server.channel_outbox_runtime_clone();
     let ingest_ns = prepared.ingest_namespace;
@@ -148,7 +157,7 @@ pub(super) fn spawn_email_channel_loops(
     let verb_reg_poll = verb_reg.clone();
     let ingest_ns_outbox = ingest_ns.clone();
     let mailbox_clone = mailbox.clone();
-    let email_ch_clone = Arc::clone(&email_ch);
+    let email_ch_clone = registered;
     let runtime_outbox = runtime.clone();
 
     let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
@@ -162,8 +171,9 @@ pub(super) fn spawn_email_channel_loops(
                     );
                     return;
                 }
-                channel_poll_loop(
+                channel_poll_loop_registered(
                     ch_registry,
+                    selected_keys,
                     verb_reg_poll,
                     ingest_ns_clone,
                     default_actor_clone,
@@ -180,8 +190,9 @@ pub(super) fn spawn_email_channel_loops(
                         "email-outbound",
                         server,
                         move |ctx| {
-                            Box::pin(channel_outbox_loop(
+                            Box::pin(channel_outbox_loop_registered(
                                 email_ch_clone.clone(),
+                                outbox_channels.clone(),
                                 rt.clone(),
                                 ingest_ns_outbox.clone(),
                                 mailbox_clone.clone(),
@@ -817,4 +828,15 @@ pub(super) async fn quarantine_original_may_be_retained(
             )
         })?;
     Ok(live < limit as u64)
+}
+
+#[cfg(all(test, feature = "channel-email"))]
+pub(super) fn spawn_email_channel_loops(
+    server: &KhiveMcpServer,
+    admission: crate::server::ChannelLoopAdmission,
+    prepared: PreparedEmailChannelLoops,
+) {
+    let channels =
+        super::channel_registration::isolated_test_registry(prepared.registered_channel());
+    spawn_email_channel_loops_registered(server, admission, prepared, channels);
 }

@@ -238,8 +238,11 @@ impl KgPack {
                         return Err(entity_merge_guard_error(guard));
                     }
                 }
+                // A merge_key_conflict names a holder only where the caller
+                // may list entities of the kept entity's kind (ADR-221).
+                let disclose = |kind: &str| registry.allows_entity_key_disclosure(token, kind);
                 self.runtime
-                    .merge_entity_with_reason_and_force(
+                    .merge_entity_with_key_disclosure(
                         token,
                         into_id,
                         from_id,
@@ -248,6 +251,7 @@ impl KgPack {
                         dry_run,
                         reason,
                         force,
+                        &disclose,
                     )
                     .await?
             }
@@ -297,7 +301,16 @@ impl KgPack {
         // as a verdict, which is the reading that fails silently.
         if dry_run {
             if let Some(object) = response.as_object_mut() {
-                object.insert("would_merge".to_string(), Value::Bool(true));
+                // A key another live entity holds refuses the real merge, so
+                // the dry run answers it the way it answers a safety floor.
+                let refused = !summary.key_conflicts.is_empty();
+                object.insert("would_merge".to_string(), Value::Bool(!refused));
+                if refused {
+                    object.insert(
+                        "refused_by".to_string(),
+                        Value::String("merge_key_conflict".to_string()),
+                    );
+                }
             }
         }
         Ok(response)

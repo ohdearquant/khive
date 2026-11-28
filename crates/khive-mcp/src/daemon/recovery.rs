@@ -560,7 +560,7 @@ pub(super) fn respawn_failed_error(failure: RespawnFailure) -> McpError {
         serde_json::json!({"reason": "respawn_failed"})
     };
     daemon_mcp_error(
-        "daemon respawn failed (respawn_failed); rebuild with `make local` and retry",
+        "daemon respawn failed (respawn_failed); check daemon configuration and the installed kkernel version, then retry",
         Some(data),
     )
 }

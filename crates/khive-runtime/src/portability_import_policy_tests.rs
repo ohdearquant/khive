@@ -17,6 +17,8 @@ fn archive(kinds: &[&str]) -> KgArchive {
             .iter()
             .enumerate()
             .map(|(index, kind)| ExportedEntity {
+                keys: Vec::new(),
+                aliases: Vec::new(),
                 id: Uuid::from_u128(index as u128 + 1),
                 kind: (*kind).into(),
                 entity_type: Some("kept-subtype".into()),

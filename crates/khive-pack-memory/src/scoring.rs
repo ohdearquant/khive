@@ -972,9 +972,10 @@ fn score_factors_with_reporter(
 
 // ── ADR-104 §2 (Stage B): bounded per-entity posterior term ───────────────────
 
-/// Default weight for the per-entity posterior term. Chosen so the clamp
-/// bounds below are exactly reachable at posterior means of 0.0 and 1.0
-/// (`1 + 0.3 * (0.0 - 0.5) = 0.85`, `1 + 0.3 * (1.0 - 0.5) = 1.15`).
+/// Default weight for the per-entity posterior term. Chosen so `t0` reaches the
+/// clamp bounds below at posterior means of 0.0 and 1.0
+/// (`1 + 0.3 * (0.0 - 0.5) = 0.85`, `1 + 0.3 * (1.0 - 0.5) = 1.15`); the
+/// served term approaches them only as evidence mass grows.
 pub const ENTITY_POSTERIOR_WEIGHT: f32 = 0.3;
 
 /// Lower bound of the per-entity posterior multiplier — the term can never
@@ -985,18 +986,52 @@ pub const ENTITY_POSTERIOR_CLAMP_MIN: f32 = 0.85;
 /// move a score up by more than 15%.
 pub const ENTITY_POSTERIOR_CLAMP_MAX: f32 = 1.15;
 
-/// `clamp(1 + w_ent * (entity_posterior_mean - 0.5), 0.85, 1.15)`.
-///
-/// `None` (no posterior for this candidate beyond the uninformative prior)
-/// is neutral: exactly `1.0`, not the midpoint of the clamp band. Untouched
-/// memories must be unaffected — the neutral value has to be an identity
-/// multiplier, not a value that happens to fall inside the bounds.
-pub fn entity_posterior_term(entity_posterior_mean: Option<f64>, w_ent: f32) -> f32 {
-    match entity_posterior_mean {
-        Some(mean) => (1.0 + w_ent * (mean as f32 - 0.5))
-            .clamp(ENTITY_POSTERIOR_CLAMP_MIN, ENTITY_POSTERIOR_CLAMP_MAX),
-        None => 1.0,
+/// Evidence mass at which the per-entity term reaches half of `t0 - 1`
+/// (ADR-104 Amendment 6, `k`). A constant of the memory pack, like
+/// [`ENTITY_POSTERIOR_WEIGHT`]; a profile does not carry it.
+pub const ENTITY_EVIDENCE_HALF_MASS: f64 = 16.0;
+
+/// `t0 = clamp(1 + w_ent * (entity_posterior_mean - 0.5), 0.85, 1.15)`, the
+/// multiplier computed from the posterior mean alone (ADR-104 Section 2).
+pub fn entity_posterior_t0(entity_posterior_mean: f64, w_ent: f32) -> f32 {
+    (1.0 + w_ent * (entity_posterior_mean as f32 - 0.5))
+        .clamp(ENTITY_POSTERIOR_CLAMP_MIN, ENTITY_POSTERIOR_CLAMP_MAX)
+}
+
+/// Evidence mass `n` of a posterior stored with the Beta(1, 1) prior inside
+/// `(alpha, beta)`: `max(0, alpha + beta - 2)` (ADR-104 Amendment 6). A
+/// non-finite sum carries no usable evidence and yields `0.0`.
+pub fn entity_evidence_mass(alpha: f64, beta: f64) -> f64 {
+    let mass = alpha + beta - 2.0;
+    if mass.is_finite() {
+        mass.max(0.0)
+    } else {
+        0.0
     }
+}
+
+/// `1 + (t0 - 1) * n / (n + k)` with `k` = [`ENTITY_EVIDENCE_HALF_MASS`]
+/// (ADR-104 Amendment 6), for `posterior = (entity_posterior_mean, n)`.
+///
+/// The term scales `t0` toward neutral by the evidence the posterior holds, in
+/// both directions: it stays within [0.85, 1.15], never moves past `t0`, and is
+/// exactly `1.0` at `n = 0`. `None` (no posterior for the memory) is exactly
+/// `1.0` too, an identity multiplier rather than a value that happens to fall
+/// inside the bounds, so untouched memories are unaffected. A non-finite mass,
+/// mean or weight is neutral as well.
+pub fn entity_posterior_term(posterior: Option<(f64, f64)>, w_ent: f32) -> f32 {
+    let Some((mean, mass)) = posterior else {
+        return 1.0;
+    };
+    if !mass.is_finite() || mass <= 0.0 {
+        return 1.0;
+    }
+    let t0 = entity_posterior_t0(mean, w_ent);
+    if !t0.is_finite() {
+        return 1.0;
+    }
+    let scale = (mass / (mass + ENTITY_EVIDENCE_HALF_MASS)) as f32;
+    1.0 + (t0 - 1.0) * scale
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

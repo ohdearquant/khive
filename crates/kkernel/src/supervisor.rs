@@ -369,6 +369,11 @@ mod unix {
             let root = tempfile::Builder::new()
                 .prefix("khive-supervisor-marker-")
                 .tempdir_in("/tmp")
+                .or_else(|_| {
+                    tempfile::Builder::new()
+                        .prefix("khive-supervisor-marker-")
+                        .tempdir()
+                })
                 .expect("create marker test directory");
             khive_runtime::daemon::open_mutating_daemon_lock(
                 &root.path().join("baseline.lock"),

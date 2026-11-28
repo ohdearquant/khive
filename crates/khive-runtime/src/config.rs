@@ -334,6 +334,16 @@ pub fn process_ref_from_env() -> Option<String> {
     }
 }
 
+/// The current process's working directory as text, for the daemon frame's `client_cwd`.
+///
+/// `None` when the directory cannot be read. A non-Unicode path is converted lossily: the value
+/// is attribution text on an audit row, never a path anything opens.
+pub fn client_cwd_from_process() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .map(|dir| dir.to_string_lossy().into_owned())
+}
+
 // ---- RuntimeConfig ----
 
 /// Runtime configuration.
@@ -357,6 +367,14 @@ pub struct RuntimeConfig {
     pub visibility_receipts: Option<crate::credentials::VisibilityReceiptConfig>,
 
     pub mounts: Vec<crate::mount_config::MountConfig>,
+
+    /// Opaque values retained from `[channel.*]` without interpretation.
+    pub channel: crate::channel_section::ChannelSectionConfig,
+    /// Host-supplied validators installed before pack registry construction.
+    pub channel_config_validators: crate::channel_section::ChannelConfigValidators,
+    /// Trusted host routes for custom communication address kinds. These
+    /// process-local callbacks must be installed in the dispatching host.
+    pub channel_send_routes: crate::channel_send::ChannelSendRoutes,
 
     /// Path to the SQLite database file. `None` = in-memory (tests).
     ///
@@ -499,6 +517,12 @@ pub struct RuntimeConfig {
     /// Effective `[blob]` file-transfer opt-in, resolved with the exact environment
     /// opt-in during construction and retained by the blob pack.
     pub blob: crate::engine_config::BlobSectionConfig,
+    /// `[knowledge]` policy: the directories `knowledge.import` may read.
+    pub knowledge: crate::engine_config::KnowledgeSectionConfig,
+    /// `[git_digest]` policy: the sources `git.digest` may read.
+    pub git_digest: crate::engine_config::GitDigestSectionConfig,
+    /// `[code_ingest]` policy: the directories `code.ingest` may use.
+    pub code_ingest: crate::engine_config::CodeIngestSectionConfig,
     /// Resolved `[exec]` sandbox section (ADR-181), threaded through like
     /// `git_write` so the exec pack reads an already-resolved config.
     pub exec: crate::engine_config::ExecSectionConfig,
@@ -654,9 +678,15 @@ impl Default for RuntimeConfig {
                     .map(|value| value == "1")
                     .unwrap_or(false),
             },
+            knowledge: crate::engine_config::KnowledgeSectionConfig::default(),
+            git_digest: crate::engine_config::GitDigestSectionConfig::default(),
+            code_ingest: crate::engine_config::CodeIngestSectionConfig::default(),
             exec: crate::engine_config::ExecSectionConfig::default(),
             telemetry: crate::telemetry_config::TelemetryConfig::default(),
             mounts: Vec::new(),
+            channel: crate::channel_section::ChannelSectionConfig::default(),
+            channel_config_validators: crate::channel_section::ChannelConfigValidators::default(),
+            channel_send_routes: crate::channel_send::ChannelSendRoutes::default(),
             display_timezone: resolve_default_display_timezone(),
             events_split: None,
             web: crate::engine_config::WebSectionConfig::default(),
@@ -1094,6 +1124,7 @@ pub fn runtime_config_from_khive_config(
     // `local`); it only widens the read visible-set below.
     let default_namespace = base.default_namespace.clone();
     let mounts = khive_cfg.mounts.clone();
+    let channel = khive_cfg.channel.clone();
     let credentials = khive_cfg.credentials.clone();
     let visibility_receipts = khive_cfg.visibility_receipts.clone();
     let code_map_root = khive_cfg.code_map_root.clone();
@@ -1219,6 +1250,9 @@ pub fn runtime_config_from_khive_config(
     let blob = crate::engine_config::BlobSectionConfig {
         file_transfers: khive_cfg.blob.file_transfers || base.blob.file_transfers,
     };
+    let knowledge = khive_cfg.knowledge.clone();
+    let git_digest = khive_cfg.git_digest.clone();
+    let code_ingest = khive_cfg.code_ingest.clone();
     let exec = khive_cfg.exec.clone();
     let telemetry = khive_cfg.telemetry.clone();
     let web = khive_cfg.web.clone();
@@ -1261,9 +1295,13 @@ pub fn runtime_config_from_khive_config(
             brain,
             git_write,
             blob,
+            knowledge,
+            git_digest,
+            code_ingest,
             exec,
             telemetry,
             mounts,
+            channel,
             code_map_root,
             code_maps,
             code_map_protected_database_paths,
@@ -1303,9 +1341,13 @@ pub fn runtime_config_from_khive_config(
         brain,
         git_write,
         blob,
+        knowledge,
+        git_digest,
+        code_ingest,
         exec,
         telemetry,
         mounts,
+        channel,
         code_map_root,
         code_maps,
         code_map_protected_database_paths,

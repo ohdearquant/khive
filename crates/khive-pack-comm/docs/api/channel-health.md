@@ -50,7 +50,53 @@ identical string `"khive:channel_health:a:b:c:d"` under the old scheme.
 quoted and internal quotes/backslashes are escaped — so distinct triples
 always serialize to distinct byte sequences.
 
+### Telegram poll observations
+
+The Telegram daemon loop dispatches `comm.heartbeat` through the same registry
+and uses `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` explicitly. Its rows land on
+the backend assigned to comm, independently of `KHIVE_TELEGRAM_INGEST_NAMESPACE`.
+The kind and configured slug keep channel observations separate.
+
+A completed `Ok` poll reports success even when its page is empty, all updates
+are filtered, or ingestion holds an envelope. The writer supplies the captured
+poll-completion `at` plus actual `held_messages` and `quarantined_after_hold`
+counts after handling the batch. These observations do not change the rule for
+acknowledging the Telegram offset. A transport error reports a safe error class
+and fixed message, retains the last success and hold facts, and keeps the
+existing five-second retry. A canceled pending poll produces no observation.
+Heartbeat persistence is best effort and does not hold a released batch.
+
+Telegram omits `poll_interval_secs`; an error retry or long-poll timeout is not
+a nominal success cadence. Newly written Telegram rows have no cadence, so
+`stalled` stays null by design and `no_success_age_secs` is the elapsed-time
+signal. As for other writers, an omitted field preserves a previously explicit
+cadence on an existing row. Missing success remains null rather than being
+replaced with process start time. The reader stays read-only. This writer adds
+no notices or channel lifecycle events and leaves email behavior unchanged.
+
 <a id="handlersrshandle_heartbeat"></a>
+
+### Configured identity and historical quarantine rows
+
+The real Telegram adapter uses its configured `maintainer_slug` consistently for
+inbound deduplication, quarantine, heartbeat and registered outbox routing.
+`from_env` defaults a missing, empty, whitespace-only or non-Unicode slug to
+`maintainer`. A manually constructed empty or whitespace-only slug instead falls
+back to the channel kind, `telegram`; nonblank configured values are preserved.
+An existing outbound message without a `channel_slug` still routes through the
+sole configured Telegram adapter. Normal comm producers do not stamp the old
+kind-only `telegram` slug; manually written backend rows are outside that
+producer guarantee.
+
+Normal polling also ages out expired quarantine rows explicitly named
+`telegram` from before the configured-slug upgrade. In the original ingest
+namespace, each poll retains the configured-slug and historical slugless cleanup
+passes, then selects the exact old kind-only slug when it differs from the
+configured slug. Each selector keeps the existing maximum of 128 rows and its
+expiry rules; the additional named selector removes only expired live rows.
+Unexpired rows, named rows without an expiry, other namespaced rows and unrelated
+slugs are untouched. A cleanup error holds the poll with the existing retry and
+records no completed-poll heartbeat. No manual maintenance step is required.
 
 ## `handlers/quarantine_heartbeat.rs::handle_heartbeat`
 
@@ -73,7 +119,7 @@ Read-modify-write against the existing row (if any) so that:
   read from the prior row rather than any in-process counter, so it is
   correct even across a daemon restart.
 - `poll_interval_secs`, when supplied, records the writer's positive nominal
-  cadence. The shipped channel loop supplies `5` on every heartbeat. Omission
+  cadence. The shipped email loop supplies `5` on every heartbeat. Omission
   remains accepted for a mixed-version internal writer and preserves any
   previously recorded cadence on that row.
 - `held_messages` and `quarantined_after_hold` are accepted only with a
@@ -360,3 +406,40 @@ available. These readings cover only the executing process, not its descendants;
 when nothing is in flight. Raw observations only, per the same "no computed
 healthy bool" rule as the rest of this verb — attributing severity to a given
 CPU/RSS number is the caller's judgment, not this verb's.
+
+## `comm.quiet` — bounded background deferral
+
+`comm.quiet(ttl_secs=30)` requests a cooperative quiet window in the executing
+process and returns `{quiet_until: "<RFC3339 UTC deadline>"}`. The required
+`ttl_secs` parameter must be an integer from 1 through 300. Canonical dispatch
+normalizes whole-valued JSON numbers such as `1.0` to integers before validation;
+fractional values such as `1.5` are refused. Missing, null,
+non-integer, zero, negative, excessive and unknown parameters refuse before
+changing quiet state. Ordinary caller Gate policy applies; this control change
+is classified as `Write` and retains normal dispatch audit behavior.
+
+Concurrent or repeated requests keep the later of the current monotonic deadline
+and `now + ttl_secs`. A shorter request cannot shorten another caller's window.
+There is no revoke operation; a requester that stops renewing cannot leave quiet
+active permanently. A live requester may extend it with further valid requests.
+`comm.health.resource.quiet_until` is always present: it is the UTC deadline of
+the winning request while active and null as soon as the monotonic deadline
+expires. Wall-clock adjustments do not change expiry.
+
+The deadline is shared across runtime instances and namespaces in this process.
+Normal forwarding applies it in the daemon; an in-process composition applies
+it in that process. It is not persisted and does not coordinate other daemons.
+The handler does not acquire a background-work permit or a database writer for
+the deadline itself. Configured ordinary audit may write, and an audit failure
+after handler execution does not roll back the deadline; an error response alone
+is therefore not proof that the request had no effect.
+
+Warm and maintenance supervisors wait before entering a new producer. KG and
+Knowledge background embedding also wait immediately before inference, and
+Knowledge snapshot warming waits before its warm attempt while retaining its
+single-flight claim. Waits respond to cancellation or daemon shutdown and
+recheck renewals. An already-running memory attempt may finish while retaining
+its existing model guard. Foreground requests, finalization, channel delivery,
+session ingestion and mmap freshness watchers continue. In-flight SQL,
+inference and blocking ANN builds are not suspended; quiet is not a guarantee
+of zero CPU activity or a host-wide contention lock.

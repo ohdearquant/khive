@@ -231,7 +231,7 @@ static MEMORY_HANDLERS: [HandlerDef; 11] = [
                 name: "min_score",
                 param_type: "number",
                 required: false,
-                description: "Minimum rank_score to include (default 0.0). This filters `rank_score`, not `score`: `score` (absolute/raw relevance in each result) stays in [0,1] regardless of fusion strategy, but `rank_score` (the composite used for ranking and this filter) is the weighted relevance/salience/temporal composite under the configured default weights — nominally [0,1] — further adjusted whenever a brain profile serves the request: a per-entity term bounded to clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15), and, when the serving profile carries a `local_factor` (a number in [0.5, 1]), a multiplication of `local` rows' rank_score by that factor; rows of every other namespace are not scaled. So a served, positively-reinforced memory's rank_score can exceed 1.0 by up to 15%, and under a profile with a factor a `local` row's rank_score is scaled down. Typical production floor: 0.3–0.7.",
+                description: "Minimum rank_score to include (default 0.0). This filters `rank_score`, not `score`: `score` (absolute/raw relevance in each result) stays in [0,1] regardless of fusion strategy, but `rank_score` (the composite used for ranking and this filter) is the weighted relevance/salience/temporal composite under the configured default weights — nominally [0,1] — further adjusted whenever a brain profile serves the request: a per-entity term t0 = clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15) scaled toward 1 by the posterior's evidence mass n, 1 + (t0 - 1) * n / (n + 16), so it stays within [0.85, 1.15] and is exactly 1 at n = 0, and, when the serving profile carries a `local_factor` (a number in [0.5, 1]), a multiplication of `local` rows' rank_score by that factor; rows of every other namespace are not scaled. So a served, positively-reinforced memory's rank_score can exceed 1.0 by up to 15%, and under a profile with a factor a `local` row's rank_score is scaled down. Typical production floor: 0.3–0.7.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -312,7 +312,7 @@ static MEMORY_HANDLERS: [HandlerDef; 11] = [
                 name: "include_breakdown",
                 param_type: "boolean",
                 required: false,
-                description: "Include per-component score breakdowns in results. Each breakdown reports `relevance` (the value the ranking composite received, with no further scaling), `fused_score` (the fused score before normalization), `composite` (`relevance_term`, `temporal_boost`, `salience_boost` and `adjustment_factor`: the factors of the multiplicative composite that ranks the hit, whose product is `pre_entity_score` when no reranker weights are configured, `adjustment_factor` null when the other three do not multiply to a positive number, `composite` absent when the composite arithmetic fell back to a zero score; the additive `weighted` contributions are not that composite), `weights_served` (always \"default\": a served profile scores with the configured default weights), `profile_component` (diagnostic only: the hit's composite under the weights the serving profile's posteriors project to, divided by its composite under the default weights; it never enters rank_score), and `namespace`, `pre_entity_score`, `entity_term`, `local_factor` (1 when no factor applies) and `duplicate_penalty` (the amount subtracted, 0 when none), each the 32-bit value used, so that rank_score = pre_entity_score * entity_term * local_factor - duplicate_penalty.",
+                description: "Include per-component score breakdowns in results. Each breakdown reports `relevance` (the value the ranking composite received, with no further scaling), `fused_score` (the fused score before normalization), `composite` (`relevance_term`, `temporal_boost`, `salience_boost` and `adjustment_factor`: the factors of the multiplicative composite that ranks the hit, whose product is `pre_entity_score` when no reranker weights are configured, `adjustment_factor` null when the other three do not multiply to a positive number, `composite` absent when the composite arithmetic fell back to a zero score; the additive `weighted` contributions are not that composite), `weights_served` (always \"default\": a served profile scores with the configured default weights), `profile_component` (diagnostic only: the hit's composite under the weights the serving profile's posteriors project to, divided by its composite under the default weights; it never enters rank_score), `entity_posterior_mean` and `entity_evidence_mass` (the serving profile's posterior mean and evidence mass n for the hit, present together, absent when no profile served the request or it holds no posterior for the hit; entity_term recomputes from them), and `namespace`, `pre_entity_score`, `entity_term`, `local_factor` (1 when no factor applies) and `duplicate_penalty` (the amount subtracted, 0 when none), each the 32-bit value used, so that rank_score = pre_entity_score * entity_term * local_factor - duplicate_penalty.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -327,6 +327,13 @@ static MEMORY_HANDLERS: [HandlerDef; 11] = [
                 param_type: "array",
                 required: false,
                 description: "Entity names to boost in scoring. Memories mentioning these entities receive a 1.3× score multiplier.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "label",
+                param_type: "string",
+                required: false,
+                description: "Call-site label, up to 128 characters, with no control characters and no leading or trailing whitespace. It does not change the results: it is kept on this recall's recall_executed event, and brain.event_counts counts those events by it in counts_by_label.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -363,6 +370,13 @@ static MEMORY_HANDLERS: [HandlerDef; 11] = [
                 param_type: "array",
                 required: false,
                 description: "Drop memories whose stored tags include any of these values. Applied after tags/tag_mode and before ranking and limit, so a run can recall everything except its own writes.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "prefer_tags",
+                param_type: "array",
+                required: false,
+                description: "Rank memories whose stored tags include any of these values ahead of the rest. Unlike tags, nothing is dropped: other matches fill the remaining slots, and each group keeps its score order.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

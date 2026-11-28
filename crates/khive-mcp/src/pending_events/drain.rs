@@ -48,6 +48,7 @@ pub async fn run_pending_events_with_config(
         namespace: None,
         no_embed: false,
         pack: Vec::new(),
+        catalog_verbosity: crate::args::CatalogVerbosity::Full,
         config: config.map(std::path::Path::to_path_buf),
         daemon: false,
         lifetime: None,

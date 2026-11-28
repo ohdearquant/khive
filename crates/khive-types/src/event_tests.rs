@@ -239,6 +239,57 @@ fn proposal_changeset_rejects_invalid_edge_weight() {
 
 #[cfg(feature = "serde")]
 #[test]
+fn proposal_changeset_edge_metadata_preserves_wire_intent_and_legacy_shape() {
+    let legacy = serde_json::json!({
+        "kind": "add_edge",
+        "source": "7426afd6-0234-4701-9045-83dfd39166e6",
+        "target": "abcdef01-2345-6789-abcd-ef0123456789",
+        "relation": "extends",
+        "weight": 0.25
+    });
+    let decoded: ProposalChangeset = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(matches!(
+        &decoded,
+        ProposalChangeset::AddEdge { metadata: None, .. }
+    ));
+    assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+
+    let mut explicit_null = legacy.clone();
+    explicit_null["metadata"] = serde_json::Value::Null;
+    let decoded: ProposalChangeset = serde_json::from_value(explicit_null).unwrap();
+    assert!(matches!(
+        &decoded,
+        ProposalChangeset::AddEdge { metadata: None, .. }
+    ));
+    assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+
+    // Shape and governed-key validation belongs to the link write boundary;
+    // decoding must retain even a draft that will be refused when applied.
+    for metadata in [
+        serde_json::json!({"optional": false, "context": {"steps": [1, true, null], "label": "evidence"}}),
+        serde_json::json!({}),
+        serde_json::json!({"dependency_kind": "not-a-kind"}),
+        serde_json::json!(["not an object"]),
+        serde_json::json!(42),
+        serde_json::json!(false),
+        serde_json::json!("not an object"),
+    ] {
+        let mut raw = legacy.clone();
+        raw["metadata"] = metadata.clone();
+        let decoded: ProposalChangeset = serde_json::from_value(raw.clone()).unwrap();
+        let ProposalChangeset::AddEdge {
+            metadata: stored, ..
+        } = &decoded
+        else {
+            panic!("expected AddEdge");
+        };
+        assert_eq!(stored.as_ref(), Some(&metadata));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), raw);
+    }
+}
+
+#[cfg(feature = "serde")]
+#[test]
 fn proposal_changeset_accepts_null_edge_weight() {
     let uuid = "7426afd6-0234-4701-9045-83dfd39166e6";
     let uuid2 = "abcdef01-2345-6789-abcd-ef0123456789";
@@ -253,6 +304,64 @@ fn proposal_changeset_accepts_null_edge_weight() {
         cs,
         ProposalChangeset::AddEdge { weight: None, .. }
     ));
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn proposal_changeset_retire_and_supersede_edge_round_trip_and_validate() {
+    let a = "7426afd6-0234-4701-9045-83dfd39166e6";
+    let b = "abcdef01-2345-6789-abcd-ef0123456789";
+    let c = "0123abcd-4567-89ab-cdef-0123456789ab";
+
+    let retire = serde_json::json!({
+        "kind": "retire_edge", "source": a, "target": b, "relation": "extends"
+    });
+    let cs: ProposalChangeset = serde_json::from_value(retire.clone()).expect("retire_edge");
+    assert!(matches!(cs, ProposalChangeset::RetireEdge { .. }));
+    assert_eq!(serde_json::to_value(&cs).unwrap(), retire);
+
+    let supersede = serde_json::json!({
+        "kind": "supersede_edge",
+        "old": {"source": a, "target": b, "relation": "extends"},
+        "new": {"source": a, "target": c, "relation": "extends", "weight": 0.5}
+    });
+    let cs: ProposalChangeset = serde_json::from_value(supersede.clone()).expect("supersede_edge");
+    assert!(matches!(cs, ProposalChangeset::SupersedeEdge { .. }));
+    assert_eq!(serde_json::to_value(&cs).unwrap(), supersede);
+
+    let decode = |old: serde_json::Value, new: serde_json::Value| {
+        serde_json::from_value::<ProposalChangeset>(
+            serde_json::json!({"kind": "supersede_edge", "old": old, "new": new}),
+        )
+    };
+    // `new` naming the edge `old` names is refused, including a symmetric
+    // relation written with the endpoints swapped.
+    for (old, new) in [
+        (
+            serde_json::json!({"source": a, "target": b, "relation": "extends"}),
+            serde_json::json!({"source": a, "target": b, "relation": "extends"}),
+        ),
+        (
+            serde_json::json!({"source": a, "target": b, "relation": "competes_with"}),
+            serde_json::json!({"source": b, "target": a, "relation": "competes_with"}),
+        ),
+    ] {
+        let err = decode(old, new).unwrap_err().to_string();
+        assert!(err.contains("different edge"), "{err}");
+    }
+    // A directed relation reversed is a different edge.
+    decode(
+        serde_json::json!({"source": a, "target": b, "relation": "extends"}),
+        serde_json::json!({"source": b, "target": a, "relation": "extends"}),
+    )
+    .expect("a reversed directed edge is a new edge");
+    let err = decode(
+        serde_json::json!({"source": a, "target": b, "relation": "extends"}),
+        serde_json::json!({"source": a, "target": c, "relation": "extends", "weight": 2.0}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("[0.0, 1.0]"), "{err}");
 }
 
 #[cfg(feature = "serde")]

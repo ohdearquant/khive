@@ -19,7 +19,16 @@ fn run_case(case: &str, raw: &str) {
     let root = tempfile::Builder::new()
         .prefix("events-main-policy-")
         .tempdir_in("/tmp")
+        .or_else(|_| {
+            tempfile::Builder::new()
+                .prefix("events-main-policy-")
+                .tempdir()
+        })
         .expect("isolated events policy fixture");
+    // The child's environment is cleared, so it gets a temporary directory of
+    // its own; without one it falls back to /tmp, which a sandboxed run closes.
+    let temporary = root.path().join("tmp");
+    std::fs::create_dir(&temporary).expect("child temporary directory");
     let output = Command::new(std::env::current_exe().expect("test executable"))
         .args([
             "--exact",
@@ -29,6 +38,7 @@ fn run_case(case: &str, raw: &str) {
         ])
         .env_clear()
         .env("HOME", root.path().join("home"))
+        .env("TMPDIR", &temporary)
         .env("KHIVE_VOLUME_LOCK_DIR", root.path().join("volume-locks"))
         .env(TIMEOUT_SINK_ENV, root.path().join("writer-timeouts"))
         .env(CHILD_CASE, case)

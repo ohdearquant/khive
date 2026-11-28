@@ -552,7 +552,7 @@ async fn anchor_priority_continues_to_a_later_fitting_pair() {
 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
-async fn ordered_diamond_and_cycle_preserve_first_owner_and_flattened_edge_order() {
+async fn ordered_diamond_and_cycle_keep_first_owner_per_anchor_and_flattened_edge_order() {
     let f = fixture();
     let [a, b, p, q, x, z, t] = [1, 2, 10, 11, 20, 21, 30].map(Uuid::from_u128);
     for (id, name) in [
@@ -596,22 +596,31 @@ async fn ordered_diamond_and_cycle_preserve_first_owner_and_flattened_edge_order
     );
     assert_eq!(rows[2]["via"], json!(p));
     assert_eq!(rows[3]["via"], json!(q));
+    // X is reached by both anchors, so it is listed under B as well, as B's own hop-1
+    // neighbor; within A the diamond still keeps its first discovering parent.
+    let rows = response["anchors"][1]["neighbors"].as_array().unwrap();
     assert_eq!(
-        response["anchors"][1]["neighbors"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
+        rows.iter().map(|r| r["id"].clone()).collect::<Vec<_>>(),
+        vec![json!(x), json!(t)]
     );
-    assert_eq!(response["anchors"][1]["neighbors"][0]["id"], json!(t));
+    assert_eq!(rows[0]["hop"], json!(1));
+    assert_eq!(rows[0]["via"], Value::Null);
+    assert_eq!(rows[0]["weight"], json!(1.0));
     assert_eq!(
         response["edges"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|r| r["target_id"].clone())
+            .map(|r| (r["source_id"].clone(), r["target_id"].clone()))
             .collect::<Vec<_>>(),
-        vec![json!(p), json!(q), json!(x), json!(z), json!(t)]
+        vec![
+            (json!(a), json!(p)),
+            (json!(a), json!(q)),
+            (json!(p), json!(x)),
+            (json!(q), json!(z)),
+            (json!(b), json!(x)),
+            (json!(b), json!(t)),
+        ]
     );
     assert_eq!(response, f.context(args).await);
 }

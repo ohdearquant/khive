@@ -44,6 +44,7 @@ fn exact_platform_capacity_binds_and_one_more_byte_is_refused() {
     let dir = tempfile::Builder::new()
         .prefix("evp-")
         .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("evp-").tempdir())
         .unwrap();
     let root = dir.path().canonicalize().unwrap();
     let fits = socket_with_required_bytes(&root, capacity());
@@ -142,6 +143,7 @@ fn forwarding_constructors_refuse_before_open_or_parent_creation() {
             let private = tempfile::Builder::new()
                 .prefix("evc-env-")
                 .tempdir_in("/tmp")
+                .or_else(|_| tempfile::Builder::new().prefix("evc-env-").tempdir())
                 .unwrap();
             for (key, _) in std::env::vars_os() {
                 if key.to_string_lossy().starts_with("KHIVE_") {
@@ -168,6 +170,7 @@ fn forwarding_constructors_refuse_before_open_or_parent_creation() {
     let dir = tempfile::Builder::new()
         .prefix("evc-")
         .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("evc-").tempdir())
         .unwrap();
     let root = dir.path().canonicalize().unwrap();
     let over = socket_with_required_bytes(&root, capacity() + 1);
@@ -200,6 +203,7 @@ fn memory_without_a_file_backend_does_not_validate_an_unused_socket() {
     let dir = tempfile::Builder::new()
         .prefix("evm-")
         .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("evm-").tempdir())
         .unwrap();
     let root = dir.path().canonicalize().unwrap();
     let over = socket_with_required_bytes(&root, capacity() + 1);

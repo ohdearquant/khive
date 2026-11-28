@@ -26,6 +26,7 @@ impl Fixture {
             exec: ExecSectionConfig {
                 root: Some(root.to_string_lossy().into_owned()),
                 read_roots: vec!["/bin".into(), "/usr/bin".into()],
+                cache_roots: Vec::new(),
                 timeout_default_s: Some(5.0),
                 timeout_max_s: Some(10.0),
                 keep: true,
@@ -287,4 +288,204 @@ async fn detached_timeout_survivor_retains_file_and_network_denials() {
     .expect("detached descendant did not report post-timeout probes");
     assert_eq!(state, b"write=denied\nconnect=denied\nbind=denied\n");
     assert_eq!(std::fs::read(outside).unwrap(), b"guard");
+}
+
+async fn original_group_liveness_reader(root: &std::path::Path) -> std::fs::File {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let ready_path = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Ok(entries) = std::fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    let path = entry.path().join("original-group-ready");
+                    if path.is_file() {
+                        return path;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("original-group fixture did not publish readiness");
+    let readiness: Value = serde_json::from_slice(&std::fs::read(&ready_path).unwrap()).unwrap();
+    let leader = readiness["leader"].as_i64().unwrap();
+    let grandchild = readiness["grandchild"].as_i64().unwrap();
+    let pgid = readiness["pgid"].as_i64().unwrap();
+    assert!(leader > 1 && grandchild > 1);
+    assert_ne!(leader, grandchild);
+    assert_eq!(
+        pgid, leader,
+        "fixture grandchild escaped the original group"
+    );
+    assert_eq!(
+        unsafe { libc::getpgid(grandchild as libc::pid_t) },
+        leader as libc::pid_t,
+        "host must confirm group membership while leader is still held"
+    );
+    let mut liveness = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(ready_path.with_file_name("original-group-live"))
+        .expect("open original-group liveness FIFO");
+    let mut byte = [0u8; 1];
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match liveness.read(&mut byte) {
+                Ok(1) => break,
+                Ok(0) => {}
+                Ok(_) => unreachable!("one-byte liveness read"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("read initial liveness byte: {error}"),
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("grandchild did not establish a live descriptor");
+    assert_eq!(byte, [b'R']);
+    liveness
+}
+
+async fn assert_original_group_fifo_closed(mut liveness: std::fs::File) {
+    use std::io::Read;
+
+    let mut byte = [0u8; 1];
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match liveness.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => panic!("unexpected post-readiness liveness bytes"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("read liveness EOF: {error}"),
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("original-group grandchild remains live after exec receipt");
+}
+
+async fn original_group_run_receipt(normal_exit: bool) -> Value {
+    let fixture = Fixture::new();
+    let tree = fixture.ready_tree().await;
+    // The FIFO proves liveness without using an orphan zombie's numeric PID as
+    // a death oracle. Every helper self-expires if a cleanup mutant omits kill.
+    let script = r#"exec /usr/bin/perl -MPOSIX -e '
+        my $leader = $$;
+        pipe(my $signal_read, my $signal_write) or die "pipe: $!";
+        my $child = fork(); die "fork: $!" unless defined $child;
+        if ($child) {
+            close($signal_write);
+            my $signal = <$signal_read>;
+            die "no live grandchild" unless defined($signal) && $signal eq "ready\n";
+            close($signal_read);
+            if ($ARGV[0] eq "normal") { exit 23; }
+            sleep 10;
+            exit 24;
+        }
+        close($signal_read);
+        my $grandchild = fork(); die "grandchild fork: $!" unless defined $grandchild;
+        if ($grandchild) {
+            close($signal_write);
+            exit 0;
+        }
+        close(STDOUT);
+        close(STDERR);
+        $SIG{ALRM} = sub { POSIX::_exit(25); };
+        alarm 10;
+        my $fifo = "$ENV{HOME}/original-group-live";
+        POSIX::mkfifo($fifo, 0600) == 0 or die "mkfifo: $!";
+        open(my $ready, ">", "$ENV{HOME}/original-group-ready.tmp") or die "ready: $!";
+        print $ready "{\"leader\":$leader,\"grandchild\":$$,\"pgid\":", getpgrp(0), "}";
+        close($ready);
+        rename("$ENV{HOME}/original-group-ready.tmp", "$ENV{HOME}/original-group-ready")
+            or die "publish ready: $!";
+        open(my $live, ">", $fifo) or die "fifo writer: $!";
+        syswrite($live, "R") == 1 or die "live byte: $!";
+        print $signal_write "ready\n";
+        close($signal_write);
+        sleep 10;
+    ' "$1""#;
+    let params = json!({
+        "tree": tree,
+        "tool": "sh",
+        "args": ["-c", script, "sh", if normal_exit { "normal" } else { "timeout" }],
+        "actor": "local",
+        "timeout_s": 5.0
+    });
+    let (result, liveness) = tokio::time::timeout(Duration::from_secs(9), async {
+        tokio::join!(
+            fixture.call("exec.run", params),
+            original_group_liveness_reader(&fixture.root)
+        )
+    })
+    .await
+    .expect("original-group exec fixture exceeded its outer setup/run bound");
+    let receipt = &result["receipt"];
+    assert_eq!(receipt["timed_out"], !normal_exit, "{receipt}");
+    assert_eq!(receipt["success"], false, "{receipt}");
+    if normal_exit {
+        assert_eq!(
+            receipt["exit_code"], 23,
+            "normal leader status was changed: {receipt}"
+        );
+    } else {
+        assert!(
+            receipt["exit_code"].is_null(),
+            "timeout exposed a terminal status: {receipt}"
+        );
+    }
+    assert_original_group_fifo_closed(liveness).await;
+    result
+}
+
+#[tokio::test]
+async fn normal_exit_receipt_ends_original_group_grandchild_liveness() {
+    original_group_run_receipt(true).await;
+}
+
+#[tokio::test]
+async fn timeout_receipt_ends_original_group_grandchild_liveness() {
+    original_group_run_receipt(false).await;
+}
+
+#[tokio::test]
+async fn run_without_descendants_preserves_nonzero_exit_status() {
+    let fixture = Fixture::new();
+    let tree = fixture.ready_tree().await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.call(
+            "exec.run",
+            json!({
+                "tree": tree,
+                "tool": "sh",
+                "args": ["-c", "exit 23"],
+                "actor": "local",
+                "timeout_s": 3.0
+            }),
+        ),
+    )
+    .await
+    .expect("no-descendant exec run did not finish within its outer bound");
+    let receipt = &result["receipt"];
+    assert_eq!(
+        receipt["exit_code"], 23,
+        "normal leader status was lost: {receipt}"
+    );
+    assert!(receipt["exit_signal"].is_null(), "{receipt}");
+    assert_eq!(receipt["timed_out"], false, "{receipt}");
+    assert_eq!(
+        receipt["success"], false,
+        "exit 23 is unsuccessful: {receipt}"
+    );
+    assert!(
+        !receipt["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("process group cleanup failed"),
+        "no-descendant normal exit must not invent cleanup failure: {receipt}"
+    );
 }

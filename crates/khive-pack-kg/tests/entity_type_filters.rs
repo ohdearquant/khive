@@ -155,6 +155,11 @@ async fn entity_type_filters_refuse_unknown_values_with_and_without_kind() {
             assert!(message.contains("zz_no_such_type_zz"), "{message}");
             assert!(message.contains("valid:"), "{message}");
             assert!(message.contains("paper"), "{message}");
+            assert!(
+                message.contains("cannot be declared per store"),
+                "{message}"
+            );
+            assert!(message.contains("properties or tags"), "{message}");
         }
         let mut granular = filter_params(verb, None, "zz_no_such_type_zz");
         granular["kind"] = json!("document");

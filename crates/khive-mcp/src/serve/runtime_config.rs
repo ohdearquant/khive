@@ -536,11 +536,8 @@ pub fn resolve_runtime_config_with_actor_ownership(
     let db_path_for_config = config_discovery_db_anchor(inputs.db);
 
     let resolved = if inputs.no_embed {
-        // `RuntimeConfig::no_embeddings()` is the canonical "zero embedders"
-        // constructor (issue #396) — it clears `embedding_model` and
-        // `additional_embedding_models` together, unlike a manual two-field
-        // override which can leave `additional_embedding_models` populated
-        // from `KHIVE_ADDITIONAL_EMBEDDING_MODELS`.
+        // Retain unsuppressed declarations until the compatibility comparison;
+        // the selected-file and absent-file paths clear them before returning.
         let no_embed_base = RuntimeConfig {
             db_path,
             default_namespace: inputs.namespace,
@@ -548,7 +545,7 @@ pub fn resolve_runtime_config_with_actor_ownership(
             // Explicit CLI flag only at this tier — env and config-file tiers are applied
             // below in resolve_actor_from_config and apply_env_brain_profile.
             brain_profile: cli_brain_profile,
-            ..RuntimeConfig::no_embeddings()
+            ..RuntimeConfig::default()
         };
         resolve_actor_from_config(
             inputs.config,
@@ -786,6 +783,7 @@ fn resolve_config(
             }
 
             let mut resolved = runtime_config_from_khive_config(&khive_cfg, base);
+            emit_embed_compatibility_warning(&khive_cfg, &resolved);
             resolve_runtime_wal_ceiling(&mut resolved, &khive_cfg.backends, force_memory)?;
             Ok(resolved)
         }
@@ -889,15 +887,30 @@ fn resolve_actor_from_config(
         Some(khive_cfg) => {
             let base = apply_config_pack_selection(&khive_cfg, base, packs_overridden);
             let mut resolved = runtime_config_from_khive_config(&khive_cfg, base);
+            emit_embed_compatibility_warning(&khive_cfg, &resolved);
             resolve_runtime_wal_ceiling(&mut resolved, &khive_cfg.backends, force_memory)?;
             resolved.disable_embedding_models();
             Ok(resolved)
         }
         None => {
             let mut resolved = base;
+            resolved.embedding_model = None;
+            resolved.additional_embedding_models.clear();
             resolve_runtime_wal_ceiling(&mut resolved, &[], force_memory)?;
             Ok(resolved)
         }
+    }
+}
+
+fn emit_embed_compatibility_warning(config: &KhiveConfig, resolved: &RuntimeConfig) {
+    let engines = resolved.configured_engines();
+    let reasons = config.embed.compatibility_reasons(engines.first());
+    if !reasons.is_empty() {
+        tracing::warn!(
+            target: "khive.config.embed",
+            reasons = ?reasons,
+            "legacy [embed] settings are ignored; [[engines]] controls embedding providers"
+        );
     }
 }
 
