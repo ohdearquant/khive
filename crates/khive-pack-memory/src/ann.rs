@@ -140,6 +140,10 @@ trait AnnBuildContext: Copy + Send + Sync {
     ) -> impl std::future::Future<Output = Result<AnnBridge, Self::Error>> + Send;
 }
 
+#[cfg(all(test, unix))]
+#[path = "ann/interactive_build_test_support.rs"]
+pub(crate) mod interactive_build_test_support;
+
 #[derive(Clone, Copy)]
 struct InteractiveAnn;
 impl AnnBuildContext for InteractiveAnn {
@@ -152,15 +156,21 @@ impl AnnBuildContext for InteractiveAnn {
         ids: Vec<Uuid>,
         namespaces: HashSet<String>,
     ) -> Result<AnnBridge, RuntimeError> {
-        tokio::task::spawn_blocking(move || AnnBridge::build(flat, dims, ids, namespaces))
-            .await
-            .map_err(|error| {
-                RuntimeError::Storage(StorageError::driver(
-                    khive_storage::StorageCapability::Vectors,
-                    "memory_ann_build",
-                    error,
-                ))
-            })?
+        #[cfg(all(test, unix))]
+        let test_gate = interactive_build_test_support::capture();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(all(test, unix))]
+            let _worker = test_gate.map(|gate| gate.enter());
+            AnnBridge::build(flat, dims, ids, namespaces)
+        })
+        .await
+        .map_err(|error| {
+            RuntimeError::Storage(StorageError::driver(
+                khive_storage::StorageCapability::Vectors,
+                "memory_ann_build",
+                error,
+            ))
+        })?
     }
 }
 
@@ -215,9 +225,13 @@ impl AnnBuildContext for BackgroundAnn<'_> {
     ) -> Result<AnnBridge, AnnBackgroundError> {
         #[cfg(test)]
         let before_build = self.before_build.cloned();
+        #[cfg(all(test, unix))]
+        let test_gate = interactive_build_test_support::capture_background();
         let child = self
             .job
             .spawn_blocking(move || {
+                #[cfg(all(test, unix))]
+                let _worker = test_gate.map(|gate| gate.enter());
                 #[cfg(test)]
                 if let Some(hook) = before_build {
                     hook();
@@ -503,6 +517,37 @@ async fn submit_ann_attempt(
             AnnBackgroundError::Runtime(error) => JobOutcome::Completed(Err(error)),
         },
     }
+}
+
+/// Own one recall-triggered Warm attempt before its detached handoff.
+/// The request may drop its receiver; admission and supervisor joining stay here.
+pub(crate) fn submit_recall_miss(
+    rt: KhiveRuntime,
+    token: NamespaceToken,
+    ann: SharedAnn,
+    model: String,
+) -> (
+    TrackedJob,
+    impl std::future::Future<Output = JobOutcome<Result<AnnEnsureStatus, RuntimeError>>>
+        + Send
+        + 'static,
+) {
+    let rt = rt.background_view();
+    let tracking = TrackedJob::register("memory_ann_build");
+    let attempt_tracking = tracking.clone();
+    let attempt = async move {
+        #[cfg(all(test, unix))]
+        {
+            interactive_build_test_support::after_real_submit(
+                submit_ann_attempt(&rt, &ann, &model, token, &attempt_tracking).await,
+            )
+        }
+        #[cfg(not(all(test, unix)))]
+        {
+            submit_ann_attempt(&rt, &ann, &model, token, &attempt_tracking).await
+        }
+    };
+    (tracking, attempt)
 }
 
 #[cfg(test)]

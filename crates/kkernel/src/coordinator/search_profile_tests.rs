@@ -153,7 +153,8 @@ async fn process_scope_config_locks_trace_once_without_store_rows() {
     for _ in 0..2 {
         let _ = service
             .fan_out_search(&query, &Namespace::local(), &[])
-            .await;
+            .await
+            .expect("active search succeeds");
     }
 
     // The registry retains the runtime. Keeping server.runtime unset deliberately
@@ -262,8 +263,7 @@ fn memory_runtime() -> Arc<KhiveRuntime> {
     ))
 }
 
-#[path = "../../../khive-runtime/tests/support/receipt_credentials.rs"]
-mod config_lock_runtime_receipt_credentials;
+use crate::receipt_credentials as config_lock_runtime_receipt_credentials;
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(config_ledger)]
@@ -508,8 +508,9 @@ async fn profiled_search(
     let service = SubstrateCoordinatorService::new(coordinator);
     let request =
         request(serde_json::json!({"kind": "entity", "query": "ProfileProbe", "limit": 10}));
-    let (_result, lines) =
+    let (result, lines) =
         search_profile::capture(service.fan_out_search(&request, &Namespace::local(), &[])).await;
+    result.expect("active search succeeds with backend failure disclosure");
     lines
         .iter()
         .map(|line| serde_json::from_str(line).expect("each line is one JSON object"))
@@ -763,8 +764,10 @@ async fn a_single_hung_backend_is_named_with_its_timeout() {
     );
     let request =
         request(serde_json::json!({"kind": "entity", "query": "ProfileProbe", "limit": 10}));
-    let (_result, lines) =
+    let (result, lines) =
         search_profile::capture(service.fan_out_search(&request, &Namespace::local(), &[])).await;
+    result.expect("backend timeout preserves active parent search");
+    assert!(khive_storage::ensure_request_read_active("search").is_ok());
     let lines: Vec<serde_json::Value> = lines
         .iter()
         .map(|line| serde_json::from_str(line).expect("each line is one JSON object"))

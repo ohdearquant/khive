@@ -195,16 +195,10 @@ pub fn count(unit: UsageUnit, n: u64) {
 pub fn account_event_write(outcome: Result<u64, &crate::StorageError>) {
     match outcome.map_err(crate::StorageError::without_sqlite_write_stage) {
         Ok(committed_rows) => count(UsageUnit::EventRows, committed_rows),
-        Err(
-            crate::StorageError::WriterTaskRequestFailed {
-                request_state: crate::WriterTaskRequestState::SideEffectsUnknown,
-                ..
-            }
-            | crate::StorageError::WriterTaskTerminated {
-                request_state: crate::WriterTaskRequestState::SideEffectsUnknown,
-                ..
-            },
-        ) => {
+        Err(error)
+            if error.writer_request_state()
+                == Some(crate::WriterTaskRequestState::SideEffectsUnknown) =>
+        {
             if let Some(context) = current() {
                 context.mark_unmeasured();
             }

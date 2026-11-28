@@ -123,6 +123,20 @@ where
     // resolved so a split rendezvous never reaches cleanup/bind/pid-write.
     ensure_rendezvous_overrides_paired()?;
 
+    if super::lifecycle::path_override(PID_PATH_ENV).is_none()
+        && super::lifecycle::path_override(SOCKET_PATH_ENV).is_none()
+    {
+        super::run_daemon::prepare_default_rendezvous_directory()?;
+        #[cfg(test)]
+        if let Some(hook) = super::run_daemon::DEFAULT_RENDEZVOUS_PREBIND_HOOK
+            .lock()
+            .expect("default rendezvous test hook")
+            .take()
+        {
+            hook();
+        }
+    }
+
     let sock = socket_path();
     let pid_file = pid_path();
     let socket_parent = sock.parent();

@@ -676,6 +676,7 @@ mod socket {
     async fn socket_split_matches_direct_order_and_wire_guards_still_refuse() {
         let dir = crate::test_process::private_tempdir_builder()
             .tempdir_in("/tmp")
+            .or_else(|_| crate::test_process::private_tempdir_builder().tempdir())
             .unwrap();
         let (socket, _server) = daemon(&dir).await;
         let forwarded = Arc::new(ForwardingEventStore::new(
@@ -755,6 +756,7 @@ mod socket {
         );
         let dir = crate::test_process::private_tempdir_builder()
             .tempdir_in("/tmp")
+            .or_else(|_| crate::test_process::private_tempdir_builder().tempdir())
             .unwrap();
         let path = dir.path().join("old.sock");
         let listener = UnixListener::bind(&path).unwrap();

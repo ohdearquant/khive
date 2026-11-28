@@ -294,3 +294,75 @@ fn synthetic_edge_inbound_rejected() {
         "inbound synthetic edge must be rejected; got {err:?}"
     );
 }
+
+#[test]
+fn return_paths_bind_complete_json_paths() {
+    for range in ["", "*0..2", "*1..2"] {
+        let query = gql::parse(&format!("MATCH (a)-[e:extends{range}]->(b) RETURN a.properties.nested.Value, b.properties.status, e.metadata.rank.order")).unwrap();
+        let compiled = compile(&query, &opts()).unwrap();
+        for path in ["$.nested.Value", "$.status", "$.rank.order"] {
+            let indices: Vec<_> = compiled
+                .params
+                .iter()
+                .enumerate()
+                .filter_map(|(i, value)| {
+                    matches!(value, QueryValue::Text(text) if text == path).then_some(i + 1)
+                })
+                .collect();
+            assert_eq!(indices.len(), 1, "{range} {path}: {:?}", compiled.params);
+            assert!(
+                compiled.sql.contains(&format!(", ?{})", indices[0])),
+                "{}",
+                compiled.sql
+            );
+            assert!(
+                !compiled.sql.contains(path),
+                "path must be bound, not inlined: {}",
+                compiled.sql
+            );
+        }
+        for alias in [
+            "a_properties_nested_Value",
+            "b_properties_status",
+            "e_metadata_rank_order",
+        ] {
+            assert!(
+                compiled.sql.contains(&format!(" AS \"{alias}\"")),
+                "{}",
+                compiled.sql
+            );
+        }
+    }
+    let direct = compile(
+        &gql::parse("MATCH (a)-[e:extends]->(b) RETURN a.properties, e.metadata").unwrap(),
+        &opts(),
+    )
+    .unwrap();
+    assert!(!direct.sql.contains("json_extract"));
+    assert!(direct.sql.contains("n0.properties AS \"a_properties\""));
+    assert!(direct.sql.contains("e0.metadata AS \"e_metadata\""));
+}
+
+#[test]
+fn return_paths_keep_synthetic_binding_boundaries() {
+    let positive =
+        gql::parse("MATCH (ev)-[e:observed_as_selected]->(m:memory) RETURN m.properties.label")
+            .unwrap();
+    let compiled = compile(&positive, &opts()).unwrap();
+    assert!(compiled
+        .params
+        .iter()
+        .any(|value| matches!(value, QueryValue::Text(path) if path == "$.label")));
+    for input in [
+        "MATCH (a)-[e:extends]->(b) RETURN a.metadata.label",
+        "MATCH (a)-[e:extends]->(b) RETURN e.properties.label",
+        "MATCH (ev)-[e:observed_as_selected]->(m:memory) RETURN e.metadata.label",
+        "MATCH (ev)-[e:observed_as_selected]->(m:memory) RETURN ev.properties.label",
+    ] {
+        let error = compile(&gql::parse(input).unwrap(), &opts()).unwrap_err();
+        assert!(
+            matches!(error, QueryError::Compile(_)),
+            "{input}: {error:?}"
+        );
+    }
+}

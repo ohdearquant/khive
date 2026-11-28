@@ -843,11 +843,76 @@ pub fn calculate_score(input: &ScoreInput<'_>, config: &ScoringConfig) -> f32 {
     calculate_score_with_reporter(input, config, &SCORE_FALLBACK_WARNINGS)
 }
 
+/// The terms of the composite `calculate_score` ranks by.
+///
+/// `relevance_term × temporal_boost × salience_boost` is `base`; the configured adjustments
+/// and the final clamp to `[0, 1]` turn `base` into `score`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ScoreFactors {
+    /// `weights.relevance × relevance_score`.
+    pub(crate) relevance_term: f32,
+    /// `1 + weights.temporal × recency`.
+    pub(crate) temporal_boost: f32,
+    /// `1 + weights.salience × salience`.
+    pub(crate) salience_boost: f32,
+    /// `relevance_term × temporal_boost × salience_boost`, before any adjustment.
+    pub(crate) base: f32,
+    /// The value `calculate_score` returns.
+    pub(crate) score: f32,
+    /// False when the arithmetic fell back to a zero score (a boost or the composite was not a
+    /// finite number): the other fields then do not describe a computed composite.
+    pub(crate) complete: bool,
+}
+
+impl ScoreFactors {
+    /// The terms of a candidate whose boost arithmetic fell back to a zero score: the relevance
+    /// term is kept, no boost was computed, and the result is marked incomplete.
+    fn fallback(relevance_term: f32) -> Self {
+        Self {
+            relevance_term,
+            temporal_boost: 0.0,
+            salience_boost: 0.0,
+            base: 0.0,
+            score: 0.0,
+            complete: false,
+        }
+    }
+
+    /// The net multiplier of the configured adjustments and the final clamp, `score / base`, so
+    /// that `relevance_term × temporal_boost × salience_boost × adjustment_factor` is `score`.
+    ///
+    /// `None` when `base` is not a positive finite number: the adjustments then act on zero, and
+    /// whatever score they leave is not a multiple of `base`.
+    pub(crate) fn adjustment_factor(&self) -> Option<f32> {
+        if self.base.is_finite() && self.base > 0.0 {
+            Some(self.score / self.base)
+        } else {
+            None
+        }
+    }
+}
+
+/// `calculate_score`, returning the terms it multiplied alongside the score.
+pub(crate) fn calculate_score_factors(
+    input: &ScoreInput<'_>,
+    config: &ScoringConfig,
+) -> ScoreFactors {
+    score_factors_with_reporter(input, config, &SCORE_FALLBACK_WARNINGS)
+}
+
 fn calculate_score_with_reporter(
     input: &ScoreInput<'_>,
     config: &ScoringConfig,
     reporter: &ScoreFallbackWarnings,
 ) -> f32 {
+    score_factors_with_reporter(input, config, reporter).score
+}
+
+fn score_factors_with_reporter(
+    input: &ScoreInput<'_>,
+    config: &ScoringConfig,
+    reporter: &ScoreFallbackWarnings,
+) -> ScoreFactors {
     let w = &config.weights;
     let semantic_base = w.relevance * input.relevance_score;
 
@@ -860,14 +925,15 @@ fn calculate_score_with_reporter(
 
     let Ok(temporal_boost) = khive_score::boost_factor_f32(w.temporal, temporal_recency) else {
         reporter.record(ScoreFallbackReason::TemporalBoost);
-        return 0.0;
+        return ScoreFactors::fallback(semantic_base);
     };
     let Ok(salience_boost) = khive_score::boost_factor_f32(w.salience, input.salience) else {
         reporter.record(ScoreFallbackReason::SalienceBoost);
-        return 0.0;
+        return ScoreFactors::fallback(semantic_base);
     };
 
-    let mut score = semantic_base * temporal_boost * salience_boost;
+    let base = semantic_base * temporal_boost * salience_boost;
+    let mut score = base;
 
     let ctx = CandidateContext {
         memory_type: input.memory_type_str,
@@ -885,16 +951,31 @@ fn calculate_score_with_reporter(
     // (for example, +Inf * 0) produces NaN. Keep the rank score numeric.
     if !score.is_finite() {
         reporter.record(ScoreFallbackReason::NonfiniteComposite);
-        return 0.0;
+        return ScoreFactors {
+            relevance_term: semantic_base,
+            temporal_boost,
+            salience_boost,
+            base,
+            score: 0.0,
+            complete: false,
+        };
     }
-    score.clamp(0.0, 1.0)
+    ScoreFactors {
+        relevance_term: semantic_base,
+        temporal_boost,
+        salience_boost,
+        base,
+        score: score.clamp(0.0, 1.0),
+        complete: true,
+    }
 }
 
 // ── ADR-104 §2 (Stage B): bounded per-entity posterior term ───────────────────
 
-/// Default weight for the per-entity posterior term. Chosen so the clamp
-/// bounds below are exactly reachable at posterior means of 0.0 and 1.0
-/// (`1 + 0.3 * (0.0 - 0.5) = 0.85`, `1 + 0.3 * (1.0 - 0.5) = 1.15`).
+/// Default weight for the per-entity posterior term. Chosen so `t0` reaches the
+/// clamp bounds below at posterior means of 0.0 and 1.0
+/// (`1 + 0.3 * (0.0 - 0.5) = 0.85`, `1 + 0.3 * (1.0 - 0.5) = 1.15`); the
+/// served term approaches them only as evidence mass grows.
 pub const ENTITY_POSTERIOR_WEIGHT: f32 = 0.3;
 
 /// Lower bound of the per-entity posterior multiplier — the term can never
@@ -905,18 +986,52 @@ pub const ENTITY_POSTERIOR_CLAMP_MIN: f32 = 0.85;
 /// move a score up by more than 15%.
 pub const ENTITY_POSTERIOR_CLAMP_MAX: f32 = 1.15;
 
-/// `clamp(1 + w_ent * (entity_posterior_mean - 0.5), 0.85, 1.15)`.
-///
-/// `None` (no posterior for this candidate beyond the uninformative prior)
-/// is neutral: exactly `1.0`, not the midpoint of the clamp band. Untouched
-/// memories must be unaffected — the neutral value has to be an identity
-/// multiplier, not a value that happens to fall inside the bounds.
-pub fn entity_posterior_term(entity_posterior_mean: Option<f64>, w_ent: f32) -> f32 {
-    match entity_posterior_mean {
-        Some(mean) => (1.0 + w_ent * (mean as f32 - 0.5))
-            .clamp(ENTITY_POSTERIOR_CLAMP_MIN, ENTITY_POSTERIOR_CLAMP_MAX),
-        None => 1.0,
+/// Evidence mass at which the per-entity term reaches half of `t0 - 1`
+/// (ADR-104 Amendment 6, `k`). A constant of the memory pack, like
+/// [`ENTITY_POSTERIOR_WEIGHT`]; a profile does not carry it.
+pub const ENTITY_EVIDENCE_HALF_MASS: f64 = 16.0;
+
+/// `t0 = clamp(1 + w_ent * (entity_posterior_mean - 0.5), 0.85, 1.15)`, the
+/// multiplier computed from the posterior mean alone (ADR-104 Section 2).
+pub fn entity_posterior_t0(entity_posterior_mean: f64, w_ent: f32) -> f32 {
+    (1.0 + w_ent * (entity_posterior_mean as f32 - 0.5))
+        .clamp(ENTITY_POSTERIOR_CLAMP_MIN, ENTITY_POSTERIOR_CLAMP_MAX)
+}
+
+/// Evidence mass `n` of a posterior stored with the Beta(1, 1) prior inside
+/// `(alpha, beta)`: `max(0, alpha + beta - 2)` (ADR-104 Amendment 6). A
+/// non-finite sum carries no usable evidence and yields `0.0`.
+pub fn entity_evidence_mass(alpha: f64, beta: f64) -> f64 {
+    let mass = alpha + beta - 2.0;
+    if mass.is_finite() {
+        mass.max(0.0)
+    } else {
+        0.0
     }
+}
+
+/// `1 + (t0 - 1) * n / (n + k)` with `k` = [`ENTITY_EVIDENCE_HALF_MASS`]
+/// (ADR-104 Amendment 6), for `posterior = (entity_posterior_mean, n)`.
+///
+/// The term scales `t0` toward neutral by the evidence the posterior holds, in
+/// both directions: it stays within [0.85, 1.15], never moves past `t0`, and is
+/// exactly `1.0` at `n = 0`. `None` (no posterior for the memory) is exactly
+/// `1.0` too, an identity multiplier rather than a value that happens to fall
+/// inside the bounds, so untouched memories are unaffected. A non-finite mass,
+/// mean or weight is neutral as well.
+pub fn entity_posterior_term(posterior: Option<(f64, f64)>, w_ent: f32) -> f32 {
+    let Some((mean, mass)) = posterior else {
+        return 1.0;
+    };
+    if !mass.is_finite() || mass <= 0.0 {
+        return 1.0;
+    }
+    let t0 = entity_posterior_t0(mean, w_ent);
+    if !t0.is_finite() {
+        return 1.0;
+    }
+    let scale = (mass / (mass + ENTITY_EVIDENCE_HALF_MASS)) as f32;
+    1.0 + (t0 - 1.0) * scale
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

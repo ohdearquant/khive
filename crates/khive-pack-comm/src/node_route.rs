@@ -1,10 +1,10 @@
 //! Node-address routing seam for `comm.send`.
 //!
 //! A recipient written as a node address (the `khive1:` form) is not delivered through the local
-//! mailbox or email. The send path hands it to a [`NodeSendRoute`], which parses the address,
-//! looks up the recipient's pinned key and seals the message. The handler then stores the sealed
-//! envelope as a sender transport row. The node channel client later reads that envelope back and
-//! never seals a message a second time.
+//! mailbox or email. When a route is installed, the send path hands it to the [`NodeSendRoute`],
+//! which parses the address, looks up the recipient's pinned key and seals the message, and the
+//! handler stores the sealed envelope as a sender transport row. Without an installed route, a
+//! node-addressed send is refused before anything is written.
 
 use std::future::Future;
 use std::pin::Pin;

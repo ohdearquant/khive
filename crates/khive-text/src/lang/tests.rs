@@ -50,6 +50,20 @@ fn compatibility_ideographs_boundary() {
 }
 
 #[test]
+fn ideographic_letters_in_symbols_block() {
+    assert!(is_cjk_char('\u{3005}')); // 々 iteration mark
+    assert!(is_cjk_char('\u{3006}')); // 〆 closing mark
+    assert!(is_cjk_char('\u{3007}')); // 〇 ideographic zero
+    assert!(!is_cjk_char('\u{3004}')); // 〄 just before, a symbol
+    assert!(!is_cjk_char('\u{3008}')); // 〈 just after, a bracket
+    assert!(!is_cjk_char('\u{3001}')); // 、 ideographic comma
+    assert!(!is_cjk_char('\u{3002}')); // 。 ideographic full stop
+
+    // A word written with the iteration mark is wholly CJK.
+    assert_eq!(ScriptProfile::analyze("人々").cjk_fraction, 1.0);
+}
+
+#[test]
 fn hiragana_boundary() {
     assert!(is_cjk_char('\u{3040}')); // first Hiragana
     assert!(is_cjk_char('\u{309F}')); // last Hiragana
@@ -217,4 +231,17 @@ fn unicode_symbol_only_queries_are_not_meaningful() {
     assert!(is_meaningful_query("\u{4F60}\u{597D}\u{4E16}\u{754C}")); // 你好世界
     assert!(is_meaningful_query("BM25"));
     assert!(is_meaningful_query("5"));
+}
+
+#[test]
+fn cjk_single_and_distinct_char_queries_are_meaningful() {
+    assert!(is_meaningful_text_query("北京城"));
+    assert!(is_meaningful_text_query("北京"));
+    assert!(is_meaningful_text_query("京"));
+}
+
+#[test]
+#[ignore = "qualification: repeated CJK currently fails the meaningful-query filter"]
+fn repeated_cjk_query_is_meaningful() {
+    assert!(is_meaningful_text_query("人人"));
 }

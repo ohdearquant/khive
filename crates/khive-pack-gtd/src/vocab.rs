@@ -106,7 +106,7 @@ pub(crate) static GTD_SCHEMA_PLAN_STMTS: [&str; 2] = [
 ///   Directive  — attempts to get hearer to do something
 ///   Assertive  — retrieves/presents state of affairs
 ///   Declaration — changes institutional status by fiat
-pub(crate) static GTD_HANDLERS: [HandlerDef; 7] = [
+pub(crate) static GTD_HANDLERS: [HandlerDef; 8] = [
     HandlerDef {
         name: "gtd.census",
         description: "Count live task created_at and archived_at values by numeric magnitude in the visible namespaces. Reports null, nonnumeric, zero, 10/13/16-digit magnitude, and other buckets. Magnitude does not establish timestamp units; the raw greater-than count is NOT temporal ordering. Optional candidates expose bounded structural anomalies as exact JSON source text evidence. Read-only: no repair or conversion; candidate output is bounded but may scan the scoped population.",
@@ -132,6 +132,35 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 7] = [
                 param_type: "object",
                 required: false,
                 description: "Resume after {namespace, id} in namespace then UUID order. Use next_cursor from the preceding page with the same scope. The namespace must be visible and id a canonical lowercase dashed full UUID. Requires include_candidates=true; null and unknown fields are rejected.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+        ],
+    },
+    HandlerDef {
+        name: "gtd.counts",
+        description: "Count one assignee's live tasks by status without returning task bodies. Always returns assignee, by_status with an entry for every task status (zero included), open (sum over non-terminal statuses) and total (sum over all statuses). A task whose stored status is absent or non-text counts as inbox, exactly as gtd.tasks reads it. Same visible namespaces as gtd.tasks; deleted tasks are not counted. Optional tag adds {name, open, rows, truncated}: open counts the assignee's open tasks carrying exactly that tag, rows lists them with only id, title, status, priority and updated_at (priority p0..p3 then other priorities, oldest updated_at first, at most limit), and truncated is true exactly when open exceeds the rows returned. No descriptions or properties are returned. Read-only; counts are aggregate queries and never load task rows.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "assignee",
+                param_type: "string",
+                required: true,
+                description: "Actor whose tasks are counted; exact match on the stored assignee, as in gtd.tasks.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "tag",
+                param_type: "string",
+                required: false,
+                description: "Exact tag such as session:oss-reviews; empty string is rejected. Adds the tag block with the assignee's open tasks carrying exactly this tag, matched as gtd.tasks(tags=[...]) matches a tag.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Maximum tag rows, default 50, range 1..=200; values outside the range are rejected, not clamped. Only used when tag is given.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -334,7 +363,10 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 7] = [
                        empty result under the default filter does NOT mean the task doesn't \
                        exist; the response carries `filter_excluded` when the default filter \
                        is the reason the result is empty. Inspect legacy records \
-                       through list(kind=\"task\"); they are not silently rewritten.",
+                       through list(kind=\"task\"); they are not silently rewritten. \
+                       If more matching tasks exist, returns {tasks: [...], has_more: true}; \
+                       exhausted pages retain their existing array or metadata-object shape. \
+                       Continuation includes blocked and broken tasks, not only actionable work.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -394,20 +426,27 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 7] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                // khive #744 raised this cap as silent; khive #2679 added the signal.
                 description: "Maximum results (default 50). A `limit` above 200 is capped to \
                               200; when that happens the response becomes an object \
                               carrying `requested_limit`, `effective_limit`, and \
-                              `limit_clamped: true` instead of the usual bare task array \
-                              (the `filter_excluded`/`hint` object wrap carries the same \
-                              three fields too).",
+                              `limit_clamped: true` (including a `filter_excluded`/`hint` object). \
+                              Independently, any page with more matching rows returns an object \
+                              with `tasks` and `has_more: true`, even at or below 200. \
+                              No `has_more` field means no further match in that page's query snapshot.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "offset",
                 param_type: "integer",
                 required: false,
-                description: "Pagination offset (default 0).",
+                description: "Pagination offset (default 0). When `has_more` is true, add the number of returned tasks to this offset and keep the same filters. Separate pages use separate snapshots; concurrent changes can shift later pages.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "compact",
+                param_type: "boolean",
+                required: false,
+                description: "Return only id, title, status, priority, assignee, tags, updated_at, and description_length in UTF-8 bytes. Defaults to false. Filters, ordering, and pagination are unchanged.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],

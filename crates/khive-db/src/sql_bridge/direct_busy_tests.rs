@@ -414,7 +414,7 @@ fn poisoned_commit_preserves_native_evidence_and_existing_driver_policy() {
         }
     }
     let fixture = Fixture::new(true, false);
-    let conn = crate::pool::open_external_writer_fixture(&fixture.pool).unwrap();
+    let mut conn = crate::pool::open_external_writer_fixture(&fixture.pool).unwrap();
     conn.authorizer(Some(deny_settlement)).unwrap();
     let (disposition, result) = execute_standalone_batch(
         &conn,

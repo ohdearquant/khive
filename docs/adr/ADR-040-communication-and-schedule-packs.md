@@ -1,7 +1,7 @@
 # ADR-040: Communication and Schedule Packs
 
-**Status**: accepted (amended 2026-08-01, 2026-08-06, 2026-08-07, 2026-09-21, 2026-09-24, 2026-09-25 and 2026-10-17)\
-**Date**: 2026-05-23 (last amended 2026-10-17)\
+**Status**: accepted (amended 2026-08-01, 2026-08-06, 2026-08-07, 2026-09-21, 2026-09-24, 2026-09-25, 2026-10-17 and 2026-11-16)\
+**Date**: 2026-05-23 (last amended 2026-11-16)\
 **Authors**: khive maintainers
 
 **Proposed amendment**: [inbox and thread limit disclosure](#amendment-proposed-inbox-and-thread-limit-disclosure-2026-09-14)
@@ -1835,3 +1835,58 @@ The implementation carries, besides tests for each rule above:
 - Automatic schedules and default horizons.
 - Cross-node relayed copies, whose stored shape this amendment does not rely on; a relayed copy that
   does not form a pair under §2 is counted `unpaired`.
+
+## Amendment (2026-11-16): single-message fetch without marking read
+
+**Status:** Accepted 2026-11-16 (#6721).
+
+`comm.read` gains an optional boolean `mark`, defaulting to true. Omission and
+`mark=true` retain the existing single and bulk mark-read behavior, including
+`body`, guarded mutation, degraded responses, and bulk result counts. `mark=false`
+is valid only with the single `id` form; supplying `ids` with `mark=false` is an
+`invalid_params` error even when the array is empty. The existing requirement to
+supply exactly one of `id` or `ids` remains. Non-boolean `mark` values, including
+null, are invalid parameters.
+
+The single-message `mark=false` path uses the same identifier resolution and
+namespace, kind, direction, addressee, and legacy-row validation as the default
+single-message read. A validation failure returns no message. On success, it
+returns the fetched message without patching its properties or changing its
+`updated_at`; it does not change unread membership. An unread message remains
+unread, and an already-read message remains read. This is an exception to the
+2026-09-24 amendment's requirement that a mark succeed before message fields are
+returned, limited to this explicitly requested nonmarking path.
+
+A successful nonmarking fetch retains the single-message response fields:
+
+- `id` is the existing short identifier, and `full_id` is the canonical UUID;
+- `status` is `"success"`, meaning the fetch succeeded;
+- `read` reports the fetched stored state using the inbox convention: only a JSON
+  boolean true is read; missing or non-boolean values report false;
+- `properties` is the fetched stored value, including null, without inserting or
+  rewriting a `read` property.
+
+With omitted or true `body`, the response also uses the existing message-field
+assembly: `subject`, `content`, `from`, `to`, `direction`, and `created_at`, plus
+available origin, trust, label, and attachment metadata and diagnostics. These
+retain the existing value and omission conventions. With `body=false`, those
+expanded fields are omitted and attachment metadata is not fetched; the response
+contains only the metadata fields above. Neither response acknowledges a mark,
+and `read=true` on an already-read message does not imply this call marked it.
+The response describes the fetched message snapshot; concurrent changes by other
+calls are not prevented.
+
+`comm.read` keeps its existing declaration/write classification and runtime audit
+behavior. Avoiding the message-state mutation does not promise that dispatch or
+audit performs no database writes. `comm.mark_read`, inbox/thread defaults, and
+all omitted/true `mark` behavior remain unchanged.
+
+Acceptance requires stored-message witnesses for unread and already-read targets,
+with and without body expansion, preserving properties, `updated_at`, and unread
+membership; body metadata must match the existing read conventions. Wrong-target
+and actor/legacy validation refusals must expose no message, and every
+`mark=false` request with `ids`, including an empty array, must refuse. Default
+and explicit-true single/bulk reads must retain their marking and degradation
+behavior. Controls that mark a nonmarking target, invent its read state, expose
+body fields under `body=false`, bypass target validation, or accept nonmarking
+bulk input must fail their corresponding stored-state or response assertion.

@@ -27,6 +27,8 @@ mod a5_rerank_tests;
 #[cfg(test)]
 mod ann_degrade_tests;
 #[cfg(test)]
+mod index_catalogue_tests;
+#[cfg(test)]
 mod namespace_move_consumer_tests;
 #[cfg(test)]
 mod namespace_move_snapshot_key_tests;

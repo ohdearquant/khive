@@ -26,7 +26,7 @@ impl StandaloneCallOwner {
         }
     }
 
-    pub(super) fn conn(&self) -> &rusqlite::Connection {
+    pub(super) fn conn(&self) -> &crate::ProgressConn {
         &self.handle.as_ref().expect("call owns its connection").conn
     }
 
@@ -61,7 +61,10 @@ impl StandaloneCallOwner {
             _retained_slot,
             read_transaction_slot,
         } = handle;
-        let settled = self.pool.write_admission().close_retired_connection(conn);
+        let settled = self
+            .pool
+            .write_admission()
+            .close_retired_connection(conn.into_inner());
         drop((_retained_slot, read_transaction_slot));
         settled
     }
@@ -100,7 +103,7 @@ where
     R: Send + 'static,
     F: FnOnce(
             &crate::read_cancellation::InterruptibleReadScope,
-            &rusqlite::Connection,
+            &crate::ProgressConn,
             bool,
             bool,
         ) -> StorageResult<R>

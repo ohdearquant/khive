@@ -19,7 +19,13 @@ pub(super) fn admit_standalone_operation(
     let admission = pool.write_admission();
     let to_storage =
         |error: SqliteError| error.into_storage_error(StorageCapability::Sql, operation);
-    let lease = acquire_standalone_lease(pool, operation)?;
+    let lease = if vacuum {
+        let _class =
+            crate::disk_guard::lease_class_scope(crate::disk_guard::LeaseClass::Maintenance);
+        acquire_standalone_lease(pool, operation)?
+    } else {
+        acquire_standalone_lease(pool, operation)?
+    };
     if vacuum {
         admission.check_for_vacuum()
     } else {
@@ -37,6 +43,6 @@ pub(super) fn acquire_standalone_lease(
     operation: &'static str,
 ) -> Result<Option<crate::disk_guard::VolumeLease>, StorageError> {
     pool.write_admission()
-        .acquire()
+        .acquire(crate::disk_guard::LeaseClass::Standalone)
         .map_err(|error| error.into_storage_error(StorageCapability::Sql, operation))
 }

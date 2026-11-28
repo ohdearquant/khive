@@ -111,8 +111,8 @@ impl MemoryPack {
             .ann_ready_timeout_ms
             .unwrap_or_else(|| super::common::ann_ready_timeout_ms(&self.runtime));
 
-        let candidates = self
-            .collect_recall_candidates(
+        let collected = self
+            .collect_recall_candidates_with_plan(
                 &p.query,
                 token,
                 RecallCandidateParams {
@@ -131,6 +131,7 @@ impl MemoryPack {
             )
             .await?;
 
+        let candidates = collected.candidates;
         let (memory_ids, _) = self.load_memory_candidate_notes(token, &candidates).await?;
         let text_candidates: Vec<Value> = candidates
             .text_hits
@@ -163,6 +164,7 @@ impl MemoryPack {
             .collect();
 
         let mut response = json!({
+            "plan": collected.plan,
             "namespace": candidates.namespace,
             "candidate_limit": candidate_limit,
             "text_candidates": text_candidates,

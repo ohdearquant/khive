@@ -33,6 +33,8 @@ pub(super) const NON_PROPERTIES_STORE_METHODS: &[&str] = &[
     "count_entities",
     "count_entities_by_type",
     "get_entity_including_deleted",
+    "get_entity_by_key",
+    "taken_entity_keys",
     "get_live_notes_by_key",
     "query_keyed_notes",
     "assign_note_key_if_unset",

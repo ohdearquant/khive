@@ -203,6 +203,8 @@ mod tests {
                 description: None,
                 properties: Default::default(),
                 tags: vec![],
+                key: None,
+                aliases: vec![],
             }),
         });
         ChangeSet::new(envelope, vec![create])
@@ -405,6 +407,8 @@ mod tests {
                     description: None,
                     properties: Default::default(),
                     tags: vec![],
+                    key: None,
+                    aliases: vec![],
                 }),
             })
         };

@@ -53,17 +53,24 @@ pub fn note_key_is_valid(key: &str) -> bool {
     key.len() <= NOTE_KEY_MAX_BYTES && !key.contains('\0')
 }
 
-/// Validate a key for a note-store operation without accessing storage.
+/// Validate an incoming key assignment without accessing storage.
+/// Reads and fences use [`note_key_is_valid`] without scanning retained keys.
 pub fn validate_note_key_for_store(key: &str, operation: &'static str) -> StorageResult<()> {
-    if note_key_is_valid(key) {
-        Ok(())
-    } else {
-        Err(crate::StorageError::InvalidInput {
+    if !note_key_is_valid(key) {
+        return Err(crate::StorageError::InvalidInput {
             capability: crate::StorageCapability::Notes,
             operation: operation.into(),
             message: "key must be at most 512 UTF-8 bytes and must not contain U+0000".into(),
-        })
+        });
     }
+    crate::secret_scan::check(key).map_err(|matched| crate::StorageError::SecretDetected {
+        capability: crate::StorageCapability::Notes,
+        operation: operation.into(),
+        matched: Box::new(crate::secret_scan::SecretMatch {
+            location: Some("note.key".into()),
+            ..matched
+        }),
+    })
 }
 
 /// Result of setting the key on an existing note that has none.
@@ -382,6 +389,8 @@ pub enum NoteTimeOrder {
     ExpiresAt,
     /// `COALESCE(expires_at, created_at) ASC, id ASC`.
     ExpiresAtOrCreatedAt,
+    /// `updated_at ASC, id ASC`: the oldest-touched rows first.
+    UpdatedAt,
 }
 
 /// Read selection on the note's top-level storage status, independent of

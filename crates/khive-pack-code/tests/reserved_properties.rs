@@ -85,6 +85,9 @@ impl Fixture {
                 db_path: Some(target.clone()),
                 actor_id: Some("test:code-reservation-map".into()),
                 packs: vec![],
+                code_ingest: khive_runtime::CodeIngestSectionConfig {
+                    roots: vec![std::env::temp_dir()],
+                },
                 ..RuntimeConfig::no_embeddings()
             },
             vec![],
@@ -119,6 +122,9 @@ impl Fixture {
             db_path: None,
             actor_id: Some("test:code-reservation-caller".into()),
             packs: vec![],
+            code_ingest: khive_runtime::CodeIngestSectionConfig {
+                roots: vec![std::env::temp_dir()],
+            },
             ..RuntimeConfig::no_embeddings()
         })
         .unwrap();

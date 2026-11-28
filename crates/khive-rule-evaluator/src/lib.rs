@@ -61,6 +61,10 @@ pub struct RuleResult {
 /// A single rule violation with location metadata and a fixability flag.
 #[derive(Debug, Serialize)]
 pub struct Violation {
+    /// Input collection that produced the finding, independent of referenced IDs.
+    /// Configuration and change-set findings may have no single input collection.
+    #[serde(skip)]
+    pub source: Option<NdjsonSource>,
     pub entity_id: Option<String>,
     pub entity_name: Option<String>,
     pub entity_kind: Option<String>,
@@ -68,4 +72,11 @@ pub struct Violation {
     pub severity: &'static str,
     pub message: String,
     pub fixable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NdjsonSource {
+    Entities,
+    Edges,
+    Notes,
 }

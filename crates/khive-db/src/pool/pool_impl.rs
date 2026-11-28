@@ -529,22 +529,25 @@ impl ConnectionPool {
         cached: Option<&WriterTaskHandle>,
         operation: &'static str,
     ) -> Result<Option<WriterTaskHandle>, StorageError> {
+        let unavailable = |source| StorageError::WriterOwnerUnavailable {
+            operation: operation.into(),
+            source: Box::new(source),
+        };
         let handle = match cached {
             Some(handle) => Some(handle.clone()),
             None => match self.writer_task_handle() {
                 Ok(handle) => handle,
-                Err(error) if self.config.write_routing_strict => return Err(error),
+                Err(error) if self.config.write_routing_strict => return Err(unavailable(error)),
                 Err(_) => None,
             },
         };
-
-        if handle.is_none() && self.config.write_routing_strict {
-            return Err(StorageError::Pool {
+        if self.config.write_routing_strict
+            && handle.as_ref().is_none_or(WriterTaskHandle::is_closed)
+        {
+            return Err(unavailable(StorageError::Pool {
                 operation: operation.into(),
-                message: "strict write routing requires a writer-task handle; no handle is \
-                          available, so the direct writer fallback was refused"
-                    .into(),
-            });
+                message: "strict write routing requires a live writer owner".into(),
+            }));
         }
         Ok(handle)
     }
@@ -640,7 +643,7 @@ impl ConnectionPool {
         // Allocate once per physical reader; checkouts move the same box between
         // the queue and lease without allocating on every borrow/return.
         Ok(Box::new(PooledReader {
-            conn: self.open_reader_connection()?,
+            conn: crate::ProgressConn::new(self.open_reader_connection()?)?,
             opened_at,
             checkouts: 0,
         }))
@@ -678,12 +681,15 @@ impl ConnectionPool {
     /// this module. The native opener below is private to these factories.
     #[track_caller]
     pub(super) fn standalone_write_unit(&self) -> Result<StandaloneWriteUnit, SqliteError> {
+        self.ensure_request_write_route("standalone_write")?;
         if self.config.read_only {
             return Err(SqliteError::InvalidData(
                 "database is read-only: standalone write transactions are not permitted".into(),
             ));
         }
-        let volume_lease = self.write_admission.acquire()?;
+        let volume_lease = self
+            .write_admission
+            .acquire(crate::disk_guard::LeaseClass::Standalone)?;
         let conn = self.open_standalone_connection()?;
         self.writer_acquisition_counters
             .standalone_acquisitions
@@ -720,6 +726,8 @@ impl ConnectionPool {
         self: Arc<Self>,
         slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<Box<dyn khive_storage::SqlWriter>, StorageError> {
+        self.ensure_request_write_route("sql_bridge_writer")
+            .map_err(|error| error.into_storage_error(StorageCapability::Sql, "open_writer"))?;
         let conn = self
             .open_standalone_connection()
             .map_err(|error| error.into_storage_error(StorageCapability::Sql, "open_writer"))?;
@@ -765,9 +773,12 @@ impl ConnectionPool {
         if !state.is_due(config, now) {
             return Ok(None);
         }
-        let unit = self
-            .standalone_write_unit()
-            .map_err(|error| format!("FTS maintenance admission: {error}"))?;
+        let unit = {
+            let _class =
+                crate::disk_guard::lease_class_scope(crate::disk_guard::LeaseClass::Maintenance);
+            self.standalone_write_unit()
+        }
+        .map_err(|error| format!("FTS maintenance admission: {error}"))?;
         crate::fts_maintenance::run_if_due_with_admission(unit.conn(), config, state, now, || {
             self.write_admission
                 .check()
@@ -1044,7 +1055,7 @@ impl ConnectionPool {
             return;
         }
 
-        close_connection_quietly(conn.conn);
+        close_connection_quietly(conn.conn.into_inner());
         self.replace_discarded_reader_slot();
     }
 
@@ -1054,7 +1065,7 @@ impl ConnectionPool {
     fn enqueue_reader_slot(&self, conn: Box<PooledReader>) {
         if let Err(conn) = self.readers.push(conn) {
             eprintln!("[sqlite-pool] reader pool queue full, discarding replacement connection");
-            close_connection_quietly(conn.conn);
+            close_connection_quietly(conn.conn.into_inner());
         }
     }
 

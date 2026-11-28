@@ -7,18 +7,15 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use khive_runtime::time_anchor::anchor_date_to_earliest_instant;
 use khive_runtime::{
-    micros_to_iso, DispatchHook, EventAttribution, EventView, KhiveRuntime, Namespace,
-    NamespaceToken, RuntimeError, VerbRegistry,
+    DispatchHook, EventAttribution, EventView, KhiveRuntime, Namespace, NamespaceToken,
+    RuntimeError, VerbRegistry,
 };
-use khive_storage::event::{Event, EventFilter};
-use khive_storage::types::PageRequest;
+use khive_storage::event::Event;
 use khive_types::{HandlerDef, IdResolutionMode};
 
 mod auto_feedback;
 mod brain_handlers;
-mod event_counts;
 mod event_page;
 #[cfg(feature = "lattice-router")]
 mod router;
@@ -26,15 +23,16 @@ mod router;
 #[cfg(feature = "lattice-router")]
 use router::*;
 
-pub(crate) use event_counts::*;
+#[cfg(test)]
+pub(crate) use khive_runtime::event_plane_read_test_support::{
+    fetch_event_counts_window, fetch_event_counts_window_exhaustive,
+};
 
 #[cfg(test)]
 #[path = "handlers/event_counts_read_budget_tests.rs"]
 mod event_counts_read_budget_tests;
 
 use crate::event::interpret;
-pub(crate) use crate::event_counts_grouping::EventCountsAccumulator;
-use crate::event_read_scope::event_actor_read_scope;
 use crate::{sync_balanced_recall_record, BrainPack, ENTITY_CACHE_CAPACITY};
 use khive_brain_core::derive_deterministic_weights;
 #[cfg(feature = "lattice-router")]
@@ -65,7 +63,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.config",
-        description: "Return projected config for a named pack parameter",
+        description: "Return projected config for a named pack parameter. Diagnostic only: a served recall scores with the configured default weights, not these.",
         visibility: khive_types::Visibility::Subhandler,
         category: khive_types::VerbCategory::Assertive,
         params: &[khive_types::ParamDef {
@@ -113,7 +111,9 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             for per-profile negative-share); events \
             carrying a work_class (today: phase_started / \
             phase_completed / phase_cancelled payloads, checked before any future \
-            payload.resource.work_class) split by counts_by_work_class. Events carrying \
+            payload.resource.work_class) split by counts_by_work_class. recall_executed rows \
+            whose memory.recall call passed label count by that label in counts_by_label \
+            (counts_by_label_page_scoped when truncated; absent when none was read). Events carrying \
             payload.resource.cost_unit (stamped on every successful verb dispatch) sum into \
             total_cost_unit and cost_unit_by_verb; events with no resource.cost_unit (events \
             older than that stamp, or errored/denied dispatches) simply \
@@ -218,7 +218,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.profiles",
-        description: "List profiles, optionally filtered by lifecycle",
+        description: "List profiles in the selected namespace catalog, optionally filtered by lifecycle. The response namespace identifies the catalog listed.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[khive_types::ParamDef {
@@ -231,14 +231,14 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.profile",
-        description: "Profile metadata, latest snapshot, current state summary",
+        description: "Profile metadata, latest snapshot, current state summary. Also returns posterior_means ({relevance, salience, temporal}, each the mean of the stored posterior, null when the profile has no state snapshot) and local_factor (the shared-pool factor set at creation; null means 1). The response namespace identifies the selected catalog. resolving_bindings lists wildcard or actor-visible bindings that select this profile for a concrete recall, knowledge_compose or rerank consumer in that catalog; wildcard actors are checked with the anonymous consumer context. serving_through_visible_binding_while_inactive is true when the profile is inactive and that list is nonempty; false makes no claim about hidden bindings. Active versus inactive lifecycle governs only the unbound fallback; a bound, non-archived profile serves regardless of that lifecycle.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[khive_types::ParamDef {
             name: "profile_id",
             param_type: "string",
             required: true,
-            description: "Profile ID string (e.g. \"balanced-recall-v1\"). NOT a UUID — use the string identifier. Alias: id.",
+            description: "Profile ID string (e.g. \"balanced-recall-v1\"), unique within a namespace. NOT a UUID — use the string identifier. Alias: id.",
             resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
@@ -266,7 +266,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "Namespace for binding resolution. Defaults to \"*\" wildcard match.",
+                description: "The profile catalog to read and the binding namespace context. If omitted, uses the caller's default catalog and matches only bindings with namespace \"*\"; profile fallback still applies when none match.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -274,7 +274,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     // ── Commissive (write state) verbs ────────────────────────────────────
     HandlerDef {
         name: "brain.activate",
-        description: "Move a profile to Active (lifecycle transition; serving reads profile state per-request)",
+        description: "Move a profile to Active for the unbound fallback. Active versus inactive lifecycle governs only the unbound fallback; a bound, non-archived profile serves regardless of that lifecycle. Serving reads profile state per-request.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[khive_types::ParamDef {
@@ -287,7 +287,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.deactivate",
-        description: "Move a profile to Inactive (lifecycle transition; retain state)",
+        description: "Move a profile to Inactive while retaining state. Active versus inactive lifecycle governs only the unbound fallback; a bound, non-archived profile continues serving regardless of that lifecycle. Deactivation does not remove bindings.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[khive_types::ParamDef {
@@ -544,7 +544,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "profile_id",
                 param_type: "string",
                 required: true,
-                description: "Profile ID to bind (must exist).",
+                description: "Profile ID to bind (must exist in this namespace catalog; IDs are unique within a namespace).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -558,7 +558,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "Namespace to match. Default \"*\" (all namespaces).",
+                description: "The profile catalog to write and the binding namespace to match. If omitted, stores a \"*\" binding in the caller's default catalog, matching every namespace context within that catalog.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -579,7 +579,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.unbind",
-        description: "Remove rows from the profile resolution table. At least one filter (profile_id, actor, namespace, or consumer_kind) is required.",
+        description: "Remove rows from the profile resolution table. At least one filter (profile_id, actor, namespace, or consumer_kind) is required. The result includes removed and unbound counts plus removed_by_namespace, an object mapping each removed binding namespace to its count (empty when none match).",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[
@@ -587,7 +587,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "profile_id",
                 param_type: "string",
                 required: false,
-                description: "Remove bindings for this profile ID. All filters use AND semantics. At least one filter is required.",
+                description: "Remove bindings for this profile ID in this namespace catalog. Profile IDs are unique within a namespace. All filters use AND semantics. At least one filter is required.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -601,7 +601,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "Remove bindings for this namespace.",
+                description: "The catalog this call reads and writes and the binding namespace to match. If omitted, bindings of every namespace in the caller's default catalog can match the other filters.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -615,7 +615,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.bindings",
-        description: "List the caller's profile binding rows; a named foreign actor must be visible to the caller.",
+        description: "List the caller's profile binding rows; a named foreign actor must be visible to the caller. The response namespace identifies the catalog read.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -623,7 +623,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "profile_id",
                 param_type: "string",
                 required: false,
-                description: "Filter bindings by profile ID.",
+                description: "Filter bindings by profile ID in this namespace catalog; IDs are unique within a namespace.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -637,7 +637,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "namespace",
                 param_type: "string",
                 required: false,
-                description: "Filter bindings by namespace.",
+                description: "The profile catalog to read and the binding namespace filter. If omitted, reads the caller's default catalog without filtering binding namespaces; other filters still apply.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             khive_types::ParamDef {
@@ -681,6 +681,13 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 param_type: "object",
                 required: false,
                 description: "Optional section priors only: {\"section_posteriors\": {\"overview\": {\"alpha\": 2.0, \"beta\": 2.0}}. Recall priors cannot be seeded at creation; other top-level keys are rejected.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            khive_types::ParamDef {
+                name: "local_factor",
+                param_type: "number",
+                required: false,
+                description: "Optional finite number in [0.5, 1]. A recall served by this profile multiplies the rank score of every shared-pool candidate (namespace `local`) by it; every other candidate is multiplied by 1. Set only here: no verb edits it and brain.reset keeps it. A value outside the range, a non-number, or an explicit null is refused and no profile is created. Omit for no factor (same as 1).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
@@ -890,8 +897,16 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.events" => self.handle_events(token, params).await,
             "brain.event_page" => self.handle_event_page(token, params).await,
             "brain.event_counts" => self.handle_event_counts(token, params).await,
-            "brain.profiles" => self.handle_profiles(params).await,
-            "brain.profile" => self.handle_profile(params).await,
+            "brain.profiles" => {
+                let mut answer = self.handle_profiles(params).await?;
+                answer["namespace"] = json!(token.namespace().as_str());
+                Ok(answer)
+            }
+            "brain.profile" => {
+                let mut answer = self.handle_profile(token, params).await?;
+                answer["namespace"] = json!(token.namespace().as_str());
+                Ok(answer)
+            }
             "brain.resolve" => self.handle_resolve(token, params, registry).await,
             "brain.bindings" => self.handle_bindings(token, params).await,
             // Commissive

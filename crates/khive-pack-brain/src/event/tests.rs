@@ -144,7 +144,7 @@ fn brain_feedback_invalid_signal_data_is_irrelevant() {
 }
 
 #[test]
-fn note_accessed_via_get_verb_is_positive_entity_signal() {
+fn note_accessed_via_get_verb_yields_no_entity_signal() {
     let id = Uuid::new_v4();
     let e = make_event("get", EventOutcome::Success, Some(id));
     match interpret(&e) {
@@ -152,7 +152,7 @@ fn note_accessed_via_get_verb_is_positive_entity_signal() {
             assert_eq!(target_id, id);
             assert_eq!(
                 entity_signal(&BrainSignal::NoteAccessed { target_id }),
-                Some((id, true))
+                None
             );
         }
         other => panic!("expected NoteAccessed, got {other:?}"),
@@ -160,7 +160,7 @@ fn note_accessed_via_get_verb_is_positive_entity_signal() {
 }
 
 #[test]
-fn note_accessed_via_remember_verb_is_positive_entity_signal() {
+fn note_accessed_via_remember_verb_is_note_accessed() {
     let id = Uuid::new_v4();
     let e = make_event("remember", EventOutcome::Success, Some(id));
     match interpret(&e) {

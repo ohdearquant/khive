@@ -68,7 +68,7 @@ struct BucketWire {
     count: u64,
 }
 
-struct HistogramWire<'a>(&'a HistogramSnapshot);
+pub(super) struct HistogramWire<'a>(pub(super) &'a HistogramSnapshot);
 
 impl Serialize for HistogramWire<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {

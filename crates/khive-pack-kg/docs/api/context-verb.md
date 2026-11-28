@@ -91,8 +91,10 @@ ADR-140 explicitly proposes this two-pass/per-anchor rule as a replacement for A
 - **Query anchors:** bounded overfetch avoids under-filling when query hits overlap explicit
   anchors. Explicit anchors retain their order and query hits fill additional positions.
 - **Expansion:** hop-1 precedes hop-2. Each stratum sorts by weight descending, neighbor UUID,
-  and parent UUID for true ties. The first discovering parent and existing visited set own
-  a node. `NotFound` after discovery retains the existing empty-expansion behavior.
+  and parent UUID for true ties. Each anchor has its own visited set, seeded with every
+  selected anchor; within it the first discovering parent owns a node, so a node several
+  anchors reach is listed under each of them (ADR-089 Amendment: one visited set per
+  anchor). `NotFound` after discovery retains the existing empty-expansion behavior.
 - **Hydration:** existing scoped entity, note, owning-backend, and mailbox reads build the
   metadata maps once. Assembly builds both endpoint fields from those maps.
 - **Assembly:** available endpoint pairs are formed and costed before budgeting. Metadata

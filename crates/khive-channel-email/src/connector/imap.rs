@@ -23,6 +23,16 @@ use crate::oauth::{TokenProvider, XOAuth2Authenticator};
 
 use super::RawEmail;
 
+const IMAP_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+const IMAP_BODY_BYTES_PER_SECOND: u64 = 512 * 1024;
+
+fn body_fetch_timeout(rfc822_size: u32) -> Duration {
+    let bytes = u64::from(rfc822_size);
+    let transfer_seconds =
+        bytes / IMAP_BODY_BYTES_PER_SECOND + u64::from(bytes % IMAP_BODY_BYTES_PER_SECOND != 0);
+    Duration::from_secs(IMAP_COMMAND_TIMEOUT.as_secs() + transfer_seconds)
+}
+
 /// IMAP session type using TLS over a compat-wrapped tokio stream.
 type ImapSession = async_imap::Session<
     async_native_tls::TlsStream<tokio_util::compat::Compat<tokio::net::TcpStream>>,
@@ -299,42 +309,59 @@ impl ImapConnector for LiveImap {
         limit: usize,
         progress: ImapProgress,
     ) -> Result<ImapFetchPage, ChannelError> {
+        self.fetch_page_with_connection(since, limit, progress, self.connect())
+            .await
+    }
+}
+
+impl LiveImap {
+    async fn fetch_page_with_connection<T, F>(
+        &self,
+        since: DateTime<Utc>,
+        limit: usize,
+        progress: ImapProgress,
+        connection: F,
+    ) -> Result<ImapFetchPage, ChannelError>
+    where
+        T: futures::AsyncRead + futures::AsyncWrite + Unpin + std::fmt::Debug + Send,
+        F: std::future::Future<Output = Result<async_imap::Session<T>, ChannelError>> + Send,
+    {
         // Single-flight (#605): hold this credential's one permit for the
         // full connect-through-logout lifecycle below, so a second concurrent
         // call (e.g. a future caller widening the poll loop's concurrency)
         // waits for this connection to finish instead of opening a second one
         // against the same mailbox.
         let _permit = self.single_flight.acquire().await;
-        let mut session = self.connect().await?;
+        let mut session = connection.await?;
 
         // EXAMINE opens INBOX read-only and returns the Mailbox struct; UIDVALIDITY is needed
         // for stable per-message dedup keys of the form `imap:{host}:{uidvalidity}:{uid}`.
-        let mailbox = session
-            .examine("INBOX")
+        let mailbox = tokio::time::timeout(IMAP_COMMAND_TIMEOUT, session.examine("INBOX"))
             .await
+            .map_err(|_| ChannelError::Transport("IMAP EXAMINE INBOX timed out (15s)".into()))?
             .map_err(|e| ChannelError::Transport(format!("IMAP EXAMINE INBOX failed: {e}")))?;
         let uid_validity = validate_uid_validity(mailbox.uid_validity)?;
 
         let Some(query) = uid_search_query(since, uid_validity, progress) else {
             // Current epoch's high-water is already at u32::MAX: nothing more
             // to search, and the epoch/high-water are unchanged.
-            let _ = session.logout().await;
+            let _ = tokio::time::timeout(IMAP_COMMAND_TIMEOUT, session.logout()).await;
             return Ok(ImapFetchPage {
                 emails: vec![],
                 next_progress: progress,
             });
         };
 
-        let uid_set = session
-            .uid_search(query)
+        let uid_set = tokio::time::timeout(IMAP_COMMAND_TIMEOUT, session.uid_search(query))
             .await
+            .map_err(|_| ChannelError::Transport("IMAP UID SEARCH timed out (15s)".into()))?
             .map_err(|e| ChannelError::Transport(format!("IMAP UID SEARCH failed: {e}")))?;
 
         let selected =
             select_uid_page(uid_set.into_iter().collect(), limit, uid_validity, progress)?;
 
         if selected.is_empty() {
-            let _ = session.logout().await;
+            let _ = tokio::time::timeout(IMAP_COMMAND_TIMEOUT, session.logout()).await;
             let next = next_progress(uid_validity, progress, &selected);
             return Ok(ImapFetchPage {
                 emails: vec![],
@@ -348,20 +375,25 @@ impl ImapConnector for LiveImap {
             .collect::<Vec<_>>()
             .join(",");
 
-        let fetched_sizes: Vec<(Option<u32>, Option<u32>)> = {
-            let mut stream = session
-                .uid_fetch(&uid_str, "RFC822.SIZE")
-                .await
-                .map_err(|e| ChannelError::Transport(format!("IMAP UID FETCH size failed: {e}")))?;
+        let fetched_sizes: Vec<(Option<u32>, Option<u32>)> =
+            tokio::time::timeout(IMAP_COMMAND_TIMEOUT, async {
+                let mut stream = session
+                    .uid_fetch(&uid_str, "RFC822.SIZE")
+                    .await
+                    .map_err(|e| {
+                        ChannelError::Transport(format!("IMAP UID FETCH size failed: {e}"))
+                    })?;
 
-            let mut collected = Vec::new();
-            while let Some(msg) = stream.try_next().await.map_err(|e| {
-                ChannelError::Transport(format!("IMAP size fetch stream error: {e}"))
-            })? {
-                collected.push((msg.uid, msg.size));
-            }
-            collected
-        };
+                let mut collected = Vec::new();
+                while let Some(msg) = stream.try_next().await.map_err(|e| {
+                    ChannelError::Transport(format!("IMAP size fetch stream error: {e}"))
+                })? {
+                    collected.push((msg.uid, msg.size));
+                }
+                Ok::<_, ChannelError>(collected)
+            })
+            .await
+            .map_err(|_| ChannelError::Transport("IMAP UID FETCH size timed out (15s)".into()))??;
         let plan = plan_size_page(
             &selected,
             fetched_sizes,
@@ -379,11 +411,18 @@ impl ImapConnector for LiveImap {
                 continue;
             }
 
+            let Some(&rfc822_size) = plan.body_sizes.get(&uid.get()) else {
+                return Err(ChannelError::Transport(format!(
+                    "IMAP size plan has no RFC822.SIZE for UID {}; page rejected",
+                    uid.get()
+                )));
+            };
             let remaining = self.max_page_bytes - page_bytes;
             let allowed = self.max_message_bytes.min(remaining);
             let body_query = format!("BODY.PEEK[]<0.{}>", allowed + 1);
             let uid_str = uid.get().to_string();
-            let (body, body_len) = {
+            let body_timeout = body_fetch_timeout(rfc822_size);
+            let (body, body_len) = tokio::time::timeout(body_timeout, async {
                 let mut stream = session
                     .uid_fetch(&uid_str, &body_query)
                     .await
@@ -417,8 +456,12 @@ impl ImapConnector for LiveImap {
                         "IMAP UID FETCH did not return a response for selected UID {}; page rejected",
                         uid.get()
                     ))
-                })?
-            };
+                })
+            })
+            .await
+            .map_err(|_| ChannelError::Transport(format!(
+                "IMAP UID FETCH body timed out ({}s)", body_timeout.as_secs()
+            )))??;
 
             if body_len > allowed {
                 if allowed < self.max_message_bytes {
@@ -433,7 +476,7 @@ impl ImapConnector for LiveImap {
             processed.push(uid);
         }
 
-        let _ = session.logout().await;
+        let _ = tokio::time::timeout(IMAP_COMMAND_TIMEOUT, session.logout()).await;
 
         let emails = process_selected_page(
             uid_validity,
@@ -453,6 +496,7 @@ impl ImapConnector for LiveImap {
 struct ImapSizePlan {
     selected: Vec<NonZeroU32>,
     oversized: HashSet<u32>,
+    body_sizes: HashMap<u32, u32>,
 }
 
 fn plan_size_page(
@@ -476,14 +520,16 @@ fn plan_size_page(
 
     let mut planned = Vec::new();
     let mut oversized = HashSet::new();
+    let mut body_sizes = HashMap::new();
     let mut page_bytes = 0usize;
     for &uid in selected {
-        let size = by_uid.remove(&uid.get()).flatten().ok_or_else(|| {
+        let rfc822_size = by_uid.remove(&uid.get()).flatten().ok_or_else(|| {
             ChannelError::Transport(format!(
                 "IMAP UID FETCH did not return RFC822.SIZE for selected UID {}; page rejected",
                 uid.get()
             ))
-        })? as usize;
+        })?;
+        let size = rfc822_size as usize;
 
         if size > max_message_bytes {
             oversized.insert(uid.get());
@@ -491,12 +537,14 @@ fn plan_size_page(
             break;
         } else {
             page_bytes += size;
+            body_sizes.insert(uid.get(), rfc822_size);
         }
         planned.push(uid);
     }
     Ok(ImapSizePlan {
         selected: planned,
         oversized,
+        body_sizes,
     })
 }
 
@@ -1776,5 +1824,914 @@ mod tests {
         assert_eq!(email.in_reply_to(), Some("<orig@example.com>"));
         assert_eq!(email.correlation(), Some("<orig@example.com>"));
         assert_eq!(email.best_body(), "reply body");
+    }
+    // Drive both endpoints in this task so paused time advances only where the
+    // test requests it. Dropping a run closes both endpoints; no task is detached.
+    enum WireStep {
+        Read(String),
+        Reply(String),
+        Bytes(Vec<u8>),
+        Mark(&'static str),
+        Delay(u64),
+        Eof,
+        Stall,
+    }
+
+    type WireTrace = Arc<std::sync::Mutex<Vec<String>>>;
+
+    async fn protocol_peer(
+        io: tokio::io::DuplexStream,
+        steps: Vec<WireStep>,
+        trace: WireTrace,
+    ) -> Result<(), String> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        let mut io = tokio::io::BufReader::new(io);
+        let mut tag = String::new();
+        for step in steps {
+            match step {
+                WireStep::Read(expected) => {
+                    let mut line = String::new();
+                    io.read_line(&mut line).await.map_err(|e| e.to_string())?;
+                    let (actual_tag, command) = line
+                        .trim_end_matches("\r\n")
+                        .split_once(' ')
+                        .ok_or_else(|| format!("missing command: {line:?}"))?;
+                    if command != expected {
+                        return Err(format!("expected {expected:?}, received {command:?}"));
+                    }
+                    tag = actual_tag.to_owned();
+                    trace.lock().unwrap().push(format!("command:{command}"));
+                }
+                WireStep::Reply(text) => {
+                    io.get_mut()
+                        .write_all(text.replace("$TAG", &tag).as_bytes())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    io.get_mut().flush().await.map_err(|e| e.to_string())?;
+                }
+                WireStep::Bytes(bytes) => {
+                    io.get_mut()
+                        .write_all(&bytes)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    io.get_mut().flush().await.map_err(|e| e.to_string())?;
+                }
+                WireStep::Mark(stage) => trace.lock().unwrap().push(stage.into()),
+                WireStep::Delay(seconds) => tokio::time::sleep(Duration::from_secs(seconds)).await,
+                WireStep::Eof => {
+                    let mut byte = [0];
+                    let count = io.read(&mut byte).await.map_err(|e| e.to_string())?;
+                    if count != 0 {
+                        return Err("expected the timed-out session to close".into());
+                    }
+                    trace.lock().unwrap().push("peer-eof".into());
+                }
+                WireStep::Stall => std::future::pending::<()>().await,
+            }
+        }
+        Ok(())
+    }
+
+    async fn protocol_connect(
+        io: tokio::io::DuplexStream,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Result<
+        async_imap::Session<tokio_util::compat::Compat<tokio::io::DuplexStream>>,
+        ChannelError,
+    > {
+        polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut client = async_imap::Client::new(io.compat());
+        client
+            .read_response()
+            .await
+            .ok_or_else(|| ChannelError::Transport("test greeting absent".into()))?
+            .map_err(|e| ChannelError::Transport(format!("test greeting: {e}")))?;
+        client
+            .login("reader", "secret")
+            .await
+            .map_err(|(e, _)| ChannelError::Auth(format!("test LOGIN: {e}")))
+    }
+
+    type WireResult<T> = (
+        Option<Result<T, ChannelError>>,
+        Option<Result<(), String>>,
+        Vec<String>,
+    );
+
+    struct WireRun<'a, T> {
+        client: std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, ChannelError>> + 'a>>,
+        peer: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + 'a>>,
+        result: Option<Result<T, ChannelError>>,
+        peer_result: Option<Result<(), String>>,
+        trace: WireTrace,
+    }
+
+    impl<'a, T> WireRun<'a, T> {
+        fn new(
+            client: impl std::future::Future<Output = Result<T, ChannelError>> + 'a,
+            peer: impl std::future::Future<Output = Result<(), String>> + 'a,
+            trace: WireTrace,
+        ) -> Self {
+            Self {
+                client: Box::pin(client),
+                peer: Box::pin(peer),
+                result: None,
+                peer_result: None,
+                trace,
+            }
+        }
+
+        async fn tick(&mut self) {
+            std::future::poll_fn(|cx| {
+                if self.result.is_none() {
+                    if let std::task::Poll::Ready(result) =
+                        std::future::Future::poll(self.client.as_mut(), cx)
+                    {
+                        self.result = Some(result);
+                    }
+                }
+                if self.peer_result.is_none() {
+                    if let std::task::Poll::Ready(result) =
+                        std::future::Future::poll(self.peer.as_mut(), cx)
+                    {
+                        self.peer_result = Some(result);
+                    }
+                }
+                std::task::Poll::Ready(())
+            })
+            .await;
+            tokio::task::yield_now().await;
+        }
+
+        async fn pump(&mut self) {
+            for _ in 0..512 {
+                self.tick().await;
+            }
+        }
+
+        async fn reach(&mut self, stage: &str) {
+            let wall_start = std::time::Instant::now();
+            for _ in 0..16_384 {
+                self.tick().await;
+                if self.trace.lock().unwrap().iter().any(|s| s == stage) {
+                    // Register the current command's timer before advancing time.
+                    self.pump().await;
+                    return;
+                }
+                assert!(self.result.is_none(), "client completed before {stage}");
+                assert!(
+                    self.peer_result.is_none(),
+                    "peer completed before {stage}: {:?}",
+                    self.peer_result
+                );
+                assert!(
+                    wall_start.elapsed() < Duration::from_secs(10),
+                    "protocol setup watchdog: {stage}"
+                );
+            }
+            panic!("protocol setup did not reach {stage}");
+        }
+
+        async fn advance(&mut self, seconds: u64) {
+            tokio::time::advance(Duration::from_secs(seconds)).await;
+            self.pump().await;
+        }
+
+        fn finish(self) -> WireResult<T> {
+            let Self {
+                client,
+                peer,
+                result,
+                peer_result,
+                trace,
+            } = self;
+            drop(client);
+            drop(peer);
+            let trace = trace.lock().unwrap().clone();
+            (result, peer_result, trace)
+        }
+    }
+
+    fn wire_since() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn wire_live(max_message: usize, max_page: usize) -> LiveImap {
+        LiveImap::new(
+            "mail.example",
+            993,
+            "reader",
+            "secret",
+            max_message,
+            max_page,
+        )
+    }
+
+    fn wire_auth() -> Vec<WireStep> {
+        vec![
+            WireStep::Reply("* OK test IMAP ready\r\n".into()),
+            WireStep::Read("LOGIN \"reader\" \"secret\"".into()),
+            WireStep::Reply("$TAG OK logged in\r\n".into()),
+        ]
+    }
+
+    fn wire_examine(steps: &mut Vec<WireStep>) {
+        steps.extend([
+            WireStep::Read("EXAMINE \"INBOX\"".into()),
+            WireStep::Reply("* 3 EXISTS\r\n* OK [UIDVALIDITY 41] stable epoch\r\n$TAG OK [READ-ONLY] selected\r\n".into()),
+        ]);
+    }
+
+    fn wire_search(steps: &mut Vec<WireStep>, query: &str, uids: &str) {
+        steps.extend([
+            WireStep::Read(format!("UID SEARCH {query}")),
+            WireStep::Reply(format!("* SEARCH {uids}\r\n$TAG OK search complete\r\n")),
+        ]);
+    }
+
+    fn wire_sizes(steps: &mut Vec<WireStep>, uids: &str, sizes: &[(u32, usize)]) {
+        steps.push(WireStep::Read(format!("UID FETCH {uids} RFC822.SIZE")));
+        for &(uid, size) in sizes {
+            steps.push(WireStep::Reply(format!(
+                "* 1 FETCH (UID {uid} RFC822.SIZE {size})\r\n"
+            )));
+        }
+        steps.push(WireStep::Reply("$TAG OK sizes complete\r\n".into()));
+    }
+
+    fn wire_body_start(steps: &mut Vec<WireStep>, uid: u32, allowed: usize) {
+        steps.push(WireStep::Read(format!(
+            "UID FETCH {uid} BODY.PEEK[]<0.{}>",
+            allowed + 1
+        )));
+    }
+
+    fn wire_body_reply(steps: &mut Vec<WireStep>, uid: u32, raw: &[u8]) {
+        steps.push(WireStep::Reply(format!(
+            "* 1 FETCH (UID {uid} BODY[] {{{}}}\r\n",
+            raw.len()
+        )));
+        steps.push(WireStep::Bytes(raw.to_vec()));
+        steps.push(WireStep::Reply(")\r\n$TAG OK body complete\r\n".into()));
+    }
+
+    fn wire_logout(steps: &mut Vec<WireStep>) {
+        steps.extend([
+            WireStep::Read("LOGOUT".into()),
+            WireStep::Reply("$TAG OK bye\r\n".into()),
+        ]);
+    }
+
+    fn wire_page<'a>(
+        live: &'a LiveImap,
+        steps: Vec<WireStep>,
+        progress: ImapProgress,
+        limit: usize,
+        capacity: usize,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> WireRun<'a, ImapFetchPage> {
+        let (client, peer) = tokio::io::duplex(capacity);
+        let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
+        WireRun::new(
+            live.fetch_page_with_connection(
+                wire_since(),
+                limit,
+                progress,
+                protocol_connect(client, polls),
+            ),
+            protocol_peer(peer, steps, trace.clone()),
+            trace,
+        )
+    }
+
+    fn wire_ok<T>(run: WireRun<'_, T>) -> T {
+        let (result, peer, _) = run.finish();
+        let value = match result {
+            Some(Ok(value)) => value,
+            Some(Err(error)) => panic!("expected complete protocol result, got {error}"),
+            None => panic!("expected complete protocol result, still pending"),
+        };
+        assert_eq!(
+            peer,
+            Some(Ok(())),
+            "healthy peer must finish its complete transcript"
+        );
+        value
+    }
+
+    fn wire_timeout<T>(run: WireRun<'_, T>, expected: &str) {
+        let (result, peer, _) = run.finish();
+        match result {
+            Some(Err(error)) => {
+                assert!(crate::backoff::is_backoff_eligible(&error));
+                assert!(
+                    matches!(&error, ChannelError::Transport(message) if message == expected),
+                    "{error}"
+                );
+            }
+            Some(Ok(_)) => panic!("expected command timeout, received a successful partial page"),
+            None => panic!("expected command timeout after its elapsed budget, still pending"),
+        }
+        assert!(
+            peer.is_none(),
+            "stalling peer unexpectedly completed: {peer:?}"
+        );
+    }
+
+    fn assert_wire_email(message: &SelectedMessage, uid: u32, raw: &[u8]) {
+        match message {
+            SelectedMessage::Email(email) => {
+                assert_eq!(email.uid, uid);
+                assert_eq!(email.raw_bytes, raw);
+                assert_eq!(
+                    email.imap_external_id,
+                    format!("imap:mail.example:41:{uid}")
+                );
+            }
+            SelectedMessage::Malformed { reason, .. } => {
+                panic!("expected parsed email, got {reason}")
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn imap_commands_time_out_after_authentication() {
+        let live = wire_live(4096, 8192);
+        // The positive transcript validates the actual greeting, LOGIN, EXAMINE,
+        // SEARCH and tagged completion grammar before the refusal cases.
+        let mut healthy = wire_auth();
+        wire_examine(&mut healthy);
+        wire_search(&mut healthy, "SINCE 01-Jan-2024", "");
+        wire_logout(&mut healthy);
+        let mut run = wire_page(
+            &live,
+            healthy,
+            ImapProgress::default(),
+            10,
+            8192,
+            Arc::default(),
+        );
+        run.pump().await;
+        assert!(wire_ok(run).emails.is_empty());
+
+        for (phase, blocked_write) in [("examine", false), ("search", false), ("examine", true)] {
+            let mut steps = wire_auth();
+            if phase == "search" {
+                wire_examine(&mut steps);
+            }
+            if !blocked_write {
+                steps.push(WireStep::Read(if phase == "search" {
+                    "UID SEARCH SINCE 01-Jan-2024".into()
+                } else {
+                    "EXAMINE \"INBOX\"".into()
+                }));
+            }
+            steps.extend([WireStep::Mark("waiting"), WireStep::Stall]);
+            let mut run = wire_page(
+                &live,
+                steps,
+                ImapProgress::default(),
+                10,
+                if blocked_write { 1 } else { 8192 },
+                Arc::default(),
+            );
+            run.reach("waiting").await;
+            run.advance(14).await;
+            assert!(
+                run.result.is_none(),
+                "command must remain pending before 15 seconds"
+            );
+            run.advance(2).await;
+            wire_timeout(
+                run,
+                if phase == "search" {
+                    "IMAP UID SEARCH timed out (15s)"
+                } else {
+                    "IMAP EXAMINE INBOX timed out (15s)"
+                },
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn imap_size_fetch_deadline_covers_stream_and_tag() {
+        let live = wire_live(4096, 8192);
+        for send_row in [false, true] {
+            let mut steps = wire_auth();
+            wire_examine(&mut steps);
+            wire_search(&mut steps, "SINCE 01-Jan-2024", "7");
+            steps.push(WireStep::Read("UID FETCH 7 RFC822.SIZE".into()));
+            if send_row {
+                steps.push(WireStep::Reply(
+                    "* 1 FETCH (UID 7 RFC822.SIZE 80)\r\n".into(),
+                ));
+            }
+            steps.extend([WireStep::Mark("size-waiting"), WireStep::Stall]);
+            let mut run = wire_page(
+                &live,
+                steps,
+                ImapProgress::default(),
+                10,
+                8192,
+                Arc::default(),
+            );
+            run.reach("size-waiting").await;
+            run.advance(14).await;
+            assert!(run.result.is_none());
+            run.advance(2).await;
+            wire_timeout(run, "IMAP UID FETCH size timed out (15s)");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn imap_body_fetch_deadline_covers_literal_and_tag() {
+        for (size, seconds) in [
+            (0, 15),
+            (1, 16),
+            (524_287, 16),
+            (524_288, 16),
+            (524_289, 17),
+            (1_048_576, 17),
+            (26_214_400, 65),
+            (u32::MAX, 8207),
+        ] {
+            assert_eq!(body_fetch_timeout(size), Duration::from_secs(seconds));
+        }
+        let live = wire_live(2 * 1024 * 1024, 4 * 1024 * 1024);
+        let mut large = minimal_rfc822("sender@example.com", "scaled body");
+        large.resize(1024 * 1024, b'x');
+        // Truthful size and literal: the 16-second successful transfer is later
+        // than the fixed command budget and earlier than its 17-second budget.
+        for delivered in [true, false] {
+            let mut steps = wire_auth();
+            wire_examine(&mut steps);
+            wire_search(&mut steps, "SINCE 01-Jan-2024", "7");
+            wire_sizes(&mut steps, "7", &[(7, large.len())]);
+            wire_body_start(&mut steps, 7, 2 * 1024 * 1024);
+            steps.push(WireStep::Mark("large-body"));
+            if delivered {
+                steps.push(WireStep::Delay(16));
+                wire_body_reply(&mut steps, 7, &large);
+                wire_logout(&mut steps);
+            } else {
+                steps.push(WireStep::Stall);
+            }
+            let mut run = wire_page(
+                &live,
+                steps,
+                ImapProgress::default(),
+                10,
+                8192,
+                Arc::default(),
+            );
+            run.reach("large-body").await;
+            run.advance(14).await;
+            assert!(run.result.is_none());
+            run.advance(2).await;
+            if delivered {
+                let page = wire_ok(run);
+                assert_eq!(page.emails.len(), 1);
+                assert_wire_email(&page.emails[0], 7, &large);
+                assert_eq!(
+                    page.next_progress,
+                    ImapProgress {
+                        uid_validity: NonZeroU32::new(41),
+                        last_seen_uid: NonZeroU32::new(7)
+                    }
+                );
+            } else {
+                assert!(
+                    run.result.is_none(),
+                    "same-size body remains pending before 17 seconds"
+                );
+                run.advance(2).await;
+                wire_timeout(run, "IMAP UID FETCH body timed out (17s)");
+            }
+        }
+
+        let raw = minimal_rfc822("sender@example.com", "small body");
+        for shape in ["partial-literal", "missing-tag", "second-uid"] {
+            let mut steps = wire_auth();
+            wire_examine(&mut steps);
+            let second = shape == "second-uid";
+            wire_search(
+                &mut steps,
+                "SINCE 01-Jan-2024",
+                if second { "7 8" } else { "7" },
+            );
+            let sizes = if second {
+                vec![(7, raw.len()), (8, raw.len())]
+            } else {
+                vec![(7, raw.len())]
+            };
+            wire_sizes(&mut steps, if second { "7,8" } else { "7" }, &sizes);
+            wire_body_start(&mut steps, 7, 2 * 1024 * 1024);
+            if second {
+                wire_body_reply(&mut steps, 7, &raw);
+                wire_body_start(&mut steps, 8, 2 * 1024 * 1024);
+            } else {
+                steps.push(WireStep::Reply(format!(
+                    "* 1 FETCH (UID 7 BODY[] {{{}}}\r\n",
+                    raw.len()
+                )));
+                if shape == "partial-literal" {
+                    steps.push(WireStep::Bytes(raw[..raw.len() / 2].to_vec()));
+                } else {
+                    steps.push(WireStep::Bytes(raw.clone()));
+                    steps.push(WireStep::Reply(")\r\n".into()));
+                }
+            }
+            steps.extend([WireStep::Mark("body-waiting"), WireStep::Stall]);
+            let mut run = wire_page(
+                &live,
+                steps,
+                ImapProgress::default(),
+                10,
+                8192,
+                Arc::default(),
+            );
+            run.reach("body-waiting").await;
+            run.advance(15).await;
+            assert!(run.result.is_none());
+            run.advance(2).await;
+            wire_timeout(run, "IMAP UID FETCH body timed out (16s)");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn imap_fetch_deadline_is_elapsed_and_resets_per_command() {
+        let live = wire_live(4096, 8192);
+        let raw = minimal_rfc822("sender@example.com", "elapsed");
+        for body in [false, true] {
+            let mut steps = wire_auth();
+            wire_examine(&mut steps);
+            wire_search(&mut steps, "SINCE 01-Jan-2024", "7");
+            if body {
+                wire_sizes(&mut steps, "7", &[(7, raw.len())]);
+                wire_body_start(&mut steps, 7, 4096);
+            } else {
+                steps.push(WireStep::Read("UID FETCH 7 RFC822.SIZE".into()));
+            }
+            steps.extend([WireStep::Mark("elapsed-start"), WireStep::Delay(10)]);
+            if body {
+                steps.push(WireStep::Reply(format!(
+                    "* 1 FETCH (UID 7 BODY[] {{{}}}\r\n",
+                    raw.len()
+                )));
+                steps.push(WireStep::Bytes(raw.clone()));
+                steps.push(WireStep::Reply(")\r\n".into()));
+            } else {
+                steps.push(WireStep::Reply(format!(
+                    "* 1 FETCH (UID 7 RFC822.SIZE {})\r\n",
+                    raw.len()
+                )));
+            }
+            steps.extend([WireStep::Mark("elapsed-activity"), WireStep::Stall]);
+            let mut run = wire_page(
+                &live,
+                steps,
+                ImapProgress::default(),
+                10,
+                8192,
+                Arc::default(),
+            );
+            run.reach("elapsed-start").await;
+            run.advance(10).await;
+            run.reach("elapsed-activity").await;
+            assert!(run.result.is_none());
+            run.advance(if body { 7 } else { 6 }).await;
+            wire_timeout(
+                run,
+                if body {
+                    "IMAP UID FETCH body timed out (16s)"
+                } else {
+                    "IMAP UID FETCH size timed out (15s)"
+                },
+            );
+        }
+
+        let mut steps = wire_auth();
+        wire_examine(&mut steps);
+        wire_search(&mut steps, "SINCE 01-Jan-2024", "8 7");
+        wire_sizes(&mut steps, "7,8", &[(8, raw.len()), (7, raw.len())]);
+        for (uid, marker) in [(7, "first-body"), (8, "second-body")] {
+            wire_body_start(&mut steps, uid, 4096);
+            steps.extend([WireStep::Mark(marker), WireStep::Delay(10)]);
+            wire_body_reply(&mut steps, uid, &raw);
+        }
+        wire_logout(&mut steps);
+        let mut run = wire_page(
+            &live,
+            steps,
+            ImapProgress::default(),
+            10,
+            8192,
+            Arc::default(),
+        );
+        run.reach("first-body").await;
+        run.advance(10).await;
+        run.reach("second-body").await;
+        assert!(run.result.is_none());
+        run.advance(10).await;
+        let page = wire_ok(run);
+        assert_eq!(page.emails.len(), 2);
+        assert_wire_email(&page.emails[0], 7, &raw);
+        assert_wire_email(&page.emails[1], 8, &raw);
+        assert_eq!(page.next_progress.last_seen_uid, NonZeroU32::new(8));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn imap_logout_deadline_preserves_completed_page_branches() {
+        let live = wire_live(4096, 8192);
+        let raw = minimal_rfc822("sender@example.com", "logout");
+        for branch in ["maximum", "empty", "populated"] {
+            for protocol_refusal in [false, true] {
+                let progress = if branch == "maximum" {
+                    ImapProgress {
+                        uid_validity: NonZeroU32::new(41),
+                        last_seen_uid: NonZeroU32::new(u32::MAX),
+                    }
+                } else {
+                    ImapProgress::default()
+                };
+                let mut steps = wire_auth();
+                wire_examine(&mut steps);
+                if branch != "maximum" {
+                    wire_search(
+                        &mut steps,
+                        "SINCE 01-Jan-2024",
+                        if branch == "empty" { "" } else { "7" },
+                    );
+                }
+                if branch == "populated" {
+                    wire_sizes(&mut steps, "7", &[(7, raw.len())]);
+                    wire_body_start(&mut steps, 7, 4096);
+                    wire_body_reply(&mut steps, 7, &raw);
+                }
+                steps.push(WireStep::Read("LOGOUT".into()));
+                steps.push(WireStep::Mark("logout"));
+                steps.push(if protocol_refusal {
+                    WireStep::Reply("$TAG NO logout unavailable\r\n".into())
+                } else {
+                    WireStep::Stall
+                });
+                let mut run = wire_page(&live, steps, progress, 10, 8192, Arc::default());
+                run.reach("logout").await;
+                if !protocol_refusal {
+                    run.advance(14).await;
+                    assert!(run.result.is_none());
+                    run.advance(2).await;
+                }
+                let (result, peer, _) = run.finish();
+                let page = match result {
+                    Some(Ok(page)) => page,
+                    Some(Err(error)) => panic!("logout must not discard completed page: {error}"),
+                    None => panic!("logout must stop waiting after 15 seconds"),
+                };
+                assert_eq!(peer, protocol_refusal.then_some(Ok(())));
+                if branch == "populated" {
+                    assert_eq!(page.emails.len(), 1);
+                    assert_wire_email(&page.emails[0], 7, &raw);
+                    assert_eq!(page.next_progress.last_seen_uid, NonZeroU32::new(7));
+                } else {
+                    assert!(page.emails.is_empty());
+                    assert_eq!(page.next_progress.last_seen_uid, progress.last_seen_uid);
+                }
+                assert_eq!(page.next_progress.uid_validity, NonZeroU32::new(41));
+            }
+        }
+    }
+
+    struct WireConnector {
+        live: LiveImap,
+        connections: std::sync::Mutex<std::collections::VecDeque<tokio::io::DuplexStream>>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ImapConnector for WireConnector {
+        async fn fetch_page(
+            &self,
+            since: DateTime<Utc>,
+            limit: usize,
+            progress: ImapProgress,
+        ) -> Result<ImapFetchPage, ChannelError> {
+            let io = self
+                .connections
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("prepared connection");
+            self.live
+                .fetch_page_with_connection(
+                    since,
+                    limit,
+                    progress,
+                    protocol_connect(io, self.polls.clone()),
+                )
+                .await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn imap_timeout_releases_single_flight_and_preserves_retry_progress() {
+        use std::sync::atomic::Ordering;
+        let live = wire_live(4096, 8192);
+        let first_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut first_steps = wire_auth();
+        first_steps.extend([
+            WireStep::Read("EXAMINE \"INBOX\"".into()),
+            WireStep::Mark("first-held"),
+            WireStep::Eof,
+        ]);
+        let mut healthy = wire_auth();
+        wire_examine(&mut healthy);
+        wire_search(&mut healthy, "SINCE 01-Jan-2024", "");
+        wire_logout(&mut healthy);
+        let mut first = wire_page(
+            &live,
+            first_steps,
+            ImapProgress::default(),
+            10,
+            8192,
+            first_polls.clone(),
+        );
+        let mut second = wire_page(
+            &live,
+            healthy,
+            ImapProgress::default(),
+            10,
+            8192,
+            second_polls.clone(),
+        );
+        first.reach("first-held").await;
+        second.pump().await;
+        assert_eq!(first_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            second_polls.load(Ordering::SeqCst),
+            0,
+            "waiting credential must not poll its connection future"
+        );
+        assert!(second.result.is_none());
+        first.advance(16).await;
+        let (result, peer, trace) = first.finish();
+        assert!(
+            matches!(result, Some(Err(ChannelError::Transport(ref text))) if text == "IMAP EXAMINE INBOX timed out (15s)")
+        );
+        assert_eq!(peer, Some(Ok(())));
+        assert!(trace.iter().any(|line| line == "peer-eof"));
+        second.pump().await;
+        assert!(wire_ok(second).emails.is_empty());
+        assert_eq!(second_polls.load(Ordering::SeqCst), 1);
+
+        // Dropping a pending caller also releases the same permit.
+        let mut stalled = wire_auth();
+        stalled.extend([
+            WireStep::Read("EXAMINE \"INBOX\"".into()),
+            WireStep::Mark("cancel-held"),
+            WireStep::Stall,
+        ]);
+        let mut cancelled = wire_page(
+            &live,
+            stalled,
+            ImapProgress::default(),
+            10,
+            8192,
+            Arc::default(),
+        );
+        cancelled.reach("cancel-held").await;
+        drop(cancelled);
+        let mut healthy = wire_auth();
+        wire_examine(&mut healthy);
+        wire_search(&mut healthy, "SINCE 01-Jan-2024", "");
+        wire_logout(&mut healthy);
+        let mut after_cancel = wire_page(
+            &live,
+            healthy,
+            ImapProgress::default(),
+            10,
+            8192,
+            Arc::default(),
+        );
+        after_cancel.pump().await;
+        assert!(wire_ok(after_cancel).emails.is_empty());
+
+        // Exercise the real legacy cursor wrapper, not a copied progress model.
+        let raw = minimal_rfc822("sender@example.com", "retry");
+        let (client1, peer1) = tokio::io::duplex(8192);
+        let (client2, peer2) = tokio::io::duplex(8192);
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetcher = ImapFetcher::with_connector(WireConnector {
+            live: wire_live(4096, 8192),
+            connections: std::sync::Mutex::new([client1, client2].into_iter().collect()),
+            polls: polls.clone(),
+        });
+        let mut fail = wire_auth();
+        wire_examine(&mut fail);
+        wire_search(&mut fail, "SINCE 01-Jan-2024", "7");
+        wire_sizes(&mut fail, "7", &[(7, raw.len())]);
+        wire_body_start(&mut fail, 7, 4096);
+        fail.extend([WireStep::Mark("retry-body"), WireStep::Stall]);
+        let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut run = WireRun::new(
+            fetcher.fetch_since(wire_since(), 10),
+            protocol_peer(peer1, fail, trace.clone()),
+            trace,
+        );
+        run.reach("retry-body").await;
+        run.advance(17).await;
+        wire_timeout(run, "IMAP UID FETCH body timed out (16s)");
+        assert_eq!(
+            *fetcher.legacy_progress.lock().await,
+            ImapProgress::default()
+        );
+        let mut retry = wire_auth();
+        wire_examine(&mut retry);
+        wire_search(&mut retry, "SINCE 01-Jan-2024", "7");
+        wire_sizes(&mut retry, "7", &[(7, raw.len())]);
+        wire_body_start(&mut retry, 7, 4096);
+        wire_body_reply(&mut retry, 7, &raw);
+        wire_logout(&mut retry);
+        let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut run = WireRun::new(
+            fetcher.fetch_since(wire_since(), 10),
+            protocol_peer(peer2, retry, trace.clone()),
+            trace,
+        );
+        run.pump().await;
+        let emails = wire_ok(run);
+        assert_eq!(emails.len(), 1);
+        assert_wire_email(&emails[0], 7, &raw);
+        assert_eq!(
+            *fetcher.legacy_progress.lock().await,
+            ImapProgress {
+                uid_validity: NonZeroU32::new(41),
+                last_seen_uid: NonZeroU32::new(7)
+            }
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn imap_protocol_pages_preserve_limits_and_dispositions() {
+        let raw = minimal_rfc822("sender@example.com", "bounded page");
+        let live = wire_live(4096, raw.len());
+        let mut steps = wire_auth();
+        wire_examine(&mut steps);
+        wire_search(&mut steps, "SINCE 01-Jan-2024", "9 7 8 8");
+        wire_sizes(
+            &mut steps,
+            "7,8,9",
+            &[(9, raw.len()), (7, 4097), (8, raw.len())],
+        );
+        wire_body_start(&mut steps, 8, raw.len());
+        wire_body_reply(&mut steps, 8, &raw);
+        wire_logout(&mut steps);
+        let mut run = wire_page(
+            &live,
+            steps,
+            ImapProgress::default(),
+            3,
+            8192,
+            Arc::default(),
+        );
+        run.pump().await;
+        let trace = run.trace.lock().unwrap().clone();
+        let page = wire_ok(run);
+        assert_eq!(page.emails.len(), 2);
+        assert!(
+            matches!(&page.emails[0], SelectedMessage::Malformed { uid: 7, imap_external_id, reason: MalformedReason::TooLarge, raw_bytes: None } if imap_external_id == "imap:mail.example:41:7")
+        );
+        assert_wire_email(&page.emails[1], 8, &raw);
+        assert_eq!(page.next_progress.last_seen_uid, NonZeroU32::new(8));
+        let bodies: Vec<_> = trace
+            .iter()
+            .filter(|line| line.contains("BODY.PEEK"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            bodies,
+            vec![format!(
+                "command:UID FETCH 8 BODY.PEEK[]<0.{}>",
+                raw.len() + 1
+            )]
+        );
+
+        let mut next = wire_auth();
+        wire_examine(&mut next);
+        wire_search(&mut next, "UID 9:*", "8 9 10");
+        wire_sizes(&mut next, "9", &[(9, raw.len())]);
+        wire_body_start(&mut next, 9, raw.len());
+        wire_body_reply(&mut next, 9, &raw);
+        wire_logout(&mut next);
+        let mut run = wire_page(&live, next, page.next_progress, 1, 8192, Arc::default());
+        run.pump().await;
+        let page = wire_ok(run);
+        assert_eq!(page.emails.len(), 1);
+        assert_wire_email(&page.emails[0], 9, &raw);
+        assert_eq!(page.next_progress.last_seen_uid, NonZeroU32::new(9));
     }
 }

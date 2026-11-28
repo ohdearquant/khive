@@ -34,6 +34,8 @@ members = [
     "khive-pack-comm",
     "khive-pack-schedule",
     "khive-pack-formal",
+    "khive-pack-forms",
+    "khive-subject",
     "khive-pack-code",
     "khive-pack-web",
     "khive-pack-telemetry",
@@ -48,6 +50,7 @@ members = [
     "khive-pack-git",
     "khive-pack-workspace",
     "khive-pack-charter",
+    "khive-pack-operation",
     "khive-mcp",
     "khive-vcs",
     "khive-vcs-adapters",
@@ -55,7 +58,6 @@ members = [
     "khive-retrieval",
     "khive-repo-showcase",
     "khive-channel",
-    "khive-channel-node",
     "khive-channel-email",
     "khive-channel-telegram",
 ]
@@ -68,7 +70,7 @@ exclude = ["khive-merge"]
 # keep this exclusion from members.
 
 [workspace.package]
-version = "0.15.0"
+version = "0.24.0"
 edition = "2021"
 # The locked libsqlite3-sys build script uses `cfg_select!`, which Rust 1.93 rejects as
 # unstable; the workspace MSRV is the CI toolchain, 1.95.
@@ -95,7 +97,7 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1-rustl
 async-imap = "0.9"
 async-native-tls = "0.5"
 mail-parser = "0.9"
-rusqlite = { version = "0.40" }
+rusqlite = { version = "0.41.1" }
 anyhow = "1.0.103"
 thiserror = "2.0"
 zstd = "0.14.3"
@@ -157,6 +159,14 @@ blake3 = { version = "1", default-features = false }
 fs4 = "1.1"
 regorus = "0.10"
 rmcp = "2.2"
+# The test computer that the ADR-220 acceptance tests run against, and the
+# HTTP/1.1 pipe that reaches it; all are already in the tree as dependencies
+# of rmcp.
+http = "1"
+http-body-util = "0.1"
+hyper = "1"
+hyper-util = "0.1"
+sse-stream = "0.2"
 futures = "0.3"
 serial_test = "3"
 libc = "0.2"

@@ -55,8 +55,10 @@ async fn test_remember_source_id_accepts_short_id() {
         .await
         .expect("neighbors call succeeds");
 
-    // response is a direct JSON array (not wrapped in an object)
-    let hits = neighbors.as_array().expect("neighbors returns array");
+    // A memory-row anchor always returns the object shape.
+    let hits = neighbors["neighbors"]
+        .as_array()
+        .expect("memory-anchored neighbors returns an object with a neighbors array");
     let found = hits.iter().any(|h| h["id"].as_str() == Some(full_id));
     assert!(
         found,
