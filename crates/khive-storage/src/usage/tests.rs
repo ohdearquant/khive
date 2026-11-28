@@ -1,4 +1,157 @@
 use super::*;
+use std::future::{poll_fn, Future};
+use std::task::Poll;
+
+const UNITS: [(UsageUnit, &str); 7] = [
+    (UsageUnit::EmbedCalls, "embed_calls"),
+    (UsageUnit::FtsPasses, "fts_passes"),
+    (UsageUnit::VectorPasses, "vector_passes"),
+    (UsageUnit::GraphHops, "graph_hops"),
+    (UsageUnit::DbRoundTrips, "db_round_trips"),
+    (UsageUnit::AnnJobsConsumed, "ann_jobs_consumed"),
+    (UsageUnit::EventRows, "event_rows"),
+];
+
+#[tokio::test]
+async fn nested_dispatch_merges_each_frozen_counter_once_and_restores_parent() {
+    let parent = UsageContext::new();
+    scope(parent.clone(), async {
+        for (unit, _) in UNITS {
+            count(unit, 1);
+        }
+        let child = scope_child(async {
+            for (unit, _) in UNITS {
+                count(unit, 2);
+            }
+            scope_child(async {
+                for (unit, _) in UNITS {
+                    count(unit, 4);
+                }
+                current().unwrap().freeze();
+            })
+            .await;
+            let child = current().unwrap();
+            child.freeze();
+            for (unit, _) in UNITS {
+                count(unit, 100);
+            }
+            child
+        })
+        .await;
+        for (unit, key) in UNITS {
+            assert_eq!(child.shipping_snapshot().unwrap()[key], 6);
+            assert_eq!(child.snapshot()[key], 106, "late work actually happened");
+            assert_eq!(parent.shipping_snapshot().unwrap()[key], 7);
+            count(unit, 8);
+        }
+    })
+    .await;
+    for (_, key) in UNITS {
+        assert_eq!(parent.shipping_snapshot().unwrap()[key], 15);
+    }
+    assert!(current().is_none());
+}
+
+#[tokio::test]
+async fn nested_dispatch_preserves_error_and_saturates_unfrozen_work() {
+    let parent = UsageContext::new();
+    parent.add(UsageUnit::EmbedCalls, u64::MAX - 1);
+    let result = scope(
+        parent.clone(),
+        scope_child(async {
+            count(UsageUnit::EmbedCalls, 3);
+            count(UsageUnit::DbRoundTrips, 2);
+            Err::<(), _>("nested dispatch failed")
+        }),
+    )
+    .await;
+    assert_eq!(result, Err("nested dispatch failed"));
+    assert_eq!(
+        parent.shipping_snapshot(),
+        Some(serde_json::json!({"embed_calls":u64::MAX,"db_round_trips":2}))
+    );
+}
+
+#[tokio::test]
+async fn nested_dispatch_unknown_completeness_propagates_even_after_freeze() {
+    for freeze_first in [false, true] {
+        let parent = UsageContext::new();
+        scope(parent.clone(), async {
+            count(UsageUnit::EmbedCalls, 1);
+            scope_child(async {
+                let child = current().unwrap();
+                count(UsageUnit::EmbedCalls, 2);
+                if freeze_first {
+                    child.freeze();
+                }
+                child.mark_unmeasured();
+            })
+            .await;
+            scope_child(async { count(UsageUnit::EmbedCalls, 4) }).await;
+        })
+        .await;
+        assert!(parent.shipping_snapshot().is_none());
+        assert_eq!(parent.snapshot()["embed_calls"], 5);
+    }
+    let parent = UsageContext::new();
+    parent.freeze();
+    scope(
+        parent.clone(),
+        scope_child(async { current().unwrap().mark_unmeasured() }),
+    )
+    .await;
+    assert!(parent.shipping_snapshot().is_none());
+}
+
+#[tokio::test]
+async fn interrupted_nested_dispatch_marks_parent_unmeasured() {
+    let parent = UsageContext::new();
+    scope(parent.clone(), async {
+        let mut child = Box::pin(scope_child(async {
+            count(UsageUnit::EmbedCalls, 1);
+            std::future::pending::<()>().await;
+        }));
+        poll_fn(|cx| {
+            assert!(child.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(parent.shipping_snapshot().is_some());
+        drop(child);
+        assert!(parent.shipping_snapshot().is_none());
+        count(UsageUnit::FtsPasses, 2);
+    })
+    .await;
+    assert_eq!(parent.snapshot()["fts_passes"], 2);
+}
+
+#[tokio::test]
+async fn panicking_nested_dispatch_marks_parent_unmeasured() {
+    let parent = UsageContext::new();
+    let result = tokio::spawn(scope(
+        parent.clone(),
+        scope_child(async {
+            count(UsageUnit::EmbedCalls, 1);
+            panic!("nested fixture panic");
+        }),
+    ))
+    .await;
+    assert!(result.unwrap_err().is_panic());
+    assert!(parent.shipping_snapshot().is_none());
+}
+
+#[tokio::test]
+async fn nested_dispatch_does_not_arm_an_unmeasured_caller() {
+    assert!(current().is_none());
+    let result = scope_child(async {
+        assert!(current().is_none());
+        count(UsageUnit::EmbedCalls, 7);
+        Err::<(), _>("unchanged")
+    })
+    .await;
+    assert_eq!(result, Err("unchanged"));
+    assert!(current().is_none());
+}
 
 #[tokio::test]
 async fn count_is_noop_without_scope_and_counts_inside() {

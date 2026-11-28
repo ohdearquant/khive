@@ -165,7 +165,11 @@ async fn a_daemon_busy_on_a_held_write_lock_answers_daemon_slow_after_write() {
     assert_eq!(snapshot["daemon_slow"]["after_write"], 1);
     assert_eq!(snapshot["fallback_total"], 0);
 
-    // The daemon stays up once the lock is released.
+    // The daemon stays up once the lock is released. The write that was stuck
+    // behind the lock may still be finishing when the probe arrives, so the
+    // probe waits on the default read deadline, not the 2 s one that made the
+    // write time out.
+    std::env::remove_var("KHIVE_REQUEST_READ_TIMEOUT_SECS");
     let probe = DaemonRequestFrame {
         ops: "stats()".to_string(),
         ..frame

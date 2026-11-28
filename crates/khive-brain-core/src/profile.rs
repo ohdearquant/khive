@@ -23,44 +23,55 @@ pub enum ProfileLifecycle {
     Archived,
 }
 
-/// Closed vocabulary of brain profile consumers (ADR-058 amendment, #542).
-/// Adding a new consumer requires adding a variant here — never a bare string
-/// literal at a call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConsumerKind {
-    Recall,
-    KnowledgeCompose,
-    Rerank,
+// Keep the enum, enumeration and wire spellings in one declaration so adding
+// a variant cannot silently omit it from binding-status probes.
+macro_rules! consumer_kinds {
+    ($($variant:ident => $wire:literal),+ $(,)?) => {
+        /// Closed vocabulary of brain profile consumers (ADR-058 amendment, #542).
+        /// Add consumers to the declaration generating this enum and its complete
+        /// enumeration, never as bare strings at call sites.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub enum ConsumerKind {
+            $(#[serde(rename = $wire)] $variant),+
+        }
+
+        impl ConsumerKind {
+            /// Every consumer, in declaration order.
+            pub const ALL: [Self; Self::NAMES.len()] = [$(Self::$variant),+];
+
+            /// Exact wire names for every consumer, in declaration order.
+            pub const NAMES: &'static [&'static str] = &[$($wire),+];
+
+            /// The exact wire-level `consumer_kind` string for this variant.
+            pub const fn as_str(&self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire),+
+                }
+            }
+        }
+
+        impl FromStr for ConsumerKind {
+            type Err = String;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s {
+                    $($wire => Ok(Self::$variant)),+,
+                    other => Err(format!("unknown ConsumerKind: {other:?}")),
+                }
+            }
+        }
+    };
 }
 
-impl ConsumerKind {
-    /// The exact wire-level `consumer_kind` string for this variant.
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            ConsumerKind::Recall => "recall",
-            ConsumerKind::KnowledgeCompose => "knowledge_compose",
-            ConsumerKind::Rerank => "rerank",
-        }
-    }
+consumer_kinds! {
+    Recall => "recall",
+    KnowledgeCompose => "knowledge_compose",
+    Rerank => "rerank",
 }
 
 impl fmt::Display for ConsumerKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for ConsumerKind {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "recall" => Ok(ConsumerKind::Recall),
-            "knowledge_compose" => Ok(ConsumerKind::KnowledgeCompose),
-            "rerank" => Ok(ConsumerKind::Rerank),
-            other => Err(format!("unknown ConsumerKind: {other:?}")),
-        }
     }
 }
 
@@ -156,13 +167,12 @@ pub async fn resolve_consumer_profile(
         "namespace": namespace,
         "consumer_kind": consumer_kind.as_str(),
     });
-    match registry
-        .dispatch_with_identity(
-            "brain.resolve",
-            resolve_params,
-            Some(khive_runtime::RequestIdentity::from_token(token)),
-        )
-        .await
+    match khive_runtime::usage::scope_child(registry.dispatch_with_identity(
+        "brain.resolve",
+        resolve_params,
+        Some(khive_runtime::RequestIdentity::from_token(token)),
+    ))
+    .await
     {
         Ok(v) => {
             let matched_binding = v

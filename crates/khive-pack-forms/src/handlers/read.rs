@@ -446,14 +446,9 @@ pub(crate) async fn neighbourhood(ctx: &Ctx<'_>, params: Value) -> Result<Value,
             });
             stated_by.dedup();
             reply["stated_by"] = Value::Array(stated_by);
-            reply["general"] = json!(names(
-                &graph,
-                &graph
-                    .incoming(root.id, EdgeRelation::Contains)
-                    .into_iter()
-                    .filter(|p| graph.is(*p, FIELD))
-                    .collect::<Vec<_>>()
-            ));
+            let (general, broader) = graph.containing_fields(root.id);
+            reply["general"] = json!(names(&graph, &general));
+            reply["broader"] = json!(names(&graph, &broader));
             reply["narrower"] = json!(names(&graph, &graph.children_of_field(root.id)));
         }
         FORM_SUBJECT => {
@@ -661,6 +656,7 @@ pub(crate) async fn lint(ctx: &Ctx<'_>, _params: Value) -> Result<Value, Runtime
                 }
                 FIELD => {
                     is_general(node)
+                        || !graph.children_of_field(node.id).is_empty()
                         || !graph.items_of_field(node.id).is_empty()
                         || graph
                             .values_of_field(node.id)

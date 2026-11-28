@@ -1357,30 +1357,41 @@ impl OperationPack {
 
         // The forms are read where the type is published, beside its source order.
         let forms_namespace = loaded.type_namespace.as_str();
-        // Each sought field's lines, then the lines of each parent field not read yet.
+        // Each sought field's lines, and the fields it narrows up the chain, nearest first,
+        // each with its lines. The forms pack refuses a cycle of narrows; the walk also stops
+        // at a field it has seen.
         let mut stated: HashMap<String, Vec<Value>> = HashMap::new();
+        let mut broader: HashMap<String, Option<String>> = HashMap::new();
         let mut parents: HashMap<String, Vec<String>> = HashMap::new();
         for field in sought.iter().map(|(field, _)| field) {
-            if stated.contains_key(field) {
+            if parents.contains_key(field) {
                 continue;
             }
-            let reply = field_lines(registry, token, forms_namespace, field).await?;
-            let general = reply["general"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect();
-            parents.insert(field.clone(), general);
-            stated.insert(field.clone(), stated_by(&reply));
-        }
-        let general: BTreeSet<String> = parents.values().flatten().cloned().collect();
-        for parent in general {
-            if let Entry::Vacant(entry) = stated.entry(parent) {
-                let reply = field_lines(registry, token, forms_namespace, entry.key()).await?;
-                entry.insert(stated_by(&reply));
+            let mut chain: Vec<String> = Vec::new();
+            let mut at = field.clone();
+            loop {
+                if let Entry::Vacant(entry) = broader.entry(at.clone()) {
+                    let reply = field_lines(registry, token, forms_namespace, &at).await?;
+                    entry.insert(
+                        reply["broader"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .next(),
+                    );
+                    stated.insert(at.clone(), stated_by(&reply));
+                }
+                match broader.get(&at).cloned().flatten() {
+                    Some(up) if up != *field && !chain.contains(&up) => {
+                        chain.push(up.clone());
+                        at = up;
+                    }
+                    _ => break,
+                }
             }
+            parents.insert(field.clone(), chain);
         }
 
         // Which slot each subject of each form revision read fills.
@@ -1500,8 +1511,10 @@ impl OperationPack {
                     json!({"document_type": document_type, "system": system, "lines": lines})
                 })
                 .collect();
-            let mut in_part: Vec<((usize, String), String, Value)> = Vec::new();
-            for parent in parents.get(&field).into_iter().flatten() {
+            // The nearest broader field first, then the next one up; within one, the source
+            // order's places first. A depth names one field of the chain.
+            let mut in_part: Vec<(usize, (usize, String), Value)> = Vec::new();
+            for (depth, parent) in parents.get(&field).into_iter().flatten().enumerate() {
                 for row in stated.get(parent).into_iter().flatten() {
                     let Some(document_type) = row["document_type"].as_str() else {
                         continue;
@@ -1514,10 +1527,10 @@ impl OperationPack {
                     part["required"] = json!(field);
                     part["document_type"] = json!(document_type);
                     part["system"] = json!(row["system"].as_bool() == Some(true));
-                    in_part.push((rank(document_type), parent.clone(), part));
+                    in_part.push((depth, rank(document_type), part));
                 }
             }
-            in_part.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+            in_part.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
             places.insert(
                 (field, slot),
                 Found {

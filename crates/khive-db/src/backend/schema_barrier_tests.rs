@@ -131,7 +131,7 @@ fn forced_index_check_rebuilds_a_dropped_index_and_then_reads_clean() {
     backend.prepare_serving_store_schemas().unwrap();
 
     let clean = backend.check_serving_forced_indexes().unwrap();
-    assert_eq!(clean.checked, 7);
+    assert_eq!(clean.checked, 9);
     assert!(clean.rebuilt.is_empty(), "{clean:?}");
 
     {
@@ -167,18 +167,84 @@ fn forced_index_check_rebuilds_a_dropped_index_and_then_reads_clean() {
 
 #[test]
 fn forced_index_check_on_a_read_only_store_names_the_missing_index() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("forced-ro.db");
-    {
-        let writable = StorageBackend::sqlite_for_test(&path).unwrap();
-        writable.prepare_serving_store_schemas().unwrap();
-        let writer = writable.pool.try_writer().unwrap();
-        writer
-            .conn()
-            .execute_batch("DROP INDEX idx_notes_created;")
-            .unwrap();
+    for index in [
+        "idx_notes_created",
+        "idx_comm_message_thread",
+        "idx_comm_message_to_actor",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forced-ro.db");
+        {
+            let writable = StorageBackend::sqlite_for_test(&path).unwrap();
+            writable.prepare_serving_store_schemas().unwrap();
+            assert!(index_exists(&writable, index));
+            let writer = writable.pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch(&format!("DROP INDEX {index}"))
+                .unwrap();
+        }
+        let readonly = StorageBackend::sqlite_read_only_for_test(&path).unwrap();
+        let error = readonly.check_serving_forced_indexes().unwrap_err();
+        assert!(error.to_string().contains(index), "{error}");
+        assert!(!index_exists(&readonly, index));
     }
-    let readonly = StorageBackend::sqlite_read_only_for_test(&path).unwrap();
-    let error = readonly.check_serving_forced_indexes().unwrap_err();
-    assert!(error.to_string().contains("idx_notes_created"), "{error}");
+}
+
+#[test]
+fn forced_comm_index_check_rebuilds_each_migration_definition() {
+    for index in ["idx_comm_message_thread", "idx_comm_message_to_actor"] {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = StorageBackend::sqlite_for_test(dir.path().join("comm-index.db")).unwrap();
+        backend.pool.run_migrations().unwrap();
+        let definition = || {
+            let reader = backend.pool.reader().unwrap();
+            reader
+                .conn()
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?1",
+                    [index],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+        };
+        let migrated = definition();
+        backend.prepare_serving_store_schemas().unwrap();
+        assert!(backend
+            .check_serving_forced_indexes()
+            .unwrap()
+            .rebuilt
+            .is_empty());
+        {
+            let writer = backend.pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch(&format!("DROP INDEX {index}"))
+                .unwrap();
+        }
+        assert!(!index_exists(&backend, index));
+        let notes_before = schema_attempts(&backend, StoreSchemaKind::Notes);
+        let repaired = backend.check_serving_forced_indexes().unwrap();
+        assert_eq!(repaired.checked, 9);
+        assert_eq!(repaired.rebuilt, vec![index]);
+        assert_eq!(
+            definition(),
+            migrated,
+            "repair must preserve migration 052's definition"
+        );
+        assert_eq!(
+            schema_attempts(&backend, StoreSchemaKind::Notes),
+            notes_before + 1
+        );
+        assert_eq!(backend.notes_seq_repair_run_count(), 0);
+        assert!(backend
+            .check_serving_forced_indexes()
+            .unwrap()
+            .rebuilt
+            .is_empty());
+        assert_eq!(
+            schema_attempts(&backend, StoreSchemaKind::Notes),
+            notes_before + 1
+        );
+    }
 }

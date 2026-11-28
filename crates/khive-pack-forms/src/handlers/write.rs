@@ -68,6 +68,8 @@ struct FieldSpec {
     comparison: Option<String>,
     /// The field's names in vocabularies, as (vocabulary, name).
     known_as: Vec<(String, String)>,
+    /// The broader field every answer to this one also answers (ADR-223 A1.1).
+    narrows: Option<String>,
 }
 
 /// The operation pack's node types (ADR-222 section 2). A vocabulary may not
@@ -171,6 +173,104 @@ fn refuse_known_as(spec: &FieldSpec) -> Result<(), RuntimeError> {
     }
 }
 
+/// Only forms.load takes the field a field narrows.
+fn refuse_narrows(spec: &FieldSpec) -> Result<(), RuntimeError> {
+    if spec.narrows.is_none() {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "field \"{}\" gives narrows, which forms.load takes; load the field in a form document",
+            spec.name
+        )))
+    }
+}
+
+/// The field `spec`'s `narrows` names, checked as ADR-223 A1.2 asks, or `None` when `field`
+/// already narrows it. `fields` holds the fields listed earlier in the document by folded
+/// wording, `value_types` the value type of each field the document loads, and `staged` the
+/// narrows the document has staged so far, from the narrower field to the broader one.
+fn narrows_target(
+    graph: &Graph,
+    fields: &HashMap<String, Slot>,
+    value_types: &HashMap<Uuid, String>,
+    staged: &HashMap<Uuid, Uuid>,
+    spec: &FieldSpec,
+    field: Uuid,
+    target: &str,
+) -> Result<Option<Uuid>, RuntimeError> {
+    let name = &spec.name;
+    let refused = |why: String| invalid(format!("field \"{name}\" narrows \"{target}\", {why}"));
+    let itself = || refused("which is the field itself; a field narrows another field".to_owned());
+    if normalize(target) == normalize(name) {
+        return Err(itself());
+    }
+    let broader = match fields.get(&normalize(target)) {
+        Some(Some((id, _))) => *id,
+        Some(None) => return Err(refused(
+            "which this document leaves undecided; decide it with forms.same or forms.split first"
+                .to_owned(),
+        )),
+        None => match graph.owners(target, None).as_slice() {
+            [] => {
+                return Err(refused(
+                    "which is neither loaded nor listed earlier in the document".to_owned(),
+                ))
+            }
+            [one] if is_general(one) => {
+                return Err(refused(
+                    "which is a general wording; a field narrows an ordinary field".to_owned(),
+                ))
+            }
+            [one] => one.id,
+            many => {
+                return Err(refused(format!(
+                    "which names several fields ({}); a field narrows one field",
+                    quoted_names(many)
+                )))
+            }
+        },
+    };
+    if broader == field {
+        return Err(itself());
+    }
+    let held = value_types
+        .get(&broader)
+        .cloned()
+        .or_else(|| graph.get(broader).and_then(|f| prop_text(f, "value_type")));
+    if held.as_deref() != Some(spec.value_type.as_str()) {
+        return Err(refused(format!(
+            "whose value_type is {}, not {}; a field narrows a field of its own value type",
+            held.as_deref().unwrap_or("unknown"),
+            spec.value_type
+        )));
+    }
+    let broader_of = |at: Uuid| staged.get(&at).copied().or_else(|| graph.broader_of(at));
+    if let Some(current) = broader_of(field) {
+        if current == broader {
+            return Ok(None);
+        }
+        let current = graph
+            .get(current)
+            .map_or_else(|| current.to_string(), |f| f.name.clone());
+        return Err(invalid(format!(
+            "field \"{name}\" already narrows \"{current}\"; a field narrows at most one field"
+        )));
+    }
+    // A narrows that would close a cycle is refused, so a walk up the chain ends.
+    let mut seen = HashSet::new();
+    let mut next = Some(broader);
+    while let Some(at) = next {
+        if at == field {
+            return Err(refused("which would close a cycle of narrows".to_owned()));
+        }
+        if !seen.insert(at) {
+            break;
+        }
+        next = broader_of(at);
+    }
+    Ok(Some(broader))
+}
+
 fn field_spec(obj: &Args) -> Result<FieldSpec, RuntimeError> {
     let name = params::text(obj, "name")?;
     let value_type = params::one_of(params::text(obj, "value_type")?, "value_type", &VALUE_TYPES)?;
@@ -194,6 +294,7 @@ fn field_spec(obj: &Args) -> Result<FieldSpec, RuntimeError> {
     refuse_exclusive_size(&name, exclusive, values.len())?;
     Ok(FieldSpec {
         known_as: known_as_spec(obj, &name)?,
+        narrows: params::opt_text(obj, "narrows")?,
         definition: params::text(obj, "definition")?,
         aliases: params::string_list(obj, "aliases")?,
         comparison: params::opt_text(obj, "comparison")?
@@ -968,6 +1069,10 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
     let mut blocked: HashMap<String, String> = HashMap::new();
     // Each name in a vocabulary the document gives, to the field it names.
     let mut claimed: HashMap<String, String> = HashMap::new();
+    // The value type of each field the document loads, and each narrows it stages, from
+    // the narrower field to the broader one.
+    let mut value_types: HashMap<Uuid, String> = HashMap::new();
+    let mut staged_narrows: HashMap<Uuid, Uuid> = HashMap::new();
     for field in params::list(doc, "fields")? {
         let mut spec = field_spec(params::entry(field, "field")?)?;
         let folded = normalize(&spec.name);
@@ -1109,6 +1214,31 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                 None
             }
         };
+        if let Some((id, _)) = &slot {
+            value_types.insert(*id, spec.value_type.clone());
+        }
+        if let Some(target) = &spec.narrows {
+            match &slot {
+                Some((id, _)) => {
+                    if let Some(broader) = narrows_target(
+                        &graph,
+                        &fields,
+                        &value_types,
+                        &staged_narrows,
+                        &spec,
+                        *id,
+                        target,
+                    )? {
+                        writes.link(broader, EdgeRelation::Contains, *id);
+                        staged_narrows.insert(*id, broader);
+                    }
+                }
+                None => warnings.push(format!(
+                    "field \"{}\" was not loaded, so the field it narrows was not recorded; load narrows with the field once it is decided",
+                    spec.name
+                )),
+            }
+        }
         if slot.is_none() {
             blocked.insert(folded.clone(), spec.name.clone());
             for alias in &spec.aliases {
@@ -1716,6 +1846,7 @@ pub(crate) async fn add_item(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runt
     } else if let Some(field) = field {
         let mut proposed = field_spec(field)?;
         refuse_known_as(&proposed)?;
+        refuse_narrows(&proposed)?;
         let owners = graph.owners(&proposed.name, None);
         if !owners.is_empty() {
             reply["status"] = json!("match");
@@ -1803,6 +1934,7 @@ pub(crate) async fn same(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
     } else if let Some(new_field) = new_field {
         let mut proposed = field_spec(new_field)?;
         refuse_known_as(&proposed)?;
+        refuse_narrows(&proposed)?;
         proposed.aliases.extend(further);
         let owners = graph.owners(&proposed.name, None);
         if !owners.is_empty() {
@@ -1910,6 +2042,7 @@ pub(crate) async fn split(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runtime
             exclusive: false,
             comparison: prop_text(field, "comparison"),
             known_as: Vec::new(),
+            narrows: None,
         },
     )?;
     writes.link(item.id, EdgeRelation::VariantOf, narrow);

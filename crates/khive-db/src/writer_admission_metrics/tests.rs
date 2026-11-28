@@ -5,6 +5,56 @@ fn advance(start: Instant, nanos: u64) -> Instant {
 }
 
 #[test]
+fn strict_threshold_counts_exclude_the_boundary_and_include_overflow() {
+    let mut histogram = Histogram::default();
+    for nanos in [
+        249_999_999,
+        250_000_000,
+        250_000_001,
+        499_999_999,
+        500_000_000,
+        500_000_001,
+        600_000_000,
+        33_000_000_000,
+    ] {
+        histogram.record(Duration::from_nanos(nanos)).unwrap();
+    }
+    let snapshot = histogram.snapshot().unwrap();
+    assert_eq!(snapshot.count, 8);
+    assert_eq!(snapshot.overflow_count, 1);
+    assert_eq!(
+        snapshot.count_strictly_above(Duration::from_millis(250)),
+        Some(6)
+    );
+    assert_eq!(
+        snapshot.count_strictly_above(Duration::from_millis(500)),
+        Some(3)
+    );
+    assert_eq!(
+        snapshot.count_strictly_above(Duration::from_secs(32)),
+        Some(1)
+    );
+}
+
+#[test]
+fn strict_threshold_counts_refuse_unrepresented_boundaries() {
+    let mut histogram = Histogram::default();
+    histogram.record(Duration::from_millis(600)).unwrap();
+    let snapshot = histogram.snapshot().unwrap();
+    assert_eq!(
+        snapshot.count_strictly_above(Duration::from_millis(500)),
+        Some(1)
+    );
+    for threshold in [
+        Duration::ZERO,
+        Duration::from_millis(300),
+        Duration::from_secs(33),
+    ] {
+        assert_eq!(snapshot.count_strictly_above(threshold), None);
+    }
+}
+
+#[test]
 fn lifecycle_separates_capacity_residence_and_service() {
     let metrics = WriterAdmissionMetrics::new();
     let start = Instant::now();

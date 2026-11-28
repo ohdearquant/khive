@@ -511,12 +511,27 @@ impl Graph {
         values
     }
 
-    /// The fields a general field contains.
+    /// The fields a field contains: those a general field may mean, and those that narrow an
+    /// ordinary field.
     pub(crate) fn children_of_field(&self, field: Uuid) -> Vec<Uuid> {
         self.out(field, EdgeRelation::Contains)
             .into_iter()
             .filter(|f| self.is(*f, FIELD))
             .collect()
+    }
+
+    /// The fields that contain a field, split into the general wordings that may mean it and
+    /// the ordinary fields it narrows (ADR-223 A1.4).
+    pub(crate) fn containing_fields(&self, field: Uuid) -> (Vec<Uuid>, Vec<Uuid>) {
+        self.incoming(field, EdgeRelation::Contains)
+            .into_iter()
+            .filter(|f| self.is(*f, FIELD))
+            .partition(|f| self.get(*f).is_some_and(is_general))
+    }
+
+    /// The ordinary field a field narrows, if any.
+    pub(crate) fn broader_of(&self, field: Uuid) -> Option<Uuid> {
+        self.containing_fields(field).1.into_iter().next()
     }
 
     pub(crate) fn parent_field(&self, value: Uuid) -> Option<Uuid> {
