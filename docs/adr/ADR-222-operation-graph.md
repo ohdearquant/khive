@@ -947,10 +947,18 @@ refusal arms of one section may be rows of one table test.
   naming no loaded document type is refused.
 - A2.10: two operation types pin the same two published step types in opposite orders; each type's
   `pins` edges carry its own order, no edge joins the two step type nodes, and each frontier follows
-  its own type's order. A step type whose requirement is about `holder`, pinned by two types that
-  each declare `holder`, has a requirement node naming the slot and no edge to either slot node. A
-  slot of the same name in two types is two nodes, and a requirement whose field name holds a `/`
-  gets a key no other requirement holds.
+  its own type's order. Two operation types that write no `after` and order the same two pinned steps
+  by `supplies` in opposite directions: each `pins` edge carries its own `derived_after`, and
+  neither shows the other's. Two operation types pin versions 1 and 2 of one step type that dropped a requirement in
+  version 2: the node shows 2, each `pins` edge carries the version its type pins, and the dropped
+  requirement's node is gone. Publishing a step type's version 3 and then its version 2 leaves the
+  node at 3 with version 3's requirement nodes; publishing an operation type's version without a
+  slot removes that slot's node; loading the same versions into an empty store in the other order
+  gives the same nodes and edges. A step type that produces one field about two slots has one
+  `produces` edge naming both. A step type whose requirement is about `holder`, pinned by two types
+  that each declare `holder`, has a requirement node naming the slot and no edge to either slot
+  node. A slot of the same name in two types is two nodes, and a requirement whose field name holds
+  a `/` gets a key no other requirement holds.
 
 ### A2.10 The working type graph: keys and edges
 
@@ -971,14 +979,26 @@ A name in a vocabulary (section 7) is qualified the same way:
 name is escaped.
 
 Escaping writes `%` as `%25` and `/` as `%2F`. Ids, slots, step names and vocabularies hold no `/`
-(`invalid_name`), and a field name or a name in a vocabulary is escaped, so the number of segments
-says which form a key has and no two nodes share one. A key longer than ADR-221's 512 bytes is refused
-at `define` (`invalid_name`).
+(`invalid_name`), and a field name or a name in a vocabulary is escaped, so within one form the
+number of segments is fixed. The segment count alone does not separate the forms: a slot key
+`operation/slot/<operation type>/<slot>` and an operation type's name in a vocabulary,
+`operation/<vocabulary>/operation_type/<name>`, both have four segments. What separates them is
+the second segment, which is either one of section 2's node types or a vocabulary, and A2.5 refuses
+a vocabulary named after a node type (`reserved_vocabulary`). So no two nodes share a key. A key
+longer than ADR-221's 512 bytes is refused at `define` (`invalid_name`).
 
-A node is one per key and carries no version. A later publish updates the node's properties to
-that publish's version and digest. The node shows the newest publish, and the published bytes
-remain the record of every version, including one a running operation pinned: every derived read
-works from published bytes (section 2).
+A node is one per key and its key carries no version. A node of a published definition (an
+operation type or a published step type) shows the highest version published under its id, not
+the one written last, as `version` and `digest` in its properties. A shorthand step type belongs to
+its operation type and shows that type's version. The nodes and edges that belong to a definition
+(an operation type's slots and `pins` edges, a step type's requirement nodes and `produces` edges)
+are those of the shown version's published bytes. When the shown version changes, a node or edge
+that version's bytes no longer hold (a dropped slot, requirement, product or pin) is removed. A
+publish below the shown version changes no node and no edge. The graph for a key is therefore the
+graph a fresh build from the published bytes gives, and a dropped store rebuilds the same graph
+whatever order the versions are loaded in (#6894 3.2). The published bytes remain the record of
+every version, including one a running operation pinned: every derived read works from published
+bytes (section 2).
 
 The edges use existing relations. Where one pair of node types needs more than one meaning, the
 meaning is `properties.role` (section 2):
@@ -987,18 +1007,31 @@ meaning is `properties.role` (section 2):
 - operation type `contains` step type, `role: pins`, for a pinned step and a shorthand one alike;
 - step type `contains` requirement;
 - requirement `links_to` its forms field, `role: requires`;
-- step type `links_to` a forms field it produces, `role: produces`, with the slot it is about.
+- step type `links_to` a forms field it produces, `role: produces`, with `slots`, the slots it
+  produces the field about (empty for a value about the operation).
+
+The store holds one edge per (source, target, relation) in a namespace, and a second write of the
+same three refreshes the first. So where one source reaches one target by one relation for more
+than one reason, the reasons are a list on the one edge. A step type that produces one field about
+two slots has one `produces` edge with both slots in `slots`. An operation type with two steps that
+pin one step type has one `pins` edge, and its `steps` lists both.
 
 A published step type may be pinned by several operation types. So no edge between two nodes that
-two operation types can share states a fact of one of them. Two facts are of that kind, and both
-sit on the operation type's own `pins` edge:
+two operation types can share states a fact of one of them. Three facts are of that kind, and all
+three sit on the operation type's own `pins` edge:
 
-- Order. The `pins` edge carries `steps: [{name, after}]`, one entry for each step of this
-  operation type that pins the step type, with that step's `after`. No `precedes` edge joins two
-  step type nodes.
+- The version pinned. The `pins` edge carries the `version` and `digest` of the step type this
+  operation type pins. A step type node's requirement nodes and `produces` edges describe the
+  node's own version. A reader compares the edge's version with the node's before reading them as
+  true of the pinning type; where the two differ, the pinned version's published bytes are the
+  answer.
+- Order. The `pins` edge carries `steps: [{name, after, derived_after, supplies}]`, one entry for
+  each step of this operation type that pins the step type. Each entry copies the step's `after`,
+  the predecessors A2.3 derived for it and its `supplies` from the published bytes, so an order the
+  document never wrote as `after` still shows. No `precedes` edge joins two step type nodes.
 - The slot a requirement is about. The requirement node holds the slot name its step type gives.
   The slot node is the one each pinning operation type declares under that name, which A2.1 makes
   every pinning type declare. No edge runs from a requirement to a slot.
 
-A reader of one operation type's order or slots follows that operation type's `pins` edges, so
-what one operation type says never reads as true of another.
+A reader of one operation type's versions, order or slots follows that operation type's `pins`
+edges, so what one operation type says never reads as true of another.
