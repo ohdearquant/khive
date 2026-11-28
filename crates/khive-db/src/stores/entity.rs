@@ -1938,8 +1938,13 @@ const ENTITIES_DDL: &str = include_str!("../../sql/entities-ddl.sql");
 pub(crate) fn ensure_entities_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(ENTITIES_DDL)?;
     conn.execute_batch(crate::migrations::ENTITY_KEYS_DDL)?;
+    conn.execute_batch(crate::migrations::ENTITY_KEY_KIND_GUARD_DDL)?;
     conn.execute_batch(crate::migrations::ENTITY_ALIASES_DDL)
 }
+
+#[cfg(test)]
+#[path = "entity_key_kind_guard_tests.rs"]
+mod entity_key_kind_guard_tests;
 
 #[cfg(test)]
 #[path = "entity_tests.rs"]
