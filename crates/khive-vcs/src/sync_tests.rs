@@ -1255,10 +1255,8 @@ fn sample_meta(tag: &str) -> MetaJson {
         fetched_at: "2026-01-01T00:00:00Z".to_string(),
         git_ref: "main".to_string(),
         commit_sha: "deadbeef".to_string(),
-        identity: SnapshotIdentity {
-            content_hash: SnapshotId::from_hash(&hex::encode(digest)).unwrap(),
-            coverage: KG_V1_COVERAGE,
-        },
+        content_hash: SnapshotId::from_hash(&hex::encode(digest)).unwrap(),
+        coverage: KG_V1_COVERAGE,
     }
 }
 
