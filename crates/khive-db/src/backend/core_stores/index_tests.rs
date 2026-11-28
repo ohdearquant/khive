@@ -81,6 +81,17 @@ async fn annotation(backend: &StorageBackend) -> (Uuid, Uuid, i64) {
 }
 
 fn message_filter(index: &str) -> NoteFilter {
+    if index == "idx_comm_message_thread" {
+        return NoteFilter {
+            kind: Some("message".into()),
+            property_filters: vec![PropertyFilter {
+                json_path: "$.thread_id".into(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text("repair-thread".into()),
+            }],
+            ..Default::default()
+        };
+    }
     let mut properties = vec![
         PropertyFilter {
             json_path: "$.direction".into(),
@@ -116,8 +127,9 @@ fn message_filter(index: &str) -> NoteFilter {
 
 async fn message(backend: &StorageBackend) -> Uuid {
     let mut note = Note::new("local", "message", "inbound");
-    note.properties =
-        Some(serde_json::json!({"direction":"inbound", "to_actor":"lambda:reader", "read":false}));
+    note.properties = Some(
+        serde_json::json!({"direction":"inbound", "to_actor":"lambda:reader", "read":false, "thread_id":"repair-thread"}),
+    );
     let id = note.id;
     NoteStore::upsert_note(backend, note).await.unwrap();
     id
@@ -208,6 +220,7 @@ async fn lazy_core_annotation_reads_repair_graph_and_notes_owned_indexes_without
 #[tokio::test]
 async fn lazy_core_message_reads_repair_each_owned_forced_index_on_every_pinned_read_route() {
     for index in [
+        "idx_comm_message_thread",
         "idx_notes_message_recipient_direction",
         "idx_notes_unread_probe_recipient_direction",
         "idx_notes_unread_probe_recipient_type_direction",
