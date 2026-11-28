@@ -11,11 +11,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use khive_score::DeterministicScore;
+use lattice_inference::model::qwen35_config::Qwen35Config;
 
 use crate::error::{Result, RetrievalError};
 use crate::hybrid::searcher::Reranker;
 
-/// The locked native engine's hook contract and geometry types.
+/// Native hook and geometry types that follow `lattice-inference` versioning.
 pub use lattice_inference::lora_hook::{
     BertLoraGeometry, LoraHook, LoraProjectionShape, LoraTargetGeometry, NoopLoraHook,
 };
@@ -72,11 +73,8 @@ impl LoraHook for ObservedHook<'_> {
         self.inner.validate_geometry(geometry)
     }
 
-    fn validate_against(
-        &self,
-        config: &lattice_inference::model::qwen35_config::Qwen35Config,
-    ) -> std::result::Result<(), String> {
-        // Preserve validators implemented against the locked engine's legacy API.
+    fn validate_against(&self, config: &Qwen35Config) -> std::result::Result<(), String> {
+        // The locked engine still exposes these compatibility validators.
         #[allow(deprecated)]
         self.inner.validate_against(config)
     }
@@ -207,7 +205,48 @@ where
             _id: PhantomData,
         }
     }
+}
 
+impl<Id, R> NativeCrossEncoderReranker<Id, R, NativeCrossEncoderModel>
+where
+    Id: Clone + Send + Sync + 'static,
+    R: RerankDocumentResolver<Id>,
+{
+    /// Load a local BERT classification checkpoint and bind its document resolver.
+    pub fn from_directory(path: &Path, resolver: Arc<R>) -> Result<Self> {
+        let model = NativeCrossEncoderModel::from_directory(path).map_err(|error| {
+            RetrievalError::rerank(format!("cross-encoder model load failed: {error}"))
+        })?;
+        Ok(Self::new(Arc::new(model), resolver))
+    }
+}
+
+#[async_trait]
+impl<Id, R, S> Reranker<Id> for NativeCrossEncoderReranker<Id, R, S>
+where
+    Id: Clone + Send + Sync + 'static,
+    R: RerankDocumentResolver<Id>,
+    S: CrossEncoderScorer,
+{
+    async fn rerank(
+        &self,
+        query: &str,
+        results: Vec<(Id, DeterministicScore)>,
+        top_k: usize,
+    ) -> Result<Vec<(Id, DeterministicScore)>> {
+        Ok(self
+            .rerank_with_hook(query, results, top_k, None)
+            .await?
+            .results)
+    }
+}
+
+impl<Id, R, S> NativeCrossEncoderReranker<Id, R, S>
+where
+    Id: Clone + Send + Sync + 'static,
+    R: RerankDocumentResolver<Id>,
+    S: CrossEncoderScorer,
+{
     /// Rerank with a native hook borrowed for this call, without retaining it.
     ///
     /// Resolution, missing-document filtering, ties and score conversion match
@@ -284,40 +323,6 @@ where
                 .collect(),
             hook_applied,
         })
-    }
-}
-
-impl<Id, R> NativeCrossEncoderReranker<Id, R, NativeCrossEncoderModel>
-where
-    Id: Clone + Send + Sync + 'static,
-    R: RerankDocumentResolver<Id>,
-{
-    /// Load a local BERT classification checkpoint and bind its document resolver.
-    pub fn from_directory(path: &Path, resolver: Arc<R>) -> Result<Self> {
-        let model = NativeCrossEncoderModel::from_directory(path).map_err(|error| {
-            RetrievalError::rerank(format!("cross-encoder model load failed: {error}"))
-        })?;
-        Ok(Self::new(Arc::new(model), resolver))
-    }
-}
-
-#[async_trait]
-impl<Id, R, S> Reranker<Id> for NativeCrossEncoderReranker<Id, R, S>
-where
-    Id: Clone + Send + Sync + 'static,
-    R: RerankDocumentResolver<Id>,
-    S: CrossEncoderScorer,
-{
-    async fn rerank(
-        &self,
-        query: &str,
-        results: Vec<(Id, DeterministicScore)>,
-        top_k: usize,
-    ) -> Result<Vec<(Id, DeterministicScore)>> {
-        Ok(self
-            .rerank_with_hook(query, results, top_k, None)
-            .await?
-            .results)
     }
 }
 

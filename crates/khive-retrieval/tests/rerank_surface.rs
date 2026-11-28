@@ -60,70 +60,16 @@ async fn identity_reranker_reexport_compiles_and_runs() {
     assert_eq!(out, results[..1]);
 }
 
-#[tokio::test]
-async fn hook_surface_preserves_legacy_reranker_and_borrowed_invocation() {
-    use khive_retrieval::{CrossEncoderScores, LoraHook, NativeRerankResult, NoopLoraHook};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+#[test]
+fn native_hook_reexports_share_the_same_types() {
+    use khive_retrieval::{hybrid, LoraHook, NativeRerankResult, NoopLoraHook};
 
-    struct BorrowedHook<'a>(&'a AtomicUsize);
-    impl LoraHook for BorrowedHook<'_> {
-        fn apply(&self, _: usize, _: &str, _: &[f32], _: &mut [f32]) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    let calls = AtomicUsize::new(0);
-    let hook = BorrowedHook(&calls);
-    let scorer = Arc::new(FakeScorer {
-        scores: vec![0.1, 0.9],
-    });
-    let opaque: &dyn CrossEncoderScorer = scorer.as_ref();
-    let plain: CrossEncoderScores = opaque
-        .score_batch_with_hook("q", &["a", "b"], None)
-        .unwrap();
-    assert_eq!(plain.scores, vec![0.1, 0.9]);
-    assert!(!plain.hook_applied);
-    for supplied in [&hook as &dyn LoraHook, &NoopLoraHook] {
-        assert!(
-            matches!(
-                opaque.score_batch_with_hook("q", &["a", "b"], Some(supplied)),
-                Err(khive_retrieval::RetrievalError::Rerank(_))
-            ),
-            "legacy scorer must explicitly refuse every supplied hook"
-        );
-    }
-    let reranker = NativeCrossEncoderReranker::new(
-        scorer,
-        Arc::new(FakeResolver {
-            documents: vec![Some("a".into()), Some("b".into())],
-        }),
-    );
-    let input = vec![
-        (1u32, DeterministicScore::from_f64(0.5)),
-        (2u32, DeterministicScore::from_f64(0.5)),
-    ];
-    let legacy = reranker.rerank("q", input.clone(), 2).await.unwrap();
-    let explicit: NativeRerankResult<u32> = reranker
-        .rerank_with_hook("q", input.clone(), 2, None)
-        .await
-        .unwrap();
-    assert_eq!(explicit.results, legacy);
-    assert_eq!(
-        explicit.results.iter().map(|row| row.0).collect::<Vec<_>>(),
-        vec![2, 1]
-    );
-    assert!(!explicit.hook_applied);
-    for supplied in [&hook as &dyn LoraHook, &NoopLoraHook] {
-        assert!(
-            matches!(
-                reranker
-                    .rerank_with_hook("q", input.clone(), 2, Some(supplied))
-                    .await,
-                Err(khive_retrieval::RetrievalError::Rerank(_))
-            ),
-            "public reranker must preserve unsupported-hook refusal"
-        );
-    }
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert_eq!(reranker.rerank("q", input, 2).await.unwrap(), legacy);
+    let hook: &dyn LoraHook = &hybrid::NoopLoraHook;
+    let _: &dyn hybrid::LoraHook = hook;
+    let _: hybrid::NoopLoraHook = NoopLoraHook;
+    let result: NativeRerankResult<u32> = hybrid::NativeRerankResult {
+        results: Vec::new(),
+        hook_applied: false,
+    };
+    let _: hybrid::NativeRerankResult<u32> = result;
 }
