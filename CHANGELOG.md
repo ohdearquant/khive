@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `apply_changeset` applies an entity restore, the inverse of a soft delete, and restores the
+  entity's keys and aliases. If any key is taken, it returns `restore_key_conflict`, names every
+  taken key, and writes nothing from the change set. It still refuses note and edge restores
+  (#6886).
+
 ## [0.24.0] - 2026-11-28
 
 ### Added
