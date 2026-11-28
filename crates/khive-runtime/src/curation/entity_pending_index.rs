@@ -58,6 +58,10 @@ pub struct EntityUpdateReport {
     pub embedding: EmbeddingTruncationReport,
     pub indexing: EntityIndexReport,
     pub post_commit_degradations: Vec<PostCommitDegradation>,
+    /// What the update's alias change asked for and did not do (ADR-221
+    /// section 2).
+    #[serde(skip_serializing_if = "crate::EntityAliasReport::is_empty")]
+    pub aliases: crate::EntityAliasReport,
 }
 
 impl EntityUpdateReport {
@@ -66,6 +70,7 @@ impl EntityUpdateReport {
             embedding,
             indexing: EntityIndexReport::complete(required),
             post_commit_degradations: Vec::new(),
+            aliases: crate::EntityAliasReport::default(),
         }
     }
 

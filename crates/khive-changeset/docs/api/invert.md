@@ -36,7 +36,7 @@ success and error. Only a complete inverse is returned.
 
 | Forward operation    | Inverse and current-record check                                                                                                                                                                          |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Entity create        | Soft delete of the same ID. The live entity must match the staged namespace, kind, type, name, description, properties, and tags.                                                                         |
+| Entity create        | Soft delete of the same ID. The live entity must match the staged namespace, kind, type, name, description, properties, and tags, hold exactly the staged key, and hold the staged aliases other than its name, each of origin `caller`. |
 | Note create          | Soft delete of the same ID. The live note must match the staged namespace, kind, content, properties, tags, salience, and decay factor; its status must remain the default and its expiry must be absent. |
 | Link                 | Soft delete of the same edge ID. The live edge must match the staged namespace, endpoints, relation, weight, and properties.                                                                              |
 | Update               | Swap the patch and preimage through `UpdateOp::new`. Every touched working field must equal the forward patch value. Then rewind those working fields to their captured preimage values.                  |

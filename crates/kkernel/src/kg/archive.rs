@@ -673,6 +673,8 @@ fn adapter_records_to_archive(
             let updated_at = parse_dt(e.updated_at.as_deref(), now)
                 .with_context(|| format!("entity {} invalid updated_at", e.id))?;
             Ok(ExportedEntity {
+                keys: Vec::new(),
+                aliases: Vec::new(),
                 id: e.id,
                 kind: e.kind,
                 entity_type: e.entity_type,
@@ -810,6 +812,10 @@ pub(super) fn archive_from_ndjson_repo(repo: &Path, namespace: &str) -> Result<K
         #[serde(default)]
         tags: Vec<String>,
         #[serde(default)]
+        keys: Vec<String>,
+        #[serde(default)]
+        aliases: Vec<khive_storage::entity::EntityAlias>,
+        #[serde(default)]
         created_at: Option<String>,
         #[serde(default)]
         updated_at: Option<String>,
@@ -855,6 +861,8 @@ pub(super) fn archive_from_ndjson_repo(repo: &Path, namespace: &str) -> Result<K
                 description: e.description,
                 properties: e.properties,
                 tags: e.tags,
+                keys: e.keys,
+                aliases: e.aliases,
                 created_at,
                 updated_at,
             })

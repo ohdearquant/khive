@@ -161,6 +161,31 @@ impl Fixture {
     }
 
     async fn new_with_tool_pack(allowlisted: bool, mapped: bool, include_tool: bool) -> Self {
+        Self::build(allowlisted, mapped, include_tool, None).await
+    }
+
+    /// An allowlisted, mapped fixture whose repository also has a `[git_write.repositories]`
+    /// row, with or without a commit identity of its own (ADR-182 Amendment 20).
+    async fn with_repository_row(author: Option<(&str, &str)>) -> Self {
+        let row = GitWriteRepositoryConfig {
+            remote: "https://github.com/fixture/project.git".into(),
+            slug: "fixture/project".into(),
+            visibility: "private".into(),
+            merge_refusals: vec![],
+            author: author.map(|(name, email)| GitWriteAuthorConfig {
+                name: name.into(),
+                email: email.into(),
+            }),
+        };
+        Self::build(true, true, true, Some(row)).await
+    }
+
+    async fn build(
+        allowlisted: bool,
+        mapped: bool,
+        include_tool: bool,
+        repository_row: Option<GitWriteRepositoryConfig>,
+    ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path().join("repo");
         std::fs::create_dir(&repo).expect("repo directory");
@@ -223,16 +248,21 @@ impl Fixture {
                         GitWriteEntryConfig {
                             repo: repo.display().to_string(),
                             branches: vec!["*".into()],
+                            access: Default::default(),
                         },
                         GitWriteEntryConfig {
                             repo: blank.display().to_string(),
                             branches: vec!["*".into()],
+                            access: Default::default(),
                         },
                     ]
                 } else {
                     vec![]
                 },
                 actors,
+                repositories: repository_row
+                    .map(|row| BTreeMap::from([(repo.display().to_string(), row)]))
+                    .unwrap_or_default(),
                 credential_resolver: vec![resolver.display().to_string(), "{ref}".into()],
                 ..Default::default()
             },

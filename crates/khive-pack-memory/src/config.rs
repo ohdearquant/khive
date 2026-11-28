@@ -519,13 +519,17 @@ pub struct ScoreBreakdown {
     /// (see `weights_served`), so this ratio never enters `rank_score`. `1.0` when no
     /// profile served the request or the default-weight score is ~0 (div-by-zero guard).
     pub profile_component: f64,
-    /// ADR-104 §3: the serving profile's per-entity Beta posterior mean for this UUID.
-    /// `None` without a serving profile or a posterior beyond the uninformative prior.
-    /// Multiplies `rank_score` by
-    /// `clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15)`;
-    /// `None` or a mean of 0.5 is neutral. See
+    /// ADR-104 Section 2: the serving profile's per-entity Beta posterior mean for this UUID.
+    /// `None` without a serving profile or without a posterior for this UUID.
+    /// With `entity_evidence_mass` it gives `entity_term`:
+    /// `t0 = clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15)`, then
+    /// `1 + (t0 - 1) * n / (n + 16)` with `n = entity_evidence_mass` (ADR-104 Amendment 6);
+    /// `None`, a mean of 0.5 or `n = 0` is neutral. See
     /// `crates/khive-pack-memory/docs/api/configuration.md#score-breakdowns`.
     pub entity_posterior_mean: Option<f64>,
+    /// ADR-104 Amendment 6: the evidence mass `n` of the same posterior, `max(0, alpha + beta - 2)`.
+    /// Present exactly when `entity_posterior_mean` is.
+    pub entity_evidence_mass: Option<f64>,
     /// Which weights scored this hit. Always `"default"`: a served profile scores with the
     /// configured default weights; the weights its posteriors project to appear only in
     /// `profile_component`.

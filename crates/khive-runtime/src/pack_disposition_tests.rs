@@ -46,11 +46,15 @@ async fn disposition_is_assigned_at_validation_and_handler_raise_sites() {
     builder.register(FailingProbePack);
     let registry = builder.build().unwrap();
     let before = registry
-        .dispatch_with_disposition("probe", serde_json::json!({"namespace": 3}), None)
+        .dispatch_with_disposition(
+            "failing_probe.probe",
+            serde_json::json!({"namespace": 3}),
+            None,
+        )
         .await
         .unwrap_err();
     let handler = registry
-        .dispatch_with_disposition("probe", serde_json::json!({}), None)
+        .dispatch_with_disposition("failing_probe.probe", serde_json::json!({}), None)
         .await
         .unwrap_err();
     assert_eq!(before.disposition(), DomainDisposition::NotCommitted);
@@ -58,7 +62,7 @@ async fn disposition_is_assigned_at_validation_and_handler_raise_sites() {
     assert!(matches!(before.source(), RuntimeError::InvalidInput(_)));
     assert!(matches!(handler.source(), RuntimeError::InvalidInput(message) if message == "boom"));
     assert!(matches!(
-        registry.dispatch("probe", serde_json::json!({})).await,
+        registry.dispatch("failing_probe.probe", serde_json::json!({})).await,
         Err(RuntimeError::InvalidInput(message)) if message == "boom"
     ));
     let unknown = registry

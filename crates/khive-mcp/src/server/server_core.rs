@@ -68,6 +68,14 @@ pub struct KhiveMcpServer {
     pub(super) bridge_executable:
         Option<Arc<std::sync::Mutex<crate::daemon::executable::BridgeExecutable>>>,
     pub(super) stdio_bridge: bool,
+    /// The caller's computer (ADR-220). Present only when the configuration
+    /// this process resolved has a `[computer]` table, and never in the daemon.
+    #[cfg(unix)]
+    pub(super) computer: Option<Arc<super::computer_bridge::ComputerBridge>>,
+    /// The caller's `[share]` table (ADR-220 Amendment 1), held like the
+    /// computer: only by the process that resolved the configuration.
+    #[cfg(unix)]
+    pub(super) share: super::bridge_share::ShareSetup,
     /// Namespace this registry was built for. The stdio client passes it to the
     /// daemon; a namespace mismatch triggers local-dispatch fallback.
     pub(super) default_namespace: String,
@@ -111,6 +119,7 @@ pub struct KhiveMcpServer {
     /// `KHIVE_OUTPUT_FORMAT` → builtin `json`. Per-request `format` fields
     /// override this at dispatch time.
     pub(super) default_output_format: OutputFormat,
+    pub(super) catalog_verbosity: crate::args::CatalogVerbosity,
     /// Last instant at which this process's daemon schedule loop began a tick.
     /// Zero means this server instance has never observed the loop running.
     /// Shared by server clones but never persisted, so a replacement process
@@ -386,5 +395,26 @@ impl KhiveMcpServer {
         self.runtime
             .as_ref()
             .map(KhiveRuntime::background_resources_control)
+    }
+
+    /// Whether a runtime this server dispatches through carries host-installed
+    /// configuration validators or `comm.send` routes. Those callbacks exist
+    /// only in this process, so its requests must not be forwarded to a daemon.
+    ///
+    /// This reads the default runtime and, with a channel feature, the comm
+    /// outbox runtime. The standard builders derive every pack runtime from the
+    /// same configuration as those. A host that assembles its registry over
+    /// other runtimes carrying callbacks must select local dispatch itself.
+    #[cfg(unix)]
+    pub(crate) fn carries_process_local_callbacks(&self) -> bool {
+        let carries = |runtime: &KhiveRuntime| {
+            let config = runtime.config();
+            !config.channel_config_validators.is_empty() || !config.channel_send_routes.is_empty()
+        };
+        #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+        if self.channel_outbox_runtime.as_ref().is_some_and(carries) {
+            return true;
+        }
+        self.runtime.as_ref().is_some_and(carries)
     }
 }

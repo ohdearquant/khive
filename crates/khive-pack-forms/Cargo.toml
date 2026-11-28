@@ -1,0 +1,29 @@
+[package]
+name = "khive-pack-forms"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Forms pack: a typed graph of printed forms, the fields their items mean, choice values and printed rules"
+
+[dependencies]
+khive-changeset = { version = "0.23.0", path = "../khive-changeset" }
+khive-types = { version = "0.23.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.23.0", path = "../khive-runtime" }
+khive-storage = { version = "0.23.0", path = "../khive-storage" }
+inventory = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# Path-only: the acceptance tests install kg beside forms; cargo strips it at publish.
+khive-pack-kg = { path = "../khive-pack-kg" }
+lattice-embed = { workspace = true }
+tokio = { workspace = true, features = ["full"] }

@@ -5,13 +5,23 @@ use std::collections::BTreeMap;
 use khive_changeset::{
     from_ndjson, to_ndjson, ChangeSet, ChangeSetError, CreateOp, CreateTarget, CurrentState,
     DeleteOp, DeletePreimage, EdgePatch, EdgePreimage, EntityCreateFields, EntityPatch,
-    EntityPreimage, Envelope, InvertError, LinkOp, MergeOp, MergePreimage, NoteCreateFields,
-    NotePatch, NotePreimage, Op, RestoreOp, UpdateOp, UpdatePatch, UpdatePreimage,
+    EntityPreimage, EntityRecord, Envelope, InvertError, LinkOp, MergeOp, MergePreimage,
+    NoteCreateFields, NotePatch, NotePreimage, Op, RestoreOp, UpdateOp, UpdatePatch,
+    UpdatePreimage,
 };
 use khive_types::{
     EdgeRelation, Entity, EntityKind, Header, Id128, Link, Namespace, Note, NoteStatus,
     PropertyValue, Timestamp,
 };
+
+fn boxed(row: impl Into<EntityRecord>) -> Box<EntityRecord> {
+    Box::new(row.into())
+}
+
+fn entity_rows<const N: usize>(rows: [(Id128, Entity); N]) -> BTreeMap<Id128, EntityRecord> {
+    rows.into_iter().map(|(id, row)| (id, row.into())).collect()
+}
+use khive_types::{EntityAlias, EntityAliasOrigin};
 use serde_json::{json, Value};
 
 fn id(value: u128) -> Id128 {
@@ -98,6 +108,8 @@ fn create_entity(row: &Entity) -> Op {
             description: row.description.clone(),
             properties: row.properties.clone(),
             tags: row.tags.clone(),
+            key: None,
+            aliases: vec![],
         }),
     })
 }
@@ -139,6 +151,7 @@ fn rename(identifier: Id128, new: &str, old: &str) -> Op {
                 entity_type: None,
                 properties: None,
                 tags: None,
+                aliases: None,
             }),
             UpdatePreimage::Entity(EntityPreimage {
                 name: Some(old.into()),
@@ -146,6 +159,7 @@ fn rename(identifier: Id128, new: &str, old: &str) -> Op {
                 entity_type: None,
                 properties: None,
                 tags: None,
+                aliases: None,
             }),
         )
         .unwrap(),
@@ -193,7 +207,7 @@ fn creates_and_link_carry_supplied_full_records_into_reverse_soft_deletes() {
         vec![create_entity(&e), create_note(&n), link(&l)],
     );
     let current = CurrentState {
-        entities: BTreeMap::from([(id(1), e.clone())]),
+        entities: entity_rows([(id(1), e.clone())]),
         notes: BTreeMap::from([(id(3), n.clone())]),
         edges: BTreeMap::from([(id(4), l.clone())]),
     };
@@ -214,7 +228,7 @@ fn creates_and_link_carry_supplied_full_records_into_reverse_soft_deletes() {
             Op::Delete(DeleteOp {
                 target_id: id(1),
                 hard: false,
-                preimage: DeletePreimage::Entity(Box::new(e)),
+                preimage: DeletePreimage::Entity(boxed(e)),
             }),
         ],
     );
@@ -245,6 +259,7 @@ fn entity_update_swaps_every_field_preserving_nullable_clear_and_whole_maps() {
                 entity_type: Some(Some("new-type".into())),
                 properties: Some(properties("new-map")),
                 tags: Some(vec!["new-tag".into()]),
+                aliases: None,
             }),
             UpdatePreimage::Entity(EntityPreimage {
                 name: Some("old".into()),
@@ -252,6 +267,7 @@ fn entity_update_swaps_every_field_preserving_nullable_clear_and_whole_maps() {
                 entity_type: Some(None),
                 properties: Some(properties("old-map")),
                 tags: Some(vec!["old-tag".into()]),
+                aliases: None,
             }),
         )
         .unwrap(),
@@ -265,6 +281,7 @@ fn entity_update_swaps_every_field_preserving_nullable_clear_and_whole_maps() {
                 entity_type: Some(None),
                 properties: Some(properties("old-map")),
                 tags: Some(vec!["old-tag".into()]),
+                aliases: None,
             }),
             UpdatePreimage::Entity(EntityPreimage {
                 name: Some("new".into()),
@@ -272,6 +289,7 @@ fn entity_update_swaps_every_field_preserving_nullable_clear_and_whole_maps() {
                 entity_type: Some(Some("new-type".into())),
                 properties: Some(properties("new-map")),
                 tags: Some(vec!["new-tag".into()]),
+                aliases: None,
             }),
         )
         .unwrap(),
@@ -279,7 +297,7 @@ fn entity_update_swaps_every_field_preserving_nullable_clear_and_whole_maps() {
     assert_inverse(
         &ChangeSet::new(envelope(1), vec![update]),
         &CurrentState {
-            entities: BTreeMap::from([(id(1), current_row)]),
+            entities: entity_rows([(id(1), current_row)]),
             ..Default::default()
         },
         vec![expected],
@@ -386,7 +404,7 @@ fn note_and_edge_updates_swap_their_fields_without_clearing_untouched_fields() {
     let inverse = assert_inverse(
         &ChangeSet::new(envelope(1), vec![rename(id(1), "after", "before")]),
         &CurrentState {
-            entities: BTreeMap::from([(id(1), e)]),
+            entities: entity_rows([(id(1), e)]),
             ..Default::default()
         },
         vec![rename(id(1), "before", "after")],
@@ -415,7 +433,7 @@ fn mixed_create_link_update_reverses_order_and_keeps_stable_ids() {
     assert_inverse(
         &forward,
         &CurrentState {
-            entities: BTreeMap::from([(id(1), live)]),
+            entities: entity_rows([(id(1), live)]),
             edges: BTreeMap::from([(id(4), l.clone())]),
             ..Default::default()
         },
@@ -429,7 +447,7 @@ fn mixed_create_link_update_reverses_order_and_keeps_stable_ids() {
             Op::Delete(DeleteOp {
                 target_id: id(1),
                 hard: false,
-                preimage: DeletePreimage::Entity(Box::new(original)),
+                preimage: DeletePreimage::Entity(boxed(original)),
             }),
         ],
     );
@@ -447,7 +465,7 @@ fn repeated_updates_check_rewound_intermediate_state() {
     assert_inverse(
         &forward,
         &CurrentState {
-            entities: BTreeMap::from([(id(1), entity(id(1), "after"))]),
+            entities: entity_rows([(id(1), entity(id(1), "after"))]),
             ..Default::default()
         },
         vec![
@@ -468,6 +486,7 @@ fn update_only_double_inversion_is_byte_exact_across_multiple_substrates() {
                 entity_type: Some(Some("after-type".into())),
                 properties: Some(properties("after-map")),
                 tags: Some(vec!["after-tag".into()]),
+                aliases: None,
             }),
             UpdatePreimage::Entity(EntityPreimage {
                 name: Some("before".into()),
@@ -475,6 +494,7 @@ fn update_only_double_inversion_is_byte_exact_across_multiple_substrates() {
                 entity_type: Some(None),
                 properties: Some(properties("before-map")),
                 tags: Some(vec!["before-tag".into()]),
+                aliases: None,
             }),
         )
         .unwrap(),
@@ -533,13 +553,15 @@ fn update_only_double_inversion_is_byte_exact_across_multiple_substrates() {
     after_entity.properties = properties("after-map");
     after_entity.tags = vec!["after-tag".into()];
     let mut after = CurrentState {
-        entities: BTreeMap::from([(id(1), after_entity.clone())]),
+        entities: entity_rows([(id(1), after_entity.clone())]),
         notes: BTreeMap::from([(id(3), after_note)]),
         edges: BTreeMap::from([(id(4), after_edge)]),
     };
     // Additional untouched rows arrive in a different insertion order; neither
     // that order nor their values may replace the forward operation order.
-    after.entities.insert(id(9), entity(id(9), "unrelated"));
+    after
+        .entities
+        .insert(id(9), entity(id(9), "unrelated").into());
     let inverse = forward.invert(envelope(2), &after).unwrap();
     let mut before_note = note(id(3), "before-note");
     before_note.salience = Some(0.5);
@@ -549,7 +571,7 @@ fn update_only_double_inversion_is_byte_exact_across_multiple_substrates() {
     before_entity.properties = properties("before-map");
     before_entity.tags = vec!["before-tag".into()];
     let before = CurrentState {
-        entities: BTreeMap::from([(id(9), entity(id(9), "unrelated")), (id(1), before_entity)]),
+        entities: entity_rows([(id(9), entity(id(9), "unrelated")), (id(1), before_entity)]),
         notes: BTreeMap::from([(id(3), before_note)]),
         edges: BTreeMap::from([(id(4), edge(id(4)))]),
     };
@@ -558,8 +580,8 @@ fn update_only_double_inversion_is_byte_exact_across_multiple_substrates() {
     let mut reverse_insert = CurrentState::default();
     reverse_insert
         .entities
-        .insert(id(9), entity(id(9), "unrelated"));
-    reverse_insert.entities.insert(id(1), after_entity);
+        .insert(id(9), entity(id(9), "unrelated").into());
+    reverse_insert.entities.insert(id(1), after_entity.into());
     reverse_insert.notes = after.notes.clone();
     reverse_insert.edges = after.edges.clone();
     assert_eq!(
@@ -571,7 +593,7 @@ fn update_only_double_inversion_is_byte_exact_across_multiple_substrates() {
 #[test]
 fn inputs_remain_unchanged_after_success_and_failure_after_a_reverse_update() {
     let current = CurrentState {
-        entities: BTreeMap::from([(id(1), entity(id(1), "after"))]),
+        entities: entity_rows([(id(1), entity(id(1), "after"))]),
         ..Default::default()
     };
     let good = ChangeSet::new(envelope(1), vec![rename(id(1), "after", "before")]);
@@ -586,7 +608,7 @@ fn inputs_remain_unchanged_after_success_and_failure_after_a_reverse_update() {
             Op::Delete(DeleteOp {
                 target_id: id(9),
                 hard: true,
-                preimage: DeletePreimage::Entity(Box::new(entity(id(9), "not invertible"))),
+                preimage: DeletePreimage::Entity(boxed(entity(id(9), "not invertible"))),
             }),
             rename(id(1), "after", "before"),
         ],
@@ -609,14 +631,14 @@ fn delete_and_merge_refuse_with_original_forward_index_without_current_rows() {
     let deleted = Op::Delete(DeleteOp {
         target_id: id(1),
         hard: true,
-        preimage: DeletePreimage::Entity(Box::new(entity(id(1), "deleted"))),
+        preimage: DeletePreimage::Entity(boxed(entity(id(1), "deleted"))),
     });
     let merged = Op::Merge(MergeOp {
         into_id: id(1),
         from_id: id(2),
         preimage: MergePreimage {
-            into: Box::new(entity(id(1), "into")),
-            from: Box::new(entity(id(2), "from")),
+            into: boxed(entity(id(1), "into")),
+            from: boxed(entity(id(2), "from")),
             incident_edges: vec![],
         },
     });
@@ -677,7 +699,7 @@ fn create_and_link_checks_refuse_later_writes_and_tombstones() {
         cs.invert(
             envelope(2),
             &CurrentState {
-                entities: BTreeMap::from([(id(1), renamed)]),
+                entities: entity_rows([(id(1), renamed)]),
                 ..Default::default()
             },
         )
@@ -692,7 +714,7 @@ fn create_and_link_checks_refuse_later_writes_and_tombstones() {
         cs.invert(
             envelope(2),
             &CurrentState {
-                entities: BTreeMap::from([(id(1), dead)]),
+                entities: entity_rows([(id(1), dead)]),
                 ..Default::default()
             },
         )
@@ -709,7 +731,7 @@ fn create_and_link_checks_refuse_later_writes_and_tombstones() {
         cs.invert(
             envelope(2),
             &CurrentState {
-                entities: BTreeMap::from([(id(1), changed_map)]),
+                entities: entity_rows([(id(1), changed_map)]),
                 ..Default::default()
             },
         )
@@ -808,7 +830,7 @@ fn touched_update_and_incoherent_map_keys_refuse_without_comparing_unrelated_fie
         cs.invert(
             envelope(2),
             &CurrentState {
-                entities: BTreeMap::from([(id(1), entity(id(1), "intervening write"))]),
+                entities: entity_rows([(id(1), entity(id(1), "intervening write"))]),
                 ..Default::default()
             },
         )
@@ -821,7 +843,7 @@ fn touched_update_and_incoherent_map_keys_refuse_without_comparing_unrelated_fie
         cs.invert(
             envelope(2),
             &CurrentState {
-                entities: BTreeMap::from([(id(1), entity(id(99), "after"))]),
+                entities: entity_rows([(id(1), entity(id(99), "after"))]),
                 ..Default::default()
             },
         )
@@ -978,7 +1000,7 @@ fn soft_deletes_restore_full_records_and_reinvert_without_content_loss() {
     n.expires_at = Some(Timestamp::from_secs(100));
     let l = edge(id(3));
     let records = vec![
-        DeletePreimage::Entity(Box::new(e.clone())),
+        DeletePreimage::Entity(boxed(e.clone())),
         DeletePreimage::Note(Box::new(n.clone())),
         DeletePreimage::Edge(Box::new(l.clone())),
     ];
@@ -997,11 +1019,11 @@ fn soft_deletes_restore_full_records_and_reinvert_without_content_loss() {
             .collect(),
     );
     let mut deleted = CurrentState {
-        entities: BTreeMap::from([(id(1), e.clone())]),
+        entities: entity_rows([(id(1), e.clone())]),
         notes: BTreeMap::from([(id(2), n.clone())]),
         edges: BTreeMap::from([(id(3), l.clone())]),
     };
-    deleted.entities.get_mut(&id(1)).unwrap().deleted_at = Some(Timestamp::from_secs(80));
+    deleted.entities.get_mut(&id(1)).unwrap().entity.deleted_at = Some(Timestamp::from_secs(80));
     let dead_note = deleted.notes.get_mut(&id(2)).unwrap();
     dead_note.deleted_at = Some(Timestamp::from_secs(80));
     dead_note.status = NoteStatus::Deleted;
@@ -1023,16 +1045,22 @@ fn soft_deletes_restore_full_records_and_reinvert_without_content_loss() {
     );
     assert_eq!(snapshot(&deleted), before);
     let mut restored = CurrentState {
-        entities: BTreeMap::from([(id(1), e)]),
+        entities: entity_rows([(id(1), e)]),
         notes: BTreeMap::from([(id(2), n)]),
         edges: BTreeMap::from([(id(3), l)]),
     };
-    restored.entities.get_mut(&id(1)).unwrap().header.updated_at = Timestamp::from_secs(90);
+    restored
+        .entities
+        .get_mut(&id(1))
+        .unwrap()
+        .entity
+        .header
+        .updated_at = Timestamp::from_secs(90);
     restored.notes.get_mut(&id(2)).unwrap().header.updated_at = Timestamp::from_secs(90);
     restored.edges.get_mut(&id(3)).unwrap().updated_at = Timestamp::from_secs(90);
     let reinverted = inverse.invert(envelope(3), &restored).unwrap();
     let expected = vec![
-        DeletePreimage::Entity(Box::new(restored.entities[&id(1)].clone())),
+        DeletePreimage::Entity(boxed(restored.entities[&id(1)].clone())),
         DeletePreimage::Note(Box::new(restored.notes[&id(2)].clone())),
         DeletePreimage::Edge(Box::new(restored.edges[&id(3)].clone())),
     ];
@@ -1061,7 +1089,7 @@ fn soft_deletes_restore_full_records_and_reinvert_without_content_loss() {
 #[test]
 fn mixed_delete_restore_history_rewinds_liveness_without_an_invented_timestamp() {
     let original = entity(id(1), "before");
-    let restored_record = DeletePreimage::Entity(Box::new(entity(id(1), "after")));
+    let restored_record = DeletePreimage::Entity(boxed(entity(id(1), "after")));
     let forward = ChangeSet::new(
         envelope(1),
         vec![
@@ -1077,7 +1105,7 @@ fn mixed_delete_restore_history_rewinds_liveness_without_an_invented_timestamp()
     let mut live = entity(id(1), "after");
     live.header.updated_at = Timestamp::from_secs(90);
     let current = CurrentState {
-        entities: BTreeMap::from([(id(1), live.clone())]),
+        entities: entity_rows([(id(1), live.clone())]),
         ..Default::default()
     };
     assert_inverse(
@@ -1087,7 +1115,7 @@ fn mixed_delete_restore_history_rewinds_liveness_without_an_invented_timestamp()
             Op::Delete(DeleteOp {
                 target_id: id(1),
                 hard: false,
-                preimage: DeletePreimage::Entity(Box::new(live)),
+                preimage: DeletePreimage::Entity(boxed(live)),
             }),
             Op::Restore(RestoreOp::new(id(1), restored_record).unwrap()),
             rename(original.header.id, "before", "after"),
@@ -1099,19 +1127,19 @@ fn mixed_delete_restore_history_rewinds_liveness_without_an_invented_timestamp()
 fn restore_and_soft_delete_refuse_changed_content_or_wrong_lifecycle() {
     let original = entity(id(1), "original");
     let restore = Op::Restore(
-        RestoreOp::new(id(1), DeletePreimage::Entity(Box::new(original.clone()))).unwrap(),
+        RestoreOp::new(id(1), DeletePreimage::Entity(boxed(original.clone()))).unwrap(),
     );
     let delete = Op::Delete(DeleteOp {
         target_id: id(1),
         hard: false,
-        preimage: DeletePreimage::Entity(Box::new(original.clone())),
+        preimage: DeletePreimage::Entity(boxed(original.clone())),
     });
     for (op, dead) in [(restore.clone(), false), (delete.clone(), true)] {
         let mut changed = original.clone();
         changed.name = "intervening edit".into();
         changed.deleted_at = dead.then(|| Timestamp::from_secs(80));
         let current = CurrentState {
-            entities: BTreeMap::from([(id(1), changed)]),
+            entities: entity_rows([(id(1), changed)]),
             ..Default::default()
         };
         let before = snapshot(&current);
@@ -1126,7 +1154,7 @@ fn restore_and_soft_delete_refuse_changed_content_or_wrong_lifecycle() {
         assert_eq!(snapshot(&current), before);
     }
     let live = CurrentState {
-        entities: BTreeMap::from([(id(1), original.clone())]),
+        entities: entity_rows([(id(1), original.clone())]),
         ..Default::default()
     };
     assert_invalidated(
@@ -1140,7 +1168,7 @@ fn restore_and_soft_delete_refuse_changed_content_or_wrong_lifecycle() {
     let mut dead = original;
     dead.deleted_at = Some(Timestamp::from_secs(80));
     let tombstoned = CurrentState {
-        entities: BTreeMap::from([(id(1), dead)]),
+        entities: entity_rows([(id(1), dead)]),
         ..Default::default()
     };
     assert_invalidated(
@@ -1160,7 +1188,7 @@ fn soft_delete_refuses_changed_entity_timestamp_and_unrestorable_note_status() {
     dead.deleted_at = Some(Timestamp::from_secs(80));
     dead.header.updated_at = Timestamp::from_secs(80);
     let current = CurrentState {
-        entities: BTreeMap::from([(id(1), dead)]),
+        entities: entity_rows([(id(1), dead)]),
         ..Default::default()
     };
     let forward = ChangeSet::new(
@@ -1168,7 +1196,7 @@ fn soft_delete_refuses_changed_entity_timestamp_and_unrestorable_note_status() {
         vec![Op::Delete(DeleteOp {
             target_id: id(1),
             hard: false,
-            preimage: DeletePreimage::Entity(Box::new(original)),
+            preimage: DeletePreimage::Entity(boxed(original)),
         })],
     );
     assert_invalidated(
@@ -1245,13 +1273,11 @@ fn reverse_restore_does_not_allow_an_earlier_create_of_a_tombstoned_record() {
         envelope(1),
         vec![
             create_entity(&row),
-            Op::Restore(
-                RestoreOp::new(id(1), DeletePreimage::Entity(Box::new(row.clone()))).unwrap(),
-            ),
+            Op::Restore(RestoreOp::new(id(1), DeletePreimage::Entity(boxed(row.clone()))).unwrap()),
         ],
     );
     let current = CurrentState {
-        entities: BTreeMap::from([(id(1), row)]),
+        entities: entity_rows([(id(1), row)]),
         ..Default::default()
     };
     assert_invalidated(
@@ -1259,5 +1285,226 @@ fn reverse_restore_does_not_allow_an_earlier_create_of_a_tombstoned_record() {
         0,
         id(1),
         "deleted_at",
+    );
+}
+
+fn held_aliases(pairs: &[(&str, EntityAliasOrigin)]) -> Vec<EntityAlias> {
+    pairs
+        .iter()
+        .cloned()
+        .map(|(alias, origin)| EntityAlias {
+            alias: alias.into(),
+            origin,
+        })
+        .collect()
+}
+
+fn keyed(row: Entity, keys: &[&str], aliases: Vec<EntityAlias>) -> EntityRecord {
+    EntityRecord {
+        entity: row,
+        keys: keys.iter().map(|key| (*key).to_string()).collect(),
+        aliases,
+    }
+}
+
+fn only(identifier: Id128, row: EntityRecord) -> CurrentState {
+    CurrentState {
+        entities: BTreeMap::from([(identifier, row)]),
+        ..Default::default()
+    }
+}
+
+fn alias_update(identifier: Id128, new: Vec<EntityAlias>, old: Vec<EntityAlias>) -> Op {
+    Op::Update(
+        UpdateOp::new(
+            identifier,
+            UpdatePatch::Entity(EntityPatch {
+                name: None,
+                description: None,
+                entity_type: None,
+                properties: None,
+                tags: None,
+                aliases: Some(new),
+            }),
+            UpdatePreimage::Entity(EntityPreimage {
+                name: None,
+                description: None,
+                entity_type: None,
+                properties: None,
+                tags: None,
+                aliases: Some(old),
+            }),
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn an_alias_set_update_inverts_to_the_exact_prior_set_with_origins() {
+    use EntityAliasOrigin::{Caller, Rename};
+    let before = held_aliases(&[("old name", Rename), ("nick", Caller)]);
+    let after = held_aliases(&[("old name", Rename), ("handle", Caller)]);
+    let forward = ChangeSet::new(
+        envelope(1),
+        vec![alias_update(id(1), after.clone(), before.clone())],
+    );
+    let live = keyed(
+        entity(id(1), "name"),
+        &["k1"],
+        after.iter().rev().cloned().collect(),
+    );
+    assert_inverse(
+        &forward,
+        &only(id(1), live),
+        vec![alias_update(id(1), before, after)],
+    );
+    // A current set that lost a member, or holds one under another origin, refuses.
+    for changed in [
+        held_aliases(&[("old name", Rename)]),
+        held_aliases(&[("old name", Caller), ("handle", Caller)]),
+    ] {
+        let current = only(id(1), keyed(entity(id(1), "name"), &["k1"], changed));
+        assert_invalidated(
+            forward.invert(envelope(2), &current).unwrap_err(),
+            0,
+            id(1),
+            "aliases",
+        );
+    }
+}
+
+#[test]
+fn a_soft_delete_restores_its_keys_and_aliases_and_refuses_changed_ones() {
+    use EntityAliasOrigin::{Caller, Merge, Rename};
+    let captured = keyed(
+        entity(id(1), "name"),
+        &["k1", "k2"],
+        held_aliases(&[("nick", Caller), ("old name", Rename)]),
+    );
+    let forward = ChangeSet::new(
+        envelope(1),
+        vec![Op::Delete(DeleteOp {
+            target_id: id(1),
+            hard: false,
+            preimage: DeletePreimage::Entity(boxed(captured.clone())),
+        })],
+    );
+    let mut dead = captured.clone();
+    dead.entity.deleted_at = Some(Timestamp::from_secs(80));
+    dead.keys.reverse();
+    dead.aliases.reverse();
+    let inverse = assert_inverse(
+        &forward,
+        &only(id(1), dead.clone()),
+        vec![Op::Restore(
+            RestoreOp::new(id(1), DeletePreimage::Entity(boxed(captured))).unwrap(),
+        )],
+    );
+    let text = to_ndjson(&inverse).unwrap();
+    assert!(text.contains(r#""keys":["k1","k2"]"#), "{text}");
+    assert!(
+        text.contains(r#"{"alias":"old name","origin":"rename"}"#),
+        "{text}"
+    );
+    let mut fewer = dead.clone();
+    fewer.keys.pop();
+    assert_invalidated(
+        forward
+            .invert(envelope(2), &only(id(1), fewer))
+            .unwrap_err(),
+        0,
+        id(1),
+        "keys",
+    );
+    let mut moved = dead;
+    moved.aliases[0].origin = Merge;
+    assert_invalidated(
+        forward
+            .invert(envelope(2), &only(id(1), moved))
+            .unwrap_err(),
+        0,
+        id(1),
+        "aliases",
+    );
+}
+
+#[test]
+fn a_keyed_create_with_aliases_inverts_to_a_soft_delete_carrying_them() {
+    use EntityAliasOrigin::{Caller, Rename};
+    let row = entity(id(1), "name");
+    let Op::Create(mut create) = create_entity(&row) else {
+        unreachable!()
+    };
+    let CreateTarget::Entity(fields) = &mut create.target else {
+        unreachable!()
+    };
+    fields.key = Some("k1".into());
+    // An alias equal to the name is not held.
+    fields.aliases = vec!["nick".into(), "name".into()];
+    let forward = ChangeSet::new(envelope(1), vec![Op::Create(create)]);
+    let live = keyed(row, &["k1"], held_aliases(&[("nick", Caller)]));
+    assert_inverse(
+        &forward,
+        &only(id(1), live.clone()),
+        vec![Op::Delete(DeleteOp {
+            target_id: id(1),
+            hard: false,
+            preimage: DeletePreimage::Entity(boxed(live.clone())),
+        })],
+    );
+    let mut unkeyed = live.clone();
+    unkeyed.keys.clear();
+    assert_invalidated(
+        forward
+            .invert(envelope(2), &only(id(1), unkeyed))
+            .unwrap_err(),
+        0,
+        id(1),
+        "keys",
+    );
+    let mut renamed = live;
+    renamed.aliases = held_aliases(&[("nick", Rename)]);
+    assert_invalidated(
+        forward
+            .invert(envelope(2), &only(id(1), renamed))
+            .unwrap_err(),
+        0,
+        id(1),
+        "aliases",
+    );
+}
+
+#[test]
+fn a_created_alias_differing_from_the_name_only_by_case_is_held() {
+    use EntityAliasOrigin::Caller;
+    let row = entity(id(1), "name");
+    let Op::Create(mut create) = create_entity(&row) else {
+        unreachable!()
+    };
+    let CreateTarget::Entity(fields) = &mut create.target else {
+        unreachable!()
+    };
+    // A create drops only an alias byte-equal to the name, as the runtime's create does.
+    fields.aliases = vec!["Name".into(), "name".into()];
+    let forward = ChangeSet::new(envelope(1), vec![Op::Create(create)]);
+    let live = keyed(row, &[], held_aliases(&[("Name", Caller)]));
+    assert_inverse(
+        &forward,
+        &only(id(1), live.clone()),
+        vec![Op::Delete(DeleteOp {
+            target_id: id(1),
+            hard: false,
+            preimage: DeletePreimage::Entity(boxed(live.clone())),
+        })],
+    );
+    let mut folded = live;
+    folded.aliases.clear();
+    assert_invalidated(
+        forward
+            .invert(envelope(2), &only(id(1), folded))
+            .unwrap_err(),
+        0,
+        id(1),
+        "aliases",
     );
 }

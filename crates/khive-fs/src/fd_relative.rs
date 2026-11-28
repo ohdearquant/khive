@@ -256,6 +256,54 @@ pub fn open_dir_at(parent: &File, name: &OsStr) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+/// Open flag for a directory handle that only resolves the next component. On Apple
+/// targets `O_SEARCH` needs search permission alone, so a directory the caller may pass
+/// through but not list still opens. Other targets keep the read-only open
+/// [`open_dir_at`] uses.
+#[cfg(target_vendor = "apple")]
+const SEARCH_ONLY: libc::c_int = libc::O_SEARCH;
+#[cfg(not(target_vendor = "apple"))]
+const SEARCH_ONLY: libc::c_int = libc::O_RDONLY;
+
+/// Open `name` relative to `parent` as a search-only directory handle, refusing a
+/// symlink at the final component.
+///
+/// The handle serves as the directory of a later descriptor-relative call and for
+/// `fstat`; on Apple targets it cannot list the directory. It is close-on-exec.
+pub fn open_search_dir_at(parent: &File, name: &OsStr) -> io::Result<File> {
+    let name = c_name(name)?;
+    // SAFETY: `parent` is a live descriptor and `name` is NUL-terminated for the call.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            SEARCH_ONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by a successful `openat` and is owned here.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// The filesystem root as a search-only directory handle, the start of a walk made
+/// with [`open_search_dir_at`].
+pub fn open_search_root() -> io::Result<File> {
+    // SAFETY: the path is a NUL-terminated literal.
+    let fd = unsafe {
+        libc::open(
+            c"/".as_ptr(),
+            SEARCH_ONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by a successful `open` and is owned here.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
 /// Pointer to the calling thread's `errno` cell.
 #[cfg(any(
     target_os = "macos",

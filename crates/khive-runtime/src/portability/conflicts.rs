@@ -1,6 +1,6 @@
 //! Explicit CLI import policies. Legacy library entry points remain in the parent module.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use khive_storage::types::SqlRow;
 use khive_storage::{Entity, SqlStatement, SqlValue};
@@ -9,6 +9,9 @@ use khive_types::ImportKindPolicy;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::names::{
+    archive_name_writes, import_key_conflict, key_holder, key_holder_statement, ArchiveNameWrites,
+};
 use super::{ExportedEdge, ExportedEntity, ImportValidation, KgArchive};
 use crate::atomic_plan::PostCommitEffect;
 use crate::atomic_prepare::{
@@ -74,6 +77,10 @@ pub struct ImportConflictSummary {
     pub entities_skipped: usize,
     #[serde(default, skip_serializing_if = "is_zero_count")]
     pub entities_registry_skipped: usize,
+    /// Entities `skip` mode left out because another live entity holds a
+    /// key they carry (ADR-221 section 4). Counted in `entities_skipped` too.
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub entities_key_conflict_skipped: usize,
     pub edges_imported: usize,
     pub edges_inserted: usize,
     pub edges_updated: usize,
@@ -152,6 +159,36 @@ fn archive_patch(record: &ExportedEntity) -> EntityPatch {
         properties: record.properties.clone().filter(|value| !value.is_null()),
         tags: (!record.tags.is_empty()).then(|| record.tags.clone()),
     }
+}
+
+/// Join an archive entity's key and alias writes to the plan that writes its
+/// row. An update plan reindexes the entity after commit when `reindex` says
+/// the writes changed its aliases; an insert plan always does.
+fn append_name_writes(
+    plan: &mut AtomicOpPlan,
+    writes: ArchiveNameWrites,
+    reindex: bool,
+) -> RuntimeResult<()> {
+    if writes.statements.is_empty() {
+        return Ok(());
+    }
+    match plan {
+        AtomicOpPlan::AddEntity(add) => add.statements.extend(writes.statements),
+        AtomicOpPlan::Update(update) => {
+            update.statements.extend(writes.statements);
+            if reindex {
+                update.post_commit = PostCommitEffect::ReindexEntity {
+                    entity_id: update.target_id,
+                };
+            }
+        }
+        _ => {
+            return Err(RuntimeError::Internal(
+                "archive entity plan writes no entity row".into(),
+            ))
+        }
+    }
+    Ok(())
 }
 
 fn identity_statement(id: Uuid) -> SqlStatement {
@@ -516,14 +553,43 @@ impl KhiveRuntime {
                     )));
                 }
             }
+            // ADR-221 section 4: each key the archive entity carries is free
+            // or already its own. The holder reads join the probes, so a key
+            // taken before the write refuses the import as a changed
+            // destination.
+            let mut named = BTreeSet::new();
+            let mut taken = None;
+            for key in &record.keys {
+                let (probe, holders) =
+                    read_probe(self, key_holder_statement(namespace, &record.kind, key)).await?;
+                result.probes.push(probe);
+                match key_holder(&holders)? {
+                    Some(holder) if holder == record.id => {
+                        named.insert(key.as_str());
+                    }
+                    Some(_) => {
+                        taken = Some(key);
+                        break;
+                    }
+                    None => {}
+                }
+            }
+            if let Some(key) = taken {
+                if options.on_conflict == ImportConflictMode::Skip {
+                    result.summary.entities_skipped += 1;
+                    result.summary.entities_key_conflict_skipped += 1;
+                    skipped_records.insert(record.id);
+                    continue;
+                }
+                return Err(import_key_conflict(record.id, &record.kind, key));
+            }
             let entity = if rows.is_empty() {
-                let entity = archive_entity(record, namespace);
-                result.entities.push(prepare_import_entity_record(
-                    self,
-                    token,
-                    entity.clone(),
-                    policy,
-                )?);
+                let mut entity = archive_entity(record, namespace);
+                let writes =
+                    archive_name_writes(&mut entity, &record.keys, &record.aliases, &named);
+                let mut plan = prepare_import_entity_record(self, token, entity.clone(), policy)?;
+                append_name_writes(&mut plan, writes, true)?;
+                result.entities.push(plan);
                 result.summary.entities_inserted += 1;
                 entity
             } else {
@@ -547,14 +613,25 @@ impl KhiveRuntime {
                         record.id
                     )));
                 }
-                let (entity, plan) = prepare_update_entity_record(
+                let (mut entity, mut plan) = prepare_update_entity_record(
                     self,
                     token,
                     record.id,
                     archive_patch(record),
+                    // ADR-221 section 3: an archive that renames a stored
+                    // entity keeps the destination's old name as a `rename`
+                    // alias, as the `update` verb does, so a lookup by that
+                    // name still finds the entity.
+                    &crate::EntityAliasChange::default().keeping_old_name(true),
                     Some(current.version),
                 )
                 .await?;
+                // The stored keys and aliases stay; the archive's are added.
+                let before = entity.aliases.clone();
+                let writes =
+                    archive_name_writes(&mut entity, &record.keys, &record.aliases, &named);
+                let reindex = entity.aliases != before;
+                append_name_writes(&mut plan, writes, reindex)?;
                 result.entities.push(plan);
                 result.summary.entities_updated += 1;
                 entity

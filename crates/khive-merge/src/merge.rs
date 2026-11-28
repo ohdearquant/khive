@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::diff_local::EdgeKey;
 use crate::edge::{merge_edges, validate_dangling_edges};
-use crate::entity::merge_entities;
+use crate::entity::{key_conflicts, kind_change_conflicts, merge_entities};
 use crate::strategy::{apply_ours_with_conflicts, apply_theirs_with_conflicts};
 use crate::types::{MergeConflict, MergeEngine, MergeError, MergeResult, SnapshotMergeStrategy};
 
@@ -31,6 +31,13 @@ fn validate_inputs(
 
     for archive in [base, ours, theirs] {
         validate_archive(archive)?;
+        // An input that already places one key on two entities is invalid,
+        // so the merge is never blamed for it.
+        if let Some(MergeConflict::KeyConflict { kind, key, .. }) =
+            key_conflicts(&archive.entities).into_iter().next()
+        {
+            return Err(MergeError::DuplicateEntityKey { kind, key });
+        }
     }
 
     Ok(())
@@ -124,11 +131,11 @@ pub fn three_way_merge(
     match strategy {
         SnapshotMergeStrategy::Ours => {
             let (merged, conflicts) = apply_ours_with_conflicts(base, ours, theirs);
-            finish_shortcut_merge(merged, ours, theirs, conflicts)
+            finish_shortcut_merge(merged, base, ours, theirs, conflicts)
         }
         SnapshotMergeStrategy::Theirs => {
             let (merged, conflicts) = apply_theirs_with_conflicts(base, ours, theirs);
-            finish_shortcut_merge(merged, ours, theirs, conflicts)
+            finish_shortcut_merge(merged, base, ours, theirs, conflicts)
         }
         SnapshotMergeStrategy::Auto => three_way_merge_auto(base, ours, theirs),
     }
@@ -137,11 +144,18 @@ pub fn three_way_merge(
 /// Sorts, stamps, and dangling-checks a last-write-wins result.
 fn finish_shortcut_merge(
     mut merged: KgArchive,
+    base: &KgArchive,
     ours: &KgArchive,
     theirs: &KgArchive,
     mut conflicts: Vec<MergeConflict>,
 ) -> Result<MergeResult, MergeError> {
     sort_entities(&mut merged);
+    // A preferred branch is not a winner for a key: two entities holding one
+    // key, or one key moved to another kind, is reported, never resolved
+    // silently (ADR-221 section 4).
+    conflicts.extend(key_conflicts(&merged.entities));
+    let kind_changes = kind_change_conflicts(base, ours, theirs, &merged.entities, &conflicts);
+    conflicts.extend(kind_changes);
     sort_edges(&mut merged.edges);
     merged.exported_at = deterministic_timestamp(ours, theirs);
     validate_archive(&merged)?;
@@ -164,6 +178,9 @@ fn three_way_merge_auto(
 
     let (merged_entities, entity_conflicts) = merge_entities(base, ours, theirs);
     all_conflicts.extend(entity_conflicts);
+    all_conflicts.extend(key_conflicts(&merged_entities));
+    let kind_changes = kind_change_conflicts(base, ours, theirs, &merged_entities, &all_conflicts);
+    all_conflicts.extend(kind_changes);
 
     let (merged_edges, edge_conflicts) = merge_edges(base, ours, theirs)?;
     all_conflicts.extend(edge_conflicts);

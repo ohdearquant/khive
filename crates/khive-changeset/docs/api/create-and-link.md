@@ -10,7 +10,7 @@ Create and link operations mint stable record IDs at staging time. This lets lat
 
 `CreateOp` carries a stage-time ID, namespace, and `CreateTarget`. The target is tagged by `kind` and separates entity fields from note fields.
 
-`EntityCreateFields` carries the closed `EntityKind`, optional governed `entity_type`, name, optional description, properties, and tags. `NoteCreateFields` carries a pack-declared note-kind string, content, properties, tags, optional salience, and optional decay factor. The note kind is intentionally not a closed enum because packs declare it.
+`EntityCreateFields` carries the closed `EntityKind`, optional governed `entity_type`, name, optional description, properties, and tags, an optional `key`, and `aliases`, a list of alias strings, both omitted from the wire when unset (ADR-221). A key is unique per namespace and kind among live entities; aliases equal to the name are not stored. `NoteCreateFields` carries a pack-declared note-kind string, content, properties, tags, optional salience, and optional decay factor. The note kind is intentionally not a closed enum because packs declare it.
 
 Create payloads deny unknown fields. Optional fields use serde defaults; absent maps and vectors become empty, while absent optional scalars remain `None`.
 

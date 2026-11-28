@@ -54,6 +54,33 @@
     ],
     "additionalProperties": false
   },
+  "git.branch_delete": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "name": {
+        "type": "string",
+        "minLength": 1
+      },
+      "expected": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{40}$"
+      },
+      "session_id": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "required": [
+      "repo",
+      "name",
+      "expected"
+    ],
+    "additionalProperties": false
+  },
   "git.update_ref": {
     "type": "object",
     "properties": {
@@ -124,6 +151,10 @@
         "type": "string",
         "pattern": "^[a-fA-F0-9]{40}$"
       },
+      "merge_parent": {
+        "type": "string",
+        "pattern": "^[a-fA-F0-9]{40}$"
+      },
       "session_id": {
         "type": "string",
         "minLength": 1
@@ -160,6 +191,18 @@
               }
             ]
           }
+        }
+      },
+      {
+        "if": {
+          "required": [
+            "merge_parent"
+          ]
+        },
+        "then": {
+          "required": [
+            "tree"
+          ]
         }
       }
     ]
@@ -200,6 +243,33 @@
       "branch",
       "expected_local",
       "expected_remote"
+    ],
+    "additionalProperties": false
+  },
+  "git.fetch": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "ref": {
+        "type": "string",
+        "minLength": 1,
+        "description": "A branch name, or pull/<N> for a pull request's head."
+      },
+      "expected_remote": {
+        "type": "string",
+        "pattern": "^[a-fA-F0-9]{40}$"
+      },
+      "session_id": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "required": [
+      "repo",
+      "ref"
     ],
     "additionalProperties": false
   },
@@ -433,6 +503,133 @@
       "subject",
       "body",
       "expected_head"
+    ],
+    "additionalProperties": false
+  },
+  "git.pr_edit": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "number": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "title": {
+        "type": "string",
+        "minLength": 1
+      },
+      "body": {
+        "type": "string"
+      },
+      "expected_head": {
+        "type": "string",
+        "pattern": "^[a-fA-F0-9]{40}$"
+      },
+      "session_id": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "required": [
+      "repo",
+      "number",
+      "expected_head"
+    ],
+    "anyOf": [
+      {
+        "required": [
+          "title"
+        ]
+      },
+      {
+        "required": [
+          "body"
+        ]
+      }
+    ],
+    "additionalProperties": false
+  },
+  "git.pr_close": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "number": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "expected_head": {
+        "type": "string",
+        "pattern": "^[a-fA-F0-9]{40}$"
+      },
+      "session_id": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "required": [
+      "repo",
+      "number",
+      "expected_head"
+    ],
+    "additionalProperties": false
+  },
+  "git.check_log": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "check_run": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "required": [
+      "repo",
+      "check_run"
+    ],
+    "additionalProperties": false
+  },
+  "git.pr_state": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "number": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "required": [
+      "repo",
+      "number"
+    ],
+    "additionalProperties": false
+  },
+  "git.issue": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "minLength": 1
+      },
+      "number": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "required": [
+      "repo",
+      "number"
     ],
     "additionalProperties": false
   },

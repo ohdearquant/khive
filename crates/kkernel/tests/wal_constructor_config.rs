@@ -180,6 +180,9 @@ fn run_topology_case(case: &str) {
         .args(["--exact", "wal_topology_child", "--ignored", "--nocapture"])
         .env_clear()
         .env("HOME", home.path())
+        // The child makes its own temporary directory; without TMPDIR it
+        // would fall back to /tmp, which a sandboxed run may not write.
+        .env("TMPDIR", home.path())
         .env("KHIVE_WAL_TOPOLOGY_CASE", case)
         .env(
             "KHIVE_SQLITE_WAL_CEILING_BYTES",

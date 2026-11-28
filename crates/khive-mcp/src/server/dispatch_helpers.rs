@@ -299,7 +299,8 @@ pub(super) async fn dispatch_via_coordinator_inner(
                                     None,
                                 )
                             };
-                        khive_storage::ensure_request_read_active("search")?;
+                        khive_storage::ensure_request_read_active("search")
+                            .map_err(|error| RuntimeError::from(error).before_requested_write())?;
                         // Preserve the coordinator search response's compatibility
                         // fields, and add the KG single-backend handler's canonical
                         // row fields for shape parity (MIN-1): `kind` (duplicates
@@ -424,12 +425,43 @@ pub(super) async fn dispatch_via_coordinator_inner(
                         })
                     }
                 }
-                Err(error) => Err(DispatchFailure::from_dispatch(tool, error)),
+                Err(error) => Err(coordinated_search_failure(tool, error)),
             })
         }
         _ => None,
     }
 }
+
+fn coordinated_search_failure(tool: &str, error: khive_runtime::DispatchError) -> DispatchFailure {
+    // Cancellation or an expired request deadline, with an explicit no-write
+    // proof, permits a new request with a fresh budget; it does not renew this
+    // request's deadline. A coincident stop must not reclassify another error or
+    // an audit failure after the search already returned its canonical result.
+    let proven_request_stop = error.disposition() == DomainDisposition::NotCommitted
+        && error.source().batch_write_disposition() == Some(DomainDisposition::NotCommitted)
+        && khive_storage::request_read_is_cancelled()
+        && matches!(
+            error.source().refusal_source(),
+            RuntimeError::Storage(khive_storage::StorageError::Timeout { operation })
+                if operation.as_ref() == "search"
+        );
+    if !proven_request_stop {
+        return DispatchFailure::from_dispatch(tool, error);
+    }
+    let (error, boundary) = error.into_parts();
+    let mut payload =
+        khive_runtime::failure_entry_parts(khive_runtime::FailureEntrySource::Runtime {
+            error,
+            boundary,
+        })
+        .into_error();
+    payload["retryable"] = json!(true);
+    DispatchFailure::with_disposition(tool, payload, boundary)
+}
+
+#[cfg(test)]
+#[path = "coordinated_search_cancellation_tests.rs"]
+mod coordinated_search_cancellation_tests;
 
 /// Resolve the coordinator search boundary's extra read-visibility set,
 /// mirroring the normal registry dispatch path's default-case

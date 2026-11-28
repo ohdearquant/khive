@@ -34,12 +34,18 @@ fn run_case(case: &str, raw: Option<&str>) {
     let root = tempfile::Builder::new()
         .prefix("events-wal-")
         .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("events-wal-").tempdir())
         .expect("isolated event fixture");
+    // The child's environment is cleared, so it gets a temporary directory of
+    // its own; without one it falls back to /tmp, which a sandboxed run closes.
+    let temporary = root.path().join("tmp");
+    std::fs::create_dir(&temporary).expect("child temporary directory");
     let mut child = Command::new(std::env::current_exe().expect("test executable"));
     child
         .args(["--exact", "events_wal_child", "--ignored", "--nocapture"])
         .env_clear()
         .env("HOME", root.path().join("home"))
+        .env("TMPDIR", &temporary)
         .env("KHIVE_VOLUME_LOCK_DIR", root.path().join("volume-locks"))
         .env(TIMEOUT_SINK_ENV, root.path().join("writer-timeouts"))
         .env(CHILD_CASE, case)

@@ -12,6 +12,8 @@ use crate::hash::snapshot_id_for_archive;
 
 fn entity(id: u128, name: &str) -> NdjsonEntity {
     NdjsonEntity {
+        keys: Vec::new(),
+        aliases: Vec::new(),
         id: Uuid::from_u128(id),
         kind: "concept".into(),
         entity_type: None,

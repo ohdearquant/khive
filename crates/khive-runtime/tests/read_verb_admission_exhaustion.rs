@@ -355,26 +355,8 @@ impl PackRuntime for AlphaPack {
     }
 }
 
-/// Rogue-pack probe: declares Assertive handlers under the verb names of
-/// several *other* real packs' allowlisted reads (`gtd.tasks`, `gtd.next`,
-/// `comm.inbox`) alongside the known-incidental-write names
-/// (`memory.recall`, `db_diagnostics`, `knowledge.*`), all under a pack name
-/// (`cross-pack-census-probe`) that matches none of
-/// `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`'s `(pack, verb)` entries.
-///
-/// This is exactly the shape of pack that admission-degrade eligibility must
-/// reject: a verb name alone is not a sound key, because any pack registered
-/// through the same `VerbRegistryBuilder` path can declare a handler under a
-/// name that collides with an allowlisted one while actually performing a
-/// durable write of its own. Binding eligibility to `(pack, verb)` — not
-/// `verb` alone — means every handler here must stay fail-closed regardless
-/// of verb name, proven by
-/// `cross_pack_reads_stay_strict_when_pack_identity_does_not_match_allowlist`
-/// below. The handlers are deliberately no-ops: this test exercises the
-/// registry's reviewed name/category/pack classification under a forced
-/// audit refusal, not real domain behavior (which the source census in
-/// `khive-runtime/src/pack.rs`'s `mod tests` audits separately).
-struct CrossPackCensusProbe;
+/// Foreign public declarations must fail before an audit policy can classify them.
+struct CrossPackCensusProbe(&'static [HandlerDef]);
 
 impl Pack for CrossPackCensusProbe {
     const NAME: &'static str = "cross-pack-census-probe";
@@ -452,7 +434,7 @@ impl PackRuntime for CrossPackCensusProbe {
         Self::ENTITY_KINDS
     }
     fn handlers(&self) -> &'static [HandlerDef] {
-        Self::HANDLERS
+        self.0
     }
     async fn dispatch(
         &self,
@@ -514,7 +496,7 @@ impl PackRuntime for PolicyDecisionProbe {
 }
 
 impl Pack for RecordingWritePack {
-    const NAME: &'static str = "recording_write";
+    const NAME: &'static str = "kg";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -1361,11 +1343,13 @@ async fn policy_decision_receipts_stay_strict_under_audit_admission_exhaustion()
         }
     }
     static TOOL_HANDLERS: [HandlerDef; 2] = [handler("tool.check"), handler("tool.describe")];
-    static GIT_HANDLERS: [HandlerDef; 4] = [
+    static GIT_HANDLERS: [HandlerDef; 6] = [
         handler("git.receipts"),
         handler("git.gates"),
         handler("git.status"),
         handler("git.log"),
+        handler("git.pr_state"),
+        handler("git.issue"),
     ];
 
     let store = Arc::new(MemoryEventStore::default());
@@ -1424,6 +1408,8 @@ async fn policy_decision_receipts_stay_strict_under_audit_admission_exhaustion()
         ("git", "git.gates"),
         ("git", "git.status"),
         ("git", "git.log"),
+        ("git", "git.pr_state"),
+        ("git", "git.issue"),
     ] {
         assert_eq!(audit_batch.test_snapshot().pending_rows, 1);
         let error = registry
@@ -1590,121 +1576,23 @@ async fn allowlisted_read_stays_strict_when_pack_is_registered_untrusted() {
     drop(filler);
 }
 
-/// Admission-degrade eligibility is bound to `(pack, verb)`, not `verb`
-/// alone: every handler `CrossPackCensusProbe` declares is `Assertive` and
-/// several of its names (`gtd.tasks`, `gtd.next`, `comm.inbox`) are on
-/// `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`, but the pack that declares
-/// them here (`cross-pack-census-probe`) matches none of the allowlist's
-/// `(pack, verb)` pairs. Every handler must therefore stay fail-closed under
-/// a forced `QueueAdmissionExhausted` outcome — the previously-"safe" names
-/// included, since a bare name match without pack verification is exactly
-/// the gap this binding closes. Before the fix, the first three names in
-/// this test's loop degraded successfully (accepted as `true` by
-/// `admission_degrade_safe`), which is the failure mode the direct probe
-/// assertion below reproduces.
-#[serial]
-#[tokio::test]
-#[serial(config_ledger)]
-async fn cross_pack_reads_stay_strict_when_pack_identity_does_not_match_allowlist() {
-    let store = Arc::new(MemoryEventStore::default());
-    let mut builder = VerbRegistryBuilder::new();
-    // Trusted registration isolates pack-identity mismatch as the sole
-    // cause of ineligibility here — untrusted registration would reject
-    // these handlers too, but for the different reason this test does not
-    // exercise (see `allowlisted_read_stays_strict_when_pack_is_registered_untrusted`).
-    builder.register_trusted(CrossPackCensusProbe);
-    builder.with_event_store(store);
-    builder.with_audit_batch_config(AuditBatchConfig {
-        max_pending_rows: std::num::NonZeroUsize::new(1).unwrap(),
-        ..AuditBatchConfig::default()
-    });
-    let registry = builder.build().expect("registry builds");
-    let audit_batch = registry
-        .audit_batch_handle()
-        .expect("event store configured, so the batch seam is too");
-
-    // Direct white-box check, independent of the audit-pressure mechanics
-    // below: a handler named like an allowlisted verb but declared by the
-    // wrong pack must never read as admission-degrade-safe.
-    for verb in ["gtd.tasks", "gtd.next", "comm.inbox"] {
+#[test]
+fn cross_pack_public_reads_are_refused_before_audit_classification() {
+    for handler in CrossPackCensusProbe::HANDLERS {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register_trusted(CrossPackCensusProbe(std::slice::from_ref(handler)));
+        let error = builder
+            .build()
+            .err()
+            .expect("foreign public owner must fail");
         assert!(
-            !registry.admission_degrade_safe_probe(verb),
-            "{verb} is on ADMISSION_DEGRADE_SAFE_VERBS under a different pack; \
-             cross-pack-census-probe's handler of the same name must not inherit \
-             its degrade-safety"
+            matches!(&error, RuntimeError::InvalidInput(message)
+                if message.contains(CrossPackCensusProbe::NAME)
+                    && message.contains(handler.name)),
+            "expected ownership refusal for {}, got {error:?}",
+            handler.name
         );
     }
-
-    fault_injection::arm_supervisor_sleep_before_spawn();
-    let occupant_batch = audit_batch.clone();
-    let occupant = tokio::spawn(async move {
-        occupant_batch
-            .submit(PreparedAuditRow {
-                event: mk_event("census.occupant"),
-                producer: AuditProducer::ConfigLocked,
-            })
-            .await
-    });
-    wait_until(std::time::Duration::from_secs(5), || {
-        let snap = audit_batch.test_snapshot();
-        snap.pending_rows == 0 && snap.in_flight_generation.is_some()
-    })
-    .await;
-
-    let filler_batch = audit_batch.clone();
-    let filler = tokio::spawn(async move {
-        filler_batch
-            .submit(PreparedAuditRow {
-                event: mk_event("census.filler"),
-                producer: AuditProducer::ConfigLocked,
-            })
-            .await
-    });
-    wait_until(std::time::Duration::from_secs(5), || {
-        audit_batch.test_snapshot().pending_rows == 1
-    })
-    .await;
-
-    let before_refused = audit_admission_refused_obligation_count();
-    let before_unresolved = audit_admission_unresolved_obligation_count();
-    for verb in [
-        "gtd.tasks",
-        "gtd.next",
-        "comm.inbox",
-        "memory.recall",
-        "db_diagnostics",
-        "knowledge.search",
-        "knowledge.suggest",
-        "knowledge.compose",
-    ] {
-        let error = match registry.dispatch(verb, Value::Null).await {
-            Ok(result) => panic!(
-                "{verb} must stay fail-closed under forced audit admission refusal — its \
-                 owning pack here does not match the allowlist's entry for this verb name; \
-                 unexpected result: {result}"
-            ),
-            Err(error) => error,
-        };
-        let message = error.to_string();
-        assert!(
-            message.contains("audit obligation commit failed")
-                && message.contains("QueueAdmissionExhausted"),
-            "{verb} must fail for the saturated audit obligation, got: {message}"
-        );
-    }
-    assert_eq!(
-        audit_admission_refused_obligation_count(),
-        before_refused,
-        "a pack-identity mismatch must never take the counted admission-degrade path"
-    );
-    assert_eq!(
-        audit_admission_unresolved_obligation_count(),
-        before_unresolved,
-        "forced queue refusal must not move the deadline-expiry counter"
-    );
-
-    drop(occupant);
-    drop(filler);
 }
 
 /// khive#2117/khive#2208 + khive#2147/khive#2217 combined: a read dispatch
