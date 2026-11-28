@@ -192,11 +192,52 @@ struct PinInput {
     version: i64,
 }
 
+/// A name in a vocabulary (section 7). Names are held on the node, never in the published
+/// bytes; they are read from the source a version was published from.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KnownAs {
+    vocabulary: String,
+    name: String,
+}
+
+/// A vocabulary is a name with no '/', and not one of section 2's node types (A2.5); a name
+/// in it may hold '/', which its key escapes.
+fn check_known_as(owner: &str, known_as: &[KnownAs]) -> Result<(), Refusal> {
+    for entry in known_as {
+        check_name("vocabulary", &entry.vocabulary)?;
+        if crate::graph::RESERVED_VOCABULARIES
+            .iter()
+            .any(|reserved| fold(reserved) == fold(&entry.vocabulary))
+        {
+            return Err(Refusal::new(
+                "reserved_vocabulary",
+                format!(
+                    "{owner}: vocabulary \"{}\" is named after an operation node type; name the vocabulary otherwise",
+                    entry.vocabulary
+                ),
+            ));
+        }
+        if entry.name.trim().is_empty() || entry.name.trim() != entry.name {
+            return Err(Refusal::new(
+                "invalid_name",
+                format!(
+                    "{owner}: name {:?} in vocabulary \"{}\" must be non-empty with no surrounding space",
+                    entry.name, entry.vocabulary
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StepTypeInput {
     id: String,
     version: i64,
+    #[serde(default)]
+    known_as: Vec<KnownAs>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -216,6 +257,8 @@ struct TypeInput {
     id: String,
     version: i64,
     #[serde(default)]
+    known_as: Vec<KnownAs>,
+    #[serde(default)]
     slots: Vec<SlotInput>,
     #[serde(default)]
     steps: Vec<StepInput>,
@@ -231,6 +274,8 @@ fn yes() -> bool {
 #[serde(deny_unknown_fields)]
 struct SlotInput {
     name: String,
+    #[serde(default)]
+    known_as: Vec<KnownAs>,
     #[serde(default)]
     repeats: bool,
     #[serde(default = "yes")]
@@ -258,6 +303,8 @@ pub(crate) struct SlotRelation {
 #[serde(deny_unknown_fields)]
 struct StepInput {
     name: String,
+    #[serde(default)]
+    known_as: Vec<KnownAs>,
     #[serde(default)]
     act: Option<String>,
     #[serde(default)]
@@ -602,6 +649,7 @@ fn compile_step_type(source: &Value) -> Result<(Stored, StepType), Refusal> {
     check_name("slot", &input.by)?;
     let act = input.act.unwrap_or_else(|| name.clone());
     check_name("act", &act)?;
+    check_known_as(&format!("step type {}", input.id), &input.known_as)?;
     check_values(&input.id, &name, &input.requires, &input.produces)?;
     let step_type = StepType {
         kind: "step_type".to_owned(),
@@ -693,6 +741,19 @@ struct StepSpec {
 }
 
 fn step_spec(type_id: &str, step: StepInput, available: &Available) -> Result<StepSpec, Refusal> {
+    if let Some(pin) = &step.step_type {
+        if !step.known_as.is_empty() {
+            return Err(Refusal::new(
+                "pinned_step_shape",
+                format!(
+                    "{type_id}: step {} pins step type {} v{}, whose names in vocabularies are given where it is published; drop known_as",
+                    step.name, pin.id, pin.version
+                ),
+            ));
+        }
+    } else {
+        check_known_as(&format!("{type_id}: step {}", step.name), &step.known_as)?;
+    }
     let mut spec = StepSpec {
         name: step.name,
         act: step.act,
@@ -1194,6 +1255,7 @@ fn compile_type(source: &Value, available: &Available) -> Result<Compiled, Refus
     let mut input: TypeInput = serde_json::from_value(source.clone())
         .map_err(|e| Refusal::new("invalid_document", e.to_string()))?;
     check_name("operation type id", &input.id)?;
+    check_known_as(&input.id, &input.known_as)?;
     if input.version < 1 {
         return Err(Refusal::new(
             "invalid_version",
@@ -1230,6 +1292,7 @@ fn compile_type(source: &Value, available: &Available) -> Result<Compiled, Refus
     };
     for slot in &input.slots {
         check_name("slot", &slot.name)?;
+        check_known_as(&format!("{}: slot {}", input.id, slot.name), &slot.known_as)?;
         if scope.slots.insert(slot.name.as_str(), slot).is_some() {
             return Err(Refusal::new(
                 "duplicate_slot",

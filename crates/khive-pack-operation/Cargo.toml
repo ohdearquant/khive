@@ -12,6 +12,7 @@ categories.workspace = true
 description = "Operation pack: published operation types, operations recorded against them, and the frontier of what is owed"
 
 [dependencies]
+khive-changeset = { version = "0.23.0", path = "../khive-changeset" }
 khive-types = { version = "0.23.0", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.23.0", path = "../khive-runtime" }
 khive-storage = { version = "0.23.0", path = "../khive-storage" }

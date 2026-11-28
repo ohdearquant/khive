@@ -23,7 +23,7 @@ pub(crate) const STEP_TYPE: &str = "step_type";
 /// A value a step type requires.
 pub(crate) const REQUIREMENT: &str = "requirement";
 /// The forms pack's field, which requirements and products name.
-const FIELD: &str = "field";
+pub(crate) const FIELD: &str = "field";
 
 /// ADR-221's longest key.
 pub(crate) const MAX_KEY_BYTES: usize = 512;
@@ -106,7 +106,10 @@ pub(crate) fn name_key(
     name: &str,
 ) -> String {
     match within {
-        Some(owner) => format!("operation/{vocabulary}/{entity_type}/{owner}/{}", escape(name)),
+        Some(owner) => format!(
+            "operation/{vocabulary}/{entity_type}/{owner}/{}",
+            escape(name)
+        ),
         None => format!("operation/{vocabulary}/{entity_type}/{}", escape(name)),
     }
 }
@@ -123,6 +126,129 @@ pub(crate) fn check_key_length(key: &str, what: &str) -> Result<(), Refusal> {
         ));
     }
     Ok(())
+}
+
+/// Vocabularies a name may not be given in: section 2's node types (A2.5). The forms pack
+/// refuses the same list for a field's names.
+pub(crate) const RESERVED_VOCABULARIES: [&str; 14] = [
+    "operation_type",
+    "variant",
+    "slot",
+    "step_type",
+    "requirement",
+    "rule",
+    "named_condition",
+    "gap_code",
+    "act_type",
+    "status_word",
+    "purpose",
+    "confidence",
+    "vocabulary",
+    "frontier_kind",
+];
+
+/// The property a definition node counts its changing graph writes in (A2.10). Every write
+/// that changes anything raises it by one, so two writes that read the same state conflict on
+/// the node whichever commits first. It is the one node property a fresh build from the
+/// published bytes does not reproduce, and it says nothing about the definition's version.
+pub(crate) const GRAPH_REVISION: &str = "graph_revision";
+
+/// One name in a vocabulary (section 7): the key of the node it names, and the key the name
+/// is held under.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct NameSpec {
+    pub node: String,
+    pub vocabulary: String,
+    pub name: String,
+    pub key: String,
+}
+
+fn push_names(
+    names: &mut Vec<NameSpec>,
+    node: String,
+    entity_type: &str,
+    within: Option<&str>,
+    known_as: Option<&Value>,
+) {
+    for entry in known_as.and_then(Value::as_array).into_iter().flatten() {
+        let (Some(vocabulary), Some(name)) = (
+            entry.get("vocabulary").and_then(Value::as_str),
+            entry.get("name").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        names.push(NameSpec {
+            node: node.clone(),
+            vocabulary: vocabulary.to_owned(),
+            name: name.to_owned(),
+            key: name_key(vocabulary, entity_type, within, name),
+        });
+    }
+}
+
+/// The names a definition's source gives its nodes. Published bytes hold canonical names only
+/// (section 7), so names are read from the source each version was published from: an
+/// operation type names itself, its slots and the steps given inside it; a step type names
+/// itself. A step that pins a published step type names nothing.
+pub(crate) fn names_in_source(kind: &str, source: &Value) -> Vec<NameSpec> {
+    let mut names = Vec::new();
+    let Some(id) = source.get("id").and_then(Value::as_str) else {
+        return names;
+    };
+    let list = |key: &str| {
+        source
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+    };
+    match kind {
+        STEP_TYPE => push_names(
+            &mut names,
+            definition_key(STEP_TYPE, id),
+            STEP_TYPE,
+            None,
+            source.get("known_as"),
+        ),
+        OPERATION_TYPE => {
+            push_names(
+                &mut names,
+                definition_key(OPERATION_TYPE, id),
+                OPERATION_TYPE,
+                None,
+                source.get("known_as"),
+            );
+            for slot in list("slots") {
+                if let Some(name) = slot.get("name").and_then(Value::as_str) {
+                    push_names(
+                        &mut names,
+                        slot_key(id, name),
+                        SLOT,
+                        Some(id),
+                        slot.get("known_as"),
+                    );
+                }
+            }
+            for step in list("steps") {
+                if step.get("step_type").is_some_and(|pin| !pin.is_null()) {
+                    continue;
+                }
+                if let Some(name) = step.get("name").and_then(Value::as_str) {
+                    push_names(
+                        &mut names,
+                        definition_key(STEP_TYPE, &format!("{id}/{name}")),
+                        STEP_TYPE,
+                        Some(id),
+                        step.get("known_as"),
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// One node the shown versions hold.
@@ -197,6 +323,32 @@ impl TypeGraph {
     pub fn extend(&mut self, other: TypeGraph) {
         self.nodes.extend(other.nodes);
         self.edges.extend(other.edges);
+    }
+
+    /// Give each node the names `names` hold for it, as `known_as` in its properties, and
+    /// return those names; a name for a node this graph does not hold is left out.
+    pub fn name_nodes(&mut self, names: &[NameSpec]) -> Vec<NameSpec> {
+        let mut kept: Vec<NameSpec> = names
+            .iter()
+            .filter(|name| self.nodes.contains_key(&name.node))
+            .cloned()
+            .collect();
+        kept.sort();
+        kept.dedup_by(|a, b| a.node == b.node && a.key == b.key);
+        let mut by_node: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+        for name in &kept {
+            by_node
+                .entry(name.node.as_str())
+                .or_default()
+                .push(json!({"vocabulary": name.vocabulary, "name": name.name}));
+        }
+        for (node, known_as) in by_node {
+            if let Some(spec) = self.nodes.get_mut(node) {
+                spec.properties
+                    .insert("known_as".to_owned(), Value::Array(known_as));
+            }
+        }
+        kept
     }
 
     /// A step type node, its requirement nodes, and the fields it requires and produces, from

@@ -20,7 +20,10 @@ fn keys_follow_section_2_and_a2_10() {
         definition_key(STEP_TYPE, "onboard/sign"),
         "operation/step_type/onboard/sign"
     );
-    assert_eq!(slot_key("onboard", "holder"), "operation/slot/onboard/holder");
+    assert_eq!(
+        slot_key("onboard", "holder"),
+        "operation/slot/onboard/holder"
+    );
     assert_eq!(
         requirement_key("verify", Some("holder"), "legal name"),
         "operation/requirement/verify/holder/legal name"
@@ -82,7 +85,9 @@ fn a_step_type_shows_its_requirements_and_one_produces_edge_per_field() {
     assert!(graph
         .nodes
         .contains_key("operation/requirement/verify/holder/legal name"));
-    assert!(graph.nodes.contains_key("operation/requirement/verify//date"));
+    assert!(graph
+        .nodes
+        .contains_key("operation/requirement/verify//date"));
     assert_eq!(graph.nodes.len(), 3);
 
     let produces = |field: &str| {
@@ -173,9 +178,11 @@ fn the_declared_edge_rules_cover_every_edge_the_graph_builds() {
         let target = type_of(&edge.target);
         let relation = relation_of(edge.relation);
         assert!(
-            OPERATION_EDGE_RULES.iter().any(|rule| rule.relation == relation
-                && rule.source == typed(source)
-                && rule.target == typed(target)),
+            OPERATION_EDGE_RULES
+                .iter()
+                .any(|rule| rule.relation == relation
+                    && rule.source == typed(source)
+                    && rule.target == typed(target)),
             "no rule for {source} {} {target}",
             edge.relation
         );
