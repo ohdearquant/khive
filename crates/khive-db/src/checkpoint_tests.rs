@@ -469,6 +469,8 @@ fn wal_read_mark_slots_keep_the_fourth_frame_for_a_later_reader() {
     assert!(observation.log_frames > pinned_frame);
 }
 
+const DIAGNOSTICS_CHECKPOINT_WAIT: Duration = Duration::from_secs(30);
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial(checkpoint_skip_metrics, khive_walpin_census_budget_env)]
 async fn db_diagnostics_reports_a_reader_pin_after_one_second_and_clears_after_backfill() {
@@ -501,13 +503,14 @@ async fn db_diagnostics_reports_a_reader_pin_after_one_second_and_clears_after_b
         shutdown_rx,
         true,
     ));
-    tokio::time::timeout(Duration::from_secs(4), async {
-        while routine_wal_observation(&pool).is_none() {
-            tokio::task::yield_now().await;
-        }
+    let sampled = wait_for(DIAGNOSTICS_CHECKPOINT_WAIT, || {
+        routine_wal_observation(&pool).is_some()
     })
-    .await
-    .expect("the checkpoint task must record its initial sample");
+    .await;
+    assert!(
+        sampled,
+        "the checkpoint task must record its initial sample"
+    );
 
     // A reader opened immediately after a full checkpoint may use WAL
     // slot 0 and cannot pin the next frame. Give it an uncheckpointed
@@ -573,22 +576,19 @@ async fn db_diagnostics_reports_a_reader_pin_after_one_second_and_clears_after_b
         .expect("matching run accompanies the reported frame");
     assert_eq!(first_run.frame, aged_probe.checkpointed_frames);
 
-    reader.release();
     let previous_tick = routine_wal_observation(&pool)
         .expect("the checkpoint task has an initial sample")
         .observed_at_unix_ms;
-    tokio::time::timeout(Duration::from_secs(4), async {
-        loop {
-            if routine_wal_observation(&pool)
-                .is_some_and(|sample| sample.observed_at_unix_ms > previous_tick)
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("a later checkpoint tick must fully backfill after the reader ends");
+    reader.release();
+    assert!(
+        wait_for(DIAGNOSTICS_CHECKPOINT_WAIT, || {
+            routine_wal_observation(&pool).is_some_and(|sample| {
+                sample.observed_at_unix_ms > previous_tick && sample.pending_frames == 0
+            })
+        })
+        .await,
+        "a later checkpoint tick must fully backfill after the reader ends"
+    );
     let drained = crate::diagnostics::collect(
         &pool,
         crate::diagnostics::BuildIdentity::from_env("test", None),
@@ -660,7 +660,7 @@ async fn db_diagnostics_reports_a_reader_pin_after_one_second_and_clears_after_b
     second_reader.execute_batch("ROLLBACK").unwrap();
 
     shutdown_tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), task)
+    tokio::time::timeout(DIAGNOSTICS_CHECKPOINT_WAIT, task)
         .await
         .expect("checkpoint task shutdown must finish")
         .expect("checkpoint task must not panic");
@@ -4890,9 +4890,8 @@ async fn session_sweep_task_exits_on_shutdown_signal() {
         .expect("session sweep task panicked");
 }
 
-/// Bounded condition poll for filesystem effects of the async sweep
-/// task — fixed sleeps flake under parallel test load because sidecar
-/// writes fsync.
+/// Poll for a background effect within the test deadline. Check once more
+/// at expiry so a delayed wake can still observe a completed effect.
 pub(super) async fn wait_for(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < deadline {
