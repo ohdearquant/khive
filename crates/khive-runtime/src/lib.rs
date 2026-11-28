@@ -56,6 +56,7 @@ mod error_projection;
 mod event_actor_scope;
 mod event_cursor_walk;
 mod event_page;
+mod event_plane_read;
 mod event_store_guard;
 pub mod events_split;
 mod fence_identity;
@@ -67,6 +68,10 @@ mod index_repair;
 #[cfg(feature = "native-rerank")]
 pub mod native_reranker;
 pub use index_repair::IndexRepairReport;
+pub mod channel_section;
+#[cfg(test)]
+mod channel_section_tests;
+pub mod channel_send;
 pub mod graph_lint;
 pub mod input_schema;
 pub mod keyed_memory;
@@ -76,9 +81,6 @@ pub mod keyed_message;
 mod kg_read;
 mod live_until;
 mod mailbox_view;
-pub mod node_config;
-#[cfg(test)]
-mod node_config_tests;
 mod note_create;
 mod note_index;
 mod note_read;
@@ -152,15 +154,19 @@ pub use blob::{
     DEFAULT_BLOB_HYDRATION_BYTES,
 };
 pub use build_info::{BuildInfo, BUILD_INFO, BUILD_VERSION};
-pub use config::{ann_fresh_tail_enabled_from_env, process_ref_from_env, WalCeilingSource};
+pub use config::{
+    ann_fresh_tail_enabled_from_env, client_cwd_from_process, process_ref_from_env,
+    WalCeilingSource,
+};
 pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};
 pub use curation::{
     entity_embedding_text, entity_fts_document, entity_merge_guard_compared_values,
     entity_merge_guard_error, entity_merge_guard_refusal_message, note_embedding_text,
     note_fts_document, validate_entity_merge_floor, ContentMergeStrategy, EdgeListFilter,
     EdgePatch, EntityDedupMergePolicy, EntityMergeGuard, EntityPatch, GuardedNoteMerge,
-    MergeAssertion, MergeEdgeConflictPreimage, MergeEdgePreimage, MergeSummary,
-    MergeTxBudgetReport, MergeTxLimits, NoteMergeGuard, NotePatch, NoteUpdatePolicy,
+    MergeAssertion, MergeEdgeConflictPreimage, MergeEdgePreimage, MergeKey, MergeKeyConflict,
+    MergeKeyMove, MergeSummary, MergeTxBudgetReport, MergeTxLimits, NoteMergeGuard, NotePatch,
+    NoteUpdatePolicy,
 };
 #[cfg(unix)]
 pub use daemon::{acquire_recovery_lock, pid_path, run_daemon, socket_path, DaemonDispatch};
@@ -175,10 +181,15 @@ pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderP
 pub use embedding::{EmbeddingModelRecord, EmbeddingModelStatus};
 pub use embedding_reranker::{EmbeddingCosineReranker, EmbeddingRerankHit};
 pub use engine_config::{
-    config_from_env, resolve_wal_ceiling, BackendConfig, BackendKind, BlobConfig,
-    BrainSectionConfig, CodeMapConfig, ConfigError, EngineConfig, GateSectionConfig,
-    GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig, PackConfig, ResolvedWalCeiling,
-    StorageSectionConfig,
+    config_from_env, read_computer_key, resolve_wal_ceiling, BackendConfig, BackendKind,
+    BlobConfig, BrainSectionConfig, CodeIngestSectionConfig, CodeMapConfig, ComputerEndpoint,
+    ComputerKey, ComputerKeyError, ComputerKeyRefusal, ComputerSectionConfig, ConfigError,
+    EngineConfig, GateSectionConfig, GitDigestSectionConfig, GitRepoAccess, GitWriteEntryConfig,
+    GitWriteSectionConfig, KhiveConfig, KnowledgeSectionConfig, PackConfig, ResolvedWalCeiling,
+    ShareSectionConfig, ShareTargetConfig, StorageSectionConfig, COMMAND_RUNNING_PACKS,
+    COMPUTER_ROUTABLE_PACKS, DEFAULT_COMPUTER_CALL_TIMEOUT_S, DEFAULT_SHARE_FILES,
+    DEFAULT_SHARE_TOTAL_BYTES, MAX_COMPUTER_CALL_TIMEOUT_S, MAX_COMPUTER_KEY_BYTES,
+    MAX_SHARE_FILES, MAX_SHARE_FILE_BYTES, MAX_SHARE_TOTAL_BYTES,
 };
 pub use error::{
     fts_text_leg_or_err, AdmissionFailureContext, AuditObligationFailure, AuditObligationReason,
@@ -199,6 +210,9 @@ pub use event_cursor_walk::{visit_events_cursor_walk, EventCursorWalkError};
 pub use event_page::{
     page_budget_exceeded_error, row_exceeds_budget_error, EventReadPageRequest, EventReadPageResult,
 };
+#[cfg(any(test, feature = "test-internals"))]
+#[doc(hidden)]
+pub use event_plane_read::test_support_exports as event_plane_read_test_support;
 pub use event_store_guard::EventAttribution;
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
@@ -234,9 +248,13 @@ pub use operations::{
 };
 pub use operations::{
     base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,
-    hex_prefix_to_uuid_pattern, merge_entry_metadata, uuid_prefix_bounds, ConditionalInsertStage,
-    EdgeEndpointKind, EntityCreateSpec, LinkSpec, NoteCreateSpec, NoteSearchHit, NoteSearchOutcome,
-    PostCommitDegradation, PrefixScope, QueryResult, Resolved,
+    entity_carries_create_payload, entity_key_add_plans, entity_key_conflict,
+    hex_prefix_to_uuid_pattern, keyed_replay_assertion_plan, merge_entry_metadata,
+    same_create_payload, uuid_prefix_bounds, validate_entity_alias, ConditionalInsertStage,
+    EdgeEndpointKind, EntityAliasChange, EntityAliasReport, EntityCreateSpec, EntityKeyAdd,
+    KeyedEntityCreate, KeyedEntityReload, LinkSpec, NoteCreateSpec, NoteSearchHit,
+    NoteSearchOutcome, PendingEntityId, PostCommitDegradation, PrefixScope, QueryResult, Resolved,
+    ENTITY_KEY_ADD_HELD_LABEL, ENTITY_KEY_ADD_LIVE_LABEL,
 };
 pub use pack::{
     resolve_explicit_namespace, ChannelIngestCapability, DispatchHook, HandlerDef,
@@ -257,6 +275,7 @@ pub use presentation::{
 };
 pub use reference_resolution::{
     resolve_reference, resolve_reference_with_entity_type, ReferenceCandidate, ReferenceResolution,
+    EXACT_NAME_CONFIDENCE,
 };
 pub use reference_ring::{ReferenceRing, RingEntry};
 pub use registry::{ObjectiveRegistry, RegisteredObjective};

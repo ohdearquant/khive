@@ -271,3 +271,234 @@ async fn test_single_result_passes_through() {
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].0, 42u32);
 }
+
+// This fixture simulates a scorer reporting hook use. Its one-element loop
+// lets the reranker test observe hook forwarding and the scorer's evidence.
+#[derive(Default)]
+struct HookAwareScorer {
+    calls: std::sync::atomic::AtomicUsize,
+    inputs: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+}
+
+impl CrossEncoderScorer for HookAwareScorer {
+    fn score_batch(&self, query: &str, documents: &[&str]) -> Vec<f32> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inputs.lock().unwrap().push((
+            query.to_string(),
+            documents
+                .iter()
+                .map(|document| (*document).to_string())
+                .collect(),
+        ));
+        vec![0.25; documents.len()]
+    }
+
+    fn score_batch_with_hook(
+        &self,
+        query: &str,
+        documents: &[&str],
+        hook: Option<&dyn LoraHook>,
+    ) -> Result<CrossEncoderScores> {
+        let mut scores = self.score_batch(query, documents);
+        let observer = hook.map(ObservedHook::new);
+        if let Some(observer) = &observer {
+            for score in &mut scores {
+                if observer.is_active(0, "ffn_output") {
+                    observer.apply(0, "ffn_output", &[1.0], std::slice::from_mut(score));
+                }
+            }
+        }
+        Ok(CrossEncoderScores {
+            scores,
+            hook_applied: observer
+                .as_ref()
+                .is_some_and(|observer| observer.applied.load(Ordering::Relaxed)),
+        })
+    }
+}
+
+struct BorrowedHook<'a> {
+    delta: &'a f32,
+    calls: &'a std::sync::atomic::AtomicUsize,
+    target: &'a str,
+}
+
+impl LoraHook for BorrowedHook<'_> {
+    fn apply(&self, _layer_idx: usize, _module: &str, _x: &[f32], output: &mut [f32]) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        for value in output {
+            *value += self.delta;
+        }
+    }
+
+    fn is_active(&self, _layer_idx: usize, module: &str) -> bool {
+        module == self.target
+    }
+}
+
+#[tokio::test]
+async fn per_call_hook_reaches_scorer_and_is_not_retained() {
+    let scorer = Arc::new(HookAwareScorer::default());
+    let reranker = NativeCrossEncoderReranker::new(
+        scorer.clone(),
+        Arc::new(FakeResolver {
+            documents: vec![Some("a".into()), None, Some("b".into())],
+        }),
+    );
+    let baseline = reranker
+        .rerank("q", candidates(&[1, 2, 3]), 2)
+        .await
+        .unwrap();
+    let delta = 0.5;
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let hook = BorrowedHook {
+        delta: &delta,
+        calls: &calls,
+        target: "ffn_output",
+    };
+    let adapted = reranker
+        .rerank_with_hook("q", candidates(&[1, 2, 3]), 1, Some(&hook))
+        .await
+        .unwrap();
+    assert!(adapted.hook_applied, "per-call hook must reach the scorer");
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        adapted.results,
+        vec![(1, DeterministicScore::from_f64(0.75))]
+    );
+    let subsequent = reranker
+        .rerank_with_hook("q", candidates(&[1, 2, 3]), 2, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        subsequent.results, baseline,
+        "hook must not survive its call"
+    );
+    assert!(!subsequent.hook_applied);
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(scorer.calls.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        *scorer.inputs.lock().unwrap(),
+        vec![("q".to_string(), vec!["a".to_string(), "b".to_string()]); 3],
+        "per-call scoring must preserve the literal query and retained document order"
+    );
+}
+
+#[tokio::test]
+async fn unsupported_hook_is_not_silently_ignored() {
+    let scorer = Arc::new(RecordingScorer::default());
+    let reranker = NativeCrossEncoderReranker::new(
+        scorer.clone(),
+        Arc::new(FakeResolver {
+            documents: vec![Some("low".into())],
+        }),
+    );
+    let delta = 0.5;
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let active = BorrowedHook {
+        delta: &delta,
+        calls: &calls,
+        target: "ffn_output",
+    };
+    for hook in [&NoopLoraHook as &dyn LoraHook, &active] {
+        let result = reranker
+            .rerank_with_hook("q", candidates(&[1]), 1, Some(hook))
+            .await;
+        assert!(
+            matches!(result, Err(RetrievalError::Rerank(ref message))
+                if message == "cross-encoder scorer does not support per-call hooks"),
+            "opaque scorer must refuse every supplied hook, including Noop"
+        );
+    }
+    assert!(scorer.calls.lock().unwrap().is_empty());
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    let none = reranker
+        .rerank_with_hook("q", candidates(&[1]), 1, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        none.results,
+        vec![(1, DeterministicScore::from_f64(0.1_f32 as f64))]
+    );
+    assert!(!none.hook_applied);
+    assert_eq!(scorer.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn skipped_batches_do_not_score_or_claim_hook_application() {
+    let scorer = Arc::new(RecordingScorer::default());
+    let reranker = NativeCrossEncoderReranker::new(
+        scorer.clone(),
+        Arc::new(FakeResolver {
+            documents: vec![None],
+        }),
+    );
+    for (input, limit) in [(candidates(&[1]), 0), (vec![], 1), (candidates(&[1]), 1)] {
+        let result = reranker
+            .rerank_with_hook("q", input, limit, Some(&NoopLoraHook))
+            .await
+            .unwrap();
+        assert!(result.results.is_empty());
+        assert!(!result.hook_applied);
+    }
+    assert!(scorer.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn observer_preserves_validation_activity_and_actual_apply() {
+    struct RefusingHook {
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+    impl LoraHook for RefusingHook {
+        fn apply(&self, _layer: usize, _module: &str, _x: &[f32], output: &mut [f32]) {
+            self.calls.lock().unwrap().push("apply");
+            output[0] += 0.5;
+        }
+        fn validate_geometry(
+            &self,
+            _geometry: &dyn LoraTargetGeometry,
+        ) -> std::result::Result<(), String> {
+            self.calls.lock().unwrap().push("geometry");
+            Err("geometry refusal".into())
+        }
+        fn validate_against_bert(
+            &self,
+            layers: usize,
+            hidden: usize,
+            intermediate: usize,
+        ) -> std::result::Result<(), String> {
+            assert_eq!((layers, hidden, intermediate), (1, 2, 4));
+            self.calls.lock().unwrap().push("legacy");
+            Err("legacy refusal".into())
+        }
+        fn is_active(&self, layer: usize, module: &str) -> bool {
+            assert_eq!((layer, module), (0, "ffn_output"));
+            self.calls.lock().unwrap().push("active");
+            true
+        }
+    }
+    let hook = RefusingHook {
+        calls: std::sync::Mutex::new(Vec::new()),
+    };
+    let observer = ObservedHook::new(&hook);
+    assert_eq!(
+        observer.validate_geometry(&BertLoraGeometry::new(1, 2, 4)),
+        Err("geometry refusal".into())
+    );
+    #[allow(deprecated)]
+    let legacy = observer.validate_against_bert(1, 2, 4);
+    assert_eq!(legacy, Err("legacy refusal".into()));
+    assert!(observer.is_active(0, "ffn_output"));
+    assert!(
+        !observer.applied.load(Ordering::Relaxed),
+        "validation and activity must not count as apply"
+    );
+    let mut output = [0.25];
+    observer.apply(0, "ffn_output", &[1.0], &mut output);
+    assert_eq!(output, [0.75]);
+    assert!(observer.applied.load(Ordering::Relaxed));
+    assert_eq!(
+        *hook.calls.lock().unwrap(),
+        vec!["geometry", "legacy", "active", "apply"]
+    );
+}

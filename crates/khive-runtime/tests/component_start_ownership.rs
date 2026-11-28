@@ -53,6 +53,7 @@ fn failed_establishment_never_starts_components_and_always_cancels() {
         let dir = tempfile::Builder::new()
             .prefix("kh-start-")
             .tempdir_in("/tmp")
+            .or_else(|_| tempfile::Builder::new().prefix("kh-start-").tempdir())
             .unwrap();
         let child_home = dir.path().join("home");
         std::fs::create_dir(&child_home).expect("empty component child HOME");

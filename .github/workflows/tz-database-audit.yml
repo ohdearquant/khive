@@ -48,6 +48,12 @@ on:
 # by a repository setting this file cannot see and does not track. This job
 # checks out, builds and runs one test; read access to the contents is the
 # whole of what it needs.
+# A new push to a pull request cancels that pull request's run in progress. Other events keep
+# one group per run, so pushes and manual runs are never cancelled.
+concurrency:
+  group: tz-database-audit-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -61,7 +67,12 @@ jobs:
     # run that merges them runs it on the merged tree.
     if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'codex/') && github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The sweep runs with --release, and a lockfile change invalidates the build cache, so the
+    # usual run pays a cold optimized build of khive-runtime and its dependencies. Over three days
+    # most runs took 10m37s to 12m31s, two succeeded at 14m52s, and four attempts were cancelled
+    # at the former 15-minute limit, each green on re-run. 30 leaves room for a slower runner
+    # without letting a hung job hold one for long.
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: crates

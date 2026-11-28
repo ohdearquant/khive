@@ -50,9 +50,8 @@ only, so the caller should fetch the binary and run the full classification. The
 workflow runs it first, so a pull request the path rules send to the full suite never downloads one.
 
 A changed path resolves to the crate whose manifest directory is its longest prefix (ADR-205 D2). A
-Markdown file resolves to no crate and is admitted under the documentation-lane rule of
-scripts/ci-docs-only.sh: a Markdown file that a non-Markdown file names, that a symlink's target
-names, or whose verb and pack counts the smoke tests check, puts the run on the full suite.
+Markdown file resolves to no crate and is admitted only when scripts/ci-docs-only.sh, run on the
+changed Markdown paths alone, admits them to the documentation lane; its rule is the one rule for both.
 
 A crate can compile or read another crate's file by naming it: `#[path = "..."]` on a module (also
 inside `cfg_attr`, at any nesting depth), or `include!`, `include_str!` or `include_bytes!`. No dependency edge records that,
@@ -179,38 +178,21 @@ def path_rule(path):
     raise Full(f"outside crate source: {path}")
 
 
-def symlink_targets(head):
-    targets = []
-    for line in git("ls-tree", "-r", "--format=%(objectmode) %(objectname)", head).splitlines():
-        mode, _, oid = line.partition(" ")
-        if mode == "120000":
-            targets.append(git("cat-file", "blob", oid))
-    return "\n".join(targets)
-
-
-def check_markdown(path, head, targets):
-    """Apply the documentation-lane rule of scripts/ci-docs-only.sh to one Markdown path."""
-    name = path.rsplit("/", 1)[-1]
-    grep = subprocess.run(
-        ["git", "grep", "-q", "-F", "-e", name, head, "--", ":(exclude)*.md"],
-        cwd=REPO, capture_output=True, check=False,
-    )
-    if grep.returncode == 0:
-        raise Full(f"{path} is named by a non-Markdown file")
-    if grep.returncode != 1:
-        raise Full(f"git grep for {name} failed (rc {grep.returncode})")
-    if name in targets:
-        raise Full(f"{path} is named by a symlink's target")
-    scanner = REPO / "tests" / "documented_verb_counts.py"
-    scan = subprocess.run(
-        [sys.executable, str(scanner), "--published-markdown", path],
-        cwd=REPO, stdin=subprocess.DEVNULL, capture_output=True, check=False,
-    )
-    if scan.returncode == 0:
-        raise Full(f"{path} carries verb or pack counts the smoke tests check against the live registry")
-    if scan.returncode != 1:
-        raise Full(f"count scanner failed for {path} (rc {scan.returncode})")
-    log(f"documentation only: {path}")
+def check_markdown(base, head, paths):
+    """Admit Markdown paths by the documentation-lane rule itself: scripts/ci-docs-only.sh judges exactly these."""
+    try:
+        run = subprocess.run(
+            ["bash", str(REPO / "scripts" / "ci-docs-only.sh"), base, head, *paths],
+            cwd=REPO, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+        )
+    except OSError as error:
+        raise Full(f"cannot run the documentation-lane rule: {error}") from error
+    for line in run.stderr.splitlines():
+        log(line)
+    if run.returncode != 0 or run.stdout != "true\n":
+        reasons = [line for line in run.stderr.splitlines() if line.startswith("full suite: ")]
+        raise Full(reasons[-1][len("full suite: "):] if reasons
+                   else f"documentation-lane rule printed {run.stdout!r} (rc {run.returncode})")
 
 
 # A coarse per-line prefilter: any file with a line naming an include macro or a path attribute is read whole, and
@@ -1089,9 +1071,7 @@ def classify(base, head, binary, paths_only=False):
     markdown, crate_paths = sorted_paths["markdown"], sorted_paths["crate"]
     manifest_paths, lockfile = sorted_paths["crate-manifest"], bool(sorted_paths["lockfile"])
     if markdown:
-        targets = symlink_targets(head)
-        for path in markdown:
-            check_markdown(path, head, targets)
+        check_markdown(base, head, markdown)
     if not crate_paths and not manifest_paths and not lockfile:
         raise Full("no crate source changed")
     # git show returns a link's target text while cargo reads the file the link names, so a manifest or lockfile

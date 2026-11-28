@@ -1,0 +1,25 @@
+{
+  "operation_types": [
+    {
+      "id": "joint-filing",
+      "version": 1,
+      "slots": [
+        {"name": "applicant", "repeats": true},
+        {"name": "item", "repeats": true, "required": false},
+        {"name": "office"},
+        {"name": "preparer"}
+      ],
+      "steps": [
+        {"name": "request", "by": "preparer"},
+        {"name": "sign", "by": "applicant", "after": ["request"]},
+        {
+          "name": "submit",
+          "by": "preparer",
+          "after": ["sign"],
+          "unless": [[{"fact": {"field": "channel", "equals": "online"}}]]
+        },
+        {"name": "issue", "by": "office", "after": ["submit"], "outcome": true}
+      ]
+    }
+  ]
+}

@@ -626,6 +626,87 @@ async fn test_apply_batch_duplicate_keys_in_one_call_are_refused() {
 }
 
 #[tokio::test]
+async fn test_apply_batch_creates_need_distinct_parts_and_retry_dedupes() {
+    async fn assert_no_edges(rt: &KhiveRuntime) {
+        let token = rt
+            .authorize(Namespace::parse("alice").expect("namespace parses"))
+            .expect("authorize namespace");
+        let page = rt
+            .graph(&token)
+            .expect("graph store")
+            .query_edges(
+                EdgeFilter::default(),
+                vec![],
+                PageRequest {
+                    limit: 1000,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query all edge relations");
+        assert!(page.items.is_empty(), "create rows must not write edges");
+    }
+
+    let rt = make_runtime();
+    let alice = make_registry_with_actor(rt.clone(), "alice");
+    let notes_before = ab_note_count(&rt, "alice").await;
+    let batch = "create-parts";
+    let rows = vec![
+        json!({
+            "action": "create",
+            "content": "sandpiper spring survey",
+            "properties": {"who": "batch-tester"},
+        }),
+        json!({
+            "action": "create",
+            "content": "sandpiper autumn survey",
+            "properties": {"who": "batch-tester"},
+        }),
+    ];
+    for dry_run in [true, false] {
+        let result = ab_apply(&alice, batch, rows.clone(), dry_run).await;
+        assert_eq!(result["entries"].as_array().unwrap().len(), 2);
+        for index in 0..2 {
+            assert_eq!(result["entries"][index]["part"], 1);
+            assert_eq!(result["entries"][index]["outcome"], "refused");
+            assert_eq!(result["entries"][index]["reason"]["code"], "duplicate-key");
+        }
+        assert_eq!(result["counts"]["refused"], 2);
+        assert_eq!(result["counts"]["written"], 0);
+        assert_eq!(ab_note_count(&rt, "alice").await, notes_before);
+        assert_no_edges(&rt).await;
+    }
+
+    let mut distinct_parts = rows;
+    distinct_parts[0]["part"] = json!(1);
+    distinct_parts[1]["part"] = json!(2);
+    let written = ab_apply(&alice, batch, distinct_parts.clone(), false).await;
+    assert_eq!(written["counts"]["written"], 2);
+    assert_eq!(written["counts"]["refused"], 0);
+    let first = ab_uuid(&written["entries"][0]["new_id"]);
+    let second = ab_uuid(&written["entries"][1]["new_id"]);
+    assert_ne!(first, second);
+    for index in 0..2 {
+        assert_eq!(written["entries"][index]["outcome"], "written");
+    }
+    assert_eq!(ab_note_count(&rt, "alice").await, notes_before + 2);
+    assert_no_edges(&rt).await;
+
+    let retry = ab_apply(&alice, batch, distinct_parts, false).await;
+    assert_eq!(retry["counts"]["deduped"], 2);
+    assert_eq!(retry["counts"]["written"], 0);
+    for index in 0..2 {
+        assert_eq!(retry["entries"][index]["outcome"], "deduped");
+        assert_eq!(
+            retry["entries"][index]["new_id"],
+            written["entries"][index]["new_id"]
+        );
+    }
+    assert_eq!(ab_note_count(&rt, "alice").await, notes_before + 2);
+    assert_no_edges(&rt).await;
+}
+
+#[tokio::test]
 async fn test_apply_batch_skip_and_delete_candidate_write_nothing() {
     let rt = make_runtime();
     let alice = make_registry_with_actor(rt.clone(), "alice");
@@ -911,6 +992,70 @@ async fn test_apply_batch_admits_an_old_row_in_an_owned_namespace() {
         archive_notes_before,
         "a dry run changes no row in the owned namespace"
     );
+}
+
+#[tokio::test]
+async fn test_apply_batch_writes_owned_namespace_successor_and_dedupes() {
+    let rt = make_runtime();
+    let archive = make_registry_with_actor(rt.clone(), "alice:archive");
+    let old = ab_seed(&archive, "osprey migration tally archived original").await;
+    let alice = ab_registry_owning(rt.clone(), "alice", &["alice:archive"]);
+    let old_before = alice
+        .dispatch("get", json!({"id": old.to_string()}))
+        .await
+        .expect("get archived row");
+    let notes_before = ab_note_count(&rt, "alice").await;
+    let archive_notes_before = ab_note_count(&rt, "alice:archive").await;
+    let rows = vec![ab_supersede(old, "osprey migration tally revised")];
+
+    let result = ab_apply(&alice, "owned-write", rows.clone(), false).await;
+    assert_eq!(result["entries"][0]["outcome"], "written");
+    assert_eq!(result["entries"][0]["old_namespace"], "alice:archive");
+    assert_eq!(result["counts"]["written"], 1);
+    let new_id = ab_uuid(&result["entries"][0]["new_id"]);
+    assert_ne!(new_id, old);
+    let new_row = alice
+        .dispatch("get", json!({"id": new_id.to_string()}))
+        .await
+        .expect("get successor row");
+    assert_eq!(new_row["namespace"], "alice");
+    assert_eq!(new_row["content"], "osprey migration tally revised");
+    assert_eq!(ab_note_count(&rt, "alice").await, notes_before + 1);
+    assert_eq!(
+        ab_note_count(&rt, "alice:archive").await,
+        archive_notes_before,
+        "the successor is not written into the owned namespace"
+    );
+    let edges = ab_source_namespace_edges(&rt, "alice", vec![old], EdgeRelation::Supersedes).await;
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].source_id, new_id);
+    assert_eq!(edges[0].target_id, old);
+    let edge_id = Uuid::from(edges[0].id);
+
+    let replay = ab_apply(&alice, "owned-write", rows, false).await;
+    assert_eq!(replay["entries"][0]["outcome"], "deduped");
+    assert_eq!(ab_uuid(&replay["entries"][0]["new_id"]), new_id);
+    assert_eq!(replay["counts"]["deduped"], 1);
+    assert_eq!(replay["counts"]["written"], 0);
+    assert_eq!(ab_note_count(&rt, "alice").await, notes_before + 1);
+    assert_eq!(
+        ab_note_count(&rt, "alice:archive").await,
+        archive_notes_before
+    );
+    let replay_edges =
+        ab_source_namespace_edges(&rt, "alice", vec![old], EdgeRelation::Supersedes).await;
+    assert_eq!(replay_edges.len(), 1);
+    assert_eq!(Uuid::from(replay_edges[0].id), edge_id);
+    let old_after = alice
+        .dispatch("get", json!({"id": old.to_string()}))
+        .await
+        .expect("get archived row after write and replay");
+    assert_eq!(old_after, old_before, "the archived row remains unchanged");
+    let replay_row = alice
+        .dispatch("get", json!({"id": new_id.to_string()}))
+        .await
+        .expect("get successor after replay");
+    assert_eq!(replay_row, new_row, "replay leaves the successor unchanged");
 }
 
 #[tokio::test]

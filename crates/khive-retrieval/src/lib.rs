@@ -70,9 +70,7 @@ pub use hybrid::{
 pub use khive_hnsw::{HnswCheckpoint, HnswCheckpointStore};
 // The native model and its inference dependency are opt-in (ADR-042).
 #[cfg(feature = "native-rerank")]
-pub use hybrid::{
-    CrossEncoderScorer, NativeCrossEncoderModel, NativeCrossEncoderReranker, RerankDocumentResolver,
-};
+pub use hybrid::native_rerank::*;
 pub use materialization::{
     materialize_ranked_prefix, DropCounts, DropDiagnostic, DropReason, MaterializationDecision,
     MaterializationError, MaterializationLimitError, MaterializationLimits, MaterializedItem,
@@ -87,7 +85,9 @@ pub use persist::{
     ShadowValidationResult,
 };
 pub use policy::{filter_by_policy, filter_by_predicate, ClearanceLevel, SearchPolicy};
-pub use query_ir::{FilterPredicate, FuseStrategy, QueryNode, RerankMethod};
+pub use query_ir::{
+    FilterPredicate, FuseStrategy, QueryNode, RerankMethod, HYBRID_CANDIDATE_MULTIPLIER,
+};
 pub use query_variants::{
     merge_query_variants, normalize_query_variants, AdmittedVariantHit, QueryVariant,
     QueryVariantLimits, QueryVariantOrigin, QueryVariantRejection, QueryVariants,

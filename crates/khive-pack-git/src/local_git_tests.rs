@@ -314,12 +314,14 @@ async fn manifest_roundtrip_preserves_git_symlink_modes_and_target_bytes() {
 }
 
 #[test]
-fn listing_preserves_delimiters_and_refuses_unsupported_modes() {
+fn listing_preserves_delimiters_keeps_links_and_refuses_unsupported_modes() {
     let oid = "1234567890123456789012345678901234567890";
     let entries = parse_listing(format!("100755 blob {oid}\ta\tb\nc\0").as_bytes()).unwrap();
     assert_eq!(entries[0].path, "a\tb\nc");
     assert_eq!(entries[0].mode, 755);
-    for metadata in ["120000 blob", "160000 commit"] {
+    let links = parse_listing(format!("120000 blob {oid}\tlink\0").as_bytes()).unwrap();
+    assert_eq!(links[0].mode, 120000);
+    for metadata in ["160000 commit", "120000 tree", "120000 commit"] {
         assert_eq!(
             parse_listing(format!("{metadata} {oid}\tx\0").as_bytes())
                 .unwrap_err()

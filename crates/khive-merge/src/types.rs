@@ -63,6 +63,13 @@ pub enum MergeConflict {
         entity_id: Uuid,
         differing_fields: Vec<String>,
     },
+    /// The merged entity set would place one key, under one kind, on more
+    /// than one entity (ADR-221 section 4). `entities` is sorted.
+    KeyConflict {
+        kind: String,
+        key: String,
+        entities: Vec<Uuid>,
+    },
     /// One branch modified an edge, the other deleted it.
     EdgeModifyDelete {
         source_id: Uuid,
@@ -154,6 +161,10 @@ pub enum MergeError {
     /// An archive repeats an entity UUID.
     #[error("duplicate entity IDs in archive: {entity_id}")]
     DuplicateEntityId { entity_id: Uuid },
+
+    /// An archive places one key, under one kind, on more than one entity.
+    #[error("duplicate entity key in archive: kind={kind}, key={key}")]
+    DuplicateEntityKey { kind: String, key: String },
 
     /// An archive repeats a semantic `(source, target, relation)` edge key.
     #[error("duplicate edge key in archive: ({edge_source}, {edge_target}, {edge_relation})")]

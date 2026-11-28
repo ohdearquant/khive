@@ -59,7 +59,7 @@ fn entity(id: &str) -> Entity {
 fn delete(substrate: &str) -> Op {
     let id: Id128 = A.parse().unwrap();
     let preimage = match substrate {
-        "entity" => DeletePreimage::Entity(Box::new(entity(A))),
+        "entity" => DeletePreimage::Entity(Box::new(entity(A).into())),
         "note" => DeletePreimage::Note(Box::new(Note {
             header: Header::new(id, Namespace::local(), Timestamp::from_secs(1)),
             kind: "observation".into(),
@@ -98,8 +98,8 @@ fn merge() -> Op {
         into_id: A.parse().unwrap(),
         from_id: B.parse().unwrap(),
         preimage: MergePreimage {
-            into: Box::new(entity(A)),
-            from: Box::new(entity(B)),
+            into: Box::new(entity(A).into()),
+            from: Box::new(entity(B).into()),
             incident_edges: Vec::new(),
         },
     })

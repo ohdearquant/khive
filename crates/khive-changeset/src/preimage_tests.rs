@@ -37,6 +37,10 @@ fn entity() -> Entity {
     }
 }
 
+fn record(entity: &Entity) -> EntityRecord {
+    EntityRecord::new(entity.clone())
+}
+
 fn note() -> Note {
     Note {
         header: entity().header,
@@ -100,7 +104,7 @@ fn every_entity_update_field_is_compared_without_other_fields() {
         let mut value = serde_json::to_value(&original).unwrap();
         let op = update("entity", field, value[field].clone());
         assert_eq!(
-            check_update(&op, CanonicalRecordRef::Entity(&original)),
+            check_update(&op, CanonicalRecordRef::Entity(&record(&original))),
             Ok(())
         );
         value[field] = changed;
@@ -115,7 +119,10 @@ fn every_entity_update_field_is_compared_without_other_fields() {
     live.description = Some("concurrent description".into());
     live.header.updated_at = Timestamp::MAX;
     live.properties.clear();
-    assert_eq!(check_update(&op, CanonicalRecordRef::Entity(&live)), Ok(()));
+    assert_eq!(
+        check_update(&op, CanonicalRecordRef::Entity(&record(&live))),
+        Ok(())
+    );
 }
 
 #[test]
@@ -170,17 +177,17 @@ fn nullable_capture_and_an_absent_field_are_different() {
     live.description = None;
     let captured_null = update("entity", "description", Value::Null);
     assert_eq!(
-        check_update(&captured_null, CanonicalRecordRef::Entity(&live)),
+        check_update(&captured_null, CanonicalRecordRef::Entity(&record(&live))),
         Ok(())
     );
     live.description = Some(String::new());
     mismatch(
-        check_update(&captured_null, CanonicalRecordRef::Entity(&live)),
+        check_update(&captured_null, CanonicalRecordRef::Entity(&record(&live))),
         "description",
     );
     let untouched = update("entity", "name", json!(live.name));
     assert_eq!(
-        check_update(&untouched, CanonicalRecordRef::Entity(&live)),
+        check_update(&untouched, CanonicalRecordRef::Entity(&record(&live))),
         Ok(())
     );
     let mut live = note();
@@ -207,7 +214,7 @@ fn properties_compare_the_whole_typed_map_not_patch_keys_or_display_values() {
     live.properties
         .insert("unmentioned".into(), PropertyValue::Null);
     mismatch(
-        check_update(&op, CanonicalRecordRef::Entity(&live)),
+        check_update(&op, CanonicalRecordRef::Entity(&record(&live))),
         "properties",
     );
     live = original.clone();
@@ -216,7 +223,7 @@ fn properties_compare_the_whole_typed_map_not_patch_keys_or_display_values() {
         PropertyValue::Float(9_007_199_254_740_992.0),
     );
     mismatch(
-        check_update(&op, CanonicalRecordRef::Entity(&live)),
+        check_update(&op, CanonicalRecordRef::Entity(&record(&live))),
         "properties",
     );
     live = original;
@@ -228,7 +235,7 @@ fn properties_compare_the_whole_typed_map_not_patch_keys_or_display_values() {
         )])),
     );
     mismatch(
-        check_update(&op, CanonicalRecordRef::Entity(&live)),
+        check_update(&op, CanonicalRecordRef::Entity(&record(&live))),
         "properties",
     );
 }
@@ -239,14 +246,17 @@ fn update_rejects_another_record_or_substrate_without_disclosing_values() {
     let op = update("entity", "name", json!(live.name));
     let mut other = live.clone();
     other.header.id = Id128::from_u128(999);
-    mismatch(check_update(&op, CanonicalRecordRef::Entity(&other)), "id");
+    mismatch(
+        check_update(&op, CanonicalRecordRef::Entity(&record(&other))),
+        "id",
+    );
     mismatch(
         check_update(&op, CanonicalRecordRef::Note(&note())),
         "substrate",
     );
     other.header.id = live.header.id;
     other.name = "sensitive later name".into();
-    let error = check_update(&op, CanonicalRecordRef::Entity(&other)).unwrap_err();
+    let error = check_update(&op, CanonicalRecordRef::Entity(&record(&other))).unwrap_err();
     assert_eq!(error.to_string(), "captured preimage differs at name");
     assert!(!format!("{error:?}").contains("sensitive"));
 }
@@ -257,11 +267,14 @@ fn entity_delete_compares_every_captured_field_except_updated_at() {
     let op = DeleteOp {
         target_id: original.header.id,
         hard: false,
-        preimage: DeletePreimage::Entity(Box::new(original.clone())),
+        preimage: DeletePreimage::Entity(Box::new(record(&original))),
     };
     let mut live = original.clone();
     live.header.updated_at = Timestamp::MAX;
-    assert_eq!(check_delete(&op, CanonicalRecordRef::Entity(&live)), Ok(()));
+    assert_eq!(
+        check_delete(&op, CanonicalRecordRef::Entity(&record(&live))),
+        Ok(())
+    );
     for (field, changed) in [
         ("id", json!(Id128::from_u128(99))),
         ("namespace", json!("other")),
@@ -277,7 +290,10 @@ fn entity_delete_compares_every_captured_field_except_updated_at() {
         let mut value = serde_json::to_value(&original).unwrap();
         value[field] = changed;
         let live = serde_json::from_value(value).unwrap();
-        mismatch(check_delete(&op, CanonicalRecordRef::Entity(&live)), field);
+        mismatch(
+            check_delete(&op, CanonicalRecordRef::Entity(&record(&live))),
+            field,
+        );
     }
 }
 
@@ -351,9 +367,12 @@ fn delete_rejects_wrong_substrate_and_unchecked_target_capture_disagreement() {
     let op = DeleteOp {
         target_id: Id128::from_u128(999),
         hard: false,
-        preimage: DeletePreimage::Entity(Box::new(live.clone())),
+        preimage: DeletePreimage::Entity(Box::new(record(&live))),
     };
-    mismatch(check_delete(&op, CanonicalRecordRef::Entity(&live)), "id");
+    mismatch(
+        check_delete(&op, CanonicalRecordRef::Entity(&record(&live))),
+        "id",
+    );
     mismatch(
         check_delete(&op, CanonicalRecordRef::Edge(&edge())),
         "substrate",
@@ -363,7 +382,92 @@ fn delete_rejects_wrong_substrate_and_unchecked_target_capture_disagreement() {
     let op = DeleteOp {
         target_id: live.header.id,
         hard: false,
+        preimage: DeletePreimage::Entity(Box::new(record(&captured))),
+    };
+    mismatch(
+        check_delete(&op, CanonicalRecordRef::Entity(&record(&live))),
+        "id",
+    );
+}
+
+fn held(keys: &[&str], aliases: &[(&str, khive_types::EntityAliasOrigin)]) -> EntityRecord {
+    EntityRecord {
+        entity: entity(),
+        keys: keys.iter().map(|key| (*key).to_string()).collect(),
+        aliases: aliases
+            .iter()
+            .cloned()
+            .map(|(alias, origin)| khive_types::EntityAlias {
+                alias: alias.into(),
+                origin,
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn entity_delete_compares_keys_and_aliases_as_sets() {
+    use khive_types::EntityAliasOrigin::{Caller, Rename};
+    let captured = held(&["k1", "k2"], &[("first", Caller), ("second", Rename)]);
+    let op = DeleteOp {
+        target_id: Id128::from_u128(1),
+        hard: false,
         preimage: DeletePreimage::Entity(Box::new(captured)),
     };
-    mismatch(check_delete(&op, CanonicalRecordRef::Entity(&live)), "id");
+    let reordered = held(&["k2", "k1"], &[("second", Rename), ("first", Caller)]);
+    assert_eq!(
+        check_delete(&op, CanonicalRecordRef::Entity(&reordered)),
+        Ok(())
+    );
+    for (field, live) in [
+        (
+            "keys",
+            held(&["k1"], &[("first", Caller), ("second", Rename)]),
+        ),
+        (
+            "keys",
+            held(
+                &["k1", "k2", "k3"],
+                &[("first", Caller), ("second", Rename)],
+            ),
+        ),
+        ("aliases", held(&["k1", "k2"], &[("first", Caller)])),
+        (
+            "aliases",
+            held(&["k1", "k2"], &[("first", Caller), ("second", Caller)]),
+        ),
+    ] {
+        mismatch(check_delete(&op, CanonicalRecordRef::Entity(&live)), field);
+    }
+}
+
+#[test]
+fn entity_update_compares_the_alias_set_only_when_the_patch_touches_it() {
+    use khive_types::EntityAliasOrigin::{Caller, Rename};
+    let op = update(
+        "entity",
+        "aliases",
+        json!([
+            {"alias": "second", "origin": "rename"},
+            {"alias": "first", "origin": "caller"}
+        ]),
+    );
+    let live = held(&["k1"], &[("first", Caller), ("second", Rename)]);
+    assert_eq!(check_update(&op, CanonicalRecordRef::Entity(&live)), Ok(()));
+    for changed in [
+        held(&["k1"], &[("first", Caller)]),
+        held(&["k1"], &[("first", Caller), ("second", Caller)]),
+    ] {
+        mismatch(
+            check_update(&op, CanonicalRecordRef::Entity(&changed)),
+            "aliases",
+        );
+    }
+    // A patch that leaves aliases alone does not read them, and an update never reads keys.
+    let op = update("entity", "name", json!("original"));
+    let other = held(&["other"], &[("third", Caller)]);
+    assert_eq!(
+        check_update(&op, CanonicalRecordRef::Entity(&other)),
+        Ok(())
+    );
 }

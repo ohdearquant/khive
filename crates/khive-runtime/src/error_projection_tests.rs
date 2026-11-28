@@ -6,6 +6,150 @@ use khive_storage::{CapacityUnavailablePhase, StorageCapability, StorageError};
 use khive_types::{Details, ErrorCode, ErrorDomain, KhiveError};
 use serde_json::json;
 
+fn lost_commit_reply() -> StorageError {
+    StorageError::WriteOutcomeUnknown {
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "reply lost",
+        )),
+    }
+}
+
+#[test]
+fn issued_commit_unknown_projects_without_claiming_task_termination() {
+    for error in [
+        RuntimeError::Storage(lost_commit_reply()),
+        RuntimeError::atomic_write_failure(lost_commit_reply()),
+    ] {
+        let value = runtime_error_value(error, DomainDisposition::NotCommitted);
+        assert_eq!(value["code"], "write_outcome_unknown");
+        assert_eq!(value["stage"], "write_outcome_unknown");
+        assert_eq!(value["request_state"], "side_effects_unknown");
+        assert_eq!(value["task_terminated"], false);
+        assert_eq!(value["retryable"], false);
+        assert_eq!(value["domain_disposition"], "unknown");
+        assert!(value.get("sqlite_primary_code").is_none());
+    }
+    let entry = super::failure_entry_parts(super::FailureEntrySource::Runtime {
+        error: RuntimeError::Storage(lost_commit_reply()),
+        boundary: DomainDisposition::NotCommitted,
+    })
+    .into_entry("create");
+    assert_eq!(entry["domain_disposition"], "unknown");
+    assert_eq!(entry["error"]["domain_disposition"], "unknown");
+    assert!(entry.get("result").is_none());
+}
+
+#[test]
+fn strict_routing_projects_typed_no_write_and_source_specific_retry() {
+    for (cause, retryable) in [
+        (
+            StorageError::Pool {
+                operation: "open".into(),
+                message: "unavailable".into(),
+            },
+            true,
+        ),
+        (StorageError::WriterTaskNoRuntime, false),
+    ] {
+        let error = StorageError::WriterOwnerUnavailable {
+            operation: "create".into(),
+            source: Box::new(cause),
+        };
+        let error = RuntimeError::atomic_write_failure(error);
+        assert_eq!(error.retryable_failure_context().is_some(), retryable);
+        let value = runtime_error_value(error, DomainDisposition::Unknown);
+        assert_eq!(value["code"], "writer_owner_unavailable");
+        assert_eq!(value["retryable"], retryable);
+        assert_eq!(value["request_state"], "not_started");
+        assert_eq!(value["task_terminated"], false);
+        assert_eq!(value["domain_disposition"], "not_committed");
+    }
+    let value = runtime_error_value(
+        RuntimeError::Storage(StorageError::WriterRouteViolation {
+            operation: "autocommit".into(),
+        }),
+        DomainDisposition::Unknown,
+    );
+    assert_eq!(value["code"], "writer_route_violation");
+    assert_eq!(value["retryable"], false);
+    assert_eq!(value["request_state"], "not_started");
+    assert_eq!(value["domain_disposition"], "not_committed");
+}
+
+#[test]
+fn issued_commit_unknown_retains_native_evidence_and_full_precedence() {
+    use khive_storage::error::{SqliteWriteFailure, SqliteWriteStage};
+    for (primary, extended, code) in [
+        (
+            rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_FULL | (3 << 8),
+            "sqlite_disk_full",
+        ),
+        (
+            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_IOERR | (4 << 8),
+            "write_outcome_unknown",
+        ),
+        (777, 777, "write_outcome_unknown"),
+    ] {
+        let error = lost_commit_reply().with_sqlite_write_failure(SqliteWriteFailure {
+            stage: SqliteWriteStage::Commit,
+            primary_code: primary,
+            extended_code: extended,
+            settlement_unknown: true,
+        });
+        let value = runtime_error_value(RuntimeError::Storage(error), DomainDisposition::Unknown);
+        assert_eq!(value["code"], code);
+        assert_eq!(value["sqlite_write_stage"], "sqlite_commit_failure");
+        assert_eq!(value["sqlite_primary_code"], primary);
+        assert_eq!(value["sqlite_extended_code"], extended);
+        assert_eq!(value["request_state"], "side_effects_unknown");
+        assert_eq!(value["task_terminated"], false);
+        assert_eq!(value["retryable"], false);
+        assert_eq!(value["domain_disposition"], "unknown");
+    }
+}
+
+#[test]
+fn unavailable_owner_retains_native_full_precedence_from_its_source() {
+    use khive_storage::error::{SqliteWriteFailure, SqliteWriteStage};
+    let extended = rusqlite::ffi::SQLITE_FULL | (3 << 8);
+    let causes = [
+        StorageError::Pool {
+            operation: "open writer".into(),
+            message: "full".into(),
+        }
+        .with_sqlite_write_failure(SqliteWriteFailure {
+            stage: SqliteWriteStage::Begin,
+            primary_code: rusqlite::ffi::SQLITE_FULL,
+            extended_code: extended,
+            settlement_unknown: false,
+        }),
+        StorageError::driver(
+            StorageCapability::Sql,
+            "open writer",
+            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(extended), None),
+        ),
+    ];
+    for cause in causes {
+        let value = runtime_error_value(
+            RuntimeError::Storage(StorageError::WriterOwnerUnavailable {
+                operation: "create".into(),
+                source: Box::new(cause),
+            }),
+            DomainDisposition::Unknown,
+        );
+        assert_eq!(value["code"], "sqlite_disk_full");
+        assert_eq!(value["sqlite_primary_code"], rusqlite::ffi::SQLITE_FULL);
+        assert_eq!(value["sqlite_extended_code"], extended);
+        assert_eq!(value["retryable"], false);
+        assert_eq!(value["request_state"], "not_started");
+        assert_eq!(value["task_terminated"], false);
+        assert_eq!(value["domain_disposition"], "not_committed");
+    }
+}
+
 #[test]
 fn capacity_phase_projection_preserves_writer_request_settlement() {
     for (phase, retryable) in [

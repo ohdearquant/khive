@@ -1668,11 +1668,11 @@ where
 struct RemoteFetchErrorPack;
 
 impl khive_types::Pack for RemoteFetchErrorPack {
-    const NAME: &'static str = "remote-fetch-error-test";
+    const NAME: &'static str = "remote_fetch";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [khive_runtime::HandlerDef] = &[khive_runtime::HandlerDef {
-        name: "remote_fetch_failure",
+        name: "remote_fetch.failure",
         description: "returns a typed remote fetch failure",
         visibility: khive_runtime::Visibility::Verb,
         category: khive_runtime::VerbCategory::Assertive,
@@ -1720,7 +1720,7 @@ async fn request_remote_fetch_error_retains_structured_fields() {
     let server = KhiveMcpServer::from_registry(builder.build().expect("test registry"));
     let response = server
         .dispatch_request_local(RequestParams {
-            ops: "remote_fetch_failure()".to_string(),
+            ops: "remote_fetch.failure()".to_string(),
             presentation: Some("verbose".to_string()),
             format: Some("json".to_string()),
             ..Default::default()
@@ -1733,7 +1733,7 @@ async fn request_remote_fetch_error_retains_structured_fields() {
     let results = envelope["results"].as_array().expect("per-op results");
     assert_eq!(results.len(), 1, "{envelope}");
     assert_eq!(results[0]["ok"], false);
-    assert_eq!(results[0]["tool"], "remote_fetch_failure");
+    assert_eq!(results[0]["tool"], "remote_fetch.failure");
     assert_eq!(
         results[0]["error"],
         json!({
@@ -1751,7 +1751,7 @@ struct LargeResultPack;
 struct LexicalTimeoutResultPack;
 
 impl khive_types::Pack for LexicalTimeoutResultPack {
-    const NAME: &'static str = "lexical-timeout-result-test";
+    const NAME: &'static str = "knowledge";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [khive_runtime::HandlerDef] = &[
@@ -1890,26 +1890,26 @@ async fn daemon_timeout_marker_survives_explicit_and_configured_auto_table_rende
 }
 
 impl khive_types::Pack for LargeResultPack {
-    const NAME: &'static str = "large-result-test";
+    const NAME: &'static str = "memory";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [khive_runtime::HandlerDef] = &[
         khive_runtime::HandlerDef {
-            name: "large_result",
+            name: "memory.large_result",
             description: "returns a caller-sized test result",
             visibility: khive_runtime::Visibility::Verb,
             category: khive_runtime::VerbCategory::Assertive,
             params: &[],
         },
         khive_runtime::HandlerDef {
-            name: "large_write",
+            name: "memory.large_write",
             description: "returns a caller-sized test result for a state-changing verb",
             visibility: khive_runtime::Visibility::Verb,
             category: khive_runtime::VerbCategory::Commissive,
             params: &[],
         },
         khive_runtime::HandlerDef {
-            name: "record_write",
+            name: "memory.record_write",
             description: "records a small committed write, for chain-ordering tests",
             visibility: khive_runtime::Visibility::Verb,
             category: khive_runtime::VerbCategory::Commissive,
@@ -1952,7 +1952,7 @@ impl khive_runtime::PackRuntime for LargeResultPack {
         _registry: &VerbRegistry,
         _token: &khive_runtime::NamespaceToken,
     ) -> Result<Value, RuntimeError> {
-        if verb == "record_write" {
+        if verb == "memory.record_write" {
             return Ok(json!({
                 "committed": true,
                 "marker": params.get("marker").cloned().unwrap_or(Value::Null),
@@ -1983,19 +1983,19 @@ struct SlowSqlReadPack {
 }
 
 impl khive_types::Pack for SlowSqlReadPack {
-    const NAME: &'static str = "slow-sql-read-test";
+    const NAME: &'static str = "slow_sql";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [khive_runtime::HandlerDef] = &[
         khive_runtime::HandlerDef {
-            name: "slow_sql_read",
+            name: "slow_sql.read",
             description: "runs SQLite work until the request read deadline interrupts it",
             visibility: khive_runtime::Visibility::Verb,
             category: khive_runtime::VerbCategory::Assertive,
             params: &[],
         },
         khive_runtime::HandlerDef {
-            name: "pending_read_phase",
+            name: "slow_sql.pending_read_phase",
             description: "waits until the request read deadline interrupts it",
             visibility: khive_runtime::Visibility::Verb,
             category: khive_runtime::VerbCategory::Assertive,
@@ -2031,7 +2031,7 @@ impl khive_runtime::PackRuntime for SlowSqlReadPack {
     ) -> Result<Value, RuntimeError> {
         use khive_storage::{SqlAccess, SqlStatement};
 
-        if verb == "pending_read_phase" {
+        if verb == "slow_sql.pending_read_phase" {
             khive_storage::await_request_read_phase(
                 "outer-deadline-probe",
                 std::future::pending::<()>(),
@@ -2100,12 +2100,12 @@ fn unit_barrier_pack(threshold: usize) -> (UnitBarrierPack, Arc<AtomicUsize>) {
 }
 
 impl khive_types::Pack for UnitBarrierPack {
-    const NAME: &'static str = "unit-barrier-test";
+    const NAME: &'static str = "unit_barrier";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [khive_runtime::HandlerDef] = &[
         khive_runtime::HandlerDef {
-            name: "barrier_wait",
+            name: "unit_barrier.wait",
             description: "blocks until `threshold` concurrent calls have arrived, for a \
                                deterministic concurrency-bound test",
             visibility: khive_runtime::Visibility::Verb,
@@ -2113,7 +2113,7 @@ impl khive_types::Pack for UnitBarrierPack {
             params: &[],
         },
         khive_runtime::HandlerDef {
-            name: "noop",
+            name: "unit_barrier.noop",
             description: "returns immediately, for chain-shape tests that need a harmless \
                                second leaf",
             visibility: khive_runtime::Visibility::Verb,
@@ -2121,7 +2121,7 @@ impl khive_types::Pack for UnitBarrierPack {
             params: &[],
         },
         khive_runtime::HandlerDef {
-            name: "always_fails",
+            name: "unit_barrier.always_fails",
             description: "always returns a per-op error, for unit-tail-abort tests",
             visibility: khive_runtime::Visibility::Verb,
             category: khive_runtime::VerbCategory::Assertive,
@@ -2155,10 +2155,10 @@ impl khive_runtime::PackRuntime for UnitBarrierPack {
         _registry: &VerbRegistry,
         _token: &khive_runtime::NamespaceToken,
     ) -> Result<Value, RuntimeError> {
-        if verb == "noop" {
+        if verb == "unit_barrier.noop" {
             return Ok(json!({"noop": true}));
         }
-        if verb == "always_fails" {
+        if verb == "unit_barrier.always_fails" {
             return Err(RuntimeError::RemoteFetchError {
                 remote: "unit-barrier-test".to_string(),
                 message: "injected failure for a unit-tail-abort test".to_string(),
@@ -2187,8 +2187,8 @@ impl khive_runtime::PackRuntime for UnitBarrierPack {
 #[serial_test::serial(config_ledger)]
 async fn bracketed_batch_of_chains_bounds_units_at_max_concurrency() {
     // ADR-016 Amendment 2: ten multi-leaf units, each a two-leaf
-    // chain (`barrier_wait() | noop()`), inside one bracketed batch.
-    // `barrier_wait` only releases once MAX_BATCH_CONCURRENCY calls have
+    // chain (`unit_barrier.wait() | unit_barrier.noop()`), inside one bracketed batch.
+    // `unit_barrier.wait` only releases once MAX_BATCH_CONCURRENCY calls have
     // arrived concurrently, so the request can only complete at all if
     // the executor both reaches that concurrency (units 9 and 10 could
     // never be admitted otherwise; the request hangs, it does not fail)
@@ -2203,7 +2203,7 @@ async fn bracketed_batch_of_chains_bounds_units_at_max_concurrency() {
     let unit_count = 10usize;
     let ops = format!(
         "[{}]",
-        vec!["barrier_wait() | noop()"; unit_count].join(", ")
+        vec!["unit_barrier.wait() | unit_barrier.noop()"; unit_count].join(", ")
     );
 
     let response = tokio::time::timeout(
@@ -2262,8 +2262,8 @@ async fn bracketed_unit_prev_ref_threads_within_its_own_unit_only() {
         .dispatch_request_local(RequestParams {
             ops: concat!(
                 "[",
-                "record_write(marker=\"seed\") | record_write(marker=$prev.marker), ",
-                "record_write(marker=\"other-unit\")",
+                "memory.record_write(marker=\"seed\") | memory.record_write(marker=$prev.marker), ",
+                "memory.record_write(marker=\"other-unit\")",
                 "]"
             )
             .to_string(),
@@ -2302,7 +2302,7 @@ async fn bracketed_dynamic_prev_resolved_write_target_is_outside_static_prefligh
         .dispatch_request_local(RequestParams {
             ops: concat!(
                 "[",
-                "record_write(marker=\"x\") | update(id=$prev.marker, name=\"dynamic\"), ",
+                "memory.record_write(marker=\"x\") | update(id=$prev.marker, name=\"dynamic\"), ",
                 "update(id=\"x\", name=\"literal\")",
                 "]"
             )
@@ -2340,7 +2340,13 @@ async fn bracketed_unit_failure_aborts_only_its_own_tail() {
     let server = KhiveMcpServer::from_registry(builder.build().expect("barrier test registry"));
     let response = server
         .dispatch_request_local(RequestParams {
-            ops: concat!("[", "always_fails() | noop(), ", "noop() | noop()", "]").to_string(),
+            ops: concat!(
+                "[",
+                "unit_barrier.always_fails() | unit_barrier.noop(), ",
+                "unit_barrier.noop() | unit_barrier.noop()",
+                "]"
+            )
+            .to_string(),
             presentation: Some("verbose".to_string()),
             format: Some("json".to_string()),
             ..Default::default()
@@ -2372,9 +2378,9 @@ async fn bracketed_batch_write_key_conflict_refuses_only_affected_units() {
         .dispatch_request_local(RequestParams {
             ops: concat!(
                 "[",
-                "update(id=\"same-id\", name=\"from-unit-0\") | record_write(marker=\"u0-tail\"), ",
+                "update(id=\"same-id\", name=\"from-unit-0\") | memory.record_write(marker=\"u0-tail\"), ",
                 "update(id=\"same-id\", name=\"from-unit-1\"), ",
-                "record_write(marker=\"u2-solo\") | record_write(marker=\"u2-tail\")",
+                "memory.record_write(marker=\"u2-solo\") | memory.record_write(marker=\"u2-tail\")",
                 "]"
             )
             .to_string(),
@@ -2458,7 +2464,7 @@ async fn bracketed_unit_aggregate_budget_matches_serial_semantics() {
     // byte size and count as the flat-mode precedent, so the same
     // arithmetic applies.
     let result_bytes = BATCH_RESPONSE_BUDGET_BYTES / 3 - 4096;
-    let leaves = vec![format!("large_result(bytes={result_bytes})"); 12].join(" | ");
+    let leaves = vec![format!("memory.large_result(bytes={result_bytes})"); 12].join(" | ");
     let server = large_result_test_server();
     let response = server
         .dispatch_request_local(RequestParams {
@@ -2517,7 +2523,7 @@ async fn bracketed_units_share_one_aggregate_response_budget() {
     // the other unit may already have in flight. A private budget per
     // unit would let each unit complete four leaves on its own.
     let result_bytes = BATCH_RESPONSE_BUDGET_BYTES / 3 - 4096;
-    let unit = vec![format!("large_result(bytes={result_bytes})"); 6].join(" | ");
+    let unit = vec![format!("memory.large_result(bytes={result_bytes})"); 6].join(" | ");
     let server = large_result_test_server();
     let response = server
         .dispatch_request_local(RequestParams {
@@ -2633,7 +2639,7 @@ async fn local_exec_dispatch_installs_the_default_request_read_deadline() {
             .saturating_add(Duration::from_secs(1)),
         server.dispatch_request_local_for_exec(
             RequestParams {
-                ops: "slow_sql_read()".to_string(),
+                ops: "slow_sql.read()".to_string(),
                 ..Default::default()
             },
             false,
@@ -2657,7 +2663,7 @@ async fn replay_dispatch_installs_the_default_request_read_deadline() {
             .saturating_add(Duration::from_secs(1)),
         server.dispatch_request_replay_as(
             RequestParams {
-                ops: "slow_sql_read()".to_string(),
+                ops: "slow_sql.read()".to_string(),
                 ..Default::default()
             },
             "local",
@@ -2681,7 +2687,7 @@ async fn canonical_dispatch_preserves_an_earlier_outer_deadline() {
     let response = khive_storage::scope_request_read_deadline(
         outer,
         server.dispatch_request_local(RequestParams {
-            ops: "pending_read_phase()".to_string(),
+            ops: "slow_sql.pending_read_phase()".to_string(),
             ..Default::default()
         }),
     )
@@ -2709,7 +2715,7 @@ struct RequestGroupDigestPack {
 }
 
 impl khive_types::Pack for RequestGroupDigestPack {
-    const NAME: &'static str = "request-group-digest-test";
+    const NAME: &'static str = "git";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [khive_runtime::HandlerDef] = &[khive_runtime::HandlerDef {
@@ -2951,7 +2957,7 @@ async fn typed_serial_dispatch_retains_full_batch_write_conflict_preflight() {
 async fn typed_serial_dispatch_retains_one_aggregate_response_budget() {
     let result_bytes = BATCH_RESPONSE_BUDGET_BYTES / 3 - 4096;
     let ops: Vec<TypedJsonOp> = (0..12)
-        .map(|_| typed_test_op("large_result", json!({"bytes": result_bytes})))
+        .map(|_| typed_test_op("memory.large_result", json!({"bytes": result_bytes})))
         .collect();
     let server = large_result_test_server();
     let parallel: Value = serde_json::from_str(
@@ -2988,6 +2994,12 @@ async fn typed_serial_dispatch_retains_one_aggregate_response_budget() {
                 .is_some_and(|error| error.contains("batch response budget"))
         })
         .expect("serial tail must contain canonical budget errors");
+    let budget_message = serial_rows[first_serial_budget_error]["error"]["message"]
+        .as_str()
+        .expect("budget error message");
+    assert!(budget_message.contains("per-request"));
+    assert!(budget_message.contains("shared across all ops in this batch request"));
+    assert!(budget_message.contains("resets for the next request"));
     assert!(
         first_serial_budget_error >= 3 && first_serial_budget_error < serial_rows.len(),
         "serial dispatch must spend one aggregate budget, not reset it per op"
@@ -3144,7 +3156,7 @@ async fn save_to_writes_full_results_without_inline_response_budgeting() {
             RequestParams {
                 plan: None,
                 ops: format!(
-                    "[large_result(bytes={result_bytes}), large_result(bytes={result_bytes})]"
+                    "[memory.large_result(bytes={result_bytes}), memory.large_result(bytes={result_bytes})]"
                 ),
                 presentation: None,
                 presentation_per_op: None,
@@ -3292,7 +3304,7 @@ async fn local_dispatch_returns_result_larger_than_daemon_frame() {
     let response = server
         .dispatch_request_local(RequestParams {
             plan: None,
-            ops: format!("large_result(bytes={result_bytes})"),
+            ops: format!("memory.large_result(bytes={result_bytes})"),
             presentation: None,
             presentation_per_op: None,
             save_to: None,
@@ -3323,7 +3335,7 @@ async fn daemon_dispatch_marks_oversized_read_result_reducible_and_not_retryable
     let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
     let response = dispatch_large_result_through_daemon(
         &server,
-        format!("large_result(bytes={result_bytes})"),
+        format!("memory.large_result(bytes={result_bytes})"),
         None,
     )
     .await;
@@ -3401,7 +3413,7 @@ async fn daemon_dispatch_marks_oversized_write_result_non_retryable_and_executed
     let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
     let response = dispatch_large_result_through_daemon(
         &server,
-        format!("large_write(bytes={result_bytes})"),
+        format!("memory.large_write(bytes={result_bytes})"),
         None,
     )
     .await;
@@ -3413,7 +3425,7 @@ async fn daemon_dispatch_marks_oversized_write_result_non_retryable_and_executed
         envelope["results"][0]["error"]["kind"],
         "response_frame_budget_exceeded"
     );
-    // `large_write` is Commissive: it already committed its change before
+    // `memory.large_write` is Commissive: it already committed its change before
     // the transport discovered the response was too large to return, so
     // a caller must not be told it is safe to reissue the operation.
     assert_eq!(envelope["results"][0]["error"]["retryable"], false);
@@ -3435,14 +3447,16 @@ async fn daemon_chain_reports_later_write_truthfully_after_earlier_frame_budget_
     let result_bytes = khive_runtime::daemon::MAX_FRAME_BYTES + 1_024;
     let response = dispatch_large_result_through_daemon(
         &server,
-        format!(r#"large_write(bytes={result_bytes}) | record_write(marker="second")"#),
+        format!(
+            r#"memory.large_write(bytes={result_bytes}) | memory.record_write(marker="second")"#
+        ),
         None,
     )
     .await;
 
     let envelope: Value = serde_json::from_str(&response).expect("response envelope");
     // The frame-budget decision is made at render time, after `run_parsed`
-    // has already dispatched every chain operation — `record_write` really
+    // has already dispatched every chain operation — `memory.record_write` really
     // ran and committed. Its entry must report that real outcome, not a
     // fabricated `aborted: true`, even though the sibling entry before it
     // is reported as failed.
@@ -3453,7 +3467,7 @@ async fn daemon_chain_reports_later_write_truthfully_after_earlier_frame_budget_
         "response_frame_budget_exceeded"
     );
     assert_eq!(envelope["results"][1]["ok"], true);
-    assert_eq!(envelope["results"][1]["tool"], "record_write");
+    assert_eq!(envelope["results"][1]["tool"], "memory.record_write");
     assert!(envelope["results"][1].get("aborted").is_none());
     assert_eq!(envelope["results"][1]["result"]["committed"], true);
     assert_eq!(envelope["results"][1]["result"]["marker"], "second");
@@ -3516,7 +3530,7 @@ fn read_only_audit_advisory_decorates_success_but_not_help_or_error() {
 struct FrameBudgetCategoryTestPack;
 
 impl khive_types::Pack for FrameBudgetCategoryTestPack {
-    const NAME: &'static str = "frame-budget-category-test";
+    const NAME: &'static str = "kg";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [khive_runtime::HandlerDef] = &[
@@ -4218,7 +4232,7 @@ async fn daemon_batch_keeps_rendered_result_when_compact_result_exceeds_frame() 
     let row_bytes = khive_runtime::daemon::MAX_FRAME_BYTES / 2;
     let response = dispatch_large_result_through_daemon(
         &server,
-        format!("large_result(table_bytes={row_bytes})"),
+        format!("memory.large_result(table_bytes={row_bytes})"),
         Some("auto".to_string()),
     )
     .await;
@@ -6932,12 +6946,10 @@ fn registry_with_visible_namespaces(ns: Vec<khive_runtime::Namespace>) -> VerbRe
 
 fn request_identity_with_visible_namespaces(ns: Vec<&str>) -> khive_runtime::RequestIdentity {
     khive_runtime::RequestIdentity {
-        owned_namespaces: Vec::new(),
         namespace: "local".to_string(),
         actor_id: None,
         visible_namespaces: ns.into_iter().map(str::to_string).collect(),
-        process_ref: None,
-        request_id: None,
+        ..Default::default()
     }
 }
 
@@ -7007,6 +7019,82 @@ async fn scheduled_replay_reads_its_own_actor_namespace_and_never_the_daemons_vi
             "daemon visibility leaked into a scheduled replay: {identity}"
         );
     }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn scheduled_replay_does_not_inherit_owned_namespaces() {
+    let archive = Namespace::parse("scheduled-owner:archive").unwrap();
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::local(),
+        actor_id: Some("scheduled-owner".to_string()),
+        owned_namespaces: vec![archive.clone()],
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string(), "memory".to_string()],
+        ..RuntimeConfig::default()
+    })
+    .expect("in-memory replay runtime");
+    let server = KhiveMcpServer::new(runtime.clone()).expect("replay server");
+    let token = runtime.authorize(archive).expect("archive namespace");
+    let old = runtime
+        .create_note(
+            &token,
+            "memory",
+            None,
+            "archived migration tally",
+            Some(0.3),
+            Some(json!({"memory_type": "episodic"})),
+            vec![],
+        )
+        .await
+        .expect("seed archived memory");
+    let ops = json!([{
+        "tool": "memory.apply_batch",
+        "args": {
+            "batch": "scheduled-owned",
+            "rows": [{
+                "id": old.id.to_string(),
+                "action": "supersede",
+                "content": "revised migration tally",
+                "properties": {"who": "scheduled-owner"}
+            }],
+            "dry_run": true
+        }
+    }])
+    .to_string();
+    let request = || RequestParams {
+        ops: ops.clone(),
+        presentation: Some("verbose".to_string()),
+        format: Some("json".to_string()),
+        ..Default::default()
+    };
+    let local = server
+        .dispatch_request_local(request())
+        .await
+        .expect("configured owner dispatch");
+    let local: Value = serde_json::from_str(&local).expect("local JSON envelope");
+    assert_eq!(local["results"][0]["ok"], true, "{local}");
+    assert_eq!(
+        local["results"][0]["result"]["entries"][0]["outcome"],
+        "planned"
+    );
+
+    let replay = server
+        .dispatch_request_replay_as(
+            request(),
+            "local",
+            Some(khive_runtime::VerifiedActor::new("scheduled-owner").unwrap()),
+        )
+        .await
+        .expect("scheduled replay dispatch");
+    let replay: Value = serde_json::from_str(&replay).expect("replay JSON envelope");
+    assert_eq!(replay["results"][0]["ok"], true, "{replay}");
+    let entry = &replay["results"][0]["result"]["entries"][0];
+    assert_eq!(entry["outcome"], "refused");
+    assert_eq!(entry["reason"]["code"], "old-namespace");
+    assert_eq!(entry["old_namespace"], "scheduled-owner:archive");
 }
 
 #[tokio::test]
@@ -7337,8 +7425,8 @@ async fn conflict_participants_distinguish_unit_causes_from_collateral_aborts() 
     let response = server
         .dispatch_request_local(RequestParams {
             ops: concat!(
-                "[record_write(marker=\"must-not-run\") | update(id=\"a\") | delete(id=\"a\"), ",
-                "update(id=\"a\"), delete(id=\"a\"), record_write(marker=\"independent\")]"
+                "[memory.record_write(marker=\"must-not-run\") | update(id=\"a\") | delete(id=\"a\"), ",
+                "update(id=\"a\"), delete(id=\"a\"), memory.record_write(marker=\"independent\")]"
             )
             .into(),
             format: Some("json".into()),

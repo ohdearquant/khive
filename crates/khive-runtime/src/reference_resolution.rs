@@ -15,7 +15,7 @@
 //! 2. **Recently-referenced ring.** An exact (case-insensitive) or substring
 //!    match against this actor's ring (`reference_ring::ReferenceRing`).
 //! 3. **Exact-name storage lookup.** A deterministic, case-sensitive match
-//!    against `entities.name` in the caller's namespace (`deleted_at IS
+//!    against `entities.name` or an alias the entity holds (ADR-221) in the caller's namespace (`deleted_at IS
 //!    NULL`) — covers any entity that already exists but was never
 //!    created/get/updated/deleted/merged/linked by this actor in this
 //!    session, so stage 2's ring never saw it (#849).
@@ -67,12 +67,13 @@ const RING_SUBSTRING_CONFIDENCE: f64 = 0.7;
 /// on that scale.
 const RING_AUTO_RESOLVE_CONFIDENCE: f64 = 0.7;
 /// Confidence for a stage-3 exact-name storage match: a deterministic,
-/// case-sensitive equality on `entities.name` — stronger evidence than the
+/// case-sensitive equality on `entities.name` or a held alias — stronger evidence than the
 /// ring's case-insensitive session cache (`RING_EXACT_CONFIDENCE`), so it
 /// sits above both ring bands, but still below the absolute certainty of an
 /// id-string passthrough (1.0), which the caller supplied directly rather
-/// than by name.
-const EXACT_NAME_CONFIDENCE: f64 = 0.98;
+/// than by name. No other stage reports this value, so a caller can tell a
+/// stage-3 hit by it; the kg `resolve` verb reads it to set `matched_alias`.
+pub const EXACT_NAME_CONFIDENCE: f64 = 0.98;
 /// Hybrid-search fallback: the top hit auto-resolves over a runner-up only
 /// when it leads by at least this ratio — RRF scores are not on a fixed
 /// 0..1 confidence scale, so a fixed absolute bar can't express "decisively
@@ -229,6 +230,7 @@ pub async fn resolve_reference_with_entity_type(
             score: RING_EXACT_CONFIDENCE,
         })
         .collect();
+    let exact = collapse_merged_candidates(runtime, token, exact).await?;
     if let Some(resolution) = resolve_from_candidates(exact) {
         return Ok(resolution);
     }
@@ -247,12 +249,13 @@ pub async fn resolve_reference_with_entity_type(
             score: RING_SUBSTRING_CONFIDENCE,
         })
         .collect();
+    let substring = collapse_merged_candidates(runtime, token, substring).await?;
     if let Some(resolution) = resolve_from_candidates(substring) {
         return Ok(resolution);
     }
 
     // Stage 3: exact-name storage lookup (#849) — a deterministic,
-    // case-sensitive match against `entities.name` in the caller's
+    // case-sensitive match against `entities.name` or a held alias in the caller's
     // namespace, run before the hybrid-search fallback so an existing exact
     // name always resolves regardless of FTS ranking, RRF score, or whether
     // this actor's session ever referenced the entity (the ring's blind
@@ -327,6 +330,47 @@ pub async fn resolve_reference_with_entity_type(
     }
 }
 
+/// Merge hops a ring candidate is followed through before it is left as is.
+const MAX_MERGE_HOPS: usize = 32;
+
+/// Count ring candidates by the entity they name now (ADR-221 section 3): a
+/// merged-away entity the ring still holds by its old name and the live entity
+/// it was merged into are one entity, so they collapse onto the live id. A
+/// candidate whose chain ends at a deleted entity or runs past
+/// [`MAX_MERGE_HOPS`] stays as it is. One candidate or none is returned
+/// unread.
+async fn collapse_merged_candidates(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    candidates: Vec<ReferenceCandidate>,
+) -> RuntimeResult<Vec<ReferenceCandidate>> {
+    if candidates.len() < 2 {
+        return Ok(candidates);
+    }
+    let store = runtime.entities(token)?;
+    let mut collapsed: Vec<ReferenceCandidate> = Vec::with_capacity(candidates.len());
+    for mut candidate in candidates {
+        let mut current = candidate.id;
+        for _ in 0..MAX_MERGE_HOPS {
+            let Some(entity) = store.get_entity_including_deleted(current).await? else {
+                break;
+            };
+            match (entity.deleted_at, entity.merged_into) {
+                (Some(_), Some(next)) => current = next,
+                (None, _) => {
+                    candidate.id = current;
+                    break;
+                }
+                (Some(_), None) => break,
+            }
+        }
+        if !collapsed.iter().any(|held| held.id == candidate.id) {
+            collapsed.push(candidate);
+        }
+    }
+    Ok(collapsed)
+}
+
 /// Apply the shared "single-above-bar resolves, multiple is ambiguous"
 /// contract to a candidate set already known to be an exact or substring
 /// ring match. Returns `None` when `candidates` is empty — the caller falls
@@ -351,7 +395,8 @@ fn resolve_from_candidates(candidates: Vec<ReferenceCandidate>) -> Option<Refere
 }
 
 /// Stage 3 of `resolve_reference` (#849): a deterministic, case-sensitive
-/// exact match against `entities.name`, scoped to `token.namespace()` (the
+/// exact match against `entities.name` or an alias the entity holds
+/// (ADR-221 section 2; an entity matching by both counts once), scoped to `token.namespace()` (the
 /// same single-namespace default the rest of this pipeline and the sibling
 /// by-name lookup in `khive-pack-kg`'s `resolve_name_async` use) and to
 /// `entity_kind` when the caller filtered by one. `query_entities` already
@@ -368,7 +413,7 @@ async fn exact_name_match(
     entity_type: Option<&str>,
 ) -> RuntimeResult<Option<ReferenceResolution>> {
     let mut filter = EntityFilter {
-        name_exact: Some(name.to_string()),
+        name_or_alias_exact: Some(name.to_string()),
         kinds: entity_kind.map(|k| vec![k.to_string()]).unwrap_or_default(),
         ..EntityFilter::default()
     };
@@ -380,7 +425,7 @@ async fn exact_name_match(
     // A storage-level `name = ?` predicate (not `name_prefix` + in-memory
     // filter) so a namespace with many newer case variants of `name` can
     // never page the exact target out from under a `created_at DESC` sort
-    // (#849, #852) — every row this query returns already equals `name`.
+    // (#849, #852) — every row this query returns already carries `name` as its name or an alias.
     // The page is small (10, not 1), but the zero/one/many decision is made
     // from `page.total` (the storage-computed COUNT(*) under the same
     // predicate), never from `page.items.len()` — with 11+ byte-identical

@@ -88,7 +88,7 @@ fn no_save_reporting_matches_exact_legacy_golden() {
     let failures = collect_op_failures(&parsed, 0, OpsFileReportMode::LegacyNoSave);
     assert_eq!(failures.len(), 1);
     assert!(failures[0].get("aborted").is_none());
-    let summary = ops_file_summary(OpsFileReportMode::LegacyNoSave, 2, 1, 1, 0, failures, 0);
+    let summary = ops_file_summary(OpsFileReportMode::LegacyNoSave, 2, 1, 1, 0, 0, failures, 0);
 
     assert_eq!(
         ops_file_progress_line(OpsFileReportMode::LegacyNoSave, 2, 2, 1, 1, 0),
@@ -144,6 +144,7 @@ fn no_save_reporting_retains_more_than_one_thousand_failures() {
         retained.len(),
         0,
         retained.len(),
+        0,
         0,
         retained,
         omitted,
@@ -212,6 +213,7 @@ fn save_reporting_bounds_failure_count_and_error_detail() {
         0,
         MAX_OPS_FILE_FAILURE_DETAILS + 1,
         0,
+        0,
         retained,
         omitted,
     );
@@ -220,4 +222,120 @@ fn save_reporting_bounds_failure_count_and_error_detail() {
         summary["failures"].as_array().unwrap().len(),
         MAX_OPS_FILE_FAILURE_DETAILS
     );
+}
+
+#[test]
+fn ops_file_budget_summary_exposes_refused_count_only_when_nonzero() {
+    let parsed = serde_json::json!({
+        "results": [
+            {"ok":true,"tool":"first","result":{}},
+            {
+                "ok":false,
+                "tool":"second",
+                "error":{"kind":"response_budget_exceeded","code":"response_budget_exceeded"}
+            }
+        ]
+    });
+    let failures = collect_op_failures(&parsed, 0, OpsFileReportMode::LegacyNoSave);
+    let summary = ops_file_summary(
+        OpsFileReportMode::LegacyNoSave,
+        2,
+        1,
+        1,
+        0,
+        1,
+        failures,
+        0,
+    );
+    assert_eq!(summary["response_budget_refused"], 1);
+
+    let save_summary = ops_file_summary(
+        OpsFileReportMode::BoundedSave,
+        2,
+        1,
+        1,
+        0,
+        1,
+        Vec::new(),
+        0,
+    );
+    assert_eq!(save_summary["response_budget_refused"], 1);
+
+    let clean_summary = ops_file_summary(
+        OpsFileReportMode::LegacyNoSave,
+        1,
+        1,
+        0,
+        0,
+        0,
+        Vec::new(),
+        0,
+    );
+    assert!(clean_summary.get("response_budget_refused").is_none());
+}
+
+#[tokio::test]
+async fn ops_file_budget_refusal_returns_error_with_partial_success() {
+    let (server, _, _) = concurrency_probe_server(false);
+    let save_dir = tempfile::tempdir().expect("save directory");
+    let save_path = save_dir.path().join("ops.jsonl");
+    let save_path_arg = save_path.to_str().expect("UTF-8 save path").to_string();
+    let result = apply_ops_file_with_response_transform(
+        &server,
+        reader_probe_ops(2),
+        Some("verbose".to_string()),
+        None,
+        Some(save_path_arg),
+        false,
+        |_, raw| {
+            let mut response: serde_json::Value =
+                serde_json::from_str(&raw).expect("dispatch result is JSON");
+            response["results"][1] = serde_json::json!({
+                "ok": false,
+                "tool": "ops_file_concurrency_probe.reader_probe",
+                "error": {
+                    "kind": "response_budget_exceeded",
+                    "code": "response_budget_exceeded",
+                    "message": "per-request batch response budget of 4194304 serialized result bytes exceeded"
+                }
+            });
+            response["summary"]["succeeded"] = serde_json::json!(1);
+            response["summary"]["failed"] = serde_json::json!(1);
+            response["status"] = serde_json::json!("partial");
+            serde_json::to_string(&response).expect("serialize transformed batch")
+        },
+    )
+    .await;
+
+    let error = result.expect_err("a budget refusal must make the ops-file call fail");
+    assert!(
+        error.to_string().contains("response budget refused 1 op(s)"),
+        "unexpected refusal error: {error}"
+    );
+    let saved_rows = std::fs::read_to_string(&save_path).expect("save file published");
+    assert_eq!(saved_rows.lines().count(), 2);
+}
+
+#[tokio::test]
+async fn ops_file_budget_control_keeps_successful_batch_green() {
+    let (server, _, _) = concurrency_probe_server(false);
+    let save_dir = tempfile::tempdir().expect("save directory");
+    let save_path = save_dir.path().join("ops.jsonl");
+    let save_path_arg = save_path.to_str().expect("UTF-8 save path").to_string();
+    let manifest = apply_ops_file_with_response_transform(
+        &server,
+        reader_probe_ops(2),
+        Some("verbose".to_string()),
+        None,
+        Some(save_path_arg),
+        false,
+        |_, raw| raw,
+    )
+    .await
+    .expect("a clean batch without budget refusals remains successful");
+
+    assert_eq!(manifest["summary"]["total"], 2);
+    assert_eq!(manifest["summary"]["succeeded"], 2);
+    assert_eq!(manifest["summary"]["failed"], 0);
+    assert!(manifest["summary"].get("response_budget_refused").is_none());
 }
