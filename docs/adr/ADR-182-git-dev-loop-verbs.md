@@ -1663,3 +1663,61 @@ cases red; 127 a scoped link entry keeps mode `120000` and its literal target (A
 scoped checkout's stored manifest bytes carry a schema other than `khive-tree/v1`, and a manifest with
 any schema the store does not know is refused at load, the branch an older binary takes on a scoped
 manifest.
+
+## Amendment 25 (2026-11-28): committing a scoped tree
+
+**Status**: Proposed. The ADR's Accepted status and every amendment above stand unchanged, except
+that item 4 withdraws Amendment 24's refusal to commit a scoped tree.
+
+Amendment 24 lets a caller check out named paths and refuses to commit the tree it gets (item 3).
+This amendment commits it: the commit changes the paths inside the tree's scope and keeps every path
+outside it as the parent commit holds it. It also brings Amendment 24 item 1 in line with the
+refusals the verb makes.
+
+1. **Amendment 24 item 1, completed.** A path holding a backslash refuses `invalid_path` with the
+   other spellings, before git runs; the tree store refuses such a path in every manifest, so no tree
+   could hold it. A listed entry under no named path refuses `git_output`, naming the entry, and
+   nothing is stored: literal pathspecs make that case unreachable, and the check holds the listing
+   to its paths should they ever not.
+2. **`git.commit` of a scoped tree.** The commit's tree is the tree of `expected_head` with each
+   scope path replaced by the manifest's entries at or under it, written as a whole-tree commit
+   writes its entries (Amendment 2 item 2). A scope path under which the manifest holds no entry is
+   removed, and one the parent does not hold is added with the directories above it. Every path
+   outside the scope keeps the parent's object and mode, links and submodules included, and no blob
+   outside the scope is read: git lists, one level at a time, only the directories on the way from
+   the root to each scope path, and `mktree` writes those directories again with the changed child.
+   The work grows with the scope and its depth, never with the size of the repository. With
+   `merge_parent` the base is still the tree of `expected_head`, and the parents are recorded as
+   Amendment 14 gives.
+3. **Refused before any ref moves.** `outside_scope` names a manifest entry under no scope path:
+   the tree store does not hold entries to their scope, so an edit through `exec.tree_put` can add
+   one, and it is never dropped silently. `scope_conflict` names a path of the parent the scoped
+   tree cannot replace: a file, link or submodule on the way to a scope path, or a submodule at or
+   under one, which no manifest can hold and which the caller never saw. A scope path the parent
+   holds as a file or a link is replaced by what the manifest holds there. Both refusals record the
+   scope in the receipt.
+4. **Amendment 24 item 3's commit refusal is withdrawn.** `git.commit` no longer refuses
+   `scoped_tree`. The rest of item 3 stands: a scoped checkout writes `khive-tree/scoped-v1`, every
+   tree written from one keeps its scope, and a binary older than Amendment 24 refuses that schema
+   at load. A binary at Amendment 24 still refuses `scoped_tree`, so no binary commits a scoped tree
+   as a whole one. For a scoped tree the receipt's inputs gain `scope`, sorted.
+
+What this does not cover: changing a tree's scope, and merging a scope path the branch changed since
+the checkout. The commit writes the manifest's content there, as a whole-tree commit writes its
+whole manifest, and `expected_head` guards the branch only.
+
+Acceptance arms added: 129 a scoped checkout of one directory and one file, edited through
+`exec.tree_put` with one file changed, one added and one deleted under the directory, commits, and
+the commit's tree differs from the parent's at exactly those three paths while every other entry
+keeps its object id and mode (`ls-tree -r` of both); 130 a scope path under which the manifest holds
+nothing is removed, and a scope path the parent does not hold is added with its directories; 131 a
+manifest entry outside the scope refuses `outside_scope` naming it, with no ref moved; 132
+`scope_conflict` for a file on the way to a scope path and for a submodule under one, each naming
+the path, with no ref moved; 133 a repository holding a submodule and a link outside the scope
+commits a scoped edit, and both keep their mode and object; 134 a scoped commit with `merge_parent`
+has `expected_head` as its first parent and the merge parent as its second; 135 the repository of
+arm 125, too large for one manifest, commits a scoped edit; arm 126 now reads: each of its scoped
+trees keeps its scope and commits as a scoped tree, its tree equal to the parent's outside the scope,
+the one whose paths cover every entry included, and its mutation control stands; mutation control:
+building the commit from the manifest alone, without the parent's entries, turns arms 129 and 133
+red.
