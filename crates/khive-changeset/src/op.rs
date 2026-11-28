@@ -517,10 +517,7 @@ fn validate_update_congruence(
 /// The first alias a set names twice, whatever the origins: one entity holds
 /// one row per alias.
 fn repeated_alias(set: &[EntityAlias]) -> Option<&str> {
-    let mut seen = std::collections::BTreeSet::new();
-    set.iter()
-        .map(|held| held.alias.as_str())
-        .find(|alias| !seen.insert(*alias))
+    crate::record::repeated(set.iter().map(|held| held.alias.as_str()))
 }
 
 fn check_touched(field: &str, patch_touched: bool, preimage_present: bool) -> Result<(), String> {
@@ -701,7 +698,9 @@ impl<'de> Deserialize<'de> for DeletePreimage {
     {
         let raw = DeletePreimageRaw::deserialize(deserializer)?;
         Ok(match raw {
-            DeletePreimageRaw::Entity(e) => DeletePreimage::Entity(Box::new(e.into())),
+            DeletePreimageRaw::Entity(e) => {
+                DeletePreimage::Entity(Box::new(e.try_into().map_err(serde::de::Error::custom)?))
+            }
             DeletePreimageRaw::Note(n) => {
                 DeletePreimage::Note(Box::new(n.try_into().map_err(serde::de::Error::custom)?))
             }
@@ -802,8 +801,8 @@ impl<'de> Deserialize<'de> for MergePreimage {
             .map(|l| l.try_into().map_err(serde::de::Error::custom))
             .collect::<Result<Vec<Link>, D::Error>>()?;
         Ok(MergePreimage {
-            into: Box::new(raw.into.into()),
-            from: Box::new(raw.from.into()),
+            into: Box::new(raw.into.try_into().map_err(serde::de::Error::custom)?),
+            from: Box::new(raw.from.try_into().map_err(serde::de::Error::custom)?),
             incident_edges,
         })
     }

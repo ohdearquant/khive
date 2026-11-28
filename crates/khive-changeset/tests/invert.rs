@@ -1473,3 +1473,38 @@ fn a_keyed_create_with_aliases_inverts_to_a_soft_delete_carrying_them() {
         "aliases",
     );
 }
+
+#[test]
+fn a_created_alias_differing_from_the_name_only_by_case_is_held() {
+    use EntityAliasOrigin::Caller;
+    let row = entity(id(1), "name");
+    let Op::Create(mut create) = create_entity(&row) else {
+        unreachable!()
+    };
+    let CreateTarget::Entity(fields) = &mut create.target else {
+        unreachable!()
+    };
+    // A create drops only an alias byte-equal to the name, as the runtime's create does.
+    fields.aliases = vec!["Name".into(), "name".into()];
+    let forward = ChangeSet::new(envelope(1), vec![Op::Create(create)]);
+    let live = keyed(row, &[], held_aliases(&[("Name", Caller)]));
+    assert_inverse(
+        &forward,
+        &only(id(1), live.clone()),
+        vec![Op::Delete(DeleteOp {
+            target_id: id(1),
+            hard: false,
+            preimage: DeletePreimage::Entity(boxed(live.clone())),
+        })],
+    );
+    let mut folded = live;
+    folded.aliases.clear();
+    assert_invalidated(
+        forward
+            .invert(envelope(2), &only(id(1), folded))
+            .unwrap_err(),
+        0,
+        id(1),
+        "aliases",
+    );
+}

@@ -92,12 +92,12 @@ Decided as the lean. The domain columns are fact 7; the evidence row design is s
 
 Every type-level node is a `concept` entity in the type namespace with an `entity_type` from:
 `operation_type`, `variant`, `slot`, `step_type`, `requirement`, `rule`, `named_condition`,
-`gap_code`, `view`, `act_type`, `status_word`, `purpose`, `confidence`, `vocabulary` and
-`frontier_kind`. Relations between them are existing relations with endpoint rules this pack
-declares; where one pair of node types needs more than one meaning (a step type requires a field,
-or produces it), the meaning is a `role` in the edge's properties (fact 4). Each node holds the
-ADR-221 key `operation/<entity_type>/<canonical name>`, so a reload finds the node it loaded
-before.
+`gap_code`, `act_type`, `status_word`, `purpose`, `confidence`, `vocabulary` and
+`frontier_kind` (`view` is withdrawn by Amendment 1, A1.7). Relations between them are existing
+relations with endpoint rules this pack declares; where one pair of node types needs more than one
+meaning (a step type requires a field, or produces it), the meaning is a `role` in the edge's
+properties (fact 4). Each node holds the ADR-221 key `operation/<entity_type>/<canonical name>`,
+so a reload finds the node it loaded before.
 
 Publishing compiles one operation type or one step type, with everything it refers to, into
 canonical definition bytes and writes one row of `operation_definitions`: namespace, definition id,
@@ -254,9 +254,8 @@ opposite of what is asked.
 The clash is read per node type: one vocabulary may use the same word for a step type and a field,
 because every name a read returns says which node type it names.
 
-Published bytes hold canonical names only. Every read verb takes `vocabulary=` and renders names in
-it at read time, falling back to the canonical name with `name_fallback: true`. The same frontier
-read in two vocabularies therefore differs in names only.
+Published bytes hold canonical names only. Rendering a read in a vocabulary (`vocabulary=` on every
+read verb) is withdrawn by Amendment 1 (A1.7); names in vocabularies are still taken at `define`.
 
 Fields are forms-pack nodes. Their names in a vocabulary are written by the forms pack, which owns
 field entities: `forms.load` takes `known_as` on a field and holds each name as the same key on the
@@ -393,23 +392,9 @@ returns counts only: moments, agreed, agreed exactly, per label value, and the m
 (label, frontier) pair. A second run over the same population returns the same counts. It refuses
 a definition any of whose predicates reads the label kind, naming the term.
 
-Replay also takes **expected cases**: facts and bindings in, an expected view record out, with no
-history. It reports, per field of the view record, agreement, **false clear** (nothing owed where
-something is expected) and **discrimination** (two cases with different expected records must not
-get the same output).
-
-A **view** is data: a verdict chosen by ordered predicates over the frontier item kinds present,
-lists of items filtered by party class or kind, and the list of applicable step types.
-`operation.frontier(view=...)` returns that record.
-
-This answers #6894 section 6, which gives no lean:
-
-> Question 4: Whether a view is data the pack interprets, or left to the caller with only the replay measures
-> in the pack.
-
-Decided: data the pack interprets. Agreement, false clear and discrimination are measured per field
-of the view record, so the pack has to produce that record to measure it; with the view in the
-caller, replay would measure only what the caller reports.
+Expected cases and views (#6894 section 3.1, and its section 6 question 4) are withdrawn by
+Amendment 1 (A1.7): the caller that asked for them designs its graph fresh and does not need a view
+in its own shape. Replay over histories, its scoreboard rows and `conform` stay.
 
 `operation.conform(operation)` lists how a history departs from its type: acts with no step, steps
 done before a precondition held, required steps neither recorded nor inferred, and requirements
@@ -517,15 +502,16 @@ One pull request per row group, in this order. Each names the acceptance rows it
    names in vocabularies, with the forms change for field names. `REQUIRES` becomes `["kg",
    "forms"]` here. Keys are written through the runtime's entity key operations, as kg `create`
    writes them; a change set carries no key operation, so how `propose` changes a key is settled
-   in item 9. Rows: #6894 1, 2, 3 and 9.
+   in item 9. Rows: #6894 1, 2, 3 and 9, row 3 as Amendment 1 (A1.4) derives the places and orders
+   them, and row 9 for its alias clash only (the rendering in two vocabularies is withdrawn).
 4. Requirements and their levels, observations and reopened steps, external check results,
    freshness, `via` and inferred acts. Rows: #6893 3 to 6; #6894 4; #6892 section 4.9 row 7.
 5. Variants, rule records with any-of premises, named conditions and gap codes. Rows: #6894 5 to 8.
 6. Sources of three kinds, the disagreement list, and `contract` with part digests. Rows: #6893 7;
    #6894 10 and 11.
 7. `operation_approvals`, and versions pinned by operations. Rows: #6893 8 and 9.
-8. `replay`, scoreboard rows, views and expected cases, and `conform`. Rows: #6893 10, 11 and 16;
-   #6894 12.
+8. `replay`, scoreboard rows and `conform`. Rows: #6893 10, 11 and 16. (#6894 row 12, expected
+   cases through a view, is withdrawn by Amendment 1.)
 9. `propose` with a measure, and approval that publishes. Rows: #6893 12 and 13.
 10. Untyped operations, `trace`, `traces` and `typing`. Rows: #6893 14 and 15.
 11. Preconditions across operations and `needs_operation`; documents, conflicts, outcomes and
@@ -559,3 +545,214 @@ in the pull request the build order above names, with these readings:
   decides between a pack hook on apply and an operation verb that applies the change set and
   publishes in one transaction, and says which.
 - The charter engine's own evaluation code; the reuse in sections 2 and 9 is of its tables only.
+
+## Amendment 1 (2026-11-27): #6904, bindings are computed, not written
+
+#6904 withdraws the form-to-form mapping row (#6892 part 1, section 3 point 4): two forms' subjects
+meet through the slot each resolves to. It changes how a slot meets a form's subjects (its section
+2), where a required value may be found (its section 3) and how an outside history records an act
+(its section 4), and it no longer asks for four requests of #6894 (its section 6). Its section 7
+leaves four decisions to this pack, made in A1.6. Its section 5, facts about the operation itself,
+asks nothing yet and stays undecided here.
+
+### A1.1 One role list, in the forms pack
+
+Roles, subject kinds and relations are the term lists a caller loads with `forms.load` (`terms`),
+shared by every form of a namespace. Three things are added to them, all in the forms pack:
+
+- A term may carry aliases. A name or an alias resolves to its term; an alias that would resolve to
+  two terms of one list is refused at `forms.load`.
+- `counting_qualifiers`: the qualifiers that only count ("first", "second", "additional"). Any other
+  qualifier may change the meaning. Qualifiers are compared after folding case and spaces.
+- `carrying_relations`: the relations by which one subject carries another ("belongs to"). Each is a
+  relation term.
+
+A slot names its kind, its role and the relation it is defined by from these lists, as a step names
+a field (section 7). `define` refuses a slot whose kind, role or relation is not a term of the
+namespace by name or alias (`unknown_term`). From the pull request that builds this, `REQUIRES`
+holds `forms`.
+
+### A1.2 A slot is given one of two ways
+
+- By kind and role, with an optional qualifier:
+  `{"name": "co_applicant", "kind": "person", "role": "applicant", "qualifier": "additional"}`.
+- By a relation to another slot of the same type:
+  `{"name": "parcel_owner", "defined_by": {"relation": "owns", "slot": "parcel"}}`.
+
+`define` refuses as `slot_shape`: a kind without a role or a role without a kind, a qualifier
+without them, a slot given both ways, a slot defined by a relation to itself, and two slots of one
+type with the same kind, role and qualifier (a party that appears more than once is one slot that
+repeats). A `defined_by` naming no slot of the type is `unknown_slot`, and a chain of `defined_by`
+that comes back to where it started is `slot_cycle`. A slot given neither way is bound only by
+`bind`. The new fields are left out of a slot's definition bytes when absent, so the digest of a
+type that uses none of them does not change.
+
+### A1.3 `resolve` and `decide`
+
+`operation.resolve(type, version?, form, revision?)` is a read verb. It reads the published type
+(the latest version unless one is given), the form revision (the latest unless one is given), the
+namespace's terms and the decisions below, and writes nothing. For each subject of the form it
+returns the first of these that yields a slot, with how it was found:
+
+1. `decision`: the newest decision naming this type, this form and this subject that still applies
+   (below). It gives a slot, or `not_this_type`.
+2. `role`: the slots whose kind and role are the subject's, compared as terms. A subject with no
+   qualifier takes the slot of its kind and role that has none. A qualifier equal to a slot's takes
+   that slot. A counting qualifier that no slot carries takes the slot of its kind and role that
+   has no qualifier. Any other qualifier blocks the match: the subject is `undecided`, with the
+   slots of its kind and role as candidates.
+3. `relation`: a slot defined by relation R to slot S, where the subject carries R to a subject that
+   resolved to S.
+4. `carried`: the subject carries a carrying relation to a subject that resolved to a slot. It needs
+   no slot of its own and is returned with the slot of the subject that carries it.
+
+Rungs 3 and 4 repeat until no subject changes, so a chain of relations resolves. Where a rung
+yields more than one slot, or a slot that does not repeat is reached by two subjects, those subjects
+are `undecided` with the candidates, and later rungs are not tried for them. A subject no rung
+reaches is `no_slot`. Resolve never guesses. The answer names the type version and the form
+revision it read.
+
+`operation.decide(type, form, subjects, slot | not_this_type, reason)` records a decision. It
+refuses, writing nothing, a subject the form's latest revision does not declare and a slot the
+type's latest version does not have. Its rows are in `operation_slot_decisions`: namespace,
+decision id, definition id, form id, the subject ids, the type version and form revision decided
+against, the slot or `not_this_type`, the reason, the actor, the time, and the ids of the earlier
+rows it supersedes (each one that named one of its subjects for this type and form). One decision
+may cover several subjects. Resolve reads decisions per subject: for each subject the newest row
+that names it decides, so a row that a later row supersedes for one of its subjects still decides
+its other subjects. Three triggers refuse a second insert of a decision id, any update and any
+delete, as on `operation_definitions` (section 2). Bundles export decisions beside the types
+(section 13).
+
+A decision is keyed by definition id, form id and subject id, not by version or revision. It keeps
+applying to a later version of the type and a later revision of the form while the subject and the
+slot it names both still exist there; where one of them is gone, resolve returns undecided or
+no_slot and names the decision that lapsed. In detail: a subject still declared whose decided slot
+the version no longer has is returned `undecided`, with the candidates rungs 2 and 3 would offer, or
+`no_slot` where there are none, and its `lapsed` field names the decision. No rung binds it
+automatically, because the decision was written for a reason the rungs do not see. A decision whose
+subject the revision no longer declares is listed under the answer's `lapsed`. A `not_this_type`
+decision lapses only with its subject. Nothing is rewritten: a new decision supersedes the lapsed
+one.
+
+Arms:
+
+- A1.3-A, #6904 section 2, municipality A. The form's subjects are _applicant_, _additional
+  applicant_, _parcel_, _parcel owner_ (owns: parcel), _applicant's mailing address_ (belongs to:
+  applicant) and _permit being revoked_. The type's slots are `applicant`, `co_applicant`
+  (qualifier additional), `parcel`, and `parcel_owner` defined by "owns `parcel`". Resolve returns
+  role, role, role, relation, carried, and `no_slot` for the last; after a decision of
+  `not_this_type` for it, the last is `decision`.
+- A1.3-B, #6904 section 2, municipality B. A second form with other subject names and the same
+  roles resolves the same with no decision written.
+- A1.3-C, the lapse rule. The A decisions still apply after the type is published as version 2 and
+  the form gets revision 2 with the same subjects. A revision that drops _permit being revoked_
+  lists its decision under `lapsed`. With a decision binding a subject to `co_applicant`, a version
+  that drops `co_applicant` returns that subject `undecided` or `no_slot`, naming the lapsed
+  decision.
+
+### A1.4 Where a required value may be found
+
+This replaces the per-step "where it may be found" of #6894 section 1.2 in section 3's `requires`.
+
+1. Places are derived from `states` (#6892 part 1, section 3 point 2). A (field, slot) a step
+   requires may be found in every document type that states that field for a subject resolving to
+   that slot by A1.3.
+2. An outside system is declared the way a document type is: a record schema with subjects and
+   lines naming fields, loaded once in the forms pack and marked as a system. Its subjects resolve
+   as a form's do, so one declaration serves every form of every type.
+3. `input_missing` still carries the places, now derived. The order between them is the
+   deployment's, not a step's: a namespace publishes one `source_order` definition (a row of
+   `operation_definitions` with that kind), a list of document types and systems. Places come in its
+   order, then those it does not list, in name order. The frontier names the `source_order` version
+   it read.
+4. Stated in part. Where the field stated is the parent of the field required in the forms pack's
+   field hierarchy, the input is reported `stated_in_part`, with both fields and the place, so the
+   caller asks only for the difference.
+
+Places are the one derived input not taken from the type's published bytes (section 2). They are a
+reading of the forms pack at the time of the read, as resolve is, so a form loaded after a type is
+published adds its places without the type being published again. The frontier names the form
+revisions it read. Places and `stated_in_part` are fields of the `input_missing` item, never an
+item of their own, so they do not change which items a frontier holds or their kinds. Replay
+(section 12) compares item kinds and the steps and slots they name, not the places an item lists,
+so a form loaded later cannot move replay's counts.
+
+Arm A1.4, #6904 section 3, the portal's six lines. The portal's schema states _structure use_
+(residential or commercial). Form A asks _structure use by occupancy class_, a child field.
+`frontier` reports that input `stated_in_part` by the portal, and six portal lines written once
+answer both municipalities' forms.
+
+### A1.5 Recording an act without naming a step
+
+`record` accepts an act as an act type and a party class or a slot, in place of a step. It looks
+for the step among the steps of the operation's type and resolved variant that take that act type
+from that party. Where several fit, it records the act on those with no activating condition
+(section 4) and reports that it chose, and which. Where every step that fits has an activating
+condition, or none fits, it refuses (`act_ambiguous`, `act_unplaced`) and writes nothing. An outside
+system's declaration (A1.4 point 2) maps its own wording to an act type and a party class, or to a
+status word (section 6), and to nothing else.
+
+Arm A1.5: #6904 gives no case, so the pull request that builds this adds one. A history line
+"signed, by the applicant side" on an operation whose type has two signing steps for that side, one
+of them conditional, records the act on the other step and reports the choice.
+
+### A1.6 The four decisions of #6904 section 7
+
+1. Resolve is a read verb of its own, not part of `define`. A resolution depends on the form and on
+   the decisions recorded so far, and both change after a type is published, while a published
+   definition never changes (section 2). Inside `define`, a form loaded later or a decision
+   recorded later would not be seen until the type was published again.
+2. Decisions live in the store, in the append-only table of A1.3, written by `operation.decide` and
+   exported in bundles. Resolve reads them on every call, and the forms pack keeps the decisions of
+   `forms.same` and `forms.split` in the store the same way; a store that only indexed the caller's
+   files would answer with whatever the files held when they were last loaded. The key is
+   definition id, form id and subject, so a decision keeps applying to a later version of the type
+   and a later revision of the form while the subject and the slot it names both still exist
+   there; where one of them is gone, resolve returns undecided or no_slot and names the decision
+   that lapsed.
+3. The forms pack owns the role list, with the counting qualifiers and the carrying relations
+   (A1.1). With one owner, the role a subject carries and the role a slot asks for are the same
+   node, so the join is a node lookup. A third vocabulary that both packs read would have to be
+   loaded before either and kept in step with both.
+4. What undoes an act belongs to the operation type: the `reopens` of section 6. One outside system
+   serves several operation types, and what a rejection voids may differ between them; kept in the
+   system's declaration, it would be one table per type again, which #6904 removes.
+
+### A1.7 Withdrawn, and kept
+
+Withdrawn:
+
+- The form-to-form mapping row (#6892 part 1, section 3 point 4).
+- Rendering a read in a vocabulary (`vocabulary=` on every read verb, #6894 section 2.1). Names in
+  vocabularies stay at `define` (section 7), and #6894 row 9's alias clash is still refused there.
+- Views and replay against expected cases (#6894 section 3.1, and its section 6 question 4), with
+  the `view` node type. #6894 row 12 is not built.
+
+Kept, because the pack uses them by itself:
+
+- Gap codes as names the caller loads (section 6). The loading from an older vocabulary that #6894
+  section 1.4 asked for was never part of this record.
+- The rule record of section 4. Section 12's proposals are rules in `proposed`, and the any-of
+  premise was decided there on its own terms.
+- Replay over histories, its scoreboard rows and `conform` (section 12), which measure proposals.
+
+### A1.8 Where it lands in the build order
+
+- A1.1 to A1.3 are one pull request after item 1 and the forms subjects (#6892 part 1): the slot
+  shape, term aliases and the two lists in the forms pack, `resolve`, `decide` and
+  `operation_slot_decisions`. Arms A1.3-A, A1.3-B and A1.3-C.
+- A1.4 lands with item 3, once the forms pack has document types (#6892 part 2), with
+  `source_order`. Arm A1.4.
+- A1.5 lands with item 4, beside the status words it maps to. Arm A1.5.
+- Decisions in bundles land with item 12.
+
+Not checked:
+
+- A1.4 point 4 reads the forms pack's field hierarchy as a general field containing the fields it
+  generalizes (`contains` between two field nodes, read today by `children_of_field` in
+  `crates/khive-pack-forms/src/store.rs`). Whether every form a deployment loads places its fields
+  in that hierarchy was not checked.
+- How much of a form resolves without a decision depends on how normalized the role list is; #6904
+  section 8 reports six of eleven rows with one wording and ten with another. Nothing here measures
+  the counting-qualifier list either.

@@ -9,6 +9,7 @@ use khive_types::{
 };
 use serde::Deserialize;
 
+use crate::record::repeated;
 use crate::EntityRecord;
 
 #[derive(Deserialize)]
@@ -36,9 +37,23 @@ pub(crate) struct StrictEntity {
     aliases: Vec<EntityAlias>,
 }
 
-impl From<StrictEntity> for EntityRecord {
-    fn from(s: StrictEntity) -> Self {
-        EntityRecord {
+impl TryFrom<StrictEntity> for EntityRecord {
+    type Error = String;
+
+    fn try_from(s: StrictEntity) -> Result<Self, Self::Error> {
+        if let Some(key) = repeated(s.keys.iter().map(String::as_str)) {
+            return Err(format!(
+                "entity record {} keys name {key:?} more than once",
+                s.id
+            ));
+        }
+        if let Some(alias) = repeated(s.aliases.iter().map(|held| held.alias.as_str())) {
+            return Err(format!(
+                "entity record {} aliases name {alias:?} more than once",
+                s.id
+            ));
+        }
+        Ok(EntityRecord {
             entity: Entity {
                 header: Header {
                     id: s.id,
@@ -56,7 +71,7 @@ impl From<StrictEntity> for EntityRecord {
             },
             keys: s.keys,
             aliases: s.aliases,
-        }
+        })
     }
 }
 
