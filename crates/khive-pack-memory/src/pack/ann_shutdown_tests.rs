@@ -543,7 +543,13 @@ fn run_case_with_peer_close(mode: &'static str, injected_close: Option<InjectedP
         run.has(protocol::REQUEST_RETURNED) && run.counts().is_some()
     });
     if !request_returned {
-        eprintln!("memory ANN request-stage diagnostic: {:?}", run.events);
+        run.cleanup();
+        eprintln!(
+            "memory ANN request-stage diagnostic: status={:?}, events={:?}\n{}",
+            run.status(),
+            run.events,
+            run.output()
+        );
     }
     assert!(request_returned, "request_setup_guard");
     require_counts(&mut run);

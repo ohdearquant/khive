@@ -72,7 +72,7 @@ pub(crate) static GIT_ENTITY_TYPES: [EntityTypeDef; 1] = [EntityTypeDef {
 /// still `Commissive` — the speaker commits a persistent change, exactly the
 /// same illocutionary force as `create`/`link`, just against a different
 /// substrate (a git repo instead of khive's own storage).
-pub(crate) static GIT_HANDLERS: [HandlerDef; 17] = [
+pub(crate) static GIT_HANDLERS: [HandlerDef; 24] = [
     crate::local_vocab::INIT,
     crate::local_vocab::CHECKOUT,
     crate::local_vocab::DIFF,
@@ -163,6 +163,7 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 17] = [
             crate::local_vocab::BRANCH,
             crate::local_vocab::TREE,
             crate::local_vocab::EXPECTED_HEAD,
+            crate::local_vocab::MERGE_PARENT,
             crate::local_vocab::SESSION,
             ParamDef {
                 name: "repo",
@@ -234,4 +235,11 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 17] = [
     crate::remote_vocab::PR_OPEN,
     crate::remote_vocab::PR_REVIEW,
     crate::remote_vocab::PR_MERGE,
+    crate::remote_vocab::PR_STATE,
+    crate::remote_vocab::ISSUE,
+    crate::remote_vocab::FETCH,
+    crate::remote_vocab::PR_EDIT,
+    crate::remote_vocab::PR_CLOSE,
+    crate::remote_vocab::CHECK_LOG,
+    crate::local_vocab::BRANCH_DELETE,
 ];

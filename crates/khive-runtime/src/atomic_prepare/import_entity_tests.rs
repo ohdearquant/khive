@@ -306,6 +306,7 @@ async fn import_update_projection_matches_the_bound_canonical_plan() {
             tags: Some(vec!["replacement-tag".into()]),
             entity_type: None,
         },
+        &crate::EntityAliasChange::default(),
         Some(original.version),
     )
     .await

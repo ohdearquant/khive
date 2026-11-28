@@ -247,8 +247,9 @@ pub struct EmailChannelConfig {
     /// instead of being dropped. Defaults to `true`. When `false`, such messages
     /// are dropped with only the IMAP UID and quarantine reason logged.
     pub quarantine_store: bool,
-    /// Trust Exchange Online's stamped internal-hop header for same-domain
-    /// maintainer mail only. Valid only when this mailbox is hosted by Exchange Online.
+    /// Trust Exchange Online's stamped internal-hop header for same-domain maintainer mail.
+    /// The operator must confirm the mailbox is hosted by Exchange Online and its receiving
+    /// boundary strips sender-supplied AuthAs headers; configuration does not verify this.
     pub trust_exchange_internal: bool,
     /// Most quarantine records that may hold a stored original message at
     /// once. Every quarantined message is still recorded; once the ingest
@@ -260,6 +261,10 @@ pub struct EmailChannelConfig {
 
 /// Default for `KHIVE_EMAIL_QUARANTINE_MAX_RETAINED`.
 pub(crate) const DEFAULT_QUARANTINE_MAX_RETAINED: usize = 256;
+
+pub(crate) const EXCHANGE_INTERNAL_PRECONDITION: &str =
+    "Use only when the mailbox is hosted by Exchange Online and its receiving boundary strips \
+     sender-supplied X-MS-Exchange-Organization-AuthAs headers. khive does not verify either condition.";
 
 impl EmailChannelConfig {
     /// Load configuration from environment variables.
@@ -350,7 +355,13 @@ impl EmailChannelConfig {
         let authserv_id_raw = require_nonempty_env("KHIVE_EMAIL_AUTHSERV_ID")?;
         let trust_anchor = TrustAnchor::parse(authserv_id_raw)?;
         let quarantine_store = optional_bool("KHIVE_EMAIL_QUARANTINE_STORE", true)?;
-        let trust_exchange_internal = optional_bool("KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL", false)?;
+        let trust_exchange_internal = optional_bool("KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL", false)
+            .map_err(|error| match error {
+            ChannelError::Config(message) => {
+                ChannelError::Config(format!("{message}. {EXCHANGE_INTERNAL_PRECONDITION}"))
+            }
+            other => other,
+        })?;
         let quarantine_max_retained = optional_count(
             "KHIVE_EMAIL_QUARANTINE_MAX_RETAINED",
             DEFAULT_QUARANTINE_MAX_RETAINED,
@@ -1036,6 +1047,8 @@ mod tests {
         let _snap = EnvSnapshot::capture(&RETAINED_KEYS);
         let _flag_snap = EnvSnapshot::capture(&["KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL"]);
         set_minimal_valid_env();
+        std::env::set_var("KHIVE_EMAIL_IMAP_HOST", "imap.non-exchange.example");
+        std::env::set_var("KHIVE_EMAIL_AUTHSERV_ID", "mx.non-exchange.example");
 
         std::env::remove_var("KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL");
         let config = EmailChannelConfig::from_env().expect("valid config must succeed");
@@ -1044,6 +1057,11 @@ mod tests {
         std::env::set_var("KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL", "true");
         let config = EmailChannelConfig::from_env().expect("valid config must succeed");
         assert!(config.trust_exchange_internal);
+        assert_eq!(config.imap_host, "imap.non-exchange.example");
+        assert_eq!(
+            config.trust_anchor,
+            TrustAnchor::AuthservId("mx.non-exchange.example".to_string())
+        );
 
         std::env::set_var("KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL", "off");
         let config = EmailChannelConfig::from_env().expect("valid config must succeed");
@@ -1056,6 +1074,18 @@ mod tests {
         assert!(
             error.contains("KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL"),
             "got: {error}"
+        );
+        assert!(
+            error.contains("mailbox is hosted by Exchange Online"),
+            "{error}"
+        );
+        assert!(
+            error.contains("boundary strips sender-supplied X-MS-Exchange-Organization-AuthAs"),
+            "{error}"
+        );
+        assert!(
+            error.contains("does not verify either condition"),
+            "{error}"
         );
     }
 

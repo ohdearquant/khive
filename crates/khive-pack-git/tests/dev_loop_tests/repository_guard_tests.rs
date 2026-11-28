@@ -33,6 +33,9 @@ async fn amendment12_arm5_program_is_unknown_on_every_repository_verb() {
             "git.update_ref" => {
                 vec![json!({"repo":f.repo,"branch":"work","to":f.base,"expected":f.base})]
             }
+            "git.branch_delete" => {
+                vec![json!({"repo":f.repo,"name":"work","expected":f.base})]
+            }
             "git.commit" => vec![
                 f.commit_params(&manifest),
                 json!({"repo":f.repo,"paths":["a.txt"],"message":"legacy program control"}),
@@ -57,6 +60,14 @@ async fn amendment12_arm5_program_is_unknown_on_every_repository_verb() {
                     json!({"repo":f.repo,"number":1,"method":"squash","subject":"Program control","body":"","expected_head":f.base}),
                 ]
             }
+            "git.pr_state" => vec![json!({"repo":f.repo,"number":1})],
+            "git.issue" => vec![json!({"repo":f.repo,"number":1})],
+            "git.check_log" => vec![json!({"repo":f.repo,"check_run":1})],
+            "git.pr_edit" => vec![
+                json!({"repo":f.repo,"number":1,"title":"Program control","expected_head":f.base}),
+            ],
+            "git.pr_close" => vec![json!({"repo":f.repo,"number":1,"expected_head":f.base})],
+            "git.fetch" => vec![json!({"repo":f.repo,"ref":"work"})],
             "git.receipts" | "git.gates" | "git.status" | "git.log" => {
                 vec![json!({"repo":f.repo})]
             }

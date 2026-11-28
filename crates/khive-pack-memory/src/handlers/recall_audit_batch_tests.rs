@@ -473,6 +473,7 @@ fn fields(query: &str, targets: Vec<String>) -> RecallExecutedFields {
         latency_us: 17,
         ann_degraded: false,
         ann_degraded_reason: None,
+        label: None,
     }
 }
 

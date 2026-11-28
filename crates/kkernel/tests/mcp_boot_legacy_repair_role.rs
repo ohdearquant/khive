@@ -72,6 +72,7 @@ fn repair_boot_line(role: Role, layout: Layout) -> String {
     let dir = tempfile::Builder::new()
         .prefix("lqr-")
         .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("lqr-").tempdir())
         .unwrap();
     let root = dir.path().canonicalize().unwrap();
     let mut command = command(&root);

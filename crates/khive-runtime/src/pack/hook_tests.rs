@@ -11,7 +11,7 @@ impl Pack for SimplePack {
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
-        name: "ping",
+        name: "simple.ping",
         description: "ping",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
@@ -128,7 +128,7 @@ async fn dispatch_hook_fires_on_successful_dispatch() {
     builder.with_dispatch_hook(hook.clone());
     let reg = builder.build().expect("registry builds");
 
-    reg.dispatch("ping", Value::Null).await.unwrap();
+    reg.dispatch("simple.ping", Value::Null).await.unwrap();
 
     assert_eq!(
         hook.calls.load(Ordering::SeqCst),
@@ -137,7 +137,7 @@ async fn dispatch_hook_fires_on_successful_dispatch() {
     );
     assert_eq!(
         hook.last_verb.lock().unwrap().as_str(),
-        "ping",
+        "simple.ping",
         "hook event must carry the dispatched verb"
     );
 }
@@ -150,9 +150,9 @@ async fn dispatch_hook_fires_multiple_times() {
     builder.with_dispatch_hook(hook.clone());
     let reg = builder.build().expect("registry builds");
 
-    reg.dispatch("ping", Value::Null).await.unwrap();
-    reg.dispatch("ping", Value::Null).await.unwrap();
-    reg.dispatch("ping", Value::Null).await.unwrap();
+    reg.dispatch("simple.ping", Value::Null).await.unwrap();
+    reg.dispatch("simple.ping", Value::Null).await.unwrap();
+    reg.dispatch("simple.ping", Value::Null).await.unwrap();
 
     assert_eq!(
         hook.calls.load(Ordering::SeqCst),
@@ -225,7 +225,7 @@ async fn dispatch_hook_does_not_fire_on_gate_deny() {
     builder.with_dispatch_hook(hook.clone());
     let reg = builder.build().expect("registry builds");
 
-    let err = reg.dispatch("ping", Value::Null).await.unwrap_err();
+    let err = reg.dispatch("simple.ping", Value::Null).await.unwrap_err();
     assert!(matches!(err, RuntimeError::PermissionDenied { .. }));
 
     assert_eq!(
@@ -257,9 +257,12 @@ async fn dispatch_hook_event_carries_namespace_from_params() {
     builder.with_dispatch_hook(ns_hook.clone());
     let reg = builder.build().expect("registry builds");
 
-    reg.dispatch("ping", serde_json::json!({"namespace": "tenant-abc"}))
-        .await
-        .unwrap();
+    reg.dispatch(
+        "simple.ping",
+        serde_json::json!({"namespace": "tenant-abc"}),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         ns_hook.ns.lock().unwrap().as_str(),
@@ -279,6 +282,6 @@ async fn no_dispatch_hook_configured_dispatch_succeeds() {
     // No with_dispatch_hook call.
     let reg = builder.build().expect("registry builds");
 
-    let res = reg.dispatch("ping", Value::Null).await.unwrap();
-    assert_eq!(res["verb"], "ping");
+    let res = reg.dispatch("simple.ping", Value::Null).await.unwrap();
+    assert_eq!(res["verb"], "simple.ping");
 }

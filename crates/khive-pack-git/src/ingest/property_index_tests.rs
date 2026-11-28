@@ -757,47 +757,344 @@ async fn dispatched_project_id_normalization_preserves_validation_and_omission()
     }
 }
 
+#[derive(Default)]
+struct NumberEventFields(serde_json::Map<String, Value>);
+
+impl tracing::field::Visit for NumberEventFields {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.insert(field.name().into(), json!(value));
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().into(), json!(value));
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0
+            .insert(field.name().into(), json!(format!("{value:?}")));
+    }
+}
+
+struct NumberEventSubscriber {
+    events: Arc<std::sync::Mutex<Vec<Value>>>,
+    next_span: std::sync::atomic::AtomicU64,
+}
+
+impl tracing::Subscriber for NumberEventSubscriber {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(
+            self.next_span
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut fields = NumberEventFields::default();
+        event.record(&mut fields);
+        self.events.lock().unwrap().push(json!({
+            "level": event.metadata().level().to_string(),
+            "target": event.metadata().target(),
+            "fields": fields.0,
+        }));
+    }
+}
+
+async fn capture_number_lookup(
+    future: impl std::future::Future<Output = Result<Option<Uuid>>>,
+) -> (Option<Uuid>, Vec<Value>) {
+    use tracing::instrument::WithSubscriber;
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dispatch = tracing::Dispatch::new(NumberEventSubscriber {
+        events: events.clone(),
+        next_span: std::sync::atomic::AtomicU64::new(1),
+    });
+    let result = async {
+        tokio::task::yield_now().await;
+        tracing::warn!(target: "git_number_lookup_probe", "number lookup subscriber is active");
+        future.await.unwrap()
+    }
+    .with_subscriber(dispatch)
+    .await;
+    let captured = events.lock().unwrap().clone();
+    (result, captured)
+}
+
+fn assert_number_observation(
+    observation: (Option<Uuid>, Vec<Value>),
+    expected: Option<Uuid>,
+    duplicate_kind: Option<&str>,
+    project: Uuid,
+    number: u64,
+) {
+    let (actual, events) = observation;
+    assert_eq!(
+        actual, expected,
+        "the lowest stored ID must decide the result"
+    );
+    let probes: Vec<_> = events
+        .iter()
+        .filter(|event| event["target"] == "git_number_lookup_probe")
+        .cloned()
+        .collect();
+    assert_eq!(
+        probes,
+        vec![json!({
+            "level": "WARN", "target": "git_number_lookup_probe",
+            "fields": {"message": "number lookup subscriber is active"},
+        })],
+        "the subscriber must capture a real event after an async yield"
+    );
+    let diagnostics: Vec<_> = events
+        .iter()
+        .filter(|event| event["target"] == "khive_pack_git::ingest")
+        .cloned()
+        .collect();
+    let expected_diagnostics: Vec<_> = duplicate_kind
+        .map(|kind| json!({
+            "level": "WARN", "target": "khive_pack_git::ingest",
+            "fields": {
+                "message": "multiple live notes match GitHub number; selecting first by stored ID",
+                "kind": kind, "namespace": "local", "project_id": project.to_string(),
+                "number": number, "matched_at_least": 2,
+            },
+        }))
+        .into_iter()
+        .collect();
+    assert_eq!(diagnostics, expected_diagnostics);
+    assert!(!serde_json::to_string(&events)
+        .unwrap()
+        .contains("private-note"));
+}
+
+async fn number_read_snapshot(runtime: &KhiveRuntime) -> Value {
+    snapshot(
+        &query(
+            runtime,
+            "SELECT * FROM notes ORDER BY id COLLATE BINARY",
+            vec![],
+        )
+        .await,
+    )
+}
+
 #[tokio::test]
-async fn number_duplicates_retain_unspecified_holder_including_invalid_ids() {
-    for invalid_first in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let runtime = file_runtime(&dir.path().join("duplicates.db"), false);
-        let token = runtime.authorize(Namespace::local()).unwrap();
-        let project = Uuid::new_v4();
-        let valid = Uuid::new_v4();
-        let ids = if invalid_first {
-            vec!["invalid-issue-id".to_string(), valid.to_string()]
-        } else {
-            vec![valid.to_string(), "invalid-issue-id".to_string()]
-        };
-        for id in &ids {
-            insert(
-                &runtime,
-                id,
-                "local",
-                "issue",
-                json!({"number":55,"project_id":project.to_string()}),
-                false,
-            );
-        }
-        for indexed in [false, true] {
-            if indexed {
-                install(&runtime);
+async fn number_duplicates_choose_stable_holder_and_warn() {
+    let project = Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap();
+    let other_project = Uuid::from_u128(99);
+    let groups = [
+        ("issue", 0x2000_0000_0000_4000_8000_0000_0000_0000_u128),
+        (
+            "pull_request",
+            0x3000_0000_0000_4000_8000_0000_0000_0000_u128,
+        ),
+    ];
+    for indexed in [false, true] {
+        for reverse in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("duplicates.db");
+            let mut runtime = file_runtime(&path, false);
+            configure_property_indexes(&runtime, indexed);
+            let mut decoy_id = 1_u128;
+            for (kind, base) in groups {
+                let mut ids: Vec<_> = (1..=3).map(|n| Uuid::from_u128(base + n)).collect();
+                if reverse {
+                    ids.reverse();
+                } else {
+                    ids.rotate_left(1);
+                }
+                for id in ids {
+                    insert(
+                        &runtime,
+                        &id.to_string(),
+                        "local",
+                        kind,
+                        json!({"number":55,"project_id":project.to_string(),"private-note":"content-canary"}),
+                        false,
+                    );
+                }
+                for (ns, decoy_kind, decoy_project, number, deleted) in [
+                    ("other", kind, project, 55, false),
+                    ("local", kind, other_project, 55, false),
+                    ("local", "observation", project, 55, false),
+                    ("local", kind, project, 56, false),
+                    ("local", kind, project, 55, true),
+                ] {
+                    insert(
+                        &runtime,
+                        &Uuid::from_u128(decoy_id).to_string(),
+                        ns,
+                        decoy_kind,
+                        json!({"number":number,"project_id":decoy_project.to_string()}),
+                        deleted,
+                    );
+                    decoy_id += 1;
+                }
             }
-            let rows = query(
-                &runtime,
-                sql!("notes_by_number_select"),
-                number_params("issue", 55, project),
-            )
-            .await;
-            assert_eq!(rows.len(), 1);
-            let selected = rows[0].get("id");
-            assert!(matches!(selected,Some(SqlValue::Text(id)) if ids.contains(id)));
-            let actual = find_by_number(&runtime, &token, "issue", project, 55)
-                .await
-                .unwrap();
-            assert!(actual.is_none() || actual == Some(valid));
-            println!("UNSPECIFIED_NUMBER_WINNER invalid_first={invalid_first} indexed={indexed} selected={selected:?} resolved={actual:?}");
+            for stage in 0..3 {
+                if stage == 1 {
+                    runtime
+                        .backend()
+                        .pool()
+                        .try_writer()
+                        .unwrap()
+                        .autocommit(|conn| Ok(conn.execute_batch("ANALYZE")?))
+                        .unwrap();
+                } else if stage == 2 {
+                    close_file_runtime(runtime).await;
+                    runtime = file_runtime(&path, false);
+                }
+                let indexes = query(
+                    &runtime,
+                    "SELECT name FROM sqlite_master WHERE type='index' AND name=?1",
+                    vec![SqlValue::Text(NUMBER_INDEX.into())],
+                )
+                .await;
+                assert_eq!(
+                    indexes.len(),
+                    if indexed { 1 } else { 0 },
+                    "the number-index state must survive stage {stage} without reinstalling"
+                );
+                let token = runtime.authorize(Namespace::local()).unwrap();
+                let before = number_read_snapshot(&runtime).await;
+                for (kind, base) in groups {
+                    let expected = Uuid::from_u128(base + 1);
+                    assert_number_observation(
+                        capture_number_lookup(find_by_number(&runtime, &token, kind, project, 55))
+                            .await,
+                        Some(expected),
+                        Some(kind),
+                        project,
+                        55,
+                    );
+                    let rows = query(
+                        &runtime,
+                        sql!("notes_by_number_select"),
+                        number_params(kind, 55, project),
+                    )
+                    .await;
+                    let ids: Vec<_> = rows.iter().map(|row| row.uuid("id").unwrap()).collect();
+                    assert_eq!(ids, vec![expected, Uuid::from_u128(base + 2)]);
+                }
+                assert_number_observation(
+                    capture_number_lookup(find_issue_or_pr_by_number(
+                        &runtime, &token, project, 55,
+                    ))
+                    .await,
+                    Some(Uuid::from_u128(groups[0].1 + 1)),
+                    Some("issue"),
+                    project,
+                    55,
+                );
+                assert_eq!(number_read_snapshot(&runtime).await, before);
+            }
+            let token = runtime.authorize(Namespace::local()).unwrap();
+            for (kind, base) in groups {
+                for removed in 1..=3 {
+                    delete(&runtime, &Uuid::from_u128(base + removed).to_string());
+                    let before = number_read_snapshot(&runtime).await;
+                    let expected = (removed < 3).then(|| Uuid::from_u128(base + removed + 1));
+                    assert_number_observation(
+                        capture_number_lookup(find_by_number(&runtime, &token, kind, project, 55))
+                            .await,
+                        expected,
+                        (removed == 1).then_some(kind),
+                        project,
+                        55,
+                    );
+                    assert_eq!(number_read_snapshot(&runtime).await, before);
+                }
+                if kind == "issue" {
+                    let before = number_read_snapshot(&runtime).await;
+                    assert_number_observation(
+                        capture_number_lookup(find_issue_or_pr_by_number(
+                            &runtime, &token, project, 55,
+                        ))
+                        .await,
+                        Some(Uuid::from_u128(groups[1].1 + 1)),
+                        Some("pull_request"),
+                        project,
+                        55,
+                    );
+                    assert_eq!(number_read_snapshot(&runtime).await, before);
+                }
+                for (number, invalid, valid_first) in [
+                    (66, format!("!private-note-{kind}-first"), false),
+                    (77, format!("zz-private-note-{kind}-last"), true),
+                ] {
+                    let valid = Uuid::from_u128(base + number as u128);
+                    for id in [valid.to_string(), invalid.clone()] {
+                        insert(
+                            &runtime,
+                            &id,
+                            "local",
+                            kind,
+                            json!({"number":number,"project_id":project.to_string()}),
+                            false,
+                        );
+                    }
+                    let before = number_read_snapshot(&runtime).await;
+                    assert_number_observation(
+                        capture_number_lookup(find_by_number(
+                            &runtime, &token, kind, project, number,
+                        ))
+                        .await,
+                        valid_first.then_some(valid),
+                        Some(kind),
+                        project,
+                        number,
+                    );
+                    let rows = query(
+                        &runtime,
+                        sql!("notes_by_number_select"),
+                        number_params(kind, number as i64, project),
+                    )
+                    .await;
+                    let expected_ids = if valid_first {
+                        vec![valid.to_string(), invalid]
+                    } else {
+                        vec![invalid, valid.to_string()]
+                    };
+                    let actual_ids: Vec<_> = rows
+                        .iter()
+                        .map(|row| match row.get("id") {
+                            Some(SqlValue::Text(id)) => id.clone(),
+                            other => panic!("expected stored ID text, got {other:?}"),
+                        })
+                        .collect();
+                    assert_eq!(actual_ids, expected_ids);
+                    assert_eq!(number_read_snapshot(&runtime).await, before);
+                }
+                insert(
+                    &runtime,
+                    &format!("private-note-{kind}-unique"),
+                    "local",
+                    kind,
+                    json!({"number":88,"project_id":project.to_string()}),
+                    false,
+                );
+                let before = number_read_snapshot(&runtime).await;
+                assert_number_observation(
+                    capture_number_lookup(find_by_number(&runtime, &token, kind, project, 88))
+                        .await,
+                    None,
+                    None,
+                    project,
+                    88,
+                );
+                assert_eq!(number_read_snapshot(&runtime).await, before);
+            }
+            drop(token);
+            close_file_runtime(runtime).await;
         }
     }
 }

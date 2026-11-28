@@ -3,6 +3,39 @@ use std::collections::HashSet;
 use super::{EndpointKind, PackRuntime, Visibility};
 use crate::RuntimeError;
 
+// Keep this runtime-private copy aligned with the authoritative contract in
+// kkernel/tests/verb_namespace_contract.rs. Its equality test reads this exact
+// slice through the builder's test-internals accessor, without a runtime
+// dependency on kkernel or a pack implementation.
+pub(super) const KG_SUBSTRATE_VERBS: &[&str] = &[
+    "create",
+    "get",
+    "list",
+    "count",
+    "stats",
+    "update",
+    "delete",
+    "restore",
+    "search",
+    "link",
+    "neighbors",
+    "traverse",
+    "query",
+    "merge",
+    "propose",
+    "review",
+    "withdraw",
+    "verbs",
+    "schema",
+    "context",
+    "resolve",
+    "whoami",
+    "scan",
+    "db_diagnostics",
+    "apply_changeset",
+    "attach",
+];
+
 /// Validate exact wire spellings and endpoints against the composed vocabulary.
 pub(super) fn validate_declarations(packs: &[Box<dyn PackRuntime>]) -> Result<(), RuntimeError> {
     let mut note_kinds = HashSet::new();
@@ -17,6 +50,29 @@ pub(super) fn validate_declarations(packs: &[Box<dyn PackRuntime>]) -> Result<()
             {
                 return Err(RuntimeError::InvalidInput(format!(
                     "pack {:?} declares invalid public handler {:?}; expected one or two ASCII identifier segments",
+                    pack.name(), handler.name
+                )));
+            }
+        }
+        // The label itself is reserved, including empty/internal-only packs.
+        // Keep the existing public identifier checks ahead of ownership checks.
+        if pack.name() == "stream" {
+            let declaration = pack
+                .handlers()
+                .first()
+                .map(|handler| format!(" for handler {:?}", handler.name))
+                .unwrap_or_default();
+            return Err(RuntimeError::InvalidInput(format!(
+                "pack {:?} uses reserved owner label{declaration}; stream.* public names belong to kg",
+                pack.name()
+            )));
+        }
+        for handler in pack.handlers() {
+            if matches!(handler.visibility, Visibility::Verb)
+                && !owns_public_handler(pack.name(), handler.name)
+            {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "pack {:?} declares public handler {:?} outside its namespace; kg permits only its bare allowlist and stream.<identifier>, other owners require their exact prefix",
                     pack.name(), handler.name
                 )));
             }
@@ -53,6 +109,15 @@ pub(super) fn validate_declarations(packs: &[Box<dyn PackRuntime>]) -> Result<()
         }
     }
     Ok(())
+}
+
+// Called only after the existing identifier grammar has accepted the name.
+fn owns_public_handler(owner: &str, name: &str) -> bool {
+    match name.split_once('.') {
+        None => owner == "kg" && KG_SUBSTRATE_VERBS.contains(&name),
+        Some((prefix, _)) if owner == "kg" => prefix == "stream",
+        Some((prefix, _)) => prefix == owner,
+    }
 }
 
 fn is_kind_name(name: &str) -> bool {

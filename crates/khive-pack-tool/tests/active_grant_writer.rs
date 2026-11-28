@@ -949,6 +949,9 @@ async fn named_grant_actor_tool_patterns_and_namespace_are_exact() {
             ("nul\0*", "nul\0tail", true),
             ("nul\0exact", "nul\0other", false),
         ] {
+            let matches = matches
+                || (column == "tool"
+                    && matches!((pattern, value), ("Exact", "exact") | ("Pre*", "prefix")));
             f.clear().await;
             let mut row = Grant::live(HELD, 10, None);
             if column == "actor" {
@@ -1071,6 +1074,7 @@ fn variant(error: &StorageError) -> &'static str {
         StorageError::AlreadyExists { .. } => "AlreadyExists",
         StorageError::Conflict { .. } => "Conflict",
         StorageError::InvalidInput { .. } => "InvalidInput",
+        StorageError::SecretDetected { .. } => "SecretDetected",
         StorageError::Unsupported { .. } => "Unsupported",
         StorageError::BlobTooLarge { .. } => "BlobTooLarge",
         StorageError::BlobSizeMismatch { .. } => "BlobSizeMismatch",
@@ -1090,6 +1094,9 @@ fn variant(error: &StorageError) -> &'static str {
         StorageError::WriterTaskBusy { .. } => "WriterTaskBusy",
         StorageError::WriterTaskRequestFailed { .. } => "WriterTaskRequestFailed",
         StorageError::WriterTaskTerminated { .. } => "WriterTaskTerminated",
+        StorageError::WriteOutcomeUnknown { .. } => "WriteOutcomeUnknown",
+        StorageError::WriterOwnerUnavailable { .. } => "WriterOwnerUnavailable",
+        StorageError::WriterRouteViolation { .. } => "WriterRouteViolation",
         StorageError::Internal(..) => "Internal",
         StorageError::WriterTaskNoRuntime => "WriterTaskNoRuntime",
         StorageError::CapacityFloor { .. } => "CapacityFloor",

@@ -240,6 +240,7 @@ async fn issue2673_entity_version_lifecycle_and_import_writers_advance_once() {
                 description: None,
                 properties: None,
                 tags: vec![],
+                aliases: Vec::new(),
             }],
         )
         .await

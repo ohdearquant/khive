@@ -60,7 +60,7 @@ and `api/snapshot-hash.md` (content-addressed `SnapshotId` hashing).
   does not match, the function returns an error before any cache file is written.
 - `RemoteConfig` maps to one entry in `schema.yaml`'s `remotes:` list.
 - Cache layout: `.khive/kg/remotes/<name>/` with `entities.ndjson`, `edges.ndjson`,
-  and `meta.json` (containing `fetched_at`, `git_ref`, `commit_sha`, `content_hash`).
+  and `meta.json` (containing `fetched_at`, `git_ref`, `commit_sha`, `content_hash`, `coverage`).
 - When `repin=true`, pin comparison is skipped and the actual hash is returned for the
   caller to write back to `schema.yaml`. The hash is always computed and written to
   `meta.json` for auditability even when no pin is present.

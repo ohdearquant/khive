@@ -2,9 +2,13 @@ use std::collections::BTreeMap;
 
 use khive_changeset::{
     from_ndjson, to_ndjson, ChangeSet, CreateOp, CreateTarget, CurrentState, DeleteOp,
-    DeletePreimage, EntityCreateFields, EntityPatch, EntityPreimage, Envelope, Op, UpdateOp,
-    UpdatePatch, UpdatePreimage,
+    DeletePreimage, EntityCreateFields, EntityPatch, EntityPreimage, EntityRecord, Envelope, Op,
+    UpdateOp, UpdatePatch, UpdatePreimage,
 };
+
+fn boxed(row: impl Into<EntityRecord>) -> Box<EntityRecord> {
+    Box::new(row.into())
+}
 use khive_types::{Entity, EntityKind, Header, Id128, Namespace, PropertyValue, Timestamp};
 
 #[derive(Clone, Copy)]
@@ -29,6 +33,7 @@ fn update(id: Id128, after: String, before: String) -> Op {
                 entity_type: None,
                 properties: None,
                 tags: None,
+                aliases: None,
             }),
             UpdatePreimage::Entity(EntityPreimage {
                 name: Some(before),
@@ -36,6 +41,7 @@ fn update(id: Id128, after: String, before: String) -> Op {
                 entity_type: None,
                 properties: None,
                 tags: None,
+                aliases: None,
             }),
         )
         .expect("congruent name patch/preimage"),
@@ -86,12 +92,14 @@ impl Fixture {
                             description: row.description.clone(),
                             properties: row.properties.clone(),
                             tags: row.tags.clone(),
+                            key: None,
+                            aliases: vec![],
                         }),
                     }));
                     inverse_ops.push(Op::Delete(DeleteOp {
                         target_id: id,
                         hard: false,
-                        preimage: DeletePreimage::Entity(Box::new(row.clone())),
+                        preimage: DeletePreimage::Entity(boxed(row.clone())),
                     }));
                 }
                 Shape::Update => {
@@ -100,7 +108,7 @@ impl Fixture {
                     inverse_ops.push(update(id, before, row.name.clone()));
                 }
             }
-            assert!(current.entities.insert(id, row).is_none());
+            assert!(current.entities.insert(id, row.into()).is_none());
         }
         let forward = ChangeSet::new(
             Envelope::new("benchmark", "codec", Timestamp::from_secs(1)),

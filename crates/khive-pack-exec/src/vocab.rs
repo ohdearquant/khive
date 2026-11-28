@@ -51,6 +51,14 @@ const P_TREE: ParamDef = ParamDef {
     resolution_mode: IdResolutionMode::NotApplicable,
 };
 
+const P_CHANGED_LIMIT: ParamDef = ParamDef {
+    name: "changed_limit",
+    param_type: "integer",
+    required: false,
+    description: "Most changes the reply's change list carries, 0 to 10,000 (default 1000); a larger value is refused, not clamped. The list also stops at 262,144 bytes of its JSON-lines form, and changed_count, changed_truncated and changed_ref (the blob holding the full list as JSON lines, read with blob.get range) say what was cut.",
+    resolution_mode: IdResolutionMode::NotApplicable,
+};
+
 #[rustfmt::skip]
 pub static EXEC_HANDLERS: [HandlerDef; 9] = [
     HandlerDef {
@@ -72,29 +80,31 @@ pub static EXEC_HANDLERS: [HandlerDef; 9] = [
     },
     HandlerDef {
         name: "exec.tree_put",
-        description: "Apply edits [{path, ref|content|delete, mode}] to a tree and return the new tree. Trees are immutable, so this mints a new manifest and never changes the input. One call yields exactly one new tree or none: any refusal stores nothing, including blobs for entries that were fine. Duplicate paths, an empty edits list, and a delete of a path the tree does not hold are refused.",
+        description: "Apply edits [{path, ref|content|delete, mode}] to a tree and return the new tree. Trees are immutable, so this mints a new manifest and never changes the input. One call yields exactly one new tree or none: any refusal stores nothing, including blobs for entries that were fine. Duplicate paths, an empty edits list, and a delete of a path the tree does not hold are refused. {path: dir, delete: true, recursive: true} removes every entry under dir/ (a link is removed as an entry, never followed); it is refused when nothing is under dir, when dir is a file, and beside any other edit under dir. changed is bounded: see changed_limit; changed_ref names the full list whenever it is not empty.",
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
         params: &[
             P_TREE,
-            ParamDef { name: "edits", param_type: "array", required: true, description: "Edits [{path, and exactly one of ref | content | delete:true, plus optional mode}]; modes are 644, 755 or 120000 (literal symlink target bytes). Omitted mode preserves an existing mode or defaults to 644; an empty array is refused.", resolution_mode: IdResolutionMode::NotApplicable },
+            ParamDef { name: "edits", param_type: "array", required: true, description: "Edits [{path, and exactly one of ref | content | delete:true, plus optional mode, plus recursive:true on a directory delete}]; modes are 644, 755 or 120000 (literal symlink target bytes). Omitted mode preserves an existing mode or defaults to 644; an empty array is refused.", resolution_mode: IdResolutionMode::NotApplicable },
+            P_CHANGED_LIMIT,
             P_NAMESPACE,
         ],
     },
     HandlerDef {
         name: "exec.tree_diff",
-        description: "Compare two tree manifests: changed [{path, op: added|modified|deleted, ref, base_ref}].",
+        description: "Compare two tree manifests: changed [{path, op: added|modified|deleted, ref, base_ref}], bounded as changed_limit says. changed_ref is null unless the reply cuts the list, when the full list is written as a blob.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
             ParamDef { name: "base", param_type: "string", required: true, description: "Base tree reference.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "head", param_type: "string", required: true, description: "Head tree reference.", resolution_mode: IdResolutionMode::NotApplicable },
+            P_CHANGED_LIMIT,
             P_NAMESPACE,
         ],
     },
     HandlerDef {
         name: "exec.run",
-        description: "Run one registered tool over a materialized tree inside the seatbelt sandbox under tool.check; returns {receipt, changed}. A timed_out:true receipt means the run deadline was reached and the initial process group was signaled; a descendant that left that group may still be alive. Output collection that reaches the deadline also sets timed_out:true, so exit_code can be 0 beside timed_out:true. A capture path longer than 1024 bytes relative to the run directory is a capture error. New receipts include tree_capture: none | complete | failed | degraded. degraded means the run directory was removed or removed and recreated during the run (tree_capture_detail starts root_missing), or its current path could not be confirmed (root_unverified): no tree_out or changed list is reported and success is false, while exit_code keeps the tool's own status. A run directory the tool renamed is still captured, and a new directory created at the old path is not. New receipts, including refusals, include effective_max_output_bytes, the resolved output retention cap in bytes for each stream for that run. New receipts, including refusals, include process_cleanup {scope, observation: not_attempted | complete | incomplete, seen_alive, certification: unverified | certified_none, detail} and tree_quiescence: unverified | certified. This backend reports scope initial_group, observation not_attempted, seen_alive false (no positive observation, not proof of absence), certification unverified and tree_quiescence unverified; it never emits certified_none. Once the sandbox is prepared, sandbox.tool_source records the resolved registry exec:<absolute path> and sandbox.tool_registry_id its canonical row UUID, beside tool_binary_digest. These report the registration used, not a check against the caller's expected source; earlier failures keep sandbox null. Every refusal writes a receipt, and the refusal error carries structured fields: code, receipt_id=<id>, reason (the receipt's reason), effective_max_output_bytes (the receipt's cap), domain_disposition not_committed. Ordinary refusals use exec_refused; binary digest failures use binary_digest_read, binary_digest_byte_limit, binary_digest_time_limit or binary_digest_worker and include elapsed_ms, bytes_read, byte_cap, time_cap_ms, and path_class when known. The id also stays inside the message text as receipt_id=<id>, unchanged, for readers that already parse it; the fields are the contract and the wording is not. New receipts always include limiting_resource: cpu_seconds | address_space | file_size | nproc | null. Only a directly waited SIGXCPU with cpu_seconds configured or SIGXFSZ with file_size configured names a resource; normal exits, other signals and timeout record null. Child ENOMEM/EAGAIN are not visible to the wrapper, so address_space and nproc remain null (and are refused at startup on macOS). Older stored receipts are unchanged. The sandbox is macOS seatbelt only: a host without /usr/bin/sandbox-exec refuses the call at startup and names the platform.",
+        description: "Run one registered tool over a materialized tree inside the seatbelt sandbox under tool.check; returns {receipt, changed} with changed bounded as changed_limit says, the same bounded list at the top level and in receipt; the stored receipt keeps the full list beside changed_count and changed_ref. A timed_out:true receipt means the run deadline was reached and the initial process group was signaled; a descendant that left that group may still be alive. Output collection that reaches the deadline also sets timed_out:true, so exit_code can be 0 beside timed_out:true. A capture path longer than 1024 bytes relative to the run directory is a capture error. New receipts include tree_capture: none | complete | failed | degraded. degraded means the run directory was removed or removed and recreated during the run (tree_capture_detail starts root_missing), or its current path could not be confirmed (root_unverified): no tree_out or changed list is reported and success is false, while exit_code keeps the tool's own status. A run directory the tool renamed is still captured, and a new directory created at the old path is not. New receipts, including refusals, include effective_max_output_bytes, the resolved output retention cap in bytes for each stream for that run. New receipts, including refusals, include process_cleanup {scope, observation: not_attempted | complete | incomplete, seen_alive, certification: unverified | certified_none, detail} and tree_quiescence: unverified | certified. This backend reports scope initial_group, observation not_attempted, seen_alive false (no positive observation, not proof of absence), certification unverified and tree_quiescence unverified; it never emits certified_none. Once the sandbox is prepared, sandbox.tool_source records the resolved registry exec:<absolute path> and sandbox.tool_registry_id its canonical row UUID, beside tool_binary_digest. These report the registration used, not a check against the caller's expected source; earlier failures keep sandbox null. Every refusal writes a receipt, and the refusal error carries structured fields: code, receipt_id=<id>, reason (the receipt's reason), effective_max_output_bytes (the receipt's cap), domain_disposition not_committed. Ordinary refusals use exec_refused; binary digest failures use binary_digest_read, binary_digest_byte_limit, binary_digest_time_limit or binary_digest_worker and include elapsed_ms, bytes_read, byte_cap, time_cap_ms, and path_class when known. The id also stays inside the message text as receipt_id=<id>, unchanged, for readers that already parse it; the fields are the contract and the wording is not. New receipts always include limiting_resource: cpu_seconds | address_space | file_size | nproc | null. Only a directly waited SIGXCPU with cpu_seconds configured or SIGXFSZ with file_size configured names a resource; normal exits, other signals and timeout record null. Child ENOMEM/EAGAIN are not visible to the wrapper, so address_space and nproc remain null (and are refused at startup on macOS). Older stored receipts are unchanged. The sandbox is macOS seatbelt only: a host without /usr/bin/sandbox-exec refuses the call at startup and names the platform.",
         visibility: Visibility::Verb,
         category: VerbCategory::Directive,
         params: &[
@@ -107,6 +117,7 @@ pub static EXEC_HANDLERS: [HandlerDef; 9] = [
             ParamDef { name: "timeout_s", param_type: "number", required: false, description: "Wall-clock limit in seconds (default and ceiling from [exec]).", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "session_id", param_type: "string", required: false, description: "Session label; receipts carry a per-session sequence.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "declared_write_paths", param_type: "array", required: false, description: "Paths the run may change; undeclared changes are dropped and the run reports success:false.", resolution_mode: IdResolutionMode::NotApplicable },
+            P_CHANGED_LIMIT,
             P_NAMESPACE,
         ],
     },
@@ -117,12 +128,13 @@ pub static EXEC_HANDLERS: [HandlerDef; 9] = [
         category: VerbCategory::Assertive,
         params: &[
             ParamDef { name: "id", param_type: "string", required: true, description: "Receipt id.", resolution_mode: IdResolutionMode::NotApplicable },
+            P_CHANGED_LIMIT,
             P_NAMESPACE,
         ],
     },
     HandlerDef {
         name: "exec.runs",
-        description: "List run receipts for an actor, newest first, optionally filtered by tool and session. timed_out:true records a run deadline, not termination of every descendant. New receipts include effective_max_output_bytes, the stored output retention cap in bytes for each stream for that run, plus process_cleanup and tree_quiescence as described by exec.run; older receipts remain unchanged.",
+        description: "List run receipts for an actor, newest first, optionally filtered by tool and session. timed_out:true records a run deadline, not termination of every descendant. New receipts include effective_max_output_bytes, the stored output retention cap in bytes for each stream for that run, plus process_cleanup and tree_quiescence as described by exec.run; older receipts remain unchanged. Change lists share one 262,144-byte bound across the whole reply, spent in row order; once it is spent the remaining rows carry empty lists with their own changed_count, changed_truncated and changed_ref.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -130,6 +142,7 @@ pub static EXEC_HANDLERS: [HandlerDef; 9] = [
             ParamDef { name: "tool", param_type: "string", required: false, description: "Tool name filter.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "session_id", param_type: "string", required: false, description: "Session filter.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "limit", param_type: "integer", required: false, description: "Page size (default 20, max 500).", resolution_mode: IdResolutionMode::NotApplicable },
+            P_CHANGED_LIMIT,
             P_NAMESPACE,
         ],
     },

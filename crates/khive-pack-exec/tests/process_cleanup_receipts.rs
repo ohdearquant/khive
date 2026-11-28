@@ -73,6 +73,7 @@ impl Fixture {
             exec: ExecSectionConfig {
                 root: Some(dir.path().join("exec-root").to_string_lossy().into_owned()),
                 read_roots: vec!["/bin".into(), "/usr/bin".into()],
+                cache_roots: Vec::new(),
                 max_output_bytes: Some(cap),
                 timeout_default_s: Some(5.0),
                 timeout_max_s: Some(10.0),

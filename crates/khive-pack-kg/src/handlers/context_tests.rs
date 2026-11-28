@@ -458,3 +458,101 @@ async fn context_pairs_use_scoped_metadata_after_controlled_real_deletion() {
         }
     }
 }
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn context_lists_a_shared_neighbor_under_every_anchor_that_reaches_it() {
+    use khive_runtime::{RuntimeConfig, VerbRegistryBuilder};
+
+    let namespace = format!("context-shared-{}", Uuid::new_v4().simple());
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        ..RuntimeConfig::no_embeddings()
+    })
+    .unwrap();
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_default_namespace(namespace.clone());
+    builder.register(KgPack::new(runtime.clone()));
+    let registry = builder.build().unwrap();
+    runtime.install_edge_rules(registry.all_edge_rules());
+    registry.call_register_entity_type_validators(&runtime);
+    let mut ids = Vec::new();
+    for name in [
+        "First anchor",
+        "Second anchor",
+        "Shared neighbor",
+        "Second hop",
+    ] {
+        let entity = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "concept", "name": name, "skip_dedup_check": true,
+                    "namespace": namespace,
+                }),
+            )
+            .await
+            .unwrap();
+        ids.push(entity["id"].as_str().unwrap().to_owned());
+    }
+    // Both anchors contain the shared neighbor, which contains the second-hop node.
+    for (source, target) in [(0, 2), (1, 2), (2, 3)] {
+        registry
+            .dispatch(
+                "link",
+                json!({
+                    "source_id": ids[source], "target_id": ids[target],
+                    "relation": "contains", "weight": 0.8, "namespace": namespace,
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    for order in [[0usize, 1], [1, 0]] {
+        for hops in [1u64, 2] {
+            let anchors = [ids[order[0]].clone(), ids[order[1]].clone()];
+            let out = registry
+                .dispatch(
+                    "context",
+                    json!({
+                        "entity_ids": anchors, "relations": ["contains"],
+                        "direction": "outgoing", "hops": hops, "fanout": 50,
+                        "budget": 65536, "namespace": namespace,
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(out["truncated"], false, "{out}");
+            assert_eq!(out["dropped"]["neighbors"], 0, "{out}");
+            let mut expected = vec![ids[2].as_str()];
+            if hops == 2 {
+                expected.push(ids[3].as_str());
+            }
+            let blocks = out["anchors"].as_array().unwrap();
+            assert_eq!(blocks.len(), 2, "{out}");
+            for (block, anchor) in blocks.iter().zip(&anchors) {
+                assert_eq!(block["entity"]["id"], anchor.as_str(), "{out}");
+                let listed: Vec<&str> = block["neighbors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|neighbor| neighbor["id"].as_str().unwrap())
+                    .collect();
+                assert_eq!(listed, expected, "anchor {anchor}: {out}");
+            }
+            let edges = out["edges"].as_array().unwrap();
+            assert_eq!(edges.len(), 2 * expected.len(), "{out}");
+            let hop1_sources: Vec<&str> = edges
+                .iter()
+                .filter(|edge| edge["hop"] == 1)
+                .map(|edge| edge["source_id"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                hop1_sources,
+                [anchors[0].as_str(), anchors[1].as_str()],
+                "{out}"
+            );
+        }
+    }
+}

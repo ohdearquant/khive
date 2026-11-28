@@ -38,6 +38,13 @@ pub struct DaemonRequestFrame {
     /// request rather than execute it while silently discarding provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_ref: Option<String>,
+    /// The originating client's working directory, as text. Attribution only, like
+    /// `process_ref`: the daemon records it on the audit rows of an anonymous caller alone,
+    /// bounded and stripped of control characters, and it reaches no gate decision, token or
+    /// stored record. Purely additive: `#[serde(default)]` with no `PROTOCOL_VERSION` bump, and a
+    /// daemon that predates the field ignores it, so its rows carry no directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_cwd: Option<String>,
     /// The client's resolved extra read-visibility namespaces (ADR-007 Rule
     /// 3b), carried on the frame so the warm daemon widens read scope to
     /// match the caller's own configuration rather than its own baked

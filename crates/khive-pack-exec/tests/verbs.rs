@@ -82,6 +82,9 @@ struct Fixture {
     _dir: tempfile::TempDir,
     root: std::path::PathBuf,
     blobs: std::path::PathBuf,
+    /// The one `[exec] cache_roots` entry, when the fixture was built with one.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    cache: Option<std::path::PathBuf>,
 }
 
 fn fixture() -> Fixture {
@@ -110,14 +113,92 @@ fn fixture_with_optional_blob_fault(
     max_output_bytes: u64,
     fault: Option<(Arc<AtomicBool>, Arc<AtomicUsize>)>,
 ) -> Fixture {
+    fixture_built(keep, limits, max_output_bytes, fault, CacheRoot::Absent)
+}
+
+/// A fixture whose runs share one cache root beside the run root.
+#[cfg(target_os = "macos")]
+fn fixture_with_cache_root() -> Fixture {
+    fixture_built(
+        false,
+        ExecLimitsConfig::default(),
+        128,
+        None,
+        CacheRoot::Existing,
+    )
+}
+
+/// A fixture whose one cache root is configured through a symbolic link and
+/// does not exist when the configuration loads.
+#[cfg(target_os = "macos")]
+fn fixture_with_late_cache_root() -> Fixture {
+    fixture_built(
+        false,
+        ExecLimitsConfig::default(),
+        128,
+        None,
+        CacheRoot::Late,
+    )
+}
+
+/// The `[exec] cache_roots` entry a fixture configures.
+enum CacheRoot {
+    /// No cache root.
+    Absent,
+    /// One existing directory, configured by its canonical path.
+    #[cfg(target_os = "macos")]
+    Existing,
+    /// One directory named through a symbolic link and not created when the
+    /// configuration loads, so the configured text is not its canonical path.
+    /// The test creates it.
+    #[cfg(target_os = "macos")]
+    Late,
+}
+
+fn fixture_built(
+    keep: bool,
+    limits: ExecLimitsConfig,
+    max_output_bytes: u64,
+    fault: Option<(Arc<AtomicBool>, Arc<AtomicUsize>)>,
+    cache_root: CacheRoot,
+) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("exec-root");
     let db = dir.path().join("khive.db");
+    // The canonical path the cache root has or will have, and the text the
+    // configuration names it by.
+    let cache: Option<(std::path::PathBuf, std::path::PathBuf)> = match cache_root {
+        CacheRoot::Absent => None,
+        #[cfg(target_os = "macos")]
+        CacheRoot::Existing => {
+            let cache = dir.path().join("exec-cache");
+            std::fs::create_dir(&cache).expect("cache root");
+            let cache = cache.canonicalize().expect("canonical cache root");
+            Some((cache.clone(), cache))
+        }
+        #[cfg(target_os = "macos")]
+        CacheRoot::Late => {
+            let parent = dir.path().join("exec-cache-parent");
+            std::fs::create_dir(&parent).expect("cache root parent");
+            let alias = dir.path().join("exec-cache-alias");
+            std::os::unix::fs::symlink(&parent, &alias).expect("cache root parent alias");
+            let canonical = parent
+                .canonicalize()
+                .expect("canonical cache root parent")
+                .join("exec-cache");
+            Some((canonical, alias.join("exec-cache")))
+        }
+    };
+    let cache_roots: Vec<String> = cache
+        .iter()
+        .map(|(_, configured)| configured.to_string_lossy().to_string())
+        .collect();
     let cfg = RuntimeConfig {
         db_path: Some(db),
         exec: ExecSectionConfig {
             root: Some(root.to_string_lossy().to_string()),
             read_roots: vec!["/bin".into(), "/usr/bin".into()],
+            cache_roots: cache_roots.clone(),
             env: vec!["E1_ALLOWED".into()],
             never: vec!["/usr/bin/true".into()],
             max_output_bytes: Some(max_output_bytes),
@@ -126,6 +207,7 @@ fn fixture_with_optional_blob_fault(
             binary_digest_timeout_s: None,
             keep,
             limits,
+            tool_profiles: Vec::new(),
         },
         // No embedding model: tool.register would otherwise build the default
         // embedder, which needs a model file the test host may not have.
@@ -161,6 +243,7 @@ fn fixture_with_optional_blob_fault(
         _dir: dir,
         root,
         blobs: blob_root,
+        cache: cache.map(|(canonical, _)| canonical),
     }
 }
 
@@ -1554,6 +1637,159 @@ async fn run_capture_read_failure_persists_failed_receipt_and_cleans_up() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn run_keeps_cache_root_writes_between_runs_and_out_of_the_output_tree() {
+    let f = fixture_with_cache_root();
+    f.register_sh("sh", "allow").await;
+    let tree = f.tree(&[("input", b"in", 644)]).await;
+    let cache = f.cache.clone().expect("fixture has a cache root");
+    let artifact = cache.join("artifact");
+    let write = format!("printf kept > {}", artifact.display());
+    let first = f
+        .call(
+            "exec.run",
+            json!({
+                "tree": tree, "tool": "sh", "args": ["-c", write], "actor": "local",
+                "session_id": "cache-1"
+            }),
+        )
+        .await;
+    let receipt = &first["receipt"];
+    assert_eq!(receipt["success"], true, "{receipt}");
+    assert_eq!(receipt["changed"], json!([]), "{receipt}");
+    assert_eq!(receipt["undeclared_changes"], json!([]), "{receipt}");
+    assert_eq!(receipt["tree_out"], json!(tree), "{receipt}");
+    let digest = receipt["sandbox"]["cache_roots_digest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("receipt names no cache roots digest: {receipt}"));
+    assert_ne!(
+        digest,
+        blake3::hash(b"[]").to_hex().as_str(),
+        "the digest must name the configured cache root, not the empty set"
+    );
+    assert_eq!(std::fs::read(&artifact).expect("artifact kept"), b"kept");
+
+    let read = format!("/bin/cat {}", artifact.display());
+    let second = f
+        .call(
+            "exec.run",
+            json!({
+                "tree": tree, "tool": "sh", "args": ["-c", read], "actor": "local",
+                "session_id": "cache-1"
+            }),
+        )
+        .await;
+    let receipt = &second["receipt"];
+    assert_eq!(receipt["success"], true, "{receipt}");
+    assert_eq!(f.blob_text(&receipt["stdout_ref"]).await, "kept");
+
+    // The same directory is closed to a computer that names no cache root.
+    let plain = fixture();
+    plain.register_sh("sh", "allow").await;
+    let tree = plain.tree(&[("input", b"in", 644)]).await;
+    let unlisted = cache.join("unlisted");
+    let write = format!("printf leaked > {}", unlisted.display());
+    let refused = plain
+        .call(
+            "exec.run",
+            json!({
+                "tree": tree, "tool": "sh", "args": ["-c", write], "actor": "local",
+                "session_id": "cache-2"
+            }),
+        )
+        .await;
+    let receipt = &refused["receipt"];
+    assert_ne!(receipt["exit_code"], 0, "{receipt}");
+    assert_eq!(
+        receipt["sandbox"]["cache_roots_digest"],
+        json!(blake3::hash(b"[]").to_hex().as_str()),
+        "{receipt}"
+    );
+    assert!(!unlisted.exists());
+}
+
+/// A cache root that does not exist when the configuration loads, configured
+/// through a symbolic link, is granted under the path it resolves to when the
+/// run starts, and the receipt and `exec.identity` name that path's digest.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_writes_a_cache_root_created_after_load_under_its_canonical_path() {
+    let f = fixture_with_late_cache_root();
+    f.register_sh("sh", "allow").await;
+    let tree = f.tree(&[("input", b"in", 644)]).await;
+    let cache = f.cache.clone().expect("fixture has a cache root");
+    std::fs::create_dir(&cache).expect("cache root created after load");
+    let artifact = cache.join("artifact");
+    let write = format!("printf kept > {}", artifact.display());
+    let run = f
+        .call(
+            "exec.run",
+            json!({
+                "tree": tree, "tool": "sh", "args": ["-c", write], "actor": "local",
+                "session_id": "late-cache"
+            }),
+        )
+        .await;
+    let receipt = &run["receipt"];
+    let profile = f.blob_text(&receipt["profile_ref"]).await;
+    assert!(
+        profile.contains(&format!("(subpath \"{}\")", cache.display())),
+        "the profile must grant the cache root's canonical path: {profile}"
+    );
+    assert_eq!(receipt["success"], true, "{receipt}");
+    assert_eq!(receipt["undeclared_changes"], json!([]), "{receipt}");
+    assert_eq!(std::fs::read(&artifact).expect("artifact written"), b"kept");
+
+    let identity = f.call("exec.identity", json!({})).await;
+    assert_eq!(
+        identity["cache_roots"],
+        json!([cache.to_string_lossy()]),
+        "{identity}"
+    );
+    assert_eq!(
+        receipt["sandbox"]["cache_roots_digest"], identity["cache_roots_digest"],
+        "{receipt}"
+    );
+}
+
+/// ADR-181 Amendment 16 acceptance 79: the run's TMPDIR is its own directory,
+/// writable, outside the output tree, replacing any caller value, and gone
+/// when the run is.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_gets_its_own_temporary_directory_outside_the_output_tree() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let tree = f.tree(&[("input", b"in", 644)]).await;
+    let script =
+        "printf kept > \"$TMPDIR/scratch\" && test -f \"$TMPDIR/scratch\" && printf %s \"$TMPDIR\"";
+    let out = f
+        .call(
+            "exec.run",
+            json!({
+                "tree": tree, "tool": "sh", "args": ["-c", script], "actor": "local",
+                "env": { "TMPDIR": "/caller-tmp" },
+                "session_id": "tmp-1"
+            }),
+        )
+        .await;
+    let receipt = &out["receipt"];
+    assert_eq!(receipt["success"], true, "{receipt}");
+    assert_eq!(receipt["changed"], json!([]), "{receipt}");
+    assert_eq!(receipt["undeclared_changes"], json!([]), "{receipt}");
+    assert_eq!(receipt["tree_out"], json!(tree), "{receipt}");
+    assert_eq!(receipt["env_dropped"], json!(["TMPDIR"]), "{receipt}");
+    let tmpdir = f.blob_text(&receipt["stdout_ref"]).await;
+    let run_id = receipt["id"].as_str().expect("run id");
+    assert!(tmpdir.ends_with(&format!("/{run_id}.tmp")), "{tmpdir}");
+    assert!(
+        !std::path::Path::new(&tmpdir).exists(),
+        "{tmpdir} must be removed with the run"
+    );
+    assert!(root_is_empty(&f));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn run_captures_output_changes_and_receipt() {
     let f = fixture();
     let registered = f.register_sh("sh", "allow").await;
@@ -1575,7 +1811,8 @@ async fn run_captures_output_changes_and_receipt() {
             "exec.run",
             json!({
                 "tree": tree, "tool": "sh", "args": ["-c", script], "actor": "local",
-                "env": { "E1_ALLOWED": "caller", "DROP": "x" }, "session_id": "s1"
+                "env": { "E1_ALLOWED": "caller", "DROP": "x", "HOME": "/caller-home" },
+                "session_id": "s1"
             }),
         )
         .await;
@@ -1591,7 +1828,9 @@ async fn run_captures_output_changes_and_receipt() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert_eq!(keys, vec!["E1_ALLOWED", "HOME"]);
+    assert_eq!(keys, vec!["E1_ALLOWED", "HOME", "TMPDIR"]);
+    // The caller's unlisted key and its own HOME are named, not dropped in silence.
+    assert_eq!(receipt["env_dropped"], json!(["DROP", "HOME"]), "{receipt}");
     let ops: std::collections::BTreeMap<String, String> = receipt["changed"]
         .as_array()
         .unwrap()
@@ -1648,8 +1887,9 @@ async fn run_receipt_reports_first_registration_when_name_is_taken() {
     let f = fixture();
     let first = f.register_sh("occupied", "allow").await;
     assert_eq!(first["created"], true);
-    let second = f
-        .call(
+    // A different source under a taken name is refused and changes nothing (ADR-180 Amendment 10).
+    let refused = f
+        .call_err(
             "tool.register",
             json!({
                 "name": "occupied", "kind": "tool", "source": "exec:/bin/echo",
@@ -1657,9 +1897,10 @@ async fn run_receipt_reports_first_registration_when_name_is_taken() {
             }),
         )
         .await;
-    assert_eq!(second["created"], false);
-    assert_eq!(second["tool"]["full_id"], first["tool"]["full_id"]);
-    assert_eq!(second["tool"]["source"], "exec:/bin/sh");
+    assert!(
+        refused.contains("cannot change source on an existing registration"),
+        "{refused}"
+    );
     let tree = f.tree(&[]).await;
     let out = f
         .call(
@@ -2572,6 +2813,7 @@ fn string_refusal_fixture() -> StringRefusalFixture {
         exec: ExecSectionConfig {
             root: Some(root.to_string_lossy().to_string()),
             read_roots: vec!["/bin".into(), "/usr/bin".into()],
+            cache_roots: Vec::new(),
             env: vec!["E1_ALLOWED".into()],
             never: vec!["/usr/bin/true".into()],
             max_output_bytes: Some(128),
@@ -2580,6 +2822,7 @@ fn string_refusal_fixture() -> StringRefusalFixture {
             binary_digest_timeout_s: None,
             keep: false,
             limits: ExecLimitsConfig::default(),
+            tool_profiles: Vec::new(),
         },
         ..RuntimeConfig::no_embeddings()
     })

@@ -66,6 +66,7 @@ impl PackRuntime for ToolPack {
         let rt = self.runtime();
         match verb {
             "tool.register" => handlers::register(rt, token, params).await,
+            "tool.unregister" => handlers::unregister(rt, token, params).await,
             "tool.ingest" => handlers::ingest(rt, registry, token, params).await,
             "tool.suggest" => handlers::suggest(rt, token, params).await,
             "tool.describe" => handlers::describe(rt, token, params).await,
