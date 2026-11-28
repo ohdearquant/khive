@@ -517,7 +517,7 @@ pub trait Pack {
 
     /// Entity-type subtypes this pack contributes to the `(EntityKind,
     /// entity_type)` registry (the `entity_type` axis is distinct from and
-    /// finer-grained than the closed [`EntityKind`](crate::entity::EntityKind)
+    /// finer-grained than the closed [`EntityKind`]
     /// taxonomy — see `khive-types::entity_type::EntityTypeRegistry`).
     ///
     /// Defaults to empty, mirroring [`EDGE_RULES`]'s additive contract:
