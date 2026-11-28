@@ -1013,6 +1013,9 @@ pub fn build_server_from_multi_backend_registry_with_catalog_verbosity(
     .with_secondary_pools(secondary_pools)
     .with_runtime(default_runtime);
 
+    #[cfg(unix)]
+    let server =
+        server.with_per_pack_local_callbacks(multi.per_pack_runtimes.values().map(Arc::as_ref));
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     let server = server.with_channel_outbox_runtime(channel_outbox_runtime);
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
