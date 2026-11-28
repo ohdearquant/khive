@@ -76,6 +76,16 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
                 })),
             ));
         }
+        if khive_request::parse_request(&ops)
+            .is_ok_and(|parsed| parsed.ops.iter().any(|op| op.tool == "bridge.share"))
+        {
+            let message = "bridge.share is answered only by the stdio bridge and kkernel exec; \
+                           nothing was sent";
+            return Err(daemon::DaemonDispatchError::new(
+                message.to_string(),
+                Some(serde_json::json!({ "kind": "invalid_input", "message": message })),
+            ));
+        }
         // Strict attributed-actor mode is checked when the server is built and
         // on the exec client, against their own actor. A daemon serves each
         // frame under the frame's actor instead, so the same policy is applied

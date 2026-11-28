@@ -34,7 +34,7 @@ impl KindHook for RewriteHook {
 
 struct RewritePack(KhiveRuntime);
 impl Pack for RewritePack {
-    const NAME: &'static str = "argument-contract-probe";
+    const NAME: &'static str = "argument_contract";
     const NOTE_KINDS: &'static [&'static str] = &["argument_contract_note"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {

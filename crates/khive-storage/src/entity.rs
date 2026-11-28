@@ -40,6 +40,16 @@ pub struct Entity {
     /// attachment substrate; reads populate it so existing response payloads
     /// keep their `content_ref` field during the coordinated cutover.
     pub content_ref: Option<String>,
+    /// Read-only projection of the entity's `entity_aliases` rows, sorted by
+    /// alias (ADR-221 section 2).
+    ///
+    /// Entity writes ignore this field: alias rows are written by their own
+    /// statements in the entity's transaction. Reads populate it, and the
+    /// full-text document and embedding text are built from it. Omitted from
+    /// serialized output when empty, so an entity without aliases serializes
+    /// as it did before aliases existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<EntityAlias>,
 }
 
 fn initial_entity_version() -> i64 {
@@ -83,6 +93,7 @@ impl Entity {
             merged_into: None,
             merge_event_id: None,
             content_ref: None,
+            aliases: Vec::new(),
         }
     }
 
@@ -111,6 +122,25 @@ impl Entity {
     }
 }
 
+/// A caller key that one entity released and another live entity now holds.
+///
+/// Restoring the releasing entity would need the key back, so a restore
+/// refuses while any such row exists (ADR-221 section 1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityKeyHolder {
+    /// Entity kind the key is scoped to.
+    pub kind: String,
+    /// The caller key, exactly as stored.
+    pub key: String,
+    /// The live entity that holds the key now.
+    pub holder_id: Uuid,
+}
+
+/// Entity aliases and their origins (ADR-221 section 2). Defined in
+/// `khive-types` so a change set can carry them; re-exported here at the path
+/// storage callers already use.
+pub use khive_types::{EntityAlias, EntityAliasOrigin};
+
 /// Entity liveness selected by an [`EntityFilter`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -135,6 +165,9 @@ pub struct EntityFilter {
     /// ANDed SQL JSON equalities; see [`EntityFilter::property_eq`].
     #[serde(default)]
     pub property_equalities: Vec<(String, SqlValue)>,
+    /// ANDed JSON text-prefix matches; see [`EntityFilter::property_prefix`].
+    #[serde(default)]
+    pub property_prefixes: Vec<(String, String)>,
     /// Live-only by default. Liveness builders replace this selection.
     #[serde(default)]
     pub tombstones: EntityTombstones,
@@ -159,6 +192,11 @@ pub struct EntityFilter {
     /// paged out. `name_exact` skips paging risk entirely by filtering to
     /// only rows that equal `name` at the SQL layer.
     pub name_exact: Option<String>,
+    /// Case-sensitive equality on `entities.name` or on any alias the entity
+    /// holds (ADR-221 section 2). Matches count entities, so an entity whose
+    /// name and alias both equal the value is one row.
+    #[serde(default)]
+    pub name_or_alias_exact: Option<String>,
     pub tags_any: Vec<String>,
     /// When non-empty, restricts results to any of these namespaces using
     /// `namespace IN (...)`. Takes precedence over the `namespace` string
@@ -189,6 +227,17 @@ impl EntityFilter {
     /// and arrays compare their serialized SQL text, not structural JSON equality.
     pub fn property_eq(mut self, path: impl Into<String>, value: SqlValue) -> Self {
         self.property_equalities.push((path.into(), value));
+        self
+    }
+
+    /// Require the JSON text at `path` in `properties` to start with `prefix`.
+    ///
+    /// Paths follow the rule of [`EntityFilter::property_eq`]. The comparison
+    /// is case-sensitive and counts characters; a missing field, a value that
+    /// is not JSON text, or properties that are not valid JSON never match.
+    /// Calls are ANDed.
+    pub fn property_prefix(mut self, path: impl Into<String>, prefix: impl Into<String>) -> Self {
+        self.property_prefixes.push((path.into(), prefix.into()));
         self
     }
 
@@ -345,4 +394,30 @@ pub trait EntityStore: Send + Sync + 'static {
     /// Returns the entity row even when `deleted_at` is set. Callers use this
     /// to distinguish "soft-deleted" from "never existed".
     async fn get_entity_including_deleted(&self, id: Uuid) -> StorageResult<Option<Entity>>;
+    /// Fetch the live entity that holds `key` for `kind` in `namespace`.
+    ///
+    /// `Ok(None)` means no live entity holds the key: it was never claimed,
+    /// or its holder was deleted and released it.
+    async fn get_entity_by_key(
+        &self,
+        _namespace: &str,
+        _kind: &str,
+        _key: &str,
+    ) -> StorageResult<Option<Entity>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Entities,
+            operation: "get_entity_by_key".into(),
+            message: "this backend does not implement entity keys".into(),
+        })
+    }
+    /// List the keys entity `id` released that another live entity holds now,
+    /// ordered by kind, then key. An empty list means a restore of `id` can
+    /// take every one of its keys back.
+    async fn taken_entity_keys(&self, _id: Uuid) -> StorageResult<Vec<EntityKeyHolder>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Entities,
+            operation: "taken_entity_keys".into(),
+            message: "this backend does not implement entity keys".into(),
+        })
+    }
 }

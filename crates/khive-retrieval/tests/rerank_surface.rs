@@ -59,3 +59,17 @@ async fn identity_reranker_reexport_compiles_and_runs() {
     let out = reranker.rerank("q", results.clone(), 1).await.unwrap();
     assert_eq!(out, results[..1]);
 }
+
+#[test]
+fn native_hook_reexports_share_the_same_types() {
+    use khive_retrieval::{hybrid, LoraHook, NativeRerankResult, NoopLoraHook};
+
+    let hook: &dyn LoraHook = &hybrid::NoopLoraHook;
+    let _: &dyn hybrid::LoraHook = hook;
+    let _: hybrid::NoopLoraHook = NoopLoraHook;
+    let result: NativeRerankResult<u32> = hybrid::NativeRerankResult {
+        results: Vec::new(),
+        hook_applied: false,
+    };
+    let _: hybrid::NativeRerankResult<u32> = result;
+}

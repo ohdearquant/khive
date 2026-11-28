@@ -30,6 +30,40 @@ pub fn opt_u32(params: &Value, key: &str, default: u32, max: u32) -> Result<u32,
 
 pub use khive_storage::now_micros;
 
+/// Prepare the namespace-local authorization changes for a captured registry row.
+/// Execute these only with the row's guarded retirement in the same writer unit.
+pub fn registry_retirement_statements(
+    namespace: &str,
+    registry_id: Uuid,
+    name: &str,
+    retired_at: i64,
+    actor: &str,
+) -> [SqlStatement; 2] {
+    [
+        SqlStatement::new(
+            khive_runtime::sql!("unregister-policies"),
+            vec![
+                SqlValue::Integer(retired_at),
+                SqlValue::Text(actor.into()),
+                SqlValue::Text(namespace.into()),
+                SqlValue::Text(name.into()),
+            ],
+        )
+        .labelled("tool-unregister-policies"),
+        SqlStatement::new(
+            khive_runtime::sql!("unregister-grants"),
+            vec![
+                SqlValue::Integer(retired_at),
+                SqlValue::Text(actor.into()),
+                SqlValue::Text(namespace.into()),
+                SqlValue::Text(registry_id.to_string()),
+                SqlValue::Text(name.into()),
+            ],
+        )
+        .labelled("tool-unregister-grants"),
+    ]
+}
+
 /// The caller's actor as one label, `kind:id`, except that the plain `actor`
 /// kind collapses to its id so a configured `lambda:khive` reads back as
 /// itself.
@@ -373,10 +407,15 @@ pub(crate) async fn list_policies(
     rt: &KhiveRuntime,
     ns: &str,
     actor: Option<&str>,
+    policy_id: Option<&str>,
     limit: u32,
 ) -> Result<Vec<PolicyRow>, RuntimeError> {
     let mut sql = format!("SELECT {POLICY_COLUMNS} FROM tool_policy WHERE namespace = ?1");
     let mut params = vec![SqlValue::Text(ns.to_string())];
+    if let Some(policy_id) = policy_id {
+        params.push(SqlValue::Text(policy_id.to_string()));
+        sql.push_str(&format!(" AND id = ?{}", params.len()));
+    }
     if let Some(actor) = actor {
         params.push(SqlValue::Text(actor.to_string()));
         sql.push_str(&format!(
@@ -400,14 +439,15 @@ pub(crate) async fn list_policies(
     rows.iter().map(PolicyRow::from_row).collect()
 }
 
-/// SQL for `pattern_matches(<col>, ?<param>)`: the pattern stored in `col`
-/// against the bound value.
+/// Match a trusted pattern expression against the bound value. Tool callers
+/// pass `lower(tool)` and ASCII-folded bytes; actor callers retain exact bytes.
 ///
 /// It compares bytes, because `pattern_matches` does and SQLite's text
 /// functions do not: `LIKE` and `length()` read a TEXT value only up to its
 /// first NUL. A stored `a\0b*` then does not end in `*` and never matches
-/// `a\0bcd`, and tool names are not NUL-free. For a `deny` policy that miss is
-/// fail-open. Every comparison therefore runs on `CAST(.. AS BLOB)`, where
+/// `a\0bcd`, and tool names are not NUL-free. SQLite's built-in `lower()` uses
+/// the complete byte length, so ASCII folding retains the suffix after NUL.
+/// Every comparison therefore runs on `CAST(.. AS BLOB)`, where
 /// `length()` counts bytes and `substr(x, -1)` is the last byte, and `X'2A'` is
 /// `*`. A lone `*` gets its own arm: `substr` of a zero-length blob is NULL,
 /// not an empty blob, so the prefix arm cannot match an empty value, and
@@ -451,7 +491,7 @@ pub(crate) async fn select_deciding_policy(
     tool: &str,
 ) -> Result<Option<PolicyRow>, RuntimeError> {
     let actor_match = pattern_match_sql("actor", 2);
-    let tool_match = pattern_match_sql("tool", 3);
+    let tool_match = pattern_match_sql("lower(tool)", 3);
     let rank = |col: &str| {
         format!(
             "CASE WHEN CAST({col} AS BLOB) = X'2A' THEN 0 \
@@ -497,7 +537,7 @@ pub(crate) async fn select_deciding_policy(
             params: vec![
                 SqlValue::Text(ns.to_string()),
                 SqlValue::Text(actor.to_string()),
-                SqlValue::Text(tool.to_string()),
+                SqlValue::Blob(tool.to_ascii_lowercase().into_bytes()),
             ],
             label: Some("tool_policy_decide".into()),
         })
@@ -579,11 +619,11 @@ async fn select_grant_on(
     selector: GrantSelector<'_>,
 ) -> Result<Option<(GrantRow, bool)>, RuntimeError> {
     let actor_match = pattern_match_sql("actor", 2);
-    let tool_match = pattern_match_sql("tool", 3);
+    let tool_match = pattern_match_sql("lower(tool)", 3);
     let mut params = vec![
         SqlValue::Text(ns.to_string()),
         SqlValue::Text(actor.to_string()),
-        SqlValue::Text(tool.to_string()),
+        SqlValue::Blob(tool.to_ascii_lowercase().into_bytes()),
         SqlValue::Integer(now),
     ];
     let pinned = match registration {
@@ -945,6 +985,14 @@ pub(crate) async fn insert_grant_request(
     Ok(row)
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static GRANT_PREPARED_PAUSE: (
+        tokio::sync::mpsc::UnboundedSender<Option<String>>,
+        std::sync::Arc<tokio::sync::Semaphore>,
+    );
+}
+
 pub(crate) async fn set_grant_status(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -961,6 +1009,19 @@ pub(crate) async fn set_grant_status(
         None
     };
     let pin = registration.as_ref().map(|row| row.pin()).transpose()?;
+    #[cfg(test)]
+    if let Ok((ready, release)) =
+        GRANT_PREPARED_PAUSE.try_with(|(ready, release)| (ready.clone(), release.clone()))
+    {
+        ready
+            .send(pin.as_ref().map(|pin| pin.registry_id().to_string()))
+            .expect("grant preparation observer");
+        release
+            .acquire()
+            .await
+            .expect("grant preparation release")
+            .forget();
+    }
     let prepared = prepared.clone();
     let ns = token.namespace().as_str().to_string();
     let visible_namespaces: Vec<String> = token
@@ -1122,11 +1183,14 @@ pub async fn decide_with_receipt(
     side_effect: Option<&str>,
     registration: Option<&RegistryPin>,
 ) -> Result<Decision, RuntimeError> {
-    // The receipt copies both strings into the namespace event log, so they get
-    // the same credential refusal every other persisted write path applies.
+    // The receipt copies both strings into the namespace event log, so screen
+    // both before persisting the decision.
     let record = invocation.caller.verb();
     secret_gate::check_at(invocation.actor, record, "actor")?;
-    secret_gate::check_at(invocation.tool, record, "tool")?;
+    match invocation.caller {
+        DecisionCaller::ToolCheck => check_tool_reference_at(invocation.tool, record)?,
+        DecisionCaller::ExecRun => secret_gate::check_at(invocation.tool, record, "tool")?,
+    }
     let decision = decide(
         rt,
         invocation.token.namespace().as_str(),
@@ -1159,6 +1223,68 @@ pub async fn decide_with_receipt(
     .with_payload(json!(payload));
     rt.events(invocation.token)?.append_event(event).await?;
     Ok(decision)
+}
+
+fn check_tool_reference_at(tool: &str, record: &str) -> Result<(), RuntimeError> {
+    if let Some((prefix, name)) = mcp_plugin_identifier_parts(tool) {
+        // Keep the repeated plugin namespace from extending a provider-looking
+        // prefix across the separator into an ordinary callable name. Each
+        // identifier component is still checked independently.
+        secret_gate::check_at(prefix, record, "tool")?;
+        return secret_gate::check_at(name, record, "tool");
+    }
+    secret_gate::check_at(tool, record, "tool")
+}
+
+fn mcp_plugin_identifier_parts(tool: &str) -> Option<(&str, &str)> {
+    let rest = tool.strip_prefix("mcp__plugin_")?;
+    let (prefixes, name) = rest.split_once("__")?;
+    if !is_ordinary_registry_identifier(name) {
+        return None;
+    }
+
+    prefixes
+        .char_indices()
+        .filter(|(_, ch)| *ch == '_')
+        .find_map(|(separator, _)| {
+            let prefix = &prefixes[..separator];
+            let repeated = &prefixes[separator + 1..];
+            (prefix == repeated && is_ordinary_registry_identifier(prefix))
+                .then_some((prefix, name))
+        })
+}
+
+fn is_ordinary_registry_identifier(value: &str) -> bool {
+    !value.is_empty() && value.split(['_', '-', '.']).all(is_ordinary_registry_run)
+}
+
+fn is_ordinary_registry_run(run: &str) -> bool {
+    if run.is_empty() || run.len() > 24 || !run.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return false;
+    }
+    if run.bytes().all(|byte| byte.is_ascii_digit()) {
+        return true;
+    }
+
+    let bytes = run.as_bytes();
+    let letter_end = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_alphabetic())
+        .unwrap_or(bytes.len());
+    if letter_end == 0 || !bytes[letter_end..].iter().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+
+    let letters = &run[..letter_end];
+    if letters.len() <= 4 {
+        return true;
+    }
+    let transitions = letters
+        .as_bytes()
+        .windows(2)
+        .filter(|pair| pair[0].is_ascii_uppercase() != pair[1].is_ascii_uppercase())
+        .count();
+    transitions as f64 / (letters.len() - 1) as f64 <= 0.3
 }
 
 /// Resolution order: an active grant allows; otherwise the most specific
@@ -1211,6 +1337,133 @@ pub async fn decide(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn unregister_refuses_a_grant_prepared_against_the_retired_registration() {
+        use khive_pack_kg::KgPack;
+        use khive_runtime::{KhiveRuntime, RequestIdentity, RuntimeError, VerbRegistryBuilder};
+        use serde_json::{json, Value};
+        use std::{sync::Arc, time::Duration};
+
+        async fn stored_grant(rt: &KhiveRuntime, id: &str) -> Value {
+            let rows = rt
+                .sql()
+                .reader()
+                .await
+                .unwrap()
+                .query_all(khive_storage::SqlStatement::new(
+                    "SELECT * FROM tool_grants WHERE namespace = ?1 AND id = ?2",
+                    vec![SqlValue::Text("local".into()), SqlValue::Text(id.into())],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            serde_json::to_value(rows).unwrap()
+        }
+
+        for retire in [false, true] {
+            let rt = KhiveRuntime::memory().unwrap();
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(KgPack::new(rt.clone()));
+            builder.register(crate::ToolPack::new(rt.clone()));
+            let registry = builder.build().unwrap();
+            registry.apply_schema_plans(rt.backend());
+            rt.install_edge_rules(registry.all_edge_rules());
+            let registered = registry
+                .dispatch(
+                    "tool.register",
+                    json!({
+                        "name":"prepared-retirement", "namespace":"owner", "source":"mcp:fixture",
+                        "side_effect":"write"
+                    }),
+                )
+                .await
+                .unwrap();
+            let registry_id = registered["tool"]["full_id"].as_str().unwrap().to_owned();
+            let identity = RequestIdentity {
+                namespace: "local".into(),
+                actor_id: Some("agent:decider".into()),
+                visible_namespaces: vec!["owner".into()],
+                ..Default::default()
+            };
+            let requested = registry.dispatch_with_identity("tool.request", json!({
+                "tool":"prepared-retirement", "actor":"agent:requester", "reason":"retirement race"
+            }), Some(identity.clone())).await.unwrap();
+            let request_id = requested["request_id"].as_str().unwrap().to_owned();
+            let before = stored_grant(&rt, &request_id).await;
+            assert_eq!(
+                super::get_grant(&rt, "local", &request_id)
+                    .await
+                    .unwrap()
+                    .status,
+                "requested"
+            );
+            let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            let grant = super::GRANT_PREPARED_PAUSE.scope(
+                (ready_tx, release.clone()),
+                registry.dispatch_with_identity(
+                    "tool.grant",
+                    json!({"id":request_id}),
+                    Some(identity.clone()),
+                ),
+            );
+            let retire_after_prepare = async {
+                let captured_id = ready_rx.recv().await.expect("actual grant preparation");
+                assert_eq!(captured_id.as_deref(), Some(registry_id.as_str()));
+                if retire {
+                    let result = registry
+                        .dispatch(
+                            "tool.unregister",
+                            json!({
+                                "tool":registry_id, "namespace":"owner"
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(result["retired"], true);
+                    assert_eq!(result["grants_revoked"], 0);
+                    assert_eq!(stored_grant(&rt, &request_id).await, before,
+                        "foreign request must still permit the ordinary requested-to-granted transition");
+                }
+                release.add_permits(1);
+            };
+            let (outcome, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(grant, retire_after_prepare)
+            })
+            .await
+            .expect("grant preparation and retirement must settle");
+            if retire {
+                assert_eq!(
+                    stored_grant(&rt, &request_id).await,
+                    before,
+                    "a stale prepared grant must not write its captured pin"
+                );
+                assert!(
+                    matches!(outcome, Err(RuntimeError::InvalidInput(ref message))
+                    if message.contains("registration changed while preparing the grant")),
+                    "{outcome:?}"
+                );
+            } else {
+                let granted = outcome.unwrap();
+                assert_eq!(granted["grant"]["status"], "granted");
+                assert_eq!(granted["grant"]["registry_id"], registry_id);
+                let check = registry
+                    .dispatch_with_identity(
+                        "tool.check",
+                        json!({
+                            "tool":"prepared-retirement", "actor":"agent:requester"
+                        }),
+                        Some(identity),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(check["source"], "grant");
+                assert_eq!(check["grant_id"], request_id);
+            }
+        }
+    }
+
     use khive_storage::types::{SqlColumn, SqlRow, SqlValue};
 
     use super::{

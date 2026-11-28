@@ -29,17 +29,20 @@ async fn db_diagnostics_commit_churn_without_readers_does_not_report_a_pin() {
         shutdown_rx,
         true,
     ));
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while routine_wal_observation(&pool).is_none() {
-            tokio::task::yield_now().await;
-        }
+    let sampled = wait_for(DIAGNOSTICS_CHECKPOINT_WAIT, || {
+        routine_wal_observation(&pool).is_some()
     })
-    .await
-    .expect("the checkpoint task must record its initial sample");
+    .await;
+    assert!(
+        sampled,
+        "the checkpoint task must record its initial sample"
+    );
 
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let committed = Arc::new(AtomicBool::new(false));
     let writer_pool = Arc::clone(&pool);
     let writer_stop = Arc::clone(&stop);
+    let writer_committed = Arc::clone(&committed);
     let writer_task = std::thread::spawn(move || {
         let writer = writer_pool.writer().expect("writer checkout");
         let mut value = 0_i64;
@@ -49,14 +52,21 @@ async fn db_diagnostics_commit_churn_without_readers_does_not_report_a_pin() {
                 .execute("INSERT INTO t VALUES (?1)", [value])
                 .expect("commit loop row");
             value += 1;
+            if value == 1 {
+                writer_committed.store(true, Ordering::SeqCst);
+            }
             std::thread::yield_now();
         }
     });
 
+    let first_commit = wait_for(DIAGNOSTICS_CHECKPOINT_WAIT, || {
+        committed.load(Ordering::SeqCst)
+    })
+    .await;
     let deadline = Instant::now() + Duration::from_millis(1_200);
     let mut saw_oldest_pinned_frame = false;
     let mut saw_pin_depth = false;
-    while Instant::now() < deadline {
+    while first_commit && Instant::now() < deadline {
         let report = crate::diagnostics::collect(
             &pool,
             crate::diagnostics::BuildIdentity::from_env("test", None),
@@ -70,10 +80,14 @@ async fn db_diagnostics_commit_churn_without_readers_does_not_report_a_pin() {
     stop.store(true, Ordering::SeqCst);
     writer_task.join().expect("commit loop must finish");
     shutdown_tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), task)
+    tokio::time::timeout(DIAGNOSTICS_CHECKPOINT_WAIT, task)
         .await
-        .expect("commit-churn checkpoint task shutdown exceeded 5 s")
+        .expect("commit-churn checkpoint task shutdown must finish")
         .expect("checkpoint task must not panic");
+    assert!(
+        first_commit,
+        "the writer must commit before observing churn"
+    );
     assert!(
         !saw_oldest_pinned_frame,
         "short-lived backfill rows without a reader must not age into pins"

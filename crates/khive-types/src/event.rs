@@ -86,7 +86,7 @@ impl EventSink {
     }
 }
 
-/// Discriminant for the 43 typed event variants produced by the verb dispatch path
+/// Discriminant for the 44 typed event variants produced by the verb dispatch path
 /// and by lifecycle telemetry producers (channel polling/backoff, config-lock,
 /// checkpoint outcome, background phase spans).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -103,6 +103,10 @@ pub enum EventKind {
     SearchExecuted,
     /// A tool-use policy decision was computed by tool.check or exec.run.
     ToolCheckDecided,
+    /// A registration correction changed its canonical grant-policy inputs.
+    /// Retention: `pinned_while_referenced`; the payload/target registry row
+    /// is the referent and its deletion is the terminal condition (ADR-180 A10).
+    ToolRegistrationChanged,
     /// A new directed edge was created between two nodes.
     LinkCreated,
     /// A new entity was created.
@@ -182,13 +186,14 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    /// All 43 event kind variants in declaration order.
-    pub const ALL: [Self; 43] = [
+    /// All 44 event kind variants in declaration order.
+    pub const ALL: [Self; 44] = [
         Self::Audit,
         Self::RecallExecuted,
         Self::RerankExecuted,
         Self::SearchExecuted,
         Self::ToolCheckDecided,
+        Self::ToolRegistrationChanged,
         Self::LinkCreated,
         Self::EntityCreated,
         Self::EntityUpdated,
@@ -240,6 +245,7 @@ impl EventKind {
             Self::RerankExecuted => EventSink::CallerEventStore,
             Self::SearchExecuted => EventSink::CallerEventStore,
             Self::ToolCheckDecided => EventSink::CallerEventStore,
+            Self::ToolRegistrationChanged => EventSink::CallerEventStore,
             Self::LinkCreated => EventSink::CallerEventStore,
             Self::EntityCreated => EventSink::CallerEventStore,
             Self::EntityUpdated => EventSink::CallerEventStore,
@@ -289,6 +295,7 @@ impl EventKind {
             Self::RerankExecuted => "rerank_executed",
             Self::SearchExecuted => "search_executed",
             Self::ToolCheckDecided => "tool_check_decided",
+            Self::ToolRegistrationChanged => "tool_registration_changed",
             Self::LinkCreated => "link_created",
             Self::EntityCreated => "entity_created",
             Self::EntityUpdated => "entity_updated",
@@ -343,6 +350,7 @@ const EVENT_KIND_VALID: &[&str] = &[
     "rerank_executed",
     "search_executed",
     "tool_check_decided",
+    "tool_registration_changed",
     "link_created",
     "entity_created",
     "entity_updated",
@@ -393,6 +401,7 @@ impl core::str::FromStr for EventKind {
             "rerank_executed" => Ok(Self::RerankExecuted),
             "search_executed" => Ok(Self::SearchExecuted),
             "tool_check_decided" => Ok(Self::ToolCheckDecided),
+            "tool_registration_changed" => Ok(Self::ToolRegistrationChanged),
             "link_created" => Ok(Self::LinkCreated),
             "entity_created" => Ok(Self::EntityCreated),
             "entity_updated" => Ok(Self::EntityUpdated),
@@ -471,6 +480,8 @@ pub enum EventPayload {
     RerankExecuted(RerankExecutedPayload),
     /// Structured payload for a tool-use policy decision.
     ToolCheckDecided(ToolCheckDecidedPayload),
+    /// A registration correction without disclosing the changed field values.
+    ToolRegistrationChanged(ToolRegistrationChangedPayload),
     /// Structured payload for a proposal-created event (requires `serde` feature).
     #[cfg(feature = "serde")]
     ProposalCreated(ProposalCreatedPayload),
@@ -500,6 +511,21 @@ pub struct ToolCheckDecidedPayload {
     pub id: Option<String>,
     pub scope: Option<String>,
     pub caller_verb: String,
+}
+
+/// A correction to the four policy inputs covered by a tool registration digest.
+/// Values of the corrected fields are deliberately absent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ToolRegistrationChangedPayload {
+    /// Authenticated actor stamped into the event row.
+    pub actor: String,
+    /// Canonical full UUID of the registry row.
+    pub id: String,
+    /// Canonical policy-input digest before the correction.
+    pub digest_before: String,
+    /// Canonical policy-input digest after the correction.
+    pub digest_after: String,
 }
 
 /// Implementation that produced a rerank event (ADR-042 Amendment 1).
@@ -738,6 +764,68 @@ mod serde_opt_opt {
     }
 }
 
+/// Natural key of a stored edge in a proposal: the edge from `source` to
+/// `target` with `relation`.
+#[cfg(feature = "serde")]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProposalEdgeKey {
+    pub source: Id128,
+    pub target: Id128,
+    pub relation: crate::EdgeRelation,
+}
+
+#[cfg(feature = "serde")]
+impl ProposalEdgeKey {
+    /// True when both keys name the same edge. A symmetric relation names one
+    /// edge whichever endpoint comes first.
+    fn names_same_edge(
+        &self,
+        source: &Id128,
+        target: &Id128,
+        relation: &crate::EdgeRelation,
+    ) -> bool {
+        if self.relation != *relation {
+            return false;
+        }
+        (self.source == *source && self.target == *target)
+            || (relation.is_symmetric() && self.source == *target && self.target == *source)
+    }
+}
+
+/// The edge a `SupersedeEdge` change adds. Fields and validation match
+/// `AddEdge`.
+#[cfg(feature = "serde")]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProposalEdgeDraft {
+    pub source: Id128,
+    pub target: Id128,
+    pub relation: crate::EdgeRelation,
+    #[serde(default)]
+    pub weight: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[cfg(feature = "serde")]
+fn validate_proposal_edge_weight(
+    variant: &str,
+    weight: Option<f32>,
+) -> Result<(), alloc::string::String> {
+    if let Some(w) = weight {
+        if !w.is_finite() {
+            return Err(alloc::format!(
+                "ProposalChangeset {variant} weight must be finite, got {w}"
+            ));
+        }
+        if !crate::validate_edge_weight(f64::from(w)) {
+            return Err(alloc::format!(
+                "ProposalChangeset {variant} weight must be in [0.0, 1.0], got {w}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The set of KG mutations a proposal intends to apply as a proposal changeset.
 #[cfg(feature = "serde")]
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -754,11 +842,28 @@ pub enum ProposalChangeset {
         patch: ProposalEntityPatch,
     },
     /// Add a typed edge. `weight` must be finite and in `[0.0, 1.0]` if present.
+    /// Metadata uses the same apply-time validation as `link`.
     AddEdge {
         source: Id128,
         target: Id128,
         relation: crate::EdgeRelation,
         weight: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+    },
+    /// Retire the live edge with this natural key by soft deletion, so
+    /// `restore` on the edge's id brings it back. Applying fails, writing
+    /// nothing, when no live edge has the key.
+    RetireEdge {
+        source: Id128,
+        target: Id128,
+        relation: crate::EdgeRelation,
+    },
+    /// Retire the live edge named by `old` as `RetireEdge` does and add `new`
+    /// as `AddEdge` does, in one atomic unit: both land or neither does.
+    SupersedeEdge {
+        old: ProposalEdgeKey,
+        new: ProposalEdgeDraft,
     },
     /// Add a note (entity-annotating or stand-alone).
     AddNote {
@@ -785,18 +890,14 @@ pub enum ProposalChangeset {
 impl ProposalChangeset {
     fn validate(&self) -> Result<(), alloc::string::String> {
         match self {
-            Self::AddEdge { weight, .. } => {
-                if let Some(w) = weight {
-                    if !w.is_finite() {
-                        return Err(alloc::format!(
-                            "ProposalChangeset AddEdge weight must be finite, got {w}"
-                        ));
-                    }
-                    if !crate::validate_edge_weight(f64::from(*w)) {
-                        return Err(alloc::format!(
-                            "ProposalChangeset AddEdge weight must be in [0.0, 1.0], got {w}"
-                        ));
-                    }
+            Self::AddEdge { weight, .. } => validate_proposal_edge_weight("AddEdge", *weight),
+            Self::SupersedeEdge { old, new } => {
+                validate_proposal_edge_weight("SupersedeEdge", new.weight)?;
+                if old.names_same_edge(&new.source, &new.target, &new.relation) {
+                    return Err(
+                        "ProposalChangeset SupersedeEdge new must name a different edge than old"
+                            .into(),
+                    );
                 }
                 Ok(())
             }
@@ -842,6 +943,16 @@ impl<'de> serde::Deserialize<'de> for ProposalChangeset {
                 target: Id128,
                 relation: crate::EdgeRelation,
                 weight: Option<f32>,
+                metadata: Option<serde_json::Value>,
+            },
+            RetireEdge {
+                source: Id128,
+                target: Id128,
+                relation: crate::EdgeRelation,
+            },
+            SupersedeEdge {
+                old: ProposalEdgeKey,
+                new: ProposalEdgeDraft,
             },
             AddNote {
                 note: NoteDraft,
@@ -869,12 +980,24 @@ impl<'de> serde::Deserialize<'de> for ProposalChangeset {
                 target,
                 relation,
                 weight,
+                metadata,
             } => Self::AddEdge {
                 source,
                 target,
                 relation,
                 weight,
+                metadata,
             },
+            ProposalChangesetRaw::RetireEdge {
+                source,
+                target,
+                relation,
+            } => Self::RetireEdge {
+                source,
+                target,
+                relation,
+            },
+            ProposalChangesetRaw::SupersedeEdge { old, new } => Self::SupersedeEdge { old, new },
             ProposalChangesetRaw::AddNote { note } => Self::AddNote { note },
             ProposalChangesetRaw::MergeEntities { into, from } => {
                 Self::MergeEntities { into, from }

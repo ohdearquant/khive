@@ -22,7 +22,8 @@ use khive_pack_kg::KgPack;
 use khive_pack_tool::ToolPack;
 use khive_runtime::blob_tree as tree;
 use khive_runtime::engine_config::{
-    GitWriteActorConfig, GitWriteEntryConfig, GitWriteSectionConfig,
+    ExecSectionConfig, GitWriteActorConfig, GitWriteAuthorConfig, GitWriteEntryConfig,
+    GitWriteRepositoryConfig, GitWriteSectionConfig,
 };
 use khive_runtime::{
     KhiveRuntime, RequestIdentity, RuntimeConfig, VerbRegistry, VerbRegistryBuilder,
@@ -52,3 +53,7 @@ include!("dev_loop_tests/status_tests.rs");
 include!("dev_loop_tests/log_tests.rs");
 
 include!("dev_loop_tests/repository_safety_tests.rs");
+
+include!("dev_loop_tests/fetched_refs_tests.rs");
+
+include!("dev_loop_tests/scoped_checkout_tests.rs");

@@ -403,6 +403,10 @@ pub struct ResolvedEntityType {
     pub entity_type: Option<String>,
 }
 
+/// Appended to every unknown-type refusal so a caller learns that the list is
+/// closed for the store and where a domain-specific type can go instead.
+pub const UNKNOWN_ENTITY_TYPE_HINT: &str = "Entity types come from the loaded packs and cannot be declared per store yet; record a domain-specific type in properties or tags.";
+
 /// Error produced by [`EntityTypeRegistry::resolve`].
 ///
 /// Dependency-light: `khive-types` cannot depend on `khive-runtime`, so
@@ -443,7 +447,7 @@ impl fmt::Display for EntityTypeError {
                 valid,
             } => write!(
                 f,
-                "unknown entity_type {raw_type:?} for {kind:?}; valid: {valid}"
+                "unknown entity_type {raw_type:?} for {kind:?}; valid: {valid}. {UNKNOWN_ENTITY_TYPE_HINT}"
             ),
         }
     }

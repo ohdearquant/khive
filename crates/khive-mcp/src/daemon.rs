@@ -175,6 +175,9 @@ mod strict_default_tests;
 mod strict_actor_frame_tests;
 
 #[cfg(all(test, unix))]
+mod anonymous_client_cwd_tests;
+
+#[cfg(all(test, unix))]
 mod config_mismatch_recovery_tests;
 
 #[cfg(all(test, unix))]

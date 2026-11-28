@@ -35,6 +35,7 @@ impl KhiveMcpServer {
             // of rejecting it or silently stamping writes under its own actor.
             actor_id: self.actor_id().map(str::to_string),
             process_ref: khive_runtime::process_ref_from_env(),
+            client_cwd: khive_runtime::client_cwd_from_process(),
             visible_namespaces: self
                 .visible_namespaces()
                 .iter()
@@ -307,6 +308,13 @@ impl KhiveMcpServer {
         if parsed_contains_bridge_diagnostics(&parsed) {
             return Err(invalid_request_error(
                 "bridge.diagnostics is available only on the stdio bridge".into(),
+            ));
+        }
+        if parsed.ops.iter().any(|op| op.tool == "bridge.share") {
+            return Err(invalid_request_error(
+                "bridge.share is answered only by the stdio bridge and kkernel exec; nothing was \
+                 sent"
+                    .into(),
             ));
         }
         validate_request_overrides(&p, parsed.ops.len())?;

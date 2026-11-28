@@ -267,6 +267,12 @@ everything not in that set.
 > binding are proven would `transactional_orphan_sweep` run on a daemon schedule, as a dry run on
 > demand through `blob.sweep`, or live on demand through `kkernel blob sweep --live`. Attachment
 > rows alone do not protect durable exec, git and derived web objects in the shared root.
+>
+> One more condition before any scheduled sweep (2026-11-23): the sweep counts as live only a
+> reference held by an attachment row or an attachment quarantine row, so exec tree manifests and
+> their entries, change-list blobs (which [ADR-181](ADR-181-exec-verb-sandboxed-run.md) Amendment 18
+> relies on nothing removing) and `git.checkout` blobs are unprotected whatever their age. No sweep
+> is scheduled until it counts them as live.
 
 This is deliberately the _only_ deletion path a consumer has besides an explicit
 `BlobStore::delete(content_ref)` call (SPEC-gate ruling, 2026-07-12): a future doc/file pack never

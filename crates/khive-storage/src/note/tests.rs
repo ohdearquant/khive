@@ -390,3 +390,40 @@ fn key_limit_counts_utf8_bytes_and_rejects_nul() {
     assert!(!note_key_is_valid(&"a".repeat(513)));
     assert!(!note_key_is_valid("before\0after"));
 }
+
+#[tokio::test]
+async fn default_key_assignment_refuses_secrets_before_any_backend_call() {
+    let store = DefaultOnlyNoteStore::default();
+    let key = format!("ghp_{}", "A".repeat(40));
+    let result = store
+        .assign_note_key_if_unset(Uuid::new_v4(), &key, "local")
+        .await;
+    assert!(
+        matches!(&result, Err(crate::StorageError::SecretDetected { .. })),
+        "default assignment must report its own secret refusal: {result:?}"
+    );
+    assert_eq!(
+        store.record_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        store.query_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(
+        note_key_is_valid(&key),
+        "legacy read selectors remain shape-only"
+    );
+    for valid in ["", "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvM1"] {
+        assert!(
+            validate_note_key_for_store(valid, "assign_note_key_if_unset").is_ok(),
+            "ordinary raw keys must not acquire a synthetic credential label"
+        );
+    }
+    for invalid in ["x".repeat(513), "prefix\0suffix".into()] {
+        assert!(matches!(
+            validate_note_key_for_store(&invalid, "assign_note_key_if_unset"),
+            Err(crate::StorageError::InvalidInput { .. })
+        ));
+    }
+}
