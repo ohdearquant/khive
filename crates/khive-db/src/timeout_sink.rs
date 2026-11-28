@@ -376,6 +376,80 @@ struct QueuedEvent {
     attempt: Option<WriterAttemptFields>,
 }
 
+impl QueuedEvent {
+    fn new(kind: &'static str, db: &str) -> Self {
+        Self {
+            ts_utc: now_rfc3339(),
+            kind,
+            db: db.to_owned(),
+            site: None,
+            phase: None,
+            error: None,
+            timeout_ms: None,
+            elapsed_ms: None,
+            queue_depth: None,
+            writer_stages: None,
+            labels: None,
+            attempt: None,
+        }
+    }
+
+    fn with_error(kind: &'static str, db: &str, error: &str) -> Self {
+        let mut event = Self::new(kind, db);
+        event.error = Some(truncate_error(error, MAX_ERROR_BYTES));
+        event
+    }
+
+    fn with_writer_stages(
+        kind: &'static str,
+        db: &str,
+        stages: &crate::writer_task::WriterStageObservation,
+    ) -> Self {
+        let mut event = Self::new(kind, db);
+        event.elapsed_ms = Some(stages.total_micros / 1_000);
+        event.queue_depth = Some(stages.queue_depth_at_entry);
+        event.writer_stages = Some(WriterStageFields {
+            queue_wait_micros: stages.queue_wait_micros,
+            transaction_acquire_micros: stages.transaction_acquire_micros,
+            body_micros: stages.body_micros,
+            commit_micros: stages.commit_micros,
+            total_micros: stages.total_micros,
+        });
+        event.labels = Some(slow_write_labels_from(stages));
+        event
+    }
+
+    fn into_line(self) -> String {
+        let Self {
+            ts_utc,
+            kind,
+            db,
+            site,
+            phase,
+            error,
+            timeout_ms,
+            elapsed_ms,
+            queue_depth,
+            writer_stages,
+            labels,
+            attempt,
+        } = self;
+        EventRecord {
+            site,
+            phase,
+            error: error.as_deref(),
+            timeout_ms,
+            elapsed_ms,
+            queue_depth,
+            writer_stages,
+            labels,
+            attempt,
+            ..EventRecord::new(ts_utc, kind, &db)
+        }
+        .into_line()
+    }
+}
+
 /// Bounded labels carried on a `"slow_write"` row and on every
 /// `"writer_attempt"` row: at most [`crate::writer_task::MAX_WRITE_LABELS`]
 /// distinct labels in first-seen order, plus the count of further distinct
@@ -474,6 +548,41 @@ struct EventRecord<'a> {
     sqlite: Option<SqliteIdentity>,
 }
 
+impl<'a> EventRecord<'a> {
+    fn new(ts_utc: String, kind: &'a str, db: &'a str) -> Self {
+        Self {
+            ts_utc,
+            kind,
+            db,
+            site: None,
+            phase: None,
+            error: None,
+            timeout_ms: None,
+            elapsed_ms: None,
+            queue_depth: None,
+            writer_stages: None,
+            labels: None,
+            attempt: None,
+            pid: None,
+            version: None,
+            sqlite: None,
+        }
+    }
+
+    fn for_process(kind: &'a str, db: &'a str) -> Self {
+        let mut record = Self::new(now_rfc3339(), kind, db);
+        record.pid = Some(std::process::id());
+        record.version = Some(env!("CARGO_PKG_VERSION"));
+        record
+    }
+
+    fn into_line(self) -> String {
+        let mut line = serde_json::to_string(&self).unwrap_or_else(|_| "{}".to_string());
+        line.push('\n');
+        line
+    }
+}
+
 /// The SQLite library this process links, as that library reports itself:
 /// `sqlite_version()`, `sqlite_source_id()` and `PRAGMA compile_options`.
 /// Carried on the `startup` row so a measurement read from this sink names
@@ -522,96 +631,9 @@ fn sqlite_identity() -> SqliteIdentity {
 
 /// The `startup` row: process id, crate version and the linked SQLite build.
 fn startup_line(db_identity: &str) -> String {
-    let record = EventRecord {
-        ts_utc: now_rfc3339(),
-        kind: "startup",
-        db: db_identity,
-        site: None,
-        phase: None,
-        error: None,
-        timeout_ms: None,
-        elapsed_ms: None,
-        queue_depth: None,
-        writer_stages: None,
-        labels: None,
-        attempt: None,
-        pid: Some(std::process::id()),
-        version: Some(env!("CARGO_PKG_VERSION")),
-        sqlite: Some(sqlite_identity()),
-    };
-    let mut line = serde_json::to_string(&record).unwrap_or_else(|_| "{}".to_string());
-    line.push('\n');
-    line
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_line(
-    ts_utc: String,
-    kind: &str,
-    db: &str,
-    site: Option<&str>,
-    phase: Option<&str>,
-    error: Option<&str>,
-    timeout_ms: Option<u64>,
-    elapsed_ms: Option<u64>,
-    queue_depth: Option<u64>,
-    writer_stages: Option<WriterStageFields>,
-    labels: Option<SlowWriteLabels>,
-    attempt: Option<WriterAttemptFields>,
-    pid: Option<u32>,
-    version: Option<&str>,
-) -> String {
-    let record = EventRecord {
-        ts_utc,
-        kind,
-        db,
-        site,
-        phase,
-        error,
-        timeout_ms,
-        elapsed_ms,
-        queue_depth,
-        writer_stages,
-        labels,
-        attempt,
-        pid,
-        version,
-        sqlite: None,
-    };
-    let mut line = serde_json::to_string(&record).unwrap_or_else(|_| "{}".to_string());
-    line.push('\n');
-    line
-}
-
-/// [`build_line`] stamped with the current time — used by the writer thread
-/// for rows it produces synchronously (startup/heartbeat/summary), as
-/// opposed to a [`QueuedEvent`]'s own enqueue-time timestamp.
-#[allow(clippy::too_many_arguments)]
-fn build_line_now(
-    kind: &str,
-    db: &str,
-    site: Option<&str>,
-    error: Option<&str>,
-    timeout_ms: Option<u64>,
-    pid: Option<u32>,
-    version: Option<&str>,
-) -> String {
-    build_line(
-        now_rfc3339(),
-        kind,
-        db,
-        site,
-        None,
-        error,
-        timeout_ms,
-        None,
-        None,
-        None,
-        None,
-        None,
-        pid,
-        version,
-    )
+    let mut record = EventRecord::for_process("startup", db_identity);
+    record.sqlite = Some(sqlite_identity());
+    record.into_line()
 }
 
 fn now_rfc3339() -> String {
@@ -834,22 +856,8 @@ fn write_event(sink: &mut AppendSink<File>, dropped: &AtomicU64, event: QueuedEv
         dropped.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let line = build_line(
-        event.ts_utc,
-        event.kind,
-        &event.db,
-        event.site,
-        event.phase,
-        event.error.as_deref(),
-        event.timeout_ms,
-        event.elapsed_ms,
-        event.queue_depth,
-        event.writer_stages,
-        event.labels,
-        event.attempt,
-        None,
-        None,
-    );
+    let is_writer_attempt = event.kind == WRITER_ATTEMPT_KIND;
+    let line = event.into_line();
     if sink.write_line(&line) {
         // A per-attempt row is one of many per second under load and is
         // measurement, not an alarm: it is appended without the fsync the
@@ -857,7 +865,7 @@ fn write_event(sink: &mut AppendSink<File>, dropped: &AtomicU64, event: QueuedEv
         // crash loses only rows still queued in the channel; an OS crash or
         // power loss can also drop written rows not yet synced. Neither
         // leaves a later row in this file to show the gap.
-        if event.kind != WRITER_ATTEMPT_KIND {
+        if !is_writer_attempt {
             sink.sync();
         }
     } else {
@@ -889,15 +897,7 @@ fn maybe_emit_heartbeat(
     if !sink.is_open() {
         return;
     }
-    let hb = build_line_now(
-        "heartbeat",
-        db_identity,
-        None,
-        None,
-        None,
-        Some(std::process::id()),
-        Some(env!("CARGO_PKG_VERSION")),
-    );
+    let hb = EventRecord::for_process("heartbeat", db_identity).into_line();
     sink.write_line(&hb);
 
     let current_dropped = dropped.load(Ordering::Relaxed);
@@ -906,15 +906,9 @@ fn maybe_emit_heartbeat(
             "sink drops since last summary: {}",
             current_dropped - *last_summary_dropped
         );
-        let summary = build_line_now(
-            "sink_error_summary",
-            "-",
-            None,
-            Some(&message),
-            None,
-            None,
-            None,
-        );
+        let mut summary = EventRecord::new(now_rfc3339(), "sink_error_summary", "-");
+        summary.error = Some(&message);
+        let summary = summary.into_line();
         if sink.write_line(&summary) {
             *last_summary_dropped = current_dropped;
         }
@@ -1110,20 +1104,9 @@ pub(crate) fn emit_timeout(db: &str, site: Site, error: &str, timeout_ms: Option
     let Some(handle) = lifecycle::route(db) else {
         return;
     };
-    let event = QueuedEvent {
-        ts_utc: now_rfc3339(),
-        kind: "timeout",
-        db: db.to_string(),
-        site: Some(site.as_str()),
-        phase: None,
-        error: Some(truncate_error(error, MAX_ERROR_BYTES)),
-        timeout_ms,
-        elapsed_ms: None,
-        queue_depth: None,
-        writer_stages: None,
-        labels: None,
-        attempt: None,
-    };
+    let mut event = QueuedEvent::with_error("timeout", db, error);
+    event.site = Some(site.as_str());
+    event.timeout_ms = timeout_ms;
     enqueue(&handle.sender, &handle.dropped, event);
 }
 
@@ -1135,20 +1118,10 @@ pub(crate) fn emit_lease_timeout(db: &str, error: &str, timeout_ms: u64) {
     let Some(handle) = lifecycle::route(db) else {
         return;
     };
-    let event = QueuedEvent {
-        ts_utc: now_rfc3339(),
-        kind: "timeout",
-        db: db.to_string(),
-        site: Some(Site::VolumeLease.as_str()),
-        phase: Some(khive_storage::CapacityUnavailablePhase::LockContended.as_str()),
-        error: Some(truncate_error(error, MAX_ERROR_BYTES)),
-        timeout_ms: Some(timeout_ms),
-        elapsed_ms: None,
-        queue_depth: None,
-        writer_stages: None,
-        labels: None,
-        attempt: None,
-    };
+    let mut event = QueuedEvent::with_error("timeout", db, error);
+    event.site = Some(Site::VolumeLease.as_str());
+    event.phase = Some(khive_storage::CapacityUnavailablePhase::LockContended.as_str());
+    event.timeout_ms = Some(timeout_ms);
     enqueue(&handle.sender, &handle.dropped, event);
 }
 
@@ -1187,20 +1160,9 @@ pub(crate) fn maybe_emit_sqlite_full(db: &str, error: &(dyn std::error::Error + 
 }
 
 fn sqlite_full_event(db: &str, error: &(dyn std::error::Error + 'static)) -> QueuedEvent {
-    QueuedEvent {
-        ts_utc: now_rfc3339(),
-        kind: "sqlite_full",
-        db: db.to_string(),
-        site: None,
-        phase: None,
-        error: Some(truncate_error(&error.to_string(), MAX_ERROR_BYTES)),
-        timeout_ms: None,
-        elapsed_ms: None,
-        queue_depth: None,
-        writer_stages: None,
-        labels: None,
-        attempt: None,
-    }
+    let mut event = QueuedEvent::new("sqlite_full", db);
+    event.error = Some(truncate_error(&error.to_string(), MAX_ERROR_BYTES));
+    event
 }
 
 /// Record a `queue_saturation` event: a caller-visible
@@ -1212,20 +1174,8 @@ pub(crate) fn emit_queue_saturation(db: &str, timeout_ms: u64) {
     let Some(handle) = lifecycle::route(db) else {
         return;
     };
-    let event = QueuedEvent {
-        ts_utc: now_rfc3339(),
-        kind: "queue_saturation",
-        db: db.to_string(),
-        site: None,
-        phase: None,
-        error: None,
-        timeout_ms: Some(timeout_ms),
-        elapsed_ms: None,
-        queue_depth: None,
-        writer_stages: None,
-        labels: None,
-        attempt: None,
-    };
+    let mut event = QueuedEvent::new("queue_saturation", db);
+    event.timeout_ms = Some(timeout_ms);
     enqueue(&handle.sender, &handle.dropped, event);
 }
 
@@ -1237,20 +1187,7 @@ pub(crate) fn emit_writer_task_retirement(db: &str, reason: &str) {
     let Some(handle) = lifecycle::route(db) else {
         return;
     };
-    let event = QueuedEvent {
-        ts_utc: now_rfc3339(),
-        kind: "writer_task_retirement",
-        db: db.to_string(),
-        site: None,
-        phase: None,
-        error: Some(truncate_error(reason, MAX_ERROR_BYTES)),
-        timeout_ms: None,
-        elapsed_ms: None,
-        queue_depth: None,
-        writer_stages: None,
-        labels: None,
-        attempt: None,
-    };
+    let event = QueuedEvent::with_error("writer_task_retirement", db, reason);
     enqueue(&handle.sender, &handle.dropped, event);
 }
 
@@ -1261,20 +1198,7 @@ pub(crate) fn emit_writer_guard_drop(db: &str, outcome: &str) {
     let Some(handle) = lifecycle::route(db) else {
         return;
     };
-    let event = QueuedEvent {
-        ts_utc: now_rfc3339(),
-        kind: "writer_guard_drop",
-        db: db.to_string(),
-        site: None,
-        phase: None,
-        error: Some(truncate_error(outcome, MAX_ERROR_BYTES)),
-        timeout_ms: None,
-        elapsed_ms: None,
-        queue_depth: None,
-        writer_stages: None,
-        labels: None,
-        attempt: None,
-    };
+    let event = QueuedEvent::with_error("writer_guard_drop", db, outcome);
     enqueue(&handle.sender, &handle.dropped, event);
 }
 
@@ -1395,20 +1319,8 @@ pub(crate) fn emit_direct_route_violation(db: &str, site: Site) {
     let Some(handle) = lifecycle::route(db) else {
         return;
     };
-    let event = QueuedEvent {
-        ts_utc: now_rfc3339(),
-        kind: "direct_route_violation",
-        db: db.to_string(),
-        site: Some(site.as_str()),
-        phase: None,
-        error: None,
-        timeout_ms: None,
-        elapsed_ms: None,
-        queue_depth: None,
-        writer_stages: None,
-        labels: None,
-        attempt: None,
-    };
+    let mut event = QueuedEvent::new("direct_route_violation", db);
+    event.site = Some(site.as_str());
     enqueue(&handle.sender, &handle.dropped, event);
 }
 
@@ -1423,26 +1335,7 @@ pub(crate) fn emit_slow_write(db: &str, stages: &crate::writer_task::WriterStage
     let Some(handle) = lifecycle::route(db) else {
         return;
     };
-    let event = QueuedEvent {
-        ts_utc: now_rfc3339(),
-        kind: "slow_write",
-        db: db.to_string(),
-        site: None,
-        phase: None,
-        error: None,
-        timeout_ms: None,
-        elapsed_ms: Some(stages.total_micros / 1_000),
-        queue_depth: Some(stages.queue_depth_at_entry),
-        writer_stages: Some(WriterStageFields {
-            queue_wait_micros: stages.queue_wait_micros,
-            transaction_acquire_micros: stages.transaction_acquire_micros,
-            body_micros: stages.body_micros,
-            commit_micros: stages.commit_micros,
-            total_micros: stages.total_micros,
-        }),
-        labels: Some(slow_write_labels_from(stages)),
-        attempt: None,
-    };
+    let event = QueuedEvent::with_writer_stages("slow_write", db, stages);
     enqueue(&handle.sender, &handle.dropped, event);
 }
 
@@ -1467,32 +1360,14 @@ pub(crate) fn emit_writer_attempt(
         return;
     };
     let attempt_seq = handle.attempt_seq.fetch_add(1, Ordering::Relaxed) + 1;
-    let event = QueuedEvent {
-        ts_utc: now_rfc3339(),
-        kind: WRITER_ATTEMPT_KIND,
-        db: db.to_string(),
-        site: None,
-        phase: None,
-        error: None,
-        timeout_ms: None,
-        elapsed_ms: Some(stages.total_micros / 1_000),
-        queue_depth: Some(stages.queue_depth_at_entry),
-        writer_stages: Some(WriterStageFields {
-            queue_wait_micros: stages.queue_wait_micros,
-            transaction_acquire_micros: stages.transaction_acquire_micros,
-            body_micros: stages.body_micros,
-            commit_micros: stages.commit_micros,
-            total_micros: stages.total_micros,
-        }),
-        labels: Some(slow_write_labels_from(stages)),
-        attempt: Some(WriterAttemptFields {
-            attempt_seq,
-            request_id: attempt.request_id,
-            outcome: if attempt.succeeded { "ok" } else { "error" },
-            rows_changed: attempt.rows_changed,
-            top_level: attempt.top_level,
-        }),
-    };
+    let mut event = QueuedEvent::with_writer_stages(WRITER_ATTEMPT_KIND, db, stages);
+    event.attempt = Some(WriterAttemptFields {
+        attempt_seq,
+        request_id: attempt.request_id,
+        outcome: if attempt.succeeded { "ok" } else { "error" },
+        rows_changed: attempt.rows_changed,
+        top_level: attempt.top_level,
+    });
     enqueue(&handle.sender, &handle.dropped, event);
 }
 

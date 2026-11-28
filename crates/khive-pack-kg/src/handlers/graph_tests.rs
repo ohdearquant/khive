@@ -536,3 +536,117 @@ async fn neighbors_limit_cursor_kind_and_projection_contract() {
     assert_eq!(context_under_cap["effective_limit"], 3);
     assert_eq!(context_under_cap["limit_clamped"], false);
 }
+
+/// The full projection carries what the record projection leaves out: the neighbor's
+/// properties and description and the edge's metadata, each null where there is none.
+#[tokio::test]
+async fn neighbors_full_projection_carries_properties_and_edge_metadata() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+    let pack = KgPack::new(rt);
+    let call = |verb: &'static str, params: serde_json::Value| {
+        let (pack, registry, token) = (&pack, &registry, &token);
+        async move {
+            pack.dispatch(verb, params, registry, token)
+                .await
+                .unwrap_or_else(|error| panic!("{verb}: {error}"))
+        }
+    };
+
+    let root = call(
+        "create",
+        json!({"kind": "entity", "name": "FullRoot", "entity_kind": "concept"}),
+    )
+    .await;
+    let described = call(
+        "create",
+        json!({"kind": "entity", "name": "FullDescribed", "entity_kind": "concept",
+            "description": "A neighbor with a body.", "properties": {"domain": "retrieval", "rank": 2}}),
+    )
+    .await;
+    let bare = call(
+        "create",
+        json!({"kind": "entity", "name": "FullBare", "entity_kind": "concept"}),
+    )
+    .await;
+    let note = call(
+        "create",
+        json!({"kind": "note", "note_kind": "observation", "content": "Full observation",
+            "properties": {"source": "bench"}}),
+    )
+    .await;
+    let root_id = root["id"].as_str().expect("root id").to_owned();
+    call(
+        "link",
+        json!({"source_id": root_id, "target_id": described["id"], "relation": "supports",
+            "weight": 0.8, "metadata": {"reason": "measured", "run": 7}}),
+    )
+    .await;
+    call(
+        "link",
+        json!({"source_id": root_id, "target_id": bare["id"], "relation": "supports", "weight": 0.5}),
+    )
+    .await;
+    call(
+        "link",
+        json!({"source_id": note["id"], "target_id": root_id, "relation": "annotates", "weight": 1.0}),
+    )
+    .await;
+
+    let full = call(
+        "neighbors",
+        json!({"id": root_id, "direction": "both", "limit": 10, "projection": "full"}),
+    )
+    .await;
+    let hits = full["neighbors"].as_array().expect("full is a page");
+    assert_eq!(hits.len(), 3, "{full}");
+    let hit = |id: &serde_json::Value| {
+        hits.iter()
+            .find(|hit| hit["id"] == *id)
+            .unwrap_or_else(|| panic!("neighbor {id} in {full}"))
+    };
+
+    let described_hit = hit(&described["id"]);
+    assert_eq!(
+        described_hit["properties"],
+        json!({"domain": "retrieval", "rank": 2})
+    );
+    assert_eq!(described_hit["description"], "A neighbor with a body.");
+    assert_eq!(
+        described_hit["edge_metadata"],
+        json!({"reason": "measured", "run": 7})
+    );
+    // The record fields are all still there.
+    assert_eq!(described_hit["name"], "FullDescribed");
+    assert_eq!(described_hit["source_id"], json!(root_id));
+    assert_eq!(described_hit["target_id"], described["id"]);
+
+    let bare_hit = hit(&bare["id"]);
+    assert_eq!(
+        bare_hit["properties"],
+        serde_json::Value::Null,
+        "{bare_hit}"
+    );
+    assert_eq!(bare_hit["description"], serde_json::Value::Null);
+    assert_eq!(bare_hit["edge_metadata"], serde_json::Value::Null);
+
+    let note_hit = hit(&note["id"]);
+    assert_eq!(note_hit["properties"]["source"], "bench", "{note_hit}");
+    assert_eq!(note_hit["description"], serde_json::Value::Null);
+    assert_eq!(note_hit["source_id"], note["id"]);
+
+    // The record projection keeps its shape: none of the three fields.
+    let record = call(
+        "neighbors",
+        json!({"id": root_id, "direction": "both", "limit": 10, "projection": "record"}),
+    )
+    .await;
+    for hit in record["neighbors"].as_array().expect("record page") {
+        for key in ["properties", "description", "edge_metadata"] {
+            assert!(hit.get(key).is_none(), "record carries {key}: {hit}");
+        }
+    }
+}

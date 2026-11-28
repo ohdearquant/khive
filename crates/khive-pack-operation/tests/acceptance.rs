@@ -12,6 +12,9 @@ use khive_runtime::{
 use khive_types::Pack;
 use serde_json::{json, Value};
 
+use khive_pack_forms as _;
+use khive_pack_kg as _;
+
 const TYPES: &str = "filing-types";
 const PREPARER: &str = "preparer-1";
 
@@ -58,7 +61,11 @@ fn with_namespace(caller: &Caller, mut params: Value) -> Value {
 
 impl Store {
     fn new() -> Self {
-        let packs = vec![OperationPack::NAME.to_owned()];
+        let packs = vec![
+            "kg".to_owned(),
+            "forms".to_owned(),
+            OperationPack::NAME.to_owned(),
+        ];
         let runtime = KhiveRuntime::new(RuntimeConfig {
             db_path: None,
             packs: packs.clone(),
@@ -69,11 +76,12 @@ impl Store {
         let mut builder = VerbRegistryBuilder::new();
         builder.with_actor_id(Some(PREPARER.to_owned()));
         PackRegistry::register_packs(&packs, runtime.clone(), &mut builder)
-            .expect("the operation pack is discovered through its factory");
+            .expect("the operation pack and the packs it requires are discovered");
         let registry = builder.build().expect("registry");
         registry
             .apply_schema_plans_with_map(&Default::default(), runtime.backend())
             .expect("pack schema installation");
+        runtime.install_edge_rules(registry.all_edge_rules());
         Self {
             registry,
             _runtime: runtime,
@@ -669,4 +677,80 @@ async fn at_least_one_is_done_when_one_identity_acts() {
     let after = store.frontier(&operation, json!({})).await;
     assert_eq!(status(&after, "sign"), "done");
     assert_eq!(items_of(&after, "act_owed")[0]["step"], "submit");
+}
+
+#[tokio::test]
+async fn a_step_waits_on_the_step_that_produces_what_it_requires() {
+    let store = Store::new();
+    let field = "case number";
+    let loaded = store
+        .call(
+            author(),
+            "forms.load",
+            json!({"document": {
+                "form_id": "CASE-1",
+                "revision": "2026-01",
+                "title": "Case form",
+                "source": {"url": "https://forms.example/case-1.pdf", "sha256": "7".repeat(64)},
+                "terms": {"kinds": ["person"], "roles": ["clerk"]},
+                "subjects": [{"id": "clerk", "kind": "person", "role": "clerk"}],
+                "fields": [{"name": field, "definition": "Number the registry gives a case.", "value_type": "identifier"}],
+                "items": [{"label": "Case number", "page": 1, "order": 1, "item_kind": "text",
+                    "filled_by": "clerk", "about": "clerk", "field": field}]
+            }}),
+        )
+        .await;
+    assert_eq!(loaded["loaded"], true, "{loaded}");
+    // `issue` requires what `assign` produces and names no `after`; the second type names the
+    // field in another case and spacing on each side.
+    for (id, produced, required) in [
+        ("numbered-case", field, field),
+        ("mixed-case", "Case  Number", "CASE number"),
+    ] {
+        let document = json!({"operation_types": [{
+            "id": id,
+            "version": 1,
+            "slots": [{"name": "clerk"}],
+            "steps": [
+                {"name": "assign", "by": "clerk", "produces": [{"field": produced, "class": "stated"}]},
+                {"name": "issue", "by": "clerk", "requires": [{"field": required, "value_type": "identifier"}], "outcome": true}
+            ]
+        }]});
+        store
+            .call(author(), "operation.define", json!({"document": document}))
+            .await;
+        let opened = store
+            .call(
+                office(),
+                "operation.open",
+                json!({"type": id, "bindings": {"clerk": person("c1")}}),
+            )
+            .await;
+        let operation = opened["operation_id"].as_str().expect("id").to_owned();
+
+        let before = store.frontier(&operation, json!({})).await;
+        let owed = items_of(&before, "act_owed");
+        assert_eq!(owed.len(), 1, "{id}: {before}");
+        assert_eq!(owed[0]["step"], "assign");
+        let blocked = items_of(&before, "act_blocked");
+        assert_eq!(blocked.len(), 1, "{id}: {before}");
+        assert_eq!(blocked[0]["step"], "issue");
+        assert_eq!(
+            blocked[0]["waits_on"][0]["step"], "assign",
+            "{id}: {before}"
+        );
+        assert_eq!(status(&before, "issue"), "blocked");
+
+        store
+            .record(
+                &operation,
+                json!([act(&format!("assign-{id}"), "assign", None)]),
+            )
+            .await;
+        let after = store.frontier(&operation, json!({})).await;
+        let owed = items_of(&after, "act_owed");
+        assert_eq!(owed.len(), 1, "{id}: {after}");
+        assert_eq!(owed[0]["step"], "issue");
+        assert!(items_of(&after, "act_blocked").is_empty(), "{id}: {after}");
+    }
 }

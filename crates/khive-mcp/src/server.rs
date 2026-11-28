@@ -257,6 +257,8 @@ impl KhiveMcpServer {
             share: Default::default(),
             stdio_bridge: false,
             runtime: None,
+            #[cfg(unix)]
+            per_pack_local_callbacks: false,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]

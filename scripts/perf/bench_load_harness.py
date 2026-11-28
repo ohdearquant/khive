@@ -287,10 +287,8 @@ ATTEMPT_LOG_ENV = "KHIVE_WRITER_ATTEMPT_LOG"
 SINK_DIR_ENV = "KHIVE_WRITER_TIMEOUT_SINK_DIR"
 SINK_HEARTBEAT_ENV = "KHIVE_WRITER_TIMEOUT_SINK_HEARTBEAT_MS"
 
-# The error a worker carries when its arrivals were still outstanding at the drain timeout and its process was still
-# running. A worker whose process had exited carries a different error. Only the worker process is read: a worker
-# alive but wedged on a daemon that died behind it still carries this one. f7_sweep.py reads a failed run as a
-# reading only when every error is this one; a test compares the two.
+# A drain timeout is a load reading only if both the worker and the original scratch daemon are still running.
+# f7_sweep.py reads a failed run as a reading only when every error is this one.
 DRAIN_TIMEOUT_CRASH = "open-loop drain exceeded --worker-timeout"
 
 # The F7 transaction shapes (ADR-135 F7, #6743), one verb each. Every one is a write.
@@ -748,7 +746,7 @@ def _prepare_open_worker(binary, tenant, idx, base_env, log_level, tmpdir, proc_
 
 
 def _run_open_workers(binary, jobs, base_env, log_level, tmpdir, proc_registry,
-                      operations, rate, worker_timeout, menu=_OP_MENU, schedule=None):
+                      operations, rate, worker_timeout, *, daemon_pid, menu=_OP_MENU, schedule=None):
     plan = plan_arrivals(menu, operations)
     planned = Counter(_OP_NAMES[fn] for fn in plan)
     receipt_pools = {tenant: deque() for tenant, _ in jobs}
@@ -766,16 +764,23 @@ def _run_open_workers(binary, jobs, base_env, log_level, tmpdir, proc_registry,
                                    request_id_prefix=new_request_id_prefix(),
                                    pick_op=iter(plan).__next__, menu=menu, schedule=schedule)
         if arrival["counts"]["outstanding"]:
-            # Kill pipes before joining threads so a wedged MCP read can finish.
+            # Check both processes before teardown closes the worker pipes.
+            current_daemon_pid, _ = _read_pid_file(base_env["KHIVE_PID"])
+            daemon_live = (
+                current_daemon_pid == daemon_pid and _pid_alive(daemon_pid) and _argv_is_khive_daemon(daemon_pid)
+            )
             outstanding = {(row["tenant"], row["worker"]) for row in arrival["records"]
                            if row["state"] == "outstanding"}
-            for _, result in workers:
-                if (result.tenant, result.idx) in outstanding:
-                    # Liveness is read before teardown kills anything, so an exit here happened during the run.
-                    proc = proc_registry.get((result.tenant, result.idx))
-                    code = proc.poll() if proc is not None else "unread"
-                    result.crashed = (DRAIN_TIMEOUT_CRASH if code is None else
-                                      f"worker process exited ({code}) with arrivals outstanding")
+            for proc, result in workers:
+                if (result.tenant, result.idx) not in outstanding:
+                    continue
+                code = proc.poll()
+                if code is not None:
+                    result.crashed = f"worker process exited ({code}) with arrivals outstanding"
+                elif not daemon_live:
+                    result.crashed = f"scratch daemon (pid {daemon_pid}) could not be verified alive at the drain timeout"
+                else:
+                    result.crashed = DRAIN_TIMEOUT_CRASH
         return [result for _, result in workers], arrival
     finally:
         stop.set()
@@ -795,6 +800,10 @@ def _run_open_workers(binary, jobs, base_env, log_level, tmpdir, proc_registry,
 
 
 # ── main driver ────────────────────────────────────────────────────────────────
+
+
+def format_worker_error(tenant, worker, detail):
+    return f"tenant={tenant} worker={worker}: {detail}"
 
 
 def _resolve_binary(mode: str) -> str:
@@ -984,6 +993,10 @@ def main() -> int:
             time.sleep(0.1)
         bpd.assert_daemon_engaged(sock_path, pid_path_file, db_path, label="loadharness-bootstrap")
         mbc.require_all_audit_success_rows(bootstrap_proc)
+        if args.arrival_rate is not None:
+            daemon_pid, _ = _read_pid_file(pid_path_file)
+            if daemon_pid is None or daemon_pid <= 0:
+                raise RuntimeError("scratch daemon PID unavailable after bootstrap")
         print("[ok] bootstrap daemon engagement confirmed", flush=True)
 
         try:
@@ -1016,6 +1029,7 @@ def main() -> int:
             worker_results, report["arrival"] = _run_open_workers(
                 binary, jobs, base_env, args.log_level, tmpdir, worker_procs,
                 args.workers * args.ops_per_worker, args.arrival_rate, args.worker_timeout,
+                daemon_pid=daemon_pid,
                 menu=MIXES[args.mix],
                 schedule=arrival_schedule(args.workers * args.ops_per_worker, args.arrival_rate,
                                           args.burst_size, args.burst_every) if args.burst_size else None,
@@ -1071,7 +1085,7 @@ def main() -> int:
 
         # ── aggregate ──
         crashed = [r for r in worker_results if r.crashed]
-        report["smoke_errors"] = [f"tenant={r.tenant} worker={r.idx}: {r.crashed}" for r in crashed]
+        report["smoke_errors"] = [format_worker_error(r.tenant, r.idx, r.crashed) for r in crashed]
 
         all_outcomes: list[OpOutcome] = []
         for r in worker_results:

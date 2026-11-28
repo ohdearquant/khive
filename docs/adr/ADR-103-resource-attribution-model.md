@@ -929,7 +929,7 @@ the per-dispatch audit row for a verb on `VerbRegistry::ADMISSION_DEGRADE_SAFE_V
 dropped best-effort instead of failing the dispatch. The caller still receives the read's
 successful result. The set is the constant `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`
 (`crates/khive-runtime/src/pack/registry_access.rs`), and the list below is that constant grouped by
-owning pack. Its count is taken from the code: at this revision the constant holds 76 entries. A
+owning pack. Its count is taken from the code: at this revision the constant holds 79 entries. A
 test fails when this list or this count differs from the constant, so an entry added on one side
 only cannot pass unnoticed.
 
@@ -942,7 +942,8 @@ only cannot pass unnoticed.
 - comm: `comm.delivered`, `comm.transport_status`, `comm.inbox`, `comm.unread`, `comm.thread`,
   `comm.health`, `comm.probe`;
 - exec: `exec.tree_get`, `exec.receipt`, `exec.runs`, `exec.events`, `exec.identity`;
-- forms: `forms.resolve`, `forms.neighbourhood`, `forms.check`, `forms.lint`, `forms.export`;
+- forms: `forms.resolve`, `forms.neighbourhood`, `forms.check`, `forms.lint`, `forms.export`,
+  `forms.terms`, `forms.subjects`;
 - git: `git.ingest_cursor`;
 - gtd: `gtd.census`, `gtd.counts`, `gtd.next`, `gtd.tasks`;
 - kg: `get`, `list`, `stats`, `count`, `search`, `neighbors`, `traverse`, `context`, `query`,
@@ -950,7 +951,7 @@ only cannot pass unnoticed.
 - knowledge: `knowledge.get`, `knowledge.list`, `knowledge.export`, `knowledge.stats`, `knowledge.fold`,
   `knowledge.topic`;
 - moodboard: `moodboard.model`, `moodboard.search`, `moodboard.preference`;
-- operation: `operation.frontier`;
+- operation: `operation.frontier`, `operation.resolve`;
 - schedule: `schedule.agenda`;
 - session: `session.list`, `session.resume`, `session.export`, `session.search`, `session.stats`;
 - tool: `tool.suggest`, `tool.describe`, `tool.list`, `tool.requests`, `tool.policies`.

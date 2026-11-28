@@ -270,6 +270,13 @@ pub(super) async fn dispatch_via_coordinator_inner(
                         // already authorized this namespace before handler-level
                         // search validation runs inside the intercepted closure.
                         let request = ValidatedSearchRequest::from_value(handler_args, registry)?;
+                        if request.follow().is_some() {
+                            return Err(RuntimeError::InvalidInput(
+                                "search follow is not available on a multi-backend search; \
+                                 call neighbors on each hit instead"
+                                    .into(),
+                            ));
+                        }
                         let (coord_result, note_status_disclosure) =
                             if request.substrate() == SearchSubstrate::Note {
                                 let selector = request.note_status().ok_or_else(|| {

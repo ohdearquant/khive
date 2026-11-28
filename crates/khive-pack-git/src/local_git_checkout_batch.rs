@@ -24,6 +24,8 @@ struct PreviewEntry<'a> {
 #[derive(Serialize)]
 struct PreviewManifest<'a> {
     schema: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<&'a [String]>,
     entries: Vec<PreviewEntry<'a>>,
 }
 
@@ -43,11 +45,16 @@ impl Write for ManifestSize {
     }
 }
 
-pub(super) fn admit_manifest(listed: &[ListedBlob]) -> Result<()> {
+pub(super) fn admit_manifest(listed: &[ListedBlob], scope: Option<&[String]>) -> Result<()> {
     // Every stored content reference is 64 unescaped ASCII hex bytes, so its
     // value cannot affect the serialized manifest size.
     let preview = PreviewManifest {
-        schema: "khive-tree/v1",
+        schema: if scope.is_some() {
+            tree::SCOPED_TREE_SCHEMA
+        } else {
+            tree::TREE_SCHEMA
+        },
+        scope,
         entries: listed
             .iter()
             .map(|entry| PreviewEntry {
@@ -58,7 +65,7 @@ pub(super) fn admit_manifest(listed: &[ListedBlob]) -> Result<()> {
             .collect(),
     };
     serde_json::to_writer(ManifestSize(0), &preview)
-        .map_err(|_| LocalGitError::new("output_limit", "checkout manifest exceeds the tree limit"))
+        .map_err(|_| super::manifest_limit(scope.is_some()))
 }
 
 type Cancellation = Arc<(Mutex<bool>, Condvar)>;

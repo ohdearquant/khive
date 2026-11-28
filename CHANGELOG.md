@@ -7,14 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-28
+
 ### Added
 
+- `neighbors` takes `projection="full"`: each neighbor carries the record fields plus its
+  `properties` and `description` and the edge's metadata as `edge_metadata`, so one call answers
+  what took a `get` per neighbor.
+- `search` accepts `follow=<relation>`: each hit carries `followed`, the targets its outgoing
+  edges of that relation reach, so a search for a wording returns the concept it names in one
+  call. Targets are read with the same visibility as `neighbors`; more than 100 targets per hit
+  sets `followed_truncated`. A multi-backend search refuses it.
+- `gtd.tasks` accepts `compact=true` for smaller task pages with description lengths. Compact
+  pages use the same filters, task order, and continuation as full pages (#6914).
 - `git.issue` reads one issue of a configured repository: its title, state, author, dates, label
   names, whole body and comments in platform order, one hundred to a page for at most ten pages,
   with the platform's comment count and whether fewer were returned. It says whether the number is
   a pull request. Terminal escapes and control and format characters are removed from the text and
   `text_altered` says when that changed anything; the text is returned as untrusted data. It is a
   read: a `[[git_write.allowed]]` row with `access = "read"` admits it, and it writes no receipt.
+- `operation.resolve` says which slot of an operation type each subject of a loaded form fills: by
+  a recorded decision, by kind, role and qualifier, by a relation to a subject in another slot, or
+  carried by a subject that has a slot. A subject with more than one candidate is undecided, and
+  one nothing reaches has no slot. `operation.decide` records, with a reason, that subjects fill a
+  slot or are not of the type; decisions are kept beside the type, never changed, and keep
+  applying while their subject and their slot exist. A slot may now name a kind, a role, a
+  qualifier or a relation to another slot, and `operation.define` refuses a term the namespace has
+  not loaded, so the operation pack is selected beside `forms` and `kg`.
+- `forms.terms` lists the loaded terms with their aliases, and `forms.subjects` lists the subjects
+  of one form revision. A term may carry aliases, and two more term lists, `counting_qualifiers`
+  and `carrying_relations`, sit beside kinds, roles and relations.
+- `operation.define` publishes step types on their own, and a step of an operation type may pin
+  one by id and version. A step may name the values it requires and produces and take a value
+  another step produces; a step that requires a value comes after the step that produces it.
+- The `forms` pack records what kind of document each form revision is. A `document_type` node
+  (`id`, `name`, `origin` of `applicant`, `third_party` or `work`, optional `issuer_class`)
+  contains its revisions; `forms.load` takes it as `document_type` and mints one, marked `minted`,
+  for a form that declares none, and a later declaration replaces the guess. An item's `relation`
+  says whether it asks for its field (the default), states it (a value printed on every document
+  of the type, which `forms.check` never asks and which an answer cannot fill) or requires an
+  attached document of a loaded type other than its own. `forms.lint` lists minted types and forms
+  no type contains, without counting them against `clean` (#6892, ADR-223).
+- `forms.load` declares an outside system the way it declares a document type:
+  `document_type` with `system: true` in place of an `origin`. Every line of a system's record
+  states its field; an asking or requiring line on one is refused at `forms.load` and
+  `forms.add_item` (#6904, ADR-222 Amendment 1).
+- `forms.neighbourhood` takes a document type as `document_type:<id>` and gives its node whether
+  the type is a system and the forms it contains. On a field it adds `stated_by`: every line that
+  states the field, with its document type, form, revision, subject and role (ADR-222 Amendment 2).
+- `forms.load` takes `known_as: [{vocabulary, name}]` on a field and holds each name as the key
+  `forms/<vocabulary>/field/<name>` on the field, written with the load. A name another field
+  holds in the same vocabulary is refused, the same name in another vocabulary is accepted, and a
+  vocabulary named after an operation node type is refused (`reserved_vocabulary`). Export and
+  replay keep the names (ADR-222 Amendment 2).
 - `git.pr_list` and `git.issue_list` list the pull requests or issues of a configured repository
   in the requested state (`open` unless `closed` or `all` is named), newest created first, one
   hundred to a page for at most ten pages, and say in `truncated` whether more matched.
@@ -22,6 +67,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Hidden characters are removed from titles, refs, labels and logins and `text_altered` says so;
   the text is returned as untrusted data. Both are reads, admitted by a row with
   `access = "read"`, and write no receipt.
+- The runtime adds a caller key to an entity that already exists (`add_entity_key`, and
+  `entity_key_add_plans` for a caller that joins the add to its own atomic unit), under the rules of
+  a keyed create: the same limits and secret scan on the key, the same uniqueness per namespace and
+  base kind, `key_conflict` against another live holder, and nothing written for a key the entity
+  already holds. An add to a deleted entity is refused as `entity_deleted` and to a merged-away one
+  as `entity_merged` (ADR-221 Amendment 1).
+
+### Breaking (Rust crates)
+
+- `khive_storage::scope_request_correlation` and `khive_storage::current_request_correlation`
+  are now `khive_storage::scope_request_id` and `khive_storage::current_request_id`. These names
+  match `request_id` in daemon frames and writer attempt rows (#6773).
 
 ## [0.23.0] - 2026-11-26
 
@@ -239,7 +296,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dimensions` and `device` values still select no provider, vector size or hardware:
   `[[engines]]` controls providers. A differing model name, dimensions that disagree with the
   default engine's declared dimensions, or any supplied device produces a startup warning;
-  agreement is silent. Unknown `[embed]` and `[embed.fields]` keys still warn and load (#6537).
+  agreement is silent. `embed.auto_embed = false` and non-default `embed.fields.include` selectors
+  are validated and accepted with a warning. Write-time embedding continues and entity vectors
+  use their usual inputs. Unknown `[embed]` and `[embed.fields]` keys still warn and load (#6537).
 
 ### Breaking (Rust crates)
 

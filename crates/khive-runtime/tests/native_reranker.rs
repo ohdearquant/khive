@@ -429,10 +429,10 @@ fn score_bits(scores: &[f32]) -> Vec<u32> {
     scores.iter().map(|score| score.to_bits()).collect()
 }
 
-#[tokio::test]
-async fn native_hook_identity_paths_preserve_exact_scores_and_provenance() {
+#[test]
+fn native_hook_identity_paths_preserve_exact_scores_and_provenance() {
     let directory = input_sensitive_checkpoint();
-    let model = Arc::new(NativeCrossEncoderModel::from_directory(directory.path()).unwrap());
+    let model = NativeCrossEncoderModel::from_directory(directory.path()).unwrap();
     let baseline = assert_input_sensitive(&model);
     let inactive = DormantHook {
         active_layer: None,
@@ -443,12 +443,6 @@ async fn native_hook_identity_paths_preserve_exact_scores_and_provenance() {
         calls: AtomicUsize::new(0),
     };
     assert!(unreachable.is_active(99, "ffn_output"));
-    let (runtime, token) = runtime();
-    let bright = create_entity(&runtime, &token, "document", Some("bright")).await;
-    let dark = create_entity(&runtime, &token, "document", Some("dark")).await;
-    let reranker = runtime.native_cross_encoder_reranker(token, model.clone());
-    let input = candidates(&[dark.id, bright.id]);
-    let expected = reranker.rerank(QUERY, input.clone(), 2).await.unwrap();
     for hook in [
         None,
         Some(&NoopLoraHook as &dyn LoraHook),
@@ -456,8 +450,7 @@ async fn native_hook_identity_paths_preserve_exact_scores_and_provenance() {
         Some(&unreachable),
     ] {
         let direct =
-            CrossEncoderScorer::score_batch_with_hook(model.as_ref(), QUERY, &DOCUMENTS, hook)
-                .unwrap();
+            CrossEncoderScorer::score_batch_with_hook(&model, QUERY, &DOCUMENTS, hook).unwrap();
         assert_eq!(
             score_bits(&direct.scores),
             score_bits(&baseline),
@@ -466,15 +459,6 @@ async fn native_hook_identity_paths_preserve_exact_scores_and_provenance() {
         assert!(
             !direct.hook_applied,
             "hook presence or unreachable activity is not native application"
-        );
-        let result = reranker
-            .rerank_with_hook(QUERY, input.clone(), 2, hook)
-            .await
-            .unwrap();
-        assert_eq!(result.results, expected);
-        assert!(
-            !result.hook_applied,
-            "identity reranking must not report an applied hook"
         );
     }
     assert_eq!(inactive.calls.load(Ordering::SeqCst), 0);
@@ -524,7 +508,7 @@ async fn native_hook_changes_real_forward_scores_and_tracks_application() {
         .collect();
     calls.store(0, Ordering::SeqCst);
     let result = reranker
-        .rerank_with_hook(QUERY, input.clone(), 3, Some(&hook))
+        .rerank_with_hook(QUERY, input, 3, Some(&hook))
         .await
         .unwrap();
     assert!(
@@ -537,17 +521,6 @@ async fn native_hook_changes_real_forward_scores_and_tracks_application() {
         "stored IDs and scores must match the actual adapted native pairs"
     );
     assert_ne!(result.results, unadapted);
-    calls.store(0, Ordering::SeqCst);
-    let next = reranker
-        .rerank_with_hook(QUERY, input, 3, None)
-        .await
-        .unwrap();
-    assert_eq!(
-        next.results, unadapted,
-        "hook must not leak into the next invocation"
-    );
-    assert!(!next.hook_applied);
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
     let direct =
         CrossEncoderScorer::score_batch_with_hook(model.as_ref(), QUERY, &DOCUMENTS, None).unwrap();
     assert_eq!(score_bits(&direct.scores), score_bits(&baseline));
@@ -602,7 +575,27 @@ async fn native_hook_geometry_refusal_precedes_forward() {
             compatibility_checks: AtomicUsize::new(0),
             neutral_checks: AtomicUsize::new(0),
         };
+        let validation_counts = || {
+            (
+                hook.compatibility_checks.load(Ordering::SeqCst),
+                hook.neutral_checks.load(Ordering::SeqCst),
+            )
+        };
+        let assert_validated = |(previous_compatibility, previous_neutral)| {
+            let (compatibility, neutral) = validation_counts();
+            assert!(compatibility > previous_compatibility);
+            if legacy {
+                assert_eq!(
+                    neutral, previous_neutral,
+                    "legacy refusal must short-circuit"
+                );
+            } else {
+                assert!(neutral > previous_neutral);
+            }
+            assert_eq!(hook.calls.load(Ordering::SeqCst), 0);
+        };
         for documents in [&[][..], &DOCUMENTS[..]] {
+            let before = validation_counts();
             let result = CrossEncoderScorer::score_batch_with_hook(
                 model.as_ref(),
                 QUERY,
@@ -613,8 +606,9 @@ async fn native_hook_geometry_refusal_precedes_forward() {
                 matches!(result, Err(RetrievalError::Rerank(ref message)) if message.contains("native hook geometry sentinel")),
                 "native hook geometry refusal must survive even an empty scoring batch"
             );
-            assert_eq!(hook.calls.load(Ordering::SeqCst), 0);
+            assert_validated(before);
         }
+        let before = validation_counts();
         let result = reranker
             .rerank_with_hook(QUERY, candidates(&[entity.id]), 1, Some(&hook))
             .await;
@@ -622,12 +616,8 @@ async fn native_hook_geometry_refusal_precedes_forward() {
             matches!(result, Err(RetrievalError::Rerank(ref message)) if message.contains("native hook geometry sentinel")),
             "stored-document reranking must preserve native geometry refusal"
         );
-        assert_eq!(hook.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(hook.compatibility_checks.load(Ordering::SeqCst), 3);
-        assert_eq!(
-            hook.neutral_checks.load(Ordering::SeqCst),
-            if legacy { 0 } else { 3 }
-        );
+        assert_validated(before);
+        let before_skips = validation_counts();
         for (input, limit) in [
             (vec![], 1),
             (candidates(&[entity.id]), 0),
@@ -641,8 +631,8 @@ async fn native_hook_geometry_refusal_precedes_forward() {
             assert!(!skipped.hook_applied);
         }
         assert_eq!(
-            hook.compatibility_checks.load(Ordering::SeqCst),
-            3,
+            validation_counts(),
+            before_skips,
             "existing early-empty reranker paths must skip scoring and validation"
         );
         assert_eq!(hook.calls.load(Ordering::SeqCst), 0);

@@ -671,7 +671,8 @@ fn install_fresh_clone(
 ) -> Result<(), CacheError> {
     let namespace_root = ensure_staging_namespace(root)
         .map_err(|e| io_err("install_fresh_clone: staging namespace", root, e))?;
-    let wrapper = namespace_root.join(Uuid::new_v4().to_string());
+    let wrapper_name = Uuid::new_v4().to_string();
+    let wrapper = namespace_root.join(&wrapper_name);
     std::fs::create_dir_all(&wrapper)
         .map_err(|e| io_err("install_fresh_clone: create staging wrapper", &wrapper, e))?;
 
@@ -702,19 +703,22 @@ fn install_fresh_clone(
     })?;
 
     let staging_dir = wrapper.join("repo");
-    clone(canonical_url, &staging_dir, cap).inspect_err(|_| {
-        // `git clone` can create and partially populate the destination
-        // before failing (network drop, auth failure, bad ref) -- clean up
-        // the whole wrapper so a run of failures doesn't leave staging
-        // litter under the private namespace.
-        let _ = std::fs::remove_dir_all(&wrapper);
-    })?;
-    let size = dir_size(&staging_dir).inspect_err(|_| {
-        let _ = std::fs::remove_dir_all(&wrapper);
-    })?;
-    if size > cap {
-        let _ = std::fs::remove_dir_all(&wrapper);
-        return Err(CacheError::CloneTooLarge { bytes: size, cap });
+    let clone_result = clone(canonical_url, &staging_dir, cap).and_then(|()| {
+        let size = dir_size(&staging_dir)?;
+        if size > cap {
+            return Err(CacheError::CloneTooLarge { bytes: size, cap });
+        }
+        Ok(())
+    });
+    if let Err(error) = clone_result {
+        if matches!(&error, CacheError::CloneTooLarge { .. }) {
+            // Both the in-flight cap and the final check require cleanup
+            // before the size refusal can leave this function.
+            remove_staging_wrapper(&namespace_root, wrapper_name.as_ref())?;
+        } else {
+            let _ = std::fs::remove_dir_all(&wrapper);
+        }
+        return Err(error);
     }
     touch(&staging_dir).inspect_err(|_| {
         let _ = std::fs::remove_dir_all(&wrapper);
@@ -1733,15 +1737,22 @@ fn staging_liveness(
     }
 }
 
-/// Remove a staging wrapper found abandoned by `staging_liveness`. The
-/// wrapper lives inside the private namespace this cache owns outright, so
+/// Remove the current clone's staging wrapper or one that `staging_liveness`
+/// found abandoned. The wrapper lives inside the private namespace this cache owns outright, so
 /// unlike an owned cache slot in the shared root (`delete_verified_owned_entry`)
 /// there is no external-writer exposure to harden against here -- nothing
 /// but this cache ever creates entries under `STAGING_NAMESPACE`.
 fn remove_staging_wrapper(namespace_root: &Path, name: &std::ffi::OsStr) -> Result<(), CacheError> {
-    match remove_dir_all_retrying(&namespace_root.join(name)) {
+    let wrapper = namespace_root.join(name);
+    match remove_dir_all_retrying(&wrapper) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(&wrapper)
+                    .is_err_and(|probe| probe.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(())
+        }
         Err(e) => Err(CacheError::Io(e)),
     }
 }

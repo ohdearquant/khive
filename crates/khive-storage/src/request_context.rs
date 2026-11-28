@@ -377,7 +377,7 @@ pub struct RequestReadContext {
     cancellations: Arc<[tokio::sync::watch::Receiver<bool>]>,
     deadline: Option<RequestReadDeadline>,
     store_acquisition_operation: Option<&'static str>,
-    correlation_id: Option<u64>,
+    request_id: Option<u64>,
     client_cwd: Option<Arc<str>>,
 }
 
@@ -529,21 +529,21 @@ where
 /// record of that request. `None` leaves an outer id in place. Children spawned
 /// through [`inherit_request_read_context`] carry the id with the rest of the
 /// context.
-pub async fn scope_request_correlation<F>(request_id: Option<u64>, future: F) -> F::Output
+pub async fn scope_request_id<F>(request_id: Option<u64>, future: F) -> F::Output
 where
     F: Future,
 {
     let mut context = capture_request_read_context();
     if request_id.is_some() {
-        context.correlation_id = request_id;
+        context.request_id = request_id;
     }
     REQUEST_READ_CONTEXT.scope(context, future).await
 }
 
-/// The request id scoped by [`scope_request_correlation`] on this task, if any.
-pub fn current_request_correlation() -> Option<u64> {
+/// The request id scoped by [`scope_request_id`] on this task, if any.
+pub fn current_request_id() -> Option<u64> {
     REQUEST_READ_CONTEXT
-        .try_with(|context| context.correlation_id)
+        .try_with(|context| context.request_id)
         .ok()
         .flatten()
 }

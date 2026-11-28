@@ -111,6 +111,8 @@ impl ServeRegistrations {
     ///
     /// A collision with a configured builtin is checked during host preparation,
     /// before any background task starts. Channel identities must remain stable.
+    /// Registering a second channel of a built-in kind holds sends without a
+    /// `channel_slug` until exactly one channel of that kind is registered.
     pub fn register_channel(&mut self, channel: Arc<dyn Channel>) -> anyhow::Result<()> {
         if self
             .channels

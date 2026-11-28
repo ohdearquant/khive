@@ -61,7 +61,8 @@ fn published_equal_archives_retain_distinct_coverage_identity() {
             fetched_at: "2026-01-01T00:00:00Z".into(),
             git_ref: "main".into(),
             commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
-            identity: expected.clone(),
+            content_hash: expected.content_hash.clone(),
+            coverage: expected.coverage.clone(),
         };
         let cache =
             publish_remote_cache(&remotes_root, name.as_str(), &[], &[], &meta, None).unwrap();
@@ -96,6 +97,8 @@ fn remote_identity_reader_refuses_malformed_explicit_metadata() {
         serde_json::json!({"content_hash": hash, "coverage": {"entities": true, "edges": true}}),
         serde_json::json!({"content_hash": hash, "coverage": {"entities": true, "edges": true, "notes": "false"}}),
         serde_json::json!({"content_hash": hash, "coverage": {"entities": true, "edges": true, "notes": false, "tasks": true}}),
+        serde_json::json!({"content_hash": hash, "Coverage": {"entities": true, "edges": true, "notes": true}}),
+        serde_json::json!({"content_hash": hash, "coverage_claim": {"entities": true, "edges": true, "notes": true}}),
     ] {
         std::fs::write(
             cache.join("meta.json"),

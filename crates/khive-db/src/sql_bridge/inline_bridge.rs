@@ -300,18 +300,18 @@ impl khive_storage::SqlAccess for SqlBridge {
     async fn writer(
         &self,
     ) -> khive_storage::types::StorageResult<Box<dyn khive_storage::SqlWriter>> {
+        if self.is_file_backed && self.pool.config().read_only {
+            return Err(StorageError::Pool {
+                operation: "writer".into(),
+                message: "backend is read-only".into(),
+            });
+        }
         let strict_handle = if self.pool.config().write_routing_strict {
             self.pool.writer_task_for_write(None, "writer")?
         } else {
             None
         };
         if self.is_file_backed {
-            if self.pool.config().read_only {
-                return Err(StorageError::Pool {
-                    operation: "writer".into(),
-                    message: "backend is read-only".into(),
-                });
-            }
             let db = crate::timeout_sink::db_label(&self.pool);
             // ADR-136 D1 gate 1: queue-first. The handle lookup runs BEFORE
             // any standalone connection is opened, and a lookup failure is
@@ -399,6 +399,12 @@ impl khive_storage::SqlAccess for SqlBridge {
         &self,
         op: AtomicUnitOp,
     ) -> khive_storage::types::StorageResult<Box<dyn Any + Send>> {
+        if self.is_file_backed && self.pool.config().read_only {
+            return Err(StorageError::Pool {
+                operation: "atomic_unit".into(),
+                message: "backend is read-only".into(),
+            });
+        }
         let strict_handle = if self.pool.config().write_routing_strict {
             self.pool.writer_task_for_write(None, "atomic_unit")?
         } else {
@@ -407,12 +413,6 @@ impl khive_storage::SqlAccess for SqlBridge {
         let event_rows = Arc::new(AtomicEventRows::default());
         let result = async {
             if self.is_file_backed {
-                if self.pool.config().read_only {
-                    return Err(StorageError::Pool {
-                        operation: "atomic_unit".into(),
-                        message: "backend is read-only".into(),
-                    });
-                }
                 // Best-effort, same guard `writer()` uses: `Ok(None)` on flag-off;
                 // `Err(WriterTaskNoRuntime)` propagates loud rather than silently
                 // falling back to a competing connection from a sync caller. ADR-136

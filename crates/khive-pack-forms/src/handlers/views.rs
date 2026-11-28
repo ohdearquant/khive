@@ -26,6 +26,9 @@ pub(crate) fn field_reply(graph: &Graph, field: &Entity) -> Value {
         "aliases": aliases(field),
         "items": graph.items_of_field(field.id).len(),
     });
+    if let Some(known_as) = prop(field, "known_as") {
+        reply["known_as"] = known_as.clone();
+    }
     if is_general(field) {
         reply["general"] = json!(true);
         reply["means"] = Value::Array(

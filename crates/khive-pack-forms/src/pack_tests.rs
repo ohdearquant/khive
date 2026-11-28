@@ -12,7 +12,7 @@ fn every_verb_is_namespaced_and_unique() {
         assert!(seen.insert(handler.name), "{} twice", handler.name);
         assert!(!handler.description.is_empty(), "{}", handler.name);
     }
-    assert_eq!(seen.len(), 10);
+    assert_eq!(seen.len(), 12);
 }
 
 #[test]
@@ -37,7 +37,7 @@ fn writes_are_commissive_and_reads_assertive() {
 #[test]
 fn the_pack_declares_its_types_and_edges_and_needs_kg() {
     assert_eq!(FormsPack::NAME, "forms");
-    assert_eq!(FormsPack::ENTITY_TYPES.len(), 7);
-    assert_eq!(FormsPack::EDGE_RULES.len(), 20);
+    assert_eq!(FormsPack::ENTITY_TYPES.len(), 10);
+    assert_eq!(FormsPack::EDGE_RULES.len(), 23);
     assert_eq!(FormsPack::REQUIRES, ["kg"]);
 }

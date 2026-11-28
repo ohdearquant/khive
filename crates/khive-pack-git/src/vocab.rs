@@ -156,7 +156,7 @@ pub(crate) static GIT_HANDLERS: [HandlerDef; 26] = [
     },
     HandlerDef {
         name: "git.commit",
-        description: "Commit a complete tree manifest with actor identity and an atomic expected-head compare, or use the legacy paths form. Tree commits require the tool pack and actor mapping, preserve the index/worktree, and return receipt_id with the SHA. Paths retain their legacy behavior.",
+        description: "Commit a complete tree manifest with actor identity and an atomic expected-head compare, or use the legacy paths form. Tree commits require the tool pack and actor mapping, preserve the index/worktree, and return receipt_id with the SHA. A scoped tree, including one edited from a scoped tree, refuses scoped_tree naming its scope before any git command runs. Paths retain their legacy behavior.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[

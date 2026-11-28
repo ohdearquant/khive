@@ -284,6 +284,12 @@
         "type": "string",
         "minLength": 1
       },
+      "paths": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
       "session_id": {
         "type": "string",
         "minLength": 1

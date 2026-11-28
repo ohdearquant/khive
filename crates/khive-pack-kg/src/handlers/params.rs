@@ -267,6 +267,7 @@ pub(crate) struct SearchParams {
     pub(crate) order_by: Option<String>,
     pub(crate) created_after: Option<String>,
     pub(crate) created_before: Option<String>,
+    pub(crate) follow: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -347,6 +348,8 @@ pub(crate) enum NeighborProjection {
     Edge,
     Summary,
     Record,
+    /// Record plus the neighbor's properties and description and the edge's metadata.
+    Full,
 }
 
 #[derive(Deserialize)]
