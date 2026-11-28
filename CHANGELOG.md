@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-28
+
 ### Added
 
 - `neighbors` takes `projection="full"`: each neighbor carries the record fields plus its
