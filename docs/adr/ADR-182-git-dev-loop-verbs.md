@@ -1608,7 +1608,7 @@ verb total counting them.
 
 ## Amendment 24 (2026-11-27): a checkout of named paths
 
-**Status**: Proposed. The ADR's Accepted status and every amendment above stand unchanged.
+**Status**: Accepted 2026-11-27 (#6930). The ADR's Accepted status and every amendment above stand unchanged.
 
 A checkout lists the whole tree at `ref` and stores one manifest for it (Amendment 2 item 8). The
 manifest has an 8 MiB load limit (`MAX_MANIFEST_BYTES`, ADR-181). A repository whose manifest is
@@ -1630,18 +1630,18 @@ a checkout is a later amendment; until then a scoped tree is refused by `git.com
    `output_limit` refusal now says a checkout may name paths.
 3. **A scoped tree is not a whole tree, and every tree written from it stays scoped.** A scoped
    checkout writes its manifest with the schema `khive-tree/scoped-v1` and a `scope` field holding
-   its sorted `paths`; a whole checkout writes `khive-tree/v1` as today. Loading a manifest returns
-   its entries with its scope, and storing one takes both, so every verb that writes a tree from a
-   tree it read (`computer.fs_edit`, `computer.fs_write`, `exec.tree_put`, a run's `tree_out`)
-   writes the same scope, and a merge of two trees whose scopes differ refuses `scope_mismatch`.
+   its sorted `paths`; a whole checkout writes `khive-tree/v1` as today. The runtime's tree store
+   loads a manifest as its entries with its scope and stores one only from both, so a verb that
+   writes a tree from a tree it read (`exec.tree_put`, a run's `tree_out`) writes the same scope, and
+   so does any tool outside this repository that edits trees through the same store.
    `git.commit` reads a manifest as the whole tree, and a path the manifest omits is a deletion
    (Amendment 2 item 2), so it refuses every `khive-tree/scoped-v1` manifest (`scoped_tree`, naming
    the scope) before any git command runs. The guard reads the manifest's schema, never its
    entries: a scoped tree whose paths happen to cover every entry of the repository is refused all
    the same, and only a tree written from a whole checkout commits. A binary older than this
    amendment refuses the scoped schema when it loads the manifest, as it refuses every schema but
-   `khive-tree/v1`, so it can neither run nor commit a scoped tree as a whole one. A manifest a
-   caller writes itself as raw bytes is outside this guard.
+   `khive-tree/v1`, so neither it nor a tool built on its store can run, edit or commit a scoped
+   tree as a whole one. A manifest a caller writes itself as raw bytes is outside this guard.
 
 What this does not cover: committing from a scoped tree, a pattern or glob in `paths`, and a
 listing limited by depth or size.
@@ -1653,10 +1653,11 @@ ref unscoped returns a superset (control); 123 `invalid_path` for each bad spell
 holding glob characters matches only itself; 125 a repository whose whole manifest exceeds the limit
 refuses unscoped, with the refusal naming `paths`, and checks out scoped under it; 126 `git.commit` of
 a scoped checkout's tree refuses `scoped_tree` naming its scope with no ref moved; the same tree with
-one file edited through `computer.fs_edit`, through `exec.tree_put` and through a run's `tree_out`
-keeps the scope and refuses the same way; a scoped checkout whose paths cover every entry of a small
-repository refuses although its entries equal the whole tree's; and the whole checkout's tree commits
-(control); mutation control: storing an edited tree without its scope turns the edited cases red;
-127 a scoped link entry keeps mode `120000` and its literal target (Amendment 19); 128 a merge of a
-scoped tree with a whole tree, and with a tree of another scope, refuses `scope_mismatch`, while two
-trees of one scope merge and the result keeps it.
+one file edited through `exec.tree_put`, and with one file written by a run and read back as its
+`tree_out`, keeps the scope and refuses the same way; a scoped checkout whose paths cover every entry
+of a small repository refuses although its entries equal the whole tree's; and the whole checkout's
+tree commits (control); mutation control: storing an edited tree without its scope turns the edited
+cases red; 127 a scoped link entry keeps mode `120000` and its literal target (Amendment 19); 128 a
+scoped checkout's stored manifest bytes carry a schema other than `khive-tree/v1`, and a manifest with
+any schema the store does not know is refused at load, the branch an older binary takes on a scoped
+manifest.
