@@ -1605,3 +1605,47 @@ refuse `remote_response`, and a repository answering under another name refuses
 `repository_identity_mismatch` after exactly one request while the same call lists once the platform
 answers (control); 121 the classifier lists both verbs as reads at version 36 with every published
 verb total counting them.
+
+## Amendment 24 (2026-11-27): a checkout of named paths
+
+**Status**: Proposed. The ADR's Accepted status and every amendment above stand unchanged.
+
+A checkout lists the whole tree at `ref` and stores one manifest for it (Amendment 2 item 8). The
+manifest has an 8 MiB load limit (`MAX_MANIFEST_BYTES`, ADR-181). A repository whose manifest is
+larger refuses `output_limit` at the tree limit, and nothing in it can be read through
+`git.checkout`. This amendment lets a caller check out only the paths it needs. Committing from such
+a checkout is a later amendment; until then a scoped tree is refused by `git.commit` (item 3).
+
+1. **`git.checkout(repo, ref, paths?)`.** `paths` lists 1 to 64 repository-relative paths, each a
+   file or a directory, spelled as the tree names them. A path with a leading slash, an empty, `.` or
+   `..` component, a trailing slash or a NUL byte refuses `invalid_path`, and one path inside another
+   refuses `overlapping_paths`, both before git runs. The listing is
+   `ls-tree -r -z --full-tree <commit> -- <paths>` with literal pathspecs set on that command alone,
+   so a path is never a pattern. A path that names nothing at the commit refuses `path_not_found`,
+   naming it, before any blob is read.
+2. **The same checkout, of fewer entries.** The manifest holds the listed entries at their full
+   repository paths. Amendment 2 item 8's bounds and blob reuse, the manifest limit and Amendment 19's
+   links apply to the listing unchanged. The result is `{commit, tree, paths}`, and the receipt's
+   inputs gain `paths`, sorted. Without `paths` nothing changes, except that the whole-tree
+   `output_limit` refusal now says a checkout may name paths.
+3. **A scoped tree is not a whole tree.** `git.commit` reads its manifest as the whole tree, and a
+   path the manifest omits is a deletion (Amendment 2 item 2), so a scoped tree committed as it
+   stands would delete everything outside its paths. `git.commit` refuses a tree that the
+   repository's checkout receipts record only as a scoped result (`scoped_tree`, naming the paths).
+   The guard reads the receipts, never the tree's content: a scoped tree whose paths happen to cover
+   every entry of the repository is refused all the same, and only a tree that a whole checkout also
+   produced passes, since it is that whole tree.
+
+What this does not cover: committing from a scoped tree, a pattern or glob in `paths`, and a
+listing limited by depth or size.
+
+Acceptance arms added: 122 a checkout naming one directory and one file returns exactly the entries
+under them at full paths with their bytes, and the receipt's inputs name both paths, while the same
+ref unscoped returns a superset (control); 123 `invalid_path` for each bad spelling,
+`overlapping_paths`, and `path_not_found` naming the path, each before any blob is read; 124 a path
+holding glob characters matches only itself; 125 a repository whose whole manifest exceeds the limit
+refuses unscoped, with the refusal naming `paths`, and checks out scoped under it; 126 `git.commit` of
+a scoped tree refuses `scoped_tree` naming its paths with no ref moved, a scoped checkout whose paths
+cover every entry of a small repository refuses the same way although its tree equals the whole
+tree's content, and the same tree produced by a whole checkout commits (control); 127 a scoped link
+entry keeps mode `120000` and its literal target (Amendment 19).
