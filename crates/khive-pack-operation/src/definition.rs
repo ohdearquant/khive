@@ -130,6 +130,17 @@ struct DocumentInput {
     operation_types: Vec<Value>,
     #[serde(default)]
     step_types: Vec<Value>,
+    #[serde(default)]
+    source_order: Option<Value>,
+}
+
+/// The deployment's order between the places a value can be read from (ADR-222 A2.6): document
+/// types and systems loaded in the forms pack, each named once. A namespace holds one, versioned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceOrder {
+    pub version: i64,
+    pub places: Vec<String>,
 }
 
 /// What a produced value is: read from a place, computed from other values, or stated by the
@@ -406,11 +417,13 @@ pub(crate) struct Compiled {
 pub(crate) type Available = BTreeMap<(String, i64), (StepType, String)>;
 
 /// What one document publishes: the step types it gives on their own, then its operation
-/// types with the step types given inside them.
+/// types with the step types given inside them, and the namespace's source order if it gives
+/// one.
 #[derive(Debug)]
 pub(crate) struct Document {
     pub step_types: Vec<Stored>,
     pub operation_types: Vec<Compiled>,
+    pub source_order: Option<(Stored, SourceOrder)>,
 }
 
 /// The step types a document names by id and version, those it gives and those its steps
@@ -453,12 +466,20 @@ pub(crate) fn compile_document(
 ) -> Result<Document, Refusal> {
     let input: DocumentInput = serde_json::from_value(document.clone())
         .map_err(|e| Refusal::new("invalid_document", e.to_string()))?;
-    if input.operation_types.is_empty() && input.step_types.is_empty() {
+    if input.operation_types.is_empty()
+        && input.step_types.is_empty()
+        && input.source_order.is_none()
+    {
         return Err(Refusal::new(
             "invalid_document",
-            "the document lists no operation type and no step type",
+            "the document lists no operation type, no step type and no source order",
         ));
     }
+    let source_order = input
+        .source_order
+        .as_ref()
+        .map(compile_source_order)
+        .transpose()?;
     let mut available = published.clone();
     let mut step_types = Vec::with_capacity(input.step_types.len());
     let mut seen_steps = BTreeSet::new();
@@ -507,7 +528,58 @@ pub(crate) fn compile_document(
     Ok(Document {
         step_types,
         operation_types: out,
+        source_order,
     })
+}
+
+/// A source order: a version and the places in order, none named twice. Names are compared as
+/// the forms pack compares them, so two spellings of one place are refused as a duplicate; that
+/// each place is loaded is checked against the forms pack before anything is written.
+fn compile_source_order(source: &Value) -> Result<(Stored, SourceOrder), Refusal> {
+    let order: SourceOrder = serde_json::from_value(source.clone())
+        .map_err(|e| Refusal::new("invalid_document", format!("source_order: {e}")))?;
+    if order.version < 1 {
+        return Err(Refusal::new(
+            "invalid_version",
+            format!(
+                "source_order: version must be 1 or more, got {}",
+                order.version
+            ),
+        ));
+    }
+    if order.places.is_empty() {
+        return Err(Refusal::new(
+            "invalid_document",
+            "source_order lists no place",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for place in &order.places {
+        // A place is a forms pack name, not an operation id, so check_name's '/' rule is not
+        // applied to it.
+        if place.trim().is_empty() || place.trim() != place {
+            return Err(Refusal::new(
+                "invalid_name",
+                format!("place {place:?} must be non-empty with no surrounding space"),
+            ));
+        }
+        if !seen.insert(fold(place)) {
+            return Err(Refusal::new(
+                "duplicate_place",
+                format!("source_order names the place \"{place}\" twice"),
+            ));
+        }
+    }
+    let value = serde_json::to_value(&order)
+        .map_err(|e| Refusal::new("invalid_document", e.to_string()))?;
+    let stored = store(
+        "source_order",
+        "source_order",
+        order.version,
+        &value,
+        source,
+    );
+    Ok((stored, order))
 }
 
 /// A step type published on its own. Its `by` and the slots its values are about are slot
@@ -1930,5 +2002,55 @@ mod tests {
             "{}",
             type_.operation_type.source
         );
+    }
+
+    fn ordering(order: Value) -> Result<Document, Refusal> {
+        compile_document(&json!({"source_order": order}), &Available::new())
+    }
+
+    #[test]
+    fn a_source_order_given_alone_is_stored_in_its_order() {
+        let compiled =
+            ordering(json!({"version": 2, "places": ["W-2", "1099-INT"]})).expect("compiles");
+        assert!(compiled.step_types.is_empty() && compiled.operation_types.is_empty());
+        let (stored, order) = compiled.source_order.expect("a source order");
+        assert_eq!((stored.kind, stored.version), ("source_order", 2));
+        assert_eq!(order.places, vec!["W-2", "1099-INT"]);
+        let bytes: Value = serde_json::from_slice(&stored.bytes).expect("stored bytes");
+        assert_eq!(bytes, json!({"version": 2, "places": ["W-2", "1099-INT"]}));
+        // The order is the deployment's: the same places in another order are another digest.
+        let (swapped, _) = ordering(json!({"version": 2, "places": ["1099-INT", "W-2"]}))
+            .expect("compiles")
+            .source_order
+            .expect("a source order");
+        assert_ne!(swapped.digest, stored.digest);
+    }
+
+    #[test]
+    fn the_source_order_checks_refuse_by_code() {
+        let cases = [
+            ("invalid_version", json!({"version": 0, "places": ["W-2"]})),
+            ("invalid_document", json!({"version": 1, "places": []})),
+            ("invalid_document", json!({"version": 1})),
+            (
+                "invalid_document",
+                json!({"version": 1, "places": ["W-2"], "id": "x"}),
+            ),
+            ("invalid_name", json!({"version": 1, "places": [" W-2"]})),
+            (
+                "duplicate_place",
+                json!({"version": 1, "places": ["W-2", "1099", "W-2"]}),
+            ),
+            (
+                "duplicate_place",
+                json!({"version": 1, "places": ["W-2", "w-2"]}),
+            ),
+        ];
+        for (code, order) in cases {
+            let refusal = ordering(order.clone()).expect_err(code);
+            assert_eq!(refusal.code, code, "{order}: {refusal}");
+        }
+        let refusal = compile_document(&json!({}), &Available::new()).expect_err("empty");
+        assert_eq!(refusal.code, "invalid_document");
     }
 }

@@ -622,3 +622,58 @@ async fn a_step_type_published_alone_is_pinned_later_and_its_version_holds_one_d
         .await;
     assert!(message.contains("version_conflict"), "{message}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_order_names_loaded_document_types_and_its_version_holds_one_order() {
+    let store = Store::new();
+    let order = |version: i64, places: Value| json!({ "document": {"source_order": {"version": version, "places": places}} });
+    store.load(form_a("2026-01", 1, true)).await;
+    // Form B is not loaded yet, so it is no place.
+    let message = store
+        .refused("operation.define", order(1, json!([A, B])))
+        .await;
+    assert!(
+        message.contains("unknown_place") && message.contains(B),
+        "{message}"
+    );
+    for (places, what) in [
+        (json!([format!("{A}@2026-01")]), "a form revision"),
+        (json!([ID]), "a field"),
+        (json!(["kind:person"]), "a term"),
+        (json!(["PERMIT-C"]), "nothing loaded"),
+    ] {
+        let message = store.refused("operation.define", order(1, places)).await;
+        assert!(message.contains("unknown_place"), "{what}: {message}");
+    }
+
+    store.load(form_b()).await;
+    // Nothing refused above was written: version 1 is published fresh here.
+    let first = store
+        .call("operation.define", order(1, json!([B, A])))
+        .await;
+    assert_eq!(first["source_order_published"]["version"], 1, "{first}");
+    assert_eq!(first["source_order_already_published"], Value::Null);
+    assert_eq!(first["published"], json!([]));
+    let again = store
+        .call("operation.define", order(1, json!([B, A])))
+        .await;
+    assert_eq!(again["source_order_published"], Value::Null, "{again}");
+    assert_eq!(
+        again["source_order_already_published"]["digest"],
+        first["source_order_published"]["digest"]
+    );
+    let message = store
+        .refused("operation.define", order(1, json!([A, B])))
+        .await;
+    assert!(message.contains("version_conflict"), "{message}");
+
+    // A second start applies the schema again over the table it already made.
+    store
+        .registry
+        .apply_schema_plans_with_map(&Default::default(), store._runtime.backend())
+        .expect("the schema applies again on a store that holds it");
+    let next = store
+        .call("operation.define", order(2, json!([A, B])))
+        .await;
+    assert_eq!(next["source_order_published"]["version"], 2, "{next}");
+}

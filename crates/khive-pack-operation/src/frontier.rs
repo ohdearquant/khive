@@ -7,12 +7,14 @@
 //! when every asked identity acted (`all_of`), when one did (`at_least_one`), or, for a slot
 //! of one identity, when an act naming no identity or the identity bound there is recorded.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::definition::{Action, OperationType, Quantifier, RuleStatus, StepType, Term};
+use crate::definition::{
+    Action, OperationType, Quantifier, Requirement, RuleStatus, StepRef, StepType, Term,
+};
 
 /// Who or what fills a slot. Two identities are the same when kind and key are.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,6 +261,152 @@ fn evaluation_order(definition: &OperationType) -> Result<Vec<String>, String> {
     Ok(placed)
 }
 
+/// Where one sought input may be found (ADR-222 A1.4): the places that state the field about a
+/// subject resolving to the requirement's slot, and the places that state its parent field.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Found {
+    pub places: Vec<Value>,
+    pub stated_in_part: Vec<Value>,
+}
+
+/// What was found for each (field, slot) sought, read from the forms pack before the frontier
+/// is evaluated.
+pub(crate) type Places = HashMap<(String, Option<String>), Found>;
+
+/// The field a requirement seeks: the supply's field when the step is supplied it, else its own.
+fn sought_field<'a>(step: &'a StepRef, need: &'a Requirement) -> (&'a str, Option<&'a str>) {
+    let supply = step
+        .supplies
+        .iter()
+        .find(|supply| supply.as_field == need.field);
+    (
+        supply.map_or(need.field.as_str(), |supply| supply.field.as_str()),
+        supply.map(|supply| supply.from.as_str()),
+    )
+}
+
+/// Every (field, slot) a step of the type may be found missing, in name order.
+pub(crate) fn sought_inputs(
+    definition: &OperationType,
+    step_types: &HashMap<String, StepType>,
+) -> BTreeSet<(String, Option<String>)> {
+    let mut sought = BTreeSet::new();
+    for step in &definition.steps {
+        let Some(step_type) = step_types.get(&step.name) else {
+            continue;
+        };
+        for need in &step_type.requires {
+            let (field, _) = sought_field(step, need);
+            sought.insert((field.to_owned(), need.slot.clone()));
+        }
+    }
+    sought
+}
+
+/// One `input_missing` item for each value `step` requires of `unit` that no record holds:
+/// the field about the identity bound to the requirement's slot, or about the operation when
+/// it names none. A supplied requirement seeks the supply's field. A requirement about a slot
+/// other than the step's own is sought of every identity bound to it, one item each.
+fn missing_inputs(
+    definition: &OperationType,
+    step_types: &HashMap<String, StepType>,
+    places: &Places,
+    state: &State,
+    step: &StepRef,
+    step_type: &StepType,
+    unit: &Unit,
+) -> Vec<Value> {
+    let mut items = Vec::new();
+    for need in &step_type.requires {
+        let (sought, supplied_from) = sought_field(step, need);
+        let abouts: Vec<Option<Option<&Identity>>> = match &need.slot {
+            None => vec![None],
+            Some(slot) if *slot == step_type.by => vec![Some(unit.identity.as_ref())],
+            Some(slot) => match state.bindings.get(slot) {
+                Some(bound) if !bound.is_empty() => bound.iter().map(|b| Some(Some(b))).collect(),
+                _ => vec![Some(None)],
+            },
+        };
+        let found = missing_item(
+            definition,
+            step_types,
+            places,
+            (step, step_type, unit),
+            need,
+            (sought, supplied_from),
+        );
+        for about in abouts {
+            let present = match about {
+                None => state.facts.contains_key(&(sought.to_owned(), None)),
+                Some(Some(identity)) => state
+                    .facts
+                    .contains_key(&(sought.to_owned(), Some(identity.reference()))),
+                Some(None) => false,
+            };
+            if present {
+                continue;
+            }
+            let mut item = found.clone();
+            if let Some(Some(identity)) = about {
+                item["identity"] = json!(identity);
+            }
+            items.push(item);
+        }
+    }
+    items
+}
+
+/// The `input_missing` item for one requirement, before it names the identity it is about.
+fn missing_item(
+    definition: &OperationType,
+    step_types: &HashMap<String, StepType>,
+    places: &Places,
+    (step, step_type, unit): (&StepRef, &StepType, &Unit),
+    need: &Requirement,
+    (sought, supplied_from): (&str, Option<&str>),
+) -> Value {
+    let found = places
+        .get(&(sought.to_owned(), need.slot.clone()))
+        .cloned()
+        .unwrap_or_default();
+    let mut item = json!({
+        "kind": "input_missing",
+        "step": step.name,
+        "act": step_type.act,
+        "by": step_type.by,
+        "supplier": unit_supplier(&step_type.by, unit.identity.as_ref()),
+        "field": sought,
+        "value_type": need.value_type,
+        "places": found.places,
+        "stated_in_part": found.stated_in_part,
+    });
+    if let Some(from) = supplied_from {
+        item["as"] = json!(need.field);
+        item["produced_by"] = json!([from]);
+    } else {
+        let producers: Vec<&str> = definition
+            .steps
+            .iter()
+            .filter(|other| {
+                step_types.get(&other.name).is_some_and(|other_type| {
+                    other_type
+                        .produces
+                        .iter()
+                        .any(|made| made.field == need.field && made.slot == need.slot)
+                })
+            })
+            .map(|other| other.name.as_str())
+            .collect();
+        if !producers.is_empty() {
+            item["produced_by"] = json!(producers);
+        }
+    }
+    if let Some(slot) = &need.slot {
+        item["slot"] = json!(slot);
+    }
+    item
+}
+
 fn unit_supplier(by: &str, identity: Option<&Identity>) -> Value {
     match identity {
         Some(identity) => json!({"slot": by, "identity": identity}),
@@ -271,6 +419,7 @@ fn unit_supplier(by: &str, identity: Option<&Identity>) -> Value {
 pub(crate) fn evaluate(
     definition: &OperationType,
     step_types: &HashMap<String, StepType>,
+    places: &Places,
     records: &[Payload],
     opened_by: &str,
     group_by: GroupBy,
@@ -503,6 +652,17 @@ pub(crate) fn evaluate(
                     .filter(|unit| unit.asked == Asked::Yes && !unit.acted)
                 {
                     let owed = eval.status == Status::Owed;
+                    if owed {
+                        // A step whose predecessors are done is owed only once every input it
+                        // requires is recorded (ADR-222 A2.4).
+                        let missing = missing_inputs(
+                            definition, step_types, places, &state, step, step_type, unit,
+                        );
+                        if !missing.is_empty() {
+                            items.extend(missing);
+                            continue;
+                        }
+                    }
                     let mut item = json!({
                         "kind": if owed { "act_owed" } else { "act_blocked" },
                         "step": step.name,
