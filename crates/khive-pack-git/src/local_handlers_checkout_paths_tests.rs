@@ -43,8 +43,8 @@ fn a_malformed_path_refuses_invalid_path() {
         "./a.txt",
         "docs/./one.md",
         "../a.txt",
-        "docs/..",
-        "docs/",
+        "sub/..",
+        "sub/",
         "a\0b",
     ] {
         let failure = refusal(&json!(["a.txt", path]));
