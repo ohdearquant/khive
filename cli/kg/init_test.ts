@@ -126,11 +126,8 @@ Deno.test("kg init: creates .khive/config.toml with defaults", async () => {
     const tomlText = await Deno.readTextFile(join(dir, ".khive/config.toml"));
     const config = parseTOML(tomlText) as Record<string, unknown>;
 
-    const embed = config["embed"] as Record<string, unknown>;
-    assertEquals(embed["model"], "mE5-small");
-    assertEquals(embed["dimensions"], 384);
-    assertEquals(embed["auto_embed"], true);
-    assertEquals(embed["batch_size"], 64);
+    assertEquals(config["embed"], { batch_size: 64 });
+    assertEquals(config["schema"], { strict: true });
   } finally {
     await removeDir(dir);
   }
