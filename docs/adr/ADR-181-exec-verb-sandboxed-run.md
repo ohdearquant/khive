@@ -2136,9 +2136,9 @@ to every row.
 
 ## Amendment 20 (2026-11-27): a run that calls store verbs, and a run fired by a schedule
 
-**Status: Proposed.** It adds one optional `exec.run` parameter, `store_verbs`, the receipt fields that record each
-call a run makes through it, and the record a schedule keeps of the runs it fires. A run that does not pass
-`store_verbs` runs exactly as before.
+**Status: Accepted 2026-11-28 (#6947).** It adds one optional `exec.run` parameter, `store_verbs`, the receipt
+fields that record each call a run makes through it, and the record a schedule keeps of the runs it fires. A run
+that does not pass `store_verbs` runs exactly as before.
 
 ### Context
 
@@ -2216,4 +2216,5 @@ the schedule.
 108. **Schedule.** A daily schedule whose action is `exec.run` with `store_verbs`, fired twice by the runner's test
      clock: each receipt's `origin` names the schedule and its `scheduled_for`; the row's `run_receipts` lists both
      receipt ids in fire order; `exec.runs(origin=...)` returns both runs; each run's `store_calls` audit events
-     name the actor that created the schedule. A caller-passed `origin` is refused.
+     name the actor that created the schedule. A schedule with no creating actor has its fire refused and recorded on
+     the schedule row, and no run directory is made. A caller-passed `origin` is refused.
