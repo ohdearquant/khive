@@ -854,6 +854,13 @@ versions definitions. Each place names a document type or system loaded in the f
 refuses a name the forms pack has not loaded (`unknown_place`) and a name given twice
 (`duplicate_place`).
 
+A source order is stored in its own append-only table, `operation_source_orders`, keyed by
+namespace and version, with the canonical bytes and their digest, and refusing an update, a delete
+and an insert over an existing key. It is not a row of `operation_definitions`, as A1.4 point 3
+said. A pack's tables are created with `CREATE TABLE IF NOT EXISTS` at every start, so a store
+that already holds `operation_definitions` would keep its `kind` check unchanged, and a third kind
+would be refused there.
+
 So a source order loads after the document types and systems it names. A deployment that loads a
 new document type publishes a new version that names it, and until then that type's places come
 after the listed ones, in name order (A1.4 point 3). The frontier reads the newest published version
