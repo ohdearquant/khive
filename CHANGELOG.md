@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `gtd.tasks` accepts `compact=true` for smaller task pages with description lengths. Compact
+  pages use the same filters, task order, and continuation as full pages (#6914).
 - `git.issue` reads one issue of a configured repository: its title, state, author, dates, label
   names, whole body and comments in platform order, one hundred to a page for at most ten pages,
   with the platform's comment count and whether fewer were returned. It says whether the number is
@@ -22,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Hidden characters are removed from titles, refs, labels and logins and `text_altered` says so;
   the text is returned as untrusted data. Both are reads, admitted by a row with
   `access = "read"`, and write no receipt.
+- The runtime adds a caller key to an entity that already exists (`add_entity_key`, and
+  `entity_key_add_plans` for a caller that joins the add to its own atomic unit), under the rules of
+  a keyed create: the same limits and secret scan on the key, the same uniqueness per namespace and
+  base kind, `key_conflict` against another live holder, and nothing written for a key the entity
+  already holds. An add to a deleted entity is refused as `entity_deleted` and to a merged-away one
+  as `entity_merged` (ADR-221 Amendment 1).
+
+### Breaking (Rust crates)
+
+- `khive_storage::scope_request_correlation` and `khive_storage::current_request_correlation`
+  are now `khive_storage::scope_request_id` and `khive_storage::current_request_id`. These names
+  match `request_id` in daemon frames and writer attempt rows (#6773).
 
 ## [0.23.0] - 2026-11-26
 

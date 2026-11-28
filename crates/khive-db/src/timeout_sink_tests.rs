@@ -136,32 +136,18 @@ fn slow_write_threshold_env_override_and_zero_disable() {
 
 #[test]
 fn slow_write_line_carries_elapsed_and_depth_and_omits_inapplicable_fields() {
-    let stages = WriterStageFields {
+    let stages = crate::writer_task::WriterStageObservation {
         queue_wait_micros: 11,
         transaction_acquire_micros: 22,
         body_micros: 1_111_000,
         commit_micros: 44,
         total_micros: 1_234_000,
+        queue_depth_at_entry: 7,
+        observed_at_unix_ms: 0,
+        labels: vec!["resolve_prefix".to_string()],
+        labels_truncated: Some(2),
     };
-    let line = build_line(
-        now_rfc3339(),
-        "slow_write",
-        "test-db",
-        None,
-        None,
-        None,
-        None,
-        Some(1234),
-        Some(7),
-        Some(stages),
-        Some(SlowWriteLabels {
-            labels: vec!["resolve_prefix".to_string()].into_boxed_slice(),
-            labels_truncated: Some(2),
-        }),
-        None,
-        None,
-        None,
-    );
+    let line = QueuedEvent::with_writer_stages("slow_write", "test-db", &stages).into_line();
     let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(parsed["kind"], "slow_write");
     assert_eq!(parsed["elapsed_ms"], 1234);
@@ -214,19 +200,11 @@ fn truncate_error_respects_utf8_char_boundaries() {
 fn enqueue_drops_and_counts_on_full_channel() {
     let (sender, _receiver) = mpsc::sync_channel::<QueuedEvent>(1);
     let dropped = AtomicU64::new(0);
-    let make_event = || QueuedEvent {
-        ts_utc: now_rfc3339(),
-        kind: "timeout",
-        db: "test-db".to_string(),
-        site: Some(Site::PoolAdmission.as_str()),
-        phase: None,
-        error: Some("boom".to_string()),
-        timeout_ms: Some(5),
-        elapsed_ms: None,
-        queue_depth: None,
-        writer_stages: None,
-        labels: None,
-        attempt: None,
+    let make_event = || {
+        let mut event = QueuedEvent::with_error("timeout", "test-db", "boom");
+        event.site = Some(Site::PoolAdmission.as_str());
+        event.timeout_ms = Some(5);
+        event
     };
 
     enqueue(&sender, &dropped, make_event());
@@ -397,20 +375,13 @@ fn concurrent_enqueue_then_single_threaded_drain_produces_intact_lines() {
             let sender = sender.clone();
             let dropped = Arc::clone(&dropped);
             thread::spawn(move || {
-                let event = QueuedEvent {
-                    ts_utc: now_rfc3339(),
-                    kind: "timeout",
-                    db: "concurrent-test".to_string(),
-                    site: Some(Site::StandaloneGraph.as_str()),
-                    phase: None,
-                    error: Some(format!("contention-{i}")),
-                    timeout_ms: Some(i as u64),
-                    elapsed_ms: None,
-                    queue_depth: None,
-                    writer_stages: None,
-                    labels: None,
-                    attempt: None,
-                };
+                let mut event = QueuedEvent::with_error(
+                    "timeout",
+                    "concurrent-test",
+                    &format!("contention-{i}"),
+                );
+                event.site = Some(Site::StandaloneGraph.as_str());
+                event.timeout_ms = Some(i as u64);
                 enqueue(&sender, &dropped, event);
             })
         })
@@ -424,22 +395,7 @@ fn concurrent_enqueue_then_single_threaded_drain_produces_intact_lines() {
     sink.set_target(Vec::new());
     let mut written_lines = 0usize;
     while let Ok(event) = receiver.try_recv() {
-        let line = build_line(
-            event.ts_utc,
-            event.kind,
-            &event.db,
-            event.site,
-            event.phase,
-            event.error.as_deref(),
-            event.timeout_ms,
-            event.elapsed_ms,
-            event.queue_depth,
-            event.writer_stages,
-            event.labels,
-            event.attempt,
-            None,
-            None,
-        );
+        let line = event.into_line();
         if sink.write_line(&line) {
             written_lines += 1;
         }

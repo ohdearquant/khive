@@ -1,5 +1,6 @@
 //! Vocabulary, schema plan and handler table for the tool pack.
 
+use khive_types::pack::TOOL_REGISTRY_ENTITY_KIND;
 use khive_types::{
     EntityKind, EntityTypeDef, HandlerDef, IdResolutionMode, PackColumnAddition,
     PackColumnAffinity, ParamDef, VerbCategory, Visibility,
@@ -18,7 +19,7 @@ pub const REGISTRY_TAG: &str = khive_types::pack::TOOL_REGISTRY_TAG;
 pub const CAPABILITY_TAG: &str = "tool-capability";
 
 /// Base entity kind of a registry object.
-pub const REGISTRY_ENTITY_KIND: &str = "project";
+pub const REGISTRY_ENTITY_KIND: &str = TOOL_REGISTRY_ENTITY_KIND.name();
 
 /// Registry object subtypes (`entity_type` on the `project` kind).
 pub const KINDS: &[&str] = &["tool", "skill", "plugin", "verb"];
@@ -41,17 +42,17 @@ pub const GRANT_STATUSES: &[&str] = &["requested", "granted", "denied", "revoked
 /// the capability concept subtype are new.
 pub static ENTITY_TYPES: [EntityTypeDef; 4] = [
     EntityTypeDef {
-        kind: EntityKind::Project,
+        kind: TOOL_REGISTRY_ENTITY_KIND,
         type_name: "skill",
         aliases: &[],
     },
     EntityTypeDef {
-        kind: EntityKind::Project,
+        kind: TOOL_REGISTRY_ENTITY_KIND,
         type_name: "plugin",
         aliases: &[],
     },
     EntityTypeDef {
-        kind: EntityKind::Project,
+        kind: TOOL_REGISTRY_ENTITY_KIND,
         type_name: "verb",
         aliases: &[],
     },

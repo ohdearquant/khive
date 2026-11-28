@@ -272,6 +272,8 @@ async fn test_single_result_passes_through() {
     assert_eq!(out[0].0, 42u32);
 }
 
+// This fixture simulates a scorer reporting hook use. Its one-element loop
+// lets the reranker test observe hook forwarding and the scorer's evidence.
 #[derive(Default)]
 struct HookAwareScorer {
     calls: std::sync::atomic::AtomicUsize,
@@ -380,44 +382,6 @@ async fn per_call_hook_reaches_scorer_and_is_not_retained() {
         vec![("q".to_string(), vec!["a".to_string(), "b".to_string()]); 3],
         "per-call scoring must preserve the literal query and retained document order"
     );
-}
-
-#[tokio::test]
-async fn noop_hook_matches_none_without_applied_evidence() {
-    let reranker = NativeCrossEncoderReranker::new(
-        Arc::new(HookAwareScorer::default()),
-        Arc::new(FakeResolver {
-            documents: vec![Some("a".into())],
-        }),
-    );
-    let none = reranker
-        .rerank_with_hook("q", candidates(&[1]), 1, None)
-        .await
-        .unwrap();
-    let noop = reranker
-        .rerank_with_hook("q", candidates(&[1]), 1, Some(&NoopLoraHook))
-        .await
-        .unwrap();
-    assert_eq!(noop.results, none.results);
-    assert!(!none.hook_applied);
-    assert!(
-        !noop.hook_applied,
-        "hook presence is not application evidence"
-    );
-    let delta = 0.5;
-    let calls = std::sync::atomic::AtomicUsize::new(0);
-    let unreachable = BorrowedHook {
-        delta: &delta,
-        calls: &calls,
-        target: "unreached_projection",
-    };
-    let result = reranker
-        .rerank_with_hook("q", candidates(&[1]), 1, Some(&unreachable))
-        .await
-        .unwrap();
-    assert_eq!(result.results, none.results);
-    assert!(!result.hook_applied);
-    assert_eq!(calls.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]

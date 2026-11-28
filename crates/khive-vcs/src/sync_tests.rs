@@ -1255,10 +1255,8 @@ fn sample_meta(tag: &str) -> MetaJson {
         fetched_at: "2026-01-01T00:00:00Z".to_string(),
         git_ref: "main".to_string(),
         commit_sha: "deadbeef".to_string(),
-        identity: SnapshotIdentity {
-            content_hash: SnapshotId::from_hash(&hex::encode(digest)).unwrap(),
-            coverage: KG_V1_COVERAGE,
-        },
+        content_hash: SnapshotId::from_hash(&hex::encode(digest)).unwrap(),
+        coverage: KG_V1_COVERAGE,
     }
 }
 
@@ -1291,7 +1289,7 @@ fn assert_cache_is_old_generation(cache_dir: &Path) {
             .unwrap();
     assert_eq!(
         meta["content_hash"],
-        sample_meta("old").identity.content_hash.as_str()
+        sample_meta("old").content_hash.as_str()
     );
 }
 
@@ -1552,7 +1550,7 @@ fn remote_cache_publish_success_exposes_complete_new_cache() {
             .unwrap();
     assert_eq!(
         meta["content_hash"],
-        sample_meta("new").identity.content_hash.as_str()
+        sample_meta("new").content_hash.as_str()
     );
 }
 

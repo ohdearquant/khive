@@ -1,7 +1,7 @@
 //! forms.check: a set of forms and answers against the forms' own rules, and
 //! the lines of those forms that no answer gives.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use khive_runtime::RuntimeError;
 use khive_storage::Entity;
@@ -15,13 +15,13 @@ use super::views::usage;
 use super::Ctx;
 use crate::store::{
     invalid, is_general, label, pending_premises, prop, prop_text, quoted_names, scalar, strings,
-    type_of, Graph,
+    type_of, wordings, Graph,
 };
 use crate::text::normalize;
 use crate::vocab::{self, FIELD_VALUE, FORM, FORM_ITEM, FORM_RULE, FORM_SECTION};
 
 /// The keys an answer given as a list entry may carry.
-const ANSWER_KEYS: [&str; 6] = ["subject", "form", "field", "row", "state", "value"];
+const ANSWER_KEYS: [&str; 7] = ["subject", "form", "field", "row", "state", "value", "key"];
 
 /// The printed lines an answer fills: the form and folded subject when it
 /// names one, the field, and the folded state of the line. An answer that
@@ -131,6 +131,8 @@ struct Answer {
     row: Option<u64>,
     state: Option<String>,
     value: Value,
+    /// What a field that compares by key compares this answer by.
+    key: Option<String>,
     keyed: bool,
 }
 
@@ -158,6 +160,7 @@ fn answers(args: &Args) -> Result<Vec<Answer>, RuntimeError> {
                 row: None,
                 state: None,
                 value: value.clone(),
+                key: None,
                 keyed: false,
             })
             .collect()),
@@ -184,12 +187,13 @@ fn answers(args: &Args) -> Result<Vec<Answer>, RuntimeError> {
                     row,
                     state: params::opt_text(obj, "state")?,
                     value: obj.get("value").cloned().unwrap_or(Value::Null),
+                    key: params::opt_text(obj, "key")?,
                     keyed: true,
                 })
             })
             .collect(),
         Some(_) => Err(invalid(
-            "answers is an object of field to answer, or a list of {subject?, form?, field, row?, state?, value}",
+            "answers is an object of field to answer, or a list of {subject?, form?, field, row?, state?, value, key?}",
         )),
     }
 }
@@ -342,6 +346,8 @@ struct Given {
     values: HashSet<Uuid>,
     rows: HashSet<(Slot, u64)>,
     choices: HashSet<(Slot, u64, Uuid)>,
+    /// What fills each row of a slot: the answer's texts and its key.
+    texts: HashMap<(Slot, u64), (Vec<String>, Option<String>)>,
 }
 
 impl Given {
@@ -542,14 +548,16 @@ fn missing(graph: &Graph, lines: &[Line<'_>], members: &[usize], need: Need) -> 
         "field": field,
         "state": state,
         "row": row,
+        "filled_by": prop_text(first.item, "filled_by"),
+        "known_to": prop_text(first.item, "known_to"),
         "lines": printed,
         "message": format!("{form} asks for {what}\"{field}\"{whose}{in_state} on {labels}; no answer gives it"),
     })
 }
 
 /// An answer that fits a line: how it shows itself, its field, the slot and
-/// row it fills, the lines that print that slot, and the values it chooses
-/// when its field is a choice.
+/// row it fills, the lines that print that slot, the values it chooses when
+/// its field is a choice, and its texts and key for constraints.
 struct Placed {
     view: Value,
     field: Uuid,
@@ -557,6 +565,8 @@ struct Placed {
     row: u64,
     printed: Vec<usize>,
     values: Vec<Uuid>,
+    texts: Vec<String>,
+    key: Option<String>,
 }
 
 /// What the answers in play give.
@@ -565,6 +575,10 @@ fn given_of(placed: &[Placed], in_play: &[bool]) -> Given {
     for (answer, _) in placed.iter().zip(in_play).filter(|(_, on)| **on) {
         given.fields.insert(answer.field);
         given.rows.insert((answer.slot.clone(), answer.row));
+        given
+            .texts
+            .entry((answer.slot.clone(), answer.row))
+            .or_insert_with(|| (answer.texts.clone(), answer.key.clone()));
         for value in &answer.values {
             given.values.insert(*value);
             given
@@ -629,6 +643,58 @@ fn unbound_line(form: &Entity, item: &Entity) -> Value {
             label(item)
         ),
     })
+}
+
+/// An answer as a constraint compares it under its field's comparison, or
+/// none when the field compares by key and the answer gives no key, or by
+/// digits and the answer holds no digit.
+fn compared_value(comparison: &str, given: &(Vec<String>, Option<String>)) -> Option<String> {
+    let (texts, key) = given;
+    let each = |fold: fn(&str) -> String| {
+        texts
+            .iter()
+            .map(|t| fold(t))
+            .collect::<Vec<_>>()
+            .join("\u{1f}")
+    };
+    match comparison {
+        "key" => key.clone(),
+        "folded" => Some(each(|t| {
+            t.split_whitespace()
+                .map(str::to_lowercase)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })),
+        "digits" => {
+            let digits = each(|t| t.chars().filter(|c| c.is_ascii_digit()).collect());
+            digits.chars().any(|c| c.is_ascii_digit()).then_some(digits)
+        }
+        _ => Some(each(|t| t.trim().to_owned())),
+    }
+}
+
+/// The lines of a checked form that one end of a constraint names: its
+/// subject, its state, and a field answering to the end's wording.
+fn end_lines(graph: &Graph, lines: &[Line<'_>], form: Uuid, end: &Value) -> Vec<usize> {
+    let text = |key: &str| end.get(key).and_then(Value::as_str).map(normalize);
+    let (subject, state) = (text("subject"), text("state"));
+    let field = text("field").unwrap_or_default();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| {
+            l.form.id == form
+                && l.slot.1 == subject
+                && l.slot.3 == state
+                && graph.get(l.slot.2).is_some_and(|f| {
+                    wordings(f).contains(&field)
+                        || strings(prop(f, "former_names"))
+                            .iter()
+                            .any(|n| normalize(n) == field)
+                })
+        })
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// forms.check: a set of forms and answers against the forms' own rules.
@@ -786,6 +852,8 @@ pub(crate) async fn check(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runtime
             row,
             printed,
             values: Vec::new(),
+            texts: texts.clone(),
+            key: answer.key.clone(),
         };
         if prop_text(field, "value_type").as_deref() != Some("choice") {
             placed.push(entry);
@@ -1037,18 +1105,156 @@ pub(crate) async fn check(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runtime
         findings.push(unbound_line(form, item));
     }
 
+    // Each constraint a checked form declares, over the answers to its two
+    // lines. A line with no answer is reported missing, not compared.
+    let mut constraints_unchecked = Vec::new();
+    for form in &set {
+        let Some(list) = prop(form, "constraints").and_then(Value::as_array) else {
+            continue;
+        };
+        for constraint in list {
+            let must = constraint
+                .get("must")
+                .and_then(Value::as_str)
+                .unwrap_or("match");
+            let ends: Vec<Vec<usize>> = constraint
+                .get("lines")
+                .and_then(Value::as_array)
+                .map(|ends| {
+                    ends.iter()
+                        .map(|end| end_lines(&graph, &lines, form.id, end))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut unchecked_because = |reason: String| {
+                constraints_unchecked.push(json!({
+                    "form": cite(form),
+                    "constraint": constraint,
+                    "reason": reason,
+                }));
+            };
+            if ends.len() != 2 || ends.iter().any(Vec::is_empty) {
+                unchecked_because("a line it names is not printed on the form".to_owned());
+                continue;
+            }
+            // A line that is not asked holds no answer to compare.
+            if ends.iter().any(|m| {
+                !m.iter()
+                    .any(|i| asked(&graph, &lines[*i], &gates, &subjects))
+            }) {
+                continue;
+            }
+            let (a, b) = (&lines[ends[0][0]], &lines[ends[1][0]]);
+            let comparison = |line: &Line<'_>| {
+                graph
+                    .get(line.slot.2)
+                    .and_then(|f| prop_text(f, "comparison"))
+                    .unwrap_or_else(|| "exact".to_owned())
+            };
+            let (by_a, by_b) = (comparison(a), comparison(b));
+            if by_a != by_b {
+                unchecked_because(format!(
+                    "\"{}\" compares by \"{by_a}\" and \"{}\" by \"{by_b}\"",
+                    label(a.item),
+                    label(b.item)
+                ));
+                continue;
+            }
+            let answered = |line: &Line<'_>| -> BTreeMap<u64, &(Vec<String>, Option<String>)> {
+                given
+                    .texts
+                    .iter()
+                    .filter(|((slot, _), _)| *slot == line.slot)
+                    .map(|((_, row), filled)| (*row, filled))
+                    .collect()
+            };
+            let repeats = |members: &[usize]| members.iter().any(|i| lines[*i].rows > 1);
+            let (given_a, given_b) = (answered(a), answered(b));
+            let (many_a, many_b) = (repeats(&ends[0]), repeats(&ends[1]));
+            // Rows pair by number; a line that does not repeat pairs with
+            // every row of one that does.
+            let pairs: Vec<(u64, u64)> = match (many_a, many_b) {
+                (false, true) if given_a.contains_key(&1) => {
+                    given_b.keys().map(|row| (1, *row)).collect()
+                }
+                (true, false) if given_b.contains_key(&1) => {
+                    given_a.keys().map(|row| (*row, 1)).collect()
+                }
+                (false, true) | (true, false) => Vec::new(),
+                _ => given_a
+                    .keys()
+                    .filter(|row| given_b.contains_key(row))
+                    .map(|row| (*row, *row))
+                    .collect(),
+            };
+            // Row pairs an answer leaves nothing to compare in, reported once
+            // for the constraint.
+            let mut uncompared: Vec<(u64, u64)> = Vec::new();
+            for (row_a, row_b) in pairs {
+                let (Some(value_a), Some(value_b)) = (
+                    compared_value(&by_a, given_a[&row_a]),
+                    compared_value(&by_b, given_b[&row_b]),
+                ) else {
+                    uncompared.push((row_a, row_b));
+                    continue;
+                };
+                let differ = must == "differ";
+                if (value_a == value_b) != differ {
+                    continue;
+                }
+                let rows = (many_a || many_b).then(|| json!([row_a, row_b]));
+                findings.push(json!({
+                    "kind": "constraint_unmet",
+                    "must": must,
+                    "form": cite(form),
+                    "text": constraint.get("text"),
+                    "lines": [usage(a.item), usage(b.item)],
+                    "rows": rows,
+                    "message": format!(
+                        "{} holds \"{}\" and \"{}\" to {must}; the answers {}",
+                        form_name(form),
+                        label(a.item),
+                        label(b.item),
+                        if differ { "are the same" } else { "differ" }
+                    ),
+                }));
+            }
+            if !uncompared.is_empty() {
+                let lacking = if by_a == "key" {
+                    "compare by key, and an answer to them gives no key"
+                } else {
+                    "compare by digits, and an answer to them holds no digit"
+                };
+                let rows = (many_a || many_b).then(|| {
+                    uncompared
+                        .iter()
+                        .map(|(row_a, row_b)| json!([row_a, row_b]))
+                        .collect::<Vec<_>>()
+                });
+                constraints_unchecked.push(json!({
+                    "form": cite(form),
+                    "constraint": constraint,
+                    "reason": format!("\"{}\" and \"{}\" {lacking}", label(a.item), label(b.item)),
+                    "rows": rows,
+                }));
+            }
+        }
+    }
+
     Ok(json!({
         "forms": set.iter().map(|f| cite(f)).collect::<Vec<_>>(),
         "consistent": findings.is_empty()
             && unresolved.is_empty()
             && unplaced.is_empty()
             && answers_not_asked.is_empty()
-            && unchecked.is_empty(),
+            && unchecked.is_empty()
+            && constraints_unchecked.is_empty(),
         "findings": findings,
         "unresolved_answers": unresolved,
         "unplaced_answers": unplaced,
         "answers_not_asked": answers_not_asked,
         "rules_unchecked": unchecked,
+        "constraints_unchecked": constraints_unchecked,
         "lines_not_asked": not_asked,
     }))
 }

@@ -70,11 +70,7 @@ pub use hybrid::{
 pub use khive_hnsw::{HnswCheckpoint, HnswCheckpointStore};
 // The native model and its inference dependency are opt-in (ADR-042).
 #[cfg(feature = "native-rerank")]
-pub use hybrid::{
-    BertLoraGeometry, CrossEncoderScorer, CrossEncoderScores, LoraHook, LoraProjectionShape,
-    LoraTargetGeometry, NativeCrossEncoderModel, NativeCrossEncoderReranker, NativeRerankResult,
-    NoopLoraHook, RerankDocumentResolver,
-};
+pub use hybrid::native_rerank::*;
 pub use materialization::{
     materialize_ranked_prefix, DropCounts, DropDiagnostic, DropReason, MaterializationDecision,
     MaterializationError, MaterializationLimitError, MaterializationLimits, MaterializedItem,

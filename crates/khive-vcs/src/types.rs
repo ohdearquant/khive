@@ -122,7 +122,7 @@ pub struct SnapshotIdentity {
     pub coverage: SnapshotCoverage,
 }
 
-fn legacy_snapshot_coverage() -> SnapshotCoverage {
+pub(crate) fn legacy_snapshot_coverage() -> SnapshotCoverage {
     KG_V1_COVERAGE
 }
 
