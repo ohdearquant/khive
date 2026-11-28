@@ -7,6 +7,8 @@
 
 mod definition;
 mod frontier;
+mod graph;
+mod graph_write;
 mod pack;
 mod resolve;
 mod schema;

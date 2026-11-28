@@ -2750,6 +2750,7 @@ dependencies = [
  "blake3",
  "chrono",
  "inventory",
+ "khive-changeset",
  "khive-pack-forms",
  "khive-pack-kg",
  "khive-runtime",

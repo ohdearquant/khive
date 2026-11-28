@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `forms.neighbourhood` on a field gives the field it narrows as `broader` and the fields that
   narrow it as `narrower`, and `general` lists only general wordings. `operation.frontier` follows
   the chain of broader fields, nearest first, for `stated_in_part` (ADR-223 Amendment 1).
+- `operation.define` writes the working type graph after each publish: a kg node for each
+  operation type, slot, step type and requirement, keyed as ADR-222 Amendment 2 A2.10 gives, with
+  `contains` edges between them and `links_to` edges to the forms pack's fields. A node shows the
+  highest published version whatever order the versions arrive in, a dropped slot or requirement
+  is removed, and every define derives again the graph of each id it names, so a failed write is
+  healed by the next define. The reply's `graph` names, per id, `written`, `unchanged` or `failed`
+  with the reason; the publish stands whatever the graph write does. `known_as` gives an operation
+  type, a step type, a slot or a step names in other vocabularies.
 
 ## [0.24.0] - 2026-11-28
 

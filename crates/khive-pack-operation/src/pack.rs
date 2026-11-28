@@ -56,14 +56,14 @@ const OBSERVED_AT: ParamDef = param(
 pub(crate) static OPERATION_HANDLERS: [HandlerDef; 7] = [
     HandlerDef {
         name: "operation.define",
-        description: "Publish operation types in the caller's namespace: slots, steps (who acts, after which steps, how many of a repeating slot), and rules that ask or skip a step on facts and on other steps. Step types may also be published on their own and pinned by a step of a type. Each step given inside a type is published as its own step type, and every step type a type uses is pinned by digest. A step that requires a value another step produces comes after it. A requirement, product or supply names a field by its canonical name in any case or spacing, and the canonical name is what is stored; a supply from a step type pinned from the namespace names the product as that type stores it, and in another case or spacing it is refused as unknown_supply unless the document names the field in a requirement or product too. A slot is given by a kind and a role with an optional qualifier, by a relation to another slot of the type, or by neither; a kind, role or relation a slot names must be a term of the namespace (forms.terms) by name or alias. Publishing the same type again is a no-op; a different type under a published version is refused. A document may also publish the namespace's source order: the document types a value is read from, in the deployment's order, each a form loaded in the namespace and named once.",
+        description: "Publish operation types in the caller's namespace: slots, steps (who acts, after which steps, how many of a repeating slot), and rules that ask or skip a step on facts and on other steps. Step types may also be published on their own and pinned by a step of a type. Each step given inside a type is published as its own step type, and every step type a type uses is pinned by digest. A step that requires a value another step produces comes after it. A requirement, product or supply names a field by its canonical name in any case or spacing, and the canonical name is what is stored; a supply from a step type pinned from the namespace names the product as that type stores it, and in another case or spacing it is refused as unknown_supply unless the document names the field in a requirement or product too. A slot is given by a kind and a role with an optional qualifier, by a relation to another slot of the type, or by neither; a kind, role or relation a slot names must be a term of the namespace (forms.terms) by name or alias. Publishing the same type again is a no-op; a different type under a published version is refused. A document may also publish the namespace's source order: the document types a value is read from, in the deployment's order, each a form loaded in the namespace and named once. After the publish commits, the working type graph of every id the document names, those already published included, is derived again from the published versions and written as kg nodes and edges linked to the forms pack's fields; `graph` in the reply names each id's outcome, written, unchanged or failed with the reason, and the publish stands whatever it is. A name another node holds in a vocabulary is refused as key_conflict, and a published version defined again with other names is refused as version_conflict.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[param(
             "document",
             "object",
             true,
-            "{step_types?: [{id, version, by, name?, act?, quantifier?, requires?, produces?}], operation_types?: [{id, version, slots: [{name, repeats?, required?, kind?, role?, qualifier?, defined_by?: {relation, slot}}], steps: [{name, by, act?, after?, quantifier? all_of|at_least_one, activated_by?, unless?, outcome?, requires?, produces?, supplies?} or {name, step_type: {id, version}, after?, activated_by?, unless?, outcome?, supplies?}], rules?: [{step, action activate|skip, when, unless?, status?, owner?, citation?}]}], source_order?: {version, places: [form_id, ...]}}, with at least one of the three. A requirement is {field, slot?, value_type}; a product is {field, slot?, class read|computed|stated}; a supply {from, field, as} takes the value step from produces as field and gives it to this step's requirement as. A condition list is alternatives of terms, each {fact: {field, slot?, present|equals|one_of}} or {step: {name, done}}. A source order is one per namespace, versioned like a type.",
+            "{step_types?: [{id, version, by, name?, act?, quantifier?, requires?, produces?, known_as?}], operation_types?: [{id, version, known_as?, slots: [{name, repeats?, required?, kind?, role?, qualifier?, defined_by?: {relation, slot}, known_as?}], steps: [{name, by, act?, after?, quantifier? all_of|at_least_one, activated_by?, unless?, outcome?, requires?, produces?, supplies?, known_as?} or {name, step_type: {id, version}, after?, activated_by?, unless?, outcome?, supplies?}], rules?: [{step, action activate|skip, when, unless?, status?, owner?, citation?}]}], source_order?: {version, places: [form_id, ...]}}, with at least one of the three. A requirement is {field, slot?, value_type}; a product is {field, slot?, class read|computed|stated}; a supply {from, field, as} takes the value step from produces as field and gives it to this step's requirement as. A condition list is alternatives of terms, each {fact: {field, slot?, present|equals|one_of}} or {step: {name, done}}. A source order is one per namespace, versioned like a type. known_as is [{vocabulary, name}], the names the node is known by in other vocabularies; a pinned step takes none.",
         )],
     },
     HandlerDef {
@@ -159,9 +159,14 @@ impl Pack for OperationPack {
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &OPERATION_HANDLERS;
+    const EDGE_RULES: &'static [khive_types::EdgeEndpointRule] =
+        &crate::graph::OPERATION_EDGE_RULES;
+    const ENTITY_TYPES: &'static [khive_types::EntityTypeDef] =
+        &crate::graph::OPERATION_ENTITY_TYPES;
     /// Slots name their kinds, roles and relations from the forms pack's term lists, and
-    /// resolve reads a form's subjects there.
-    const REQUIRES: &'static [&'static str] = &["forms"];
+    /// resolve reads a form's subjects there. The working type graph is written as kg nodes
+    /// and edges that link to the forms pack's fields.
+    const REQUIRES: &'static [&'static str] = &["kg", "forms"];
     const SCHEMA_PLAN: Option<PackSchemaPlan> = Some(PackSchemaPlan {
         pack: Self::NAME,
         statements: crate::schema::OPERATION_SCHEMA_STATEMENTS,
@@ -326,11 +331,11 @@ fn now_us() -> i64 {
     chrono::Utc::now().timestamp_micros()
 }
 
-fn stmt(sql: &str, params: Vec<SqlValue>) -> SqlStatement {
+pub(crate) fn stmt(sql: &str, params: Vec<SqlValue>) -> SqlStatement {
     SqlStatement::new(sql, params)
 }
 
-fn text(value: &str) -> SqlValue {
+pub(crate) fn text(value: &str) -> SqlValue {
     SqlValue::Text(value.to_owned())
 }
 
@@ -338,19 +343,19 @@ fn corrupt(message: impl Into<String>) -> StorageError {
     StorageError::Internal(format!("operation: {}", message.into()))
 }
 
-fn col_text(row: &SqlRow, name: &str) -> StorageResult<String> {
+pub(crate) fn col_text(row: &SqlRow, name: &str) -> StorageResult<String> {
     row.text(name)
         .map(str::to_owned)
         .map_err(|e| corrupt(format!("column {name}: {e}")))
 }
 
-fn col_opt_text(row: &SqlRow, name: &str) -> StorageResult<Option<String>> {
+pub(crate) fn col_opt_text(row: &SqlRow, name: &str) -> StorageResult<Option<String>> {
     row.opt_text(name)
         .map(|value| value.map(str::to_owned))
         .map_err(|e| corrupt(format!("column {name}: {e}")))
 }
 
-fn col_i64(row: &SqlRow, name: &str) -> StorageResult<i64> {
+pub(crate) fn col_i64(row: &SqlRow, name: &str) -> StorageResult<i64> {
     row.i64(name)
         .map_err(|e| corrupt(format!("column {name}: {e}")))
 }
@@ -404,7 +409,7 @@ fn parse_identity(params: &Params, what: &str, value: &Value) -> Result<Identity
 }
 
 /// A definition row read back and checked against the digest it is pinned by.
-fn checked_definition(row: &SqlRow, kind: &str, pinned: &str) -> StorageResult<Vec<u8>> {
+pub(crate) fn checked_definition(row: &SqlRow, kind: &str, pinned: &str) -> StorageResult<Vec<u8>> {
     let bytes = col_bytes(row, "definition_bytes")?;
     let held_kind = col_text(row, "kind")?;
     let held_digest = col_text(row, "digest")?;
@@ -610,6 +615,10 @@ impl OperationPack {
         check_terms(&params, &document.operation_types, registry, token).await?;
         check_value_types(&params, &document, &fields)?;
         check_places(&params, &document, registry, token).await?;
+        crate::graph_write::check_document(&self.runtime, token, &document)
+            .await?
+            .map_err(|refusal| params.refused(refusal))?;
+        let targets = crate::graph_write::targets(&document);
         let now = now_us();
         let verb = params.verb.clone();
         let unit_verb = verb.clone();
@@ -671,7 +680,12 @@ impl OperationPack {
             })
         });
         let out = self.runtime.sql().atomic_unit(op).await?;
-        unit_value(out, &verb)
+        let mut reply = unit_value(out, &verb)?;
+        // The publish has committed and stands whatever the graph write does (A2.10).
+        reply["graph"] = Value::Array(
+            crate::graph_write::write_graphs(&self.runtime, registry, token, &targets).await,
+        );
+        Ok(reply)
     }
 
     /// The step types a document names by id and version that are already published in
@@ -1789,7 +1803,7 @@ impl OperationPack {
 }
 
 /// A read of the forms pack, made as the caller.
-async fn forms_read(
+pub(crate) async fn forms_read(
     registry: &VerbRegistry,
     token: &NamespaceToken,
     verb: &str,
@@ -2140,7 +2154,28 @@ async fn held_same(
             ),
         ));
     }
+    // Names in vocabularies are not in the published bytes, so the same digest can come with
+    // other names. A version keeps the names it was published with (A2.10).
+    let held_source = col_opt_text(&row, "source_bytes")?.unwrap_or_default();
+    if source_names(stored.kind, &stored.source) != source_names(stored.kind, &held_source) {
+        return Err(refuse(
+            verb,
+            Refusal::new(
+                "version_conflict",
+                format!(
+                    "{} v{} is published with other names in vocabularies; publish a new version to name it otherwise",
+                    stored.id, stored.version
+                ),
+            ),
+        ));
+    }
     Ok(true)
+}
+
+fn source_names(kind: &str, source: &str) -> Vec<crate::graph::NameSpec> {
+    serde_json::from_str::<Value>(source)
+        .map(|source| crate::graph::names_in_source(kind, &source))
+        .unwrap_or_default()
 }
 
 async fn insert_record(

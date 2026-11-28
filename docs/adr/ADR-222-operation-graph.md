@@ -956,11 +956,24 @@ refusal arms of one section may be rows of one table test.
   then its version 2 leaves the node at 3 with version 3's requirement nodes; publishing an
   operation type's version without a slot removes that slot's node; loading the same versions
   into an empty store in the other order gives the same nodes and edges. A step type that
-  produces one field about two slots has one `produces` edge naming both. A step type whose
-  requirement is about `holder`, pinned by two types that each declare `holder`, has a
-  requirement node naming the slot and no edge to either slot node. A slot of the same name in
-  two types is two nodes, and a requirement whose field name holds a `/` gets a key no other
+  produces one field about two slots has one `produces` edge naming both, with `about_operation`
+  false; one that produces a field about the operation and about `holder` has one edge with
+  `about_operation` true and `slots` `[holder]`. A `produces` edge about neither is refused. A
+  step type whose requirement is about `holder`, pinned by two types that each declare `holder`,
+  has a requirement node naming the slot and no edge to either slot node. A slot of the same name
+  in two types is two nodes, and a requirement whose field name holds a `/` gets a key no other
   requirement holds.
+- A2.10, the write: a define whose graph write fails at every attempt still publishes, replies
+  `failed` with a reason for that id and leaves the node at the version it showed; the next define
+  naming the id writes the graph, which equals a fresh build's. Versions 2 and 3 of one id defined
+  in either order leave the node at 3. A write that heals version 2's graph races the write for
+  version 3, in both commit orders: the one that commits second finds the definition node moved,
+  reads again, and leaves no edge of version 2. A node whose edge was lost is linked again under
+  the same entity, and is removed when the next version drops it. A repeated define answers
+  `unchanged` and leaves the node's properties, `graph_revision` included, its version and its
+  update time as they were. A name a document gives two nodes and a name another node holds are
+  refused (`key_conflict`); one name in two vocabularies is taken; a published version defined
+  again with other names is refused (`version_conflict`).
 
 ### A2.10 The working type graph: keys and edges
 
@@ -1000,7 +1013,10 @@ publish below the shown version changes no node and no edge. The graph for a key
 graph a fresh build from the published bytes gives, and a dropped store rebuilds the same graph
 whatever order the versions are loaded in (#6894 3.2). The published bytes remain the record of
 every version, including one a running operation pinned: every derived read works from published
-bytes (section 2).
+bytes (section 2). One node property is not reproduced by a fresh build: `graph_revision` on an
+operation type's or a published step type's node, which counts the graph writes that changed
+something (A2.10, the write). It says nothing about the type, and a reader never compares it with
+`version`.
 
 The edges use existing relations. Where one pair of node types needs more than one meaning, the
 meaning is `properties.role` (section 2):
@@ -1009,13 +1025,19 @@ meaning is `properties.role` (section 2):
 - operation type `contains` step type, `role: pins`, for a pinned step and a shorthand one alike;
 - step type `contains` requirement;
 - requirement `links_to` its forms field, `role: requires`;
-- step type `links_to` a forms field it produces, `role: produces`, with `slots`, the slots it
-  produces the field about (empty for a value about the operation).
+- step type `links_to` a forms field it produces, `role: produces`, with `about_operation`,
+  whether it produces a value of the field about the operation, and `slots`, the slots it
+  produces the field about. Every `produces` edge carries `about_operation`, true or false, and
+  `slots` lists slot names only, so a reader takes the operation from `about_operation` and
+  never from an empty `slots`. An edge with `about_operation` false and no slots is refused at
+  `define`.
 
 The store holds one edge per (source, target, relation) in a namespace, and a second write of the
 same three refreshes the first. So where one source reaches one target by one relation for more
 than one reason, the reasons are a list on the one edge. A step type that produces one field about
-two slots has one `produces` edge with both slots in `slots`. An operation type with two steps that
+two slots has one `produces` edge with both slots in `slots`; one that produces it about the
+operation and about `holder` has one edge with `about_operation` true and `slots` `[holder]`. An
+operation type with two steps that
 pin one step type has one `pins` edge, and its `steps` lists both.
 
 A published step type may be pinned by several operation types. So no edge between two nodes that
@@ -1038,3 +1060,40 @@ requirement is about, is held by name on the requirement node:
 
 A reader of one operation type's versions, order or slots follows that operation type's `pins`
 edges, so what one operation type says never reads as true of another.
+
+### A2.10 The working type graph: the write
+
+`define` publishes first, in a unit of its own. It then writes the graph of each id the document
+names, each in a unit of its own: the step types it publishes, the published step types its steps
+pin, and its operation types. The publish stands whatever the graph write does. A reply for a
+committed publish is never an error because the graph write failed; it names, per id, `graph`:
+`written`, `unchanged` or `failed` with the reason.
+
+Every define re-derives the graph of every id it names, the `already_published` ones included.
+That is how a graph whose write failed is repaired, and the only way: a graph stays as its last
+write left it until a define that names its id runs again.
+
+The graph write decides the shown version by reading `operation_definitions`, never from the
+version the caller just published. It commits only while every node and edge it read is unchanged,
+and reads again when one moved, up to three times. Two defines of versions 2 and 3 of one id that
+finish in either order leave the node at 3.
+
+Every graph write that changes anything asserts the definition node in the state it was read and
+moves it, raising its `graph_revision` by one, so a write that read before another committed never
+commits beside it. A write that changes nothing does not raise it, so a repeated define still
+answers `unchanged` and leaves the node as it was. The rebuild and other-order equality arms
+compare the graph without `graph_revision`.
+
+The write finds a definition's nodes by their keys, every key a graph of any of its published
+versions holds, as well as by the edges that leave the definition node. A node no edge leads to
+any more is updated, linked again or removed, and never created a second time under its key.
+
+Names in vocabularies (A2.5) are not in the published bytes; each is in the source the version was
+published from. A node holds every name the sources of the published versions give it, while the
+shown version's graph holds the node, so a name an older version gave stays when a later version
+no longer gives it. A published version keeps its names: defining it again with other names is
+refused (`version_conflict`), and a new version is published to name it otherwise. A name stays
+on the node that holds it while that node is shown, so a name never moves to another node. A
+define that gives a held name to another node is refused before anything is published
+(`key_conflict`, with the holder's `existing_id`), as is a document that gives one name to two
+nodes. A name is released when its node is removed.
