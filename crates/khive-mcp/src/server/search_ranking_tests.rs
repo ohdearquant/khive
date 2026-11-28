@@ -27,9 +27,22 @@ mod search_ranking_tests {
         ) -> Result<CoordSearchResult, RuntimeError> {
             // Ranking rows in this fake are observations and have no mailbox
             // routing. Concrete message scenarios cover the scoped service.
-            Ok(self
-                .fan_out_search(request, token.gate_namespace(), extra_visible)
-                .await)
+            self.fan_out_search(request, token.gate_namespace(), extra_visible)
+                .await
+        }
+
+        async fn fan_out_note_search_scoped_with_count(
+            &self,
+            request: &ValidatedSearchRequest,
+            token: &khive_runtime::NamespaceToken,
+            args: &Value,
+            extra_visible: &[Namespace],
+        ) -> Result<(CoordSearchResult, u64), RuntimeError> {
+            // Only active observation rows; this ranking fixture does not test disclosure.
+            let result = self
+                .fan_out_search_scoped(request, token, args, extra_visible)
+                .await?;
+            Ok((result, 0))
         }
 
         async fn locate(&self, _id: Uuid) -> Option<BackendId> {
@@ -59,7 +72,7 @@ mod search_ranking_tests {
             request: &ValidatedSearchRequest,
             _namespace: &Namespace,
             _extra_visible: &[Namespace],
-        ) -> CoordSearchResult {
+        ) -> Result<CoordSearchResult, RuntimeError> {
             // Deliberately leave filtering to the MCP boundary under test.
             let id = Uuid::from_u128(1);
             let score = DeterministicScore::from_raw(1_i64 << 31);
@@ -113,7 +126,7 @@ mod search_ranking_tests {
                     vector_error: None,
                 });
             }
-            CoordSearchResult {
+            Ok(CoordSearchResult {
                 entity_hits,
                 note_hits,
                 per_backend,
@@ -127,7 +140,7 @@ mod search_ranking_tests {
                 note_updated_at: [(id, 2_000_000)].into_iter().collect(),
                 note_versions: [(id, 1)].into_iter().collect(),
                 note_names: [(id, Some("stored name".into()))].into_iter().collect(),
-            }
+            })
         }
         fn is_single_backend(&self) -> bool {
             false
@@ -308,6 +321,38 @@ mod search_ranking_tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A coordinated search assembles its own rows and cannot follow edges
+    /// across backends, so it refuses `follow` instead of dropping it.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn coordinator_refuses_follow() {
+        let server = server(Some(RankingCoordinator {
+            kind: RankScoreKind::Rrf,
+            signals: SearchSignals::default(),
+            failed: false,
+        }));
+        for substrate in ["entity", "note"] {
+            let control = search(
+                &server,
+                json!({"kind": substrate, "query": "ranking"}),
+                "verbose",
+            )
+            .await;
+            assert_eq!(control["ok"], true, "{control}");
+            let entry = search(
+                &server,
+                json!({"kind": substrate, "query": "ranking", "follow": "extends"}),
+                "verbose",
+            )
+            .await;
+            assert_eq!(entry["ok"], false, "{entry}");
+            assert!(
+                entry.to_string().contains("not available on a multi-backend search"),
+                "{entry}"
+            );
         }
     }
 }

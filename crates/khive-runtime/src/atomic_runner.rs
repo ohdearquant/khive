@@ -721,7 +721,10 @@ pub(crate) async fn run_prepared_atomic_unit<T: Send + 'static, E: Send + 'stati
 
 pub(crate) fn atomic_unit_error_allows_recorded_refusal(error: &StorageError) -> bool {
     match error.without_sqlite_write_stage() {
-        StorageError::WriterTaskTerminated { .. } => false,
+        StorageError::WriterTaskTerminated { .. }
+        | StorageError::WriteOutcomeUnknown { .. }
+        | StorageError::WriterOwnerUnavailable { .. }
+        | StorageError::WriterRouteViolation { .. } => false,
         StorageError::WriterTaskRequestFailed { request_state, .. } => {
             *request_state == khive_storage::WriterTaskRequestState::TransactionRolledBack
         }

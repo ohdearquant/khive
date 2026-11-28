@@ -29,12 +29,15 @@ use khive_storage::types::{
 use khive_storage::EntityFilter;
 use khive_types::SubstrateKind;
 
+use super::query_ir_adapter as query_ir;
 use crate::ann::{self, AnnKey};
 use crate::config::{
     is_english_only_embedding_model, RecallConfig, ScoreBreakdown, WeightedContributions,
 };
 use crate::query_cache::QueryEmbeddingCache;
 use crate::MemoryPack;
+use khive_retrieval::hybrid::executor::{finish_collect, CollectionPlan};
+use khive_retrieval::QueryNode;
 
 /// Test-only per-model retrieval failpoints for exercising `collect_model_ann_hits`'
 /// engine-failure isolation (ADR-031) without a real ANN or sqlite-vec outage.
@@ -166,49 +169,38 @@ tokio::task_local! {
     pub(super) static PROF_CID: u64;
 }
 
-pub(super) fn recall_profile_enabled() -> bool {
+pub(super) fn recall_profile_enabled(runtime: &khive_runtime::KhiveRuntime) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let enabled = std::env::var("KHIVE_RECALL_PROFILE").is_ok();
-        khive_runtime::config_ledger::record_config_locked(
-            "KHIVE_RECALL_PROFILE",
-            enabled.to_string(),
-        );
-        enabled
-    })
+    let enabled = *ENABLED.get_or_init(|| std::env::var("KHIVE_RECALL_PROFILE").is_ok());
+    runtime.record_config_locked("KHIVE_RECALL_PROFILE", || enabled.to_string());
+    enabled
 }
 
-pub(crate) fn ann_overfetch_max_rounds() -> usize {
+pub(crate) fn ann_overfetch_max_rounds(runtime: &khive_runtime::KhiveRuntime) -> usize {
     static ROUNDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *ROUNDS.get_or_init(|| {
-        let rounds = std::env::var("ANN_OVERFETCH_MAX_ROUNDS")
+    let rounds = *ROUNDS.get_or_init(|| {
+        std::env::var("ANN_OVERFETCH_MAX_ROUNDS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(3);
-        khive_runtime::config_ledger::record_config_locked(
-            "ANN_OVERFETCH_MAX_ROUNDS",
-            rounds.to_string(),
-        );
-        rounds
-    })
+            .unwrap_or(3)
+    });
+    runtime.record_config_locked("ANN_OVERFETCH_MAX_ROUNDS", || rounds.to_string());
+    rounds
 }
 
 /// Return the cached ANN readiness timeout, defaulting to 8 seconds.
 /// See `crates/khive-pack-memory/docs/api/configuration.md`.
-pub(super) fn ann_ready_timeout_ms() -> u64 {
+pub(super) fn ann_ready_timeout_ms(runtime: &khive_runtime::KhiveRuntime) -> u64 {
     static TIMEOUT_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *TIMEOUT_MS.get_or_init(|| {
+    let ms = *TIMEOUT_MS.get_or_init(|| {
         const DEFAULT_ANN_READY_TIMEOUT_MS: u64 = 8_000;
-        let ms = std::env::var("KHIVE_MEMORY_ANN_READY_TIMEOUT_MS")
+        std::env::var("KHIVE_MEMORY_ANN_READY_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_ANN_READY_TIMEOUT_MS);
-        khive_runtime::config_ledger::record_config_locked(
-            "KHIVE_MEMORY_ANN_READY_TIMEOUT_MS",
-            ms.to_string(),
-        );
-        ms
-    })
+            .unwrap_or(DEFAULT_ANN_READY_TIMEOUT_MS)
+    });
+    runtime.record_config_locked("KHIVE_MEMORY_ANN_READY_TIMEOUT_MS", || ms.to_string());
+    ms
 }
 
 #[inline(always)]
@@ -418,6 +410,17 @@ pub(super) fn balanced_recall_state_from_profile_response(
     ))
 }
 
+/// The shared-pool factor a served profile carries, read from its `brain.profile` response.
+///
+/// A missing, null or non-numeric `local_factor`, and a value outside [0.5, 1] (which
+/// `brain.create_profile` never stores), yield 1: no scaling.
+pub(super) fn local_factor_from_profile_response(resp: &Value) -> f32 {
+    resp.get("local_factor")
+        .and_then(Value::as_f64)
+        .filter(|factor| factor.is_finite() && (0.5..=1.0).contains(factor))
+        .map_or(1.0, |factor| factor as f32)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RememberParams {
@@ -431,9 +434,15 @@ pub(super) struct RememberParams {
     #[serde(alias = "source")]
     pub(super) source_id: Option<String>,
     pub(super) tags: Option<Vec<String>>,
+    /// Caller-supplied structured fields stored beside `memory_type` and `tags`.
+    /// Validated by `validate_properties` in the remember handler.
+    #[serde(default)]
+    pub(super) properties: Option<serde_json::Value>,
     #[serde(default)]
     pub(super) embedding_model: Option<String>,
-    /// Exact namespace override; otherwise episodic uses actor scope and semantic uses local.
+    /// Exact namespace override. Without it, both memory types use the caller's actor
+    /// namespace; an anonymous caller keeps the token's namespace. Every anonymous
+    /// memory is flagged `attribution: "unresolved"`, with or without this override.
     #[serde(default)]
     pub(super) namespace: Option<String>,
 }
@@ -507,6 +516,11 @@ pub(super) struct RecallParams {
     /// recall everything except its own writes.
     #[serde(default)]
     pub(super) exclude_tags: Option<Vec<String>>,
+    /// Rank memories whose stored tags include any of these values ahead of
+    /// the rest. Unlike `tags` it drops nothing: other matches fill the
+    /// remaining slots, and each group keeps its score order.
+    #[serde(default)]
+    pub(super) prefer_tags: Option<Vec<String>>,
     /// When true every hit carries `source_id`: the target of the memory's
     /// `annotates` edge, or null when the memory has none.
     #[serde(default)]
@@ -535,6 +549,39 @@ pub(super) struct RecallParams {
     /// `brain.event_counts` since/until convention.
     #[serde(default)]
     pub(super) created_before: Option<String>,
+    /// Caller-chosen call-site label, kept on this recall's `recall_executed`
+    /// event so `brain.event_counts` can count recalls by it.
+    #[serde(default)]
+    pub(super) label: Option<String>,
+}
+
+/// Longest `memory.recall` label accepted, in Unicode scalar values.
+pub(super) const MAX_RECALL_LABEL_CHARS: usize = 128;
+
+/// Check a caller-supplied recall label: non-empty, at most
+/// [`MAX_RECALL_LABEL_CHARS`] characters, no control characters and no
+/// leading or trailing whitespace, so a count keyed by it is exact.
+pub(super) fn validate_recall_label(label: Option<&str>) -> Result<Option<String>, RuntimeError> {
+    let Some(label) = label else {
+        return Ok(None);
+    };
+    if label.is_empty() || label.trim() != label {
+        return Err(RuntimeError::InvalidInput(
+            "memory.recall: label must be non-empty with no leading or trailing whitespace"
+                .to_string(),
+        ));
+    }
+    if label.chars().count() > MAX_RECALL_LABEL_CHARS {
+        return Err(RuntimeError::InvalidInput(format!(
+            "memory.recall: label is longer than {MAX_RECALL_LABEL_CHARS} characters"
+        )));
+    }
+    if label.chars().any(char::is_control) {
+        return Err(RuntimeError::InvalidInput(
+            "memory.recall: label must not contain control characters".to_string(),
+        ));
+    }
+    Ok(Some(label.to_string()))
 }
 
 fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
@@ -600,14 +647,7 @@ pub(crate) const DEFAULT_DECAY_EPISODIC: f64 = 0.02;
 /// Default decay_factor for semantic memories (~139-day half-life).
 pub(crate) const DEFAULT_DECAY_SEMANTIC: f64 = 0.005;
 
-/// `memory.recall` requests whose total handler time reaches this are logged at WARN
-/// with a duration/result-shape breakdown, unconditionally (unlike the opt-in
-/// `KHIVE_RECALL_PROFILE` per-stage eprintln profiler). Matches the threshold and
-/// rationale established for `knowledge.compose` (#887 / PR #915): well above a
-/// healthy recall (sub-second in the common case) but comfortably inside the
-/// end-to-end `recall_deadline_ms` budget (30s default), so a slow-but-completing
-/// recall is visible in the daemon log before it ever risks tripping the deadline
-/// or a client-side timeout (#30 / originally #889).
+/// Warn on recalls reaching 10 seconds; see `docs/api/recall-pipeline.md#slow-request-stage-telemetry`.
 pub(super) const RECALL_SLOW_THRESHOLD_MS: u64 = 10_000;
 
 pub(super) fn compute_score(
@@ -619,7 +659,49 @@ pub(super) fn compute_score(
     age_days: f64,
 ) -> (f64, ScoreBreakdown) {
     let relevance = normalize_relevance(raw_relevance, &cfg.fuse_strategy);
+    let (total, mut breakdown) = compute_score_inner(
+        cfg,
+        pipeline,
+        relevance,
+        salience,
+        decay_factor,
+        age_days,
+        true,
+    );
+    breakdown.fused_score = raw_relevance;
+    (total, breakdown)
+}
 
+/// Breakdown for a hit `handle_recall` has already normalized: `relevance` is the value the
+/// ranking composite received, and the breakdown reports it unchanged.
+pub(super) fn compute_score_for_recall(
+    cfg: &RecallConfig,
+    pipeline: &MemoryRecallPipeline,
+    relevance: f64,
+    salience: f64,
+    decay_factor: f64,
+    age_days: f64,
+) -> (f64, ScoreBreakdown) {
+    compute_score_inner(
+        cfg,
+        pipeline,
+        relevance,
+        salience,
+        decay_factor,
+        age_days,
+        false,
+    )
+}
+
+fn compute_score_inner(
+    cfg: &RecallConfig,
+    pipeline: &MemoryRecallPipeline,
+    relevance: f64,
+    salience: f64,
+    decay_factor: f64,
+    age_days: f64,
+    report: bool,
+) -> (f64, ScoreBreakdown) {
     let effective_salience = cfg.decay_model.apply(
         salience,
         age_days,
@@ -653,6 +735,8 @@ pub(super) fn compute_score(
 
     let breakdown = ScoreBreakdown {
         relevance,
+        // The caller holds the score before normalization and sets it.
+        fused_score: 0.0,
         salience_raw: salience,
         salience_decayed: effective_salience,
         temporal,
@@ -661,10 +745,21 @@ pub(super) fn compute_score(
             salience_contribution: i_contrib,
             temporal_contribution: t_contrib,
         },
-        // ADR-104 §3: set to neutral/absent here; `handle_recall` overwrites
-        // both when a profile served the request (component 1 ran).
+        // Neutral/absent here; `handle_recall` fills the fields it reports.
+        composite: None,
         profile_component: 1.0,
         entity_posterior_mean: None,
+        entity_evidence_mass: None,
+        weights_served: if report {
+            "default".to_string()
+        } else {
+            String::new()
+        },
+        namespace: String::new(),
+        pre_entity_score: total as f32,
+        entity_term: 1.0,
+        local_factor: 1.0,
+        duplicate_penalty: 0.0,
     };
     (total, breakdown)
 }
@@ -801,6 +896,17 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+pub(super) struct CollectedMemoryCandidates {
+    pub(super) candidates: RecallCandidateSet,
+    pub(super) plan: QueryNode,
+}
+
+struct CollectedMemoryVectors {
+    candidates: RecallVectorCandidateResult,
+    declared: CollectionPlan,
+    leaves: Vec<query_ir::MemoryLeaf>,
+}
+
 pub(super) struct RecallCandidateSet {
     pub(super) namespace: String,
     pub(super) text_hits: Vec<TextSearchHit>,
@@ -918,7 +1024,6 @@ pub(super) struct RecallVectorCandidateParams<'a> {
 }
 
 pub(super) struct RecallVectorCandidateResult {
-    pub(super) vector_hits_per_model: Vec<(String, Vec<VectorSearchHit>)>,
     /// Whether any model timed out to FTS-only while its tracked build continued.
     pub(super) ann_degraded: bool,
     /// #1657: the first degraded model's failure-site reason; `None` when no
@@ -1177,7 +1282,7 @@ impl MemoryPack {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let prof = recall_profile_enabled();
+        let prof = recall_profile_enabled(&self.runtime);
         let call_id = PROF_CID.try_with(|id| *id).unwrap_or(0);
         let t_fts = if prof { Some(Instant::now()) } else { None };
         let searcher = self.runtime.text_for_notes(token)?;
@@ -1235,6 +1340,18 @@ impl MemoryPack {
         token: &NamespaceToken,
         opts: RecallCandidateParams<'_>,
     ) -> Result<RecallCandidateSet, RuntimeError> {
+        Ok(self
+            .collect_recall_candidates_with_plan(query, token, opts)
+            .await?
+            .candidates)
+    }
+
+    pub(super) async fn collect_recall_candidates_with_plan(
+        &self,
+        query: &str,
+        token: &NamespaceToken,
+        opts: RecallCandidateParams<'_>,
+    ) -> Result<CollectedMemoryCandidates, RuntimeError> {
         khive_storage::ensure_request_read_active("memory.recall")?;
         let RecallCandidateParams {
             candidate_limit,
@@ -1257,38 +1374,40 @@ impl MemoryPack {
             .collect();
         let primary_ns = token.namespace().as_str().to_string();
 
+        let text_declared = query_ir::text_declaration()?;
         let text_fut = async {
-            if !legs.text {
-                return Ok::<_, RuntimeError>((Vec::new(), None));
-            }
-            let started = Instant::now();
-            let hits = self
-                .collect_recall_text_hits(
-                    token,
-                    query,
-                    &visible,
-                    candidate_limit,
-                    snippet_policy,
-                    cjk_fts_bypass,
-                    fts_gather,
-                )
-                .await?;
-            Ok((hits, Some(started.elapsed())))
+            let started = legs.text.then(Instant::now);
+            let leaf = query_ir::text_leaf(
+                self,
+                token,
+                query,
+                &visible,
+                candidate_limit,
+                legs.text,
+                snippet_policy,
+                cjk_fts_bypass,
+                fts_gather,
+            )
+            .await?;
+            Ok::<_, RuntimeError>((leaf, started.map(|time| time.elapsed())))
         };
         let vector_fut = async {
             if !legs.vector {
                 // No embedding, ANN, fresh-tail or sqlite-vec work: the arm
                 // never ran, so it reports no hits, no degradation and no
                 // unproven session fence.
-                return Ok::<_, RuntimeError>(RecallVectorCandidateResult {
-                    vector_hits_per_model: Vec::new(),
-                    ann_degraded: false,
-                    ann_degraded_reason: None,
-                    session_unmet_models: Vec::new(),
-                    timings: RecallStageTimings::default(),
+                return Ok::<_, RuntimeError>(CollectedMemoryVectors {
+                    candidates: RecallVectorCandidateResult {
+                        ann_degraded: false,
+                        ann_degraded_reason: None,
+                        session_unmet_models: Vec::new(),
+                        timings: RecallStageTimings::default(),
+                    },
+                    declared: query_ir::declaration(Vec::new())?,
+                    leaves: Vec::new(),
                 });
             }
-            self.collect_recall_vector_hits(
+            self.collect_recall_vector_leaves(
                 token,
                 query,
                 &primary_ns,
@@ -1303,19 +1422,35 @@ impl MemoryPack {
             )
             .await
         };
-        let ((text_hits, fts_elapsed), vector_result) = tokio::try_join!(text_fut, vector_fut)?;
+        let ((text_leaf, fts_elapsed), vector_result) = tokio::try_join!(text_fut, vector_fut)?;
+        let declared = query_ir::declaration(
+            text_declared
+                .slots()
+                .iter()
+                .cloned()
+                .chain(vector_result.declared.slots().iter().cloned())
+                .collect(),
+        )?;
+        let mut leaves = vec![text_leaf];
+        leaves.extend(vector_result.leaves);
+        let executed = finish_collect(&declared, leaves, None).map_err(query_ir::executor_error)?;
+        let (text_hits, vector_hits_per_model) = query_ir::raw_streams(executed.collected)?;
+        let vector_result = vector_result.candidates;
         let mut timings = vector_result.timings;
         timings.fts = fts_elapsed;
         khive_storage::ensure_request_read_active("memory.recall")?;
-        Ok(RecallCandidateSet {
-            namespace: primary_ns,
-            text_hits,
-            vector_hits_per_model: vector_result.vector_hits_per_model,
-            visible_namespaces: visible,
-            ann_degraded: vector_result.ann_degraded,
-            ann_degraded_reason: vector_result.ann_degraded_reason,
-            session_unmet_models: vector_result.session_unmet_models,
-            timings,
+        Ok(CollectedMemoryCandidates {
+            plan: executed.plan,
+            candidates: RecallCandidateSet {
+                namespace: primary_ns,
+                text_hits,
+                vector_hits_per_model,
+                visible_namespaces: visible,
+                ann_degraded: vector_result.ann_degraded,
+                ann_degraded_reason: vector_result.ann_degraded_reason,
+                session_unmet_models: vector_result.session_unmet_models,
+                timings,
+            },
         })
     }
 
@@ -1323,13 +1458,13 @@ impl MemoryPack {
     ///
     /// Global ANN starts at `max(k * 4, k + 32)` and post-filters; sqlite-vec filters in
     /// SQL. See `crates/khive-pack-memory/docs/api/recall-pipeline.md`.
-    pub(super) async fn collect_recall_vector_hits(
+    async fn collect_recall_vector_leaves(
         &self,
         token: &NamespaceToken,
         query: &str,
         ns: &str,
         opts: RecallVectorCandidateParams<'_>,
-    ) -> Result<RecallVectorCandidateResult, RuntimeError> {
+    ) -> Result<CollectedMemoryVectors, RuntimeError> {
         khive_storage::ensure_request_read_active("memory.recall")?;
         let RecallVectorCandidateParams {
             candidate_limit,
@@ -1347,7 +1482,7 @@ impl MemoryPack {
         const ANN_OVERFETCH_MARGIN: usize = 32;
         let ann_fetch_limit = (candidate_limit as usize * ANN_OVERFETCH_FACTOR)
             .max(candidate_limit as usize + ANN_OVERFETCH_MARGIN);
-        let prof = recall_profile_enabled();
+        let prof = recall_profile_enabled(&self.runtime);
         let call_id = PROF_CID.try_with(|id| *id).unwrap_or(0);
 
         let mut ann_degraded = false;
@@ -1362,9 +1497,11 @@ impl MemoryPack {
             self.runtime.registered_embedding_model_names()
         };
 
-        let vector_hits_per_model: Vec<(String, Vec<VectorSearchHit>)> = if model_names.is_empty() {
-            vec![]
-        } else {
+        let declared = query_ir::vector_declaration(&model_names)?;
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(model_names.len().max(1)));
+        let observer = query_ir::Observer::current();
+        let mut executed_leaves = Vec::with_capacity(model_names.len());
+        if !model_names.is_empty() {
             let embed_started = Instant::now();
             let t_embed = if prof { Some(embed_started) } else { None };
             let query_vecs: Vec<(String, Vec<f32>)> = match model_names.len() {
@@ -1503,23 +1640,32 @@ impl MemoryPack {
                 }
             }
 
+            let embedded_models: HashSet<String> =
+                query_vecs.iter().map(|(model, _)| model.clone()).collect();
+            for slot in declared.slots() {
+                if !embedded_models
+                    .iter()
+                    .any(|model| slot.key == format!("vector:{model}"))
+                {
+                    executed_leaves.push(query_ir::skipped_vector(slot, candidate_limit).await?);
+                }
+            }
+
             // Widening rounds are resolved before this loop, enabling deterministic tests.
 
             let t_ann_total = if prof { Some(Instant::now()) } else { None };
             let mut ann_route = "ann";
 
-            // Per-model ANN/sqlite-vec resolution is independent I/O (durable-epoch
-            // check, warm-cache search, possible detached ensure-wait, possible
-            // exact-scan fallback) — fan the models out concurrently instead of
-            // paying their latency serially. Mirrors the embed step's 1/2/N
-            // dispatch immediately above.
-            let per_model_results: Vec<PerModelAnnHits> = match query_vecs.len() {
+            // Resolve independent model I/O concurrently.
+            // See `docs/api/recall-pipeline.md#vector-candidate-collection`.
+            let per_model_results: Vec<query_ir::MemoryLeaf> = match query_vecs.len() {
                 0 => Vec::new(),
                 1 => {
                     let (model_name, vec) = query_vecs.into_iter().next().unwrap();
                     let session_seq =
                         session_fence.and_then(|fence| fence.proof_for_model(&model_name));
-                    let r = collect_model_ann_hits(
+                    let slot = query_ir::model_slot(&declared, &model_name)?;
+                    let r = query_ir::vector_leaf(
                         &self.runtime,
                         &self.ann,
                         token,
@@ -1532,6 +1678,9 @@ impl MemoryPack {
                         ann_overfetch_max_rounds,
                         ann_ready_timeout_ms,
                         session_seq,
+                        slot,
+                        &permits,
+                        observer.clone(),
                     )
                     .await?;
                     khive_storage::ensure_request_read_active("memory.recall")?;
@@ -1543,7 +1692,9 @@ impl MemoryPack {
                     let (m1, v1) = it.next().unwrap();
                     let seq0 = session_fence.and_then(|fence| fence.proof_for_model(&m0));
                     let seq1 = session_fence.and_then(|fence| fence.proof_for_model(&m1));
-                    let f0 = collect_model_ann_hits(
+                    let slot0 = query_ir::model_slot(&declared, &m0)?;
+                    let slot1 = query_ir::model_slot(&declared, &m1)?;
+                    let f0 = query_ir::vector_leaf(
                         &self.runtime,
                         &self.ann,
                         token,
@@ -1556,8 +1707,11 @@ impl MemoryPack {
                         ann_overfetch_max_rounds,
                         ann_ready_timeout_ms,
                         seq0,
+                        slot0,
+                        &permits,
+                        observer.clone(),
                     );
-                    let f1 = collect_model_ann_hits(
+                    let f1 = query_ir::vector_leaf(
                         &self.runtime,
                         &self.ann,
                         token,
@@ -1570,6 +1724,9 @@ impl MemoryPack {
                         ann_overfetch_max_rounds,
                         ann_ready_timeout_ms,
                         seq1,
+                        slot1,
+                        &permits,
+                        observer.clone(),
                     );
                     let (r0, r1) = tokio::join!(f0, f1);
                     khive_storage::ensure_request_read_active("memory.recall")?;
@@ -1580,6 +1737,9 @@ impl MemoryPack {
                     for (model_name, vec) in query_vecs {
                         let session_seq =
                             session_fence.and_then(|fence| fence.proof_for_model(&model_name));
+                        let slot = query_ir::model_slot(&declared, &model_name)?;
+                        let permits = permits.clone();
+                        let observer = observer.clone();
                         let rt = self.runtime.clone();
                         let ann_shared = self.ann.clone();
                         let token_owned = token.clone();
@@ -1588,7 +1748,7 @@ impl MemoryPack {
                         handles.push(tokio::spawn(
                             khive_runtime::runtime::inherit_request_embedder_scope(
                                 khive_storage::inherit_request_read_context(async move {
-                                    collect_model_ann_hits(
+                                    query_ir::vector_leaf(
                                         &rt,
                                         &ann_shared,
                                         &token_owned,
@@ -1601,6 +1761,9 @@ impl MemoryPack {
                                         ann_overfetch_max_rounds,
                                         ann_ready_timeout_ms,
                                         session_seq,
+                                        slot,
+                                        &permits,
+                                        observer,
                                     )
                                     .await
                                 }),
@@ -1637,7 +1800,8 @@ impl MemoryPack {
                 }
             };
 
-            for r in &per_model_results {
+            for leaf in &per_model_results {
+                let r = query_ir::model_evidence(leaf)?;
                 timings.record_parallel_model(r.ann_elapsed, r.fresh_tail_elapsed);
                 if r.session_unmet {
                     session_unmet_models.push(r.model_name.clone());
@@ -1652,14 +1816,11 @@ impl MemoryPack {
                     ann_route = "sqlite_vec";
                 }
             }
-            let results: Vec<(String, Vec<VectorSearchHit>)> = per_model_results
-                .into_iter()
-                .map(|r| (r.model_name, r.hits))
-                .collect();
+            let total_hits: usize = per_model_results.iter().map(|leaf| leaf.hits().len()).sum();
+            executed_leaves.extend(per_model_results);
 
             if prof {
                 if let Some(t) = t_ann_total {
-                    let total_hits: usize = results.iter().map(|(_, h)| h.len()).sum();
                     eprintln!(
                         r#"{{"c":{},"s":"ann","us":{},"n":{},"route":"{}"}}"#,
                         call_id,
@@ -1669,16 +1830,18 @@ impl MemoryPack {
                     );
                 }
             }
-            results
-        };
+        }
 
         khive_storage::ensure_request_read_active("memory.recall")?;
-        Ok(RecallVectorCandidateResult {
-            vector_hits_per_model,
-            ann_degraded,
-            ann_degraded_reason,
-            session_unmet_models,
-            timings,
+        Ok(CollectedMemoryVectors {
+            candidates: RecallVectorCandidateResult {
+                ann_degraded,
+                ann_degraded_reason,
+                session_unmet_models,
+                timings,
+            },
+            declared,
+            leaves: executed_leaves,
         })
     }
 
@@ -1741,15 +1904,15 @@ impl MemoryPack {
 
 /// One embedding model's outcome from [`collect_model_ann_hits`].
 pub(super) struct PerModelAnnHits {
-    model_name: String,
-    hits: Vec<VectorSearchHit>,
+    pub(super) model_name: String,
+    pub(super) hits: Vec<VectorSearchHit>,
     /// This model's warm ANN wait was bounded out (#836); recall degraded to FTS-only for it.
     pub(super) degraded: bool,
     /// The degradation reason captured at the failure site with `{:?}` formatting;
     /// `Some` iff `degraded`.
     pub(super) degraded_reason: Option<String>,
     /// This model fell through to the exact sqlite-vec scan instead of warm ANN.
-    used_sqlite_vec_fallback: bool,
+    pub(super) used_sqlite_vec_fallback: bool,
     /// Time spent in ANN readiness/search/widening or exact sqlite-vec work,
     /// excluding the separately measured fresh-tail leg.
     ann_elapsed: Duration,
@@ -1868,11 +2031,8 @@ pub(super) async fn collect_model_ann_hits(
     }
 }
 
-/// Split out of `collect_recall_vector_hits` so per-model units — each with independent
-/// durable-epoch checks, warm-cache search, possible detached ensure-wait, and possible
-/// exact-scan fallback — can run concurrently instead of serially. All error paths
-/// propagate via `?`; the [`collect_model_ann_hits`] wrapper converts them into a
-/// degraded outcome for this model rather than aborting every engine's recall.
+/// Propagate errors to the wrapper for per-model degradation (ADR-031).
+/// See `docs/api/recall-pipeline.md#vector-candidate-collection`.
 #[allow(clippy::too_many_arguments)]
 async fn collect_model_ann_hits_inner(
     runtime: &khive_runtime::KhiveRuntime,
@@ -1923,35 +2083,32 @@ async fn collect_model_ann_hits_inner(
             None
         }
         Ok(None) => {
+            use khive_runtime::resource_admission::JobOutcome;
+
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-            let rt_detached = runtime.clone();
-            let token_detached = token.clone();
-            let ann_detached = ann.clone();
+            let readiness = tokio::time::timeout(
+                std::time::Duration::from_millis(ann_ready_timeout_ms),
+                done_rx,
+            );
+            let (tracking, attempt) = ann::submit_recall_miss(
+                runtime.clone(),
+                token.clone(),
+                ann.clone(),
+                model_name.clone(),
+            );
+            #[cfg(test)]
             let model_detached = model_name.clone();
-            khive_runtime::track_named_background_task("memory_ann_build", async move {
+            drop(tokio::spawn(async move {
+                let _tracking = tracking;
                 #[cfg(test)]
                 retrieval_failpoints::before_ann_build(&model_detached).await;
-                let result = ann::ensure_ann_for_model(
-                    &rt_detached,
-                    &token_detached,
-                    &ann_detached,
-                    &model_detached,
-                )
-                .await;
+                let result = attempt.await;
                 #[cfg(test)]
                 retrieval_failpoints::after_ann_build(&model_detached);
                 let _ = done_tx.send(result);
-            });
-            match khive_storage::await_request_read_phase(
-                "memory.recall",
-                tokio::time::timeout(
-                    std::time::Duration::from_millis(ann_ready_timeout_ms),
-                    done_rx,
-                ),
-            )
-            .await?
-            {
-                Ok(Ok(Ok(status))) => {
+            }));
+            match khive_storage::await_request_read_phase("memory.recall", readiness).await? {
+                Ok(Ok(JobOutcome::Completed(Ok(status)))) => {
                     tracing::debug!(
                         ?status,
                         model = %model_name,
@@ -1963,7 +2120,46 @@ async fn collect_model_ann_hits_inner(
                     khive_storage::ensure_request_read_active("memory.recall")?;
                     searched
                 }
-                Ok(Ok(Err(e))) => return Err(e),
+                Ok(Ok(JobOutcome::Completed(Err(e)))) => return Err(e),
+                Ok(Ok(JobOutcome::Cancelled)) => {
+                    tracing::warn!(
+                        outcome = "Cancelled",
+                        model = %model_name,
+                        namespace = %ns,
+                        "memory ANN Warm attempt not ready; degrading recall to FTS-only"
+                    );
+                    model_ann_degrade_reason = Some(
+                        "memory ANN Warm attempt Cancelled; degrading recall to FTS-only for this model"
+                            .to_owned(),
+                    );
+                    None
+                }
+                Ok(Ok(JobOutcome::Refused(_))) => {
+                    tracing::warn!(
+                        outcome = "Refused",
+                        model = %model_name,
+                        namespace = %ns,
+                        "memory ANN Warm attempt not ready; degrading recall to FTS-only"
+                    );
+                    model_ann_degrade_reason = Some(
+                        "memory ANN Warm attempt Refused; degrading recall to FTS-only for this model"
+                            .to_owned(),
+                    );
+                    None
+                }
+                Ok(Ok(JobOutcome::FinalizationTimedOut)) => {
+                    tracing::warn!(
+                        outcome = "FinalizationTimedOut",
+                        model = %model_name,
+                        namespace = %ns,
+                        "memory ANN Warm attempt not ready; degrading recall to FTS-only"
+                    );
+                    model_ann_degrade_reason = Some(
+                        "memory ANN Warm attempt FinalizationTimedOut; degrading recall to FTS-only for this model"
+                            .to_owned(),
+                    );
+                    None
+                }
                 Ok(Err(_sender_dropped)) => {
                     // A detached-task panic degrades this model instead of failing recall.
                     tracing::warn!(

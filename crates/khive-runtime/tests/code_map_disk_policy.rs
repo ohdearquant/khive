@@ -17,9 +17,15 @@ fn code_map_runtime_uses_captured_policy_and_lock_directory() {
     let mut fixture = None;
     if run_exact_test_in_child(CHILD, false, |command| {
         let root = private_root();
+        // The child's environment is cleared, so it gets a temporary directory
+        // of its own; without one it falls back to /tmp, which a sandboxed run
+        // closes.
+        let temporary = root.path().join("tmp");
+        std::fs::create_dir(&temporary).expect("child temporary directory");
         command
             .env_clear()
             .env("HOME", root.path().join("home"))
+            .env("TMPDIR", &temporary)
             .env("KHIVE_TEST_HARNESS", "1")
             .env(ROOT, root.path())
             .env("KHIVE_VOLUME_LOCK_DIR", root.path().join("captured-locks"))

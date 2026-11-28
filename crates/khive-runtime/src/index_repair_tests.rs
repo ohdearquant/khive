@@ -1,5 +1,6 @@
 use super::*;
 use crate::{EmbedderProvider, Namespace, NoteEmbeddingPolicy, NoteEmbeddingPolicySpec};
+use khive_db::test_hooks::TestHooks;
 use khive_storage::{TextFilter, TextQueryMode, TextSearch, TextSearchRequest};
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use serde_json::json;
@@ -415,7 +416,7 @@ async fn degraded_note_insert_recovers_keyword_search_without_substrate_rewrite(
     let observed = attempts.clone();
     {
         use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-        runtime.backend().pool().writer().unwrap().autocommit(|conn| Ok(conn.authorizer(Some(move |context: AuthContext<'_>| {
+        runtime.backend().pool().writer().unwrap().autocommit(|conn| Ok(conn.test_authorizer(Some(move |context: AuthContext<'_>| {
             if matches!(context.action, AuthAction::Insert { table_name } if table_name == "fts_notes_rowids") {
                 observed.fetch_add(1, Ordering::SeqCst);
                 Authorization::Deny
@@ -437,7 +438,7 @@ async fn degraded_note_insert_recovers_keyword_search_without_substrate_rewrite(
         .writer()
         .unwrap()
         .autocommit(|conn| {
-            Ok(conn.authorizer(
+            Ok(conn.test_authorizer(
                 None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
             )?)
         })

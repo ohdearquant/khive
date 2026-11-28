@@ -166,3 +166,74 @@ fn three_node_chain() {
     let nodes: Vec<_> = q.pattern.nodes().collect();
     assert_eq!(nodes.len(), 3);
 }
+
+#[test]
+fn not_exists_is_a_scoped_atom_with_existing_boolean_precedence() {
+    let mut query = parse("MATCH (r:concept) WHERE r.name = 'always' OR NOT EXISTS { (f:concept {name: 'evidence'})-[e:supports]->(r) } AND r.name = 'eligible' RETURN r.id").unwrap();
+    let WhereExpr::Or(left, right) = &query.where_clause else {
+        panic!("OR must be outermost")
+    };
+    assert!(matches!(left.as_ref(), WhereExpr::Condition(_)));
+    let WhereExpr::And(absence, condition) = right.as_ref() else {
+        panic!("AND must bind first")
+    };
+    let WhereExpr::NotExists(pattern) = absence.as_ref() else {
+        panic!("expected scoped absence")
+    };
+    assert_eq!(pattern.elements.len(), 3);
+    assert_eq!(
+        pattern
+            .nodes()
+            .map(|n| n.variable.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("f"), Some("r")]
+    );
+    assert_eq!(pattern.edges().next().unwrap().relations, ["supports"]);
+    assert!(matches!(condition.as_ref(), WhereExpr::Condition(_)));
+    assert_eq!(
+        query
+            .where_clause
+            .conditions()
+            .map(|c| c.variable.as_str())
+            .collect::<Vec<_>>(),
+        ["r", "r"]
+    );
+    let mut visited = 0;
+    query
+        .where_clause
+        .for_each_condition_mut(&mut |_| visited += 1);
+    assert_eq!(
+        visited, 2,
+        "block-local inline constraints are not outer scalar conditions"
+    );
+    let singleton =
+        parse("MATCH (r) WHERE NOT EXISTS { (r:concept {name: 'present'}) } RETURN r.id").unwrap();
+    assert!(matches!(singleton.where_clause, WhereExpr::NotExists(ref p) if p.elements.len() == 1));
+    for variable in ["not", "exists", "count"] {
+        let query = parse(&format!(
+            "MATCH ({variable}) WHERE {variable}.name = 'literal' RETURN {variable}.id"
+        ))
+        .unwrap();
+        assert_eq!(
+            query.where_clause.conditions().next().unwrap().variable,
+            variable
+        );
+    }
+}
+
+#[test]
+fn not_exists_refuses_query_clauses_and_malformed_blocks() {
+    for source in [
+        "MATCH (r) WHERE NOT EXISTS { } RETURN r",
+        "MATCH (r) WHERE NOT EXISTS { (r) RETURN r",
+        "MATCH (r) WHERE NOT EXISTS { MATCH (r) } RETURN r",
+        "MATCH (r) WHERE NOT EXISTS { (r) WHERE r.name = 'x' } RETURN r",
+        "MATCH (r) WHERE NOT EXISTS { (r) RETURN r } RETURN r",
+        "MATCH (r) WHERE NOT EXISTS { (r) ORDER BY r.id } RETURN r",
+        "MATCH (r) WHERE NOT EXISTS { (r), (s) } RETURN r",
+        "MATCH (r) WHERE NOT EXISTS { NOT EXISTS { (r) } } RETURN r",
+        "MATCH (r) OPTIONAL MATCH (f)-[:supports]->(r) RETURN r",
+    ] {
+        assert!(parse(source).is_err(), "must refuse: {source}");
+    }
+}

@@ -92,7 +92,8 @@ contract the driver's tests bind to; the record above stands where not restated.
    `..` component or a symlink escape is refused before materialization.
 2. **Environment.** The caller supplies the environment values; the `[exec] env` config allow-lists
    the keys that may pass; the server sets `HOME` to the run directory; nothing is inherited from the
-   host. The receipt records `env_keys`.
+   host. The receipt records `env_keys`, and in `env_dropped` the caller's keys whose value did not
+   reach the child as given: a key outside the allow-list, or `HOME`.
 3. **`declared_write_paths`** (optional). When given, a change outside the declared set makes the run
    `success: false`, names the offending paths in `undeclared_changes`, and drops their bytes: they
    are neither stored nor part of `tree_out`.
@@ -879,6 +880,9 @@ Amended by [Amendment 14](#amendment-14-2026-10-21-the-executables-bytes-the-mac
 and 5 with three items added, and acceptance arms 44, 45, 49 to 53, 56, 58, 59 and 60, with arms 61 to 67 added. No host
 turns networked runs on before Amendment 14 is accepted.
 
+Decision item 7 is replaced by [Amendment 19](#amendment-19-2026-11-27-toolrequest-creates-a-request-unless-a-grant-allows)
+item 1, which applies its rule to every registered row.
+
 This amendment provides the network declaration that a host needs to run adapters which reach a
 remote service under exec. It does not decide which registrations may declare it.
 
@@ -956,9 +960,12 @@ accepted by its driven arms, never by its text.
    it is not. Per-destination egress is later work and is not decided here.
 
    Re-registering an existing name keeps the stored row unchanged (ADR-180 test
-   `re_registration_keeps_the_approved_object_and_definition`), so a `network` passed on a
+   `re_registration_updates_definition_and_invalidates_only_mismatched_grants`), so a `network` passed on a
    re-registration does not reach the row. `tool.describe`, `tool.list` and the register response
    report the stored `network`, so the caller sees what is stored rather than what was asked.
+
+   ADR-180 Amendment 10 rewrites the existing-name behavior of `tool.register`: supplied fields
+   correct the row, and a source or kind change on any existing row, this one included, is refused.
 
    Which registrations may carry `network` is the hosting deployment's registration policy, not
    exec's. exec enforces the declaration a row carries; it does not decide eligibility, and nothing
@@ -1356,6 +1363,8 @@ item 8).
 
    An upgraded executable is a new registration under a new name, granted again. Re-registering an existing name never
    changes the stored row (item 2).
+   ADR-180 Amendment 10 rewrites this for `tool.register`: other supplied fields correct the row, and a source
+   or kind change on any existing row, this one included, is refused.
 
 2. **Re-registration refuses a conflicting network declaration.** `tool.register` on a name that already has a row
    validates a passed `network` or `executable_digest` as it would for a new row. When a passed value differs from the
@@ -1366,7 +1375,7 @@ item 8).
    `claim_entity_if_absent` returns the winner with `created` false after checking only its identity
    (`handlers.rs:463-478`, `khive-runtime/src/operations/entity_create.rs:103-135`). It runs before any capability link
    is written. This replaces Amendment 13 Decision item 1's statement that a re-registration's `network` silently does
-   not reach the row. ADR-180's `re_registration_keeps_the_approved_object_and_definition` passes neither property and is
+   not reach the row. ADR-180's `re_registration_updates_definition_and_invalidates_only_mismatched_grants` passes neither property and is
    unaffected.
 
 3. **The host setting is named, typed and bound to measured builds.** The setting is the `[exec.network]` table of the
@@ -1708,3 +1717,419 @@ Added arms:
     case red, leaves arm 59 green, and turns arm 65's loopback-address case red (refused naming `network` instead).
 
 Implementation of Amendments 13 and 14 follows acceptance of both and goes through the usual review and gates.
+
+## Amendment 15 (2026-11-21): cache roots, directories a run may write that outlive it
+
+**Status: Proposed 2026-11-21.** Additive. A host that configures no cache root is unaffected: its profile, its
+template digest and its receipts' existing keys are unchanged byte for byte.
+
+### Context
+
+Decision item 3 gives a run one writable place, its run directory, and the run directory is the unit of capture: it
+is walked after the run, a change outside the declared write paths fails the run, and a declared change is stored.
+That is right for a command whose output is the point. It is wrong for a build. A compiler writes a package cache and
+a build directory that are many times the size of the source tree, are worth keeping between runs and are not the
+run's result. Inside the run directory they are either undeclared changes that fail the run, or declared changes
+that are hashed and stored on every run and thrown away with the directory, so the next run starts cold.
+
+### Decision
+
+1. **Config.** `[exec] cache_roots` is a list of absolute directories. It is empty by default. Each entry is
+   canonicalized at load, like a read root, and again when a run starts. The run-start form is the one the checks
+   compare, the profile grants and the digest names: a root created after load, or named through a symbolic link,
+   was otherwise granted under a text the sandbox never matches.
+2. **Profile.** For each cache root the profile grants what it grants the run directory: `file-read*`,
+   `file-read-metadata` (with the exact ancestor directories), `file-map-executable` and `file-write*`. Nothing else
+   in the profile changes. In particular there is still no network, and the version-control and `never` denials of
+   Amendment 9 apply to a binary under a cache root as they do anywhere.
+3. **Refusal.** A run is refused before materialization, with the reason, when a cache root is not absolute, when it
+   does not exist or cannot be resolved, when it holds the exec root or sits inside it, or when it equals, holds or
+   sits inside a read root. A cache root must exist when a run starts; the operator creates it. Entries are compared
+   in canonical form, so a symbolic link or a `..` component does not hide an overlap. An overlap with the exec root
+   would let one run write another run's directory, and an overlap with a read root would make a directory the
+   configuration calls read-only writable. The refusal names the entry and, for an overlap, the root it overlaps.
+   Each entry is resolved by one walk, component by component, that follows every symbolic link it meets and records
+   where each link sits; the walk's result is what is checked, granted and digested, so no second read of the file
+   system comes between the check and the grant. An entry is refused when any symbolic link met while resolving it,
+   one met inside another link's target included, sits inside the exec root or inside a cache root, naming the link
+   and that root: a run can point such a link elsewhere, and the next run would be granted write wherever it points.
+   A link where no run can write is followed. A walk that follows more than 40 links is refused. An entry whose
+   walked path is not spelled as the file system reports it (another letter case on a volume that ignores case) is
+   refused, naming the spelling to write; that check can only refuse, and the grant stays the walk's result.
+   The check does not judge what else a cache root holds. A root that holds a home directory, a credential or a
+   store is the operator's error and is not refused.
+4. **Capture.** Nothing under a cache root is part of the run's output. It is not walked, not hashed, not stored, and
+   it is not removed when the run directory is.
+5. **Receipt and identity.** The receipt's `sandbox` object carries `cache_roots_digest`: the BLAKE3 hex of the
+   sorted canonical cache roots, as resolved when the run starts, in the read roots' serialization (Amendment 1
+   item 7). `exec.identity` reports
+   `cache_roots` and the same digest. The digest of the empty list means the run had no cache root.
+
+### What a cache root costs
+
+A run with a cache root is not a function of its input tree. It can read what an earlier run left and it can change
+what a later run reads, and that includes code: a build script or a compiler plugin compiled by one run is loaded by
+the next. Two consequences follow, and an operator who configures a cache root accepts both.
+
+- **Runs that share a cache root share a trust boundary.** A cache root belongs to one principal. An operator who
+  serves two principals that must not influence each other gives them separate hosts or no cache root.
+- **A receipt with a non-empty `cache_roots_digest` does not prove its output from its input.** It proves the
+  output from the input and the cache's state, which is not recorded. Re-running against an empty cache root is the
+  way to check an output that matters.
+
+The operator also owns the cache root's size. It is outside the run directory, so the output cap and capture limits
+do not bound it. A quota on its volume does.
+
+### Acceptance
+
+68. **Profile, no cache root.** The write rule names the run directory alone.
+69. **Profile, one cache root.** The read, metadata, executable-map and write rules each name it, the metadata rule
+    names its exact ancestors, and no network operation appears.
+70. **Overlap.** A cache root equal to the exec root, holding it, inside it, or relative is refused with the reason.
+    A sibling directory is not (control).
+71. **Seatbelt.** Under the rendered profile a write into the run directory succeeds (control), a write into the
+    cache root succeeds and the file exists afterwards, a write into a sibling directory is refused, and the same
+    cache directory is refused under a profile rendered without it.
+72. **Run.** On a host with one cache root, a run that writes a file there succeeds with no changed and no
+    undeclared paths and an unchanged output tree, its receipt carries a `cache_roots_digest` other than the empty
+    list's, the file is on disk after the run directory is gone, and a second run reads it. On a host with no cache
+    root the same write fails and the receipt's digest is the empty list's.
+73. **Existence.** A cache root that does not exist is refused with a reason that names the entry and says it must
+    exist when a run starts. A sibling directory that exists is accepted (control).
+74. **Canonical form.** A cache root that is an alias, through a symbolic link, of a directory inside the exec root,
+    and a cache root written with `..` components that resolves inside the exec root, are each refused.
+75. **Read roots.** A cache root equal to a read root, holding one, or inside one is refused with a reason that names
+    both entries. A read root and a cache root that are siblings are accepted (control), including two names that
+    share only a text prefix.
+76. **Identity.** Without a configured cache root `exec.identity` reports an empty `cache_roots` and the digest of
+    the empty list. With one it reports the root and a different digest. This is checked without a sandbox.
+
+## Amendment 16 (2026-11-22): the run's own temporary directory and unix sockets inside a run
+
+**Status: Accepted 2026-11-22.** Changes every run's profile, so the template digest changes, and every receipt's
+`env_keys` gains `TMPDIR`. It replaces three passages of Amendment 15: item 2's sentence that there is still no
+network; acceptance 68, "The write rule names the run directory alone", which acceptance 78 replaces; and the last
+clause of acceptance 69, "and no network operation appears", which acceptance 77 replaces. Decision step 3's "no
+network" and Acceptance 4 now read: TCP and UDP stay refused, loopback included, and a unix-domain socket is allowed
+under the run directory and the run's temporary directory and nowhere else.
+
+### Context
+
+The profile refuses every network operation, and binding or connecting a unix-domain socket is one. A test suite that
+starts a server and its client in one process tree, as the daemon and forwarding tests do, therefore fails in a run
+for that reason alone, and its result says nothing about the code. A run also had no temporary directory of its own:
+`TMPDIR` was whatever the caller passed, and on a shared host that is a directory every run writes.
+
+### Decision
+
+1. **Temporary directory.** Before the launch the run verb creates the run directory's sibling `<run id>.tmp` in the
+   exec root, mode 0700, and sets `TMPDIR` to it after the caller's environment is applied, as it sets `HOME`. A
+   caller's `TMPDIR` is never passed; it is named in `env_dropped`. The directory is outside the run directory, so
+   nothing written there is captured. It is removed with the run, also when the run directory is kept, because it
+   holds no output. A failure to create it fails the run before the launch, with the path in the reason.
+2. **Profile.** The temporary directory is granted what the run directory is granted for files: `file-read*`,
+   `file-read-metadata` and `file-write*`. It is not granted `file-map-executable`, so code is not loaded from it.
+3. **Sockets.** One rule is added:
+   `(allow network-bind network-outbound (subpath <run directory>) (subpath <temporary directory>))`. Seatbelt matches
+   a unix-domain socket's bind and connect by its path, so a run may bind a socket under either directory and connect
+   to a socket there. A path filter cannot match an inet address, so TCP and UDP stay refused, loopback included, and
+   so does every socket outside the two directories, the khive daemon's among them. No `network-inbound` rule is
+   added. Both paths are canonical (the exec root is resolved at load and the names come from the run id), so no
+   `/tmp` spelling opens the whole of `/private/tmp`. Read roots and cache roots take no socket.
+4. **Unchanged.** Networked runs (Amendments 13 and 14), read roots, cache roots and the version-control and `never`
+   denials of Amendment 9 are as before.
+
+### Acceptance
+
+77. **Profile, network.** The one network rule names exactly the run directory and the temporary directory. No inet
+    term, no inbound rule, no `/tmp` spelling and no read or cache root appears in it.
+78. **Profile, writes.** The write rule names the run directory and the temporary directory, then each cache root.
+79. **Run.** `TMPDIR` is `<run id>.tmp` and writable; a file written there leaves no changed and no undeclared path
+    and the output tree unchanged; a caller's `TMPDIR` is named in `env_dropped`; after the run the directory is gone
+    and the exec root is empty.
+80. **Seatbelt.** A connect is judged by delivery: the listener writes what it receives to a file and the arm reads
+    its token back, because `nc -U -z` exits 1 against a live unix listener on macOS. Under the rendered profile a
+    sandboxed listener and a sandboxed client deliver a token inside the run directory and inside the temporary
+    directory (control). A bind outside both is refused, including under a sibling whose name shares the run
+    directory's text prefix. A sandboxed client's token does not reach a listener made outside the sandbox, one of
+    them standing for the daemon's socket; nor does it through a symbolic link or a hard link inside the run
+    directory that names that socket, each made outside the sandbox. A hard link to that socket made from inside the
+    sandbox is refused. A bind through a directory link inside the run directory that points outside leaves no
+    socket there. A loopback connect is refused. Each refusal has a control that runs the same command outside the
+    sandbox and succeeds: the same token arrives by the same path, the same link is made, the same bind leaves its
+    socket.
+
+## Amendment 17 (2026-11-23): tool profiles, `/bin` and the root links
+
+**Status: Accepted 2026-11-23.** Items 1 and 2 change every run's profile, so the template digest changes. Items 3
+to 6 change nothing on a host that configures no tool profile, and nothing for a tool that has none: its profile is
+the template, byte for byte.
+
+### Context
+
+Three things a run needs were refused by the template, each for a reason that reads as the program's own.
+
+- A shell searching `PATH` inspects each candidate before it launches one. `/bin` was not a read root, so that
+  inspection was refused and `mkdir` by name answered "command not found" whatever `PATH` held, while `/bin/mkdir`
+  by its path ran.
+- `/etc` and `/var` are links on macOS, to `private/etc` and `private/var`. The roots under `/private` were
+  readable, the links were not, so `/etc/hosts`, `/etc/ssl/cert.pem` and every file under `/usr/share/zoneinfo`
+  (itself a link into `/var/db/timezone`) were refused under the names programs use.
+- Some tools need one more thing than any run should have: a GPU test needs the Metal device and Metal's shader
+  cache; a test that serializes on a lock file needs that one file outside the run; a tool that looks for a volume
+  needs to list one directory. Granting any of these to every run widens every run.
+
+### Decision
+
+1. **`/bin`.** `/bin` is a system read root: `file-read*` and `file-read-metadata`, with the exact ancestors. It is
+   not granted `file-map-executable` or any write. It holds the system's own tools on the sealed volume, as `/usr`
+   does.
+2. **Root links.** The metadata rule names `/etc` and `/var` as literals: a run may inspect each link and follows
+   it to a path the roots already allow. Nothing under `/private/var` outside the roots becomes readable, by either
+   name, and the directory behind `/var` does not list.
+3. **Tool profiles.** `[[exec.tool_profiles]]` entries each name one registered tool and any of:
+   - `metal = true`: the GPU's user-client class `AGXDeviceUserClient`, the global names
+     `com.apple.MTLCompilerService` and `com.apple.bsd.dirhelper`, and read and write under Metal's own folder
+     `com.apple.metal` inside the cache folder the system names for the user the runs execute as
+     (`_CS_DARWIN_USER_CACHE_DIR`), with that folder's ancestors and `/var` for traversal only. Without the cache
+     folder every pipeline is compiled again on every run.
+   - `files = [...]`: read and write of each exact path. A path that does not exist yet resolves through its
+     directory, so a lock file a run creates still matches.
+   - `list_dirs = [...]`: opening and listing each exact directory, nothing below it.
+
+   Each path is kept in the spelling the configuration gives and in its resolved form, because a program opens the
+   spelling and the sandbox matches the resolved path while it checks each directory the spelling walks through.
+   The additions are appended after the template and change nothing in it. An entry that turns nothing on adds
+   nothing.
+4. **Sockets: one rule.** Amendment 16's rule stays the only socket rule: a run binds and connects unix-domain
+   sockets under its run directory and its own temporary directory, and nowhere else. A tool profile adds no socket
+   rule. An earlier form of tool profiles carried a `unix_sockets` key that allowed sockets under the run directory
+   and the cache roots, with an inbound rule; it is not adopted, for three reasons. Amendment 16 already gives every
+   run what the key was for: a test makes its sockets under its temporary directory, and `TMPDIR` is now the run's
+   own directory instead of a caller's path into a cache root. The key's one addition was the cache roots, which
+   outlive the run and are shared by every run on the host at once, so a socket there is a channel between
+   concurrent runs; Amendment 16 item 3 keeps read and cache roots free of sockets for that reason. And Amendment
+   16's form is the one acceptance 80 drives through links and a shared text prefix. The key still loads, because
+   `[exec]` refuses unknown keys and configurations that set it must keep starting; it adds no rule and the profile
+   reports it under `superseded_keys`.
+5. **Honoured.** A profile is given only to a run whose decision came from a grant, for a caller that is not
+   anonymous. A run of a profiled tool allowed any other way is refused with `tool_profile_unhonoured:` and the
+   reason, before the tree is read and before anything is materialized, rather than run without the additions and
+   fail later for a reason that reads as the tool's. A Metal profile on a host that cannot name the user's cache
+   folder is refused the same way. A configuration with an empty tool name, a tool named twice, a relative path, a
+   path under the exec root, or a `files` path under a system read root, a configured read root or a cache root
+   refuses every run before materialization, naming the entry and the root. A `files` path under a read root would
+   make writable what the configuration keeps read-only, and one under a cache root would grant per tool what every
+   run already shares. A `list_dirs` path only lists, so a root above it is no conflict.
+6. **Receipt and identity.** The receipt's `sandbox` object carries `tool_profile`: `null` for a run without one,
+   else the tool, `metal`, `metal_cache`, the resolved `files` and `list_dirs`, `superseded_keys`, and
+   `rules_digest`, the BLAKE3 hex of the rendered additions. The additions name no run directory, so the digest is
+   the same for every run of the tool; `profile_digest` already names the whole profile of the run.
+   `exec.identity` reports `tool_profiles` in the same form and `system_root_links`.
+
+### What a tool profile costs
+
+A profiled run is wider than the template, and the width is the operator's choice per tool. The Metal device is
+shared hardware, and Metal's cache folder is kept between runs and shared by every run of the tool, so it carries
+the trust boundary a cache root carries (Amendment 15). A named file is shared by every run that names it; that is
+its point for a lock. Only a grant hands the width to a caller, never a policy allow (item 5). A grant names the
+tool, not a profile: a profile the operator adds or changes later applies to grants already made, as read and cache
+roots do, and the receipt's `rules_digest` is the record of what a run had.
+
+### Acceptance
+
+81. **Profile, `/bin`.** The read and metadata rules name `/bin`; the executable-map and write rules do not; no
+    rule names `/sbin`, `/opt`, `/Applications` or `/Users`.
+82. **Seatbelt, `/bin`.** A sandboxed shell with `PATH=/usr/bin:/bin` makes a directory with `mkdir` by name and
+    `command -v mkdir` prints `/bin/mkdir`. Control: the same profile with `/bin` taken out of both rules exits 127
+    for the same command and launches `/bin/mkdir` by path. `ls /sbin` and a `mkdir` under `/bin` are refused.
+83. **Root links.** The metadata rule names `/etc` and `/var` as literals and no rule names either as a subpath or
+    names `/private/var` as one. Under the rendered profile `/etc/hosts` reads (control: `/private/etc/hosts`), a
+    zoneinfo file reads, a log under `/private/var/log` is refused by both names, and `/var/` does not list.
+84. **No profile.** With no tool profile, and with an entry that turns nothing on, the rendered profile equals the
+    template byte for byte.
+85. **Metal.** The rules name the user-client class, the two global names once each, read and write of Metal's
+    folder only, and the cache folder's ancestors and `/var` for traversal; no network term. Off means off. On a
+    host with a GPU and the compiled probe (`tests/fixtures/metal_probe.swift`) the probe passes unsandboxed
+    (control), passes under the Metal profile, and fails at the device under the template.
+86. **Files and directories.** The rules are exact literals with exact ancestors and no subpath. Under the rendered
+    profile the named file is written by its configured spelling and by its resolved path, a file beside it is
+    refused, and the template refuses it; the named directory lists, and a directory below it, a file in it and its
+    parent do not, and the template does not list it.
+87. **Conflicts.** An empty tool name, a tool named twice, a relative path, a path under the exec root, and a
+    `files` path under a system read root, under a configured read root and under a cache root are each refused with
+    the reason, the last three naming the root; two well-formed entries are accepted, one of them listing a
+    directory under a read root (control).
+88. **Sockets.** A profile that sets `unix_sockets` renders the same additions and the same `rules_digest` as the
+    same profile without it; the rendered profile's only network rule is Amendment 16's; `superseded_keys` names
+    the key. A configuration that sets it loads, and a misspelled key in an entry is refused.
+89. **Honoured.** A profiled tool allowed by policy is refused `tool_profile_unhonoured:` naming the policy, and an
+    anonymous caller naming a granted actor is refused naming anonymity, each before the tree is read and with
+    nothing materialized. Control: an unprofiled tool allowed the same way reaches the tree refusal.
+90. **Run.** A granted run of the profiled tool writes the named file; its receipt's `tool_profile` names the tool,
+    the file and a `rules_digest` equal to the one `exec.identity` reports, and its `profile_digest` differs from a
+    plain tool's. The plain tool, granted the same way, cannot write the file and its receipt's `tool_profile` is
+    `null`. The profiled tool cannot write the named file's neighbour.
+91. **Identity.** `exec.identity` reports each tool profile with its digest, `system_root_links` and `/bin` among
+    the system read roots.
+
+## Amendment 18 (2026-11-23): bounded change lists and directory deletes
+
+**Status: Accepted 2026-11-23.** A reply of at most 1000 changes within 262,144 bytes is the same as today plus three
+fields. A delete without `recursive` is unchanged.
+
+### Context
+
+Every verb that reports a change list returns all of it. `exec.tree_put` and `exec.tree_diff` return it in the
+reply, `exec.run` returns it twice (at the top level and inside the receipt), and `exec.receipt` and `exec.runs`
+return it from the stored row. A delete of a whole checkout through `exec.tree_put`, one edit per file because a
+delete names exactly one entry, came back as a 1.67 MB reply that the caller's transport dropped: the tree had been
+minted and the caller never saw its reference.
+
+### Decision
+
+1. **The bound.** A reply carries at most `changed_limit` changes, 1000 when the call does not set it, and at most
+   262,144 bytes of them, counted in the JSON-lines form of item 3: each change's compact JSON and its newline. The
+   list stops before the first change that would cross either bound, so a reply holds a prefix of the full list in
+   its path order. No argument raises the byte bound. `exec.runs` returns many rows in one reply, and its byte bound
+   is one bound across the whole reply: rows in the reply's order, each list a prefix of its row's list, and once
+   262,144 bytes are spent every remaining row carries an empty list with its own `changed_count`,
+   `changed_truncated: true` and `changed_ref`. `changed_limit` applies to each row.
+2. **`changed_limit`.** `exec.tree_put`, `exec.tree_diff`, `exec.run`, `exec.receipt` and `exec.runs` accept
+   `changed_limit`, an integer from 0 to 10,000. A larger value is refused and the refusal names 10,000; it is not
+   clamped. A negative or non-integer value is refused. On `exec.tree_put` the refusal comes before any write, under
+   Amendment 4 item 2. 0 returns an empty list and the three fields.
+3. **Three fields.** Beside every bounded list the reply carries `changed_count`, the length of the full list;
+   `changed_truncated`, true when the reply holds fewer changes than that; and `changed_ref`, the blob reference of
+   the full list as JSON lines: one change per line in path order, each the same object the reply uses in compact
+   JSON, each line ending in a newline. The blob is content addressed, so one list has one reference whichever verb
+   wrote it. It is a committed object like any other, and nothing in the runtime removes a committed object (the
+   store's reclamation sweeps only unfinished uploads), so it lasts as long as the blob store does and
+   `exec.tree_put`, which keeps no receipt row, needs nothing else to hold it; if the store has lost it, `blob.get`
+   refuses as not found naming the reference, and the list is computed again by `exec.tree_diff` of the call's
+   `base` and `tree`, or read from a run's persisted receipt.
+   - `exec.tree_put` and `exec.run` write the blob whenever the list is not empty; `changed_ref` is null only for an
+     empty list, with one exception: when `exec.run` cannot write the blob, its reply and its receipt keep the bounded
+     list with `changed_ref: null`, `success` is false, and the reason says the change list could not be written.
+   - `exec.run` stores `changed_count` and `changed_ref` on the persisted receipt. `exec.receipt` and `exec.runs`
+     return them from the row and write nothing.
+   - `exec.tree_diff` writes the blob only when it cuts the list and otherwise returns `changed_ref: null`. That
+     write takes it off the admission degrade-safe list, where it is classified with the reads that write.
+4. **One list per reply.** `exec.run`'s reply keeps the list at the top level and inside `receipt`, and both are the
+   same bounded list with the same three fields, so the reply holds at most twice the byte bound of change data,
+   524,288 bytes. That sits under the daemon frame, the 8 MiB (8,388,608-byte) limit on every reply the daemon
+   writes, which is also the frame item 6's `blob.get` slices must fit.
+   Dropping the copy inside `receipt` would bound the reply at once the byte bound but break item 8 for every caller
+   that reads `receipt.changed`.
+5. **The persisted receipt keeps the full list.** The bound applies to replies only. A receipt stored before this
+   amendment has no `changed_ref`: when `exec.receipt` or `exec.runs` cuts its list, the reply says
+   `changed_truncated: true` with `changed_ref: null`, and no verb returns more of that row's list than the bounds
+   allow.
+6. **Reading `changed_ref` in full.** `blob.get(content_ref=<changed_ref>, range={"offset": O, "length": L})`
+   returns bytes O to O+L of the list in base64 with the object's `size`. The caller starts at offset 0, adds each
+   reply's `range.length` to the offset, and stops when the offset equals `size`; the concatenated bytes, split at
+   newlines, are the full list. The caller picks L, and `blob.get` refuses a slice that would not fit the daemon
+   frame, naming the largest it returns. A computer seat has this route today: `blob.get` with `range` answers on a
+   computer (read back 2026-11-23). `blob.get` hydrates at most 64 MiB, about 300,000 changes at typical path
+   lengths; a longer list is written and named all the same, and `blob.get` refuses it naming its size.
+7. **Directory delete.** An edit `{"path": D, "delete": true, "recursive": true}` removes every entry whose path is
+   D followed by `/` and more. The match is by path component: `dir` never removes `dir2` or anything under it. A
+   symbolic-link entry under D is removed as an entry; its target is not read and nothing it names is touched,
+   because a tree stores a link as its target text (Amendment 5). D passes the path rules every edit path passes
+   (the tree manifest rule at the head of this record, tested by Amendment 4's acceptance 27): an empty path, a
+   leading `/`, a trailing slash, and an empty, `.` or `..` component are refused before any match, so `dir/`,
+   `./dir` and `dir/../dir` are refused rather than read as `dir`, and the root of the tree (empty, `.` or `/`)
+   is refused by the same rule. Refused, each naming the edit: D that holds no entry, D that names a file entry,
+   `recursive` on an edit that is not a delete, and any other edit in the same call whose path is under D, naming
+   both indices as the duplicate rule does (Amendment 4 item 4). `recursive: false` is the same as leaving it out. A delete without it
+   that names a directory is refused as today, and the refusal now names `recursive`.
+8. **Compatibility.** A reply of at most 1000 changes within 262,144 bytes is the same as today plus the three
+   fields of item 3.
+
+### Acceptance
+
+92. **Count.** `exec.tree_put` deleting 1,500 short-path entries returns 1,000 changes, `changed_count` 1,500,
+    `changed_truncated` true and a `changed_ref`; with `changed_limit` 1,500 it returns all 1,500 and
+    `changed_truncated` false.
+93. **Bytes.** A list of 1,000 changes with 400-character paths returns fewer than 1,000; their JSON-lines bytes are
+    at most 262,144, the next change would cross it, and the reply is a prefix of the blob's lines.
+94. **Ceiling.** `changed_limit` 10,001 is refused naming 10,000 and `exec.tree_put` leaves the blob store object
+    count unchanged; 10,000 is accepted; -1 and `"5"` are refused.
+95. **Route.** A recursive delete of 1,200 entries returns the bounded reply; the full list read back through
+    `blob.get` in 64 KiB ranges equals the list `tree::diff` gives for the two trees. A run that deletes 1,200
+    declared files returns the bounded reply, and the same route gives a list equal to the persisted receipt's.
+96. **Run reply.** The top-level and receipt lists are equal and bounded, with equal fields; `exec.receipt` and
+    `exec.runs` return the bounded list and the stored `changed_ref`, and leave the blob store object count unchanged.
+    `exec.runs` over several runs whose lists each fill the byte bound returns at most 262,144 bytes of changes in
+    the whole reply, and the rows after the bound is spent carry empty lists with their own three fields.
+97. **Diff.** `exec.tree_diff` under the bound leaves the object count unchanged and returns `changed_ref: null`;
+    over it, it writes one object whose reference equals `exec.tree_put`'s for the same list.
+98. **Directory delete.** `dir` removes `dir/a` and `dir/sub/b` and keeps `dir2` and `dir2/x`; a link `dir/l` to
+    `../keep` is removed and `keep` stays; `recursive` on a file path, on the root (each spelling), on a directory
+    with no entries and on a put is refused; a second edit under `dir` is refused naming both indices; a plain
+    delete of `dir` is refused naming `recursive`; `dir/`, `./dir` and `dir/../dir` with `recursive` are each
+    refused by the path rule.
+99. **Compatibility.** A three-change reply from each verb equals today's reply plus the three fields.
+
+## Amendment 19 (2026-11-27): `tool.request` creates a request unless a grant allows
+
+**Status: Accepted 2026-11-27 (#6926).** It amends ADR-180's Approval fast path for every registered row, and replaces Amendment 13
+Decision item 7, whose rule it applies to every row instead of rows carrying `network` only. A call whose decision is
+`allow` from a grant is answered as today, and no decision changes.
+
+### Context
+
+A host that moves its working tools onto computers registers tools that only read, some of them with a tool profile
+(Amendment 17), and each such tool has to be able to obtain a grant.
+
+`tool.request` returns the decision without a request row whenever the decision is `allow`
+(`khive-pack-tool/src/handlers.rs:1285-1293`). A registration with `side_effect: "read"` and no policy row is allowed
+by default (`khive-pack-tool/src/policy.rs:1323-1327`), so `tool.request` answers it with `request_id: null`. A run of a
+tool with a profile is honoured only when a grant allows it (Amendment 17 item 5). A read tool with a profile is
+therefore refused `tool_profile_unhonoured:` on every run and has no way to ask for the grant that would let it run.
+Measured on a computer: such a tool was refused, `tool.request` for it returned no request id, and it ran only after
+it was registered with another side effect, which misstates what it does.
+
+Amendment 13 item 7 closed the same trap for rows carrying `network`. The tool pack has no code for that rule today
+(`khive-pack-tool/src` does not read `network`), so the trap is open for those rows as well.
+
+The tool pack does not read exec's configuration, so it cannot tell which rows have a profile, and narrowing the rule
+to them would need a read across packs. A call to `tool.request` is a caller asking for a grant, so the rule applies
+to every row.
+
+### Decision
+
+1. **A request is created unless a grant already allows.** `tool.request` inserts a request row and returns its id
+   whenever the decision is not `allow` with `source` `grant`: an `allow` from a policy row and an `allow` from the
+   side-effect default now create one, beside `ask` and `deny` as today. The row is the one the reference resolves to,
+   by name, id or prefix, as for every other `tool.request`. The request follows ADR-180's Approval contract
+   unchanged: it is created `requested` with a null pin, approval pins it, the self-grant refusal and the status
+   transitions apply, and `notify` is sent as for any other request. Each call inserts one row, as a call decided
+   `ask` does today; an open request for the same actor and tool is not reused.
+2. **A request changes no decision until it is granted.** No decision reads a request row: `tool.check`, `exec.run`
+   and every other caller of the decision see an open, denied or expired request as if it did not exist. A call
+   allowed by a policy row or by default stays allowed, from the same source, while the request is open and after it
+   is denied. A granted request decides as every grant does, ahead of policy rows (ADR-180 Amendment 4 item 7).
+3. **The reply names both.** The response carries the decision and its `source` as today, with `request_id`,
+   `status` and `notified` as for an `ask`, so the caller sees both that the call is allowed now and that a grant is
+   pending. A call whose decision is `allow` from a grant writes nothing and returns `request_id: null`.
+4. **The profile refusal names the next call.** Exec's `tool_profile_unhonoured:` reason for a run allowed other
+   than by a grant ends by naming `tool.request` with the tool's name as the call that asks for one.
+5. **Amendment 13 item 7.** Replaced by item 1. Arm 58 stands, with its first mutation control read as "restoring the
+   fast path for an `allow` that is not from a grant".
+
+### Acceptance
+
+100. **Default allow.** For a row registered `side_effect: "read"` with no policy row, `tool.check` returns `allow`
+     from `default`; `tool.request` returns `allow` from `default` with a non-null `request_id` and `status`
+     `requested`, and with `notify` set it sends the notice; `tool.check` afterwards still returns `allow` from
+     `default`. Mutation control: keeping the fast path for every `allow` turns this arm red.
+101. **Policy allow, then grant.** For a row allowed by a policy row, `tool.request` returns a request id and a
+     different actor grants it; `tool.check` then returns `allow` from `grant` with that grant's id, and a second
+     `tool.request` returns `request_id: null` and leaves the number of request rows unchanged. A second request on
+     a sibling row, denied instead, leaves that row's decision `allow` from `policy`. Mutation control: treating a
+     `requested` row as an active grant turns the first `tool.check` after the request red.
+102. **Profiled read tool.** For a row registered `side_effect: "read"` with a tool profile, a run is refused
+     `tool_profile_unhonoured:` with a reason naming `default` and `tool.request`; `tool.request` returns a request
+     id; after a different actor grants it, a run is honoured and its receipt's `tool_profile` names the tool.
+     Control: the same row with no profile runs from the default allow before any request.

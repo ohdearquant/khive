@@ -114,10 +114,24 @@ impl Serialize for CanonicalEntity<'_> {
         let entity = self.0;
         let mut tags: Vec<_> = entity.tags.iter().map(String::as_str).collect();
         tags.sort_unstable();
-        let mut map = serializer.serialize_map(Some(7))?;
+        // ADR-221 section 4: keys and aliases (each with its origin) are
+        // hashed sorted, and only when present, so an entity holding none
+        // hashes as it did before they were carried.
+        let mut keys: Vec<_> = entity.keys.iter().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut aliases: Vec<_> = entity.aliases.iter().collect();
+        aliases.sort_unstable();
+        let len = 7 + usize::from(!keys.is_empty()) + usize::from(!aliases.is_empty());
+        let mut map = serializer.serialize_map(Some(len))?;
+        if !aliases.is_empty() {
+            map.serialize_entry("aliases", &aliases)?;
+        }
         map.serialize_entry("description", &entity.description)?;
         map.serialize_entry("entity_type", &entity.entity_type)?;
         map.serialize_entry("id", &entity.id.to_string())?;
+        if !keys.is_empty() {
+            map.serialize_entry("keys", &keys)?;
+        }
         map.serialize_entry("kind", &entity.kind)?;
         map.serialize_entry("name", &entity.name)?;
         map.serialize_entry("properties", &entity.properties.as_ref().map(SortedValue))?;
@@ -155,7 +169,7 @@ impl Serialize for CanonicalEdge<'_> {
 
 /// Sort nested object keys without cloning property values. Array order stays
 /// unchanged; JSON string and number rendering remains serde_json's own.
-struct SortedValue<'a>(&'a Value);
+pub(crate) struct SortedValue<'a>(pub(crate) &'a Value);
 
 impl Serialize for SortedValue<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>

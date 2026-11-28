@@ -340,7 +340,7 @@ establish live freshness. #4977 replaces that as the live freshness test. The ex
 parseable and blocking; it is not evidence of a successful forge read
 (`apps/kg-editor/src/lib/review-bundle.test.ts:48`). ADR-145's repository-head wording and the schema annotation
 describe that captured-bundle check (`docs/adr/ADR-145-local-first-kg-workbench.md:174`,
-`docs/schemas/khive-review-v1.schema.json:2104`, `apps/kg-editor/scripts/review-json-schema.mjs:20`).
+`docs/schemas/khive-review-v1.schema.json:2024`, `apps/kg-editor/scripts/review-json-schema.mjs:20`).
 
 The live read MUST NOT rewrite the captured head to make a stale bundle appear current. Once slice 3 is enabled,
 `expected_head` carries the reviewed bundle head into the existing write path, which reads the PR head before mutation

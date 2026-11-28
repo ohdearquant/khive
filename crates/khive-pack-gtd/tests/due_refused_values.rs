@@ -153,6 +153,37 @@ async fn assign_and_create_timezone_refusals_mask_credentials_before_due() {
 }
 
 #[tokio::test]
+async fn assign_and_create_refuse_invalid_timezones_without_due_without_writes() {
+    let registry = fixture();
+    let retained = [seed(&registry).await];
+    let secret = credential();
+    for verb in ["gtd.assign", "create"] {
+        for explicit_null_due in [false, true] {
+            for (raw, shown, masked) in [
+                ("Mars/Olympus", "Mars/Olympus", false),
+                (&secret, "***MASKED***", true),
+            ] {
+                let mut fields = json!({"timezone": raw});
+                if explicit_null_due {
+                    fields["due"] = Value::Null;
+                }
+                refuse_task_shape_with_snapshots(
+                    &registry,
+                    verb,
+                    create_args(verb, "Refused zone without deadline", fields),
+                    format!(
+                        "timezone must be an IANA zone name (e.g. \"America/New_York\"); got {shown:?}"
+                    ),
+                    masked.then_some(secret.as_str()),
+                    &retained,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn task_update_due_refusals_mask_credentials_and_preserve_the_snapshot() {
     let registry = fixture();
     let id = seed(&registry).await;
@@ -197,7 +228,7 @@ async fn task_update_due_refusals_mask_credentials_and_preserve_the_snapshot() {
 }
 
 #[tokio::test]
-async fn valid_deadlines_keep_normalization_aliases_and_unused_timezone_behavior() {
+async fn valid_deadlines_keep_normalization_aliases_and_no_due_means_no_echo() {
     let registry = fixture();
     for verb in ["gtd.assign", "create"] {
         for (index, fields, due, zone) in [
@@ -215,13 +246,13 @@ async fn valid_deadlines_keep_normalization_aliases_and_unused_timezone_behavior
             ),
             (
                 2,
-                json!({"timezone": "unused-invalid-zone"}),
+                json!({"timezone": "Asia/Tokyo"}),
                 Value::Null,
                 Value::Null,
             ),
             (
                 3,
-                json!({"due": null, "timezone": "unused-invalid-zone"}),
+                json!({"due": null, "timezone": "America/New_York"}),
                 Value::Null,
                 Value::Null,
             ),
@@ -948,5 +979,246 @@ async fn create_task_properties_type_refusals_mask_credentials_without_writes() 
             &retained_ids,
         )
         .await;
+    }
+}
+
+#[tokio::test]
+async fn create_refuses_top_level_timezone_before_task_normalization() {
+    let registry = fixture();
+    seed(&registry).await;
+    let mut args = create_args(
+        "create",
+        "Refused top-level timezone",
+        json!({"due": "2026-06-01", "timezone": "Asia/Tokyo"}),
+    );
+    args["timezone"] = json!("America/New_York");
+    let error = registry
+        .dispatch("create", args)
+        .await
+        .expect_err("the public create schema must refuse top-level timezone");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("create: unknown field `timezone`; allowed: "),
+        "expected the public create unknown-field diagnostic: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn create_normalizes_timezone_aliases_in_raw_stored_properties() {
+    let runtime =
+        khive_runtime::KhiveRuntime::memory().expect("create a private in-memory runtime");
+    assert!(
+        runtime.backend_data_dir().is_none(),
+        "the raw-storage fixture must have no backend data directory"
+    );
+    let configured_zone = runtime.config().display_timezone.name();
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(khive_pack_gtd::GtdPack::new(runtime.clone()));
+    let registry = builder.build().expect("build private KG + GTD registry");
+    runtime.install_edge_rules(registry.all_edge_rules());
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize the private local namespace");
+    let notes = runtime.notes(&token).expect("open the private note store");
+
+    for (case, fields, due, zone) in [
+        (
+            "property-only",
+            json!({"due": "2026-06-01", "timezone": "Asia/Tokyo"}),
+            Some("2026-06-01T00:00:00+09:00"),
+            Some("Asia/Tokyo"),
+        ),
+        (
+            "null-alias",
+            json!({"due": "2026-06-01T12:00:00+02:00", "timezone": null}),
+            Some("2026-06-01T10:00:00+00:00"),
+            Some(configured_zone),
+        ),
+        ("absent-due", json!({"timezone": "Asia/Tokyo"}), None, None),
+        (
+            "null-due",
+            json!({"due": null, "timezone": "America/New_York"}),
+            None,
+            None,
+        ),
+        (
+            "null-alias-without-due",
+            json!({"timezone": null}),
+            None,
+            None,
+        ),
+    ] {
+        let title = format!("Raw timezone normalization {case}");
+        let mut args = create_args("create", &title, fields);
+        args["properties"]["timezone_alias_marker"] = json!(case);
+        let created = registry
+            .dispatch("create", args)
+            .await
+            .expect("the public create path must accept property timezone aliases");
+        let id = created["id"]
+            .as_str()
+            .expect("the create receipt must contain a string id");
+        let id = uuid::Uuid::parse_str(id).expect("the create receipt id must be a UUID");
+        let note = notes
+            .get_note_including_deleted(id)
+            .await
+            .expect("read the stored task note")
+            .expect("the created task note must exist in the private local store");
+        let properties = note
+            .properties
+            .expect("the stored task must have properties");
+        assert_eq!(
+            properties["timezone_alias_marker"],
+            json!(case),
+            "{case}: raw readback must preserve the arbitrary input property"
+        );
+        assert_eq!(properties["due"], json!(due), "{case}: normalized deadline");
+        assert_eq!(
+            properties["due_timezone"],
+            json!(zone),
+            "{case}: canonical deadline zone"
+        );
+        if due.is_none() {
+            assert!(
+                properties.get("due").is_none(),
+                "{case}: no stored deadline"
+            );
+            assert!(
+                properties.get("due_timezone").is_none(),
+                "{case}: no stored deadline zone without a deadline"
+            );
+        }
+        assert!(
+            properties.get("timezone").is_none(),
+            "{case}: the raw stored timezone alias must be consumed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stream_append_refuses_shadowed_invalid_nested_timezone_after_valid_baseline() {
+    let runtime = khive_runtime::KhiveRuntime::memory().expect("create a private stream runtime");
+    assert!(
+        runtime.backend_data_dir().is_none(),
+        "the stream fixture must have no backend data directory"
+    );
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(khive_pack_gtd::GtdPack::new(runtime.clone()));
+    let registry = builder
+        .build()
+        .expect("build private KG + GTD stream registry");
+    runtime.install_edge_rules(registry.all_edge_rules());
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize the private stream namespace");
+    let notes = runtime
+        .notes(&token)
+        .expect("open the private stream note store");
+    let baseline_title = "Stream timezone validation baseline";
+    let appended = registry
+        .dispatch(
+            "stream.append",
+            json!({
+                "stream": "gtd-timezone-validation-r2",
+                "note_kind": "task",
+                "record": {
+                    "title": baseline_title,
+                    "due": "2026-06-01",
+                    "timezone": "America/New_York",
+                    "properties": {
+                        "timezone": "Asia/Tokyo",
+                        "timezone_alias_marker": "stream-baseline"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("a public task stream with valid top-level and nested zones must append");
+    let id = appended["id"]
+        .as_str()
+        .expect("the stream append receipt must contain a string id");
+    let id = uuid::Uuid::parse_str(id).expect("the stream append receipt id must be a UUID");
+    let note = notes
+        .get_note(id)
+        .await
+        .expect("read the actual streamed task note")
+        .expect("the streamed task note must exist in the private local store");
+    let baseline = note
+        .properties
+        .expect("the streamed task must have properties");
+    assert_eq!(baseline["timezone_alias_marker"], json!("stream-baseline"));
+    assert_eq!(baseline["due"], json!("2026-06-01T00:00:00-04:00"));
+    assert_eq!(baseline["due_timezone"], json!("America/New_York"));
+    assert!(
+        baseline.get("timezone").is_none(),
+        "the valid stream baseline must consume the raw timezone alias"
+    );
+    let before_tasks = tasks(&registry).await;
+    let before_stream = registry
+        .dispatch(
+            "stream.stat",
+            json!({"stream": "gtd-timezone-validation-r2"}),
+        )
+        .await
+        .unwrap();
+
+    let secret = credential();
+    for (raw, shown, masked) in [
+        ("Mars/Olympus", "Mars/Olympus", false),
+        (&secret, "***MASKED***", true),
+    ] {
+        for due in [Some(json!("2026-06-01")), None, Some(Value::Null)] {
+            let mut record = json!({
+                "title": "Refused stream shadowed timezone",
+                "timezone": "America/New_York",
+                "properties": {"timezone": raw}
+            });
+            if let Some(due) = due {
+                record["due"] = due;
+            }
+            let error = registry
+                .dispatch(
+                    "stream.append",
+                    json!({
+                        "stream": "gtd-timezone-validation-r2",
+                        "note_kind": "task",
+                        "record": record
+                    }),
+                )
+                .await
+                .expect_err("public task stream append must refuse a shadowed invalid nested zone");
+            let rendered = error.to_string();
+            let expected = format!(
+                "properties.timezone must be an IANA zone name (e.g. \"America/New_York\"); got {shown:?}"
+            );
+            assert!(
+                rendered.contains(&expected),
+                "expected the nested-zone refusal after the successful stream baseline: {rendered}"
+            );
+            if masked {
+                assert!(
+                    !rendered.contains(secret.as_str()),
+                    "the nested-zone refusal must not expose the credential"
+                );
+            }
+            assert_eq!(
+                tasks(&registry).await,
+                before_tasks,
+                "refusal changed tasks"
+            );
+            assert_eq!(
+                registry
+                    .dispatch(
+                        "stream.stat",
+                        json!({"stream": "gtd-timezone-validation-r2"})
+                    )
+                    .await
+                    .unwrap(),
+                before_stream,
+                "refusal advanced the stream"
+            );
+        }
     }
 }

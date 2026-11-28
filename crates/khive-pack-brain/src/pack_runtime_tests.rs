@@ -365,6 +365,7 @@ fn runtime() -> KhiveRuntime {
         display_timezone: chrono_tz::UTC,
         events_split: None,
         web: Default::default(),
+        ..RuntimeConfig::no_embeddings()
     })
     .expect("isolated in-memory runtime")
 }

@@ -275,6 +275,8 @@ fn complete_target_status(status: Option<&str>) -> Result<&'static str, RuntimeE
 #[serde(deny_unknown_fields)]
 struct TasksParams {
     #[serde(default)]
+    compact: bool,
+    #[serde(default)]
     status: Option<String>,
     #[serde(default)]
     assignee: Option<String>,
@@ -459,12 +461,12 @@ pub(crate) async fn resolve_context_entity_id(
 /// Property filters that select this value must use `FilterOp::TextEqOrNonText`
 /// (not plain `Eq`) so their SQL predicate mirrors [`task_status`]'s exact
 /// `CASE` semantics for absent, JSON-null, and non-text legacy values.
-const DEFAULT_STATUS: &str = "inbox";
+pub(crate) const DEFAULT_STATUS: &str = "inbox";
 
 /// Priority projected when the `priority` property is missing or non-text.
 /// An explicit default-priority filter uses `FilterOp::TextEqOrNonText` to
 /// match that fallback; empty and unknown strings retain their stored values.
-const DEFAULT_PRIORITY: &str = "p2";
+pub(crate) const DEFAULT_PRIORITY: &str = "p2";
 
 /// Status used internally on a task. Defaults to "inbox" when missing or non-string.
 fn task_status(props: Option<&Value>) -> String {
@@ -542,6 +544,28 @@ fn priority_rank(props: Option<&Value>) -> u8 {
     }
 }
 
+fn task_title(note: &khive_storage::note::Note) -> String {
+    note.name
+        .clone()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| format!("[{}]", note.kind.as_str()))
+}
+
+fn render_compact_task(note: &khive_storage::note::Note) -> Value {
+    let props = note.properties.as_ref();
+    let field = |name| props.and_then(|props| props.get(name));
+    json!({
+        "id": short_id(note.id),
+        "title": task_title(note),
+        "status": task_status(props),
+        "priority": field("priority").and_then(Value::as_str).unwrap_or(DEFAULT_PRIORITY),
+        "assignee": field("assignee"),
+        "tags": field("tags").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default(),
+        "updated_at": ts_to_rfc(note.updated_at),
+        "description_length": field("description").and_then(Value::as_str).map_or(0, str::len),
+    })
+}
+
 /// Build the response object for any task-shaped operation.
 ///
 /// `pub` (widened from private, ADR-099 B3): the
@@ -551,11 +575,7 @@ fn priority_rank(props: Option<&Value>) -> u8 {
 /// field-for-field without a duplicated renderer.
 pub fn render_task(note: &khive_storage::note::Note) -> Value {
     let props = note.properties.clone().unwrap_or(json!({}));
-    let title = note
-        .name
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| format!("[{}]", note.kind.as_str()));
+    let title = task_title(note);
     let status = props
         .get("status")
         .and_then(|v| v.as_str())
@@ -676,7 +696,8 @@ async fn fetch_all_matching_tasks(
         property_filters,
         namespaces,
         ..Default::default()
-    };
+    }
+    .with_default_note_status(khive_storage::note::NoteStatusSelector::Active);
     let store = runtime.notes(token)?;
 
     let notes = store
@@ -1463,11 +1484,6 @@ impl GtdPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: TasksParams = deser(params)?;
-        // #744 → #2679: see the identical rationale in `handle_next` above — the
-        // bare-array shape stays byte-identical when unclamped; wrapping happens
-        // only when `requested_limit > limit` fires below (checked at every
-        // return site, including the `filter_excluded` object wrap further
-        // down, which already switches shape for an unrelated reason).
         let requested_limit = p.limit.unwrap_or(50);
         let limit = requested_limit.clamp(1, 200);
         let limit_clamped = requested_limit > limit;
@@ -1612,29 +1628,37 @@ impl GtdPack {
             tags: p.tags.unwrap_or_default(),
             tag_mode: p.tag_mode.unwrap_or_default(),
             ..Default::default()
-        };
-        let page = self
+        }
+        .with_default_note_status(khive_storage::note::NoteStatusSelector::Active);
+        let mut page = self
             .runtime()
             .notes(token)?
             .query_notes_filtered_count_free(
                 token.namespace().as_str(),
                 &filter,
                 PageRequest {
-                    limit,
+                    limit: limit + 1,
                     offset: offset.into(),
                 },
             )
             .await
             .map_err(|e| RuntimeError::Internal(format!("query_notes_filtered: {e}")))?;
 
-        let diagnostics =
-            crate::dependency::diagnose_tasks(self.runtime(), token, &page.items).await?;
-        let result: Vec<Value> = page
-            .items
-            .iter()
-            .zip(diagnostics.iter())
-            .map(|(note, diagnostic)| diagnostic.render(note))
-            .collect();
+        let has_more = page.items.len() > limit as usize;
+        // The lookahead only witnesses continuation; it is not part of the
+        // caller's page and must not incur dependency diagnostics.
+        page.items.truncate(limit as usize);
+        let result: Vec<Value> = if p.compact {
+            page.items.iter().map(render_compact_task).collect()
+        } else {
+            let diagnostics =
+                crate::dependency::diagnose_tasks(self.runtime(), token, &page.items).await?;
+            page.items
+                .iter()
+                .zip(diagnostics.iter())
+                .map(|(note, diagnostic)| diagnostic.render(note))
+                .collect()
+        };
 
         // #96: a bare `[]` is indistinguishable from "no such task" when the
         // *default* state exclusion is what emptied the result —
@@ -1683,9 +1707,14 @@ impl GtdPack {
                 return Ok(response);
             }
         }
-        if limit_clamped {
+        if limit_clamped || has_more {
             let mut response = json!({ "tasks": result });
-            insert_limit_report(&mut response, requested_limit, limit);
+            if has_more {
+                response["has_more"] = json!(true);
+            }
+            if limit_clamped {
+                insert_limit_report(&mut response, requested_limit, limit);
+            }
             Ok(response)
         } else {
             Ok(Value::Array(result))
@@ -1820,3 +1849,67 @@ impl GtdPack {
 #[cfg(test)]
 #[path = "handlers_lifecycle_snapshot_tests.rs"]
 mod lifecycle_snapshot_tests;
+
+#[cfg(test)]
+mod archive_visibility_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tasks_and_next_preserve_workflow_filters_but_exclude_archived_notes() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let runtime = KhiveRuntime::memory().unwrap();
+            let token = runtime
+                .authorize(khive_runtime::Namespace::local())
+                .unwrap();
+            let mut builder = khive_runtime::VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(GtdPack::new(runtime.clone()));
+            let registry = builder.build().expect("actual GTD schema and hooks");
+            runtime.install_edge_rules(registry.all_edge_rules());
+            let mut expected = None;
+            for (status, priority, timestamp) in [("archived", "p0", 20), ("active", "p2", 10)] {
+                let mut note =
+                    khive_storage::note::Note::new("local", "task", format!("{status} task"));
+                note.status = status.into();
+                note.created_at = timestamp;
+                note.updated_at = timestamp;
+                note.properties =
+                    Some(json!({"status": "next", "priority": priority, "depends_on": []}));
+                if status == "active" {
+                    expected = Some(note.id);
+                }
+                runtime
+                    .notes(&token)
+                    .unwrap()
+                    .upsert_note(note)
+                    .await
+                    .unwrap();
+            }
+            let expected = expected.unwrap().to_string();
+            let pack = GtdPack::new(runtime);
+            let next = pack.handle_next(&token, json!({"limit": 1})).await.unwrap();
+            let next = next.as_array().unwrap();
+            assert_eq!(next.len(), 1);
+            assert_eq!(
+                next[0]["full_id"], expected,
+                "next must not prioritize an archived actionable task"
+            );
+            let tasks = pack
+                .handle_tasks(&token, json!({"status": "next", "limit": 1}))
+                .await
+                .unwrap();
+            let tasks = tasks.as_array().unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(
+                tasks[0]["full_id"], expected,
+                "tasks must apply active note status before pagination"
+            );
+            assert_eq!(
+                tasks[0]["status"], "next",
+                "workflow status remains distinct"
+            );
+        })
+        .await
+        .expect("bounded actual GTD ordinary-query regression");
+    }
+}

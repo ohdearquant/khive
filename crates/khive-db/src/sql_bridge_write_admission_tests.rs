@@ -109,22 +109,33 @@ fn maintenance_admission_in_child() -> bool {
 
 fn maintenance_admission_pool(dir: &std::path::Path, queue_enabled: bool) -> ConnectionPool {
     let dir = dir.canonicalize().unwrap();
-    ConnectionPool::new(PoolConfig {
+    // Pool startup is setup, not a deadline-refusal oracle. Use the canonical
+    // disk-guard budget; each test installs its own capacity probe afterward.
+    let disk_guard_config = crate::DiskGuardEnvironment::default()
+        .resolve(Some(0), None)
+        .unwrap();
+    let disk_guard_deadline_ms = disk_guard_config.guard_deadline_ms;
+    let config = PoolConfig {
         path: Some(dir.join("maintenance.db")),
         volume_lock_dir: Some(dir.join("volume-locks")),
         write_queue_enabled: Some(queue_enabled),
         write_queue_capacity: 8,
         write_routing_strict: false,
         write_admission_deadline_ms: 2_000,
-        disk_guard_config: Some(
-            crate::DiskGuardEnvironment::default()
-                .resolve(Some(0), Some(100))
-                .unwrap(),
-        ),
+        disk_guard_config: Some(disk_guard_config),
         busy_timeout: std::time::Duration::from_secs(1),
         ..PoolConfig::for_test()
+    };
+    let write_admission_deadline_ms = config.write_admission_deadline_ms;
+    ConnectionPool::new(config).unwrap_or_else(|error| {
+        panic!(
+            "maintenance pool open failed: disk_guard_deadline_ms={disk_guard_deadline_ms}, \
+             write_admission_deadline_ms={write_admission_deadline_ms}, \
+             queue_enabled={queue_enabled}, database_path={}, volume_lock_dir={}: {error:?}",
+            dir.join("maintenance.db").display(),
+            dir.join("volume-locks").display(),
+        )
     })
-    .unwrap()
 }
 
 #[tokio::test]

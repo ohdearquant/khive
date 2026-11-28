@@ -308,6 +308,122 @@ async fn remember_replay_answers_from_the_stored_memory() {
         .and_then(|v| v.as_str())
         .map(str::to_owned);
     assert_eq!(stored_type.as_deref(), Some("semantic"));
+
+    let alternate = rt
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "alternate source",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .map(|(row, _report)| row)
+        .expect("alternate entity");
+    let missing = uuid::Uuid::new_v4();
+    for replay_source in [alternate.id, missing] {
+        let replay = registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": "replayed memory answers from the store",
+                    "memory_type": "semantic",
+                    "namespace": "local",
+                    "source_id": replay_source.to_string(),
+                    "idempotency_key": "remember-replay-stored",
+                }),
+            )
+            .await
+            .expect("replay ignores a changed or missing full UUID source");
+        assert_eq!(replay["id"], first["id"]);
+        assert_eq!(replay["replayed"], serde_json::json!(true));
+        assert_eq!(replay["edge_id"], serde_json::json!(first_edge));
+    }
+    let mut reader = rt.sql().reader().await.expect("sql reader");
+    let edge_count = reader
+        .query_scalar(SqlStatement {
+            sql: "SELECT COUNT(*) FROM graph_edges WHERE source_id = ?1".into(),
+            params: vec![SqlValue::Text(first["id"].as_str().unwrap().into())],
+            label: Some("remember-replay-edge-count".into()),
+        })
+        .await
+        .expect("count original memory edges");
+    assert!(matches!(edge_count, Some(SqlValue::Integer(1))));
+    drop(reader);
+
+    assert!(rt
+        .delete_entity(&token, source.id, true)
+        .await
+        .expect("delete source"));
+    let mut reader = rt.sql().reader().await.expect("sql reader");
+    let before = reader
+        .query_scalar(SqlStatement {
+            sql: "SELECT COUNT(*) FROM graph_edges WHERE source_id = ?1".into(),
+            params: vec![SqlValue::Text(first["id"].as_str().unwrap().into())],
+            label: Some("remember-replay-edges-before".into()),
+        })
+        .await
+        .expect("count edges after source deletion");
+    drop(reader);
+    let replay = registry
+        .dispatch(
+            "memory.remember",
+            serde_json::json!({
+                "content": "replayed memory answers from the store",
+                "memory_type": "semantic",
+                "namespace": "local",
+                "source_id": source.id.to_string(),
+                "idempotency_key": "remember-replay-stored",
+            }),
+        )
+        .await
+        .expect("replay after deletion of original source");
+    assert_eq!(replay["id"], first["id"]);
+    assert_eq!(replay["replayed"], serde_json::json!(true));
+    let surviving_edges = rt
+        .neighbors_with_query(
+            &token,
+            first["id"].as_str().unwrap().parse().unwrap(),
+            khive_storage::types::NeighborQuery {
+                direction: khive_storage::types::Direction::Out,
+                relations: Some(vec![khive_storage::EdgeRelation::Annotates]),
+                limit: None,
+                min_weight: None,
+            },
+        )
+        .await
+        .expect("read surviving original annotation");
+    let surviving_edge = surviving_edges.first().map(|hit| hit.edge_id.to_string());
+    if let Some(edge) = &surviving_edge {
+        assert_eq!(edge, &first_edge);
+    }
+    assert_eq!(
+        replay.get("edge_id").and_then(|edge| edge.as_str()),
+        surviving_edge.as_deref()
+    );
+    let mut reader = rt.sql().reader().await.expect("sql reader");
+    let after = reader
+        .query_scalar(SqlStatement {
+            sql: "SELECT COUNT(*) FROM graph_edges WHERE source_id = ?1".into(),
+            params: vec![SqlValue::Text(first["id"].as_str().unwrap().into())],
+            label: Some("remember-replay-edges-after".into()),
+        })
+        .await
+        .expect("count edges after replay");
+    assert!(matches!((before, after),
+        (Some(SqlValue::Integer(a)), Some(SqlValue::Integer(b))) if a == b));
+    drop(reader);
+    assert_eq!(
+        rt.notes(&token)
+            .unwrap()
+            .get_live_notes_by_key("local", "remember-replay-stored", Some("memory"))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 struct CountingService(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
@@ -740,4 +856,318 @@ async fn actual_seal_key_failure_retains_holder_and_unknown_disposition_on_creat
         assert!(!projected.to_string().contains("provider-secret-sentinel"));
         assert!(!projected.to_string().contains("ann_write_log_seq"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// `properties` validation
+// ---------------------------------------------------------------------------
+
+/// Run the validator and return the `InvalidInput` message it refused with.
+fn refusal_message(raw: &serde_json::Value) -> String {
+    match super::validate_properties(raw, &[]) {
+        Err(RuntimeError::InvalidInput(message)) => message,
+        Err(other) => panic!("expected InvalidInput, got {other:?}"),
+        Ok(accepted) => panic!("expected a refusal, got {accepted:?}"),
+    }
+}
+
+/// A one-entry `properties` object.
+fn single_entry(key: &str, value: serde_json::Value) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert(key.to_owned(), value);
+    serde_json::Value::Object(map)
+}
+
+/// A `properties` object with `count` distinct valid keys.
+fn object_with_keys(count: usize) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for index in 0..count {
+        map.insert(format!("key_{index}"), serde_json::json!("v"));
+    }
+    serde_json::Value::Object(map)
+}
+
+#[test]
+fn properties_must_be_an_object() {
+    for raw in [
+        serde_json::json!("text"),
+        serde_json::json!(7),
+        serde_json::json!(["a"]),
+        serde_json::json!(null),
+    ] {
+        let message = refusal_message(&raw);
+        assert!(message.contains("must be a JSON object"), "{message}");
+    }
+}
+
+#[test]
+fn properties_accept_32_keys_and_refuse_33() {
+    let accepted = super::validate_properties(&object_with_keys(32), &[]).expect("32 keys pass");
+    assert_eq!(accepted.len(), 32);
+
+    let message = refusal_message(&object_with_keys(33));
+    assert!(message.contains("33 keys"), "{message}");
+    assert!(message.contains("at most 32 keys"), "{message}");
+}
+
+#[test]
+fn properties_accept_a_64_char_key_and_refuse_65() {
+    let at_limit = format!("a{}", "b".repeat(63));
+    assert_eq!(at_limit.chars().count(), 64);
+    super::validate_properties(&single_entry(&at_limit, serde_json::json!("v")), &[])
+        .expect("a 64-character key passes");
+
+    let over = format!("a{}", "b".repeat(64));
+    assert_eq!(over.chars().count(), 65);
+    let message = refusal_message(&single_entry(&over, serde_json::json!("v")));
+    assert!(message.contains("is invalid"), "{message}");
+    assert!(message.contains("1-64 characters"), "{message}");
+}
+
+#[test]
+fn properties_refuse_malformed_keys() {
+    for key in [
+        "",
+        "Upper",
+        "1lead",
+        "_lead",
+        "with-dash",
+        "with space",
+        "dotted.key",
+        "\u{fc}n\u{ef}",
+    ] {
+        let message = refusal_message(&single_entry(key, serde_json::json!("v")));
+        assert!(message.contains("is invalid"), "{key:?}: {message}");
+        assert!(message.contains("1-64 characters"), "{key:?}: {message}");
+    }
+}
+
+#[test]
+fn properties_accept_well_formed_keys() {
+    for key in ["a", "z9", "source_id", "a_b_c_1"] {
+        super::validate_properties(&single_entry(key, serde_json::json!("v")), &[])
+            .unwrap_or_else(|e| panic!("{key:?} should pass: {e:?}"));
+    }
+}
+
+#[test]
+fn properties_refuse_reserved_keys() {
+    for key in ["memory_type", "tags", "attribution", "supersedes"] {
+        let message = refusal_message(&single_entry(key, serde_json::json!("v")));
+        assert!(message.contains(&format!("{key:?}")), "{message}");
+        assert!(message.contains("reserved"), "{message}");
+    }
+}
+
+async fn remember_reserved_property_refusal(key: &str) -> String {
+    let rt = with_receipt_credentials(KhiveRuntime::memory().expect("in-memory runtime"));
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt));
+    let registry = builder.build().expect("registry");
+
+    let error = registry
+        .dispatch(
+            "memory.remember",
+            serde_json::json!({
+                "content": "memory with a reserved property",
+                "properties": single_entry(key, serde_json::json!("caller value"))
+            }),
+        )
+        .await
+        .expect_err("memory.remember must refuse caller-supplied reserved properties");
+    let RuntimeError::InvalidInput(message) = error else {
+        panic!("expected InvalidInput, got {error:?}");
+    };
+    assert!(message.contains(&format!("{key:?}")), "{message}");
+    assert!(message.contains("reserved"), "{message}");
+    message
+}
+
+#[tokio::test]
+async fn remember_refuses_memory_type_property_with_top_level_parameter() {
+    let message = remember_reserved_property_refusal("memory_type").await;
+    assert!(
+        message.contains("use the top-level memory_type parameter"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn remember_refuses_tags_property_with_top_level_parameter() {
+    let message = remember_reserved_property_refusal("tags").await;
+    assert!(
+        message.contains("use the top-level tags parameter"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn remember_refuses_attribution_property_with_runtime_guidance() {
+    let message = remember_reserved_property_refusal("attribution").await;
+    assert!(
+        message.contains("omit attribution; the runtime sets it for anonymous callers"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn remember_refuses_supersedes_property() {
+    let message = remember_reserved_property_refusal("supersedes").await;
+    assert!(
+        message.contains("memory.apply_batch row with action=\"supersede\""),
+        "{message}"
+    );
+    assert!(
+        message.contains("link(relation=\"supersedes\") from the new memory to the old memory"),
+        "{message}"
+    );
+}
+
+#[test]
+fn memory_guide_reserved_properties_match_handler() {
+    let guide = include_str!("../../../../docs/guide/memory.md");
+    let section = guide
+        .split_once("### Reserved properties\n")
+        .expect("reserved properties section")
+        .1
+        .split("\n### ")
+        .next()
+        .expect("reserved properties section body");
+    let mut documented: Vec<_> = section
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .map(|line| {
+            let cells: Vec<_> = line.split('|').map(str::trim).collect();
+            assert_eq!(cells.len(), 4, "two-column reserved property row: {line}");
+            (
+                cells[1].trim_matches('`').to_owned(),
+                cells[2].replace('`', ""),
+            )
+        })
+        .collect();
+    let mut expected: Vec<_> = super::RESERVED_PROPERTY_KEYS
+        .iter()
+        .map(|(key, replacement)| (key.to_string(), replacement.to_string()))
+        .collect();
+    documented.sort();
+    expected.sort();
+    assert_eq!(
+        documented, expected,
+        "guide reserved properties and replacements"
+    );
+}
+
+#[test]
+fn properties_accept_strings_numbers_booleans_and_string_arrays() {
+    let raw = serde_json::json!({
+        "text": "value",
+        "count": 3,
+        "ratio": 0.5,
+        "big": u64::MAX,
+        "flag": false,
+        "refs": ["a", "b"],
+        "empty": [],
+    });
+    let accepted = super::validate_properties(&raw, &[]).expect("every allowed value shape passes");
+    assert_eq!(accepted.len(), 7);
+    assert_eq!(accepted["refs"], serde_json::json!(["a", "b"]));
+}
+
+#[test]
+fn properties_refuse_null_nested_objects_and_non_string_arrays() {
+    let cases = [
+        (serde_json::json!(null), "null is not allowed"),
+        (
+            serde_json::json!({"inner": 1}),
+            "nested objects are not allowed",
+        ),
+        (serde_json::json!([1, 2]), "an array may hold strings only"),
+        (
+            serde_json::json!(["a", 1]),
+            "an array may hold strings only",
+        ),
+        (serde_json::json!([["a"]]), "an array may hold strings only"),
+        (serde_json::json!([null]), "an array may hold strings only"),
+        // JSON cannot carry NaN or infinity: a non-finite float becomes null
+        // before it reaches the validator, so it is refused as null.
+        (serde_json::json!(f64::NAN), "null is not allowed"),
+    ];
+    for (value, rule) in cases {
+        let message = refusal_message(&single_entry("field", value.clone()));
+        assert!(message.contains("\"field\""), "{value}: {message}");
+        assert!(message.contains(rule), "{value}: {message}");
+    }
+}
+
+#[test]
+fn properties_accept_8192_bytes_and_refuse_8193() {
+    // `{"k":"<text>"}` is 8 bytes of framing plus the text.
+    let at_limit = single_entry("k", serde_json::Value::String("x".repeat(8184)));
+    assert_eq!(
+        serde_json::to_string(&at_limit).expect("serialize").len(),
+        8192
+    );
+    super::validate_properties(&at_limit, &[]).expect("8192 bytes pass");
+
+    let over = single_entry("k", serde_json::Value::String("x".repeat(8185)));
+    assert_eq!(serde_json::to_string(&over).expect("serialize").len(), 8193);
+    let message = refusal_message(&over);
+    assert!(message.contains("8193 bytes"), "{message}");
+    assert!(message.contains("8192 bytes"), "{message}");
+}
+
+/// An exact replay is judged on content alone (`keyed_memory` compares the
+/// stored content and never the stored properties or tags). A replay that
+/// carries different `properties` therefore returns the original memory and
+/// the original properties stay; this pins that behaviour, the same one a
+/// replay with different tags has.
+#[tokio::test]
+async fn remember_replay_with_different_properties_keeps_the_stored_properties() {
+    let rt = with_receipt_credentials(KhiveRuntime::memory().expect("in-memory runtime"));
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let first = registry
+        .dispatch(
+            "memory.remember",
+            serde_json::json!({
+                "content": "keyed memory carrying properties",
+                "memory_type": "semantic",
+                "idempotency_key": "remember-replay-properties",
+                "properties": {"source": "first"},
+            }),
+        )
+        .await
+        .expect("first remember");
+    let second = registry
+        .dispatch(
+            "memory.remember",
+            serde_json::json!({
+                "content": "keyed memory carrying properties",
+                "memory_type": "semantic",
+                "idempotency_key": "remember-replay-properties",
+                "properties": {"source": "second", "extra": "ignored"},
+            }),
+        )
+        .await
+        .expect("replay with different properties is still an exact replay");
+
+    assert_eq!(second["id"], first["id"]);
+    assert_eq!(second["replayed"], serde_json::json!(true));
+
+    let notes = rt
+        .notes(&token)
+        .expect("note store")
+        .get_live_notes_by_key("local", "remember-replay-properties", Some("memory"))
+        .await
+        .expect("key lookup");
+    assert_eq!(notes.len(), 1);
+    let stored = notes[0].properties.as_ref().expect("stored properties");
+    assert_eq!(stored["source"], "first");
+    assert!(stored.get("extra").is_none());
 }

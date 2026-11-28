@@ -8,9 +8,13 @@ The three primary weights are relevance `0.70`, salience `0.20`, and temporal `0
 
 Retrieval defaults include a candidate multiplier of 20, optional explicit candidate limit, RRF fusion with `k = 10`, score floor zero, salience floor zero, and breakdowns disabled. Weighted fusion (vector `0.7`, text `0.3`) remains selectable per call via `fusion_strategy: "weighted"`; an explicit `fusion_strategy: "rrf"` request fuses with the configured `k` (10 by default) and uses `k = 60` only when the configured fusion is not RRF.
 
-A tuning sweep of 116 configurations on the synthetic contract corpus produced the same recall@10 (`0.9333`) for every configuration and supplied no evidence either way. A later live-corpus golden-suite sweep (2026-07-21, adversarial-paraphrase and holdout suites) did discriminate: the weighted default regressed paraphrase recall relative to RRF `k = 10`, which was restored as the calibrated default.
-
 `validate()` returns `RuntimeError::InvalidInput` for inconsistent values. `try_from_value()` deserializes JSON and validates in one operation.
+
+### Default selection rationale
+
+The historical 2026-05-25 tuning sweep evaluated 116 configurations on the synthetic contract corpus and produced the same recall@10 (`0.9333`) for every configuration. That flat landscape cannot empirically distinguish the parameters; `tests/khive-contract/tune/README.md` retains the limitation and the need for a harder corpus with embeddings, synonym queries, and partial matches.
+
+The 2026-07-21 live-corpus golden-suite sweep did distinguish the strategies. The weighted default (vector `0.7`, text `0.3`) regressed adversarial-paraphrase hit@5 from `0.471` to `0.353` and MRR from `0.321` to `0.153`, while RRF `k = 10` held the holdout suite at its best tier and was restored as the calibrated default. Min-max weighted fusion lets a keyword-only text hit outrank paraphrase hits visible only to the vector leg; rank-based RRF avoids that magnitude mismatch. Salience still contributes through the composite score weights.
 
 ## Candidate and ANN controls
 
@@ -18,7 +22,7 @@ A tuning sweep of 116 configurations on the synthetic contract corpus produced t
 
 `ann_overfetch_max_rounds` controls namespace-aware ANN widening. Round one requests `max(candidate_limit * 4, candidate_limit + 32)` and each later round doubles the fetch window, bounded only by the round count and corpus exhaustion, until enough visible candidates survive. `Some(1)` disables widening. When absent, `ANN_OVERFETCH_MAX_ROUNDS` supplies a process-wide value, defaulting to three. A separate post-hydration re-gather loop in recall quadruples its candidate limit per pass, capped by the server-wide maximum; that loop is not governed by this setting.
 
-`ann_ready_timeout_ms` bounds a cold-miss call to `ensure_ann_for_model` before that model degrades to FTS-only. It falls back to `KHIVE_MEMORY_ANN_READY_TIMEOUT_MS`, default 8,000 ms. The bound exists because recall and boot warming share the same model single-flight lock; without a timeout, a recall arriving during a from-scratch warm could wait for the full build, observed above 300 seconds in issue #836.
+`ann_ready_timeout_ms` bounds the receiver wait for a detached writable cold-miss Warm attempt, including queued admission. It falls back to `KHIVE_MEMORY_ANN_READY_TIMEOUT_MS`, default 8,000 ms. Expiry drops only the receiver; tracked admission/build/supervisor work can continue for later requests. Expiry and received not-ready outcomes select the existing degraded FTS/bounded fresh-tail path. The bound avoids waiting for the full build behind the shared model single-flight lock; see issue #836.
 
 `recall_deadline_ms` bounds the complete pipeline and defaults to 30,000 ms through `KHIVE_MEMORY_RECALL_DEADLINE_MS`. Per-request validation and operator fallback behavior are described in `crates/khive-pack-memory/docs/api/recall-pipeline.md`.
 
@@ -26,12 +30,12 @@ A tuning sweep of 116 configurations on the synthetic contract corpus produced t
 
 Decay operates on raw salience and age in days:
 
-| Variant | Formula |
-| --- | --- |
-| `Exponential` | `salience * exp(-decay_factor * age_days)` |
-| `Hyperbolic` | `salience / (1 + decay_factor * age_days)` |
-| `PowerLaw` | `salience * half_life / (half_life + age_days)` |
-| `None` | raw salience |
+| Variant       | Formula                                         |
+| ------------- | ----------------------------------------------- |
+| `Exponential` | `salience * exp(-decay_factor * age_days)`      |
+| `Hyperbolic`  | `salience / (1 + decay_factor * age_days)`      |
+| `PowerLaw`    | `salience * half_life / (half_life + age_days)` |
+| `None`        | raw salience                                    |
 
 Exponential and hyperbolic use the note's own decay factor. Power-law uses its configured half-life override. The independent temporal recency component uses `temporal_half_life_days`; it does not replace the note's salience decay.
 
@@ -47,12 +51,37 @@ Selection rules are original order, lowest document frequency, and highest IDF. 
 
 ## `BrainProfileHint`
 
-The hint names a profile, a result boost (default `1.3`), and a posterior threshold (default `0.6`). Modern serve-time profile projection resolves full profile state in the handler; the hint remains part of the configuration surface for compatibility.
+The hint names a profile, a result boost (default `1.3`), and a posterior threshold (default `0.6`). A served profile's full state is resolved in the handler, where it supplies the per-entity posteriors and the profile's `local_factor`; it does not change the scoring weights. The hint remains part of the configuration surface for compatibility.
 
 ## Score breakdowns
 
-`ScoreBreakdown` reports raw relevance, raw and decayed salience, temporal recency, weighted contributions, total score, profile weight projection, and the optional per-entity posterior mean.
+`ScoreBreakdown` reports the relevance the hit was ranked with, the fused score it came from, the factors of the ranking composite, raw and decayed salience, temporal recency, the additive weighted contributions, the profile weight projection, the optional per-entity posterior mean, and the terms that make up the returned `rank_score`.
 
-`profile_component` is the ratio of projected-weight score to default-weight score. It is `1.0` when no profile served the request or the default score is effectively zero. `entity_posterior_mean` is absent without a learned posterior; when present, the score has also received the bounded entity multiplier documented in `crates/khive-pack-memory/docs/api/scoring.md`.
+`relevance` is the value the ranking composite received: the fused score after the calibrated normalization (never above 0.82), reported without further scaling. `fused_score` is the fused score before that normalization.
 
-`total()` sums the three weighted contributions. Profile and entity components describe later multiplicative effects and are not added to that sum.
+`composite` reports the factors of the multiplicative composite that ranks the hit, each the 32-bit value used:
+
+```text
+relevance_term = weights.relevance * relevance
+temporal_boost = 1 + weights.temporal * recency
+salience_boost = 1 + weights.salience * salience
+adjustment_factor = net multiplier of the configured adjustments and the final clamp to [0, 1]
+```
+
+With no `reranker_weights` configured, `relevance_term * temporal_boost * salience_boost * adjustment_factor` equals `pre_entity_score`. When `reranker_weights` is configured, `pre_entity_score` is the reranker output and `composite` still describes the default composite. `adjustment_factor` is `null` when the first three factors do not multiply to a positive number: the adjustments then act on zero or less, and no multiplier describes the score they leave. `composite` is absent from `memory.recall_score`, which scores additively, and from a hit whose composite arithmetic produced a non-finite value and fell back to a zero score.
+
+`temporal` and `salience_decayed` are the half-life recency and the decayed salience that the weighted reranker reads, and `weighted` splits the `RecallConfig` weights additively over `relevance`, the amplified `salience_decayed` and `temporal`. That additive composite is the one `memory.recall_score` scores with. Without `reranker_weights` a recall ranks by `composite`, so in such a recall the three `weighted` contributions do not sum to `pre_entity_score`.
+
+A served profile scores with the configured default weights. `weights_served` is always `"default"`. `profile_component` is a diagnostic: the ratio of the hit's score under the weights the profile's posteriors project to, to its score under the default weights. It is reported for the breakdown only and never enters `rank_score`. It is `1.0` when no profile served the request or the default score is effectively zero.
+
+`namespace`, `pre_entity_score`, `entity_term`, `local_factor` and `duplicate_penalty` report the terms of the returned `rank_score`, each the 32-bit value used:
+
+```text
+rank_score = pre_entity_score * entity_term * local_factor - duplicate_penalty
+```
+
+`pre_entity_score` is the weighted reranker output when `reranker_weights` is configured, and the default-weight composite otherwise. `local_factor` is the serving profile's `local_factor` for a hit in the `local` namespace, and `1` for every other namespace and whenever no profile with a factor serves the request. `duplicate_penalty` is the amount the duplicate-prefix penalty subtracted, `0` when none applied; when the penalty would take the score below zero it is the whole score, and `rank_score` is `0`.
+
+`entity_posterior_mean` reports the serving profile's per-entity Beta posterior mean for the hit's UUID, and `entity_evidence_mass` the evidence mass `n` that posterior holds (`max(0, alpha + beta - 2)`). Both are absent when no profile served the request or the profile holds no posterior for the UUID; a posterior at the prior reports `n = 0`, which is neutral. Together they give `entity_term`, the rank-score multiplier: `t0 = clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15)`, then `1 + (t0 - 1) * n / (n + 16)` (ADR-104 Section 2 and Amendment 6). `None`, a mean of `0.5` and `n = 0` are neutral; otherwise the term adjusts `rank_score` by up to ±15% relative to the same candidate under a profile without a posterior for it, and reaches half of `t0 - 1` at an evidence mass of 16. The scoring context is documented in `crates/khive-pack-memory/docs/api/scoring.md`.
+
+`total()` sums the three weighted contributions, which a recall does not rank by (see above). Profile and entity components describe later multiplicative effects and are not added to that sum.

@@ -96,7 +96,7 @@ async fn writable_warm_starts_one_tracked_watcher_idempotently_and_it_exits_on_d
     let dir = tempfile::tempdir().expect("tempdir");
     let config = RuntimeConfig {
         db_path: Some(dir.path().join("rotation-watcher-lifecycle.db")),
-        embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+        embedding_model: None,
         additional_embedding_models: vec![],
         ..RuntimeConfig::no_embeddings()
     };

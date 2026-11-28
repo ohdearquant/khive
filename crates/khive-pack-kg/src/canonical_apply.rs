@@ -165,9 +165,9 @@ pub(crate) fn validate_proposal(
     }
 }
 
-/// The proposal's own scan reads `delta` as one NDJSON string, where a JSON escape keeps a
-/// credential's shape hidden until the text is decoded, so the decoded envelope and every
-/// operation are scanned as well. Values under runtime-reserved property keys are scanned too:
+/// The proposal's own scan decodes each escaped string literal in `delta`; the decoded
+/// envelope and every operation are scanned here as well, because the apply worker validates
+/// a stored proposal again and it may have been stored before that scan decoded literals. Values under runtime-reserved property keys are scanned too:
 /// the proposal stores the delta when it is created, before apply decides whether a reserved
 /// value may be written, and the runtime's own reserved values are fixed strings that pass.
 fn scan_decoded_delta(changeset: &ChangeSet) -> Result<(), RuntimeError> {

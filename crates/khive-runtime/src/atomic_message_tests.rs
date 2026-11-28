@@ -696,3 +696,69 @@ async fn create_notes_atomic_derives_from_actor_overwriting_a_forged_value() {
              caller-supplied forged value"
     );
 }
+
+#[tokio::test]
+async fn atomic_note_keys_refuse_the_indexed_member_before_preparing_writes() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let seed = Note::new("local", "observation", "retained atomic fixture")
+        .with_properties(serde_json::json!({"keep": 7}));
+    runtime
+        .raw_notes(&token)
+        .unwrap()
+        .upsert_note(seed.clone())
+        .await
+        .unwrap();
+    let before = runtime.list_notes(&token, None, 100, 0).await.unwrap();
+    let key = format!("ghp_{}", "A".repeat(40));
+    let requests = ["ordinary-key", key.as_str()]
+        .into_iter()
+        .map(|key| AtomicNoteRequest {
+            spec: AtomicNoteSpec {
+                token: &token,
+                id: None,
+                kind: "observation",
+                name: None,
+                content: "ordinary atomic content",
+                properties: None,
+            },
+            options: AtomicNoteOptions {
+                key: Some(key),
+                embed: Some(false),
+                ..Default::default()
+            },
+        })
+        .collect();
+    let acquisitions = runtime
+        .backend()
+        .pool()
+        .writer_acquisition_snapshot()
+        .acquisitions;
+    let result = prepare_atomic_note_requests(&runtime, requests).await;
+    assert!(
+        matches!(&result, Err(RuntimeError::SecretDetected(matched))
+        if matched.detector == "github-token" && matched.location.as_deref() == Some("note[1].key")),
+        "atomic key preparation must refuse its own indexed key before any plan can commit"
+    );
+    assert_eq!(
+        runtime
+            .backend()
+            .pool()
+            .writer_acquisition_snapshot()
+            .acquisitions,
+        acquisitions
+    );
+    assert_eq!(
+        runtime.list_notes(&token, None, 100, 0).await.unwrap(),
+        before
+    );
+    assert_eq!(
+        runtime
+            .raw_notes(&token)
+            .unwrap()
+            .get_note(seed.id)
+            .await
+            .unwrap(),
+        Some(seed)
+    );
+}

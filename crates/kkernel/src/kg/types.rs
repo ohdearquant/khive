@@ -200,8 +200,12 @@ pub struct FetchArgs {
 /// CLI arguments for `kkernel kg export`.
 #[derive(clap::Parser, Debug)]
 pub struct ExportArgs {
-    /// Output archive JSON path.
+    /// Output archive JSON path, or project root with --ndjson.
     pub output: PathBuf,
+
+    /// Export sorted project NDJSON files instead of an archive.
+    #[arg(long)]
+    pub ndjson: bool,
 
     /// SQLite database path. Required so this command never defaults to ~/.khive.
     #[arg(long)]

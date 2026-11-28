@@ -6,7 +6,9 @@ fn untrusted_parent_directory_is_refused() {
     // component swapped after validation is refusing directories other
     // local users can write. A group/other-writable parent is refused
     // before any open; an owner-only parent proceeds.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let _registry_guard = TestRegistryGuard::new(dir.path());
     let open_dir = dir.path().join("shared");
     std::fs::create_dir(&open_dir).unwrap();
@@ -35,7 +37,9 @@ fn harden_refuses_a_sidecar_symlink_at_use_time() {
     // each target with O_NOFOLLOW and chmods the returned handle, so a
     // symlink present AT USE TIME is refused by the open itself — no
     // lstat-then-chmod window — and the link's target keeps its mode.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let victim = dir.path().join("victim.txt");
     std::fs::write(&victim, b"v").unwrap();
     std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -62,7 +66,9 @@ fn lock_symlink_is_refused_and_target_untouched() {
     // and the link's target must keep its inode content and mode. A
     // plain lock in the same directory must still acquire — the control
     // that proves the refusal is the symlink, not a broken guard.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let victim = dir.path().join("victim.txt");
     std::fs::write(&victim, b"v").unwrap();
     std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -94,7 +100,9 @@ fn planted_wal_symlink_is_refused_before_open() {
     // SQLite creates `-wal` without O_EXCL, so a planted `-wal` symlink
     // would redirect WAL writes; admission checks the sidecar suffixes
     // before the database is ever created or opened.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let _registry_guard = TestRegistryGuard::new(dir.path());
     let victim = dir.path().join("victim.txt");
     std::fs::write(&victim, b"w").unwrap();
@@ -113,7 +121,9 @@ fn planted_wal_symlink_is_refused_before_open() {
 #[test]
 fn hardening_refuses_a_directory_at_the_database_path_without_touching_it() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .unwrap();
     let db = dir.path().join("events.db");
     std::fs::create_dir(&db).unwrap();
     std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o700)).unwrap();

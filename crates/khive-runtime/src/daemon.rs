@@ -34,8 +34,8 @@ pub use boot_guard::*;
 use locks::open_lock_file;
 #[cfg(unix)]
 pub use locks::{
-    acquire_daemon_boot_guard, acquire_recovery_lock, try_acquire_daemon_boot_guard_until,
-    try_acquire_recoverer_lock_until, DaemonBootGuard,
+    acquire_daemon_boot_guard, acquire_recovery_lock, open_mutating_daemon_lock,
+    try_acquire_daemon_boot_guard_until, try_acquire_recoverer_lock_until, DaemonBootGuard,
 };
 #[cfg(unix)]
 pub(crate) use locks::{peer_uid, uid_is_permitted};
@@ -154,6 +154,7 @@ mod config_id;
 use config_id::parse_config_id;
 pub use config_id::{
     config_id_extra_embedder_exclusions, config_ids_compatible, first_config_mismatch_field,
+    no_receipt_ring_fingerprint, visibility_receipt_policy_fingerprint,
 };
 
 mod wire_frames;

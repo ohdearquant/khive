@@ -344,7 +344,8 @@ async fn fan_out_search_uses_served_kind_metadata_before_dispatch() {
 
     let (_entity_hits, _note_hits, per_backend) = coordinator
         .fan_out_search(&request, &Namespace::local())
-        .await;
+        .await
+        .expect("active search succeeds");
 
     assert_eq!(per_backend.len(), 1);
     assert_eq!(per_backend[0].backend_id.as_str(), "notes");
@@ -394,7 +395,8 @@ async fn hot_path_guard_g4_excluded_backend_note_dispatch_count_stays_flat() {
 
     let (_entities, _notes, per_backend) = coordinator
         .fan_out_search(&request, &Namespace::local())
-        .await;
+        .await
+        .expect("active search succeeds");
     assert_eq!(per_backend.len(), 1);
     assert_eq!(per_backend[0].backend_id.as_str(), "notes");
 
@@ -630,7 +632,10 @@ async fn fan_out_search_single_backend_returns_hits() {
         "query": "FlashAttention",
         "limit": 10,
     }));
-    let (hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (hits, _note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
 
     assert!(!hits.is_empty(), "should find the entity");
     assert_eq!(per_backend.len(), 1, "single backend report");
@@ -688,7 +693,8 @@ async fn fan_out_search_passes_text_mode_to_entity_and_note_backends() {
             }));
             let (default_entities, default_notes, default_backends) = coordinator
                 .fan_out_search(&default_request, &namespace)
-                .await;
+                .await
+                .expect("active search succeeds");
             assert!(default_entities.is_empty() && default_notes.is_empty());
             assert!(default_backends
                 .iter()
@@ -700,8 +706,10 @@ async fn fan_out_search_passes_text_mode_to_entity_and_note_backends() {
                 "source": "text",
                 "text_mode": "any_term",
             }));
-            let (entities, notes, backends) =
-                coordinator.fan_out_search(&any_request, &namespace).await;
+            let (entities, notes, backends) = coordinator
+                .fan_out_search(&any_request, &namespace)
+                .await
+                .expect("active search succeeds");
             assert!(backends.iter().all(|backend| backend.error.is_none()));
             if kind == "entity" {
                 assert_eq!(entities.len(), 1, "multi_backend={multi_backend}");
@@ -750,7 +758,10 @@ async fn fan_out_search_single_backend_preserves_text_hits_on_vector_arm_error()
         "query": "FlashAttention",
         "limit": 10,
     }));
-    let (hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (hits, _note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
 
     assert!(
         !hits.is_empty(),
@@ -847,7 +858,10 @@ async fn fan_out_search_single_backend_preserves_note_text_hits_on_vector_arm_er
         "query": "FlashAttentionNote",
         "limit": 10,
     }));
-    let (_hits, note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (_hits, note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
 
     assert!(
         !note_hits.is_empty(),
@@ -919,7 +933,10 @@ async fn fan_out_search_multi_backend_vector_arm_failure_isolated_to_its_backend
         "query": "LoRA",
         "limit": 10,
     }));
-    let (merged_hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (merged_hits, _note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
 
     assert_eq!(per_backend.len(), 2, "both backends in report");
     assert!(
@@ -1000,7 +1017,10 @@ async fn fan_out_search_single_backend_applies_source_filter_before_limit() {
         "source": "vector",
         "limit": 1,
     }));
-    let (entity_hits, _, entity_backends) = coord.fan_out_search(&entity_request, &ns).await;
+    let (entity_hits, _, entity_backends) = coord
+        .fan_out_search(&entity_request, &ns)
+        .await
+        .expect("active search succeeds");
     assert!(
         entity_hits.is_empty(),
         "single-backend entity results must apply source=vector before limit"
@@ -1016,7 +1036,10 @@ async fn fan_out_search_single_backend_applies_source_filter_before_limit() {
         "source": "vector",
         "limit": 1,
     }));
-    let (_, note_hits, note_backends) = coord.fan_out_search(&note_request, &ns).await;
+    let (_, note_hits, note_backends) = coord
+        .fan_out_search(&note_request, &ns)
+        .await
+        .expect("active search succeeds");
     assert!(
         note_hits.is_empty(),
         "single-backend note results must apply source=vector before limit"
@@ -1075,7 +1098,10 @@ async fn fan_out_search_two_backends_merged() {
         "query": "LoRA",
         "limit": 10,
     }));
-    let (merged_hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (merged_hits, _note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
 
     assert_eq!(per_backend.len(), 2, "both backends in report");
     // Merged set should contain at least one hit from the combined results.
@@ -1123,7 +1149,10 @@ async fn fan_out_search_caps_merged_entity_hits_at_limit() {
         "query": "limitprobe",
         "limit": 2,
     }));
-    let (merged_hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (merged_hits, _note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
 
     assert_eq!(per_backend.len(), 2, "both backends in report");
     assert!(
@@ -1173,7 +1202,10 @@ async fn fan_out_search_caps_merged_note_hits_at_limit() {
         "query": "notelimitprobe",
         "limit": 2,
     }));
-    let (_entity_hits, note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (_entity_hits, note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
 
     assert_eq!(per_backend.len(), 2, "both backends in report");
     assert!(
@@ -1185,9 +1217,37 @@ async fn fan_out_search_caps_merged_note_hits_at_limit() {
         "merged note hits must be capped at limit=2, got {}",
         note_hits.len()
     );
+
+    // The coordinated boundary must normalize a whole-number JSON float just
+    // as registry dispatch does before applying the same result limit.
+    let registry = packs_registry(Arc::clone(&rt_main), &["kg"]);
+    let float_request = ValidatedSearchRequest::from_value(
+        serde_json::json!({
+            "kind": "note",
+            "query": "notelimitprobe",
+            "limit": 2.0,
+        }),
+        &registry,
+    )
+    .expect("whole-float limit normalizes at the coordinated search boundary");
+    assert_eq!(float_request.limit(), 2);
+    let (_entity_hits, float_hits, float_per_backend) = coord
+        .fan_out_search(&float_request, &ns)
+        .await
+        .expect("active search succeeds");
+    assert_eq!(float_per_backend.len(), 2, "both backends in report");
+    assert!(
+        float_per_backend.iter().all(|r| r.error.is_none()),
+        "no backend errors for whole-float limit"
+    );
+    assert_eq!(
+        float_hits.len(),
+        2,
+        "whole-float limit returns two note hits"
+    );
 }
 
-// ---- MAJ-2: per-backend fan-out search timeout ----
+// ---- Per-backend fan-out search timeout ----
 
 #[test]
 fn backend_search_failure_classifies_typed_runtime_timeouts_without_message_matching() {
@@ -1253,7 +1313,11 @@ async fn fan_out_search_hung_backend_times_out_sibling_still_returns() {
         "limit": 10,
     }));
 
-    let (hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (hits, _note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
+    assert!(khive_storage::ensure_request_read_active("search").is_ok());
 
     assert_eq!(per_backend.len(), 2, "both backends must report");
     let hung_report = per_backend
@@ -1306,7 +1370,10 @@ async fn fan_out_search_multiple_hung_backends_share_one_absolute_deadline() {
     }));
     let started = tokio::time::Instant::now();
 
-    let (hits, note_hits, per_backend) = coord.fan_out_search(&request, &Namespace::local()).await;
+    let (hits, note_hits, per_backend) = coord
+        .fan_out_search(&request, &Namespace::local())
+        .await
+        .expect("active search succeeds");
 
     assert!(hits.is_empty());
     assert!(note_hits.is_empty());
@@ -1342,7 +1409,10 @@ async fn fan_out_search_rejects_sibling_that_completed_during_interrupt_grace() 
         "limit": 10,
     }));
 
-    let (hits, note_hits, per_backend) = coord.fan_out_search(&request, &Namespace::local()).await;
+    let (hits, note_hits, per_backend) = coord
+        .fan_out_search(&request, &Namespace::local())
+        .await
+        .expect("active search succeeds");
 
     assert!(hits.is_empty());
     assert!(note_hits.is_empty());
@@ -1364,17 +1434,11 @@ async fn fan_out_search_rejects_sibling_that_completed_during_interrupt_grace() 
     }
 }
 
-/// Same guarantee as the spawned multi-backend hung-backend test above, but
-/// for the single-backend early-return path (`entries.len() == 1`), which
-/// has no spawned task for the fan-out timeout loop above to bound — the
-/// `hybrid_search` await there is now wrapped in its own
-/// `tokio::time::timeout` directly (r2 follow-up to MAJ-2).
-///
-/// RED before the fix: the single-entry branch awaited `hybrid_search`
-/// directly with no timeout at all, so a hung single backend blocked
-/// `fan_out_search` forever — this test would never resolve rather than
-/// merely asserting the wrong thing (see the mutation-control note in the
-/// implementation report for how this was verified as load-bearing).
+/// The single-backend early-return path (`entries.len() == 1`) must bound
+/// each `hybrid_search` await directly with `tokio::time::timeout`.
+/// It has no spawned task for the multi-backend fan-out timeout loop to bound.
+/// A hung backend must therefore return the same timeout result as in the
+/// multi-backend path, rather than blocking `fan_out_search` indefinitely.
 #[tokio::test(start_paused = true)]
 #[serial_test::serial(config_ledger)]
 async fn fan_out_search_single_backend_hung_backend_times_out_entity_substrate() {
@@ -1395,7 +1459,10 @@ async fn fan_out_search_single_backend_hung_backend_times_out_entity_substrate()
         "limit": 10,
     }));
 
-    let (hits, note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (hits, note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
 
     assert!(hits.is_empty(), "no hits: the only backend timed out");
     assert!(
@@ -1439,8 +1506,10 @@ async fn fan_out_search_timeout_masks_backend_credentials_in_coordinator_warning
         .finish();
 
     let guard = tracing::subscriber::set_default(subscriber);
-    let (_hits, _note_hits, per_backend) =
-        coord.fan_out_search(&request, &Namespace::local()).await;
+    let (_hits, _note_hits, per_backend) = coord
+        .fan_out_search(&request, &Namespace::local())
+        .await
+        .expect("active search succeeds");
     drop(guard);
     let logs = captured.contents();
 
@@ -1511,8 +1580,10 @@ async fn fan_out_search_masks_real_authorization_cause_in_coordinator_warning() 
         .finish();
 
     let guard = tracing::subscriber::set_default(subscriber);
-    let (_hits, _note_hits, per_backend) =
-        coord.fan_out_search(&request, &Namespace::local()).await;
+    let (_hits, _note_hits, per_backend) = coord
+        .fan_out_search(&request, &Namespace::local())
+        .await
+        .expect("active search succeeds");
     drop(guard);
     let logs = captured.contents();
 
@@ -1554,7 +1625,10 @@ async fn fan_out_search_single_backend_hung_backend_times_out_note_substrate() {
         "limit": 10,
     }));
 
-    let (hits, note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (hits, note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
 
     assert!(
         hits.is_empty(),
@@ -1575,7 +1649,7 @@ async fn fan_out_search_single_backend_hung_backend_times_out_note_substrate() {
     );
 }
 
-// ---- MAJ-3: caller visibility scope must reach the fan-out authorization ----
+// ---- Caller visibility scope must reach the fan-out authorization ----
 
 /// Single-backend coordinator path: a row stored under a namespace visible
 /// to the caller only through `extra_visible` (not the primary namespace)
@@ -1619,7 +1693,8 @@ async fn fan_out_search_with_visibility_single_backend_finds_extra_namespace_row
             &Namespace::local(),
             std::slice::from_ref(&tenant_ns),
         )
-        .await;
+        .await
+        .expect("active search succeeds");
     assert!(
         per_backend.iter().all(|r| r.error.is_none()),
         "no backend errors: {per_backend:?}"
@@ -1631,7 +1706,8 @@ async fn fan_out_search_with_visibility_single_backend_finds_extra_namespace_row
 
     let (narrow_hits, _notes, _per_backend) = coord
         .fan_out_search_with_visibility(&request, &Namespace::local(), &[])
-        .await;
+        .await
+        .expect("active search succeeds");
     assert!(
         narrow_hits.is_empty(),
         "primary-only visibility (no widening) must not see the tenant-a row"
@@ -1683,7 +1759,8 @@ async fn fan_out_search_with_visibility_multi_backend_finds_extra_namespace_row(
             &Namespace::local(),
             std::slice::from_ref(&tenant_ns),
         )
-        .await;
+        .await
+        .expect("active search succeeds");
     assert!(
         per_backend.iter().all(|r| r.error.is_none()),
         "no backend errors: {per_backend:?}"
@@ -1695,7 +1772,8 @@ async fn fan_out_search_with_visibility_multi_backend_finds_extra_namespace_row(
 
     let (narrow_hits, _notes, _per_backend) = coord
         .fan_out_search_with_visibility(&request, &Namespace::local(), &[])
-        .await;
+        .await
+        .expect("active search succeeds");
     assert!(
         narrow_hits.is_empty(),
         "primary-only visibility (no widening) must not see the tenant-b row"
@@ -1740,7 +1818,8 @@ async fn fan_out_search_applies_source_filter_before_rrf_and_limit() {
 
     let (entity_hits, _, _) = entity_coord
         .fan_out_search(&entity_request, &Namespace::local())
-        .await;
+        .await
+        .expect("active search succeeds");
     assert_eq!(
         entity_hits
             .iter()
@@ -1758,7 +1837,8 @@ async fn fan_out_search_applies_source_filter_before_rrf_and_limit() {
     }));
     let (both_hits, _, _) = entity_coord
         .fan_out_search(&both_request, &Namespace::local())
-        .await;
+        .await
+        .expect("active search succeeds");
     assert_eq!(
         both_hits
             .iter()
@@ -1801,7 +1881,8 @@ async fn fan_out_search_applies_source_filter_before_rrf_and_limit() {
 
     let (_, note_hits, _) = note_coord
         .fan_out_search(&note_request, &Namespace::local())
-        .await;
+        .await
+        .expect("active search succeeds");
     assert_eq!(
         note_hits.iter().map(|hit| hit.note_id).collect::<Vec<_>>(),
         vec![text_note],
@@ -1809,7 +1890,7 @@ async fn fan_out_search_applies_source_filter_before_rrf_and_limit() {
     );
 }
 
-// ---- MAJ-4: RRF merge must see each backend's full candidate window ----
+// ---- RRF merge must see each backend's full candidate window ----
 
 /// `alpha` ranks `[X, W, Y]` (`Y` at #3); `beta` ranks `[Z, V, Y]` (`Y` at
 /// #3). `Y`'s fused RRF score (2×1/63 ≈ 0.03175, appearing on both backends)
@@ -1861,7 +1942,10 @@ async fn fan_out_search_rrf_merge_uses_full_candidate_window_not_per_backend_lim
         "limit": 2,
     }));
 
-    let (hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (hits, _note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
     assert!(
         per_backend.iter().all(|r| r.error.is_none()),
         "no backend errors: {per_backend:?}"
@@ -1948,7 +2032,10 @@ async fn fan_out_search_rrf_merge_uses_full_candidate_window_not_per_backend_lim
         "limit": 2,
     }));
 
-    let (_entity_hits, note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (_entity_hits, note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
     assert!(
         per_backend.iter().all(|r| r.error.is_none()),
         "no backend errors: {per_backend:?}"
@@ -2062,7 +2149,10 @@ async fn fan_out_search_empty_registry_returns_empty() {
         "query": "anything",
         "limit": 10,
     }));
-    let (hits, note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (hits, note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
     assert!(hits.is_empty());
     assert!(note_hits.is_empty());
     assert!(per_backend.is_empty());
@@ -2109,7 +2199,10 @@ async fn fan_out_partial_failure_preserves_working_backend_hits() {
         "query": "PartialFailureProbe",
         "limit": 10,
     }));
-    let (merged_hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (merged_hits, _note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
 
     // Both backends must be reported.
     assert_eq!(
@@ -2190,7 +2283,10 @@ async fn fan_out_panicked_backend_is_explicit_in_per_backend() {
         .without_time()
         .finish();
     let guard = tracing::subscriber::set_default(subscriber);
-    let (merged_hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (merged_hits, _note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
     drop(guard);
     let logs = captured.contents();
     assert_eq!(per_backend.len(), 2, "every spawned backend is reported");
@@ -2372,7 +2468,10 @@ async fn t1_single_backend_zero_change_invariant() {
         "query": "T1Entity",
         "limit": 10,
     }));
-    let (hits, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (hits, _note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
     assert!(
         !hits.is_empty(),
         "T1: fan-out on single backend must return hits"
@@ -2879,7 +2978,10 @@ async fn t3_fan_out_search_merged_from_two_backends() {
         "query": "Entity",
         "limit": 20,
     }));
-    let (merged, _note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (merged, _note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
 
     assert_eq!(per_backend.len(), 2, "T3: both backends in report");
     assert!(
@@ -3033,7 +3135,10 @@ async fn fan_out_note_search_two_backends() {
         "query": "observation",
         "limit": 10,
     }));
-    let (_entity_hits, note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (_entity_hits, note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
 
     assert_eq!(per_backend.len(), 2, "both backends in report");
     assert!(per_backend.iter().all(|r| r.error.is_none()), "no errors");
@@ -3105,7 +3210,10 @@ async fn fan_out_search_props_filter_drops_non_matching() {
         "limit": 10,
         "properties": {"status": "keep"},
     }));
-    let (hits, _note_hits, _per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (hits, _note_hits, _per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
 
     let hit_ids: Vec<uuid::Uuid> = hits.iter().map(|h| h.entity_id).collect();
     assert!(
@@ -3173,7 +3281,10 @@ async fn fan_out_search_props_filter_before_truncation_semantics() {
         "limit": 1,
         "properties": {"keep": true},
     }));
-    let (hits, _note_hits, _per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (hits, _note_hits, _per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
 
     let hit_ids: Vec<uuid::Uuid> = hits.iter().map(|h| h.entity_id).collect();
     assert_eq!(
@@ -3241,7 +3352,10 @@ async fn fan_out_search_tags_filter_drops_non_matching() {
         "limit": 10,
         "tags": ["target-tag"],
     }));
-    let (hits, _note_hits, _per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (hits, _note_hits, _per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
 
     let hit_ids: Vec<uuid::Uuid> = hits.iter().map(|h| h.entity_id).collect();
     assert!(
@@ -3347,7 +3461,10 @@ async fn fan_out_search_preserves_full_entity_filter_contract() {
         "tags": ["entity-target"],
     }));
 
-    let (hits, note_hits, per_backend) = coord.fan_out_search(&request, &ns).await;
+    let (hits, note_hits, per_backend) = coord
+        .fan_out_search(&request, &ns)
+        .await
+        .expect("active search succeeds");
     let hit_ids: Vec<Uuid> = hits.iter().map(|hit| hit.entity_id).collect();
     assert!(
         note_hits.is_empty(),
@@ -3447,7 +3564,10 @@ async fn fan_out_search_preserves_full_note_filter_contract() {
         "tags": ["note-target"],
     }));
 
-    let (entity_hits, note_hits, per_backend) = coord.fan_out_search(&include_request, &ns).await;
+    let (entity_hits, note_hits, per_backend) = coord
+        .fan_out_search(&include_request, &ns)
+        .await
+        .expect("active search succeeds");
     let note_ids: Vec<Uuid> = note_hits.iter().map(|hit| hit.note_id).collect();
     assert!(
         entity_hits.is_empty(),
@@ -3472,7 +3592,10 @@ async fn fan_out_search_preserves_full_note_filter_contract() {
         "properties": {"scope": "keep"},
         "tags": ["note-target"],
     }));
-    let (_entity_hits, note_hits, _per_backend) = coord.fan_out_search(&exclude_request, &ns).await;
+    let (_entity_hits, note_hits, _per_backend) = coord
+        .fan_out_search(&exclude_request, &ns)
+        .await
+        .expect("active search succeeds");
     assert!(
         note_hits.is_empty(),
         "the only matching note must be hidden when superseded notes are excluded"
@@ -4006,7 +4129,9 @@ async fn coordinator_service_preserves_timeout_failure_kind() {
 
     let result = service
         .fan_out_search(&request, &Namespace::local(), &[])
-        .await;
+        .await
+        .expect("active search succeeds");
+    assert!(khive_storage::ensure_request_read_active("search").is_ok());
 
     let failure = result.per_backend[0]
         .error
@@ -4067,7 +4192,10 @@ async fn substrate_coordinator_service_hydrates_entity_and_note_metadata() {
         "query": "Min1HydrationEntityProbe",
         "limit": 10,
     }));
-    let entity_result = service.fan_out_search(&entity_request, &ns, &[]).await;
+    let entity_result = service
+        .fan_out_search(&entity_request, &ns, &[])
+        .await
+        .expect("active search succeeds");
     let entity_errors: Vec<&str> = entity_result
         .per_backend
         .iter()
@@ -4105,7 +4233,10 @@ async fn substrate_coordinator_service_hydrates_entity_and_note_metadata() {
         "query": "min1hydrationnoteprobe",
         "limit": 10,
     }));
-    let note_result = service.fan_out_search(&note_request, &ns, &[]).await;
+    let note_result = service
+        .fan_out_search(&note_request, &ns, &[])
+        .await
+        .expect("active search succeeds");
     let note_errors: Vec<&str> = note_result
         .per_backend
         .iter()

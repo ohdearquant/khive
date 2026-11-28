@@ -27,15 +27,17 @@ set -euo pipefail
 #       (catches missing files, accidental excludes, license drift)
 #     - The whole workspace compiles against current path deps
 #
-#   It does NOT exercise `cargo publish --dry-run`, because that command
-#   tries to resolve transitive deps against the live crates.io index.
-#   For any workspace bump (e.g. 0.1.2 → 0.1.3), downstream crates fail
-#   immediately on the second crate: cargo cannot find `khive-score 0.1.3`
-#   in the index until it has actually been published. There is no flag
-#   (`--no-verify`, `--allow-dirty`, …) that bypasses this resolution
-#   step. The only path that exercises the full transitive build with
-#   published deps is `--live`, one crate at a time, with the 30s index
-#   wait between each.
+#   It does NOT run `cargo publish --dry-run`. Run one crate at a time,
+#   that command resolves each crate's khive dependencies against the live
+#   crates.io index, so after a workspace bump (e.g. 0.1.2 → 0.1.3) the
+#   second crate fails: `khive-score 0.1.3` is not in the index until it
+#   has been published. The workspace form,
+#   `cargo publish --dry-run --locked --workspace`, packages every crate
+#   and verifies each against the others' packaged sources, so it passes on
+#   a bumped tree. It needs network access to the index and fails offline.
+#   That run, at the commit being published, is what NO_VERIFY=1 above
+#   relies on; `--live` then publishes one crate at a time with the 30s
+#   index wait between each.
 #
 # Prerequisites:
 #   cargo login                                 (one-time crates.io token setup)
@@ -63,7 +65,6 @@ cd "$SCRIPT_DIR/../crates"
 CRATES=(
     khive-lion-core      # copied kernel; no khive-* dependencies
     khive-types
-    khive-capability
     khive-score
     khive-quant
     khive-fs             # no khive-* dependencies; dep of khive-vamana and khive-db, publish first
@@ -75,6 +76,7 @@ CRATES=(
     khive-bm25
     khive-fusion
     khive-db
+    khive-capability     # needs khive-db and khive-storage (above); no workspace crate depends on it
     khive-hnsw
     khive-query
     khive-gate
@@ -90,6 +92,7 @@ CRATES=(
     # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)
     khive-pack-formal    # needs khive-runtime + khive-types (both above); dev-dep of khive-pack-kg, so publish first
     khive-pack-kg
+    khive-subject        # runtime, KG and Formal are development dependencies
     khive-vcs            # needs khive-pack-kg (normal dep) + khive-runtime/storage/types (all above)
     khive-pack-agent     # needs khive-runtime/storage/types + dev-dep khive-pack-kg (all above)
     khive-pack-blob      # needs khive-runtime/storage/types (all above); dep of khive-mcp, dev-dep of khive-pack-git/exec
@@ -108,6 +111,8 @@ CRATES=(
     khive-pack-session   # needs khive-pack-kg + khive-runtime/storage/types (all above)
     khive-pack-workspace # needs khive-pack-kg/gtd/git/session (all above)
     khive-pack-charter   # needs khive-runtime/storage/types (all above); dep of khive-mcp/kkernel
+    khive-pack-forms     # needs khive-changeset/runtime/storage/types (all above); dep of khive-mcp/kkernel
+    khive-pack-operation # needs khive-runtime/storage/types (all above); dep of khive-mcp/kkernel
     khive-pack-template
     khive-pack-moodboard   # needs khive-runtime/storage/types (all above); dep of khive-mcp/kkernel
     khive-channel-email    # needs khive-channel (above); optional dep of khive-mcp
@@ -152,8 +157,7 @@ echo "    CRATES ladder OK (${#CRATES[@]} publishable workspace members all pres
 # `make publish-dry` validates SemVer before any real publish. The shared exclude
 # list covers pre-1.0 surfaces still moving under active development, including
 # some crates that already have a crates.io baseline. Its full policy lives in
-# scripts/lib/semver_excludes.txt (#568), also consumed by release.yml so the two
-# gates cannot drift out of sync with each other.
+# scripts/lib/semver_excludes.txt (#568).
 echo ""
 # The gate rebuilds every crate's rustdoc against its crates.io baseline. When it
 # already ran at this exact commit on another machine (the release dry run), the

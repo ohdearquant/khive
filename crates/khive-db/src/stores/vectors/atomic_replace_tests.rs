@@ -1,3 +1,4 @@
+use crate::test_hooks::TestHooks;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -559,7 +560,7 @@ async fn same_identity_replacement_logs_only_upsert() {
         pool.try_writer()
             .expect("pool writer")
             .conn()
-            .authorizer(Some(move |context: AuthContext<'_>| {
+            .test_authorizer(Some(move |context: AuthContext<'_>| {
                 if matches!(
                     context.action,
                     AuthAction::Insert {
@@ -597,7 +598,7 @@ async fn same_identity_replacement_logs_only_upsert() {
     pool.try_writer()
         .expect("pool writer")
         .conn()
-        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
         .expect("remove statement authorizer");
 }
 

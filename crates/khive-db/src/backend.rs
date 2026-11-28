@@ -23,6 +23,8 @@ mod core_stores;
 mod memory_visibility;
 mod pack_schema;
 mod policy_open;
+mod schema_barrier;
+pub use schema_barrier::ForcedIndexCheck;
 
 #[cfg(test)]
 #[path = "backend/filter_builder_tests.rs"]
@@ -56,13 +58,10 @@ fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool,
 /// `StorageBackend::text()`/`text_with_tokenizer()` is called uncached on
 /// essentially every text-store access (`khive-runtime` builds a fresh
 /// `Fts5TextSearch` per call, never caching the `Arc`). The backend skips this
-/// check once a table's marker is durable, but a table with no rows yet is
-/// re-checked on every fetch, so the check stays on the hot path — it must
-/// stay O(1), not scale with either
-/// table's row count, or it reintroduces the exact class of cost this
-/// migration exists to remove. `SELECT EXISTS(... LIMIT 1)` is an index probe
-/// that stops at the first row, unlike `COUNT(*)` which SQLite satisfies by
-/// walking every row of the smallest available index.
+/// check once a table's marker is durable, and the marker is written on the
+/// first check even for a table with no rows, so a request after that never
+/// takes the writer for it. The completion probe below is an index probe
+/// (`SELECT EXISTS(... LIMIT 1)`) that stops at the first row.
 ///
 /// Completion is read from a durable marker row rather than inferred from
 /// the map's own row count: a map can legitimately be empty for a table with
@@ -72,17 +71,17 @@ fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool,
 /// and the raw SQL in `khive-runtime`'s
 /// `atomic_prepare`/`atomic_message`/`curation`) maintains the FTS row and
 /// its map row atomically, inside one transaction, so a legitimately
-/// half-empty map from a live write path never happens either. Until the
-/// table actually holds a row, there is nothing to reconcile and the marker
-/// is deliberately left unwritten — both probes below stay O(1) index-only
-/// lookups on an empty table, so repeating them costs nothing, and a table
-/// that later gains rows through anything other than the maintained write
-/// paths (a raw-SQL legacy seed, or a restored pre-map snapshot) is still
-/// picked up and reconciled the next time this runs. Once the table holds at
-/// least one row, the marker asserts a bijection — every live row has
-/// exactly one map row pointing at it, and every map row points at a live
-/// row with the same key — so reconciliation runs in three steps before the
-/// marker is written, all inside one transaction:
+/// half-empty map from a live write path never happens either. The marker is
+/// written for an empty table too (ADR-154 Amendment 3: no schema work on a
+/// request path after readiness), so rows that later reach the table through
+/// anything other than the maintained write paths (a raw-SQL seed) must
+/// maintain the map themselves; a restored or imported store whose marker is
+/// absent is still reconciled the next time this runs. The marker asserts a
+/// bijection — every live row has exactly one map row pointing at it, and
+/// every map row points at a live row with the same key — so reconciliation
+/// runs in three steps before the marker is written, all inside one
+/// transaction; on an empty table the first step removes any leftover map
+/// rows and the other two do nothing:
 ///
 /// 1. Any existing map row that no longer has a matching live FTS row at the
 ///    same rowid AND the same `(namespace, subject_id)` is removed first. A
@@ -102,9 +101,8 @@ fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool,
 ///    mirroring migration 024's own first sweep, so no live row is left
 ///    without a map entry.
 ///
-/// The marker is then written in the same transaction. Returns whether the
-/// marker is durable when this returns: `false` only for a table with no rows
-/// yet. This function never
+/// The marker is then written in the same transaction, and is durable when
+/// this returns `Ok`. This function never
 /// checks `entities`/`notes` for orphaned subjects — that sweep is specific
 /// to those two backing tables and stays in migration 024's SQL; a generic
 /// `table_key` here has no fixed backing table to check against.
@@ -112,7 +110,7 @@ fn ensure_fts_rowid_map_backfilled(
     conn: &rusqlite::Connection,
     table: &str,
     admission: &crate::pool::WriteAdmission,
-) -> Result<bool, SqliteError> {
+) -> Result<(), SqliteError> {
     let map = text::rowid_map_table(table);
     let state = text::rowid_map_state_table(table);
     let already_backfilled: bool = conn.query_row(
@@ -121,15 +119,7 @@ fn ensure_fts_rowid_map_backfilled(
         |row| row.get(0),
     )?;
     if already_backfilled {
-        return Ok(true);
-    }
-    let fts_has_a_row: bool = conn.query_row(
-        &format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"),
-        [],
-        |row| row.get(0),
-    )?;
-    if !fts_has_a_row {
-        return Ok(false);
+        return Ok(());
     }
 
     conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -171,7 +161,7 @@ fn ensure_fts_rowid_map_backfilled(
     match result {
         Ok(()) => {
             conn.execute_batch("COMMIT")?;
-            Ok(true)
+            Ok(())
         }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
@@ -242,7 +232,7 @@ fn validate_vector_table_columns(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StoreSchemaKind {
     Entities,
     Graph,
@@ -252,7 +242,7 @@ pub(crate) enum StoreSchemaKind {
 }
 
 impl StoreSchemaKind {
-    fn initializer(self) -> fn(&rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    pub(crate) fn initializer(self) -> fn(&rusqlite::Connection) -> Result<(), rusqlite::Error> {
         match self {
             Self::Entities => entity::ensure_entities_schema,
             Self::Graph => graph::ensure_graph_schema,
@@ -308,12 +298,18 @@ pub struct StorageBackend {
     vector_tables_ready: parking_lot::Mutex<std::collections::HashSet<String>>,
     /// FTS tables whose schema, rowid-map sidecar and durable backfill marker
     /// this backend has already proven under the writer. A table is recorded
-    /// only once its marker exists, so a table with no rows yet is re-checked
-    /// by the next fetch, and a warm fetch never takes the writer or the
-    /// volume lease: a search opens its text store on every call. As with
+    /// once its marker exists, which the first check writes even for an empty
+    /// table, so a warm fetch never takes the writer or the volume lease: a
+    /// search opens its text store on every call. As with
     /// `vector_tables_ready`, a table dropped behind a live backend is not
     /// recreated until the backend is reopened.
     text_tables_ready: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Sparse model keys whose `sparse_<model_key>` table and namespace index
+    /// this backend has already ensured under the writer. Recorded only after
+    /// the ensure succeeded, so a failed ensure is retried, and a warm fetch
+    /// takes no write unit. As with `vector_tables_ready`, a table dropped
+    /// behind a live backend is not recreated until the backend is reopened.
+    sparse_tables_ready: parking_lot::Mutex<std::collections::HashSet<String>>,
     /// How many times the lazy `notes_seq` anti-join repair has actually
     /// executed against this backend's pool. Gates `notes_for_namespace` so
     /// the repair (a full `notes` scan) runs at most once per backend for
@@ -446,6 +442,7 @@ impl StorageBackend {
             path: Some(resolved),
             vector_tables_ready: Default::default(),
             text_tables_ready: Default::default(),
+            sparse_tables_ready: Default::default(),
             notes_seq_repair_runs: AtomicUsize::new(0),
             store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         })
@@ -558,6 +555,7 @@ impl StorageBackend {
             path: Some(resolved),
             vector_tables_ready: Default::default(),
             text_tables_ready: Default::default(),
+            sparse_tables_ready: Default::default(),
             notes_seq_repair_runs: AtomicUsize::new(0),
             store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         })
@@ -581,6 +579,7 @@ impl StorageBackend {
             path: None,
             vector_tables_ready: Default::default(),
             text_tables_ready: Default::default(),
+            sparse_tables_ready: Default::default(),
             notes_seq_repair_runs: AtomicUsize::new(0),
             store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         })
@@ -637,7 +636,7 @@ impl StorageBackend {
         statements: &[&'static str],
         additions: &[khive_types::PackColumnAddition],
     ) -> Result<(), SqliteError> {
-        let writer = self.pool.writer()?;
+        let writer = self.pool.writer_for_schema()?;
         writer.transaction(|conn| {
             pack_schema::add_missing_columns(conn, additions)?;
             for &stmt in statements {
@@ -735,9 +734,13 @@ impl StorageBackend {
                 "cannot stage attachment cutover on a read-only backend".into(),
             ));
         }
-        let mut writer = self.pool.writer()?;
+        // Cutover work is schema work whoever calls it: its leases are migration class.
+        let _class = crate::disk_guard::lease_class_scope(crate::disk_guard::LeaseClass::Migration);
+        let mut writer = self.pool.writer_for_attachment_cutover()?;
         let admission = self.pool.write_admission();
-        crate::migrations::stage_attachment_cutover_with_admission(writer.conn_mut(), &admission)
+        writer.conn_mut().with_mut(|conn| {
+            crate::migrations::stage_attachment_cutover_with_admission(conn, &admission)
+        })
     }
 
     /// Atomically publish a verified batch of pack-owned attachment roles.
@@ -752,37 +755,38 @@ impl StorageBackend {
                 "cannot apply verified attachments on a read-only backend".into(),
             ));
         }
-        let mut writer = self.pool.writer()?;
-        let tx = writer
-            .conn_mut()
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let _class = crate::disk_guard::lease_class_scope(crate::disk_guard::LeaseClass::Migration);
+        let mut writer = self.pool.writer_for_attachment_cutover()?;
         let admission = self.pool.write_admission();
-        if let Err(error) = admission.check() {
-            let rollback = tx.rollback();
-            return Err(crate::migrations::capacity_refusal_after_rollback(
-                writer.conn(),
-                rollback,
-                error,
-                "verified attachment publication",
-            ));
-        }
-        for attachment in attachments {
-            attachment
-                .validate()
-                .map_err(|error| SqliteError::InvalidData(error.to_string()))?;
-            crate::migrations::apply_generic_verified_attachment(
-                &tx,
-                &attachment.record_uuid.to_string(),
-                attachment.substrate.as_str(),
-                &attachment.role,
-                &attachment.content_ref,
-                attachment.media_type.as_deref(),
-                attachment.size_bytes,
-                attachment.created_at,
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+        writer.conn_mut().with_mut(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if let Err(error) = admission.check() {
+                let rollback = tx.rollback();
+                return Err(crate::migrations::capacity_refusal_after_rollback(
+                    conn,
+                    rollback,
+                    error,
+                    "verified attachment publication",
+                ));
+            }
+            for attachment in attachments {
+                attachment
+                    .validate()
+                    .map_err(|error| SqliteError::InvalidData(error.to_string()))?;
+                crate::migrations::apply_generic_verified_attachment(
+                    &tx,
+                    &attachment.record_uuid.to_string(),
+                    attachment.substrate.as_str(),
+                    &attachment.role,
+                    &attachment.content_ref,
+                    attachment.media_type.as_deref(),
+                    attachment.size_bytes,
+                    attachment.created_at,
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Atomically swap GC liveness/fences to attachments, remove the legacy
@@ -797,9 +801,12 @@ impl StorageBackend {
                 "cannot finalize attachment cutover on a read-only backend".into(),
             ));
         }
-        let mut writer = self.pool.writer()?;
+        let _class = crate::disk_guard::lease_class_scope(crate::disk_guard::LeaseClass::Migration);
+        let mut writer = self.pool.writer_for_attachment_cutover()?;
         let admission = self.pool.write_admission();
-        crate::migrations::finalize_attachment_cutover_with_admission(writer.conn_mut(), &admission)
+        writer.conn_mut().with_mut(|conn| {
+            crate::migrations::finalize_attachment_cutover_with_admission(conn, &admission)
+        })
     }
 
     /// Get an EntityStore. Applies the entities DDL if not already present.
@@ -902,11 +909,13 @@ impl StorageBackend {
     ) -> Result<crate::pool::PooledAutocommitWriteUnit<'_>, SqliteError> {
         let context = khive_storage::capture_request_read_context();
         let Some(operation) = context.store_acquisition_operation() else {
-            return self.pool.autocommit_write_unit();
+            return self.pool.writer_for_schema()?.admit_autocommit();
         };
         let writer = self
             .pool
-            .writer_until_for_admitted_operation(|| context.blocking_stop_reason().is_some())?
+            .schema_writer_until_for_admitted_operation(|| {
+                context.blocking_stop_reason().is_some()
+            })?
             .ok_or_else(|| {
                 SqliteError::RequestReadStopped(khive_storage::StorageError::Timeout {
                     operation: operation.into(),
@@ -949,10 +958,7 @@ impl StorageBackend {
             // so this load-then-run-then-store is race-free: no other caller on
             // this pool can observe or advance `notes_seq_repair_runs` while we
             // hold the writer guard (khive #827).
-            if self.notes_seq_repair_runs.load(Ordering::Relaxed) == 0 {
-                note::repair_notes_seq(writer.conn())?;
-                self.notes_seq_repair_runs.fetch_add(1, Ordering::Relaxed);
-            }
+            self.repair_notes_seq_with_writer(writer.conn())?;
         }
 
         Ok(Arc::new(
@@ -1199,7 +1205,7 @@ impl StorageBackend {
         key_version: &str,
         dimensions: u32,
     ) -> Result<(), SqliteError> {
-        let writer = self.pool.autocommit_write_unit()?;
+        let writer = self.pool.writer_for_schema()?.admit_autocommit()?;
         writer
             .conn()
             .execute_batch(crate::migrations::EMBEDDING_MODELS_DDL)
@@ -1248,6 +1254,34 @@ impl StorageBackend {
         self.sparse_for_namespace(model_key, "local")
     }
 
+    /// Forget which FTS tables this backend has proven, so the next fetch
+    /// re-checks each table under the writer. For tests that clear a durable
+    /// marker to reproduce a store that predates it.
+    #[cfg(test)]
+    pub(crate) fn forget_proven_text_tables_for_test(&self) {
+        self.text_tables_ready.lock().clear();
+    }
+
+    /// Ensure `sparse_<model_key>` and its namespace index exist, once per
+    /// backend: a warm call takes no write unit. The caller has validated
+    /// `model_key`. The set is checked before the writer is taken and again
+    /// under it, and a key is recorded only after the ensure succeeded, while
+    /// the writer is still held.
+    fn ensure_sparse_table(&self, model_key: &str) -> Result<(), SqliteError> {
+        if self.sparse_tables_ready.lock().contains(model_key) {
+            return Ok(());
+        }
+        let writer = self.pool.writer_for_schema()?.admit_autocommit()?;
+        if !self.sparse_tables_ready.lock().contains(model_key) {
+            sparse::ensure_sparse_schema(writer.conn(), model_key)
+                .map_err(SqliteError::Rusqlite)?;
+            self.sparse_tables_ready
+                .lock()
+                .insert(model_key.to_string());
+        }
+        Ok(())
+    }
+
     /// Get a SparseStore for a specific model key with an explicit default namespace.
     ///
     /// The `model_key` must contain only ASCII alphanumeric/underscore characters.
@@ -1282,9 +1316,7 @@ impl StorageBackend {
                 )));
             }
         } else {
-            let writer = self.pool.autocommit_write_unit()?;
-            sparse::ensure_sparse_schema(writer.conn(), model_key)
-                .map_err(SqliteError::Rusqlite)?;
+            self.ensure_sparse_table(model_key)?;
         }
 
         Ok(Arc::new(sparse::SqliteSparseStore::new(
@@ -1419,22 +1451,20 @@ impl StorageBackend {
                 )));
             }
         } else if !self.text_tables_ready.lock().contains(&table) {
-            let writer = self.pool.autocommit_write_unit()?;
+            let writer = self.pool.writer_for_schema()?.admit_autocommit()?;
             // A concurrent caller may have proven this table while this one
             // waited for the writer.
             if !self.text_tables_ready.lock().contains(&table) {
                 writer.conn().execute_batch(&ddl)?;
                 writer.conn().execute_batch(&text::rowid_map_ddl(&table))?;
-                let marker_durable = ensure_fts_rowid_map_backfilled(
+                ensure_fts_rowid_map_backfilled(
                     writer.conn(),
                     &table,
                     &self.pool.write_admission(),
                 )?;
                 // Record the table only now that every step succeeded, while
                 // the writer is still held.
-                if marker_durable {
-                    self.text_tables_ready.lock().insert(table.clone());
-                }
+                self.text_tables_ready.lock().insert(table.clone());
             }
         }
 
@@ -1559,6 +1589,10 @@ mod store_accessor_tests;
 #[cfg(test)]
 #[path = "backend/store_accessor_index_tests.rs"]
 mod store_accessor_index_tests;
+
+#[cfg(test)]
+#[path = "backend/schema_barrier_tests.rs"]
+mod schema_barrier_tests;
 
 #[cfg(test)]
 #[path = "backend_tests.rs"]

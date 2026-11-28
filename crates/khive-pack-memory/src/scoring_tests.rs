@@ -60,6 +60,10 @@ fn is_cjk_dominant_query_accepts_pure_cjk() {
     // Hiragana, Katakana, and Hangul count as CJK.
     assert!(is_cjk_dominant_query("これはペンです"));
     assert!(is_cjk_dominant_query("안녕하세요"));
+    // The iteration mark and ideographic zero are CJK letters, not other letters.
+    assert!(is_cjk_dominant_query("人々"));
+    assert!(is_cjk_dominant_query("時々 a"));
+    assert!(is_cjk_dominant_query("〇〇"));
 }
 
 #[test]
@@ -459,7 +463,52 @@ fn entity_match_condition_keeps_alphabetic_word_boundaries() {
     assert!(!AdjustmentCondition::EntityMatch.matches(&ctx));
 }
 
-// ── ADR-104 §2 (Stage B): entity_posterior_term ────────────────────────────
+// ── ADR-104 Section 2 and Amendment 6: the per-entity posterior term ─────
+
+#[test]
+fn entity_posterior_t0_neutral_at_uninformative_prior_mean() {
+    let t0 = entity_posterior_t0(0.5, ENTITY_POSTERIOR_WEIGHT);
+    assert!((t0 - 1.0).abs() < 1e-6, "got {t0}");
+}
+
+#[test]
+fn entity_posterior_t0_reaches_low_clamp_bound_at_mean_zero() {
+    let t0 = entity_posterior_t0(0.0, ENTITY_POSTERIOR_WEIGHT);
+    assert!(
+        (t0 - ENTITY_POSTERIOR_CLAMP_MIN).abs() < 1e-6,
+        "w_ent=0.3 at mean=0.0 must land exactly on the 0.85 clamp bound, got {t0}"
+    );
+}
+
+#[test]
+fn entity_posterior_t0_reaches_high_clamp_bound_at_mean_one() {
+    let t0 = entity_posterior_t0(1.0, ENTITY_POSTERIOR_WEIGHT);
+    assert!(
+        (t0 - ENTITY_POSTERIOR_CLAMP_MAX).abs() < 1e-6,
+        "w_ent=0.3 at mean=1.0 must land exactly on the 1.15 clamp bound, got {t0}"
+    );
+}
+
+#[test]
+fn entity_posterior_t0_never_exceeds_clamp_bounds_for_out_of_range_input() {
+    assert_eq!(
+        entity_posterior_t0(-5.0, ENTITY_POSTERIOR_WEIGHT),
+        ENTITY_POSTERIOR_CLAMP_MIN
+    );
+    assert_eq!(
+        entity_posterior_t0(5.0, ENTITY_POSTERIOR_WEIGHT),
+        ENTITY_POSTERIOR_CLAMP_MAX
+    );
+}
+
+#[test]
+fn entity_posterior_t0_moves_monotonically_with_mean() {
+    let low = entity_posterior_t0(0.2, ENTITY_POSTERIOR_WEIGHT);
+    let mid = entity_posterior_t0(0.5, ENTITY_POSTERIOR_WEIGHT);
+    let high = entity_posterior_t0(0.8, ENTITY_POSTERIOR_WEIGHT);
+    assert!(low < mid, "low={low} mid={mid}");
+    assert!(mid < high, "mid={mid} high={high}");
+}
 
 #[test]
 fn entity_posterior_term_neutral_when_no_posterior() {
@@ -467,49 +516,183 @@ fn entity_posterior_term_neutral_when_no_posterior() {
 }
 
 #[test]
-fn entity_posterior_term_neutral_at_uninformative_prior_mean() {
-    // Beta(1,1) mean = 0.5 — the uninformative prior itself, distinct
-    // from `None`, must also be an identity multiplier.
-    let term = entity_posterior_term(Some(0.5), ENTITY_POSTERIOR_WEIGHT);
-    assert!((term - 1.0).abs() < 1e-6, "got {term}");
-}
-
-#[test]
-fn entity_posterior_term_reaches_low_clamp_bound_at_mean_zero() {
-    let term = entity_posterior_term(Some(0.0), ENTITY_POSTERIOR_WEIGHT);
-    assert!(
-        (term - ENTITY_POSTERIOR_CLAMP_MIN).abs() < 1e-6,
-        "w_ent=0.3 at mean=0.0 must land exactly on the 0.85 clamp bound, got {term}"
+fn entity_posterior_term_neutral_at_the_prior_with_zero_evidence() {
+    // A posterior at the Beta(1, 1) prior holds no evidence: n = 0 gives exactly 1.0.
+    let n = entity_evidence_mass(1.0, 1.0);
+    assert_eq!(n, 0.0);
+    assert_eq!(
+        entity_posterior_term(Some((0.5, n)), ENTITY_POSTERIOR_WEIGHT),
+        1.0
+    );
+    // n = 0 is neutral whatever the mean says.
+    assert_eq!(
+        entity_posterior_term(Some((1.0, 0.0)), ENTITY_POSTERIOR_WEIGHT),
+        1.0
     );
 }
 
 #[test]
-fn entity_posterior_term_reaches_high_clamp_bound_at_mean_one() {
-    let term = entity_posterior_term(Some(1.0), ENTITY_POSTERIOR_WEIGHT);
-    assert!(
-        (term - ENTITY_POSTERIOR_CLAMP_MAX).abs() < 1e-6,
-        "w_ent=0.3 at mean=1.0 must land exactly on the 1.15 clamp bound, got {term}"
+fn entity_evidence_mass_is_zero_below_the_prior_mass() {
+    // Shipped representation: alpha + beta < 2 holds less than the prior, so n = 0.
+    assert_eq!(entity_evidence_mass(0.5, 1.0), 0.0);
+    assert_eq!(entity_evidence_mass(0.0, 0.0), 0.0);
+    assert_eq!(
+        entity_posterior_term(
+            Some((0.5 / 1.5, entity_evidence_mass(0.5, 1.0))),
+            ENTITY_POSTERIOR_WEIGHT
+        ),
+        1.0
     );
 }
 
 #[test]
-fn entity_posterior_term_never_exceeds_clamp_bounds_for_out_of_range_input() {
-    // A Beta posterior mean is mathematically bounded to [0, 1], but the
-    // clamp must hold defensively regardless — the term is never allowed
-    // to move a score by more than +-15% no matter what value reaches it.
-    let low = entity_posterior_term(Some(-5.0), ENTITY_POSTERIOR_WEIGHT);
-    let high = entity_posterior_term(Some(5.0), ENTITY_POSTERIOR_WEIGHT);
-    assert_eq!(low, ENTITY_POSTERIOR_CLAMP_MIN);
-    assert_eq!(high, ENTITY_POSTERIOR_CLAMP_MAX);
+fn entity_evidence_mass_rejects_non_finite_input() {
+    assert_eq!(entity_evidence_mass(f64::NAN, 1.0), 0.0);
+    assert_eq!(entity_evidence_mass(f64::INFINITY, 1.0), 0.0);
+    assert_eq!(
+        entity_posterior_term(Some((0.9, f64::NAN)), ENTITY_POSTERIOR_WEIGHT),
+        1.0
+    );
 }
 
 #[test]
-fn entity_posterior_term_moves_monotonically_with_mean() {
-    let low = entity_posterior_term(Some(0.2), ENTITY_POSTERIOR_WEIGHT);
-    let mid = entity_posterior_term(Some(0.5), ENTITY_POSTERIOR_WEIGHT);
-    let high = entity_posterior_term(Some(0.8), ENTITY_POSTERIOR_WEIGHT);
-    assert!(low < mid, "low={low} mid={mid}");
-    assert!(mid < high, "mid={mid} high={high}");
+fn entity_posterior_term_is_neutral_for_a_non_finite_mean_or_weight() {
+    for mean in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let term = entity_posterior_term(Some((mean, 4.0)), ENTITY_POSTERIOR_WEIGHT);
+        assert!(
+            term == 1.0
+                || (ENTITY_POSTERIOR_CLAMP_MIN..=ENTITY_POSTERIOR_CLAMP_MAX).contains(&term),
+            "mean {mean}: term {term} must be neutral or inside the bounds"
+        );
+    }
+    assert_eq!(
+        entity_posterior_term(Some((f64::NAN, 4.0)), ENTITY_POSTERIOR_WEIGHT),
+        1.0
+    );
+    assert_eq!(entity_posterior_term(Some((0.9, 4.0)), f32::NAN), 1.0);
+}
+
+/// The amendment's formula written out independently of the code under test:
+/// `1 + (t0 - 1) * n / (n + 16)` with `t0` and `n` from the stored `(alpha, beta)`.
+fn expected_term(alpha: f64, beta: f64) -> f64 {
+    let mean = alpha / (alpha + beta);
+    let t0 = (1.0 + 0.3 * (mean - 0.5)).clamp(0.85, 1.15);
+    let n = (alpha + beta - 2.0).max(0.0);
+    1.0 + (t0 - 1.0) * n / (n + 16.0)
+}
+
+fn served_term(alpha: f64, beta: f64) -> f32 {
+    let mean = alpha / (alpha + beta);
+    entity_posterior_term(
+        Some((mean, entity_evidence_mass(alpha, beta))),
+        ENTITY_POSTERIOR_WEIGHT,
+    )
+}
+
+fn assert_term(label: &str, alpha: f64, beta: f64, expected_move: f64) {
+    let got = served_term(alpha, beta) as f64;
+    let want = expected_term(alpha, beta);
+    assert!(
+        (got - want).abs() < 1e-6,
+        "{label}: term {got} != formula {want}"
+    );
+    assert!(
+        (got - 1.0 - expected_move).abs() < 1e-4,
+        "{label}: move {} != amendment table {expected_move}",
+        got - 1.0
+    );
+}
+
+#[test]
+fn entity_posterior_term_matches_formula_at_shipped_mass() {
+    // Shipped mass: every explicit judgment adds 1.0 to the Beta(1, 1) prior.
+    assert_term("one useful, shipped mass", 2.0, 1.0, 0.0029);
+    assert_term("one not_useful, shipped mass", 1.0, 2.0, -0.0029);
+    assert_term("one wrong, shipped mass", 1.0, 2.0, -0.0029);
+    assert_term("16 useful, shipped mass", 17.0, 1.0, 0.0667);
+    // A weighted signal adds its weight: 0.1 of evidence moves the term by
+    // 0.3 * (1.1 / 2.1 - 0.5) * 0.1 / 16.1 = 4.437e-5 (8.83e-5 at k = 8).
+    assert_weighted_term("weighted signal 0.1, shipped mass");
+}
+
+fn assert_weighted_term(label: &str) {
+    let got = served_term(1.1, 1.0) as f64;
+    assert!(
+        (got - expected_term(1.1, 1.0)).abs() < 1e-6,
+        "{label}: term {got} != formula {}",
+        expected_term(1.1, 1.0)
+    );
+    assert!(
+        (got - 1.0 - 4.437e-5).abs() < 5e-7,
+        "{label}: move {} != 4.437e-5",
+        got - 1.0
+    );
+}
+
+#[test]
+fn entity_posterior_term_matches_formula_at_amendment_2_mass() {
+    // Amendment 2's table: useful and not_useful add 1.5, wrong adds 2.0.
+    assert_term("one useful, Amendment 2 mass", 2.5, 1.0, 0.0055);
+    assert_term("one not_useful, Amendment 2 mass", 1.0, 2.5, -0.0055);
+    assert_term("one wrong, Amendment 2 mass", 1.0, 3.0, -0.0083);
+    assert_term("16 useful, Amendment 2 mass", 25.0, 1.0, 0.0831);
+    // Amendment 2's weighted row: implicit_positive carries 0.1 of evidence.
+    assert_weighted_term("implicit_positive 0.1, Amendment 2 mass");
+}
+
+#[test]
+fn entity_posterior_term_reaches_half_of_t0_at_evidence_mass_sixteen() {
+    // Shipped mass, 16 useful: n = 16 = k, so the term moves exactly half of t0 - 1.
+    let mean = 17.0 / 18.0;
+    let t0 = entity_posterior_t0(mean, ENTITY_POSTERIOR_WEIGHT);
+    let term = served_term(17.0, 1.0);
+    assert!(
+        ((term - 1.0) - (t0 - 1.0) / 2.0).abs() < 1e-6,
+        "term={term} t0={t0}"
+    );
+}
+
+#[test]
+fn entity_posterior_term_stays_in_bounds_and_never_passes_t0() {
+    let grid = [
+        0.5, 0.75, 1.0, 1.1, 1.5, 2.0, 2.5, 3.0, 5.0, 10.0, 17.0, 50.0, 100.0, 200.0,
+    ];
+    for &alpha in &grid {
+        for &beta in &grid {
+            let mean = alpha / (alpha + beta);
+            let n = entity_evidence_mass(alpha, beta);
+            let t0 = entity_posterior_t0(mean, ENTITY_POSTERIOR_WEIGHT);
+            let term = entity_posterior_term(Some((mean, n)), ENTITY_POSTERIOR_WEIGHT);
+            assert!(
+                (ENTITY_POSTERIOR_CLAMP_MIN..=ENTITY_POSTERIOR_CLAMP_MAX).contains(&term),
+                "alpha={alpha} beta={beta}: term {term} out of bounds"
+            );
+            assert!(
+                (term - 1.0).abs() <= (t0 - 1.0).abs() + 1e-7,
+                "alpha={alpha} beta={beta}: term {term} moved past t0 {t0}"
+            );
+            assert!(
+                (term - 1.0) * (t0 - 1.0) >= 0.0,
+                "alpha={alpha} beta={beta}: term {term} on the other side of neutral from t0 {t0}"
+            );
+        }
+    }
+    // Means outside [0, 1] put t0 on the clamp endpoints; the scaled term stays inside them.
+    // The 1e-7 slack above and here is one f32 rounding step at 1.0, not a looser bound.
+    for &mean in &[-1.0, 0.0, 1.0, 2.0] {
+        for &n in &[0.5, 16.0, 1.0e6] {
+            let t0 = entity_posterior_t0(mean, ENTITY_POSTERIOR_WEIGHT);
+            let term = entity_posterior_term(Some((mean, n)), ENTITY_POSTERIOR_WEIGHT);
+            assert!(
+                (ENTITY_POSTERIOR_CLAMP_MIN..=ENTITY_POSTERIOR_CLAMP_MAX).contains(&term),
+                "mean={mean} n={n}: term {term} out of bounds"
+            );
+            assert!(
+                (term - 1.0).abs() <= (t0 - 1.0).abs() + 1e-7,
+                "mean={mean} n={n}: term {term} moved past t0 {t0}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -566,4 +749,151 @@ fn meaningful_query_policies_keep_distinct_admission_rules() {
             "recall policy for {query:?}"
         );
     }
+}
+
+fn scalar_boost_input() -> ScoreInput<'static> {
+    ScoreInput {
+        salience: 1.0,
+        memory_type_str: "episodic",
+        content: "scalar boost fixture",
+        created_at_millis: 0,
+        decay_factor: 0.0,
+        now_millis: 0,
+        relevance_score: 0.25,
+        entity_names: &[],
+    }
+}
+
+fn scalar_boost_config() -> ScoringConfig {
+    ScoringConfig {
+        weights: ScoringWeights {
+            relevance: 1.0,
+            temporal: 0.0,
+            salience: 0.0,
+        },
+        adjustments: Vec::new(),
+        ..ScoringConfig::default()
+    }
+}
+
+fn assert_invalid_boost_stays_zero(mut input: ScoreInput<'_>, config: &ScoringConfig) {
+    for relevance_score in [0.0, 0.25] {
+        input.relevance_score = relevance_score;
+        assert_eq!(
+            calculate_score(&input, config).to_bits(),
+            0.0_f32.to_bits(),
+            "invalid boost at relevance {relevance_score}"
+        );
+    }
+}
+
+#[test]
+fn calculate_score_isolates_temporal_boost() {
+    let input = scalar_boost_input();
+    let mut config = scalar_boost_config();
+
+    for (weight, expected) in [(0.0, 0.25_f32), (1.0, 0.5), (2.0, 0.75)] {
+        config.weights.temporal = weight;
+        assert_eq!(
+            calculate_score(&input, &config).to_bits(),
+            expected.to_bits()
+        );
+    }
+}
+
+#[test]
+fn calculate_score_temporal_boost_errors_return_terminal_zero() {
+    let mut config = scalar_boost_config();
+    config.adjustments.push(ScoreAdjustment {
+        condition: AdjustmentCondition::MemoryType {
+            kind: "episodic".to_string(),
+        },
+        operation: AdjustmentOp::Add { value: 0.5 },
+    });
+
+    for weight in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        config.weights.temporal = weight;
+        assert_invalid_boost_stays_zero(scalar_boost_input(), &config);
+    }
+
+    let mut input = scalar_boost_input();
+    input.now_millis = 86_400_000;
+    input.decay_factor = f32::NEG_INFINITY;
+    config.weights.temporal = 0.0;
+    assert_eq!(
+        khive_score::boost_factor_f32(0.0, f32::INFINITY),
+        Err(khive_score::ArithmeticError::NonFinite { parameter: "x" })
+    );
+    assert_invalid_boost_stays_zero(input, &config);
+
+    let mut input = scalar_boost_input();
+    input.now_millis = 86_400_000;
+    input.decay_factor = -80.0;
+    config.weights.temporal = f32::MAX;
+    let recency = 80.0_f32.exp();
+    assert!(recency.is_finite());
+    assert_eq!(
+        khive_score::boost_factor_f32(f32::MAX, recency),
+        Err(khive_score::ArithmeticError::Overflow {
+            operation: "boost product",
+        })
+    );
+    assert_invalid_boost_stays_zero(input, &config);
+}
+
+#[test]
+fn calculate_score_salience_boost_errors_return_terminal_zero() {
+    let mut config = scalar_boost_config();
+    config.adjustments.push(ScoreAdjustment {
+        condition: AdjustmentCondition::MemoryType {
+            kind: "episodic".to_string(),
+        },
+        operation: AdjustmentOp::Add { value: 0.5 },
+    });
+
+    for weight in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        config.weights.salience = weight;
+        assert_invalid_boost_stays_zero(scalar_boost_input(), &config);
+    }
+
+    config.weights.salience = 0.0;
+    for salience in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut input = scalar_boost_input();
+        input.salience = salience;
+        assert_invalid_boost_stays_zero(input, &config);
+    }
+
+    let mut input = scalar_boost_input();
+    input.salience = 2.0;
+    config.weights.salience = f32::MAX;
+    assert_eq!(
+        khive_score::boost_factor_f32(f32::MAX, 2.0),
+        Err(khive_score::ArithmeticError::Overflow {
+            operation: "boost product",
+        })
+    );
+    assert_invalid_boost_stays_zero(input, &config);
+}
+
+#[test]
+fn calculate_score_clamps_only_after_subtract_adjustment() {
+    let input = scalar_boost_input();
+    let mut config = scalar_boost_config();
+    config.weights.temporal = 3.0;
+    config.weights.salience = 1.0;
+
+    assert_eq!(calculate_score(&input, &config), 1.0);
+    config.adjustments.push(ScoreAdjustment {
+        condition: AdjustmentCondition::MemoryType {
+            kind: "episodic".to_string(),
+        },
+        operation: AdjustmentOp::Subtract { value: 1.5 },
+    });
+    assert_eq!(calculate_score(&input, &config), 0.5);
+
+    config.adjustments[0].operation = AdjustmentOp::Subtract { value: 2.5 };
+    assert_eq!(
+        calculate_score(&input, &config).to_bits(),
+        0.0_f32.to_bits()
+    );
 }

@@ -418,12 +418,66 @@ const V59_UP: &str = include_str!("../sql/059-comm-legacy-quarantine-index.sql")
 const V60_UP: &str = include_str!("../sql/060-note-stream-truncation.sql");
 const V61_UP: &str = include_str!("../sql/061-edge-governance.sql");
 const V62_UP: &str = include_str!("../sql/062-authority-store.sql");
+const V63_UP: &str = include_str!("../sql/063-pending-entity-indexes.sql");
+const V64_UP: &str = include_str!("../sql/064-node-confirmed-pins.sql");
+const V65_UP: &str = include_str!("../sql/065-graph-edges-target-relation-index.sql");
+const V66_UP: &str = include_str!("../sql/066-comm-undelivered-due-index.sql");
+const V67_UP: &str = include_str!("../sql/067-entity-keys.sql");
+
+/// DDL for entity keys (ADR-221): the `entity_keys` table and the triggers on
+/// `entities` that release, reclaim and drop its rows. Shared between
+/// migration V67 and the entity store's idempotent schema setup, so a store
+/// opened without the migration chain still has the table its triggers name.
+pub const ENTITY_KEYS_DDL: &str = V67_UP;
+
+const V68_UP: &str = include_str!("../sql/068-entity-aliases.sql");
+
+/// DDL for entity aliases (ADR-221): the `entity_aliases` table, its indexes
+/// and the trigger on `entities` that drops its rows on a hard delete. Shared
+/// between migration V68 and the entity store's idempotent schema setup, as
+/// [`ENTITY_KEYS_DDL`] is.
+pub const ENTITY_ALIASES_DDL: &str = V68_UP;
+
+const V69_UP: &str = include_str!("../sql/069-entity-key-kind-guard.sql");
+
+/// DDL for the trigger on `entities` that refuses a kind change of a live
+/// entity holding keys, and a restore under a kind other than the one its keys
+/// were released under (ADR-221 section 1). Shared between migration V69 and
+/// the entity store's idempotent schema setup, as [`ENTITY_KEYS_DDL`] is; it
+/// names `entity_keys`, so it runs after that DDL.
+pub const ENTITY_KEY_KIND_GUARD_DDL: &str = V69_UP;
+
+/// Retained V66 schema needs only its ledger restored, not an index rebuild.
+fn migrate_undelivered_due_index(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let installed: Option<String> = tx
+        .query_row(
+            include_str!("../sql/comm-outbound-due-index-definition.sql"),
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let (_, create) = V66_UP
+        .split_once("CREATE INDEX")
+        .ok_or(rusqlite::Error::InvalidQuery)?;
+    let expected = format!("CREATE INDEX{create}");
+    // SQLite omits the terminal semicolon. Preserve every interior byte,
+    // including whitespace in SQL string literals, when comparing definitions.
+    if installed.as_deref().is_some_and(|sql| {
+        sql.trim().trim_end_matches(';') == expected.trim().trim_end_matches(';')
+    }) {
+        return Ok(());
+    }
+    tx.execute_batch(V66_UP)
+}
 
 // Ledger-tail replay may retain the physical column; accept only its exact shape.
 fn migrate_proposal_archive(tx: &rusqlite::Transaction<'_>) -> Result<(), SqliteError> {
-    let migration_error = |error: rusqlite::Error| SqliteError::Migration {
-        version: 58,
-        error: format!("proposals_open.archived_at migration failed: {error}"),
+    let migration_error = |error: rusqlite::Error| {
+        SqliteError::migration_with_cause(
+            58,
+            format!("proposals_open.archived_at migration failed: {error}"),
+            error,
+        )
     };
     let column = tx
         .query_row(
@@ -452,10 +506,10 @@ fn migrate_proposal_archive(tx: &rusqlite::Transaction<'_>) -> Result<(), Sqlite
         {
             Ok(())
         }
-        Some(_) => Err(SqliteError::Migration {
-            version: 58,
-            error: "incompatible proposals_open.archived_at: expected an ordinary nullable INTEGER column without a default or primary key".into(),
-        }),
+        Some(_) => Err(SqliteError::migration_message(
+            58,
+            "incompatible proposals_open.archived_at: expected an ordinary nullable INTEGER column without a default or primary key",
+        )),
     }
 }
 
@@ -850,6 +904,41 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         name: "authority_store",
         up: V62_UP,
     },
+    VersionedMigration {
+        version: 63,
+        name: "pending_entity_indexes",
+        up: V63_UP,
+    },
+    VersionedMigration {
+        version: 64,
+        name: "node_confirmed_pins",
+        up: V64_UP,
+    },
+    VersionedMigration {
+        version: 65,
+        name: "graph_edges_target_relation_index",
+        up: V65_UP,
+    },
+    VersionedMigration {
+        version: 66,
+        name: "comm_undelivered_due_index",
+        up: V66_UP,
+    },
+    VersionedMigration {
+        version: 67,
+        name: "entity_keys",
+        up: V67_UP,
+    },
+    VersionedMigration {
+        version: 68,
+        name: "entity_aliases",
+        up: V68_UP,
+    },
+    VersionedMigration {
+        version: 69,
+        name: "entity_key_kind_guard",
+        up: V69_UP,
+    },
 ];
 
 /// Durable state of ADR-121's boot-gated, two-stage attachment cutover.
@@ -942,6 +1031,39 @@ fn validate_complete_attachment_schema(conn: &Connection) -> Result<(), SqliteEr
         }
     }
     Ok(())
+}
+
+/// Whether the migration chain would stop at [`ATTACHMENT_CUTOVER_VERSION`] and
+/// leave the store for the host's application-assisted cutover, read without
+/// mutating the connection.
+///
+/// `false` for a store already at or past the cutover version, since the chain
+/// never reaches that step again. Below it, the answer is the chain's own
+/// condition evaluated on the store as it is now: the cutover is `Incomplete`,
+/// or an entity still holds a legacy `content_ref`. A store whose `entities`
+/// table has no `content_ref` column yet (no table, or a store below V10) holds
+/// no legacy reference. An impossible marker and ledger pair is an error, as it
+/// is for the chain.
+pub fn attachment_cutover_would_defer(conn: &Connection) -> Result<bool, SqliteError> {
+    if read_schema_version(conn)? >= ATTACHMENT_CUTOVER_VERSION {
+        return Ok(false);
+    }
+    cutover_defers(conn, attachment_cutover_status(conn)?)
+}
+
+/// The V21 deferral condition, shared by the chain and
+/// [`attachment_cutover_would_defer`] so there is one copy of it.
+fn cutover_defers(conn: &Connection, status: AttachmentCutoverStatus) -> Result<bool, SqliteError> {
+    let legacy_refs: i64 = if schema_column_exists(conn, "entities", "content_ref")? {
+        conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE content_ref IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?
+    } else {
+        0
+    };
+    Ok(status == AttachmentCutoverStatus::Incomplete || legacy_refs != 0)
 }
 
 /// Inspect the coordinated V21 state without mutating the connection.
@@ -2016,10 +2138,7 @@ fn apply_versioned_migration(
     }
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| SqliteError::Migration {
-            version: migration.version,
-            error: e.to_string(),
-        })?;
+        .map_err(|e| SqliteError::migration(migration.version, e))?;
     if let Err(error) = admission.check() {
         let rollback = tx.rollback();
         return Err(capacity_refusal_after_rollback(
@@ -2035,10 +2154,7 @@ fn apply_versioned_migration(
     // its DDL again would fail; fast-forward past everything it applied.
     let sibling_version: u32 = tx
         .query_row(SCHEMA_VERSION_PROBE_SQL, [], |row| row.get(0))
-        .map_err(|e| SqliteError::Migration {
-            version: migration.version,
-            error: e.to_string(),
-        })?;
+        .map_err(|e| SqliteError::migration(migration.version, e))?;
     #[cfg(test)]
     if instrumented_first_begin {
         use std::sync::atomic::Ordering::SeqCst;
@@ -2081,99 +2197,66 @@ fn apply_versioned_migration(
     }
 
     if migration.version == 46 {
-        memory_visibility::capture_pre_v46(&tx).map_err(|error| SqliteError::Migration {
-            version: migration.version,
-            error: error.to_string(),
-        })?;
+        memory_visibility::capture_pre_v46(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
         #[cfg(test)]
         memory_visibility::test_state::stop_at(memory_visibility::test_state::Stop::AfterCapture)?;
     }
 
     if migration.version == ATTACHMENT_CUTOVER_VERSION {
-        let status = attachment_cutover_status(&tx).map_err(|e| SqliteError::Migration {
-            version: migration.version,
-            error: e.to_string(),
-        })?;
-        let legacy_refs: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM entities WHERE content_ref IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| SqliteError::Migration {
-                version: migration.version,
-                error: e.to_string(),
-            })?;
+        let status = attachment_cutover_status(&tx)
+            .map_err(|e| SqliteError::migration(migration.version, e))?;
+        let defers = cutover_defers(&tx, status)
+            .map_err(|e| SqliteError::migration(migration.version, e))?;
 
         // V21 belongs to the boot coordinator. Ordinary backend open may
         // finish the degenerate zero-ref case atomically, but it must not
         // expose a dual-source interval or eagerly stage a legacy DB.
-        if status == AttachmentCutoverStatus::Incomplete || legacy_refs != 0 {
+        if defers {
             drop(tx);
             return Ok(MigrationStep::Deferred);
         }
         if status != AttachmentCutoverStatus::Pending {
-            return Err(SqliteError::Migration {
-                version: migration.version,
-                error: format!("unexpected attachment cutover state {status:?}"),
-            });
+            return Err(SqliteError::migration_message(
+                migration.version,
+                format!("unexpected attachment cutover state {status:?}"),
+            ));
         }
 
         let now = chrono::Utc::now().timestamp_micros();
-        stage_attachment_cutover_on_connection(&tx, now).map_err(|e| SqliteError::Migration {
-            version: migration.version,
-            error: e.to_string(),
-        })?;
-        finalize_attachment_cutover_on_connection(&tx, now).map_err(|e| {
-            SqliteError::Migration {
-                version: migration.version,
-                error: e.to_string(),
-            }
-        })?;
+        stage_attachment_cutover_on_connection(&tx, now)
+            .map_err(|e| SqliteError::migration(migration.version, e))?;
+        finalize_attachment_cutover_on_connection(&tx, now)
+            .map_err(|e| SqliteError::migration(migration.version, e))?;
     } else if migration.version == 36 {
         // The events store DDL may already have added these columns.
-        crate::stores::event::ensure_operation_attribution_columns(&tx).map_err(|error| {
-            SqliteError::Migration {
-                version: migration.version,
-                error: error.to_string(),
-            }
-        })?;
+        crate::stores::event::ensure_operation_attribution_columns(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
     } else if migration.version == 44 {
-        migrate_outbound_due_key(&tx).map_err(|error| SqliteError::Migration {
-            version: migration.version,
-            error: error.to_string(),
-        })?;
+        migrate_outbound_due_key(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
     } else if migration.version == 48 {
-        migrate_acknowledgement_journal(&tx).map_err(|error| SqliteError::Migration {
-            version: migration.version,
-            error: error.to_string(),
-        })?;
+        migrate_acknowledgement_journal(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
     } else if migration.version == 58 {
         migrate_proposal_archive(&tx)?;
+    } else if migration.version == 66 {
+        migrate_undelivered_due_index(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
     } else if migration.name == SESSION_IDENTITY_MIGRATION_NAME {
         tx.execute_batch(migration.up)
-            .map_err(|error| SqliteError::Migration {
-                version: migration.version,
-                error: error.to_string(),
-            })?;
-        session_identity_migration::apply(&tx).map_err(|error| SqliteError::Migration {
-            version: migration.version,
-            error: error.to_string(),
-        })?;
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
+        session_identity_migration::apply(&tx)
+            .map_err(|error| SqliteError::migration(migration.version, error))?;
     } else {
         tx.execute_batch(migration.up)
-            .map_err(|e| SqliteError::Migration {
-                version: migration.version,
-                error: e.to_string(),
-            })?;
+            .map_err(|e| SqliteError::migration(migration.version, e))?;
     }
 
     let visibility_counts = if migration.version == MEMORY_VISIBILITY_CUTOVER_VERSION {
         Some(
-            memory_visibility::cutover_counts(&tx).map_err(|error| SqliteError::Migration {
-                version: migration.version,
-                error: error.to_string(),
-            })?,
+            memory_visibility::cutover_counts(&tx)
+                .map_err(|error| SqliteError::migration(migration.version, error))?,
         )
     } else {
         None
@@ -2190,10 +2273,7 @@ fn apply_versioned_migration(
             "UPDATE _schema_migrations SET name = 'list_cursor_sequences' WHERE version = 13;\n\
              UPDATE _schema_migrations SET name = 'graph_edges_id_unique' WHERE version = 14;",
         )
-        .map_err(|e| SqliteError::Migration {
-            version: migration.version,
-            error: e.to_string(),
-        })?;
+        .map_err(|e| SqliteError::migration(migration.version, e))?;
     }
 
     let now = chrono::Utc::now().timestamp_micros();
@@ -2202,10 +2282,7 @@ fn apply_versioned_migration(
          ON CONFLICT(version) DO NOTHING",
         rusqlite::params![migration.version, migration.name, now],
     )
-    .map_err(|e| SqliteError::Migration {
-        version: migration.version,
-        error: e.to_string(),
-    })?;
+    .map_err(|e| SqliteError::migration(migration.version, e))?;
 
     #[cfg(test)]
     if instrumented_first_begin {
@@ -2218,10 +2295,8 @@ fn apply_versioned_migration(
             memory_visibility::test_state::Stop::BeforeCutoverCommit,
         )?;
     }
-    tx.commit().map_err(|e| SqliteError::Migration {
-        version: migration.version,
-        error: e.to_string(),
-    })?;
+    tx.commit()
+        .map_err(|e| SqliteError::migration(migration.version, e))?;
     if let Some(counts) = visibility_counts {
         memory_visibility::log_counts(&counts, conn.path().unwrap_or(":memory:"));
     }

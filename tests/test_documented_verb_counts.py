@@ -62,6 +62,21 @@ The server config loads all three (`kg`, `comm`, `workspace`).
         self.assertIn(("pack_verbs", "kg", 20), {(c.kind, c.pack, c.value) for c in claims})
         self.assertIn(("pack_verbs", "workspace", 0), {(c.kind, c.pack, c.value) for c in claims})
 
+    def test_hyphenated_number_words_read_as_their_whole_value(self) -> None:
+        claims = scan_document(
+            "docs/guide/api-reference.md",
+            "twenty-one verbs across forty-two packs.\n"
+            "## `kg` pack — twenty-one verbs\n"
+            "## `comm` pack — twenty verbs\n",
+            PACK_COUNTS,
+        )
+        values = {(c.line, c.value) for c in claims}
+        self.assertTrue({(1, 21), (1, 42), (2, 21)} <= values, values)
+        # Control: a plain number word still reads as itself.
+        self.assertIn((3, 20), values)
+        # The last part of a compound is never read as the whole number.
+        self.assertFalse({(1, 1), (1, 2), (2, 1)} & values, values)
+
     def test_scanner_covers_status_cells_and_line_wrapped_pack_counts(self) -> None:
         claims = scan_document(
             "README.md",
@@ -541,7 +556,7 @@ After persisting a reminder, the other three schedule verbs do not require `comm
         # ci-docs-only.sh asks this predicate about one changed path; the scan walks the
         # tree with the same globs. Paths the globs treat differently are all present.
         paths = {
-            "README.md", "CONTRIBUTING.md", "npm/README.md", "npm/CHANGES.md",
+            "README.md", "CONTRIBUTING.md", "other/README.md", "other/CHANGES.md",
             "docs/guide.md", "docs/guide/deep/counts.md", "docs/adr/ADR-001-x.md",
             "docs/adrx/notes.md", "marketplace/a/b/skill.md", "scripts/notes.md",
             "crates/README.md", "crates/khive-db/README.md", "crates/khive-db/docs/a/b.md",

@@ -4,7 +4,7 @@ use chrono::Datelike;
 use khive_types::{base_entity_rule_allows, endpoint_matches, EdgeEndpointRule, EdgeRelation};
 
 use crate::config::*;
-use crate::{EvaluationContext, EvaluationMode, NdjsonState, RuleResult, Violation};
+use crate::{EvaluationContext, EvaluationMode, NdjsonSource, NdjsonState, RuleResult, Violation};
 
 /// Read an edge record's source endpoint id, accepting either canonical
 /// serialization spelling: `source` (khive-vcs sync, kkernel archive, and
@@ -55,6 +55,13 @@ pub fn collect_ids(content: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// Select an edge record ID; a present canonical field shadows the legacy alias.
+fn edge_record_id(v: &serde_json::Value) -> Option<&str> {
+    v.get("edge_id")
+        .or_else(|| v.get("id"))
+        .and_then(|id| id.as_str())
+}
+
 /// Collect edge record IDs from edges.ndjson into a set.
 ///
 /// Edge records use `"edge_id"` as the canonical key (ADR-002 / portability
@@ -63,13 +70,7 @@ pub fn collect_ids(content: &str) -> std::collections::HashSet<String> {
 /// in either serialization form.
 pub fn collect_edge_ids(content: &str) -> std::collections::HashSet<String> {
     parsed_ndjson_values(content)
-        .filter_map(|v| {
-            // Prefer the canonical `edge_id` field; fall back to `id`.
-            v.get("edge_id")
-                .or_else(|| v.get("id"))
-                .and_then(|i| i.as_str())
-                .map(str::to_string)
-        })
+        .filter_map(|v| edge_record_id(&v).map(str::to_string))
         .collect()
 }
 
@@ -89,6 +90,7 @@ fn validate_severity(rule_id: &str, s: &str) -> Option<RuleResult> {
             severity: "error",
             passed: false,
             violations: vec![Violation {
+                source: None,
                 entity_id: None,
                 entity_name: None,
                 entity_kind: None,
@@ -130,6 +132,7 @@ pub fn evaluate(
                     severity: "error",
                     passed: false,
                     violations: vec![Violation {
+                        source: None,
                         entity_id: None,
                         entity_name: None,
                         entity_kind: None,
@@ -246,6 +249,12 @@ fn evaluate_rule(rule: &RuleConfig, path: &str) -> Vec<Violation> {
     let condition: Option<(&str, &str)> = rule.condition.as_deref().and_then(|c| c.split_once('='));
 
     let sev = severity_static(&rule.severity);
+    let is_edge_rule = rule.kind == "edge";
+    let source = Some(if is_edge_rule {
+        NdjsonSource::Edges
+    } else {
+        NdjsonSource::Entities
+    });
     let mut violations = Vec::new();
 
     for line in content.lines().filter(|l| !l.trim().is_empty()) {
@@ -259,8 +268,14 @@ fn evaluate_rule(rule: &RuleConfig, path: &str) -> Vec<Violation> {
                 let src = edge_source_id(&v).unwrap_or("");
                 let tgt = edge_target_id(&v).unwrap_or("");
                 if src == tgt {
+                    let id = if is_edge_rule {
+                        edge_record_id(&v).filter(|id| !id.is_empty())
+                    } else {
+                        Some(src)
+                    };
                     violations.push(Violation {
-                        entity_id: Some(src.to_owned()),
+                        source,
+                        entity_id: id.map(str::to_owned),
                         entity_name: None,
                         entity_kind: v
                             .get("relation")
@@ -268,7 +283,7 @@ fn evaluate_rule(rule: &RuleConfig, path: &str) -> Vec<Violation> {
                             .map(str::to_owned),
                         rule_id: rule.id.clone(),
                         severity: sev,
-                        message: rule.message.replace("{id}", src),
+                        message: rule.message.replace("{id}", id.unwrap_or("")),
                         fixable: false,
                     });
                 }
@@ -284,18 +299,20 @@ fn evaluate_rule(rule: &RuleConfig, path: &str) -> Vec<Violation> {
         if let Some(req) = rule.require_field.as_deref() {
             let val = v.get(req).and_then(|f| f.as_str()).unwrap_or("");
             if val.is_empty() {
-                let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                let id = if is_edge_rule {
+                    edge_record_id(&v)
+                } else {
+                    v.get("id").and_then(|id| id.as_str())
+                }
+                .filter(|id| !id.is_empty());
                 violations.push(Violation {
-                    entity_id: if id.is_empty() {
-                        None
-                    } else {
-                        Some(id.to_owned())
-                    },
+                    source,
+                    entity_id: id.map(str::to_owned),
                     entity_name: v.get("name").and_then(|n| n.as_str()).map(str::to_owned),
                     entity_kind: v.get("kind").and_then(|k| k.as_str()).map(str::to_owned),
                     rule_id: rule.id.clone(),
                     severity: sev,
-                    message: rule.message.replace("{id}", id),
+                    message: rule.message.replace("{id}", id.unwrap_or("")),
                     fixable: false,
                 });
             }
@@ -515,6 +532,7 @@ pub fn check_edge_endpoint_types(
 
             if !allowed {
                 violations.push(Violation {
+                    source: Some(NdjsonSource::Edges),
                     entity_id: Some(src_id.to_string()),
                     entity_name: None,
                     entity_kind: Some(src.kind.clone()),
@@ -599,6 +617,7 @@ pub fn check_edge_direction_conventions(
                     && rule.forward_target_kinds.iter().any(|k| k == &src.kind);
                 if reversed {
                     violations.push(Violation {
+                        source: Some(NdjsonSource::Edges),
                         entity_id: Some(src_id.to_string()),
                         entity_name: None,
                         entity_kind: Some(src.kind.clone()),
@@ -663,6 +682,7 @@ pub fn check_dangling_refs(
                     if let Some(id) = id {
                         if !known_ids.contains(id) {
                             violations.push(Violation {
+                                source: Some(NdjsonSource::Edges),
                                 entity_id: Some(id.to_string()),
                                 entity_name: None,
                                 entity_kind: None,
@@ -735,6 +755,7 @@ pub fn check_naming_conventions(entities_path: &str, cfg: &NamingConventionsConf
 
             if name.trim().is_empty() {
                 violations.push(Violation {
+                    source: Some(NdjsonSource::Entities),
                     entity_id: id.clone(),
                     entity_name: Some(name.to_string()),
                     entity_kind: kind.clone(),
@@ -747,6 +768,7 @@ pub fn check_naming_conventions(entities_path: &str, cfg: &NamingConventionsConf
             }
             if no_ws && name != name.trim() {
                 violations.push(Violation {
+                    source: Some(NdjsonSource::Entities),
                     entity_id: id.clone(),
                     entity_name: Some(name.to_string()),
                     entity_kind: kind.clone(),
@@ -758,6 +780,7 @@ pub fn check_naming_conventions(entities_path: &str, cfg: &NamingConventionsConf
             }
             if no_paren && has_parenthetical_suffix(name) {
                 violations.push(Violation {
+                    source: Some(NdjsonSource::Entities),
                     entity_id: id.clone(),
                     entity_name: Some(name.to_string()),
                     entity_kind: kind.clone(),
@@ -772,6 +795,7 @@ pub fn check_naming_conventions(entities_path: &str, cfg: &NamingConventionsConf
             }
             if name.chars().count() > max_length {
                 violations.push(Violation {
+                    source: Some(NdjsonSource::Entities),
                     entity_id: id.clone(),
                     entity_name: Some(name.to_string()),
                     entity_kind: kind.clone(),
@@ -857,7 +881,10 @@ pub fn check_citation_date_lint(
     let sev = severity_static(&cfg.severity);
     let mut violations = Vec::new();
 
-    for path in [entities_path, notes_path] {
+    for (path, source) in [
+        (entities_path, NdjsonSource::Entities),
+        (notes_path, NdjsonSource::Notes),
+    ] {
         {
             let content = path;
             for line in content.lines().filter(|l| !l.trim().is_empty()) {
@@ -878,6 +905,7 @@ pub fn check_citation_date_lint(
                     };
                     if let Some(desc) = future_date_description(value, &now) {
                         violations.push(Violation {
+                            source: Some(source),
                             entity_id: id.clone(),
                             entity_name: name.clone(),
                             entity_kind: kind.clone(),

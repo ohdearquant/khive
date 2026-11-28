@@ -3,6 +3,15 @@ fn actor_registry(
     actor: &str,
     namespace: &str,
 ) -> (VerbRegistry, KhiveRuntime) {
+    actor_registry_with_route(backend, actor, namespace, None)
+}
+
+fn actor_registry_with_route(
+    backend: Arc<khive_db::StorageBackend>,
+    actor: &str,
+    namespace: &str,
+    route: Option<Arc<dyn crate::node_route::NodeSendRoute>>,
+) -> (VerbRegistry, KhiveRuntime) {
     let runtime = KhiveRuntime::from_backend(
         backend,
         RuntimeConfig {
@@ -35,7 +44,11 @@ fn actor_registry(
     );
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-    builder.register(CommPack::new(runtime.clone()));
+    let mut comm_pack = CommPack::new(runtime.clone());
+    if let Some(route) = route {
+        comm_pack = comm_pack.with_node_route(route);
+    }
+    builder.register(comm_pack);
     builder.with_actor_id(Some(actor.to_string()));
     builder.with_default_namespace(namespace);
     (builder.build().expect("actor registry"), runtime)

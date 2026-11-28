@@ -91,3 +91,86 @@ async fn async_phase_cannot_degrade_cancelled_work_to_success() {
 
     assert!(matches!(result, Err(StorageError::Timeout { .. })));
 }
+
+#[tokio::test]
+async fn request_id_is_scoped_kept_by_an_empty_inner_scope_and_inherited() {
+    assert_eq!(current_request_id(), None);
+
+    let (inner, after_empty, child, after_deadline) = scope_request_id(Some(41), async {
+        let inner = scope_request_id(Some(42), async { current_request_id() }).await;
+        let after_empty = scope_request_id(None, async { current_request_id() }).await;
+        let child = tokio::spawn(inherit_request_read_context(async { current_request_id() }))
+            .await
+            .expect("child task");
+        let after_deadline =
+            scope_request_read_deadline(Duration::from_secs(60), async { current_request_id() })
+                .await;
+        (inner, after_empty, child, after_deadline)
+    })
+    .await;
+
+    assert_eq!(inner, Some(42), "an inner id replaces the outer one");
+    assert_eq!(
+        after_empty,
+        Some(41),
+        "an empty inner scope keeps the outer id"
+    );
+    assert_eq!(
+        child,
+        Some(41),
+        "a child spawned with the inherited context keeps the id"
+    );
+    assert_eq!(
+        after_deadline,
+        Some(41),
+        "a nested deadline scope keeps the id"
+    );
+    assert_eq!(
+        tokio::spawn(async { current_request_id() }).await.unwrap(),
+        None,
+        "a task outside every scope has no id"
+    );
+}
+
+#[tokio::test]
+async fn request_client_cwd_is_scoped_kept_by_an_empty_inner_scope_and_inherited() {
+    assert_eq!(current_request_client_cwd(), None);
+
+    let (after_empty, child, inside_request_id_scope) =
+        scope_request_client_cwd(Some("/work/a".to_string()), async {
+            let after_empty =
+                scope_request_client_cwd(None, async { current_request_client_cwd() }).await;
+            let child = tokio::spawn(inherit_request_read_context(async {
+                current_request_client_cwd()
+            }))
+            .await
+            .expect("child task");
+            let inside_request_id_scope =
+                scope_request_id(Some(7), async { current_request_client_cwd() }).await;
+            (after_empty, child, inside_request_id_scope)
+        })
+        .await;
+
+    assert_eq!(
+        after_empty.as_deref(),
+        Some("/work/a"),
+        "an empty inner scope keeps the outer value"
+    );
+    assert_eq!(
+        child.as_deref(),
+        Some("/work/a"),
+        "an inheriting child keeps the value"
+    );
+    assert_eq!(
+        inside_request_id_scope.as_deref(),
+        Some("/work/a"),
+        "a nested request ID scope keeps the value"
+    );
+    assert_eq!(
+        tokio::spawn(async { current_request_client_cwd() })
+            .await
+            .unwrap(),
+        None,
+        "a task outside every scope has no value"
+    );
+}

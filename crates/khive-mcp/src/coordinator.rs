@@ -208,19 +208,21 @@ pub trait CoordinatorService: Send + Sync {
     /// boundary cannot silently narrow the public wire shape.
     ///
     /// `extra_visible` is the caller's resolved extra read-visibility
-    /// namespaces beyond `namespace` itself (MAJ-3 fix) — the same
+    /// namespaces beyond `namespace` itself — the same
     /// `['local'] ∪ visible_namespaces` set the normal registry dispatch path
     /// authorizes with, or empty when the caller named an explicit
     /// `namespace=` (which intentionally narrows visibility). Implementations
     /// must authorize each backend's search token with this widened set
     /// rather than `namespace` alone, or a namespace visible only through
     /// `visible_namespaces` silently drops out of coordinator search results.
+    /// Caller cancellation or an elapsed request deadline returns the original
+    /// typed error; backend-local failures remain in a successful partial result.
     async fn fan_out_search(
         &self,
         request: &ValidatedSearchRequest,
         namespace: &Namespace,
         extra_visible: &[Namespace],
-    ) -> CoordSearchResult;
+    ) -> Result<CoordSearchResult, RuntimeError>;
 
     /// Search with the gate-authorized caller token and original arguments.
     /// Older coordinators can still serve entity searches. Note searches
@@ -238,9 +240,22 @@ pub trait CoordinatorService: Send + Sync {
                     .into(),
             ));
         }
-        Ok(self
-            .fan_out_search(request, token.gate_namespace(), extra_visible)
-            .await)
+        self.fan_out_search(request, token.gate_namespace(), extra_visible)
+            .await
+    }
+
+    /// Scoped note search with the number of otherwise eligible notes excluded
+    /// by the effective status selector. Unavailable implementations fail closed.
+    async fn fan_out_note_search_scoped_with_count(
+        &self,
+        _request: &ValidatedSearchRequest,
+        _token: &NamespaceToken,
+        _args: &serde_json::Value,
+        _extra_visible: &[Namespace],
+    ) -> Result<(CoordSearchResult, u64), RuntimeError> {
+        Err(RuntimeError::Internal(
+            "this coordinator does not support note search status disclosure".into(),
+        ))
     }
 
     /// True when only one backend is registered (zero-change invariant check).

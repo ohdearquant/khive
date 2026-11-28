@@ -359,6 +359,41 @@ fn store_guard_refuses_a_database_named_like_a_lock_sidecar() {
     );
 }
 
+/// A store under an ancestor the daemon may pass through but not list is claimed:
+/// ancestors are opened search-only. A sandboxed run grants exactly that on the
+/// directories above its temporary directory.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn store_guard_claims_under_an_ancestor_it_may_search_but_not_list() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("fixture");
+    let root = dir.path().canonicalize().expect("canonical fixture");
+    let passage = root.join("passage");
+    let database = passage.join("stores/khive.db");
+    std::fs::create_dir_all(database.parent().unwrap()).expect("store directory");
+    std::fs::set_permissions(&passage, std::fs::Permissions::from_mode(0o111))
+        .expect("search-only ancestor");
+
+    let listed = std::fs::read_dir(&passage).map(|_| ());
+    let claimed = acquire_daemon_store_guards([database.clone()]);
+    std::fs::set_permissions(&passage, std::fs::Permissions::from_mode(0o755))
+        .expect("restore the fixture");
+
+    assert_eq!(
+        listed
+            .expect_err("control: the ancestor cannot be listed")
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let guards = claimed.expect("a claim under a search-only ancestor");
+    assert!(passage.join("stores/.khive.db.khived.lock").is_file());
+    drop(guards);
+}
+
 #[test]
 fn store_guard_read_only_claim_refuses_a_missing_parent_without_creating_anything() {
     let dir = tempfile::tempdir().expect("fixture");

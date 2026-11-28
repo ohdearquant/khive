@@ -18,6 +18,10 @@ const PR_MERGE: &str = include_str!("fixtures/pr_merge.charter");
 
 const PR: &str = "acme/widgets#7";
 
+mod refused_values_tests {
+    include!("workflows_tests/refused_values.rs");
+}
+
 struct Fixture {
     runtime: KhiveRuntime,
     registry: VerbRegistry,
@@ -846,9 +850,7 @@ async fn observations_and_starts_are_checked_against_the_registry() {
                 Some(khive_runtime::RequestIdentity {
                     namespace: "local".to_owned(),
                     actor_id: Some(actor.to_owned()),
-                    visible_namespaces: vec![],
-                    process_ref: None,
-                    request_id: None,
+                    ..Default::default()
                 }),
             )
             .await
@@ -2457,9 +2459,7 @@ async fn charter_waiting_only_returns_phases_owed_to_the_caller() {
     let identity = khive_runtime::RequestIdentity {
         namespace: "local".to_owned(),
         actor_id: Some("actor-5".to_owned()),
-        visible_namespaces: vec![],
-        process_ref: None,
-        request_id: None,
+        ..Default::default()
     };
 
     let unfiltered = f
@@ -2544,8 +2544,7 @@ async fn charter_start_rejects_a_subject_owned_by_an_unseen_namespace() {
         namespace: "team_a".to_owned(),
         actor_id: Some("actor-1".to_owned()),
         visible_namespaces: vec![],
-        process_ref: None,
-        request_id: None,
+        ..Default::default()
     };
 
     let result = f
@@ -2583,8 +2582,7 @@ async fn charter_observe_rejects_a_subject_outside_visible_namespaces() {
         namespace: "team_a".to_owned(),
         actor_id: Some("actor-1".to_owned()),
         visible_namespaces: vec![],
-        process_ref: None,
-        request_id: None,
+        ..Default::default()
     };
 
     let result = f
@@ -2640,9 +2638,7 @@ async fn charter_request_id_reuse_in_another_namespace_is_a_conflict() {
     let identity = |namespace: &str| khive_runtime::RequestIdentity {
         namespace: namespace.to_owned(),
         actor_id: Some("actor-1".to_owned()),
-        visible_namespaces: vec![],
-        process_ref: None,
-        request_id: None,
+        ..Default::default()
     };
     let first = f
         .registry
@@ -2675,9 +2671,7 @@ async fn waiting_as(f: &Fixture, actor: &str, params: Value) -> Value {
             Some(khive_runtime::RequestIdentity {
                 namespace: "local".to_owned(),
                 actor_id: Some(actor.to_owned()),
-                visible_namespaces: vec![],
-                process_ref: None,
-                request_id: None,
+                ..Default::default()
             }),
         )
         .await

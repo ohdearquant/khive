@@ -62,8 +62,24 @@ NUMBER_WORDS = {
     "eighteen": 18,
     "nineteen": 19,
     "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+    "seventy": 70,
+    "eighty": 80,
+    "ninety": 90,
 }
-COUNT_TOKEN = rf"(?:\d+|{'|'.join(NUMBER_WORDS)})"
+TENS_WORDS = ("twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety")
+UNIT_WORDS = ("one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
+# A compound such as "twenty-one" is one token. The lookbehind keeps a count
+# from starting inside a hyphenated word, so the last part of a compound is
+# never read as the whole number.
+COUNT_TOKEN = (
+    rf"(?<![A-Za-z]-)(?:\d+"
+    rf"|(?:{'|'.join(TENS_WORDS)})-(?:{'|'.join(UNIT_WORDS)})"
+    rf"|{'|'.join(NUMBER_WORDS)})"
+)
 VERB_COUNT_MODIFIERS = r"(?:(?:public|agent-facing|production|mcp-callable|bare)\s+)*"
 PACK_COUNT_MODIFIERS = r"(?:(?:built-in|default(?:-loaded)?|loaded|production)\s+)*"
 VERB_COUNT_RE = re.compile(
@@ -177,7 +193,10 @@ def registry_counts(verbs_result: object) -> RegistryCounts:
 
 def _number(token: str) -> int:
     lowered = token.lower()
-    return int(lowered) if lowered.isdigit() else NUMBER_WORDS[lowered]
+    if lowered.isdigit():
+        return int(lowered)
+    tens, _, unit = lowered.partition("-")
+    return NUMBER_WORDS[tens] + (NUMBER_WORDS[unit] if unit else 0)
 
 
 def _plain(line: str) -> str:
@@ -614,7 +633,6 @@ PUBLISHED_NAMES = (
     "README.md",
     "AGENTS.md",
     "CLAUDE.md",
-    "npm/README.md",
     "cli/main.ts",
     "cli/tests/golden/help_toplevel.txt",
 )

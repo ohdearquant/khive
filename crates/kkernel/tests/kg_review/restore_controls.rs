@@ -21,7 +21,7 @@ fn restore_review_refuses_approval_through_uncovered_path() {
     });
     let (changeset, rules) = write_case(
         temp.path(),
-        "family:atlas",
+        "family:bob",
         &[create(other, "Other entity"), restore.to_string()],
     );
     let before_entries = directory_entries(temp.path());
@@ -68,8 +68,8 @@ fn restore_review_refuses_approval_through_uncovered_path() {
 #[test]
 fn version_one_is_refused_before_review() {
     let temp = TempDir::new().expect("temp dir");
-    let (changeset, rules) = write_case(temp.path(), "family:atlas", &[]);
-    let mut old: serde_json::Value = serde_json::from_str(&envelope("family:atlas")).unwrap();
+    let (changeset, rules) = write_case(temp.path(), "family:bob", &[]);
+    let mut old: serde_json::Value = serde_json::from_str(&envelope("family:bob")).unwrap();
     old["schema_version"] = serde_json::json!(1);
     std::fs::write(&changeset, format!("{old}\n")).unwrap();
     let output = run_review(&changeset, &rules, Some("family:independent"));

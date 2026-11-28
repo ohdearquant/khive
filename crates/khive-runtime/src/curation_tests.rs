@@ -303,7 +303,7 @@ async fn list_undelivered_outbound_messages_email_row_past_the_scan_window() {
     email.created_at -= 1_000_000;
     email.updated_at = email.created_at;
     email.properties =
-        Some(serde_json::json!({"direction": "outbound", "to_actor": "email:ocean@example.test"}));
+        Some(serde_json::json!({"direction": "outbound", "to_actor": "email:reader@example.test"}));
     let email_id = email.id;
 
     let mut fillers = Vec::with_capacity(FILLERS);
@@ -1948,6 +1948,7 @@ async fn update_entity_type_patch_validates_preserves_fields_and_requires_reinde
                 entity_type: Some(Some(" Algorithm ".to_string())),
                 ..Default::default()
             },
+            &[],
         )
         .await
         .expect("registered entity_type must validate");
@@ -1974,6 +1975,7 @@ async fn update_entity_type_patch_validates_preserves_fields_and_requires_reinde
                 entity_type: Some(Some("not_registered".to_string())),
                 ..Default::default()
             },
+            &[],
         )
         .await
         .expect_err("unregistered entity_type must be rejected");
@@ -2055,6 +2057,7 @@ async fn concurrent_entity_property_patches_from_one_revision_only_one_survives(
                     properties: Some(serde_json::json!({"a": 1})),
                     ..Default::default()
                 },
+                &[],
             )
             .await
         })
@@ -2072,6 +2075,7 @@ async fn concurrent_entity_property_patches_from_one_revision_only_one_survives(
                     properties: Some(serde_json::json!({"b": 1})),
                     ..Default::default()
                 },
+                &[],
             )
             .await
         })
@@ -2258,6 +2262,7 @@ async fn entity_cas_refuses_a_replacement_revision_that_does_not_advance() {
                 properties: Some(serde_json::json!({"a": 1})),
                 ..Default::default()
             },
+            &[],
         )
         .await
         .expect("prepare update");
@@ -2343,6 +2348,7 @@ async fn entity_cas_refuses_a_stale_replacement_that_would_resurrect_a_tombstone
                 properties: Some(serde_json::json!({"a": 1})),
                 ..Default::default()
             },
+            &[],
         )
         .await
         .expect("prepare update");
@@ -2553,7 +2559,7 @@ async fn update_entity_reindexes_when_name_changes() {
 
     assert!(
         !hits_old.contains(&entity.id),
-        "old name should no longer match after rename"
+        "the plain runtime update keeps no rename alias, so the old name no longer matches"
     );
     assert!(
         hits_new.contains(&entity.id),
@@ -9127,6 +9133,7 @@ async fn run_entity_merge_with_limits(
                 limits,
                 Uuid::new_v4(),
                 None,
+                None,
             )
             .map_err(|error| match error {
                 MergeSqlError::Sqlite(error) => error,
@@ -9169,6 +9176,7 @@ async fn preview_entity_merge_bytes(rt: &KhiveRuntime, into_id: Uuid, from_id: U
                     max_bytes: usize::MAX,
                 },
                 Uuid::new_v4(),
+                None,
                 None,
             )
             .map_err(|error| match error {
@@ -9941,6 +9949,8 @@ async fn persist_prepared_entity_update_rejects_reserved_final_object() {
             entity.updated_at,
             entity.deleted_at,
             None,
+            Vec::new(),
+            None,
         )
         .await
         .expect_err("the persistence boundary must reject a reserved final property");
@@ -10330,7 +10340,16 @@ async fn committed_entity_update_records_event_before_reindex_failure() {
         )
         .await
         .expect_err("the injected reindex error must be surfaced");
-    assert!(error.to_string().contains("injected FTS failure"));
+    let RuntimeError::Khive(error) = error else {
+        panic!("expected committed-update diagnostic");
+    };
+    let details = error.details().unwrap();
+    assert_eq!(details.get("committed"), Some("true"));
+    assert_eq!(details.get("retryable"), Some("false"));
+    assert!(details
+        .get("post_commit_degradations")
+        .unwrap()
+        .contains("fts_prepare"));
     assert_eq!(rt.get_entity(&tok, entity.id).await.unwrap().name, "After");
     let events = rt
         .events(&tok)
@@ -11095,4 +11114,221 @@ async fn merge_fts_insert_matches_canonical_document() {
             assert_eq!(value, &expected, "{column}; notes={notes}, named={named}");
         }
     }
+}
+
+fn rename_to(name: &str) -> EntityPatch {
+    EntityPatch {
+        name: Some(name.to_owned()),
+        ..Default::default()
+    }
+}
+
+fn rename_alias(alias: &str) -> khive_storage::entity::EntityAlias {
+    khive_storage::entity::EntityAlias {
+        alias: alias.to_owned(),
+        origin: khive_storage::entity::EntityAliasOrigin::Rename,
+    }
+}
+
+/// ADR-221 section 3, acceptance 8: a rename keeps the old name as a
+/// `rename` alias and the event names both names.
+#[tokio::test]
+async fn a_rename_keeps_the_old_name_and_the_event_names_both() {
+    let rt = rt();
+    let tok = NamespaceToken::local();
+    let entity = rt
+        .create_entity(&tok, "concept", None, "Old Name", None, None, vec![])
+        .await
+        .unwrap();
+    let (renamed, _) = rt
+        .update_entity_with_aliases_and_index_report(
+            &tok,
+            entity.id,
+            rename_to("New Name"),
+            &crate::EntityAliasChange::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(renamed.aliases, vec![rename_alias("Old Name")]);
+    assert_eq!(
+        rt.get_entity(&tok, entity.id).await.unwrap().aliases,
+        vec![rename_alias("Old Name")]
+    );
+    let events = entity_update_events(&rt, &tok).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].payload["changed_fields"],
+        serde_json::json!(["name", "aliases"])
+    );
+    assert_eq!(events[0].payload["previous_name"], "Old Name");
+    assert_eq!(events[0].payload["name"], "New Name");
+}
+
+/// Acceptance 8 and 9: `keep_old_name: false` keeps no alias, and the event
+/// still names the previous name.
+#[tokio::test]
+async fn keep_old_name_false_keeps_no_alias_and_the_event_names_both() {
+    let rt = rt();
+    let tok = NamespaceToken::local();
+    let entity = rt
+        .create_entity(&tok, "concept", None, "Old Name", None, None, vec![])
+        .await
+        .unwrap();
+    let (renamed, _) = rt
+        .update_entity_with_aliases_and_index_report(
+            &tok,
+            entity.id,
+            rename_to("New Name"),
+            &crate::EntityAliasChange::default().keeping_old_name(false),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(renamed.aliases.is_empty());
+    assert!(rt
+        .get_entity(&tok, entity.id)
+        .await
+        .unwrap()
+        .aliases
+        .is_empty());
+    let events = entity_update_events(&rt, &tok).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].payload["changed_fields"],
+        serde_json::json!(["name"])
+    );
+    assert_eq!(events[0].payload["previous_name"], "Old Name");
+    assert_eq!(events[0].payload["name"], "New Name");
+}
+
+/// A rename through the plain runtime update keeps no alias: packs use it
+/// for names they derive themselves. The event still names both names.
+#[tokio::test]
+async fn a_rename_through_the_plain_runtime_update_keeps_no_alias() {
+    let rt = rt();
+    let tok = NamespaceToken::local();
+    let entity = rt
+        .create_entity(&tok, "concept", None, "Old Name", None, None, vec![])
+        .await
+        .unwrap();
+    let (renamed, _) = rt
+        .update_entity_with_embedding_report(&tok, entity.id, rename_to("New Name"))
+        .await
+        .unwrap();
+    assert!(renamed.aliases.is_empty());
+    assert!(rt
+        .get_entity(&tok, entity.id)
+        .await
+        .unwrap()
+        .aliases
+        .is_empty());
+    let events = entity_update_events(&rt, &tok).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].payload["previous_name"], "Old Name");
+    assert_eq!(events[0].payload["name"], "New Name");
+}
+
+/// An update that leaves the name alone names no previous name.
+#[tokio::test]
+async fn an_update_that_keeps_the_name_names_no_previous_name() {
+    let rt = rt();
+    let tok = NamespaceToken::local();
+    let entity = rt
+        .create_entity(&tok, "concept", None, "Same", None, None, vec![])
+        .await
+        .unwrap();
+    rt.update_entity_with_aliases_and_index_report(
+        &tok,
+        entity.id,
+        EntityPatch {
+            description: Some(Some("described".to_owned())),
+            ..Default::default()
+        },
+        &crate::EntityAliasChange::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let events = entity_update_events(&rt, &tok).await;
+    assert_eq!(events.len(), 1);
+    assert!(events[0].payload.get("previous_name").is_none());
+    assert!(events[0].payload.get("name").is_none());
+}
+
+/// The admin route keeps both halves of the rule: a rename onto a held
+/// alias drops that alias whatever wrote it, and keeps the old name.
+#[tokio::test]
+async fn the_admin_route_renames_onto_a_held_alias_and_keeps_the_old_name() {
+    let rt = rt();
+    let tok = NamespaceToken::local();
+    let entity = rt
+        .create_entity(&tok, "concept", None, "A", None, None, vec![])
+        .await
+        .unwrap();
+    rt.sql()
+        .writer()
+        .await
+        .unwrap()
+        .execute(khive_db::stores::entity::entity_alias_insert_statement(
+            &entity.namespace,
+            entity.id,
+            "B",
+            khive_storage::entity::EntityAliasOrigin::Merge,
+            1,
+        ))
+        .await
+        .unwrap();
+    let current = rt.get_entity(&tok, entity.id).await.unwrap();
+    assert_eq!(current.aliases.len(), 1);
+    let renamed = rt
+        .update_entity_if_unchanged(&tok, &current, rename_to("B"), &[])
+        .await
+        .unwrap();
+    assert_eq!(renamed.name, "B");
+    assert_eq!(renamed.aliases, vec![rename_alias("A")]);
+    assert_eq!(
+        rt.get_entity(&tok, entity.id).await.unwrap().aliases,
+        vec![rename_alias("A")]
+    );
+    let events = entity_update_events(&rt, &tok).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].payload["changed_fields"],
+        serde_json::json!(["name", "aliases"])
+    );
+    assert_eq!(events[0].payload["previous_name"], "A");
+}
+
+/// An entity with an empty name, such as a pack's placeholder row before its
+/// first update, can be merged; its empty name never becomes an alias.
+#[tokio::test]
+async fn a_merge_keeps_no_empty_name_as_an_alias() {
+    let rt = rt();
+    let tok = NamespaceToken::local();
+    let kept = rt
+        .create_entity(&tok, "concept", None, "Kept", None, None, vec![])
+        .await
+        .unwrap();
+    let placeholder = khive_storage::Entity::new(tok.namespace().as_str(), "concept", "");
+    rt.entities(&tok)
+        .unwrap()
+        .upsert_entity(placeholder.clone())
+        .await
+        .unwrap();
+    rt.merge_entity_with_reason_and_force(
+        &tok,
+        kept.id,
+        placeholder.id,
+        EntityDedupMergePolicy::PreferInto,
+        ContentMergeStrategy::Append,
+        false,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    let merged = rt.get_entity(&tok, kept.id).await.unwrap();
+    assert_eq!(merged.name, "Kept");
+    assert!(merged.aliases.is_empty(), "{:?}", merged.aliases);
 }

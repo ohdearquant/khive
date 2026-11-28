@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use khive_db::pool::NoteSearchFallbackCause;
 use lattice_embed::{EmbeddingModel, EmbeddingRole, EmbeddingService, TokenCount, MAX_TEXT_BYTES};
 use uuid::Uuid;
 
@@ -11,6 +12,7 @@ use crate::embedder_registry::with_embedding_admission;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 use khive_retrieval::hybrid::{combine_leg_first_appearance, fuse_labelled, HitLabel};
+use khive_retrieval::HYBRID_CANDIDATE_MULTIPLIER as CANDIDATE_MULTIPLIER;
 use khive_score::DeterministicScore;
 use khive_storage::types::{
     PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorRecord,
@@ -66,9 +68,6 @@ pub fn arm_backfill_reader_fail() {
 /// which dedup-before-create needs at graph sizes of 50–2700 entities.
 const RRF_K: usize = 10;
 
-/// Candidates pulled per path before fusion. Higher = better recall, more work.
-const CANDIDATE_MULTIPLIER: u32 = 4;
-
 /// Advisory emitted by write verbs when only the embedding input was bounded.
 pub const EMBEDDING_INPUT_TRUNCATED_WARNING: &str =
     "embedding input was truncated to the embedder maximum; full content was stored unchanged";
@@ -87,6 +86,36 @@ pub struct DocumentEmbeddingOutcome {
     /// None means the provider does not support token reporting.
     pub provider_token_count: Option<TokenCount>,
     pub truncated: bool,
+}
+
+// The provider's token count describes the byte-bounded input; it does not
+// estimate tokens discarded by the earlier byte limit.
+fn document_vector_or_refusal(outcome: DocumentEmbeddingOutcome) -> RuntimeResult<Vec<f32>> {
+    if !outcome.truncated {
+        return Ok(outcome.vector);
+    }
+    let token_count = outcome
+        .provider_token_count
+        .filter(|count| count.truncated());
+    let byte_cut = outcome.source_bytes > outcome.embedded_bytes;
+    let detail = match (byte_cut, token_count) {
+        (true, Some(count)) => format!(
+            "from {} to {} bytes and from {} to {} provider tokens for the byte-bounded input",
+            outcome.source_bytes, outcome.embedded_bytes, count.before_truncation, count.embedded
+        ),
+        (true, None) => format!(
+            "from {} to {} bytes",
+            outcome.source_bytes, outcome.embedded_bytes
+        ),
+        (false, Some(count)) => format!(
+            "from {} to {} provider tokens",
+            count.before_truncation, count.embedded
+        ),
+        (false, None) => "by an unspecified input limit".to_string(),
+    };
+    Err(RuntimeError::InvalidInput(format!(
+        "embedding input truncated {detail}; use embed_document_outcome to inspect the bounded vector"
+    )))
 }
 
 /// Aggregate truncation accounting for one logical write or reindex batch.
@@ -416,13 +445,7 @@ impl KhiveRuntime {
     /// inspect the vector together with the truncation metadata.
     pub async fn embed_document(&self, text: &str) -> RuntimeResult<Vec<f32>> {
         let outcome = self.embed_document_outcome(text).await?;
-        if outcome.truncated {
-            return Err(RuntimeError::InvalidInput(format!(
-                "embedding input truncated from {} to {} bytes; use embed_document_outcome to inspect the bounded vector",
-                outcome.source_bytes, outcome.embedded_bytes
-            )));
-        }
-        Ok(outcome.vector)
+        document_vector_or_refusal(outcome)
     }
 
     /// Embed a document with the default model and retain input-bounding metadata.
@@ -670,8 +693,8 @@ impl KhiveRuntime {
     }
 
     /// The note-search vector leg uses the pack-owned graph when that model
-    /// has an installed, consumer-protected bridge. Only a missing graph for
-    /// this consumer takes the existing exact sqlite-vec route.
+    /// has an installed, consumer-protected bridge. A missing model, backend
+    /// provider, or eligible graph takes the existing exact sqlite-vec route.
     pub(crate) async fn note_search_vector_search(
         &self,
         token: &NamespaceToken,
@@ -684,16 +707,19 @@ impl KhiveRuntime {
             None => self.embed_query_for_token(token, query_text).await?,
         };
         let model = self.default_embedder_name();
-        if !model.is_empty() {
-            if let Some(provider) = self.note_search_ann_provider()? {
-                if let Some(hits) = provider.search(token, model, &embedding, top_k).await? {
-                    crate::note_search_ann::record_ann_route();
-                    crate::usage::count(crate::usage::UsageUnit::VectorPasses, 1);
-                    return Ok(hits);
-                }
+        let fallback_cause = if model.is_empty() {
+            NoteSearchFallbackCause::NoModel
+        } else if let Some(provider) = self.note_search_ann_provider()? {
+            if let Some(hits) = provider.search(token, model, &embedding, top_k).await? {
+                crate::note_search_ann::record_ann_route(self.backend().pool());
+                crate::usage::count(crate::usage::UsageUnit::VectorPasses, 1);
+                return Ok(hits);
             }
-        }
-        crate::note_search_ann::record_fallback_route();
+            NoteSearchFallbackCause::NoEligibleGraph
+        } else {
+            NoteSearchFallbackCause::NoProvider
+        };
+        crate::note_search_ann::record_fallback_route(self.backend().pool(), fallback_cause);
         self.vector_search(
             token,
             Some(embedding),

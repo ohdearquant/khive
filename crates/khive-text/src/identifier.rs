@@ -11,50 +11,46 @@ pub fn is_identifier(text: &str) -> bool {
         return false;
     }
 
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
+    let mut chars = text.chars();
+    let mut previous: Option<char> = None;
 
-    // Single-char identifiers: just a letter, no boundary possible
-    if n < 2 {
-        return false;
-    }
-
-    // Check for explicit separator characters
-    for &c in &chars {
-        if matches!(c, '_' | '-' | '/' | '.' | ':') {
+    while let Some(current) = chars.next() {
+        if matches!(current, '_' | '-' | '/' | '.' | ':') {
             return true;
         }
-    }
 
-    // Match the camelCase, acronym-to-word, and digit-letter boundaries used by the splitter.
-    for i in 0..n - 1 {
-        let a = chars[i];
-        let b = chars[i + 1];
-        if (a.is_ascii_lowercase() && b.is_ascii_uppercase())
-            || is_acronym_boundary(&chars, i + 1)
-            || (a.is_ascii_alphabetic() && b.is_ascii_digit())
-            || (a.is_ascii_digit() && b.is_ascii_alphabetic())
-        {
-            return true;
+        if let Some(prev) = previous {
+            let mut lookahead = chars.clone();
+            let next = lookahead.next();
+            let after_next = lookahead.next();
+            if (prev.is_ascii_lowercase() && current.is_ascii_uppercase())
+                || is_acronym_boundary(prev, current, next, after_next)
+                || (prev.is_ascii_alphabetic() && current.is_ascii_digit())
+                || (prev.is_ascii_digit() && current.is_ascii_alphabetic())
+            {
+                return true;
+            }
         }
+        previous = Some(current);
     }
 
     false
 }
 
-fn is_acronym_boundary(chars: &[char], index: usize) -> bool {
+fn is_acronym_boundary(
+    previous: char,
+    current: char,
+    next: Option<char>,
+    after_next: Option<char>,
+) -> bool {
     // An uppercase pair followed by a lowercase letter starts a word (XMLParser, XMLToJSON),
     // except a terminal plural `s` (APIs, IDs, URLs). An ASCII lowercase letter after the
     // `s` makes it part of the next word instead (DBUsers, APIUsage).
-    index > 0
-        && chars[index - 1].is_ascii_uppercase()
-        && chars[index].is_ascii_uppercase()
-        && chars.get(index + 1).is_some_and(|&next| {
+    previous.is_ascii_uppercase()
+        && current.is_ascii_uppercase()
+        && next.is_some_and(|next| {
             next.is_ascii_lowercase()
-                && (next != 's'
-                    || chars
-                        .get(index + 2)
-                        .is_some_and(|after_s| after_s.is_ascii_lowercase()))
+                && (next != 's' || after_next.is_some_and(|after_s| after_s.is_ascii_lowercase()))
         })
 }
 
@@ -109,7 +105,12 @@ pub fn split_identifier(text: &str, min_part_len: usize) -> Vec<String> {
                 // e.g. camelCase: split before 'C'
                 parts.push(current.clone());
                 current.clear();
-            } else if is_acronym_boundary(&chars, i) {
+            } else if is_acronym_boundary(
+                prev,
+                c,
+                chars.get(i + 1).copied(),
+                chars.get(i + 2).copied(),
+            ) {
                 // e.g. "XMLParser": push "XML", start the next part with "P".
                 parts.push(current.clone());
                 current.clear();

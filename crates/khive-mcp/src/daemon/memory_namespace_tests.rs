@@ -26,20 +26,14 @@ async fn request(
     let frame = DaemonRequestFrame {
         ops,
         presentation: Some("verbose".into()),
-        presentation_per_op: None,
         namespace: "local".into(),
         actor_id: actor.map(str::to_owned),
-        process_ref: None,
         visible_namespaces: visible.iter().map(|ns| (*ns).to_owned()).collect(),
         config_id: config_id.to_owned(),
         protocol_version: PROTOCOL_VERSION,
-        probe_only: false,
-        metrics_only: false,
-        plan: false,
         format: Some("json".into()),
-        format_per_op: None,
         from_wire: true,
-        request_id: None,
+        ..Default::default()
     };
     let response = timeout(Duration::from_secs(10), exchange(socket, &frame))
         .await
@@ -267,17 +261,22 @@ async fn exercise(socket: &Path, config_id: &str) -> [bool; 3] {
         "actor visibility must not relocate observations"
     );
     let local_memories = ids(2);
-    assert_eq!(local_memories.len(), 3);
-    for id in [&writes[0]["id"], &writes[1]["id"], &anonymous[0]["id"]] {
+    assert_eq!(local_memories.len(), 2);
+    for id in [&writes[1]["id"], &anonymous[0]["id"]] {
         assert!(
             local_memories.contains(&id),
-            "semantic, explicit-local and anonymous writes remain local"
+            "explicit-local and anonymous writes remain local"
         );
     }
-    assert_eq!(
-        ids(3),
-        vec![&chain[1]["id"]],
+    let actor_memories = ids(3);
+    assert_eq!(actor_memories.len(), 2);
+    assert!(
+        actor_memories.contains(&&chain[1]["id"]),
         "episodic default writes use the actor namespace"
+    );
+    assert!(
+        actor_memories.contains(&&writes[0]["id"]),
+        "semantic default writes from a bound actor use the actor namespace"
     );
     let anonymous_recall = request(
         socket, config_id, None, &[],

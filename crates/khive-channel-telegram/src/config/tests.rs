@@ -100,12 +100,12 @@ fn from_env_respects_overridden_slug_and_namespace() {
     std::env::set_var("KHIVE_TELEGRAM_BOT_TOKEN", "test-token"); // gitleaks:allow
     std::env::set_var("KHIVE_TELEGRAM_MAINTAINER_CHAT_ID", "42");
     std::env::remove_var("KHIVE_TELEGRAM_AUTHORIZED_SENDER_ID");
-    std::env::set_var("KHIVE_TELEGRAM_MAINTAINER_SLUG", "leo");
-    std::env::set_var("KHIVE_TELEGRAM_INGEST_NAMESPACE", "lambda:leo");
+    std::env::set_var("KHIVE_TELEGRAM_MAINTAINER_SLUG", "alice");
+    std::env::set_var("KHIVE_TELEGRAM_INGEST_NAMESPACE", "lambda:alice");
 
     let config = TelegramChannelConfig::from_env().expect("valid config must succeed");
-    assert_eq!(config.maintainer_slug, "leo");
-    assert_eq!(config.ingest_namespace, "lambda:leo");
+    assert_eq!(config.maintainer_slug, "alice");
+    assert_eq!(config.ingest_namespace, "lambda:alice");
 }
 
 #[test]

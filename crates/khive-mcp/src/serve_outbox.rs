@@ -360,14 +360,23 @@ pub(super) async fn outbox_once(
         )
         .await;
     let outcome = match &scan_result {
-        Ok(notes) => khive_pack_comm::OutboxScanOutcome::Success {
-            pending_rows_seen: notes.len() as u64,
-            pending_rows_limit: SCAN_PAGE_LIMIT,
-            oldest_pending_created_at: notes
-                .iter()
-                .map(|note| note.created_at)
-                .min()
-                .and_then(chrono::DateTime::from_timestamp_micros),
+        Ok(notes) => match runtime
+            .outbound_health_for_channel(&token, policy.prefix(), &channel_slug, include_legacy)
+            .await
+        {
+            Ok(backlog) => khive_pack_comm::OutboxScanOutcome::Success {
+                pending_rows_seen: notes.len() as u64,
+                pending_rows_limit: SCAN_PAGE_LIMIT,
+                oldest_pending_created_at: notes
+                    .iter()
+                    .map(|note| note.created_at)
+                    .min()
+                    .and_then(chrono::DateTime::from_timestamp_micros),
+                backlog,
+            },
+            Err(error) => khive_pack_comm::OutboxScanOutcome::Failure {
+                error_message: error.to_string(),
+            },
         },
         Err(error) => khive_pack_comm::OutboxScanOutcome::Failure {
             error_message: error.to_string(),
@@ -706,7 +715,11 @@ async fn prepare_email(
     let mut external_list_unsubscribe: Option<String> = None;
     let mut external_footer: Option<String> = None;
     if let (true, Some(normalized)) = (external_recipient, normalized_recipient.as_deref()) {
-        let footer = match email_policy.external_footer() {
+        let is_list = props
+            .get("tags")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some("traffic:list")));
+        let footer = match email_policy.external_footer_for_list(is_list) {
             Some(Ok(text)) => text.to_string(),
             Some(Err(reason)) => {
                 let last_error = format!("external email footer is unavailable: {reason}");

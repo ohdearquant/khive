@@ -174,3 +174,52 @@ fn plural_exemption_ends_only_at_an_ascii_lowercase_continuation() {
         assert_eq!(split_identifier(input, 1), vec![input.to_lowercase()]);
     }
 }
+
+#[test]
+fn classifier_keeps_global_guards_and_separator_end_positions() {
+    for (input, expected) in [
+        ("", false),
+        ("a", false),
+        ("APIS", false),
+        ("APIs", false),
+        (":a", true),
+        ("a:", true),
+        ("_a", true),
+        ("a_", true),
+        ("a/", true),
+        ("a.", true),
+        ("a-", true),
+        ("::", false),
+        ("你_中", false),
+        ("A２", false),
+    ] {
+        assert_eq!(is_identifier(input), expected, "input={input:?}");
+    }
+}
+
+#[test]
+fn classifier_rejects_later_whitespace_after_an_early_boundary() {
+    for input in ["aB ", "a_\u{2003}", "a:B\n", "a_b\tmore", "a1\u{2009}"] {
+        assert!(!is_identifier(input), "input={input:?}");
+    }
+}
+
+#[test]
+fn classifier_and_splitter_keep_nul_and_multibyte_lookahead() {
+    for (input, expected_identifier, expected_parts) in [
+        ("a\0B", false, vec!["a\0b"]),
+        ("a\0bC", true, vec!["a\0b", "c"]),
+        ("DBUs\0", false, vec!["dbus\0"]),
+        ("DBUs\0a", false, vec!["dbus\0a"]),
+        ("DBUsa", true, vec!["db", "usa"]),
+        ("éA", false, vec!["éa"]),
+        ("éA1", true, vec!["éa", "1"]),
+    ] {
+        assert_eq!(is_identifier(input), expected_identifier, "input={input:?}");
+        assert_eq!(
+            split_identifier(input, 1),
+            expected_parts,
+            "input={input:?}"
+        );
+    }
+}

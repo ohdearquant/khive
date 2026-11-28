@@ -36,4 +36,4 @@ pub use score::DeterministicScore;
 pub use unit_score::{
     affine_clamped, affine_clamped_f32, boost_factor, boost_factor_f32, UnitScore,
 };
-pub use weights::{NamedWeights, ValidatedWeights};
+pub use weights::{scaled_weighted_mean, NamedWeights, ValidatedWeights};

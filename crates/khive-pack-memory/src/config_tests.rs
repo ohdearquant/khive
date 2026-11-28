@@ -292,6 +292,7 @@ fn partial_config_new_fields_use_defaults() {
 fn score_breakdown_total_sums_contributions() {
     let bd = ScoreBreakdown {
         relevance: 0.5,
+        fused_score: 0.05,
         salience_raw: 0.8,
         salience_decayed: 0.6,
         temporal: 0.3,
@@ -300,8 +301,16 @@ fn score_breakdown_total_sums_contributions() {
             salience_contribution: 0.12,
             temporal_contribution: 0.03,
         },
+        composite: None,
         profile_component: 1.0,
         entity_posterior_mean: None,
+        entity_evidence_mass: None,
+        weights_served: "default".to_string(),
+        namespace: "local".to_string(),
+        pre_entity_score: 0.5,
+        entity_term: 1.0,
+        local_factor: 1.0,
+        duplicate_penalty: 0.0,
     };
     let expected = 0.35 + 0.12 + 0.03;
     let diff = (bd.total() - expected).abs();

@@ -52,11 +52,12 @@ async fn test_episodic_remember_stamps_actor_namespace() {
     );
 }
 
-/// ADR-007 Rev 6: semantic memory → remains in "local" (shared pool).
+/// Semantic memory without `namespace=` lands in the caller's actor namespace.
 ///
-/// Even with actor_id="alice", a semantic memory must land in "local".
+/// With actor_id="alice", a semantic memory is stored in "alice", the same as an
+/// episodic one, and carries no `attribution` flag.
 #[tokio::test]
-async fn test_semantic_remember_stamps_local_namespace() {
+async fn test_semantic_remember_stamps_actor_namespace() {
     let rt = make_runtime();
     let registry = make_registry_with_actor(rt.clone(), "alice");
 
@@ -80,10 +81,117 @@ async fn test_semantic_remember_stamps_local_namespace() {
 
     let stored_ns = got["namespace"].as_str().expect("note has namespace field");
     assert_eq!(
-        stored_ns, "local",
-        "ADR-007 Rev 6: semantic memory must always land in 'local' regardless of actor; \
+        stored_ns, "alice",
+        "a semantic memory without namespace= must land in the caller's actor namespace; \
          got: {stored_ns:?}"
     );
+    assert!(
+        result.get("attribution").is_none(),
+        "an attributed write must not carry an attribution key: {result}"
+    );
+    assert!(
+        got["properties"].get("attribution").is_none(),
+        "an attributed write must not store an attribution key: {got}"
+    );
+}
+
+/// An explicit `namespace="local"` still wins over the actor default for a semantic write.
+#[tokio::test]
+async fn test_semantic_remember_explicit_local_namespace_wins() {
+    let rt = make_runtime();
+    let registry = make_registry_with_actor(rt.clone(), "alice");
+
+    let result = registry
+        .dispatch(
+            "memory.remember",
+            json!({
+                "content": "alice semantic fact written to the shared namespace on purpose",
+                "memory_type": "semantic",
+                "namespace": "local",
+            }),
+        )
+        .await
+        .expect("memory.remember must succeed");
+    let note_id = result["id"].as_str().expect("response has id").to_owned();
+
+    let got = registry
+        .dispatch("get", json!({ "id": note_id }))
+        .await
+        .expect("get by UUID must succeed");
+    assert_eq!(got["namespace"], "local");
+    assert!(result.get("attribution").is_none());
+}
+
+/// An anonymous caller has no actor namespace: both memory types stay in `local` and are
+/// flagged as unresolved in the response and in the stored properties.
+#[tokio::test]
+async fn test_anonymous_remember_is_flagged_unresolved() {
+    let rt = make_runtime();
+    let registry = make_registry(rt);
+
+    for memory_type in ["semantic", "episodic"] {
+        let result = registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": format!("anonymous {memory_type} memory without a namespace"),
+                    "memory_type": memory_type,
+                }),
+            )
+            .await
+            .expect("memory.remember must succeed");
+        assert_eq!(
+            result["attribution"], "unresolved",
+            "{memory_type}: {result}"
+        );
+        let note_id = result["id"].as_str().expect("response has id").to_owned();
+
+        let got = registry
+            .dispatch("get", json!({ "id": note_id }))
+            .await
+            .expect("get by UUID must succeed");
+        assert_eq!(got["namespace"], "local", "{memory_type}: {got}");
+        assert_eq!(
+            got["properties"]["attribution"], "unresolved",
+            "{memory_type}: {got}"
+        );
+    }
+}
+
+/// An attributed caller writes both memory types to its actor namespace and the row
+/// carries no `attribution` key, in the response or in the stored properties.
+#[tokio::test]
+async fn test_attributed_remember_carries_no_attribution_key() {
+    let rt = make_runtime();
+    let registry = make_registry_with_actor(rt.clone(), "alice");
+
+    for memory_type in ["semantic", "episodic"] {
+        let result = registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": format!("alice {memory_type} memory with an attributed author"),
+                    "memory_type": memory_type,
+                }),
+            )
+            .await
+            .expect("memory.remember must succeed");
+        assert!(
+            result.get("attribution").is_none(),
+            "{memory_type}: {result}"
+        );
+        let note_id = result["id"].as_str().expect("response has id").to_owned();
+
+        let got = registry
+            .dispatch("get", json!({ "id": note_id }))
+            .await
+            .expect("get by UUID must succeed");
+        assert_eq!(got["namespace"], "alice", "{memory_type}: {got}");
+        assert!(
+            got["properties"].get("attribution").is_none(),
+            "{memory_type}: {got}"
+        );
+    }
 }
 
 /// ADR-007 Rev 6: explicit namespace= override takes precedence over routing rules.

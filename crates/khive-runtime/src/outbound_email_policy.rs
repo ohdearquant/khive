@@ -17,6 +17,8 @@ const UNSUBSCRIBE_PLACEHOLDER: &str = "{unsubscribe}";
 /// A recipient-key secret and every token key must decode to at least this many bytes.
 const MIN_KEY_BYTES: usize = 32;
 
+const LIST_FOOTER_ENV: &str = "KHIVE_EMAIL_LIST_FOOTER_FILE";
+
 const MIRROR_URL_ENV: &str = "KHIVE_EMAIL_SUPPRESSION_MIRROR_URL";
 const MIRROR_TOKEN_ENV: &str = "KHIVE_EMAIL_SUPPRESSION_MIRROR_TOKEN";
 const MIRROR_MAX_AGE_ENV: &str = "KHIVE_EMAIL_SUPPRESSION_MIRROR_MAX_AGE_SECS";
@@ -64,6 +66,9 @@ pub struct OutboundEmailPolicy {
     /// The operator's external footer text, or the reason it is unavailable. `None` while
     /// external senders are unset, in which case no footer is ever consulted.
     external_footer: Option<Result<Arc<str>, Arc<str>>>,
+    /// The separate list footer for external `traffic:list` messages. It never falls back to
+    /// the default external footer; `None` only while external senders are unset.
+    list_footer: Option<Result<Arc<str>, Arc<str>>>,
     /// The remote suppression mirror. `None` when it is not configured or external senders are
     /// unset.
     suppression_mirror: Option<SuppressionMirror>,
@@ -79,6 +84,7 @@ impl Default for OutboundEmailPolicy {
             recipient_key_secret: None,
             token_keys: Arc::default(),
             external_footer: None,
+            list_footer: None,
             suppression_mirror: None,
             external_admission: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -257,6 +263,32 @@ impl OutboundEmailPolicy {
         })
     }
 
+    /// The separate footer for external list traffic, or the reason it is unavailable.
+    /// `None` while external senders are unset; never consults the default footer.
+    pub fn list_footer(&self) -> Option<Result<&str, &str>> {
+        self.list_footer.as_ref().map(|value| {
+            value
+                .as_ref()
+                .map(|text| &**text)
+                .map_err(|reason| &**reason)
+        })
+    }
+
+    /// Select the footer for an external send. List traffic never falls back to the default.
+    pub fn external_footer_for_list(&self, is_list: bool) -> Option<Result<&str, &str>> {
+        if is_list {
+            self.list_footer()
+        } else {
+            self.external_footer()
+        }
+    }
+
+    fn resolve_list_footer(&mut self, path: Option<&str>) {
+        if self.has_external_senders() {
+            self.list_footer = Some(read_list_footer(path));
+        }
+    }
+
     /// The remote suppression mirror, when one is configured (ADR-200 §6).
     pub fn suppression_mirror(&self) -> Option<&SuppressionMirror> {
         self.suppression_mirror.as_ref()
@@ -293,7 +325,7 @@ impl OutboundEmailPolicy {
 
     /// Read only public policy inputs, without loading a connector or credentials.
     ///
-    /// The unsubscribe key variables, the footer file and the suppression mirror variables are
+    /// The unsubscribe key variables, the footer files and the suppression mirror variables are
     /// read only when external senders are configured; while the senders variable is unset none
     /// of them is consulted.
     pub fn from_env() -> Result<Self, String> {
@@ -323,6 +355,11 @@ impl OutboundEmailPolicy {
         } else {
             None
         };
+        let list_footer_file = if external_senders.is_some() {
+            read(LIST_FOOTER_ENV)?
+        } else {
+            None
+        };
         let (mirror_url, mirror_token, mirror_max_age) = if external_senders.is_some() {
             (
                 read(MIRROR_URL_ENV)?,
@@ -341,6 +378,7 @@ impl OutboundEmailPolicy {
             token_keys.as_deref(),
             footer_file.as_deref(),
         )?;
+        policy.resolve_list_footer(list_footer_file.as_deref());
         policy.suppression_mirror = parse_suppression_mirror(
             mirror_url.as_deref(),
             mirror_token.as_deref(),
@@ -401,6 +439,7 @@ impl OutboundEmailPolicy {
         policy.recipient_key_secret = Some(Arc::from(secret.as_slice()));
         policy.token_keys = Arc::new(parse_token_keys(token_keys)?);
         policy.external_footer = Some(footer.map(Arc::from).map_err(Arc::from));
+        policy.resolve_list_footer(None);
         Ok(policy)
     }
 
@@ -409,6 +448,14 @@ impl OutboundEmailPolicy {
     #[doc(hidden)]
     pub fn with_external_footer_for_tests(mut self, footer: Result<&str, &str>) -> Self {
         self.external_footer = Some(footer.map(Arc::from).map_err(Arc::from));
+        self
+    }
+
+    /// Replace the list footer state on a test policy without changing the default footer.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn with_list_footer_for_tests(mut self, footer: Result<&str, &str>) -> Self {
+        self.list_footer = Some(footer.map(Arc::from).map_err(Arc::from));
         self
     }
 
@@ -472,6 +519,7 @@ impl OutboundEmailPolicy {
             policy.recipient_key_secret = Some(Arc::from(recipient_key_secret.as_slice()));
             policy.token_keys = Arc::new(token_keys);
             policy.external_footer = Some(read_external_footer(footer_file));
+            policy.resolve_list_footer(None);
         }
         Ok(policy)
     }
@@ -673,15 +721,23 @@ fn parse_token_keys(raw: &str) -> Result<BTreeMap<u8, Arc<[u8]>>, String> {
 /// placeholder-less footer is not a start-up error; it is recorded as an unavailability reason
 /// that refuses external admission.
 fn read_external_footer(path: Option<&str>) -> Result<Arc<str>, Arc<str>> {
+    read_footer_file(path, "KHIVE_EMAIL_EXTERNAL_FOOTER_FILE")
+}
+
+fn read_list_footer(path: Option<&str>) -> Result<Arc<str>, Arc<str>> {
+    read_footer_file(path, LIST_FOOTER_ENV)
+}
+
+fn read_footer_file(path: Option<&str>, name: &str) -> Result<Arc<str>, Arc<str>> {
     let Some(path) = path else {
-        return Err(Arc::from("KHIVE_EMAIL_EXTERNAL_FOOTER_FILE is not set"));
+        return Err(Arc::<str>::from(format!("{name} is not set")));
     };
     let text = std::fs::read_to_string(path)
-        .map_err(|_| Arc::from("KHIVE_EMAIL_EXTERNAL_FOOTER_FILE could not be read"))?;
+        .map_err(|_| Arc::<str>::from(format!("{name} could not be read")))?;
     if !text.contains(UNSUBSCRIBE_PLACEHOLDER) {
-        return Err(Arc::from(
-            "KHIVE_EMAIL_EXTERNAL_FOOTER_FILE does not contain {unsubscribe}",
-        ));
+        return Err(Arc::<str>::from(format!(
+            "{name} does not contain {UNSUBSCRIBE_PLACEHOLDER}"
+        )));
     }
     Ok(Arc::from(text))
 }
@@ -1393,5 +1449,106 @@ mod tests {
         assert!(OutboundEmailPolicy::default()
             .suppression_mirror()
             .is_none());
+    }
+
+    #[test]
+    fn external_constructors_record_a_named_missing_list_footer() {
+        let resolved = OutboundEmailPolicy::resolve_with_external(
+            None,
+            Some("maintainer@example.com"),
+            Some("actor:sender"),
+            Some("5"),
+            Some(&rk()),
+            Some(&token_keys_hex()),
+            None,
+        )
+        .unwrap();
+        let configured = OutboundEmailPolicy::configured_for_tests(
+            vec!["allowed@example.com".into()],
+            vec!["actor:sender".into()],
+            5,
+        )
+        .unwrap();
+        for policy in [resolved, configured, enabled()] {
+            assert_eq!(
+                policy.list_footer(),
+                Some(Err("KHIVE_EMAIL_LIST_FOOTER_FILE is not set"))
+            );
+            assert_eq!(policy.external_footer_for_list(true), policy.list_footer());
+        }
+        let mut internal = OutboundEmailPolicy::default();
+        internal.resolve_list_footer(Some("/nonexistent/unused-list-footer"));
+        assert!(internal.list_footer().is_none());
+        assert!(internal.external_footer_for_list(true).is_none());
+    }
+
+    #[test]
+    fn list_footer_selection_never_falls_back_or_requires_the_default_footer() {
+        let policy = enabled();
+        assert_eq!(
+            policy.external_footer_for_list(false),
+            Some(Ok("Reply to unsubscribe: {unsubscribe}"))
+        );
+        assert_eq!(
+            policy.external_footer_for_list(true),
+            Some(Err("KHIVE_EMAIL_LIST_FOOTER_FILE is not set"))
+        );
+        let policy = policy
+            .with_list_footer_for_tests(Ok("List notice: {unsubscribe}\n"))
+            .with_external_footer_for_tests(Err("KHIVE_EMAIL_EXTERNAL_FOOTER_FILE is not set"));
+        assert_eq!(
+            policy.external_footer_for_list(true),
+            Some(Ok("List notice: {unsubscribe}\n"))
+        );
+        assert_eq!(
+            policy.external_footer_for_list(false),
+            Some(Err("KHIVE_EMAIL_EXTERNAL_FOOTER_FILE is not set"))
+        );
+    }
+
+    #[test]
+    fn list_footer_file_validation_is_named_and_cached() {
+        let dir = std::env::temp_dir().join(format!(
+            "khive-list-footer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let unreadable = dir.join("directory-not-a-footer");
+        std::fs::create_dir(&unreadable).unwrap();
+        let without_placeholder = dir.join("without-placeholder.txt");
+        std::fs::write(&without_placeholder, "operator-footer-content-sentinel").unwrap();
+        let mut policy = enabled();
+        for (path, reason) in [
+            (None, "KHIVE_EMAIL_LIST_FOOTER_FILE is not set"),
+            (
+                Some(unreadable.to_str().unwrap()),
+                "KHIVE_EMAIL_LIST_FOOTER_FILE could not be read",
+            ),
+            (
+                Some(without_placeholder.to_str().unwrap()),
+                "KHIVE_EMAIL_LIST_FOOTER_FILE does not contain {unsubscribe}",
+            ),
+        ] {
+            policy.resolve_list_footer(path);
+            assert_eq!(policy.list_footer(), Some(Err(reason)));
+            assert_eq!(
+                policy.external_footer(),
+                Some(Ok("Reply to unsubscribe: {unsubscribe}"))
+            );
+        }
+        let valid = dir.join("with-placeholder.txt");
+        let original = "List contact.\n{unsubscribe}\n";
+        std::fs::write(&valid, original).unwrap();
+        policy.resolve_list_footer(valid.to_str());
+        assert_eq!(policy.list_footer(), Some(Ok(original)));
+        std::fs::write(&valid, "changed after startup").unwrap();
+        std::fs::remove_file(&valid).unwrap();
+        assert_eq!(policy.list_footer(), Some(Ok(original)));
+        assert_eq!(policy.clone().list_footer(), Some(Ok(original)));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

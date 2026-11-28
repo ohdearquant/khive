@@ -2109,7 +2109,7 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
         embedding_model: None,
         additional_embedding_models: vec![],
         packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
-        actor_id: Some("leo".to_string()),
+        actor_id: Some("casey".to_string()),
         ..khive_runtime::RuntimeConfig::default()
     })
     .expect("runtime");
@@ -2117,7 +2117,7 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
     let token = rt.authorize(ns.clone()).expect("authorize local");
     assert_eq!(
         token.actor().id,
-        "leo",
+        "casey",
         "test setup: token must carry the configured actor"
     );
 
@@ -2145,7 +2145,7 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
     // construction-baked actor id (independent of `RuntimeConfig::actor_id`,
     // which only affects tokens minted directly via `rt.authorize`) — bake
     // the same actor here so `registry.dispatch` calls carry it too.
-    builder.with_actor_id(Some("leo".to_string()));
+    builder.with_actor_id(Some("casey".to_string()));
     let registry = builder.build().expect("registry");
 
     registry
@@ -2153,7 +2153,7 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
             "brain.create_profile",
             serde_json::json!({
                 "namespace": ns.as_str(),
-                "name": "leo-actor-recall-v1",
+                "name": "casey-actor-recall-v1",
                 "consumer_kind": "recall",
             }),
         )
@@ -2164,7 +2164,7 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
             "brain.activate",
             serde_json::json!({
                 "namespace": ns.as_str(),
-                "profile_id": "leo-actor-recall-v1",
+                "profile_id": "casey-actor-recall-v1",
             }),
         )
         .await
@@ -2175,8 +2175,8 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
         .dispatch(
             "brain.bind",
             serde_json::json!({
-                "actor": "leo",
-                "profile_id": "leo-actor-recall-v1",
+                "actor": "casey",
+                "profile_id": "casey-actor-recall-v1",
                 "consumer_kind": "recall",
             }),
         )
@@ -2199,7 +2199,7 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
     assert!(!hits.is_empty(), "must find the seeded note");
     assert_eq!(
         hits[0]["served_by_profile_id"],
-        serde_json::json!("leo-actor-recall-v1"),
+        serde_json::json!("casey-actor-recall-v1"),
         "recall response must stamp the actor-bound profile, not the default"
     );
 
@@ -2223,7 +2223,7 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
             assert!(
                 matches!(
                     row.get("served_by_profile_id"),
-                    Some(khive_storage::types::SqlValue::Text(s)) if s == "leo-actor-recall-v1"
+                    Some(khive_storage::types::SqlValue::Text(s)) if s == "casey-actor-recall-v1"
                 ),
                 "serve ledger row must carry the actor-bound profile id"
             );
@@ -2240,14 +2240,14 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
     registry
         .dispatch(
             "brain.deactivate",
-            json!({"namespace": ns.as_str(), "profile_id": "leo-actor-recall-v1"}),
+            json!({"namespace": ns.as_str(), "profile_id": "casey-actor-recall-v1"}),
         )
         .await
         .expect("deactivate the bound profile");
     registry
         .dispatch(
             "brain.archive",
-            json!({"namespace": ns.as_str(), "profile_id": "leo-actor-recall-v1"}),
+            json!({"namespace": ns.as_str(), "profile_id": "casey-actor-recall-v1"}),
         )
         .await
         .expect("archive the bound profile");
@@ -2279,7 +2279,8 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
     assert_eq!(hits[0]["serve_attribution"], json!("unspecified"));
 }
 
-// The actor-resolved profile must both project weights and stamp the response.
+// The actor-resolved profile must stamp the response and supply the posterior state
+// behind the diagnostic `profile_component`.
 #[tokio::test]
 #[serial(background_tasks)]
 #[serial_test::serial(config_ledger)]
@@ -2297,7 +2298,7 @@ async fn recall_serve_time_projection_uses_the_actor_resolved_profile() {
         embedding_model: None,
         additional_embedding_models: vec![],
         packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
-        actor_id: Some("leo".to_string()),
+        actor_id: Some("casey".to_string()),
         ..khive_runtime::RuntimeConfig::default()
     })
     .expect("runtime");
@@ -2309,7 +2310,7 @@ async fn recall_serve_time_projection_uses_the_actor_resolved_profile() {
     let token = rt.authorize(ns.clone()).expect("authorize local");
     assert_eq!(
         token.actor().id,
-        "leo",
+        "casey",
         "test setup: token must carry the configured actor"
     );
 
@@ -2334,7 +2335,7 @@ async fn recall_serve_time_projection_uses_the_actor_resolved_profile() {
         crate::test_support::with_receipt_credentials(rt.clone()),
     ));
     builder.register(brain);
-    builder.with_actor_id(Some("leo".to_string()));
+    builder.with_actor_id(Some("casey".to_string()));
     let registry = builder.build().expect("registry");
 
     registry
@@ -2352,7 +2353,7 @@ async fn recall_serve_time_projection_uses_the_actor_resolved_profile() {
         .dispatch(
             "brain.bind",
             serde_json::json!({
-                "actor": "leo",
+                "actor": "casey",
                 "profile_id": "adr104-resolution-v1",
                 "consumer_kind": "recall",
             }),
@@ -2395,6 +2396,192 @@ async fn recall_serve_time_projection_uses_the_actor_resolved_profile() {
         "serve-time projection must have used the actor-resolved profile's \
              skewed posterior state, not defaults: profile_component={profile_component}"
     );
+}
+
+// Projection is diagnostic work: a bound profile needs it only for returned breakdowns.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_bound_profile_projects_config_only_for_breakdown() {
+    use khive_pack_brain::BrainPack;
+
+    let tmp = tempfile::Builder::new()
+        .prefix("khive-mem-recall-breakdown-projection-")
+        .tempdir_in(std::env::temp_dir())
+        .expect("temp dir");
+    let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: Some(tmp.path().join("khive.db")),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
+        actor_id: Some("casey".to_string()),
+        ..khive_runtime::RuntimeConfig::default()
+    })
+    .expect("runtime");
+    rt.register_embedder(FixedVecProvider {
+        model_name: ADR104_MODEL.to_string(),
+        map: adr104_fixed_vectors(),
+    });
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+    assert_eq!(token.actor().id, "casey");
+
+    // Identical fixed vectors make retrieval repeatable; the reranker below excludes age.
+    let mut note_ids = Vec::new();
+    for salience in [0.1, 0.9] {
+        note_ids.push(
+            rt.create_note(
+                &token,
+                "memory",
+                None,
+                ADR104_H_CONTENT,
+                Some(salience),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note")
+            .id,
+        );
+    }
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    builder.register(BrainPack::new(rt.clone()));
+    builder.with_actor_id(Some("casey".to_string()));
+    let registry = builder.build().expect("registry");
+    let profile_id = "breakdown-projection-v1";
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": profile_id,
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+    registry
+        .dispatch(
+            "brain.bind",
+            serde_json::json!({
+                "actor": "casey",
+                "profile_id": profile_id,
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("bind profile to actor");
+    adr104_skew_salience(&registry, profile_id, note_ids[0], 30).await;
+
+    let params = serde_json::json!({
+        "namespace": ns.as_str(),
+        "query": ADR104_QUERY,
+        "fusion_strategy": "vector_only",
+        "embedding_model": ADR104_MODEL,
+        "include_breakdown": false,
+        "limit": 10,
+        "config": {
+            "include_breakdown": false,
+            "reranker_weights": { "relevance": 1.0 },
+            "scoring": { "mmr_penalty": 0.0 },
+        },
+    });
+    let (plain, plain_calls) = crate::tunable::count_project_config_calls_6377(
+        registry.dispatch("memory.recall", params.clone()),
+    )
+    .await;
+    let plain = plain.expect("recall without breakdown");
+    assert_eq!(
+        plain_calls, 0,
+        "a recall without a breakdown must not project the serving profile"
+    );
+    let plain_hits = plain.as_array().expect("bare array result");
+    assert_eq!(
+        plain_hits.len(),
+        note_ids.len(),
+        "must return both seeded notes"
+    );
+    for hit in plain_hits {
+        assert_eq!(hit["served_by_profile_id"], profile_id);
+        assert!(hit.get("breakdown").is_none());
+    }
+
+    let mut request_verbose = params.clone();
+    request_verbose["include_breakdown"] = serde_json::json!(true);
+    let mut config_verbose = params;
+    let _ = config_verbose
+        .as_object_mut()
+        .expect("recall params object")
+        .remove("include_breakdown");
+    config_verbose["config"]["include_breakdown"] = serde_json::json!(true);
+    for (route, verbose_params) in [("request", request_verbose), ("config", config_verbose)] {
+        let (verbose, verbose_calls) = crate::tunable::count_project_config_calls_6377(
+            registry.dispatch("memory.recall", verbose_params),
+        )
+        .await;
+        let verbose = verbose.expect("recall with breakdown");
+        assert_eq!(
+            verbose_calls, 1,
+            "project once for the entire verbose recall via {route}"
+        );
+        let verbose_hits = verbose.as_array().expect("bare array result");
+        assert_eq!(verbose_hits.len(), plain_hits.len());
+        for (before, after) in plain_hits.iter().zip(verbose_hits) {
+            assert_eq!(after["full_id"], before["full_id"], "ranked IDs must match");
+            assert_eq!(after["rank_score"], before["rank_score"]);
+            assert_eq!(after["score"], before["score"]);
+            assert_eq!(after["raw_score"], before["raw_score"]);
+            assert_eq!(after["served_by_profile_id"], profile_id);
+            assert_eq!(after["breakdown"]["weights_served"], "default");
+            assert_eq!(after["breakdown"]["namespace"], ns.as_str());
+        }
+        let skewed = &verbose_hits[adr104_position(verbose_hits, note_ids[0])];
+        let profile_component = skewed["breakdown"]["profile_component"]
+            .as_f64()
+            .expect("profile_component present under include_breakdown");
+        assert!(
+            (profile_component - 1.0).abs() > 1e-6,
+            "the breakdown must use the bound profile's skewed posterior: {profile_component}"
+        );
+    }
+}
+
+// The standalone score verb always reports a breakdown with the default weight label.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_score_reports_default_weights_served() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall_score",
+            serde_json::json!({
+                "rrf": 0.7,
+                "salience": 0.6,
+                "decay_factor": 0.01,
+                "age_days": 2.0,
+            }),
+        )
+        .await
+        .expect("memory.recall_score");
+    assert_eq!(
+        result["breakdown"]["weights_served"].as_str(),
+        Some("default"),
+        "the standalone score breakdown must retain its default weight label"
+    );
+    assert_eq!(result["breakdown"]["namespace"].as_str(), Some(""));
 }
 
 // Anonymous callers must not match an explicit `actor="local"` binding.
@@ -2696,7 +2883,7 @@ async fn recall_profile_resolution_latency_is_bounded() {
     use khive_pack_brain::BrainPack;
     use std::time::Duration;
 
-    async fn timed_recall(with_brain: bool) -> Duration {
+    async fn timed_recall(with_brain: bool) -> (Duration, u64) {
         let rt = if with_brain {
             build_full_rt_with_brain()
         } else {
@@ -2773,17 +2960,19 @@ async fn recall_profile_resolution_latency_is_bounded() {
             )
             .await
             .expect("recall");
-        start.elapsed()
+        let elapsed = start.elapsed();
+        let resolved_deadline_ms = crate::pack::recall_deadline_ms(&rt);
+        (elapsed, resolved_deadline_ms)
     }
 
-    let without_brain = timed_recall(false).await;
-    let with_brain = timed_recall(true).await;
+    let (without_brain, _) = timed_recall(false).await;
+    let (with_brain, resolved_deadline_ms) = timed_recall(true).await;
     eprintln!(
         "[ADR-081 §5 latency] recall without brain pack: {without_brain:?}; \
              recall with brain pack (profile resolution + async ledger dispatch): {with_brain:?}"
     );
     // Dispatch uses this same cached deadline when the request has no override.
-    let caller_bound = Duration::from_millis(crate::pack::recall_deadline_ms()).saturating_mul(2);
+    let caller_bound = Duration::from_millis(resolved_deadline_ms).saturating_mul(2);
     if let Some(caller_bound) = timing::duration_bound(caller_bound, None) {
         assert!(
             with_brain < caller_bound,
@@ -2987,11 +3176,19 @@ fn adr104_position(hits: &[Value], id: Uuid) -> usize {
         .unwrap_or_else(|| panic!("id {target} not present in recall hits: {hits:?}"))
 }
 
-/// Different profile state must flip ordering for the same corpus and query.
+/// Reads a JSON number that was serialized from an `f32` back as that `f32`.
+fn breakdown_f32(v: &Value) -> f32 {
+    v.as_f64()
+        .unwrap_or_else(|| panic!("expected a JSON number, got {v:?}")) as f32
+}
+
+/// A served profile scores with the configured default weights: even when its posterior
+/// projects to weights that would reverse the order, the order and the scores of hits
+/// without an entity posterior match an unprofiled recall.
 #[tokio::test]
 #[serial(background_tasks)]
 #[serial_test::serial(config_ledger)]
-async fn adr104_profile_differentiated_ranking_flips_order() {
+async fn adr104_served_profile_scores_with_default_weights_and_keeps_default_order() {
     let (_rt, registry, ns, h_id, l_id) = adr104_build_ranking_corpus().await;
 
     registry
@@ -3012,6 +3209,7 @@ async fn adr104_profile_differentiated_ranking_flips_order() {
         "query": ADR104_QUERY,
         "fusion_strategy": "vector_only",
         "embedding_model": ADR104_MODEL,
+        "include_breakdown": true,
         "limit": 10,
     });
 
@@ -3034,10 +3232,764 @@ async fn adr104_profile_differentiated_ranking_flips_order() {
         "at configured-default weights H's relevance edge must win: {default_hits:?}"
     );
     assert!(
-        adr104_position(skewed_hits, l_id) < adr104_position(skewed_hits, h_id),
-        "under the salience-skewed profile L must overtake H — if this still \
-             matches the default ordering, the serve-time projection call is not \
-             wired into scoring: {skewed_hits:?}"
+        adr104_position(skewed_hits, h_id) < adr104_position(skewed_hits, l_id),
+        "a served profile must score with the default weights, so H keeps its lead \
+             even though the salience-skewed posterior projects weights that favour L: \
+             {skewed_hits:?}"
+    );
+
+    let l_default = &default_hits[adr104_position(default_hits, l_id)];
+    let l_skewed = &skewed_hits[adr104_position(skewed_hits, l_id)];
+    assert_eq!(
+        breakdown_f32(&l_skewed["rank_score"]),
+        breakdown_f32(&l_default["rank_score"]),
+        "L has no entity posterior and no factor applies, so its rank_score under a \
+             served profile must equal its rank_score without one"
+    );
+
+    let h_skewed = &skewed_hits[adr104_position(skewed_hits, h_id)];
+    assert_eq!(
+        h_skewed["breakdown"]["weights_served"].as_str(),
+        Some("default"),
+        "the breakdown must say the default weights were served"
+    );
+
+    let profile = registry
+        .dispatch(
+            "brain.profile",
+            serde_json::json!({ "profile_id": "adr104-skew-recall-v1" }),
+        )
+        .await
+        .expect("brain.profile");
+    let salience_mean = profile["posterior_means"]["salience"]
+        .as_f64()
+        .expect("brain.profile reports posterior_means.salience");
+    assert!(
+        salience_mean > 0.5,
+        "30 useful signals raise the salience posterior well above its prior mean of 0.2: \
+             {salience_mean}"
+    );
+    for key in ["relevance", "temporal"] {
+        assert!(
+            profile["posterior_means"][key].is_number(),
+            "posterior_means.{key} must be reported: {profile:?}"
+        );
+    }
+    let profile_component = h_skewed["breakdown"]["profile_component"]
+        .as_f64()
+        .expect("profile_component present under include_breakdown");
+    assert!(
+        (profile_component - 1.0).abs() > 1e-6,
+        "profile_component stays a diagnostic of the projected weights: {profile_component}"
+    );
+}
+
+/// Creates a recall profile in `ns`, carrying `local_factor` when one is given.
+async fn adr104_create_factor_profile(
+    registry: &khive_runtime::VerbRegistry,
+    ns: &Namespace,
+    name: &str,
+    local_factor: Option<f64>,
+) {
+    let mut params = serde_json::json!({
+        "namespace": ns.as_str(),
+        "name": name,
+        "consumer_kind": "recall",
+    });
+    if let Some(factor) = local_factor {
+        params["local_factor"] = serde_json::json!(factor);
+    }
+    registry
+        .dispatch("brain.create_profile", params)
+        .await
+        .expect("create profile");
+}
+
+/// Recalls the ranking-corpus query with breakdowns, optionally served by `profile_id`.
+async fn adr104_recall_hits(
+    registry: &khive_runtime::VerbRegistry,
+    ns: &Namespace,
+    profile_id: Option<&str>,
+    min_score: Option<f64>,
+) -> Vec<Value> {
+    let mut params = serde_json::json!({
+        "namespace": ns.as_str(),
+        "query": ADR104_QUERY,
+        "fusion_strategy": "vector_only",
+        "embedding_model": ADR104_MODEL,
+        "include_breakdown": true,
+        "limit": 10,
+    });
+    if let Some(profile_id) = profile_id {
+        params["profile_id"] = serde_json::json!(profile_id);
+    }
+    if let Some(min_score) = min_score {
+        params["min_score"] = serde_json::json!(min_score);
+    }
+    registry
+        .dispatch("memory.recall", params)
+        .await
+        .expect("recall")
+        .as_array()
+        .expect("bare array result")
+        .clone()
+}
+
+/// Asserts `rank_score == pre_entity_score * entity_term * local_factor - duplicate_penalty`
+/// in f32, using the values the breakdown reports.
+fn adr104_assert_rank_identity(hit: &Value) {
+    let b = &hit["breakdown"];
+    let expected = breakdown_f32(&b["pre_entity_score"])
+        * breakdown_f32(&b["entity_term"])
+        * breakdown_f32(&b["local_factor"])
+        - breakdown_f32(&b["duplicate_penalty"]);
+    assert_eq!(
+        breakdown_f32(&hit["rank_score"]),
+        expected,
+        "rank_score must follow the breakdown identity: {hit:?}"
+    );
+}
+
+/// Under a profile with `local_factor`, every `local` row's rank score is scaled by the factor
+/// while its returned `score` is unchanged, and the breakdown reports the values used.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_local_factor_scales_local_rows_and_leaves_the_returned_score() {
+    let (_rt, registry, ns, h_id, l_id) = adr104_build_ranking_corpus().await;
+    adr104_create_factor_profile(&registry, &ns, "adr104-factor-half-v1", Some(0.5)).await;
+
+    let plain = adr104_recall_hits(&registry, &ns, None, None).await;
+    let served = adr104_recall_hits(&registry, &ns, Some("adr104-factor-half-v1"), None).await;
+    assert_eq!(
+        plain.len(),
+        served.len(),
+        "the factor must not change which rows return"
+    );
+
+    for id in [h_id, l_id] {
+        let before = &plain[adr104_position(&plain, id)];
+        let after = &served[adr104_position(&served, id)];
+        assert_eq!(after["breakdown"]["namespace"].as_str(), Some("local"));
+        assert_eq!(breakdown_f32(&after["breakdown"]["local_factor"]), 0.5_f32);
+        assert_eq!(breakdown_f32(&before["breakdown"]["local_factor"]), 1.0_f32);
+        assert_eq!(
+            breakdown_f32(&after["rank_score"]),
+            breakdown_f32(&before["rank_score"]) * 0.5_f32,
+            "a local row's rank_score under the profile is its unscaled value times the factor"
+        );
+        assert!(
+            before["score"].is_number(),
+            "a vector hit returns a score: {before:?}"
+        );
+        assert_eq!(
+            after["score"], before["score"],
+            "the returned score is taken before the factor"
+        );
+        adr104_assert_rank_identity(before);
+        adr104_assert_rank_identity(after);
+    }
+}
+
+/// A profile without `local_factor` returns the same rows, order and scores as no profile.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_profile_without_local_factor_matches_recall_without_a_profile() {
+    let (_rt, registry, ns, _h_id, _l_id) = adr104_build_ranking_corpus().await;
+    adr104_create_factor_profile(&registry, &ns, "adr104-factor-none-v1", None).await;
+
+    let plain = adr104_recall_hits(&registry, &ns, None, None).await;
+    let served = adr104_recall_hits(&registry, &ns, Some("adr104-factor-none-v1"), None).await;
+
+    let ids = |hits: &[Value]| -> Vec<Option<String>> {
+        hits.iter()
+            .map(|h| h["id"].as_str().map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(ids(&plain), ids(&served));
+    for (before, after) in plain.iter().zip(served.iter()) {
+        assert_eq!(
+            breakdown_f32(&after["rank_score"]),
+            breakdown_f32(&before["rank_score"])
+        );
+        assert_eq!(after["score"], before["score"]);
+        assert_eq!(breakdown_f32(&after["breakdown"]["local_factor"]), 1.0_f32);
+    }
+}
+
+/// `min_score` is applied to the factor-adjusted rank score: a floor between a row's scaled and
+/// unscaled score keeps it without a factor and drops it under the factor.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_min_score_applies_to_the_factor_adjusted_rank_score() {
+    let (_rt, registry, ns, h_id, _l_id) = adr104_build_ranking_corpus().await;
+    adr104_create_factor_profile(&registry, &ns, "adr104-factor-floor-v1", Some(0.5)).await;
+
+    let plain = adr104_recall_hits(&registry, &ns, None, None).await;
+    let h_plain = breakdown_f32(&plain[adr104_position(&plain, h_id)]["rank_score"]);
+    assert!(h_plain > 0.0, "H needs a positive rank_score for this test");
+    let floor = f64::from(h_plain) * 0.75;
+
+    let contains = |hits: &[Value], id: Uuid| {
+        let target = id.to_string();
+        hits.iter()
+            .any(|h| h["id"].as_str() == Some(target.as_str()))
+    };
+    let unscaled = adr104_recall_hits(&registry, &ns, None, Some(floor)).await;
+    assert!(
+        contains(&unscaled, h_id),
+        "without a factor H clears the floor: {unscaled:?}"
+    );
+    let scaled =
+        adr104_recall_hits(&registry, &ns, Some("adr104-factor-floor-v1"), Some(floor)).await;
+    assert!(
+        !contains(&scaled, h_id),
+        "the floor applies to the factor-adjusted score, which is below it: {scaled:?}"
+    );
+}
+
+/// A namespace the readers below hold besides the shared pool (`local`).
+const LF_OWN_NS: &str = "lf-own";
+
+/// A recall registry whose read set is the shared pool plus [`LF_OWN_NS`].
+fn lf_registry(rt: &KhiveRuntime) -> khive_runtime::VerbRegistry {
+    use khive_pack_brain::BrainPack;
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
+    builder.with_visible_namespaces(vec![Namespace::parse(LF_OWN_NS).expect("own namespace")]);
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    builder.register(BrainPack::new(rt.clone()));
+    builder.build().expect("registry")
+}
+
+/// Stores a memory note in `namespace` and returns its id.
+async fn lf_note(
+    rt: &TestRuntime,
+    namespace: &str,
+    content: &str,
+    salience: f64,
+    properties: Option<Value>,
+) -> Uuid {
+    let token = rt
+        .authorize(Namespace::parse(namespace).expect("namespace"))
+        .expect("authorize");
+    rt.create_note(
+        &token,
+        "memory",
+        None,
+        content,
+        Some(salience),
+        properties,
+        vec![],
+    )
+    .await
+    .expect("create note")
+    .id
+}
+
+/// Recalls `query` with breakdowns, optionally served by `profile_id`; `extra` is an object of
+/// further request parameters.
+async fn lf_recall(
+    registry: &khive_runtime::VerbRegistry,
+    query: &str,
+    profile_id: Option<&str>,
+    extra: Value,
+) -> Vec<Value> {
+    let mut params = serde_json::json!({
+        "query": query,
+        "include_breakdown": true,
+        "limit": 10,
+    });
+    if let Some(profile_id) = profile_id {
+        params["profile_id"] = serde_json::json!(profile_id);
+    }
+    for (key, value) in extra.as_object().expect("extra params object") {
+        params[key] = value.clone();
+    }
+    registry
+        .dispatch("memory.recall", params)
+        .await
+        .expect("recall")
+        .as_array()
+        .expect("bare array result")
+        .clone()
+}
+
+/// Request parameters that rank by decayed salience alone, so a note's unscaled rank score is its
+/// salience, and that compare duplicates on their first 12 characters.
+fn lf_salience_ranking() -> Value {
+    serde_json::json!({
+        "config": {
+            "reranker_weights": { "salience": 1.0 },
+            "scoring": { "mmr_prefix_len": 12 },
+        }
+    })
+}
+
+fn lf_rank(hit: &Value) -> f32 {
+    breakdown_f32(&hit["rank_score"])
+}
+
+fn lf_field(hit: &Value, field: &str) -> f32 {
+    breakdown_f32(&hit["breakdown"][field])
+}
+
+/// Salience decays a little between writing a note and recalling it, so values read back are
+/// compared to the nominal ones with a small tolerance.
+fn lf_assert_close(actual: f32, expected: f32, what: &str) {
+    assert!(
+        (actual - expected).abs() < 1e-4,
+        "{what}: expected about {expected}, got {actual}"
+    );
+}
+
+fn lf_has(hits: &[Value], id: Uuid) -> bool {
+    let target = id.to_string();
+    hits.iter()
+        .any(|h| h["id"].as_str() == Some(target.as_str()))
+}
+
+/// Means of a profile's three stored posteriors as `brain.profile` reports them:
+/// relevance, salience, temporal.
+async fn lf_posterior_means(registry: &khive_runtime::VerbRegistry, profile_id: &str) -> [f64; 3] {
+    let profile = registry
+        .dispatch(
+            "brain.profile",
+            serde_json::json!({ "profile_id": profile_id }),
+        )
+        .await
+        .expect("brain.profile");
+    ["relevance", "salience", "temporal"].map(|key| {
+        profile["posterior_means"][key]
+            .as_f64()
+            .unwrap_or_else(|| panic!("posterior_means.{key} must be a number: {profile:?}"))
+    })
+}
+
+/// Under a profile with a factor only rows in `local` are scaled: a shared row that outranks an
+/// own-namespace row without the factor falls below it with the factor, and every breakdown names
+/// its row's namespace and the factor applied to it.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_local_factor_scales_local_rows_and_no_other_namespace() {
+    let rt = build_full_rt_with_brain();
+    let shared = lf_note(&rt, "local", "lfscale probe shared pool row", 0.8, None).await;
+    let own = lf_note(&rt, LF_OWN_NS, "lfscale probe own namespace row", 0.6, None).await;
+    let registry = lf_registry(&rt);
+    let local = Namespace::parse("local").expect("local namespace");
+    adr104_create_factor_profile(&registry, &local, "lf-scale-half-v1", Some(0.5)).await;
+    let ranking = serde_json::json!({ "config": { "reranker_weights": { "salience": 1.0 } } });
+
+    let plain = lf_recall(&registry, "lfscale probe", None, ranking.clone()).await;
+    assert!(
+        adr104_position(&plain, shared) < adr104_position(&plain, own),
+        "without a profile the shared row's higher salience wins: {plain:?}"
+    );
+    let plain_shared = &plain[adr104_position(&plain, shared)];
+    let plain_own = &plain[adr104_position(&plain, own)];
+    assert_eq!(plain_shared["breakdown"]["namespace"], "local");
+    assert_eq!(plain_own["breakdown"]["namespace"], LF_OWN_NS);
+    assert_eq!(lf_field(plain_shared, "local_factor"), 1.0);
+    lf_assert_close(lf_rank(plain_shared), 0.8, "unscaled shared row");
+    lf_assert_close(lf_rank(plain_own), 0.6, "unscaled own row");
+
+    let served = lf_recall(
+        &registry,
+        "lfscale probe",
+        Some("lf-scale-half-v1"),
+        ranking,
+    )
+    .await;
+    assert!(
+        adr104_position(&served, own) < adr104_position(&served, shared),
+        "the factor must put the own row ahead of the scaled shared row: {served:?}"
+    );
+    let served_shared = &served[adr104_position(&served, shared)];
+    let served_own = &served[adr104_position(&served, own)];
+    assert_eq!(served_shared["breakdown"]["namespace"], "local");
+    assert_eq!(served_own["breakdown"]["namespace"], LF_OWN_NS);
+    assert_eq!(lf_field(served_shared, "local_factor"), 0.5_f32);
+    assert_eq!(
+        lf_field(served_own, "local_factor"),
+        1.0,
+        "a row outside `local` is multiplied by 1"
+    );
+    lf_assert_close(lf_rank(served_shared), 0.4, "scaled shared row");
+    lf_assert_close(lf_rank(served_own), 0.6, "unscaled own row");
+    adr104_assert_rank_identity(served_shared);
+    adr104_assert_rank_identity(served_own);
+}
+
+/// A text-only hit has no vector similarity, so its returned `score` falls back to the rank score
+/// as it stood before the factor: the factor scales `rank_score` and leaves `score` alone.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_text_only_local_hit_keeps_its_returned_score_under_the_factor() {
+    let rt = build_full_rt_with_brain();
+    lf_note(&rt, "local", "lftext probe shared pool row", 0.4, None).await;
+    let registry = lf_registry(&rt);
+    let local = Namespace::parse("local").expect("local namespace");
+    adr104_create_factor_profile(&registry, &local, "lf-text-half-v1", Some(0.5)).await;
+    let ranking = serde_json::json!({ "config": { "reranker_weights": { "salience": 1.0 } } });
+
+    let plain = lf_recall(&registry, "lftext probe", None, ranking.clone()).await;
+    let served = lf_recall(&registry, "lftext probe", Some("lf-text-half-v1"), ranking).await;
+    assert_eq!(plain.len(), 1, "{plain:?}");
+    assert_eq!(served.len(), 1, "{served:?}");
+    for hit in [&plain[0], &served[0]] {
+        assert!(
+            hit["raw_score"].is_null(),
+            "the corpus has no embedder, so the hit is text-only: {hit:?}"
+        );
+    }
+
+    let served_hit = &served[0];
+    lf_assert_close(lf_rank(served_hit), 0.2, "scaled rank score");
+    assert_eq!(
+        breakdown_f32(&served_hit["score"]),
+        lf_field(served_hit, "pre_entity_score") * lf_field(served_hit, "entity_term"),
+        "a text-only hit's score is the rank score before the factor"
+    );
+    assert_eq!(
+        breakdown_f32(&plain[0]["score"]),
+        lf_rank(&plain[0]),
+        "without a factor the two are the same number"
+    );
+    lf_assert_close(
+        breakdown_f32(&served_hit["score"]),
+        breakdown_f32(&plain[0]["score"]),
+        "score under the factor against score without a profile",
+    );
+}
+
+/// The duplicate-prefix penalty is subtracted after the factor and floors at zero. At factor 0.5 and
+/// the default penalty of 0.1, a later shared-pool copy with unscaled score 0.3 keeps 0.05 and one at
+/// 0.15 falls to zero, against 0.2 and 0.05 without the factor; a positive `min_score` then drops the
+/// zeroed copy. The breakdown identity holds with the duplicates present, with and without a weighted
+/// reranker.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_local_factor_duplicate_penalty_runs_on_the_scaled_rank_score() {
+    let rt = build_full_rt_with_brain();
+    let a = lf_note(&rt, "local", "lfdup probe copy a", 0.9, None).await;
+    let b = lf_note(&rt, "local", "lfdup probe copy b", 0.3, None).await;
+    let c = lf_note(&rt, "local", "lfdup probe copy c", 0.15, None).await;
+    let registry = lf_registry(&rt);
+    let local = Namespace::parse("local").expect("local namespace");
+    adr104_create_factor_profile(&registry, &local, "lf-dup-half-v1", Some(0.5)).await;
+
+    let plain = lf_recall(&registry, "lfdup probe", None, lf_salience_ranking()).await;
+    let served = lf_recall(
+        &registry,
+        "lfdup probe",
+        Some("lf-dup-half-v1"),
+        lf_salience_ranking(),
+    )
+    .await;
+    for hits in [&plain, &served] {
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        for hit in hits {
+            adr104_assert_rank_identity(hit);
+        }
+    }
+
+    let (plain_a, plain_b, plain_c) = (
+        &plain[adr104_position(&plain, a)],
+        &plain[adr104_position(&plain, b)],
+        &plain[adr104_position(&plain, c)],
+    );
+    lf_assert_close(lf_rank(plain_a), 0.9, "first copy without the factor");
+    lf_assert_close(lf_rank(plain_b), 0.2, "0.3 copy without the factor");
+    lf_assert_close(lf_rank(plain_c), 0.05, "0.15 copy without the factor");
+    assert_eq!(lf_field(plain_a, "duplicate_penalty"), 0.0);
+
+    let (served_a, served_b, served_c) = (
+        &served[adr104_position(&served, a)],
+        &served[adr104_position(&served, b)],
+        &served[adr104_position(&served, c)],
+    );
+    lf_assert_close(lf_rank(served_a), 0.45, "first copy under the factor");
+    assert_eq!(
+        lf_field(served_a, "duplicate_penalty"),
+        0.0,
+        "the highest scaled copy is the one spared"
+    );
+    lf_assert_close(lf_rank(served_b), 0.05, "0.3 copy under the factor");
+    lf_assert_close(lf_field(served_b, "duplicate_penalty"), 0.1, "full penalty");
+    assert_eq!(
+        lf_rank(served_c),
+        0.0,
+        "a copy whose scaled score is at or below the penalty falls to zero"
+    );
+    lf_assert_close(
+        lf_field(served_c, "duplicate_penalty"),
+        0.075,
+        "the penalty subtracted from a zeroed copy is its whole scaled score",
+    );
+
+    let floor = serde_json::json!({
+        "config": lf_salience_ranking()["config"].clone(),
+        "min_score": 0.01,
+    });
+    let plain_floored = lf_recall(&registry, "lfdup probe", None, floor.clone()).await;
+    let served_floored = lf_recall(&registry, "lfdup probe", Some("lf-dup-half-v1"), floor).await;
+    assert!(
+        lf_has(&plain_floored, c),
+        "without the factor the 0.15 copy keeps 0.05: {plain_floored:?}"
+    );
+    assert!(
+        lf_has(&served_floored, b) && !lf_has(&served_floored, c),
+        "under the factor a positive min_score drops only the zeroed copy: {served_floored:?}"
+    );
+
+    let default_weights = serde_json::json!({ "config": { "scoring": { "mmr_prefix_len": 12 } } });
+    let unreranked = lf_recall(
+        &registry,
+        "lfdup probe",
+        Some("lf-dup-half-v1"),
+        default_weights,
+    )
+    .await;
+    assert_eq!(unreranked.len(), 3, "{unreranked:?}");
+    for hit in &unreranked {
+        assert_eq!(lf_field(hit, "local_factor"), 0.5_f32);
+        adr104_assert_rank_identity(hit);
+    }
+    assert!(
+        unreranked
+            .iter()
+            .any(|hit| lf_field(hit, "duplicate_penalty") > 0.0),
+        "a later copy must carry the penalty it was charged: {unreranked:?}"
+    );
+}
+
+/// The copy the duplicate penalty spares is the one that ranks higher after the factor: an own copy
+/// that scores below a shared copy without the factor is spared once the factor scales the shared
+/// copy under it.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_duplicate_penalty_spares_the_own_copy_over_a_scaled_shared_copy() {
+    let rt = build_full_rt_with_brain();
+    let shared = lf_note(&rt, "local", "lfspare probe shared copy", 0.8, None).await;
+    let own = lf_note(&rt, LF_OWN_NS, "lfspare probe own copy", 0.6, None).await;
+    let registry = lf_registry(&rt);
+    let local = Namespace::parse("local").expect("local namespace");
+    adr104_create_factor_profile(&registry, &local, "lf-spare-half-v1", Some(0.5)).await;
+
+    let plain = lf_recall(&registry, "lfspare probe", None, lf_salience_ranking()).await;
+    let served = lf_recall(
+        &registry,
+        "lfspare probe",
+        Some("lf-spare-half-v1"),
+        lf_salience_ranking(),
+    )
+    .await;
+    assert_eq!(plain.len(), 2, "{plain:?}");
+    assert_eq!(served.len(), 2, "{served:?}");
+
+    let plain_shared = &plain[adr104_position(&plain, shared)];
+    let plain_own = &plain[adr104_position(&plain, own)];
+    assert_eq!(
+        lf_field(plain_shared, "duplicate_penalty"),
+        0.0,
+        "without the factor the higher-scoring shared copy is spared"
+    );
+    lf_assert_close(lf_field(plain_own, "duplicate_penalty"), 0.1, "own copy");
+    lf_assert_close(lf_rank(plain_own), 0.5, "own copy without the factor");
+
+    let served_shared = &served[adr104_position(&served, shared)];
+    let served_own = &served[adr104_position(&served, own)];
+    assert_eq!(
+        lf_field(served_own, "duplicate_penalty"),
+        0.0,
+        "under the factor the own copy outranks the scaled shared copy and is spared"
+    );
+    lf_assert_close(lf_rank(served_own), 0.6, "spared own copy");
+    lf_assert_close(
+        lf_field(served_shared, "duplicate_penalty"),
+        0.1,
+        "shared copy",
+    );
+    lf_assert_close(lf_rank(served_shared), 0.3, "penalised shared copy");
+    adr104_assert_rank_identity(served_own);
+    adr104_assert_rank_identity(served_shared);
+}
+
+/// A superseded row stays suppressed through its edge when the factor scales its superseding
+/// `local` row below `min_score`. Suppression through the `supersedes` property needs the
+/// superseding row to be admitted, so that row, scaled out, no longer suppresses.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_superseded_row_stays_suppressed_by_edge_when_the_factor_drops_its_superseder() {
+    let rt = build_full_rt_with_brain();
+    let old_by_edge = lf_note(&rt, "local", "lfsup probe older by edge", 0.6, None).await;
+    let old_by_property = lf_note(&rt, "local", "lfsup probe older by property", 0.6, None).await;
+    let new_by_edge = lf_note(&rt, "local", "lfsup probe newer by edge", 0.3, None).await;
+    let new_by_property = lf_note(
+        &rt,
+        "local",
+        "lfsup probe newer by property",
+        0.3,
+        Some(serde_json::json!({ "supersedes": old_by_property.to_string() })),
+    )
+    .await;
+    let token = rt
+        .authorize(Namespace::parse("local").expect("local namespace"))
+        .expect("authorize");
+    rt.link(
+        &token,
+        new_by_edge,
+        old_by_edge,
+        khive_types::EdgeRelation::Supersedes,
+        1.0,
+        None,
+    )
+    .await
+    .expect("supersedes edge");
+    let registry = lf_registry(&rt);
+    let local = Namespace::parse("local").expect("local namespace");
+    adr104_create_factor_profile(&registry, &local, "lf-sup-half-v1", Some(0.5)).await;
+    let params = serde_json::json!({
+        "config": { "reranker_weights": { "salience": 1.0 } },
+        "min_score": 0.2,
+    });
+
+    let plain = lf_recall(&registry, "lfsup probe", None, params.clone()).await;
+    assert!(
+        lf_has(&plain, new_by_edge) && lf_has(&plain, new_by_property),
+        "without the factor both superseding rows clear the floor: {plain:?}"
+    );
+    assert!(
+        !lf_has(&plain, old_by_edge) && !lf_has(&plain, old_by_property),
+        "so both older rows are suppressed: {plain:?}"
+    );
+
+    let served = lf_recall(&registry, "lfsup probe", Some("lf-sup-half-v1"), params).await;
+    assert!(
+        !lf_has(&served, new_by_edge) && !lf_has(&served, new_by_property),
+        "the factor scales both superseding rows below the floor: {served:?}"
+    );
+    assert!(
+        !lf_has(&served, old_by_edge),
+        "the older row is still suppressed through its incoming edge: {served:?}"
+    );
+    assert!(
+        lf_has(&served, old_by_property),
+        "a row named only by a property of a row that was not admitted is not suppressed: {served:?}"
+    );
+}
+
+/// Recalls with no judgment move a served profile's entity-blind posteriors, and the profile still
+/// scores with the default weights: the same query returns the same order, every entity term stays
+/// 1, and each rank score is unchanged, while `profile_component` shows the projection has moved.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_without_judgment_moves_the_posteriors_but_not_the_served_ranking() {
+    let (rt, _unobserved, ns, h_id, _l_id) = adr104_build_ranking_corpus().await;
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
+    khive_runtime::PackRegistry::register_packs(
+        &["kg".to_string(), "brain".to_string()],
+        rt.clone(),
+        &mut builder,
+    )
+    .expect("register kg and the brain pack with its dispatch hook");
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    let registry = builder.build().expect("registry");
+
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": "adr104-drift-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+    let extra = serde_json::json!({
+        "namespace": ns.as_str(),
+        "fusion_strategy": "vector_only",
+        "embedding_model": ADR104_MODEL,
+    });
+
+    let before = lf_recall(
+        &registry,
+        ADR104_QUERY,
+        Some("adr104-drift-v1"),
+        extra.clone(),
+    )
+    .await;
+    let means_before = lf_posterior_means(&registry, "adr104-drift-v1").await;
+    for _ in 0..8 {
+        lf_recall(
+            &registry,
+            ADR104_QUERY,
+            Some("adr104-drift-v1"),
+            extra.clone(),
+        )
+        .await;
+    }
+    let mut means_after = means_before;
+    for _ in 0..200 {
+        means_after = lf_posterior_means(&registry, "adr104-drift-v1").await;
+        if (means_after[0] - means_before[0]).abs() > 1e-6 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        means_after[0] > means_before[0] + 1e-6,
+        "recalls that return hits must move the relevance posterior: \
+         before={means_before:?} after={means_after:?}"
+    );
+
+    let after = lf_recall(&registry, ADR104_QUERY, Some("adr104-drift-v1"), extra).await;
+    let order = |hits: &[Value]| -> Vec<String> {
+        hits.iter()
+            .map(|h| h["id"].as_str().expect("id").to_owned())
+            .collect()
+    };
+    assert_eq!(
+        order(&before),
+        order(&after),
+        "moved posteriors must not reorder a served profile's results"
+    );
+    assert!(!after.is_empty(), "the corpus must return hits");
+    for (earlier, later) in before.iter().zip(after.iter()) {
+        assert_eq!(later["breakdown"]["weights_served"], "default");
+        assert_eq!(lf_field(earlier, "entity_term"), 1.0);
+        assert_eq!(lf_field(later, "entity_term"), 1.0);
+        lf_assert_close(
+            lf_rank(later),
+            lf_rank(earlier),
+            "rank score after recalls without judgment",
+        );
+    }
+
+    let h_after = &after[adr104_position(&after, h_id)];
+    let component = h_after["breakdown"]["profile_component"]
+        .as_f64()
+        .expect("profile_component present");
+    assert!(
+        (component - 1.0).abs() > 1e-3,
+        "the projected weights have moved away from the defaults and are only reported: \
+         profile_component={component}"
     );
 }
 
@@ -3397,6 +4349,32 @@ async fn recall_breakdown_reports_profile_component_and_entity_posterior_mean() 
             breakdown["entity_posterior_mean"].is_null(),
             "no profile served the request => entity_posterior_mean must be absent"
         );
+        assert!(
+            breakdown["entity_evidence_mass"].is_null(),
+            "no profile served the request => entity_evidence_mass must be absent"
+        );
+        assert_eq!(breakdown["weights_served"].as_str(), Some("default"));
+        assert_eq!(breakdown["namespace"].as_str(), Some("local"));
+        assert_eq!(
+            breakdown_f32(&breakdown["local_factor"]),
+            1.0,
+            "no profile served the request => local_factor must be neutral 1"
+        );
+        assert_eq!(
+            breakdown_f32(&breakdown["duplicate_penalty"]),
+            0.0,
+            "a single hit has no duplicate to be penalised against"
+        );
+        let identity = breakdown_f32(&breakdown["pre_entity_score"])
+            * breakdown_f32(&breakdown["entity_term"])
+            * breakdown_f32(&breakdown["local_factor"])
+            - breakdown_f32(&breakdown["duplicate_penalty"]);
+        assert_eq!(
+            breakdown_f32(&hits[0]["rank_score"]),
+            identity,
+            "rank_score must equal pre_entity_score * entity_term * local_factor - \
+             duplicate_penalty in f32"
+        );
     }
 
     let (_rt, registry, ns, h_id, l_id) = adr104_build_ranking_corpus().await;
@@ -3436,11 +4414,10 @@ async fn recall_breakdown_reports_profile_component_and_entity_posterior_mean() 
     let h_pos = adr104_position(hits, h_id);
     let l_pos = adr104_position(hits, l_id);
     assert!(
-        l_pos < h_pos,
-        "the component-1 salience-projection margin (matching the \
-             profile-differentiated ranking test) is wide enough that H's \
-             bounded (<=+15%) component-2 entity term does not overturn it: \
-             {hits:?}"
+        h_pos < l_pos,
+        "a served profile scores with the default weights, so H's relevance edge \
+             (plus its bounded entity term) must keep it ahead of L even though the \
+             skewed posterior projects weights that favour L: {hits:?}"
     );
 
     let h_component = hits[h_pos]["breakdown"]["profile_component"]
@@ -3459,12 +4436,161 @@ async fn recall_breakdown_reports_profile_component_and_entity_posterior_mean() 
         "H received 30 'useful' signals against an uninformative Beta(1,1) \
              prior; its entity posterior mean must be high, got {h_ent_mean}"
     );
+    let h_mass = hits[h_pos]["breakdown"]["entity_evidence_mass"]
+        .as_f64()
+        .expect("H's posterior reports its evidence mass");
+    assert!(
+        (h_mass - 30.0).abs() < 1e-9,
+        "shipped mass: 30 useful signals hold 30.0 of evidence, got {h_mass}"
+    );
+    assert_eq!(
+        breakdown_f32(&hits[h_pos]["breakdown"]["entity_term"]),
+        crate::scoring::entity_posterior_term(
+            Some((h_ent_mean, h_mass)),
+            crate::scoring::ENTITY_POSTERIOR_WEIGHT,
+        ),
+        "entity_term recomputes from the breakdown's mean and evidence mass"
+    );
 
     assert!(
         hits[l_pos]["breakdown"]["entity_posterior_mean"].is_null(),
         "L never received feedback => entity_posterior_mean must be absent, \
              not a guessed prior mean"
     );
+    assert!(
+        hits[l_pos]["breakdown"]["entity_evidence_mass"].is_null(),
+        "L never received feedback => entity_evidence_mass must be absent"
+    );
+
+    for hit in [&hits[h_pos], &hits[l_pos]] {
+        let breakdown = &hit["breakdown"];
+        assert_eq!(
+            breakdown["weights_served"].as_str(),
+            Some("default"),
+            "a served profile scores with the configured default weights: {breakdown:?}"
+        );
+        assert_eq!(breakdown["namespace"].as_str(), Some("local"));
+        assert_eq!(
+            breakdown_f32(&breakdown["local_factor"]),
+            1.0,
+            "a profile without a factor leaves local rows unscaled"
+        );
+        assert_eq!(breakdown_f32(&breakdown["duplicate_penalty"]), 0.0);
+        let identity = breakdown_f32(&breakdown["pre_entity_score"])
+            * breakdown_f32(&breakdown["entity_term"])
+            * breakdown_f32(&breakdown["local_factor"])
+            - breakdown_f32(&breakdown["duplicate_penalty"]);
+        assert_eq!(
+            breakdown_f32(&hit["rank_score"]),
+            identity,
+            "rank_score must equal pre_entity_score * entity_term * local_factor - \
+             duplicate_penalty in f32: {hit:?}"
+        );
+    }
+}
+
+/// Recalls three `local` memories that share the query's leading terms, with breakdowns, under
+/// the default configuration (RRF fusion, default scoring weights and adjustments).
+async fn breakdown_probe_hits() -> Vec<Value> {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+    for content in [
+        "breakdown probe composite alpha beta gamma",
+        "breakdown probe composite alpha beta",
+        "breakdown probe composite alpha",
+    ] {
+        rt.create_note(&token, "memory", None, content, Some(0.5), None, vec![])
+            .await
+            .expect("create note");
+    }
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": "breakdown probe composite alpha beta gamma",
+                "include_breakdown": true,
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("recall");
+    result.as_array().expect("bare array result").clone()
+}
+
+/// `relevance` is the value the ranking composite received, not that value scaled a second
+/// time. Under the default RRF fusion every ranked relevance lies in the calibrated band
+/// [0.15, 0.82]; a second `min(x * (k + 1), 1.0)` scaling with `k = 10` reports `1.0` for every
+/// value at or above 1/11, so each hit here would have read `1.0`.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_breakdown_relevance_is_the_ranked_value_not_a_saturated_one() {
+    let hits = breakdown_probe_hits().await;
+    assert!(!hits.is_empty(), "the probe memories must be recalled");
+    for hit in &hits {
+        let breakdown = &hit["breakdown"];
+        let relevance = breakdown["relevance"].as_f64().expect("relevance");
+        assert!(
+            relevance < 1.0,
+            "breakdown relevance must be the ranked value, not saturated at 1.0: {breakdown:?}"
+        );
+        assert!(
+            (0.15 - 1e-6..=0.82 + 1e-6).contains(&relevance),
+            "breakdown relevance must lie in the normalized band [0.15, 0.82]: {breakdown:?}"
+        );
+        let fused_score = breakdown["fused_score"]
+            .as_f64()
+            .expect("breakdown reports the fused score beside relevance");
+        assert!(
+            fused_score > 0.0,
+            "the fused score before normalization is positive: {breakdown:?}"
+        );
+    }
+}
+
+/// With no reranker weights the composite factors reported in the breakdown multiply back to
+/// `pre_entity_score`, and `relevance_term` is the default relevance weight times the reported
+/// `relevance`.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_breakdown_composite_factors_reproduce_pre_entity_score() {
+    let hits = breakdown_probe_hits().await;
+    assert!(!hits.is_empty(), "the probe memories must be recalled");
+    let relevance_weight = crate::scoring::ScoringConfig::default().weights.relevance;
+    for hit in &hits {
+        let breakdown = &hit["breakdown"];
+        let composite = &breakdown["composite"];
+        let relevance_term = breakdown_f32(&composite["relevance_term"]);
+        let temporal_boost = breakdown_f32(&composite["temporal_boost"]);
+        let salience_boost = breakdown_f32(&composite["salience_boost"]);
+        let adjustment_factor = breakdown_f32(&composite["adjustment_factor"]);
+        let pre_entity_score = breakdown_f32(&breakdown["pre_entity_score"]);
+
+        let product = relevance_term * temporal_boost * salience_boost * adjustment_factor;
+        assert!(
+            (product - pre_entity_score).abs() <= 1e-5 * pre_entity_score.abs().max(1.0),
+            "relevance_term * temporal_boost * salience_boost * adjustment_factor must equal \
+             pre_entity_score: product {product}, pre_entity_score {pre_entity_score}: {hit:?}"
+        );
+
+        let relevance = breakdown_f32(&breakdown["relevance"]);
+        assert!(
+            (relevance_term - relevance_weight * relevance).abs() <= 1e-6,
+            "relevance_term must be the relevance weight times the reported relevance: \
+             {hit:?}"
+        );
+    }
 }
 
 /// Identical store, query, and profile state must yield identical ranks and scores.
@@ -3626,41 +4752,163 @@ async fn adr104_stage_b_no_posterior_candidate_scores_identically_with_fresh_pro
     );
 }
 
-/// One useful signal lifts only the targeted profile's next equivalent recall.
+const ADR104_TIE_QUERY: &str = "near tie probe query";
+const ADR104_TIE_FILLER: &str = "filler near tie content";
+const ADR104_TIE_FIRST: &str = "first near tie candidate";
+const ADR104_TIE_SECOND: &str = "second near tie candidate";
+const ADR104_TIE_NEIGHBOUR: &str = "neighbour near tie candidate";
+
+/// Recall of the near-tie corpus under `profile_id`: `(id, rank_score, breakdown)` per hit.
+async fn adr104_tie_recall(
+    registry: &khive_runtime::VerbRegistry,
+    ns: &Namespace,
+    profile_id: Option<&str>,
+) -> Vec<(Uuid, f64, Value)> {
+    let mut params = serde_json::json!({
+        "namespace": ns.as_str(),
+        "query": ADR104_TIE_QUERY,
+        "fusion_strategy": "vector_only",
+        "embedding_model": ADR104_MODEL,
+        "include_breakdown": true,
+        "limit": 10
+    });
+    if let Some(pid) = profile_id {
+        params["profile_id"] = serde_json::json!(pid);
+    }
+    let result = registry
+        .dispatch("memory.recall", params)
+        .await
+        .expect("recall");
+    result
+        .as_array()
+        .expect("bare array result")
+        .iter()
+        .map(|hit| {
+            let id = Uuid::parse_str(hit["id"].as_str().expect("hit id")).expect("uuid");
+            let score = hit["rank_score"].as_f64().expect("rank_score");
+            (id, score, hit["breakdown"].clone())
+        })
+        .collect()
+}
+
+fn adr104_tie_hit(hits: &[(Uuid, f64, Value)], id: Uuid) -> (usize, f64, Value) {
+    let pos = hits
+        .iter()
+        .position(|(hit_id, _, _)| *hit_id == id)
+        .unwrap_or_else(|| panic!("{id} missing from hits {hits:?}"));
+    (pos, hits[pos].1, hits[pos].2.clone())
+}
+
+fn adr104_send_useful(target_id: Uuid, profile_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "target_id": target_id.to_string(),
+        "signal": "useful",
+        "served_by_profile_id": profile_id,
+    })
+}
+
+/// The amendment's term written out independently of the code under test.
+fn adr104_expected_term(mean: f64, mass: f64) -> f64 {
+    let t0 = (1.0 + 0.3 * (mean - 0.5)).clamp(0.85, 1.15);
+    1.0 + (t0 - 1.0) * mass / (mass + 16.0)
+}
+
+/// ADR-104 Amendment 6 at the shipped mass (1.0 per explicit judgment): one `useful` moves the
+/// candidate's score by exactly the evidence-scaled term, which lifts it past a near tie under
+/// the profile that received the signal and nowhere else, but not past a neighbour about 1% ahead
+/// (the unscaled term, +5%, would); after an evidence mass of 16 the term has moved half of
+/// `t0 - 1` and lifts it past that neighbour.
 #[tokio::test]
 #[serial(background_tasks)]
 #[serial_test::serial(config_ledger)]
-async fn adr104_stage_b_one_signal_lifts_rank_only_under_the_served_profile() {
+async fn adr104_entity_term_scales_with_evidence_only_under_the_served_profile() {
     use khive_pack_brain::BrainPack;
 
     let rt = build_full_rt_with_brain();
+    let mut vectors = HashMap::new();
+    vectors.insert(
+        ADR104_TIE_QUERY.to_string(),
+        vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    vectors.insert(
+        ADR104_TIE_FILLER.to_string(),
+        vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    // Identical vectors give both candidates the same relevance; only salience separates them.
+    for content in [ADR104_TIE_FIRST, ADR104_TIE_SECOND, ADR104_TIE_NEIGHBOUR] {
+        vectors.insert(
+            content.to_string(),
+            vec![0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+    }
+    rt.register_embedder(FixedVecProvider {
+        model_name: ADR104_MODEL.to_string(),
+        map: vectors,
+    });
     let ns = Namespace::parse("local").expect("ns");
     let token = rt.authorize(ns.clone()).expect("token");
-    let note_id = rt
+    rt.create_note(
+        &token,
+        "memory",
+        None,
+        ADR104_TIE_FILLER,
+        Some(0.5),
+        None,
+        vec![],
+    )
+    .await
+    .expect("filler note");
+    let first_id = rt
         .create_note(
             &token,
             "memory",
             None,
-            "adr104b feedback lift probe note",
-            Some(0.6),
+            ADR104_TIE_FIRST,
+            Some(0.500),
             None,
             vec![],
         )
         .await
-        .expect("create note")
+        .expect("first candidate")
+        .id;
+    let second_id = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            ADR104_TIE_SECOND,
+            Some(0.499),
+            None,
+            vec![],
+        )
+        .await
+        .expect("second candidate")
+        .id;
+    // Salience boost 1 + 0.2 * s: 0.56 against 0.499 puts the neighbour about 1% ahead.
+    let neighbour_id = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            ADR104_TIE_NEIGHBOUR,
+            Some(0.56),
+            None,
+            vec![],
+        )
+        .await
+        .expect("neighbour candidate")
         .id;
 
-    let brain = BrainPack::new(rt.clone());
     let mut builder = VerbRegistryBuilder::new();
     builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
     builder.register(KgPack::new(rt.clone()));
     builder.register(MemoryPack::new(
         crate::test_support::with_receipt_credentials(rt.clone()),
     ));
-    builder.register(brain);
+    builder.register(BrainPack::new(rt.clone()));
     let registry = builder.build().expect("registry");
 
-    for name in ["adr104b-lift-a-v1", "adr104b-lift-b-v1"] {
+    for name in ["adr104-tie-a-v1", "adr104-tie-b-v1"] {
         registry
             .dispatch(
                 "brain.create_profile",
@@ -3674,67 +4922,148 @@ async fn adr104_stage_b_one_signal_lifts_rank_only_under_the_served_profile() {
             .expect("create profile");
     }
 
-    async fn recall_score(
-        registry: &khive_runtime::VerbRegistry,
-        ns: &Namespace,
-        profile_id: Option<&str>,
-    ) -> f64 {
-        let mut params = serde_json::json!({
-            "namespace": ns.as_str(),
-            "query": "adr104b feedback lift probe note",
-            "limit": 10
-        });
-        if let Some(pid) = profile_id {
-            params["profile_id"] = serde_json::json!(pid);
-        }
-        let result = registry
-            .dispatch("memory.recall", params)
-            .await
-            .expect("recall");
-        let hits = result.as_array().expect("bare array result");
-        assert_eq!(hits.len(), 1);
-        hits[0]["rank_score"].as_f64().expect("rank_score")
-    }
-
-    let a_before = recall_score(&registry, &ns, Some("adr104b-lift-a-v1")).await;
-    let b_before = recall_score(&registry, &ns, Some("adr104b-lift-b-v1")).await;
-    let default_before = recall_score(&registry, &ns, None).await;
+    let a_before = adr104_tie_recall(&registry, &ns, Some("adr104-tie-a-v1")).await;
+    let b_before = adr104_tie_recall(&registry, &ns, Some("adr104-tie-b-v1")).await;
+    let default_before = adr104_tie_recall(&registry, &ns, None).await;
+    let (first_pos, first_score, _) = adr104_tie_hit(&a_before, first_id);
+    let (second_pos, second_before, second_breakdown) = adr104_tie_hit(&a_before, second_id);
     assert!(
-        (a_before - default_before).abs() < 1e-9 && (b_before - default_before).abs() < 1e-9,
-        "both fresh profiles must start identical to defaults: a={a_before} \
-             b={b_before} default={default_before}"
+        first_pos < second_pos && first_score > second_before,
+        "the higher-salience candidate must lead before any feedback: {a_before:?}"
+    );
+    let gap = first_score / second_before - 1.0;
+    assert!(
+        gap > 0.0 && gap < 0.001,
+        "the corpus must be a near tie (relative gap below 0.1%), got {gap}"
+    );
+    assert!(
+        second_breakdown["entity_evidence_mass"].is_null(),
+        "no feedback yet => entity_evidence_mass must be absent: {second_breakdown:?}"
+    );
+    let (neighbour_pos, neighbour_score, _) = adr104_tie_hit(&a_before, neighbour_id);
+    let neighbour_gap = neighbour_score / second_before - 1.0;
+    assert!(
+        neighbour_pos < second_pos && neighbour_gap > 0.003 && neighbour_gap < 0.05,
+        "the neighbour must lead the second candidate by more than one scaled useful (+0.29%) \
+         and less than the unscaled term (+5%), got {neighbour_gap}: {a_before:?}"
     );
 
     registry
         .dispatch(
             "brain.feedback",
-            serde_json::json!({
-                "target_id": note_id.to_string(),
-                "signal": "useful",
-                "served_by_profile_id": "adr104b-lift-a-v1",
-            }),
+            adr104_send_useful(second_id, "adr104-tie-a-v1"),
         )
         .await
         .expect("one explicit useful signal under profile A");
 
-    let a_after = recall_score(&registry, &ns, Some("adr104b-lift-a-v1")).await;
-    let b_after = recall_score(&registry, &ns, Some("adr104b-lift-b-v1")).await;
-    let default_after = recall_score(&registry, &ns, None).await;
+    let a_after = adr104_tie_recall(&registry, &ns, Some("adr104-tie-a-v1")).await;
+    let b_after = adr104_tie_recall(&registry, &ns, Some("adr104-tie-b-v1")).await;
+    let default_after = adr104_tie_recall(&registry, &ns, None).await;
 
+    let (first_pos_after, first_after, _) = adr104_tie_hit(&a_after, first_id);
+    let (second_pos_after, second_after, breakdown) = adr104_tie_hit(&a_after, second_id);
+    let mean = breakdown["entity_posterior_mean"]
+        .as_f64()
+        .expect("one useful => entity_posterior_mean present");
+    let mass = breakdown["entity_evidence_mass"]
+        .as_f64()
+        .expect("one useful => entity_evidence_mass present");
     assert!(
-        a_after > a_before,
-        "one useful signal under profile A must lift the score under \
-             profile A: before={a_before} after={a_after}"
+        (mass - 1.0).abs() < 1e-9,
+        "shipped mass: one useful adds 1.0 of evidence, got {mass}"
+    );
+    let term = crate::scoring::entity_posterior_term(
+        Some((mean, mass)),
+        crate::scoring::ENTITY_POSTERIOR_WEIGHT,
+    );
+    assert_eq!(
+        breakdown_f32(&breakdown["entity_term"]),
+        term,
+        "the term recomputes from the breakdown's mean and evidence mass"
     );
     assert!(
-        (b_after - b_before).abs() < 1e-9,
-        "profile B never received the signal => its score must be \
-             unchanged: before={b_before} after={b_after}"
+        (term as f64 - adr104_expected_term(mean, mass)).abs() < 1e-6,
+        "one useful: term {term} != 1 + (t0 - 1) * n / (n + 16) = {}",
+        adr104_expected_term(mean, mass)
     );
     assert!(
-        (default_after - default_before).abs() < 1e-9,
-        "defaults (no profile) must be unchanged by feedback given under \
-             an explicit profile: before={default_before} after={default_after}"
+        (term as f64 - (1.0 + 0.05 / 17.0)).abs() < 1e-6,
+        "one useful at the shipped mass: mean 2/3, t0 1.05, term 1 + 0.05 / 17, got {term}"
+    );
+    assert!(
+        (second_after / second_before - term as f64).abs() < 1e-5,
+        "the served score moves by exactly the term: before={second_before} \
+         after={second_after} term={term}"
+    );
+    assert!(
+        (first_after - first_score).abs() < 1e-9,
+        "the candidate without feedback is unchanged: before={first_score} after={first_after}"
+    );
+    assert!(
+        second_pos_after < first_pos_after,
+        "one useful lifts the second candidate past the near tie under profile A: {a_after:?}"
+    );
+    let (neighbour_pos_after, _, _) = adr104_tie_hit(&a_after, neighbour_id);
+    assert!(
+        neighbour_pos_after < second_pos_after,
+        "one scaled useful does not lift the second candidate past the neighbour: {a_after:?}"
+    );
+
+    for (label, before, after) in [
+        ("profile B", &b_before, &b_after),
+        ("no profile", &default_before, &default_after),
+    ] {
+        for id in [first_id, second_id] {
+            let (pos_before, score_before, _) = adr104_tie_hit(before, id);
+            let (pos_after, score_after, _) = adr104_tie_hit(after, id);
+            assert!(
+                pos_before == pos_after && (score_before - score_after).abs() < 1e-9,
+                "{label} never received the signal => order and score unchanged for {id}: \
+                 before={before:?} after={after:?}"
+            );
+        }
+    }
+
+    for _ in 0..15 {
+        registry
+            .dispatch(
+                "brain.feedback",
+                adr104_send_useful(second_id, "adr104-tie-a-v1"),
+            )
+            .await
+            .expect("further useful signals under profile A");
+    }
+    let a_sixteen = adr104_tie_recall(&registry, &ns, Some("adr104-tie-a-v1")).await;
+    let (second_pos_sixteen, second_sixteen, breakdown) = adr104_tie_hit(&a_sixteen, second_id);
+    let (neighbour_pos_sixteen, _, _) = adr104_tie_hit(&a_sixteen, neighbour_id);
+    let mean = breakdown["entity_posterior_mean"]
+        .as_f64()
+        .expect("entity_posterior_mean present");
+    let mass = breakdown["entity_evidence_mass"]
+        .as_f64()
+        .expect("entity_evidence_mass present");
+    assert!(
+        (mass - 16.0).abs() < 1e-9,
+        "shipped mass: 16 useful judgments hold 16.0 of evidence, got {mass}"
+    );
+    let t0 = (1.0 + 0.3 * (mean - 0.5)).clamp(0.85, 1.15);
+    let term = breakdown_f32(&breakdown["entity_term"]) as f64;
+    assert!(
+        ((term - 1.0) - (t0 - 1.0) / 2.0).abs() < 1e-6,
+        "at an evidence mass of 16 the term moves half of t0 - 1: term={term} t0={t0}"
+    );
+    assert!(
+        (term - (1.0 + 0.3 * (17.0 / 18.0 - 0.5) / 2.0)).abs() < 1e-6,
+        "16 useful at the shipped mass: mean 17/18, term 1 + (t0 - 1) / 2, got {term}"
+    );
+    assert!(
+        (second_sixteen / second_before - term).abs() < 1e-5,
+        "the served score moves by exactly the term: before={second_before} \
+         after={second_sixteen} term={term}"
+    );
+    assert!(
+        second_pos_sixteen < neighbour_pos_sixteen,
+        "an evidence mass of 16 lifts the second candidate past the neighbour: {a_sixteen:?}"
     );
 }
 
@@ -3824,11 +5153,25 @@ async fn adr104_stage_b_saturated_posterior_never_exceeds_clamp_bound_end_to_end
         "expected a near-saturated mean, got {ent_mean}"
     );
 
-    // Divide out the global component to assert the entity clamp in isolation.
+    // A served profile scores with the default weights, so the whole ratio to the unprofiled
+    // score is the entity term; the projected weights only show up in `profile_component`.
     let profile_component = hits[0]["breakdown"]["profile_component"]
         .as_f64()
         .expect("profile_component present");
-    let implied_entity_term = (saturated_score / baseline_score) / profile_component;
+    assert!(
+        (profile_component - 1.0).abs() > 1e-6,
+        "200 useful signals move the projected weights, which are reported but not served: \
+             profile_component={profile_component}"
+    );
+    let implied_entity_term = saturated_score / baseline_score;
+    let reported_entity_term = hits[0]["breakdown"]["entity_term"]
+        .as_f64()
+        .expect("entity_term present");
+    assert!(
+        (implied_entity_term - reported_entity_term).abs() < 1e-4,
+        "rank_score must differ from the unprofiled score by exactly the entity term: \
+             implied={implied_entity_term} reported={reported_entity_term}"
+    );
     assert!(
         implied_entity_term <= crate::scoring::ENTITY_POSTERIOR_CLAMP_MAX as f64 + 1e-6,
         "entity term must never exceed the +15% clamp bound: implied={implied_entity_term}"
@@ -3912,7 +5255,7 @@ async fn adr104_stage_b_entity_term_isolated_via_matched_global_feedback_count()
         ns: &Namespace,
         profile_id: &str,
         target_x_id: Uuid,
-    ) -> (f64, f64, Option<f64>) {
+    ) -> (f64, f64, Option<(f64, f64)>) {
         let result = registry
             .dispatch(
                 "memory.recall",
@@ -3932,8 +5275,15 @@ async fn adr104_stage_b_entity_term_isolated_via_matched_global_feedback_count()
         let profile_component = hits[pos]["breakdown"]["profile_component"]
             .as_f64()
             .expect("profile_component present");
-        let entity_posterior_mean = hits[pos]["breakdown"]["entity_posterior_mean"].as_f64();
-        (rank_score, profile_component, entity_posterior_mean)
+        let breakdown = &hits[pos]["breakdown"];
+        let mean = breakdown["entity_posterior_mean"].as_f64();
+        let mass = breakdown["entity_evidence_mass"].as_f64();
+        assert_eq!(
+            mean.is_some(),
+            mass.is_some(),
+            "entity_evidence_mass is present exactly when entity_posterior_mean is: {breakdown:?}"
+        );
+        (rank_score, profile_component, mean.zip(mass))
     }
 
     let (score_under_x, component_under_x, ent_mean_under_x) =
@@ -4063,6 +5413,9 @@ async fn adr104_stage_b_entity_term_applies_under_weighted_reranker() {
     let ent_mean_after = after_hits[0]["breakdown"]["entity_posterior_mean"]
         .as_f64()
         .expect("entity_posterior_mean present after feedback");
+    let ent_mass_after = after_hits[0]["breakdown"]["entity_evidence_mass"]
+        .as_f64()
+        .expect("entity_evidence_mass present after feedback");
 
     assert!(
         score_after > score_before,
@@ -4071,7 +5424,7 @@ async fn adr104_stage_b_entity_term_applies_under_weighted_reranker() {
     );
 
     let expected_ratio = crate::scoring::entity_posterior_term(
-        Some(ent_mean_after),
+        Some((ent_mean_after, ent_mass_after)),
         crate::scoring::ENTITY_POSTERIOR_WEIGHT,
     ) as f64;
     let observed_ratio = score_after / score_before;
@@ -6475,6 +7828,95 @@ async fn recall_persists_recall_executed_event_with_full_payload() {
         candidates, &selected,
         "candidates mirrors selected at this emission boundary"
     );
+    assert!(
+        event.payload.get("label").is_none(),
+        "a recall without label stores none: {:?}",
+        event.payload
+    );
+}
+
+/// #6802 K54: a caller's `label` rides the recall_executed payload so
+/// brain.event_counts can count recalls by call site; malformed labels are
+/// refused before any read.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_label_is_kept_on_the_recall_executed_event() {
+    const NOTE_TEXT: &str = "call site label coverage note for recall events";
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+    rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+        .await
+        .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    let registry = builder.build().expect("registry");
+
+    for bad in ["", " hook", "hook ", "ho\nok"] {
+        let error = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({"query": NOTE_TEXT, "label": bad}),
+            )
+            .await
+            .expect_err("a malformed label is refused");
+        assert!(error.to_string().contains("label"), "{bad:?}: {error}");
+    }
+    let too_long = "l".repeat(129);
+    let error = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({"query": NOTE_TEXT, "label": too_long}),
+        )
+        .await
+        .expect_err("a label over 128 characters is refused");
+    assert!(error.to_string().contains("128"), "{error}");
+
+    let before = khive_runtime::background_task_count();
+    for label in ["session hook", "session hook", "wake"] {
+        registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({"query": NOTE_TEXT, "limit": 5, "label": label}),
+            )
+            .await
+            .expect("labelled recall succeeds");
+    }
+    for _ in 0..200 {
+        if khive_runtime::background_task_count() <= before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let page = rt
+        .events(&token)
+        .expect("event store")
+        .query_events(
+            khive_storage::event::EventFilter {
+                kinds: vec![khive_types::EventKind::RecallExecuted],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query_events");
+    let mut labels: Vec<&str> = page
+        .items
+        .iter()
+        .map(|event| event.payload["label"].as_str().expect("label stored"))
+        .collect();
+    labels.sort_unstable();
+    assert_eq!(labels, ["session hook", "session hook", "wake"]);
 }
 
 /// created_after/created_before: half-open [after, before) window over
@@ -7013,3 +8455,240 @@ async fn keyword_only_widening_ignores_vector_leg_candidates() {
 #[cfg(test)]
 #[path = "recall_boundary_tests.rs"]
 mod recall_boundary_tests;
+
+#[tokio::test]
+async fn test_hidden_incoming_budget_counts_only_returned_hit() {
+    let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        ..Default::default()
+    })
+    .expect("private in-memory budget fixture");
+    let local = rt
+        .authorize(khive_runtime::Namespace::parse("local").expect("local namespace"))
+        .expect("budget local token");
+    let first_content = "d2budgettoken one";
+    let second_content = "d2budgettoken two";
+    assert_eq!(
+        first_content.len(),
+        second_content.len(),
+        "equal ASCII content budget"
+    );
+    assert!(first_content.is_ascii() && second_content.is_ascii());
+    let mut targets = Vec::new();
+    for content in [first_content, second_content] {
+        let note = rt
+            .create_note(&local, "memory", None, content, Some(0.7), None, Vec::new())
+            .await
+            .expect("budget create_note failed; setup failure, never control credit");
+        assert_eq!(note.kind, "memory");
+        assert_eq!(note.namespace, "local");
+        targets.push(note.id);
+    }
+    let params = || {
+        serde_json::json!({
+            "namespace": "local", "query": "d2budgettoken", "fusion_strategy": "keyword_only",
+            "min_score": 0.0, "limit": 10, "full_content": true,
+        })
+    };
+    let mut baseline_builder = khive_runtime::VerbRegistryBuilder::new();
+    baseline_builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    baseline_builder.register(crate::MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    let baseline_registry = baseline_builder.build().expect("budget baseline registry");
+    let baseline = baseline_registry
+        .dispatch_with_disposition("memory.recall", params(), None)
+        .await
+        .expect("actual unbounded keyword recall; invalid setup is not control credit");
+    let baseline_hits = baseline.as_array().expect("nonempty keyword recall array");
+    assert_eq!(baseline_hits.len(), 2, "budget_fixture_two_ranked_hits");
+    for target in &targets {
+        assert!(
+            baseline_hits
+                .iter()
+                .any(|hit| hit["id"] == target.to_string()),
+            "both actual fixture hits are returned before the cap"
+        );
+    }
+    for hit in baseline_hits {
+        assert_eq!(
+            hit["hidden_incoming_edges"],
+            serde_json::json!({
+                "total": 0, "by_relation": {"supersedes": 0},
+            }),
+            "uncapped fixture zero baseline"
+        );
+    }
+    drop(baseline_registry);
+
+    let pack = crate::MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
+    {
+        let mut config = pack.config.lock().expect("budget scoring config");
+        config.scoring = Some(crate::scoring::ScoringConfig {
+            default_token_budget: first_content.len(),
+            chars_per_token: 1,
+            ..Default::default()
+        });
+    }
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    builder.register(pack);
+    let registry = builder.build().expect("capped budget registry");
+    let capped_baseline = registry
+        .dispatch_with_disposition("memory.recall", params(), None)
+        .await
+        .expect("actual capped keyword recall baseline");
+    let capped_hits = capped_baseline.as_array().expect("nonempty capped array");
+    assert_eq!(capped_hits.len(), 1, "budget_fixture_one_returned_hit");
+    assert_eq!(
+        capped_hits[0]["truncated"],
+        serde_json::json!(true),
+        "budget cut is visible on its hit"
+    );
+    assert_eq!(
+        capped_hits[0]["hidden_incoming_edges"]["total"],
+        serde_json::json!(0)
+    );
+
+    let hidden_ns = "d2-budget-hidden";
+    let hidden_token = rt
+        .authorize(khive_runtime::Namespace::parse(hidden_ns).expect("budget hidden namespace"))
+        .expect("budget hidden seed token");
+    let hidden_source = rt
+        .create_note(
+            &hidden_token,
+            "memory",
+            None,
+            "private budget source",
+            Some(0.7),
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("budget hidden source failed; setup failure, never control credit");
+    for (index, target) in targets.iter().enumerate() {
+        let edge = serde_json::from_value(serde_json::json!({
+            "id": format!("70000000-0000-7000-9000-{:012x}", index + 1),
+            "namespace": hidden_ns, "source_id": hidden_source.id, "target_id": target,
+            "relation": "supersedes", "weight": 0.75,
+            "created_at": "2026-11-04T00:00:00Z", "updated_at": "2026-11-04T00:00:00Z",
+            "deleted_at": null, "metadata": {"fixture": "budget-hidden"}, "target_backend": null,
+        }))
+        .expect("budget edge representation");
+        rt.graph(&hidden_token)
+            .expect("budget hidden seed graph")
+            .upsert_edge(edge)
+            .await
+            .expect("budget edge failed; setup failure, never control credit");
+    }
+    let response = registry
+        .dispatch_with_disposition("memory.recall", params(), None)
+        .await
+        .expect("actual capped recall with hidden edges");
+    let hits = response.as_array().expect("nonempty capped result array");
+    assert_eq!(hits.len(), 1, "budget_capped_recall_returns_one_hit");
+    assert!(
+        targets
+            .iter()
+            .any(|target| hits[0]["id"] == target.to_string()),
+        "budget result belongs to the two seeded candidates"
+    );
+    assert_eq!(
+        hits[0]["truncated"],
+        serde_json::json!(true),
+        "budget_capped_hit_is_stamped"
+    );
+    assert_eq!(
+        hits[0]["hidden_incoming_edges"]["total"],
+        serde_json::json!(1),
+        "budget_capped_recall_hidden_count"
+    );
+    assert_eq!(
+        hits[0]["hidden_incoming_edges"]["by_relation"],
+        serde_json::json!({"supersedes": 1})
+    );
+    let bytes = response.to_string();
+    assert!(
+        !bytes.contains(hidden_ns),
+        "budget hidden namespace omitted"
+    );
+    assert!(
+        !bytes.contains(&hidden_source.id.to_string()),
+        "budget hidden source omitted"
+    );
+}
+
+#[tokio::test]
+async fn hidden_incoming_timings_distinguish_zero_count_from_skipped_step() {
+    let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        ..Default::default()
+    })
+    .expect("private in-memory timing fixture");
+    let local = rt
+        .authorize(khive_runtime::Namespace::parse("local").expect("local namespace"))
+        .expect("timing local token");
+    let target = rt
+        .create_note(
+            &local,
+            "memory",
+            None,
+            "hiddenincomingstageprobe",
+            Some(0.7),
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("timing fixture note");
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(rt.clone()));
+    builder.register(crate::MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
+    let registry = builder.build().expect("timing fixture registry");
+    let params = |query| {
+        json!({
+            "namespace": "local",
+            "query": query,
+            "fusion_strategy": "keyword_only",
+            "min_score": 0.0,
+            "limit": 1,
+            "include_timings": true,
+        })
+    };
+    let entered = registry
+        .dispatch_with_disposition("memory.recall", params("hiddenincomingstageprobe"), None)
+        .await
+        .expect("entered count recall");
+    let hits = entered["results"].as_array().expect("timed recall results");
+    assert_eq!(hits.len(), 1, "the count step has one ranked target");
+    assert_eq!(hits[0]["id"], target.id.to_string());
+    assert_eq!(hits[0]["hidden_incoming_edges"]["total"], json!(0));
+    assert!(
+        entered["timings"]["hidden_incoming_us"].as_u64().is_some(),
+        "an entered count returning zero keeps its measured duration: {entered:?}"
+    );
+
+    let skipped = registry
+        .dispatch_with_disposition("memory.recall", params("nohitstageprobe"), None)
+        .await
+        .expect("empty ranking recall");
+    assert!(
+        skipped["results"]
+            .as_array()
+            .expect("empty timed results")
+            .is_empty(),
+        "the skipped arm has no ranked targets"
+    );
+    assert!(
+        skipped["timings"]
+            .get("hidden_incoming_us")
+            .expect("the skipped count stage is reported")
+            .is_null(),
+        "a skipped count has no measured duration: {skipped:?}"
+    );
+}

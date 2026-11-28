@@ -95,38 +95,89 @@ impl<K: Eq + Hash> NamedWeights<K> {
             }
         }
 
-        let mut weight_scale: f64 = 0.0;
-        let mut feature_scale: f64 = 1.0;
-        for (key, value) in features {
-            let weight = self.weights.get(key).copied().unwrap_or(0.0);
-            if weight == 0.0 {
-                continue;
-            }
-            if !value.is_finite() {
-                return Err(ArithmeticError::NonFinite {
-                    parameter: "feature",
-                });
-            }
-            weight_scale = weight_scale.max(weight);
+        scaled_weighted_mean_with(
+            features
+                .iter()
+                .map(|(key, value)| (self.weights.get(key).copied().unwrap_or(0.0), *value)),
+            |value| {
+                if !value.is_finite() {
+                    Err(ArithmeticError::NonFinite {
+                        parameter: "feature",
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+        )
+    }
+}
+
+/// Compute a max-scaled mean of `(weight, value)` pairs without validation.
+///
+/// Callers own weight and feature validation. For finite results, weights must be
+/// finite and nonnegative, and values with nonzero weights must be finite. Raw
+/// zero weights ignore their values. A zero maximum weight returns `0.0`.
+/// Negative or nonfinite inputs are not rejected or sanitized; the denominator
+/// includes only positive scaled weights, preserving unchecked arithmetic use.
+///
+/// Each iterator clone must replay the same pairs in the same order without
+/// side effects. One ordered pass finds the weight maximum and active feature-
+/// magnitude maximum (at least one); a second accumulates the scaled mean.
+/// Multiplication and addition remain separate; the normalized intermediate is
+/// clamped to `[-1, 1]` before rescaling, without clamping the final score.
+///
+/// The core allocates no heap storage of its own. Cloning and evaluating the
+/// supplied iterator may have caller-defined costs; array and slice iterators
+/// keep the arithmetic allocation-free with constant auxiliary space.
+pub fn scaled_weighted_mean<I>(weighted_features: I) -> f64
+where
+    I: Iterator<Item = (f64, f64)> + Clone,
+{
+    match scaled_weighted_mean_with(
+        weighted_features,
+        |_| Ok::<(), std::convert::Infallible>(()),
+    ) {
+        Ok(mean) => mean,
+        Err(never) => match never {},
+    }
+}
+
+// Validate raw nonzero-weight values while finding both independent scales.
+// Keeping the callback private leaves checked and unchecked policy at callers.
+fn scaled_weighted_mean_with<I, E>(
+    weighted_features: I,
+    mut validate: impl FnMut(f64) -> Result<(), E>,
+) -> Result<f64, E>
+where
+    I: Iterator<Item = (f64, f64)> + Clone,
+{
+    let mut scale = 0.0_f64;
+    let mut feature_scale = 1.0_f64;
+    for (weight, value) in weighted_features.clone() {
+        if weight != 0.0 {
+            validate(value)?;
+        }
+        scale = scale.max(weight);
+        if weight != 0.0 {
             feature_scale = feature_scale.max(value.abs());
         }
-        if weight_scale == 0.0 {
-            return Ok(0.0);
-        }
-
-        let mut numerator = 0.0;
-        let mut denominator = 0.0;
-        for (key, value) in features {
-            let weight = self.weights.get(key).copied().unwrap_or(0.0);
-            if weight == 0.0 {
-                continue;
-            }
-            let scaled_weight = weight / weight_scale;
-            numerator += scaled_weight * (*value / feature_scale);
-            denominator += scaled_weight;
-        }
-        Ok((numerator / denominator).clamp(-1.0, 1.0) * feature_scale)
     }
+    if scale == 0.0 {
+        return Ok(0.0);
+    }
+    let mut numerator = 0.0_f64;
+    let mut weight_sum = 0.0_f64;
+    for (weight, feature_value) in weighted_features {
+        if weight == 0.0 {
+            continue;
+        }
+        let normalized_weight = weight / scale;
+        numerator += normalized_weight * (feature_value / feature_scale);
+        if normalized_weight > 0.0 {
+            weight_sum += normalized_weight;
+        }
+    }
+    Ok((numerator / weight_sum).clamp(-1.0, 1.0) * feature_scale)
 }
 
 fn validate_weight(weight: f64) -> Result<(), ArithmeticError> {

@@ -96,6 +96,10 @@ fn store_monthly_anchor(properties: &mut Value, repeat: Option<&str>, trigger_at
 /// parsed request so callers can inspect verb names without re-parsing.
 fn validate_action(action: &str) -> Result<khive_request::ParsedRequest, RuntimeError> {
     khive_request::parse_request(action).map_err(|e| {
+        // The parser quotes caller text (a bareword value, for one), so its
+        // message is masked like every other refusal that carries caller input.
+        let e = e.to_string();
+        let e = mask_for_redaction_surface(RedactionSurface::GateProbe, &e);
         RuntimeError::InvalidInput(format!(
             "schedule.action: invalid DSL ({e}); \
              provide a valid verb call (e.g. \"schedule.remind(content=\\\"hello\\\")\")"
@@ -261,7 +265,8 @@ fn optional_create_kind_alias_for_replay<'a>(
         )),
         Some(Value::String(value)) => Ok(Some(value.as_str())),
         Some(value) => Err(RuntimeError::InvalidInput(format!(
-            "create: `{field}` must be a string or null; got {value}"
+            "create: `{field}` must be a string or null; got {}",
+            mask_for_redaction_surface(RedactionSurface::GateProbe, &value.to_string())
         ))),
     }
 }
@@ -587,6 +592,11 @@ struct ScheduleBulkCreateEntryCheck {
     entity_kind: Option<String>,
     entity_type: Option<String>,
     description: Option<String>,
+    // entity-only: the item's caller key and `on_key`
+    key: Option<String>,
+    on_key: Option<String>,
+    // entity-only: caller aliases
+    aliases: Option<Vec<String>>,
     // note-only
     content: Option<String>,
     note_kind: Option<String>,
@@ -598,9 +608,10 @@ struct ScheduleBulkCreateEntryCheck {
 
 /// Validate a `create(items=[...])` bulk payload the way `handle_create`'s
 /// bulk path would: `items` must parse into the same shape as
-/// `BulkCreateEntry` (deny-unknown-fields), an entity item needs a `name`
-/// and takes no note-only field, and a note item needs `content` and takes no
-/// entity-only field.
+/// `BulkCreateEntry` (deny-unknown-fields), an entity item needs a `name`,
+/// takes no note-only field and sets `on_key` only to `"update"` beside a
+/// `key`, and a note item needs `content` and takes no entity-only field,
+/// `key`, `on_key` and `aliases` included.
 fn validate_create_bulk_items(
     items_value: &Value,
     registry: &VerbRegistry,
@@ -609,7 +620,8 @@ fn validate_create_bulk_items(
         .map_err(|e| {
             RuntimeError::InvalidInput(format!(
                 "schedule.action: verb \"create\": malformed `items` — could not parse bulk \
-             entries: {e}"
+             entries: {}",
+                mask_for_redaction_surface(RedactionSurface::GateProbe, &e.to_string())
             ))
         })?;
     if entries.len() > 1000 {
@@ -627,6 +639,22 @@ fn validate_create_bulk_items(
                         "schedule.action: verb \"create\": items[{idx}] content, note_kind and \
                          salience apply only to note items"
                     )));
+                }
+                match entry.on_key.as_deref() {
+                    None => {}
+                    Some("update") if entry.key.is_some() => {}
+                    Some("update") => {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "schedule.action: verb \"create\": items[{idx}] on_key applies only \
+                             to a keyed entity item"
+                        )));
+                    }
+                    Some(_) => {
+                        return Err(RuntimeError::InvalidInput(format!(
+                            "schedule.action: verb \"create\": items[{idx}] on_key accepts only \
+                             \"update\""
+                        )));
+                    }
                 }
                 let canonical = reconcile_specific_for_replay(
                     &format!("items[{idx}] "),
@@ -657,6 +685,12 @@ fn validate_create_bulk_items(
                 }
             }
             CreateKindClass::Note { specific } => {
+                if entry.key.is_some() || entry.on_key.is_some() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "schedule.action: verb \"create\": items[{idx}] key and on_key apply \
+                         only to entity items of a bulk create"
+                    )));
+                }
                 if entry.entity_kind.is_some()
                     || entry.entity_type.is_some()
                     || entry.description.is_some()
@@ -664,6 +698,12 @@ fn validate_create_bulk_items(
                     return Err(RuntimeError::InvalidInput(format!(
                         "schedule.action: verb \"create\": items[{idx}] entity_kind, \
                          entity_type and description apply only to entity items"
+                    )));
+                }
+                if entry.aliases.is_some() {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "schedule.action: verb \"create\": items[{idx}] aliases apply only to \
+                         entity items"
                     )));
                 }
                 let canonical = reconcile_specific_for_replay(
@@ -1074,7 +1114,8 @@ pub(crate) async fn handle_agenda(
         order_by_instant: true,
         after_instant,
         ..Default::default()
-    };
+    }
+    .with_default_note_status(khive_storage::note::NoteStatusSelector::Active);
 
     const PAGE_SIZE: u32 = 64;
     let mut events = Vec::with_capacity(limit as usize);
@@ -1368,5 +1409,63 @@ mod reservation_tests {
         let after = store.get_note(id).await.expect("read row").expect("row");
         assert_eq!(after.properties, Some(planted), "row changed");
         assert_eq!(after.updated_at, before.updated_at, "revision changed");
+    }
+}
+
+#[cfg(test)]
+mod archive_visibility_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn agenda_excludes_archived_pending_notes_before_instant_order_and_limit() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let runtime = KhiveRuntime::memory().unwrap();
+            let token = runtime
+                .authorize(khive_runtime::Namespace::local())
+                .unwrap();
+            let mut expected = None;
+            for (status, trigger) in [
+                ("archived", "2099-01-01T00:00:00Z"),
+                ("active", "2099-01-02T00:00:00Z"),
+            ] {
+                let mut note = Note::new(
+                    "local",
+                    "scheduled_event",
+                    format!("{status} pending event"),
+                );
+                note.status = status.into();
+                note.properties = Some(json!({"status": "pending", "trigger_at": trigger}));
+                if status == "active" {
+                    expected = Some(note.id.to_string());
+                }
+                runtime
+                    .notes(&token)
+                    .unwrap()
+                    .upsert_note(note)
+                    .await
+                    .unwrap();
+            }
+            let result = handle_agenda(
+                &runtime,
+                &token,
+                json!({
+                    "limit": 1, "from": "2098-01-01T00:00:00Z", "to": "2100-01-01T00:00:00Z",
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["count"], 1);
+            assert_eq!(
+                result["events"][0]["full_id"],
+                expected.unwrap(),
+                "agenda must omit archived pending events before its limit"
+            );
+            assert_eq!(
+                result["events"][0]["properties"]["status"], "pending",
+                "workflow state remains unchanged"
+            );
+        })
+        .await
+        .expect("bounded actual schedule agenda regression");
     }
 }

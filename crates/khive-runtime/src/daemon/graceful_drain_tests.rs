@@ -103,9 +103,14 @@ async fn drain_returns_promptly_with_no_accepted_connection() {
 fn stopped_listener_is_closed_before_drain() {
     use std::process::{Command, Stdio};
 
-    let dir = tempfile::Builder::new()
+    let dir = crate::test_process::private_tempdir_builder()
         .prefix("kh-drain-")
         .tempdir_in("/tmp")
+        .or_else(|_| {
+            crate::test_process::private_tempdir_builder()
+                .prefix("kh-drain-")
+                .tempdir()
+        })
         .expect("short isolated socket directory");
     let child_home = dir.path().join("home");
     std::fs::create_dir(&child_home).expect("empty daemon child HOME");

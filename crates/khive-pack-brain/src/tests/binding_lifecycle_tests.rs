@@ -138,3 +138,145 @@ async fn w4_c3_resolve_skips_archived_binding() {
         })
     );
 }
+
+fn unbind_reach_snapshot(pack: &BrainPack, actor: &str) -> Vec<(String, String, String, i32)> {
+    let state = pack.state.lock().expect("binding reach state");
+    let mut bindings: Vec<_> = state
+        .bindings
+        .iter()
+        .filter(|binding| binding.actor == actor)
+        .map(|binding| {
+            (
+                binding.namespace.clone(),
+                binding.profile_id.clone(),
+                binding.consumer_kind.clone(),
+                binding.priority,
+            )
+        })
+        .collect();
+    bindings.sort();
+    bindings
+}
+
+async fn seed_unbind_reach_bindings(
+    pack: &BrainPack,
+    registry: &khive_runtime::VerbRegistry,
+    token: &NamespaceToken,
+    actor: &str,
+) {
+    for namespace in ["binding-alpha", "binding-beta"] {
+        let bound = pack
+            .dispatch(
+                "brain.bind",
+                json!({
+                    "profile_id": "balanced-recall-v1",
+                    "actor": actor,
+                    "namespace": namespace,
+                    "consumer_kind": "recall",
+                }),
+                registry,
+                token,
+            )
+            .await
+            .expect("bind through the local catalog");
+        assert_eq!(bound["bound"], true, "{bound}");
+        assert_eq!(bound["actor"], actor, "{bound}");
+        assert_eq!(bound["namespace"], namespace, "{bound}");
+        assert_eq!(bound["profile_id"], "balanced-recall-v1", "{bound}");
+        assert_eq!(bound["consumer_kind"], "recall", "{bound}");
+    }
+    assert_eq!(
+        unbind_reach_snapshot(pack, actor),
+        vec![
+            (
+                "binding-alpha".to_string(),
+                "balanced-recall-v1".to_string(),
+                "recall".to_string(),
+                0,
+            ),
+            (
+                "binding-beta".to_string(),
+                "balanced-recall-v1".to_string(),
+                "recall".to_string(),
+                0,
+            ),
+        ],
+        "both binding namespaces must exist in the same catalog"
+    );
+}
+
+#[tokio::test]
+async fn unbind_without_namespace_reports_removals_by_binding_namespace() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).expect("local catalog token");
+    let actor = "unbind-reach-actor";
+    seed_unbind_reach_bindings(&pack, &registry, &token, actor).await;
+
+    let result = pack
+        .dispatch("brain.unbind", json!({"actor": actor}), &registry, &token)
+        .await
+        .expect("actor-only unbind");
+    assert_eq!(
+        result["removed_by_namespace"],
+        json!({"binding-alpha": 1, "binding-beta": 1}),
+        "brain_unbind_reports_removed_by_binding_namespace: {result}"
+    );
+    assert_eq!(result["removed"], 2, "{result}");
+    assert_eq!(result["unbound"], 2, "{result}");
+    assert!(
+        unbind_reach_snapshot(&pack, actor).is_empty(),
+        "actor-only unbind removes both binding namespaces"
+    );
+}
+
+#[tokio::test]
+async fn unbind_with_namespace_preserves_other_binding_and_reports_empty_no_match() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).expect("local catalog token");
+    let actor = "unbind-scoped-actor";
+    seed_unbind_reach_bindings(&pack, &registry, &token, actor).await;
+    let before = unbind_reach_snapshot(&pack, actor);
+    let survivor = vec![before[1].clone()];
+
+    let result = pack
+        .dispatch(
+            "brain.unbind",
+            json!({"actor": actor, "namespace": "binding-alpha"}),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("namespace-scoped unbind");
+    assert_eq!(
+        result["removed_by_namespace"],
+        json!({"binding-alpha": 1}),
+        "scoped unbind reports only the removed binding namespace: {result}"
+    );
+    assert_eq!(result["removed"], 1, "{result}");
+    assert_eq!(result["unbound"], 1, "{result}");
+    assert_eq!(
+        unbind_reach_snapshot(&pack, actor),
+        survivor,
+        "the other binding remains unchanged"
+    );
+
+    let no_match = pack
+        .dispatch(
+            "brain.unbind",
+            json!({"actor": actor, "namespace": "binding-alpha"}),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("successful no-match unbind");
+    assert_eq!(no_match["removed_by_namespace"], json!({}), "{no_match}");
+    assert_eq!(no_match["removed"], 0, "{no_match}");
+    assert_eq!(no_match["unbound"], 0, "{no_match}");
+    assert_eq!(
+        unbind_reach_snapshot(&pack, actor),
+        survivor,
+        "a no-match call retains the other binding"
+    );
+}

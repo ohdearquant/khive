@@ -295,13 +295,13 @@ async fn feedback_tier2_namespace_bound_profile_credited() {
 
 /// Tier-2, actor-bound: `knowledge.feedback`'s own call site must thread the
 /// caller's actor identity, not just `resolve_compose_type_weights` (the read
-/// side). Binds `actor-bound-compose` by `actor="leo"` only, leaving namespace
+/// side). Binds `actor-bound-compose` by `actor="casey"` only, leaving namespace
 /// as the wildcard `"*"` — a namespace-only resolution can never reach it.
 /// Mutation: reverting `handle_feedback`'s call site back to `actor=None`
 /// must make this test fail (fall through to tier-3, `emitted` absent/false).
 #[tokio::test]
 async fn feedback_tier2_actor_bound_profile_credited() {
-    let rt = make_rt_with_actor("leo");
+    let rt = make_rt_with_actor("casey");
     let ns = Namespace::parse("local").expect("ns");
 
     let mut builder = VerbRegistryBuilder::new();
@@ -312,7 +312,7 @@ async fn feedback_tier2_actor_bound_profile_credited() {
     // `VerbRegistry` mints its own per-dispatch tokens from its own
     // construction-baked actor id (independent of `RuntimeConfig::actor_id`) —
     // bake the same actor here so `registry.dispatch` calls carry it too.
-    builder.with_actor_id(Some("leo".to_string()));
+    builder.with_actor_id(Some("casey".to_string()));
     let registry = builder.build().expect("registry");
     rt.install_edge_rules(registry.all_edge_rules());
 
@@ -336,10 +336,10 @@ async fn feedback_tier2_actor_bound_profile_credited() {
     registry
         .dispatch(
             "brain.bind",
-            json!({"actor": "leo", "profile_id": "actor-bound-compose", "consumer_kind": "knowledge_compose"}),
+            json!({"actor": "casey", "profile_id": "actor-bound-compose", "consumer_kind": "knowledge_compose"}),
         )
         .await
-        .expect("bind actor-bound profile to actor=leo");
+        .expect("bind actor-bound profile to actor=casey");
 
     let r = registry
         .dispatch(

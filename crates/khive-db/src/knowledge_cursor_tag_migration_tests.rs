@@ -194,63 +194,64 @@ fn legacy_cursor_index_upgrade_keeps_rows_and_uses_ordered_live_index() {
     })
     .unwrap();
     let mut writer = pool.writer().unwrap();
-    let conn = writer.conn_mut();
-    historical_prefix(conn);
-    assert!(index_sql(conn).contains("tags NOT LIKE '%type:domain%'"));
-    seed(conn);
-    let before = rows(conn);
-    let domains_before: (String, i64) = conn
-        .query_row(
-            "SELECT sql,rootpage FROM sqlite_schema WHERE name='idx_knowledge_domains_cursor'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    run_migrations(conn).unwrap();
-    assert_index(conn);
-    assert_eq!(rows(conn), before);
-    let domains_after: (String, i64) = conn
-        .query_row(
-            "SELECT sql,rootpage FROM sqlite_schema WHERE name='idx_knowledge_domains_cursor'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(domains_after, domains_before, "domain index is untouched");
-    assert_eq!(
-        walk_and_explain(conn, ""),
-        [
-            "00-near",
-            "01-prefix",
-            "02-case",
-            "07-mixed-escaped",
-            "10-malformed"
-        ]
-    );
-    assert_eq!(
-        walk_and_explain(conn, " AND status = 'active'"),
-        ["00-near", "02-case", "10-malformed"]
-    );
-    let rootpage: i64 = conn
-        .query_row(
-            "SELECT rootpage FROM sqlite_schema WHERE name='idx_knowledge_atoms_cursor'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    run_migrations(conn).unwrap();
-    assert_eq!(rows(conn), before);
-    let reopened: i64 = conn
-        .query_row(
-            "SELECT rootpage FROM sqlite_schema WHERE name='idx_knowledge_atoms_cursor'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        reopened, rootpage,
-        "repeat startup does not rebuild a current index"
-    );
+    writer.conn_mut().with_mut(|conn| {
+        historical_prefix(conn);
+        assert!(index_sql(conn).contains("tags NOT LIKE '%type:domain%'"));
+        seed(conn);
+        let before = rows(conn);
+        let domains_before: (String, i64) = conn
+            .query_row(
+                "SELECT sql,rootpage FROM sqlite_schema WHERE name='idx_knowledge_domains_cursor'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        run_migrations(conn).unwrap();
+        assert_index(conn);
+        assert_eq!(rows(conn), before);
+        let domains_after: (String, i64) = conn
+            .query_row(
+                "SELECT sql,rootpage FROM sqlite_schema WHERE name='idx_knowledge_domains_cursor'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(domains_after, domains_before, "domain index is untouched");
+        assert_eq!(
+            walk_and_explain(conn, ""),
+            [
+                "00-near",
+                "01-prefix",
+                "02-case",
+                "07-mixed-escaped",
+                "10-malformed"
+            ]
+        );
+        assert_eq!(
+            walk_and_explain(conn, " AND status = 'active'"),
+            ["00-near", "02-case", "10-malformed"]
+        );
+        let rootpage: i64 = conn
+            .query_row(
+                "SELECT rootpage FROM sqlite_schema WHERE name='idx_knowledge_atoms_cursor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        run_migrations(conn).unwrap();
+        assert_eq!(rows(conn), before);
+        let reopened: i64 = conn
+            .query_row(
+                "SELECT rootpage FROM sqlite_schema WHERE name='idx_knowledge_atoms_cursor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            reopened, rootpage,
+            "repeat startup does not rebuild a current index"
+        );
+    });
 }
 
 #[test]

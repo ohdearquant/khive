@@ -18,6 +18,29 @@ use khive_storage::{
 /// sqlite-vec's ceiling on `k` in a vec0 KNN query (`SQLITE_VEC_VEC0_K_MAX`).
 const VEC0_K_MAX: usize = 4096;
 
+// One sanitized trace per search-kernel invocation, including early errors.
+// `not_completed` includes interruption and other errors; it does not infer a
+// cause from a low-level SQLite error.
+struct TieSearchTrace {
+    knn_attempts: u32,
+    tie_widenings: u32,
+    scalar_fallback: &'static str,
+    outcome: &'static str,
+}
+
+impl Drop for TieSearchTrace {
+    fn drop(&mut self) {
+        tracing::trace!(
+            target: "khive_db::stores::vectors::tie_widening",
+            knn_attempts = self.knn_attempts,
+            tie_widenings = self.tie_widenings,
+            scalar_fallback = self.scalar_fallback,
+            outcome = self.outcome,
+            "sqlite vector search kernel finished"
+        );
+    }
+}
+
 impl SqliteVecStore {
     /// Prepare the existing single-query kernel without acquiring a reader.
     fn prepare_search(
@@ -75,6 +98,12 @@ impl SqliteVecStore {
         }
 
         Ok(move |conn: &rusqlite::Connection| {
+            let mut trace = TieSearchTrace {
+                knn_attempts: 0,
+                tie_widenings: 0,
+                scalar_fallback: "none",
+                outcome: "not_completed",
+            };
             if query_embedding.len() != dims {
                 return Err(rusqlite::Error::InvalidParameterCount(
                     query_embedding.len(),
@@ -161,12 +190,19 @@ impl SqliteVecStore {
             let mut k = top_k.saturating_add(1);
             let mut rows = loop {
                 if k > VEC0_K_MAX {
+                    trace.scalar_fallback = if trace.knn_attempts == 0 {
+                        "direct_over_limit"
+                    } else {
+                        "tie_exhausted_limit"
+                    };
                     break query_rows(&exact_sql, top_k)?;
                 }
+                trace.knn_attempts += 1;
                 let rows = query_rows(&match_sql, k)?;
                 if top_k == 0 || rows.len() < k || rows[k - 1].1 > rows[top_k - 1].1 {
                     break rows;
                 }
+                trace.tie_widenings += 1;
                 k = if k == VEC0_K_MAX {
                     VEC0_K_MAX + 1
                 } else {
@@ -193,6 +229,7 @@ impl SqliteVecStore {
                 });
             }
 
+            trace.outcome = "completed";
             Ok(hits)
         })
     }
@@ -943,5 +980,196 @@ impl VectorStore for SqliteVecStore {
             max_dimensions: Some(8192),
             index_kinds: vec![VectorIndexKind::SqliteVec],
         })
+    }
+}
+
+#[cfg(all(test, feature = "vectors"))]
+mod tie_widening_trace_tests {
+    use super::*;
+    use crate::pool::{ConnectionPool, PoolConfig};
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::{layer::Context, layer::SubscriberExt, Layer};
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    struct Captured {
+        knn_attempts: u64,
+        tie_widenings: u64,
+        scalar_fallback: String,
+        outcome: String,
+    }
+
+    impl Visit for Captured {
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            match field.name() {
+                "knn_attempts" => self.knn_attempts = value,
+                "tie_widenings" => self.tie_widenings = value,
+                _ => {}
+            }
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            match field.name() {
+                "scalar_fallback" => self.scalar_fallback = value.to_owned(),
+                "outcome" => self.outcome = value.to_owned(),
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+    }
+
+    struct Capture(Arc<Mutex<Vec<Captured>>>);
+
+    impl<S: Subscriber> Layer<S> for Capture {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            if event.metadata().target() == "khive_db::stores::vectors::tie_widening" {
+                let names: std::collections::BTreeSet<_> = event
+                    .metadata()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name())
+                    .collect();
+                assert_eq!(
+                    names,
+                    std::collections::BTreeSet::from([
+                        "knn_attempts",
+                        "message",
+                        "outcome",
+                        "scalar_fallback",
+                        "tie_widenings",
+                    ])
+                );
+                let mut fields = Captured::default();
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields);
+            }
+        }
+    }
+
+    fn request(top_k: u32) -> VectorSearchRequest {
+        VectorSearchRequest {
+            query_vectors: vec![vec![1.0, 0.0, 0.0]],
+            top_k,
+            namespace: None,
+            kind: Some(SubstrateKind::Note),
+            embedding_model: None,
+            filter: None,
+            backend_hints: None,
+        }
+    }
+
+    #[test]
+    fn actual_search_kernel_emits_sanitized_completion_and_error_traces() {
+        crate::extension::ensure_extensions_loaded();
+        let dir = tempfile::tempdir().expect("synthetic vector directory");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join("trace.db")),
+                write_queue_enabled: Some(false),
+                volume_lock_dir: Some(dir.path().join("locks")),
+                ..PoolConfig::for_test()
+            })
+            .expect("synthetic vector pool"),
+        );
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            true,
+            "trace".into(),
+            "trace-model".into(),
+            3,
+            "local".into(),
+        )
+        .expect("synthetic vector store");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&captured)));
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        pool.writer()
+            .unwrap()
+            .autocommit(|conn| {
+                conn.execute_batch(
+                    "CREATE VIRTUAL TABLE vec_trace USING vec0(\
+                     subject_id TEXT PRIMARY KEY, namespace TEXT NOT NULL, kind TEXT NOT NULL, \
+                     field TEXT NOT NULL, embedding_model TEXT NOT NULL, \
+                     embedding float[3] distance_metric=cosine)",
+                )?;
+                // The empty population is a positive one-attempt baseline.
+                assert!(store.prepare_search(request(1)).unwrap()(conn)?.is_empty());
+                conn.execute_batch("BEGIN")?;
+                let vector = encode_f32_native(&[1.0, 0.0, 0.0]);
+                let mut stmt = conn.prepare(
+                    "INSERT INTO vec_trace(subject_id, namespace, kind, field, embedding_model, embedding) \
+                     VALUES (?1, 'local', 'note', 'note.content', 'trace-model', ?2)",
+                )?;
+                for id in (1..=4096_u128).rev() {
+                    stmt.execute(rusqlite::params![Uuid::from_u128(id).to_string(), &vector])?;
+                }
+                drop(stmt);
+                conn.execute_batch("COMMIT")?;
+
+                // A whole equal-distance cohort forces all k stages through the cap.
+                let query = store.prepare_search(request(1)).unwrap();
+                let hits = query(conn)?;
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].subject_id, Uuid::from_u128(1));
+
+                // An oversized request takes the direct scalar route, not tie widening.
+                let query = store.prepare_search(request(4096)).unwrap();
+                assert_eq!(query(conn)?.len(), 4096);
+
+                // No SQL attempt starts on a dimension error, and the original
+                // error remains observable to the caller.
+                let mut invalid = request(1);
+                invalid.query_vectors = vec![vec![1.0, 0.0]];
+                let query = store.prepare_search(invalid).unwrap();
+                assert!(matches!(
+                    query(conn),
+                    Err(rusqlite::Error::InvalidParameterCount(2, 3))
+                ));
+
+                // A SQL failure counts the attempt but propagates the original
+                // error; the trace reports no diagnostic or error text.
+                conn.execute_batch("DROP TABLE vec_trace")?;
+                let query = store.prepare_search(request(1)).unwrap();
+                assert!(query(conn).is_err());
+                Ok(())
+            })
+            .expect("synthetic query fixture");
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![
+                Captured {
+                    knn_attempts: 1,
+                    tie_widenings: 0,
+                    scalar_fallback: "none".into(),
+                    outcome: "completed".into(),
+                },
+                Captured {
+                    knn_attempts: 12,
+                    tie_widenings: 12,
+                    scalar_fallback: "tie_exhausted_limit".into(),
+                    outcome: "completed".into(),
+                },
+                Captured {
+                    knn_attempts: 0,
+                    tie_widenings: 0,
+                    scalar_fallback: "direct_over_limit".into(),
+                    outcome: "completed".into(),
+                },
+                Captured {
+                    knn_attempts: 0,
+                    tie_widenings: 0,
+                    scalar_fallback: "none".into(),
+                    outcome: "not_completed".into(),
+                },
+                Captured {
+                    knn_attempts: 1,
+                    tie_widenings: 0,
+                    scalar_fallback: "none".into(),
+                    outcome: "not_completed".into(),
+                },
+            ]
+        );
     }
 }

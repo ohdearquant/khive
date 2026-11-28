@@ -6,7 +6,7 @@
 //! caller-selected L1, L1.5, and L2 tiers in `source_ingest`.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use serde::Deserialize;
@@ -97,6 +97,47 @@ pub(crate) fn parse_tiers(entries: Option<&[String]>) -> Result<TierSelection, R
     Ok(selection)
 }
 
+/// Admit `requested` only when its resolved form, symlinks included, lies under a
+/// resolved `[code_ingest].roots` entry. A path outside every root and one that
+/// cannot be resolved give the same message.
+fn admit_under_roots(
+    requested: &Path,
+    roots: &[PathBuf],
+    field: &str,
+    raw: &str,
+) -> Result<(), RuntimeError> {
+    let admitted = std::fs::canonicalize(requested)
+        .map(|resolved| {
+            roots
+                .iter()
+                .filter_map(|root| std::fs::canonicalize(root).ok())
+                .any(|root| resolved.starts_with(root))
+        })
+        .unwrap_or(false);
+    if admitted {
+        Ok(())
+    } else {
+        Err(RuntimeError::InvalidInput(format!(
+            "{field} {raw:?} is not under a configured code.ingest root"
+        )))
+    }
+}
+
+/// An existing target is resolved itself, so a link inside a root that points
+/// outside every root is refused. A target that does not exist yet is judged by
+/// its nearest existing ancestor, which decides where a write would land.
+fn admit_target_under_roots(
+    target: &Path,
+    roots: &[PathBuf],
+    raw: &str,
+) -> Result<(), RuntimeError> {
+    let existing = target
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .unwrap_or(target);
+    admit_under_roots(existing, roots, "db", raw)
+}
+
 impl CodePack {
     pub(crate) async fn handle_ingest(&self, params: Value) -> Result<Value, RuntimeError> {
         let CodeIngestParams {
@@ -108,6 +149,11 @@ impl CodePack {
         let languages = parse_languages(languages.as_deref())?;
         let tiers = parse_tiers(tiers.as_deref())?;
         let path = PathBuf::from(&path_raw);
+        let roots = &self.runtime.config().code_ingest.roots;
+        admit_under_roots(&path, roots, "path", &path_raw)?;
+        if let Some(db) = db.as_deref() {
+            admit_target_under_roots(Path::new(db), roots, db)?;
+        }
         if !path.is_dir() {
             return Err(RuntimeError::InvalidInput(format!(
                 "path {path_raw:?} does not exist or is not a directory"
@@ -123,6 +169,8 @@ impl CodePack {
         )
         .map_err(RuntimeError::InvalidInput)?;
         if db.is_none() {
+            // `<path>/.khive` may already exist as a link that leaves every root.
+            admit_target_under_roots(&db_path, roots, &db_path.display().to_string())?;
             let parent = db_path.parent().ok_or_else(|| {
                 RuntimeError::InvalidInput("default code-map target has no parent".into())
             })?;

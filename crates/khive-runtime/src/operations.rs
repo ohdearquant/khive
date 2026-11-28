@@ -329,8 +329,23 @@ pub(crate) fn legacy_post_commit_result_with_embedding<T>(
 }
 
 mod attachments;
+mod entity_aliases;
+pub(crate) use entity_aliases::{
+    apply_entity_alias_change, entity_updated_payload, unguarded as unguarded_alias_statements,
+};
+pub use entity_aliases::{validate_entity_alias, EntityAliasChange, EntityAliasReport};
 mod entity_bulk;
 mod entity_create;
+mod entity_key_add;
+pub use entity_key_add::{
+    entity_key_add_plans, EntityKeyAdd, ENTITY_KEY_ADD_HELD_LABEL, ENTITY_KEY_ADD_LIVE_LABEL,
+};
+mod entity_keys;
+pub(crate) use entity_keys::validate_entity_key;
+pub use entity_keys::{
+    entity_carries_create_payload, entity_key_conflict, keyed_replay_assertion_plan,
+    same_create_payload, KeyedEntityCreate, KeyedEntityReload, PendingEntityId,
+};
 mod entity_indexes;
 #[cfg(any(test, feature = "fault-injection"))]
 mod fault_injection;
@@ -359,7 +374,7 @@ pub use edge_query::QueryResult;
 use graph_rules::{accepted_entity_relations_description, static_impossible_edge_pattern_warnings};
 pub use graph_rules::{
     accepted_entity_relations_for_entities, accepted_pack_relations_for_entities,
-    dependency_kind_inference_hint, merge_entry_metadata,
+    allowed_pairs_for_relation_description, dependency_kind_inference_hint, merge_entry_metadata,
 };
 pub(crate) use graph_rules::{
     canonical_edge_endpoint_kinds, canonical_edge_endpoints, merge_dependency_kind,
@@ -1575,8 +1590,8 @@ impl KhiveRuntime {
         properties_filter: Option<&serde_json::Value>,
         text_mode: TextQueryMode,
     ) -> RuntimeResult<Vec<NoteSearchHit>> {
-        let (hits, _vector_error) = self
-            .search_notes_inner(
+        let (hits, _note_status_dropped) = self
+            .search_notes_with_text_mode_and_status(
                 token,
                 query_text,
                 query_vector,
@@ -1586,7 +1601,8 @@ impl KhiveRuntime {
                 tags_any,
                 properties_filter,
                 text_mode,
-                false,
+                khive_storage::note::NoteStatusSelector::Active,
+                None,
             )
             .await?;
         Ok(hits)
@@ -1635,21 +1651,21 @@ impl KhiveRuntime {
         properties_filter: Option<&serde_json::Value>,
         text_mode: TextQueryMode,
     ) -> RuntimeResult<NoteSearchOutcome> {
-        let (hits, vector_error) = self
-            .search_notes_inner(
+        let (outcome, _note_status_dropped) = self
+            .search_notes_outcome_with_text_mode_and_status(
                 token,
                 query_text,
-                None,
                 limit,
                 note_kind,
                 include_superseded,
                 tags_any,
                 properties_filter,
                 text_mode,
-                true,
+                khive_storage::note::NoteStatusSelector::Active,
+                None,
             )
             .await?;
-        Ok(NoteSearchOutcome { hits, vector_error })
+        Ok(outcome)
     }
 
     /// Restore a note tombstone owned by the caller's primary namespace.
@@ -1823,6 +1839,9 @@ pub struct EntityCreateSpec {
     pub description: Option<String>,
     pub properties: Option<serde_json::Value>,
     pub tags: Vec<String>,
+    /// Caller aliases (ADR-221 section 2), validated before anything is
+    /// read. An alias equal to `name` is not stored.
+    pub aliases: Vec<String>,
 }
 
 // INLINE TEST JUSTIFICATION: tests here exercise private helpers (canonical_edge_endpoints,

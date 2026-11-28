@@ -15,6 +15,9 @@ mod link_audit_alias {
     include!("link_audit_alias_tests.rs");
 }
 
+#[path = "pack/config_lock_runtime_tests.rs"]
+mod config_lock_runtime;
+
 #[tokio::test]
 async fn pack_host_state_shares_the_registered_dispatch_instance_across_clones() {
     struct HostStatePack(Arc<AtomicUsize>);
@@ -75,7 +78,7 @@ async fn pack_host_state_shares_the_registered_dispatch_instance_across_clones()
     assert_eq!(host.load(Ordering::SeqCst), 1);
     assert!(registry.pack_host_state::<String>("host_state").is_none());
     assert!(registry.pack_host_state::<AtomicUsize>("missing").is_none());
-    assert!(registry.pack_host_state::<AtomicUsize>("alpha").is_none());
+    assert!(registry.pack_host_state::<AtomicUsize>("kg").is_none());
 }
 
 /// Verbs known, by cross-pack source review (#2147/#2217), to have
@@ -92,10 +95,16 @@ const KNOWN_ADMISSION_UNSAFE_VERBS: &[&str] = &[
     "comm.suppression_list",
     "comm.withheld_body",
     "db_diagnostics",
+    "exec.tree_diff",
+    "git.check_log",
     "git.checkout",
     "git.diff",
     "git.gates",
+    "git.issue",
+    "git.issue_list",
     "git.log",
+    "git.pr_list",
+    "git.pr_state",
     "git.receipts",
     "git.reconcile",
     "git.status",
@@ -683,11 +692,16 @@ fn policy_decision_receipts_are_admission_unsafe_under_trusted_owners() {
         }
     }
     static TOOL_HANDLERS: [HandlerDef; 2] = [handler("tool.check"), handler("tool.describe")];
-    static GIT_HANDLERS: [HandlerDef; 4] = [
+    static GIT_HANDLERS: [HandlerDef; 9] = [
         handler("git.receipts"),
         handler("git.gates"),
         handler("git.status"),
         handler("git.log"),
+        handler("git.pr_state"),
+        handler("git.pr_list"),
+        handler("git.issue"),
+        handler("git.issue_list"),
+        handler("git.check_log"),
     ];
 
     let mut builder = VerbRegistryBuilder::new();
@@ -712,6 +726,11 @@ fn policy_decision_receipts_are_admission_unsafe_under_trusted_owners() {
         "git.gates",
         "git.status",
         "git.log",
+        "git.pr_state",
+        "git.pr_list",
+        "git.issue",
+        "git.issue_list",
+        "git.check_log",
     ] {
         assert!(
             !registry.admission_degrade_safe_probe(verb),
@@ -906,6 +925,18 @@ fn read_replay_requires_trusted_owning_pack_for_every_opted_in_verb() {
             } else {
                 builder.register(pack);
             }
+            if name != owner {
+                let error = builder
+                    .build()
+                    .err()
+                    .expect("foreign public owner must fail");
+                assert!(
+                    matches!(&error, RuntimeError::InvalidInput(message)
+                        if message.contains(name) && message.contains(handlers[0].name)),
+                    "expected ownership refusal for {name}, got {error:?}"
+                );
+                continue;
+            }
             let registry = builder.build().expect("replay fixture registry");
             for handler in handlers {
                 assert_eq!(
@@ -943,7 +974,7 @@ fn read_replay_excludes_reads_with_fresh_persisted_serve_or_search_rows() {
 
 #[test]
 fn read_replay_uses_effect_classification_instead_of_speech_act_category() {
-    static HANDLERS: [HandlerDef; 3] = [
+    static HANDLERS: [HandlerDef; 2] = [
         HandlerDef {
             name: "stats",
             description: "category cannot override the reviewed operation effects",
@@ -958,13 +989,6 @@ fn read_replay_uses_effect_classification_instead_of_speech_act_category() {
             category: VerbCategory::Assertive,
             params: &[],
         },
-        HandlerDef {
-            name: "unclassified_read",
-            description: "an unknown operation remains ineligible",
-            visibility: Visibility::Verb,
-            category: VerbCategory::Assertive,
-            params: &[],
-        },
     ];
     let mut builder = VerbRegistryBuilder::new();
     builder.register_trusted(CountingHandlersPack {
@@ -972,10 +996,24 @@ fn read_replay_uses_effect_classification_instead_of_speech_act_category() {
         handlers: &HANDLERS,
         calls: Arc::new(AtomicUsize::new(0)),
     });
+    static UNCLASSIFIED_HANDLERS: [HandlerDef; 1] = [HandlerDef {
+        name: "probe.unclassified_read",
+        description: "an unknown operation remains ineligible",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[],
+    }];
+    builder.register_trusted(CountingHandlersPack {
+        name: "probe",
+        handlers: &UNCLASSIFIED_HANDLERS,
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
     let registry = builder.build().expect("mutating fixture registry");
     assert!(registry.is_read_replay_safe("stats"));
     assert!(!registry.is_read_replay_safe("create"));
-    assert!(!registry.is_read_replay_safe("unclassified_read"));
+    assert!(registry.has_verb("probe.unclassified_read"));
+    assert_eq!(crate::classify_operation("probe.unclassified_read"), None);
+    assert!(!registry.is_read_replay_safe("probe.unclassified_read"));
 }
 
 /// Re-derives each [`VerbRegistry::SIDE_EFFECTING_ASSERTIVE_VERBS`] entry's
@@ -1199,7 +1237,7 @@ fn from_token_preserves_process_ref() {
 struct AlphaPack;
 
 impl Pack for AlphaPack {
-    const NAME: &'static str = "alpha";
+    const NAME: &'static str = "kg";
     const NOTE_KINDS: &'static [&'static str] = &["memo", "log"];
     const ENTITY_KINDS: &'static [&'static str] = &["widget"];
     const BRAIN_CONSUMER_KINDS: &'static [&'static str] = &["recall", "search"];
@@ -1259,7 +1297,7 @@ impl Pack for GateErrorTrackingPack {
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
-        name: "guarded",
+        name: "gate_error_tracking.guarded",
         description: "track whether gate-error dispatch reaches the handler",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
@@ -1307,7 +1345,7 @@ impl Pack for SleepingPack {
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
-        name: "slow_op",
+        name: "sleeping.slow_op",
         description: "sleeps before returning",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
@@ -1350,7 +1388,7 @@ impl Pack for BetaPack {
     const BRAIN_CONSUMER_KINDS: &'static [&'static str] = &["search", "knowledge_compose"];
     const HANDLERS: &'static [HandlerDef] = &[
         HandlerDef {
-            name: "notify",
+            name: "beta.notify",
             description: "send alert",
             visibility: Visibility::Verb,
             category: VerbCategory::Commissive,
@@ -1426,7 +1464,7 @@ impl PackRuntime for CollidingPack {
 struct ReservedEnvelopeParamPack;
 
 impl Pack for ReservedEnvelopeParamPack {
-    const NAME: &'static str = "reserved-envelope-param";
+    const NAME: &'static str = "broken";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -1504,7 +1542,7 @@ async fn dispatch_routes_to_correct_pack() {
     let res = reg.dispatch("list", Value::Null).await.unwrap();
     assert_eq!(res["pack"], "alpha");
 
-    let res = reg.dispatch("notify", Value::Null).await.unwrap();
+    let res = reg.dispatch("beta.notify", Value::Null).await.unwrap();
     assert_eq!(res["pack"], "beta");
 }
 
@@ -1530,7 +1568,7 @@ fn verb_collision_is_boot_time_error() {
         "error must name the colliding verb: {msg}"
     );
     assert!(
-        msg.contains("alpha") || msg.contains("colliding"),
+        msg.contains("kg") || msg.contains("colliding"),
         "error must name one of the conflicting packs: {msg}"
     );
 }
@@ -1550,7 +1588,7 @@ fn reserved_request_envelope_param_is_boot_time_error() {
                 ref pack,
                 ref verb,
                 ref param,
-            } if pack == "reserved-envelope-param"
+            } if pack == "broken"
                 && verb == "broken.serve"
                 && param == "presentation"
         ),
@@ -1788,8 +1826,8 @@ fn note_kind_duplicate_rejected_at_build_time() {
         "error must name the duplicate kind: {msg}"
     );
     assert!(
-        msg.contains("alpha") || msg.contains("dup"),
-        "error must name one of the conflicting packs: {msg}"
+        msg.contains("kg") && msg.contains("dup"),
+        "error must name both conflicting packs: {msg}"
     );
 }
 
@@ -2601,7 +2639,7 @@ struct TokenCapturingPack {
 }
 
 impl Pack for TokenCapturingPack {
-    const NAME: &'static str = "alpha";
+    const NAME: &'static str = "kg";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = AlphaPack::HANDLERS;
@@ -2679,7 +2717,7 @@ struct VisibilityCapturingPack {
 }
 
 impl Pack for VisibilityCapturingPack {
-    const NAME: &'static str = "alpha";
+    const NAME: &'static str = "kg";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = AlphaPack::HANDLERS;
@@ -3381,7 +3419,7 @@ impl PackRuntime for GitDigestResultPack {
 struct MalformedGitDigestResultPack;
 
 impl Pack for MalformedGitDigestResultPack {
-    const NAME: &'static str = "malformed-git";
+    const NAME: &'static str = "git";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -4249,25 +4287,15 @@ fn serial_census_surfaces_source_and_serial_argument_parse_failures() {
         .contains("unsupported serial attribute arguments"));
 }
 
-/// An event-backed registry can drain the process-wide config ledger at
-/// dispatch, and `record_config_locked` (and every `OnceLock` reader
-/// that wraps it — `context_profile_enabled`, `recall_profile_enabled`,
-/// `ann_overfetch_max_rounds`, `ann_ready_timeout_ms`,
-/// `recall_deadline_ms`, `request_read_timeout`,
-/// `backend_search_timeout_ms`, ... — enumerated here only as the
-/// evidence that motivated widening the seed, never as the source of
-/// truth for who counts) writes to it, so every compiled test that
-/// reaches either — directly, through a same-text wrapper, or by
-/// dispatching a verb whose handler reaches one — must join the
-/// ledger's serial group even when its own assertion is about another
-/// audit field.
+/// Keep the existing conservative serialization policy for event fixtures and
+/// runtime config producers. Runtime ledgers are separate, while the readers'
+/// process-wide OnceLock values and the audit diagnostic counters still have
+/// process lifetime. Explicit stores no longer drain any runtime ledger.
 ///
-/// The seed is deliberately just the two true seams
-/// (`with_event_store`, `record_config_locked`) rather than a
-/// hand-maintained list of every wrapper: `file_seam_names` grows the
-/// known set to a fixed point, so a future `OnceLock` reader that wraps
-/// `record_config_locked` is picked up the moment it exists, without
-/// anyone remembering to add it here.
+/// The seed stays `with_event_store` / `record_config_locked`: dot calls to
+/// the runtime method and lazy fallback closures are visible to `calls_name`.
+/// `file_seam_names` still grows wrappers to a fixed point; process-only tracing
+/// readers are not runtime-ledger producers.
 #[test]
 fn event_store_test_fixtures_are_config_ledger_serialized() {
     let sources = workspace_rust_sources();
@@ -4659,13 +4687,6 @@ async fn intercepted_gate_error_returns_typed_refusal_without_invoking_operation
         }
     }
 
-    // Entry reset, not exit: a `config_ledger`-grouped test that panics
-    // after queueing a row (elsewhere in this group) would otherwise
-    // leave it for whichever test the serial lock hands off to next;
-    // this test's exact `events.len() == 1` assertion below has no
-    // tolerance for an inherited row.
-    let _ = crate::config_ledger::drain_config_locked();
-
     let invoked = Arc::new(AtomicUsize::new(0));
     let invoked_by_operation = Arc::clone(&invoked);
     let store = Arc::new(MemoryEventStore::default());
@@ -4727,10 +4748,6 @@ async fn intercepted_deny_remains_distinct_and_does_not_invoke_operation() {
             Ok(GateDecision::deny("intercepted policy denied"))
         }
     }
-
-    // Entry reset, not exit — see the sibling test above for why an
-    // exact `events.len() == 1` assertion needs a clean ledger.
-    let _ = crate::config_ledger::drain_config_locked();
 
     let invoked = Arc::new(AtomicUsize::new(0));
     let invoked_by_operation = Arc::clone(&invoked);
@@ -4980,7 +4997,7 @@ async fn deny_gate_returns_permission_denied_pack_never_invoked() {
         const NOTE_KINDS: &'static [&'static str] = &[];
         const ENTITY_KINDS: &'static [&'static str] = &[];
         const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
-            name: "guarded",
+            name: "tracked.guarded",
             description: "a guarded verb",
             visibility: Visibility::Verb,
             category: VerbCategory::Assertive,
@@ -5022,10 +5039,13 @@ async fn deny_gate_returns_permission_denied_pack_never_invoked() {
     builder.with_gate(Arc::new(AlwaysDenyGate));
     let reg = builder.build().expect("registry builds");
 
-    let err = reg.dispatch("guarded", Value::Null).await.unwrap_err();
+    let err = reg
+        .dispatch("tracked.guarded", Value::Null)
+        .await
+        .unwrap_err();
     assert!(
-        matches!(err, RuntimeError::PermissionDenied { ref verb, ref reason, .. } if verb == "guarded" && reason.contains("always deny")),
-        "expected PermissionDenied with verb=guarded and reason, got: {err:?}"
+        matches!(err, RuntimeError::PermissionDenied { ref verb, ref reason, .. } if verb == "tracked.guarded" && reason.contains("always deny")),
+        "expected PermissionDenied with verb=tracked.guarded and reason, got: {err:?}"
     );
     assert_eq!(
         invoked.load(Ordering::SeqCst),
@@ -5054,7 +5074,7 @@ async fn update_denial_precedes_id_existence_resolution() {
     }
 
     impl khive_types::Pack for ExistenceOracleUpdatePack {
-        const NAME: &'static str = "existence_oracle";
+        const NAME: &'static str = "kg";
         const NOTE_KINDS: &'static [&'static str] = &[];
         const ENTITY_KINDS: &'static [&'static str] = &[];
         const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -5502,7 +5522,7 @@ async fn obligation_failure_reports_a_write_that_already_committed() {
     }
 
     impl Pack for RecordingWritePack {
-        const NAME: &'static str = "recording_write";
+        const NAME: &'static str = "knowledge";
         const NOTE_KINDS: &'static [&'static str] = &[];
         const ENTITY_KINDS: &'static [&'static str] = &[];
         // `knowledge.index` rather than `create`, and the choice is
@@ -5665,15 +5685,8 @@ async fn obligation_failure_reports_a_write_that_already_committed() {
 #[serial(audit_append_failures)]
 #[serial(audit_obligation_append_failures)]
 async fn config_locked_row_degrades_without_failing_the_dispatch_that_observed_it() {
-    // Deny-gate a dispatch so the only append this call makes is the
-    // immediate `ConfigLocked` drain in the gate-check block: the
-    // `GateDenied` row and the eventual `PermissionDenied` return are
-    // unaffected by the store either way (see the two `let _ =` sites
-    // above), so any failure this test observes is isolated to the
-    // pure-observability `ConfigLocked` row. The `fail_appends: true`
-    // store also fails the fire-and-forget `GateDenied` append, which
-    // now counts on the obligation counter (`#[serial(...)]` above
-    // keeps that from racing this file's exact-delta assertions on it).
+    // Refuse the bound runtime's actual ConfigLocked generation while the
+    // denial event can still commit. The dispatch keeps its own denial result.
     #[derive(Debug)]
     struct DenyGate;
     impl Gate for DenyGate {
@@ -5684,17 +5697,20 @@ async fn config_locked_row_degrades_without_failing_the_dispatch_that_observed_i
         }
     }
 
-    crate::config_ledger::record_config_locked("adr133_test_key", "adr133_test_value");
-
-    let store = Arc::new(MemoryEventStore {
-        fail_appends: true,
-        ..MemoryEventStore::default()
-    });
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(AlphaPack);
-    builder.with_gate(Arc::new(DenyGate));
-    builder.with_event_store(store);
-    let registry = builder.build().expect("registry builds");
+    let fixture = config_lock_runtime::Fixture::configured(
+        KhiveRuntime::memory().expect("runtime"),
+        "local",
+        "denied",
+        config_lock_runtime::audit_config(),
+        |builder| {
+            builder.with_gate(Arc::new(DenyGate));
+        },
+    );
+    fixture
+        .runtime
+        .record_config_locked("adr133_test_key", || "adr133_test_value".into());
+    fixture.store.refuse_config();
+    let registry = &fixture.registry;
 
     let err = registry
         .dispatch("list", Value::Null)
@@ -5713,6 +5729,9 @@ async fn config_locked_row_degrades_without_failing_the_dispatch_that_observed_i
         "the config-locked row's commit failure must be visible as degradation"
     );
     assert!(metrics.degraded_rows >= 1);
+    fixture
+        .assert_refused_once_then_recovered("adr133_test_key", true)
+        .await;
 }
 
 #[tokio::test]
@@ -5725,19 +5744,14 @@ async fn config_locked_row_failure_never_fails_a_dispatch_that_would_otherwise_s
     // it. Only the `ConfigLocked` generation fails here — the gate
     // allows the call, so `list`'s own `DispatchSucceeded` obligation
     // row commits in a later, unaffected generation.
-    crate::config_ledger::record_config_locked(
-        "adr133_success_path_key",
-        "adr133_success_path_value",
-    );
-
-    let store = Arc::new(MemoryEventStore {
-        fail_kind: Some(EventKind::ConfigLocked),
-        ..MemoryEventStore::default()
-    });
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(AlphaPack);
-    builder.with_event_store(store);
-    let registry = builder.build().expect("registry builds");
+    let fixture = config_lock_runtime::Fixture::new();
+    fixture
+        .runtime
+        .record_config_locked("adr133_success_path_key", || {
+            "adr133_success_path_value".into()
+        });
+    fixture.store.refuse_config();
+    let registry = &fixture.registry;
 
     let result = registry
         .dispatch("list", Value::Null)
@@ -5755,6 +5769,9 @@ async fn config_locked_row_failure_never_fails_a_dispatch_that_would_otherwise_s
         metrics.degraded_rows >= 1,
         "the config-locked row's failure must remain visible as degradation"
     );
+    fixture
+        .assert_refused_once_then_recovered("adr133_success_path_key", false)
+        .await;
 }
 
 /// An `EventStore` that only implements the base trait — the
@@ -5840,15 +5857,12 @@ async fn db_diagnostics_with_audit_metrics_reports_batch_failure_and_degradation
     // check regardless of allow/deny, and `list`'s deferred
     // `DispatchSucceeded` (obligation) row is appended once dispatch
     // resolves — both against the same persistently failing store.
-    crate::config_ledger::record_config_locked("adr133_diag_test_key", "adr133_diag_test_value");
-    let store = Arc::new(MemoryEventStore {
-        fail_appends: true,
-        ..MemoryEventStore::default()
-    });
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(AlphaPack);
-    builder.with_event_store(store);
-    let registry = builder.build().expect("registry builds");
+    let fixture = config_lock_runtime::Fixture::new();
+    fixture
+        .runtime
+        .record_config_locked("adr133_diag_test_key", || "adr133_diag_test_value".into());
+    fixture.store.refuse_all();
+    let registry = &fixture.registry;
     let _ = registry.dispatch("list", Value::Null).await;
 
     let metrics = registry
@@ -5861,6 +5875,7 @@ async fn db_diagnostics_with_audit_metrics_reports_batch_failure_and_degradation
         "the list dispatch's obligation row must count as a flush failure"
     );
 
+    fixture.finish().await;
     let rt = KhiveRuntime::memory().expect("memory runtime should create");
     let report = rt
         .db_diagnostics_with_audit_metrics(Some(metrics))
@@ -5927,7 +5942,7 @@ async fn audit_event_duration_us_reflects_measured_dispatch_time() {
     builder.with_event_store(store.clone());
     let reg = builder.build().expect("registry builds");
 
-    reg.dispatch("slow_op", serde_json::json!({}))
+    reg.dispatch("sleeping.slow_op", serde_json::json!({}))
         .await
         .unwrap();
 
@@ -6037,7 +6052,7 @@ struct MailboxTrackingPack {
 }
 
 impl Pack for MailboxTrackingPack {
-    const NAME: &'static str = "mailbox_tracking";
+    const NAME: &'static str = "comm";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[
@@ -6061,7 +6076,7 @@ impl Pack for MailboxTrackingPack {
 #[async_trait]
 impl PackRuntime for MailboxTrackingPack {
     fn name(&self) -> &str {
-        "mailbox_tracking"
+        "comm"
     }
     fn note_kinds(&self) -> &'static [&'static str] {
         &[]
@@ -6304,13 +6319,13 @@ async fn gate_error_returns_typed_refusal_without_invoking_pack() {
     let reg = builder.build().expect("registry builds");
 
     let err = reg
-        .dispatch("guarded", Value::Null)
+        .dispatch("gate_error_tracking.guarded", Value::Null)
         .await
         .expect_err("gate unavailability must refuse normal dispatch");
     assert!(matches!(
         err,
         RuntimeError::GateUnavailable { ref verb, ref reason }
-            if verb == "guarded"
+            if verb == "gate_error_tracking.guarded"
                 && reason == "gate backend unavailable"
                 && !reason.contains("gate broken")
     ));
@@ -6333,7 +6348,7 @@ async fn gate_error_returns_typed_refusal_without_invoking_pack() {
         .await
         .unwrap();
     let event = &page.items[0];
-    assert_eq!(event.verb, "guarded");
+    assert_eq!(event.verb, "gate_error_tracking.guarded");
     assert_eq!(event.outcome, EventOutcome::Error);
     assert_eq!(event.payload["decision"], "gate_unavailable");
     assert!(event.payload.get("deny_reason").is_none());
@@ -6368,14 +6383,14 @@ async fn gate_error_audit_failure_cannot_reopen_dispatch_or_replace_typed_error(
     let registry = builder.build().expect("registry builds");
 
     let error = registry
-        .dispatch("guarded", Value::Null)
+        .dispatch("gate_error_tracking.guarded", Value::Null)
         .await
         .expect_err("audit persistence failure must not reopen dispatch");
 
     assert!(matches!(
         error,
         RuntimeError::GateUnavailable { ref verb, ref reason }
-            if verb == "guarded"
+            if verb == "gate_error_tracking.guarded"
                 && reason == "gate backend unavailable"
                 && !reason.contains("gate still broken")
     ));
@@ -6414,7 +6429,7 @@ async fn gate_unavailable_reason_never_carries_backend_error_text() {
     let registry = builder.build().expect("registry builds");
 
     let err = registry
-        .dispatch("guarded", Value::Null)
+        .dispatch("gate_error_tracking.guarded", Value::Null)
         .await
         .expect_err("gate unavailability must refuse dispatch");
 
@@ -6464,14 +6479,14 @@ async fn gate_policy_error_classifies_distinctly_from_backend_unavailable() {
     let registry = builder.build().expect("registry builds");
 
     let err = registry
-        .dispatch("guarded", Value::Null)
+        .dispatch("gate_error_tracking.guarded", Value::Null)
         .await
         .expect_err("gate unavailability must refuse dispatch");
 
     assert!(matches!(
         err,
         RuntimeError::GateUnavailable { ref verb, ref reason }
-            if verb == "guarded"
+            if verb == "gate_error_tracking.guarded"
                 && reason == "gate policy evaluation failed"
                 && !reason.contains("rule set has no allow clause")
     ));
@@ -7111,7 +7126,7 @@ struct EmbeddingAwarePack {
 }
 
 impl khive_types::Pack for EmbeddingAwarePack {
-    const NAME: &'static str = "embedding_aware";
+    const NAME: &'static str = "kg";
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &["widget"];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
@@ -7160,7 +7175,7 @@ impl khive_types::Pack for FailingProbePack {
     const NOTE_KINDS: &'static [&'static str] = &[];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
-        name: "probe",
+        name: "failing_probe.probe",
         description: "always fails",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
@@ -7293,7 +7308,7 @@ async fn resource_work_class_present_cost_unit_absent_when_dispatch_returns_erro
     let reg = builder.build().expect("registry builds");
 
     let err = reg
-        .dispatch("probe", serde_json::json!({}))
+        .dispatch("failing_probe.probe", serde_json::json!({}))
         .await
         .unwrap_err();
     assert!(matches!(err, RuntimeError::InvalidInput(_)));
@@ -7857,40 +7872,19 @@ async fn first_event(store: &Arc<MemoryEventStore>) -> Event {
     page.items[0].clone()
 }
 
-/// A fresh `MemoryEventStore` for a test that will assert `first_event`'s
-/// exact one-event count, with the process-wide config ledger drained
-/// first.
-///
-/// `first_event` itself runs *after* dispatch, so it cannot fix this: a
-/// `config_ledger`-grouped test that panics after queueing a row (a
-/// direct `record_config_locked` call, or a `OnceLock` reader it
-/// invoked) but before its own event-backed dispatch never drains that
-/// row itself, leaving it queued for whichever test the serial lock
-/// hands off to next. If that next test builds its store with plain
-/// `Arc::new(MemoryEventStore::default())`, its own dispatch call
-/// drains the inherited row as an extra `ConfigLocked` event alongside
-/// the one it expects, and `first_event`'s exact `page.items.len() ==
-/// 1` assertion sees two. The fix has to run before dispatch, so it
-/// lives in the store constructor every exact-one-event test calls, not
-/// in the post-dispatch helper that reads the count.
+/// A fresh explicit store for exact-one-event assertions. It has no runtime
+/// binding, so constructing it neither drains nor resets another runtime.
 fn clean_ledger_event_store() -> Arc<MemoryEventStore> {
-    let _ = crate::config_ledger::drain_config_locked();
     Arc::new(MemoryEventStore::default())
 }
 
-/// Regression: a preceding
-/// `config_ledger`-grouped test that queues a row (directly, or via a
-/// `OnceLock` reader it invoked) and then panics before its own
-/// event-backed dispatch drains it leaves that row queued for whichever
-/// test the serial lock hands to next. Simulate exactly that leaked row
-/// here and prove `clean_ledger_event_store` — not `first_event` itself,
-/// which only runs after dispatch and so cannot fix a pre-dispatch race
-/// — is what keeps `first_event`'s exact one-event assertion honest.
+/// An explicit store's own event stays exact even while another live runtime
+/// has a pending observation. Binding that runtime later still delivers it.
 #[tokio::test]
 #[serial(config_ledger)]
 async fn first_event_is_immune_to_a_ledger_row_a_prior_test_never_drained() {
-    let _ = crate::config_ledger::drain_config_locked();
-    crate::config_ledger::record_config_locked("simulated_leaked_key", "leaked_value");
+    let pending = KhiveRuntime::memory().expect("pending runtime");
+    pending.record_config_locked("simulated_leaked_key", || "leaked_value".into());
 
     let store = clean_ledger_event_store();
     let mut builder = VerbRegistryBuilder::new();
@@ -7911,6 +7905,17 @@ async fn first_event_is_immune_to_a_ledger_row_a_prior_test_never_drained() {
 
     let ev = first_event(&store).await;
     assert_eq!(ev.outcome, EventOutcome::Success);
+    reg.audit_batch_handle()
+        .unwrap()
+        .close_and_wait_for_physical_completion()
+        .await
+        .unwrap();
+    let bound = config_lock_runtime::Fixture::from_runtime(pending, "local", "pending-owner");
+    bound.dispatch().await;
+    bound
+        .assert_rows(&[("simulated_leaked_key", "leaked_value")])
+        .await;
+    bound.finish().await;
 }
 
 #[tokio::test]
@@ -7949,7 +7954,7 @@ async fn dispatch_with_identity_stamps_request_id_on_dispatch_error() {
 
     let err = reg
         .dispatch_with_identity(
-            "probe",
+            "failing_probe.probe",
             serde_json::json!({"namespace": "test-ns"}),
             Some(RequestIdentity {
                 request_id: Some(102),

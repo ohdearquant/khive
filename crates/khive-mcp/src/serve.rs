@@ -6,10 +6,18 @@
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 #[path = "serve/channel_poll.rs"]
 mod channel_poll;
-#[cfg(feature = "channel-email")]
+#[cfg(all(test, feature = "channel-email"))]
 pub(crate) use channel_poll::channel_outbox_loop;
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 use channel_poll::*;
+
+#[path = "serve/channel_registration.rs"]
+mod channel_registration;
+pub use channel_registration::ServeRegistrations;
+
+#[cfg(test)]
+#[path = "serve/channel_registration_tests.rs"]
+mod channel_registration_tests;
 
 #[path = "serve/claimed_backend.rs"]
 mod claimed_backend;
@@ -67,10 +75,12 @@ use storage_topology::plan_configured_storage_targets;
 mod server_build;
 
 pub use server_build::{
-    build_server, build_server_from_multi_backend_registry, build_server_multi_backend,
-    build_server_multi_backend_with_db_anchor, build_server_with_explicit_namespace,
-    checkpoint_pool_for, enforce_strict_actor_mode, is_forwarding_client, mark_mcp_host_role,
-    mcp_max_readers, WiringSurface,
+    build_server, build_server_from_multi_backend_registry,
+    build_server_from_multi_backend_registry_with_catalog_verbosity, build_server_multi_backend,
+    build_server_multi_backend_with_catalog_verbosity, build_server_multi_backend_with_db_anchor,
+    build_server_multi_backend_with_db_anchor_and_catalog_verbosity,
+    build_server_with_explicit_namespace, checkpoint_pool_for, enforce_strict_actor_mode,
+    is_forwarding_client, mark_mcp_host_role, mcp_max_readers, WiringSurface,
 };
 
 #[cfg(unix)]
@@ -79,10 +89,9 @@ pub use server_build::{
     MaintenanceTopologyRefusal,
 };
 
-#[cfg(test)]
-pub(crate) use server_build::is_strict_actor_mode;
-
-pub(crate) use server_build::{canonical_path_no_side_effects, should_warn_unattributed};
+pub(crate) use server_build::{
+    canonical_path_no_side_effects, is_strict_actor_mode, should_warn_unattributed,
+};
 
 use server_build::{
     build_server_from_prepared, canonical_backend_path, prepare_server_boot,
@@ -98,8 +107,9 @@ mod runtime_config;
 pub use runtime_config::{
     apply_env_output_format, build_single_backend_runtime, config_discovery_db_anchor,
     enable_events_forwarding_for_daemon, install_resolved_blob_store, resolve_runtime_config,
-    resolve_runtime_config_with_db_anchor, resolved_actor_disclosure, resolved_database_disclosure,
-    resolved_volume_lock_disclosure, resolved_wal_ceiling_disclosure, RuntimeConfigInputs,
+    resolve_runtime_config_with_actor_ownership, resolve_runtime_config_with_db_anchor,
+    resolved_actor_disclosure, resolved_database_disclosure, resolved_volume_lock_disclosure,
+    resolved_wal_ceiling_disclosure, ConfiguredActorOwnership, RuntimeConfigInputs,
 };
 
 use runtime_config::{
@@ -117,7 +127,8 @@ mod runtime_hooks;
 use disk_policy::{open_backend, open_backend_with_wal_ceiling};
 #[cfg(unix)]
 pub use events_socket_preflight::{
-    preflight_events_socket_for_boot, prepare_preflighted_daemon_store_plan,
+    preflight_daemon_configuration, preflight_events_socket_for_boot,
+    prepare_preflighted_daemon_store_plan,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -139,9 +150,13 @@ mod startup;
 
 use startup::*;
 pub use startup::{
-    db_override_refusal_envelope, run, DatabaseOverrideConflict, MultiBackendRegistry,
-    DB_OVERRIDE_CONFLICT_CODE,
+    db_override_refusal_envelope, run, run_with_registrations, DatabaseOverrideConflict,
+    MultiBackendRegistry, DB_OVERRIDE_CONFLICT_CODE,
 };
+
+#[cfg(test)]
+#[path = "serve/embed_pipeline_tests.rs"]
+mod embed_pipeline_tests;
 
 #[cfg(all(test, unix))]
 #[path = "serve/demand_startup_tests.rs"]
@@ -201,6 +216,41 @@ pub async fn serve_server(
     boot_guard: Option<std::fs::File>,
     schedule_rt: Option<KhiveRuntime>,
 ) -> anyhow::Result<()> {
+    serve_server_with_registrations(
+        server,
+        args,
+        registry,
+        boot_guard,
+        schedule_rt,
+        ServeRegistrations::default(),
+    )
+    .await
+}
+
+/// Serve a pre-built server with caller-owned channels registered for this boot.
+///
+/// Exact builtin/caller `(kind, slug)` collisions refuse before background tasks start.
+/// Registration does not itself poll a caller channel; its host owns that drive.
+/// Bundles with validators or send routes refuse here: use [`run_with_registrations`]
+/// to install them before construction. Independently built hosts may configure `RuntimeConfig`
+/// before building and pass only channels/residents to this entrypoint. On Unix, a server whose
+/// runtime carries validators or send routes must be the daemon or select local dispatch with
+/// `KHIVE_NO_DAEMON=1`, as on [`run_with_registrations`].
+pub async fn serve_server_with_registrations(
+    server: KhiveMcpServer,
+    args: &Args,
+    registry: &TransportRegistry,
+    boot_guard: Option<std::fs::File>,
+    schedule_rt: Option<KhiveRuntime>,
+    registrations: ServeRegistrations,
+) -> anyhow::Result<()> {
+    registrations.require_prebuilt_compatible()?;
+    #[cfg(unix)]
+    channel_registration::require_local_dispatch_for(
+        server.carries_process_local_callbacks(),
+        args,
+        khive_runtime::daemon::env_truthy("KHIVE_NO_DAEMON"),
+    )?;
     if let Some(generation) = args.resumed_generation {
         tracing::warn!(
             generation,
@@ -209,9 +259,12 @@ pub async fn serve_server(
         );
     }
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
-    let prepared_background = prepare_host_background_tasks(args, &server)?;
+    let prepared_background =
+        prepare_host_background_tasks_with_registrations(args, &server, &registrations).await?;
     #[cfg(unix)]
     if args.daemon {
+        // The daemon serves many callers and never routes (ADR-220 section 1).
+        let server = server.without_computer();
         khive_runtime::daemon::run_daemon_with_options_and_boot_guard_and_start(
             server,
             boot_guard,
@@ -234,6 +287,10 @@ pub async fn serve_server(
     // coordinator boot path (sweep coverage, ADR-091 Amendment 2).
     // Without this spawn, every multi-backend session is permanently
     // invisible to cross-process WAL-pin attribution.
+    // ADR-220 section 8: the computer's catalog is read once as the bridge
+    // starts; the tool description is built from that read.
+    #[cfg(unix)]
+    server.read_computer_catalog_in_background();
     start_host_background_tasks(args, &server, schedule_rt, prepared_background);
     serve_with_session_sweep(server, args, registry).await
 }
@@ -263,6 +320,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     max_readers: Option<usize>,
     daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
 ) -> anyhow::Result<MultiBackendRegistry> {
+    KhiveRuntime::validated_background_limits(&base_config)?;
     base_config.prepare_engines()?;
     let email_policy = OutboundEmailPolicy::from_env().map_err(anyhow::Error::msg)?;
     let PreparedStorageTopology {
@@ -364,6 +422,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     enforce_strict_actor_mode(
         default_runtime.config().actor_id.as_deref(),
         &default_runtime.config().packs,
+        default_runtime.config().require_attributed_actor,
     )?;
     if should_warn_unattributed(
         default_runtime.config().actor_id.as_deref(),
@@ -390,6 +449,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     builder.with_gate(gate);
     builder.with_default_namespace(default_namespace.as_str());
     builder.with_visible_namespaces(visible_namespaces);
+    builder.with_owned_namespaces(default_runtime.config().owned_namespaces.clone());
     builder.with_actor_id(default_runtime.config().actor_id.clone());
 
     if default_runtime.is_read_only() {
