@@ -10,7 +10,8 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use super::lines::{
-    check_subjects, declared_in, declared_on, line_props, subject_props, subject_specs, term_specs,
+    check_subjects, constraint_specs, constraints_prop, declared_in, declared_on, line_props,
+    subject_props, subject_specs, term_specs,
 };
 use super::params::{self, Args};
 use super::views::{field_reply, nearest};
@@ -21,8 +22,8 @@ use crate::store::{
 };
 use crate::text::normalize;
 use crate::vocab::{
-    self, FIELD, FIELD_VALUE, FORM, FORM_ISSUER, FORM_ITEM, FORM_RULE, FORM_SECTION, FORM_SUBJECT,
-    FORM_TERM, ITEM_KINDS, TERM_LISTS, VALUE_TYPES,
+    self, COMPARISONS, FIELD, FIELD_VALUE, FORM, FORM_ISSUER, FORM_ITEM, FORM_RULE, FORM_SECTION,
+    FORM_SUBJECT, FORM_TERM, ITEM_KINDS, TERM_LISTS, VALUE_TYPES,
 };
 
 /// The format tag of an export document, checked by replay.
@@ -59,6 +60,9 @@ struct FieldSpec {
     aliases: Vec<String>,
     values: Vec<(String, String)>,
     exclusive: bool,
+    /// How the field's answers compare when a constraint holds two lines to
+    /// match or differ; `exact` when not stated.
+    comparison: Option<String>,
 }
 
 fn field_spec(obj: &Args) -> Result<FieldSpec, RuntimeError> {
@@ -85,6 +89,9 @@ fn field_spec(obj: &Args) -> Result<FieldSpec, RuntimeError> {
     Ok(FieldSpec {
         definition: params::text(obj, "definition")?,
         aliases: params::string_list(obj, "aliases")?,
+        comparison: params::opt_text(obj, "comparison")?
+            .map(|c| params::one_of(c, "comparison", &COMPARISONS))
+            .transpose()?,
         exclusive,
         name,
         value_type,
@@ -190,16 +197,15 @@ fn stage_field(
     writes: &mut Writes,
     spec: &FieldSpec,
 ) -> Result<(Uuid, HashMap<String, Uuid>), RuntimeError> {
-    let field = writes.create_entity(
-        FIELD,
-        &spec.name,
-        None,
-        map([
-            ("definition", json!(spec.definition)),
-            ("value_type", json!(spec.value_type)),
-            ("aliases", json!(alias_list(&spec.name, &spec.aliases))),
-        ]),
-    )?;
+    let mut properties = map([
+        ("definition", json!(spec.definition)),
+        ("value_type", json!(spec.value_type)),
+        ("aliases", json!(alias_list(&spec.name, &spec.aliases))),
+    ]);
+    if let Some(comparison) = &spec.comparison {
+        properties.insert("comparison".to_owned(), json!(comparison));
+    }
+    let field = writes.create_entity(FIELD, &spec.name, None, properties)?;
     let mut values = HashMap::new();
     let mut ordered = Vec::new();
     for (index, (name, definition)) in spec.values.iter().enumerate() {
@@ -429,18 +435,24 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
     let mut counts = Counts::default();
     let mut warnings = Vec::new();
 
-    let form = writes.create_entity(
-        FORM,
-        &title,
-        None,
-        map([
-            ("form_id", json!(form_id)),
-            ("revision", json!(revision)),
-            ("title", json!(title)),
-            ("source_url", json!(source_url)),
-            ("source_sha256", json!(source_sha256)),
-        ]),
-    )?;
+    // What the form is for and what it holds its lines to are kept on the
+    // form; both are checked below, before anything is written.
+    let purposes = params::string_list(doc, "purposes")?;
+    let constraints = constraint_specs(doc)?;
+    let mut form_properties = map([
+        ("form_id", json!(form_id)),
+        ("revision", json!(revision)),
+        ("title", json!(title)),
+        ("source_url", json!(source_url)),
+        ("source_sha256", json!(source_sha256)),
+    ]);
+    if !purposes.is_empty() {
+        form_properties.insert("purposes".to_owned(), json!(purposes));
+    }
+    if !constraints.is_empty() {
+        form_properties.insert("constraints".to_owned(), constraints_prop(&constraints));
+    }
+    let form = writes.create_entity(FORM, &title, None, form_properties)?;
     counts.forms = 1;
 
     if let Some(issuer) = params::object(doc, "issuer")? {
@@ -484,6 +496,19 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
             counts.terms += 1;
         }
     }
+    let mut named = HashSet::new();
+    for purpose in &purposes {
+        if !named.insert(normalize(purpose)) {
+            return Err(invalid(format!(
+                "the document names the purpose \"{purpose}\" twice"
+            )));
+        }
+        if !known.contains(&("purpose".to_owned(), normalize(purpose))) {
+            return Err(invalid(format!(
+                "the form is for \"{purpose}\", which is not a loaded purpose; list it under terms"
+            )));
+        }
+    }
     let subjects = subject_specs(doc)?;
     check_subjects(&subjects, &known)?;
     let mut subject_ids: HashMap<String, Uuid> = HashMap::new();
@@ -496,6 +521,8 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
     let declared = declared_in(&subjects);
 
     let mut fields: HashMap<String, Slot> = HashMap::new();
+    // How each field of the document compares its answers.
+    let mut comparisons: HashMap<Uuid, String> = HashMap::new();
     // Each wording of a field left undecided, to the name the document gives it.
     let mut blocked: HashMap<String, String> = HashMap::new();
     for field in params::list(doc, "fields")? {
@@ -514,6 +541,12 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                 let (id, values) = stage_field(&mut writes, &spec)?;
                 counts.fields += 1;
                 counts.values += values.len();
+                comparisons.insert(
+                    id,
+                    spec.comparison
+                        .clone()
+                        .unwrap_or_else(|| "exact".to_owned()),
+                );
                 Some((id, values))
             }
             [existing]
@@ -524,17 +557,34 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                         == Some(spec.value_type.as_str()) =>
             {
                 counts.fields_reused += 1;
+                // A reused field compares one way for every form that prints it,
+                // and a field loaded with no comparison compares exactly: a later
+                // document never changes what an earlier form's constraint means.
+                let held = prop_text(existing, "comparison").unwrap_or_else(|| "exact".to_owned());
+                if let Some(stated) = &spec.comparison {
+                    if *stated != held {
+                        return Err(invalid(format!(
+                            "field \"{}\" compares its answers by \"{held}\"; the document says \"{stated}\"",
+                            spec.name
+                        )));
+                    }
+                }
                 // A later revision may print a shorter wording of a field it
                 // reuses; the field keeps it.
                 let added_aliases = new_aliases(&graph, existing, &mut spec, &mut warnings);
+                let mut properties = props(existing);
+                let mut changed = false;
                 if !added_aliases.is_empty() {
                     let mut list = aliases(existing);
                     list.extend(added_aliases.iter().cloned());
-                    let mut properties = props(existing);
                     properties.insert("aliases".to_owned(), json!(list));
-                    writes.update_entity(existing, None, None, Some(properties))?;
                     counts.aliases_added += added_aliases.len();
+                    changed = true;
                 }
+                if changed {
+                    writes.update_entity(existing, None, None, Some(properties))?;
+                }
+                comparisons.insert(existing.id, held);
                 let mut values = graph_values(&graph, existing.id);
                 let old: Vec<Uuid> = values.values().copied().collect();
                 let mut added = Vec::new();
@@ -607,6 +657,9 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
     )?;
 
     let mut item_keys = HashSet::new();
+    // Each printed line that asks for a field: its folded subject, its field
+    // and its folded state, for the constraints below.
+    let mut printed: Vec<(Option<String>, Uuid, Option<String>)> = Vec::new();
     let mut items_by_label: HashMap<String, Vec<Uuid>> = HashMap::new();
     let mut pending_links = Vec::new();
     let mut item_replies = Vec::new();
@@ -657,6 +710,15 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                 .cloned()
                 .unwrap_or_else(|| name.clone());
             item_properties.insert("field_pending".to_owned(), json!(waiting));
+        }
+        if let Some(Some((field, _))) = &slot {
+            let folded = |key: &str| {
+                item_properties
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(normalize)
+            };
+            printed.push((folded("about"), *field, folded("state")));
         }
         let id = writes.create_entity(FORM_ITEM, &spec.label, None, item_properties)?;
         writes.link(parent, EdgeRelation::Contains, id);
@@ -719,6 +781,55 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
             ))
         })?;
         writes.link(source, EdgeRelation::LinksTo, target);
+    }
+
+    // Each end of a constraint is a line the form prints, and both ends
+    // compare their answers one way.
+    for constraint in &constraints {
+        let mut compared: Vec<(String, String)> = Vec::new();
+        for end in &constraint.ends {
+            let what = end.describe();
+            let Some((field, _)) = document_field(&fields, &graph, &end.field)? else {
+                return Err(invalid(format!(
+                    "a constraint names the line {what}, whose field waits for forms.same or forms.split"
+                )));
+            };
+            let subject = match &end.subject {
+                Some(id) if declared.contains_key(&normalize(id)) => Some(normalize(id)),
+                Some(id) => {
+                    return Err(invalid(format!(
+                        "a constraint names the line {what}, and the form does not declare \"{id}\""
+                    )));
+                }
+                None if !declared.is_empty() => {
+                    return Err(invalid(format!(
+                        "a constraint names the line {what} without a subject; its form declares subjects, so each line of a constraint names one"
+                    )));
+                }
+                None => None,
+            };
+            let state = end.state.as_deref().map(normalize);
+            if !printed
+                .iter()
+                .any(|(about, f, s)| *about == subject && *f == field && *s == state)
+            {
+                return Err(invalid(format!(
+                    "a constraint names the line {what}, which the form does not print"
+                )));
+            }
+            let comparison = comparisons
+                .get(&field)
+                .cloned()
+                .or_else(|| graph.get(field).and_then(|f| prop_text(f, "comparison")))
+                .unwrap_or_else(|| "exact".to_owned());
+            compared.push((what, comparison));
+        }
+        if compared[0].1 != compared[1].1 {
+            return Err(invalid(format!(
+                "a constraint compares {} by \"{}\" and {} by \"{}\"; both lines of a constraint compare one way",
+                compared[0].0, compared[0].1, compared[1].0, compared[1].1
+            )));
+        }
     }
 
     for rule in params::list(doc, "rules")? {
@@ -1294,6 +1405,7 @@ pub(crate) async fn split(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runtime
             aliases: Vec::new(),
             values: Vec::new(),
             exclusive: false,
+            comparison: prop_text(field, "comparison"),
         },
     )?;
     writes.link(item.id, EdgeRelation::VariantOf, narrow);

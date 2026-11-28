@@ -52,12 +52,21 @@ pub(crate) const MAX_ROWS: u64 = 100;
 /// group, or at least one row of a repeating line.
 pub(crate) const NECESSITIES: [&str; 4] = ["required", "optional", "one_of", "at_least_one_row"];
 
+/// How two answers compare when a constraint holds their lines to match or
+/// to differ: as written, with case and spacing folded, by their digits
+/// alone, or by a key the caller gives with each answer.
+pub(crate) const COMPARISONS: [&str; 4] = ["exact", "folded", "digits", "key"];
+
+/// What a constraint holds two lines to.
+pub(crate) const MUSTS: [&str; 2] = ["match", "differ"];
+
 /// The term lists a document loads, by the name the document gives each list
 /// and the name a term node carries.
-pub(crate) const TERM_LISTS: [(&str, &str); 3] = [
+pub(crate) const TERM_LISTS: [(&str, &str); 4] = [
     ("kinds", "kind"),
     ("roles", "role"),
     ("relations", "relation"),
+    ("purposes", "purpose"),
 ];
 
 /// Item kinds that must point at exactly one field.

@@ -12,7 +12,7 @@ use serde_json::{json, Map, Value};
 use super::params::{self, Args};
 use crate::store::{invalid, prop, prop_text};
 use crate::text::normalize;
-use crate::vocab::{self, MAX_ROWS, NECESSITIES, TERM_LISTS};
+use crate::vocab::{self, MAX_ROWS, MUSTS, NECESSITIES, TERM_LISTS};
 
 /// One term a document loads into one of its lists.
 pub(super) struct TermSpec {
@@ -31,7 +31,7 @@ pub(super) fn term_specs(doc: &Args) -> Result<Vec<TermSpec>, RuntimeError> {
         .find(|key| !TERM_LISTS.iter().any(|(name, _)| name == key))
     {
         return Err(invalid(format!(
-            "terms has no list \"{key}\"; its lists are kinds, roles and relations"
+            "terms has no list \"{key}\"; its lists are kinds, roles, relations and purposes"
         )));
     }
     let mut out = Vec::new();
@@ -188,14 +188,31 @@ pub(super) fn subject_props(spec: &SubjectSpec, form_key: &str) -> Map<String, V
     props
 }
 
-/// The subjects a form declares, by folded id: the id as declared and the
-/// rows the subject repeats, when it does.
-pub(super) type Declared = HashMap<String, (String, Option<u64>)>;
+/// A subject as the lines of its form name it: the id as declared, the rows
+/// it repeats when it does, and the subject it names under each relation.
+#[derive(Clone)]
+pub(super) struct DeclaredSubject {
+    id: String,
+    rows: Option<u64>,
+    relations: Vec<(String, String)>,
+}
+
+/// The subjects a form declares, by folded id.
+pub(super) type Declared = HashMap<String, DeclaredSubject>;
 
 pub(super) fn declared_in(specs: &[SubjectSpec]) -> Declared {
     specs
         .iter()
-        .map(|s| (normalize(&s.id), (s.id.clone(), s.repeats)))
+        .map(|s| {
+            (
+                normalize(&s.id),
+                DeclaredSubject {
+                    id: s.id.clone(),
+                    rows: s.repeats,
+                    relations: s.relations.clone(),
+                },
+            )
+        })
         .collect()
 }
 
@@ -203,20 +220,39 @@ pub(super) fn declared_on(subjects: &HashMap<String, &Entity>) -> Declared {
     subjects
         .iter()
         .map(|(folded, subject)| {
+            let relations = prop(subject, "relations")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|r| {
+                            Some((
+                                r.get("relation")?.as_str()?.to_owned(),
+                                r.get("to")?.as_str()?.to_owned(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             (
                 folded.clone(),
-                (
-                    prop_text(subject, "subject_id").unwrap_or_else(|| subject.name.clone()),
-                    prop(subject, "repeats").and_then(Value::as_u64),
-                ),
+                DeclaredSubject {
+                    id: prop_text(subject, "subject_id").unwrap_or_else(|| subject.name.clone()),
+                    rows: prop(subject, "repeats").and_then(Value::as_u64),
+                    relations,
+                },
             )
         })
         .collect()
 }
 
 /// The line properties of a printed item beyond its label, page and order:
-/// `about`, `filled_by`, `state`, `repeats`, `necessity`, `group` and
-/// `selects`, checked against the subjects its form declares.
+/// `about`, `filled_by`, `known_to`, `state`, `repeats`, `necessity`,
+/// `group` and `selects`, checked against the subjects its form declares.
+///
+/// `known_to` names the subject that already holds the line's value, apart
+/// from the one who writes it: a declared subject, or `{relation}` for the
+/// subject the line's own subject names under that relation (an account
+/// held at an institution is known to that institution).
 ///
 /// On a form that declares subjects, every item that asks for a field names
 /// the subject it is about and the subject who writes it, both declared, and
@@ -241,7 +277,7 @@ pub(super) fn line_props(
     let asks = vocab::item_needs_field(item_kind);
     let with_subjects = !declared.is_empty();
 
-    let subject = |id: &str, role: &str| -> Result<(String, Option<u64>), RuntimeError> {
+    let subject = |id: &str, role: &str| -> Result<DeclaredSubject, RuntimeError> {
         declared.get(&normalize(id)).cloned().ok_or_else(|| {
             if with_subjects {
                 invalid(format!(
@@ -256,12 +292,12 @@ pub(super) fn line_props(
     };
 
     let mut props = Map::new();
-    let mut subject_rows = None;
+    let mut about_subject = None;
     match &about {
         Some(id) => {
-            let (declared_id, rows) = subject(id, "the subject it is about")?;
-            subject_rows = rows;
-            props.insert("about".to_owned(), json!(declared_id));
+            let declared = subject(id, "the subject it is about")?;
+            props.insert("about".to_owned(), json!(declared.id));
+            about_subject = Some(declared);
         }
         None if asks && with_subjects => {
             return Err(invalid(format!(
@@ -271,12 +307,61 @@ pub(super) fn line_props(
         None => {}
     }
     if asks && with_subjects {
-        let (declared_id, _) = subject(filled_by, "the subject who writes it (filled_by)")?;
-        props.insert("filled_by".to_owned(), json!(declared_id));
+        let declared = subject(filled_by, "the subject who writes it (filled_by)")?;
+        props.insert("filled_by".to_owned(), json!(declared.id));
+    }
+    match obj.get("known_to") {
+        None | Some(Value::Null) => {}
+        Some(_) if !asks => {
+            return Err(invalid(format!(
+                "item \"{label}\" asks for no field, so no subject holds its value (known_to)"
+            )));
+        }
+        Some(Value::String(id)) => {
+            let holder = subject(id, "the subject that already holds its value (known_to)")?;
+            props.insert("known_to".to_owned(), json!(holder.id));
+        }
+        Some(via @ Value::Object(_)) => {
+            let relation = params::text(params::entry(via, "known_to")?, "relation")?;
+            let Some(about) = &about_subject else {
+                return Err(invalid(format!(
+                    "item \"{label}\" takes known_to through the relation \"{relation}\", but names no subject it is about"
+                )));
+            };
+            let targets: Vec<&String> = about
+                .relations
+                .iter()
+                .filter(|(r, _)| normalize(r) == normalize(&relation))
+                .map(|(_, to)| to)
+                .collect();
+            let to = match targets.as_slice() {
+                [to] => *to,
+                [] => {
+                    return Err(invalid(format!(
+                        "item \"{label}\" takes known_to through the relation \"{relation}\", and its subject \"{}\" names no subject under that relation",
+                        about.id
+                    )));
+                }
+                _ => {
+                    return Err(invalid(format!(
+                        "item \"{label}\" takes known_to through the relation \"{relation}\", and its subject \"{}\" names more than one subject under it; name the subject instead",
+                        about.id
+                    )));
+                }
+            };
+            let holder = subject(to, "the subject that already holds its value (known_to)")?;
+            props.insert("known_to".to_owned(), json!(holder.id));
+            props.insert("known_to_via".to_owned(), json!(relation));
+        }
+        Some(_) => {
+            return Err(invalid(format!(
+                "item \"{label}\": known_to is the id of a subject, or {{relation}} naming the subject its own subject holds under that relation"
+            )));
+        }
     }
     let mut selected = Vec::new();
     for id in &selects {
-        selected.push(subject(id, "a subject its value selects")?.0);
+        selected.push(subject(id, "a subject its value selects")?.id);
     }
     if !selected.is_empty() {
         props.insert("selects".to_owned(), json!(selected));
@@ -298,7 +383,9 @@ pub(super) fn line_props(
         None if asks && with_subjects => Some("required".to_owned()),
         None => None,
     };
-    let rows = own_rows.or(subject_rows).unwrap_or(1);
+    let rows = own_rows
+        .or(about_subject.as_ref().and_then(|s| s.rows))
+        .unwrap_or(1);
     match (necessity.as_deref(), &group) {
         (Some("one_of"), None) => {
             return Err(invalid(format!(
@@ -325,4 +412,110 @@ pub(super) fn line_props(
         props.insert("group".to_owned(), json!(group));
     }
     Ok(props)
+}
+
+/// One end of a constraint: the line that asks a subject's field, in a state.
+pub(super) struct End {
+    pub(super) subject: Option<String>,
+    pub(super) field: String,
+    pub(super) state: Option<String>,
+}
+
+impl End {
+    pub(super) fn describe(&self) -> String {
+        let whose = self
+            .subject
+            .as_ref()
+            .map(|s| format!(" of \"{s}\""))
+            .unwrap_or_default();
+        let state = self
+            .state
+            .as_ref()
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default();
+        format!("\"{}\"{whose}{state}", self.field)
+    }
+}
+
+/// A constraint a form declares across two of its lines.
+pub(super) struct ConstraintSpec {
+    pub(super) must: String,
+    pub(super) ends: [End; 2],
+    text: Option<String>,
+}
+
+/// The constraints of a document, each `{must, lines: [two ends], text?}`.
+pub(super) fn constraint_specs(doc: &Args) -> Result<Vec<ConstraintSpec>, RuntimeError> {
+    let mut out = Vec::new();
+    for constraint in params::list(doc, "constraints")? {
+        let obj = params::entry(constraint, "constraint")?;
+        let must = params::one_of(params::text(obj, "must")?, "must", &MUSTS)?;
+        let mut ends = Vec::new();
+        for end in params::list(obj, "lines")? {
+            let end = params::entry(end, "constraint line")?;
+            ends.push(End {
+                subject: params::opt_text(end, "subject")?,
+                field: params::text(end, "field")?,
+                state: params::opt_text(end, "state")?,
+            });
+        }
+        let ends: [End; 2] = ends.try_into().map_err(|ends: Vec<End>| {
+            invalid(format!(
+                "a constraint holds two lines to {must}; this one names {}",
+                ends.len()
+            ))
+        })?;
+        let fold = |end: &End| {
+            (
+                end.subject.as_deref().map(normalize),
+                normalize(&end.field),
+                end.state.as_deref().map(normalize),
+            )
+        };
+        if fold(&ends[0]) == fold(&ends[1]) {
+            return Err(invalid(format!(
+                "a constraint holds two different lines to {must}; this one names {} twice",
+                ends[0].describe()
+            )));
+        }
+        out.push(ConstraintSpec {
+            text: params::opt_text(obj, "text")?,
+            must,
+            ends,
+        });
+    }
+    Ok(out)
+}
+
+/// The constraints as a form node keeps them.
+pub(super) fn constraints_prop(specs: &[ConstraintSpec]) -> Value {
+    Value::Array(
+        specs
+            .iter()
+            .map(|spec| {
+                let lines: Vec<Value> = spec
+                    .ends
+                    .iter()
+                    .map(|end| {
+                        let mut line = Map::new();
+                        if let Some(subject) = &end.subject {
+                            line.insert("subject".to_owned(), json!(subject));
+                        }
+                        line.insert("field".to_owned(), json!(end.field));
+                        if let Some(state) = &end.state {
+                            line.insert("state".to_owned(), json!(state));
+                        }
+                        Value::Object(line)
+                    })
+                    .collect();
+                let mut constraint = Map::new();
+                constraint.insert("must".to_owned(), json!(spec.must));
+                constraint.insert("lines".to_owned(), Value::Array(lines));
+                if let Some(text) = &spec.text {
+                    constraint.insert("text".to_owned(), json!(text));
+                }
+                Value::Object(constraint)
+            })
+            .collect(),
+    )
 }

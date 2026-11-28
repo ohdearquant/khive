@@ -91,7 +91,16 @@ fn item_view(graph: &Graph, item: &Entity) -> Value {
         };
         view[slot] = json!(target.name);
     }
-    for key in ["about", "state", "repeats", "necessity", "group", "selects"] {
+    for key in [
+        "about",
+        "known_to",
+        "known_to_via",
+        "state",
+        "repeats",
+        "necessity",
+        "group",
+        "selects",
+    ] {
         if let Some(value) = prop(item, key) {
             view[key] = value.clone();
         }
@@ -350,6 +359,8 @@ pub(crate) async fn neighbourhood(ctx: &Ctx<'_>, params: Value) -> Result<Value,
             let mut subjects: Vec<&Entity> = graph.subjects_of(&key).into_values().collect();
             subjects.sort_by(|a, b| a.name.cmp(&b.name));
             reply["subjects"] = Value::Array(subjects.into_iter().map(subject_view).collect());
+            reply["purposes"] = json!(strings(prop(root, "purposes")));
+            reply["constraints"] = prop(root, "constraints").cloned().unwrap_or(json!([]));
             reply["rules"] = json!(rules_of(&graph, &key));
             reply["related"] = json!({
                 "competes_with": forms_cited(&graph, graph.either(root.id, EdgeRelation::CompetesWith)),
@@ -383,7 +394,13 @@ pub(crate) async fn neighbourhood(ctx: &Ctx<'_>, params: Value) -> Result<Value,
                             .subjects_of(&form)
                             .get(&normalize(&about))
                             .and_then(|s| prop_text(s, "role"));
-                        Some(json!({"form": form, "item": label(item), "subject": about, "role": role}))
+                        Some(json!({
+                            "form": form,
+                            "item": label(item),
+                            "subject": about,
+                            "role": role,
+                            "known_to": prop_text(item, "known_to"),
+                        }))
                     })
                     .collect(),
             );
@@ -418,6 +435,20 @@ pub(crate) async fn neighbourhood(ctx: &Ctx<'_>, params: Value) -> Result<Value,
                     .then(a.name.cmp(&b.name))
             });
             reply["term"] = json!({"list": list, "name": root.name, "definition": prop_text(root, "definition")});
+            if list == "purpose" {
+                // Every form that says it is for this purpose.
+                let mut forms: Vec<&Entity> = graph
+                    .of_type(FORM)
+                    .into_iter()
+                    .filter(|f| {
+                        strings(prop(f, "purposes"))
+                            .iter()
+                            .any(|p| normalize(p) == term)
+                    })
+                    .collect();
+                forms.sort_by_key(|f| graph.key(f.id));
+                reply["forms"] = Value::Array(forms.into_iter().map(cite).collect());
+            }
             reply["subjects"] = Value::Array(
                 subjects
                     .into_iter()
