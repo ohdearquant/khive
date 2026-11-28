@@ -336,6 +336,10 @@ pub(crate) use entity_aliases::{
 pub use entity_aliases::{validate_entity_alias, EntityAliasChange, EntityAliasReport};
 mod entity_bulk;
 mod entity_create;
+mod entity_key_add;
+pub use entity_key_add::{
+    entity_key_add_plans, EntityKeyAdd, ENTITY_KEY_ADD_HELD_LABEL, ENTITY_KEY_ADD_LIVE_LABEL,
+};
 mod entity_keys;
 pub(crate) use entity_keys::validate_entity_key;
 pub use entity_keys::{
