@@ -188,6 +188,8 @@ pub(super) fn preflight_daemon_launch(
 
     // Parse the child's actual argv, including clap's inherited environment
     // bindings, so validation and launch cannot select different stores.
+    // get_args() excludes the executable: its leading `mcp` is deliberately
+    // consumed as clap's program name, leaving `--daemon` as the first flag.
     let command = daemon_launch_command(std::path::Path::new("kkernel"), config, db, packs);
     let args = crate::args::Args::try_parse_from(command.get_args())?;
     crate::serve::preflight_daemon_configuration(&args)
