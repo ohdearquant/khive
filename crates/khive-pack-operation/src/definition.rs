@@ -532,9 +532,10 @@ pub(crate) fn compile_document(
     })
 }
 
-/// A source order: a version and the places in order, none named twice. Names are compared as
-/// the forms pack compares them, so two spellings of one place are refused as a duplicate; that
-/// each place is loaded is checked against the forms pack before anything is written.
+/// A source order: a version and the places in order. Two places that fold to one name are
+/// refused as a duplicate; otherwise a place is matched to a forms pack document type id
+/// exactly, and that each place is loaded is checked against the forms pack before anything
+/// is written.
 fn compile_source_order(source: &Value) -> Result<(Stored, SourceOrder), Refusal> {
     let order: SourceOrder = serde_json::from_value(source.clone())
         .map_err(|e| Refusal::new("invalid_document", format!("source_order: {e}")))?;

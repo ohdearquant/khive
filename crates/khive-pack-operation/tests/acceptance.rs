@@ -984,8 +984,9 @@ fn stating_record(form_id: &str, n: u8, document_type: Value, lines: &[(&str, &s
             {"id": "witness", "kind": "person", "role": "witness"}
         ],
         "fields": [
-            {"name": PERMIT, "definition": "The number a registry gives a permit.", "value_type": "identifier"},
-            {"name": REFERENCE, "definition": "Any reference a registry gives a permit.", "value_type": "identifier"}
+            {"name": REFERENCE, "definition": "Any reference a registry gives a permit.", "value_type": "identifier"},
+            {"name": PERMIT, "definition": "The number a registry gives a permit.", "value_type": "identifier",
+                "narrows": REFERENCE}
         ],
         "items": items,
     })
@@ -1037,21 +1038,13 @@ async fn a_missing_input_lists_its_places_in_the_source_order_and_its_parent_sta
             .await;
         assert_eq!(loaded["loaded"], true, "{loaded}");
     }
-    // The permit reference is the parent of the permit number in the field hierarchy.
-    let node = |reply: &Value| reply["node"]["id"].as_str().expect("a node id").to_owned();
-    let parent = store
-        .call(author(), "forms.neighbourhood", json!({"node": REFERENCE}))
-        .await;
+    // Each record loads the permit number as narrowing the permit reference; no edge is
+    // written by hand.
     let child = store
         .call(author(), "forms.neighbourhood", json!({"node": PERMIT}))
         .await;
-    store
-        .call(
-            author(),
-            "link",
-            json!({"source_id": node(&parent), "target_id": node(&child), "relation": "contains"}),
-        )
-        .await;
+    assert_eq!(child["broader"], json!([REFERENCE]), "{child}");
+    assert_eq!(child["general"], json!([]), "{child}");
 
     let document = json!({
         "source_order": {"version": 1, "places": ["zeta-portal", "registry-extract"]},
@@ -1134,4 +1127,109 @@ async fn a_missing_input_lists_its_places_in_the_source_order_and_its_parent_sta
         "{view}"
     );
     assert_eq!(view["source_order"]["version"], 2, "{view}");
+}
+
+#[tokio::test]
+async fn stated_in_part_walks_the_whole_chain_nearest_first_and_skips_a_general_wording() {
+    let store = Store::new();
+    let line = |order: u32, field: &str, subject: &str| {
+        json!({"label": format!("{field} of the {subject}"), "page": 1, "order": order,
+            "item_kind": "text", "relation": "states", "about": subject, "field": field})
+    };
+    let code = json!({"name": "code", "definition": "The code a registry gives a permit.", "value_type": "identifier"});
+    let mut narrowing = code.clone();
+    narrowing["narrows"] = json!(PERMIT);
+    // The reference's line is printed before the permit number's.
+    let record = json!({
+        "form_id": "CHAIN-1",
+        "revision": "2026-01",
+        "title": "Record CHAIN-1",
+        "source": {"url": "https://forms.example/CHAIN-1.pdf", "sha256": "7".repeat(64)},
+        "document_type": {"id": "chain-portal", "name": "Chain portal", "system": true},
+        "terms": {"kinds": ["person"], "roles": ["holder", "witness"]},
+        "subjects": [
+            {"id": "holder", "kind": "person", "role": "holder"},
+            {"id": "witness", "kind": "person", "role": "witness"}
+        ],
+        "fields": [
+            {"name": REFERENCE, "definition": "Any reference a registry gives a permit.", "value_type": "identifier"},
+            {"name": PERMIT, "definition": "The number a registry gives a permit.", "value_type": "identifier",
+                "narrows": REFERENCE},
+            narrowing
+        ],
+        "items": [line(1, REFERENCE, "holder"), line(2, PERMIT, "holder"), line(3, "code", "witness")],
+    });
+    let loaded = store
+        .call(author(), "forms.load", json!({"document": record}))
+        .await;
+    assert_eq!(loaded["loaded"], true, "{loaded}");
+
+    // The wording "code" is split: the field the step requires keeps its narrows and is
+    // held by a general wording beside a parcel code the holder's line states.
+    let mut holder_code = line(4, "code", "holder");
+    holder_code.as_object_mut().expect("line").remove("field");
+    let added = store
+        .call(
+            author(),
+            "forms.add_item",
+            json!({"form": "CHAIN-1", "item": holder_code, "field": code}),
+        )
+        .await;
+    store
+        .call(
+            author(),
+            "forms.split",
+            json!({
+                "field": "code",
+                "item": added["item"]["id"],
+                "existing_name": "permit code",
+                "new_name": "parcel code",
+                "new_definition": "The code a registry gives a parcel."
+            }),
+        )
+        .await;
+    let required = store
+        .call(
+            author(),
+            "forms.neighbourhood",
+            json!({"node": "permit code"}),
+        )
+        .await;
+    assert_eq!(required["broader"], json!([PERMIT]), "{required}");
+    assert_eq!(required["general"], json!(["code"]), "{required}");
+
+    let document = json!({
+        "operation_types": [{
+            "id": "permit-check",
+            "version": 1,
+            "slots": [{"name": "holder", "kind": "person", "role": "holder"}],
+            "steps": [{"name": "check", "by": "holder", "outcome": true,
+                "requires": [{"field": "permit code", "value_type": "identifier", "slot": "holder"}]}]
+        }]
+    });
+    store
+        .call(author(), "operation.define", json!({"document": document}))
+        .await;
+    let opened = store
+        .call(
+            office(),
+            "operation.open",
+            json!({"type": "permit-check", "bindings": {"holder": person("h1")}}),
+        )
+        .await;
+    let operation = opened["operation_id"].as_str().expect("id").to_owned();
+
+    let view = store.frontier(&operation, json!({})).await;
+    let missing = items_of(&view, "input_missing");
+    assert_eq!(missing.len(), 1, "{view}");
+    assert_eq!(missing[0]["places"], json!([]), "{view}");
+    let part = |stated: &str| {
+        json!({"form": "CHAIN-1", "revision": "2026-01", "subject": "holder", "stated": stated,
+            "required": "permit code", "document_type": "chain-portal", "system": true})
+    };
+    assert_eq!(
+        missing[0]["stated_in_part"],
+        json!([part(PERMIT), part(REFERENCE)]),
+        "{view}"
+    );
 }

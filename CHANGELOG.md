@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state a parent of the field. The frontier names the source order and the form revisions it read.
   `operation.define` publishes a `source_order` (`version`, `places`) and refuses a place that is
   not a loaded document type or system (ADR-222 Amendments 1 and 2).
+- `forms.load` takes `narrows` on a field: the one ordinary field of the same value type, loaded
+  before or listed earlier in the document, whose values include every value of this one. The load
+  holds it as a contains edge from the broader field. A narrows naming the field itself, a field
+  the document leaves undecided, a general wording, several fields, a field of another value type,
+  a second broader field or one that would close a cycle is refused and writes nothing, and the
+  same narrows given again writes nothing; `forms.add_item` and `forms.same` refuse it.
+  `forms.neighbourhood` on a field gives the field it narrows as `broader` and the fields that
+  narrow it as `narrower`, and `general` lists only general wordings. `operation.frontier` follows
+  the chain of broader fields, nearest first, for `stated_in_part` (ADR-223 Amendment 1).
 
 ## [0.24.0] - 2026-11-28
 
