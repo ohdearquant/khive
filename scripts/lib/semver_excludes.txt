@@ -14,7 +14,6 @@ khive-pack-agent
 khive-pack-blob
 khive-pack-charter
 khive-pack-exec
-khive-pack-forms
 khive-pack-moodboard
 khive-pack-operation
 khive-pack-telemetry
