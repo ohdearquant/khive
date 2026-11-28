@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
@@ -17,7 +17,9 @@ use khive_types::{
 };
 
 use crate::definition::{
-    canonical_json, compile_document, digest, fold, Compiled, OperationType, Refusal, StepType,
+    canonical_json, compile_document, digest, fold, named_fields, step_type_refs,
+    write_canonical_field_names, Available, Compiled, Document, OperationType, Refusal, StepType,
+    Stored,
 };
 use crate::frontier::{evaluate, GroupBy, Identity, Payload};
 use crate::resolve::{resolve, Decision, Subject, Terms};
@@ -53,14 +55,14 @@ const OBSERVED_AT: ParamDef = param(
 pub(crate) static OPERATION_HANDLERS: [HandlerDef; 7] = [
     HandlerDef {
         name: "operation.define",
-        description: "Publish operation types in the caller's namespace: slots, steps (who acts, after which steps, how many of a repeating slot), and rules that ask or skip a step on facts and on other steps. Each step is published as its own step type and pinned by digest. A slot is given by a kind and a role with an optional qualifier, by a relation to another slot of the type, or by neither; a kind, role or relation a slot names must be a term of the namespace (forms.terms) by name or alias. Publishing the same type again is a no-op; a different type under a published version is refused.",
+        description: "Publish operation types in the caller's namespace: slots, steps (who acts, after which steps, how many of a repeating slot), and rules that ask or skip a step on facts and on other steps. Step types may also be published on their own and pinned by a step of a type. Each step given inside a type is published as its own step type, and every step type a type uses is pinned by digest. A step that requires a value another step produces comes after it. A requirement, product or supply names a field by its canonical name in any case or spacing, and the canonical name is what is stored. A slot is given by a kind and a role with an optional qualifier, by a relation to another slot of the type, or by neither; a kind, role or relation a slot names must be a term of the namespace (forms.terms) by name or alias. Publishing the same type again is a no-op; a different type under a published version is refused.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[param(
             "document",
             "object",
             true,
-            "{operation_types: [{id, version, slots: [{name, repeats?, required?, kind?, role?, qualifier?, defined_by?: {relation, slot}}], steps: [{name, by, act?, after?, quantifier? all_of|at_least_one, activated_by?, unless?, outcome?}], rules?: [{step, action activate|skip, when, unless?, status?, owner?, citation?}]}]}. A condition list is alternatives of terms, each {fact: {field, slot?, present|equals|one_of}} or {step: {name, done}}.",
+            "{step_types?: [{id, version, by, name?, act?, quantifier?, requires?, produces?}], operation_types?: [{id, version, slots: [{name, repeats?, required?, kind?, role?, qualifier?, defined_by?: {relation, slot}}], steps: [{name, by, act?, after?, quantifier? all_of|at_least_one, activated_by?, unless?, outcome?, requires?, produces?, supplies?} or {name, step_type: {id, version}, after?, activated_by?, unless?, outcome?, supplies?}], rules?: [{step, action activate|skip, when, unless?, status?, owner?, citation?}]}]}, with at least one of the two lists. A requirement is {field, slot?, value_type}; a product is {field, slot?, class read|computed|stated}; a supply {from, field, as} takes the value step from produces as field and gives it to this step's requirement as. A condition list is alternatives of terms, each {fact: {field, slot?, present|equals|one_of}} or {step: {name, done}}.",
         )],
     },
     HandlerDef {
@@ -591,18 +593,39 @@ impl OperationPack {
         registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
-        let document = Value::Object(params.object("document")?);
-        let compiled = compile_document(&document).map_err(|refusal| params.refused(refusal))?;
-        check_terms(&params, &compiled, registry, token).await?;
+        let mut source = Value::Object(params.object("document")?);
         let namespace = token.namespace().as_str().to_owned();
+        let fields = read_fields(&params, &named_fields(&source), registry, token).await?;
+        let canonical: BTreeMap<String, String> = fields
+            .iter()
+            .map(|(folded, (name, _))| (folded.clone(), name.clone()))
+            .collect();
+        write_canonical_field_names(&mut source, &canonical);
+        let held = self
+            .published_step_types(&namespace, &step_type_refs(&source))
+            .await?;
+        let document =
+            compile_document(&source, &held).map_err(|refusal| params.refused(refusal))?;
+        check_terms(&params, &document.operation_types, registry, token).await?;
+        check_value_types(&params, &document, &fields)?;
         let now = now_us();
         let verb = params.verb.clone();
         let unit_verb = verb.clone();
         let op: AtomicUnitOp = Box::new(move |writer| {
             Box::pin(async move {
+                let mut step_types_published = Vec::new();
+                let mut step_types_already = Vec::new();
+                for stored in &document.step_types {
+                    if held_same(&mut *writer, &unit_verb, &namespace, stored).await? {
+                        step_types_already.push(stored_summary(stored));
+                        continue;
+                    }
+                    insert_definition(&mut *writer, &namespace, stored, now).await?;
+                    step_types_published.push(stored_summary(stored));
+                }
                 let mut published = Vec::new();
                 let mut already = Vec::new();
-                for type_ in &compiled {
+                for type_ in &document.operation_types {
                     if held_same(&mut *writer, &unit_verb, &namespace, &type_.operation_type)
                         .await?
                     {
@@ -619,21 +642,7 @@ impl OperationPack {
                         {
                             continue;
                         }
-                        writer
-                            .execute(stmt(
-                                include_str!("../sql/definition-insert.sql"),
-                                vec![
-                                    text(&namespace),
-                                    text(&stored.id),
-                                    SqlValue::Integer(stored.version),
-                                    text(stored.kind),
-                                    text(&stored.digest),
-                                    SqlValue::Blob(stored.bytes.clone()),
-                                    text(&stored.source),
-                                    SqlValue::Integer(now),
-                                ],
-                            ))
-                            .await?;
+                        insert_definition(&mut *writer, &namespace, stored, now).await?;
                     }
                     published.push(summary(type_));
                 }
@@ -641,11 +650,48 @@ impl OperationPack {
                     "namespace": namespace,
                     "published": published,
                     "already_published": already,
+                    "step_types_published": step_types_published,
+                    "step_types_already_published": step_types_already,
                 })))
             })
         });
         let out = self.runtime.sql().atomic_unit(op).await?;
         unit_value(out, &verb)
+    }
+
+    /// The step types a document names by id and version that are already published in
+    /// `namespace`, each read back against its own digest. A row of another kind is left out,
+    /// so a pin to it is refused as `unknown_step_type`.
+    async fn published_step_types(
+        &self,
+        namespace: &str,
+        refs: &BTreeSet<(String, i64)>,
+    ) -> Result<Available, RuntimeError> {
+        let mut available = Available::new();
+        if refs.is_empty() {
+            return Ok(available);
+        }
+        let mut reader = self.runtime.sql().reader().await?;
+        for (id, version) in refs {
+            let Some(row) = reader
+                .query_row(stmt(
+                    include_str!("../sql/definition-get.sql"),
+                    vec![text(namespace), text(id), SqlValue::Integer(*version)],
+                ))
+                .await?
+            else {
+                continue;
+            };
+            if col_text(&row, "kind")? != "step_type" {
+                continue;
+            }
+            let held = col_text(&row, "digest")?;
+            let bytes = checked_definition(&row, "step_type", &held)?;
+            let step_type: StepType = serde_json::from_slice(&bytes)
+                .map_err(|e| RuntimeError::Internal(format!("step type {id} v{version}: {e}")))?;
+            available.insert((id.clone(), *version), (step_type, held));
+        }
+        Ok(available)
     }
 
     async fn open(&self, params: Params, token: &NamespaceToken) -> Result<Value, RuntimeError> {
@@ -1538,6 +1584,119 @@ fn summary(type_: &Compiled) -> Value {
             .map(|step| json!({"id": step.id, "version": step.version, "digest": step.digest}))
             .collect::<Vec<_>>(),
     })
+}
+
+/// Refuse a requirement or product that names a field the forms pack does not hold, or names
+/// it by anything but its canonical name in some case and spacing. Each distinct name is read
+/// once, through `forms.neighbourhood`. Returns each field by its folded name: its canonical
+/// name and its value type.
+async fn read_fields(
+    params: &Params,
+    named: &BTreeSet<String>,
+    registry: &VerbRegistry,
+    token: &NamespaceToken,
+) -> Result<BTreeMap<String, (String, String)>, RuntimeError> {
+    let mut fields = BTreeMap::new();
+    for field in named {
+        let unknown = |why: &str| {
+            params.refused(Refusal::new(
+                "unknown_field",
+                format!("field \"{field}\" {why}; load it with forms.load"),
+            ))
+        };
+        let reply = match forms_read(
+            registry,
+            token,
+            "forms.neighbourhood",
+            json!({ "node": field }),
+        )
+        .await
+        {
+            Ok(reply) => reply,
+            Err(RuntimeError::InvalidInput(_)) => {
+                return Err(unknown("is not a field of this namespace"))
+            }
+            Err(error) => return Err(error),
+        };
+        if reply["node"]["type"].as_str() != Some("field") {
+            return Err(unknown("names a forms node that is not a field"));
+        }
+        let canonical = reply["field"]["name"].as_str().unwrap_or_default();
+        if fold(canonical) != fold(field) {
+            return Err(unknown(&format!(
+                "is not a canonical field name (it answers to \"{canonical}\")"
+            )));
+        }
+        let value_type = reply["field"]["value_type"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        fields.insert(fold(canonical), (canonical.to_owned(), value_type));
+    }
+    Ok(fields)
+}
+
+/// Refuse a requirement whose value type is not its field's (ADR-222 A2.2), the fields being
+/// those `read_fields` returned. A step type pinned from the namespace was checked when it was
+/// published.
+fn check_value_types(
+    params: &Params,
+    document: &Document,
+    fields: &BTreeMap<String, (String, String)>,
+) -> Result<(), RuntimeError> {
+    for stored in document.step_types.iter().chain(
+        document
+            .operation_types
+            .iter()
+            .flat_map(|type_| type_.step_types.iter()),
+    ) {
+        let step_type: StepType = serde_json::from_slice(&stored.bytes)
+            .map_err(|e| RuntimeError::Internal(format!("step type {}: {e}", stored.id)))?;
+        for need in &step_type.requires {
+            let held = fields
+                .get(&fold(&need.field))
+                .map(|(_, value_type)| value_type.as_str())
+                .unwrap_or_default();
+            if held != need.value_type {
+                return Err(params.refused(Refusal::new(
+                    "value_type_mismatch",
+                    format!(
+                        "{}: step {} requires {} as {}, but the field holds {held}",
+                        step_type.id, step_type.name, need.field, need.value_type
+                    ),
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stored_summary(stored: &Stored) -> Value {
+    json!({"id": stored.id, "version": stored.version, "digest": stored.digest})
+}
+
+async fn insert_definition(
+    writer: &mut dyn SqlWriter,
+    namespace: &str,
+    stored: &Stored,
+    now: i64,
+) -> StorageResult<()> {
+    writer
+        .execute(stmt(
+            include_str!("../sql/definition-insert.sql"),
+            vec![
+                text(namespace),
+                text(&stored.id),
+                SqlValue::Integer(stored.version),
+                text(stored.kind),
+                text(&stored.digest),
+                SqlValue::Blob(stored.bytes.clone()),
+                text(&stored.source),
+                SqlValue::Integer(now),
+            ],
+        ))
+        .await?;
+    Ok(())
 }
 
 /// True when the definition is already stored with the same digest; a different digest under

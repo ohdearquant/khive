@@ -484,3 +484,141 @@ async fn decide_refuses_what_the_form_or_the_type_does_not_have_and_writes_nothi
     let reply = store.resolve(A, json!({})).await;
     assert_eq!(reply["decisions_read"], 0, "{reply}");
 }
+
+/// A type in which `assign` produces `produced` and the outcome `issue` requires `required`
+/// as `value_type`, with no `after` between them.
+fn flow_document(id: &str, required: &str, value_type: &str, produced: &str) -> Value {
+    json!({"operation_types": [{
+        "id": id,
+        "version": 1,
+        "slots": [{"name": "clerk"}],
+        "steps": [
+            {"name": "assign", "by": "clerk", "produces": [{"field": produced, "class": "stated"}]},
+            {"name": "issue", "by": "clerk", "requires": [{"field": required, "value_type": value_type}], "outcome": true}
+        ]
+    }]})
+}
+
+fn stamp(act: Option<&str>) -> Value {
+    let mut step_type = json!({"id": "stamp", "version": 1, "by": "clerk",
+        "requires": [{"field": ID, "value_type": "identifier"}]});
+    if let Some(act) = act {
+        step_type["act"] = json!(act);
+    }
+    step_type
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn define_names_only_loaded_fields_by_their_canonical_name_and_value_type() {
+    let store = Store::new();
+    let define = |document: Value| json!({ "document": document });
+    let message = store
+        .refused(
+            "operation.define",
+            define(flow_document("t", ID, "identifier", ID)),
+        )
+        .await;
+    assert!(
+        message.contains("unknown_field") && message.contains(ID),
+        "{message}"
+    );
+
+    let mut form = form_a("2026-01", 1, true);
+    form["fields"][0]["aliases"] = json!(["id number"]);
+    store.load(form).await;
+    let cases = [
+        (
+            flow_document("t", "id number", "identifier", ID),
+            "unknown_field",
+            "answers to",
+        ),
+        (
+            flow_document("t", "applicant", "identifier", ID),
+            "unknown_field",
+            "not a field",
+        ),
+        (
+            flow_document("t", ID, "identifier", "ghost field"),
+            "unknown_field",
+            "ghost field",
+        ),
+        (
+            flow_document("t", ID, "text", ID),
+            "value_type_mismatch",
+            "identifier",
+        ),
+        (
+            json!({"step_types": [{"id": "stamp", "version": 1, "by": "clerk",
+                "requires": [{"field": ID, "value_type": "text"}]}]}),
+            "value_type_mismatch",
+            "stamp",
+        ),
+    ];
+    for (document, code, part) in cases {
+        let message = store
+            .refused("operation.define", define(document.clone()))
+            .await;
+        assert!(
+            message.contains(code) && message.contains(part),
+            "{document}: {message}"
+        );
+    }
+    let reply = store
+        .call(
+            "operation.define",
+            define(flow_document(
+                "t",
+                "Identification Number",
+                "identifier",
+                ID,
+            )),
+        )
+        .await;
+    assert_eq!(reply["published"][0]["id"], "t", "{reply}");
+    // The canonical name is what is stored: the type written with it is the one published.
+    let again = store
+        .call(
+            "operation.define",
+            define(flow_document("t", ID, "identifier", ID)),
+        )
+        .await;
+    assert_eq!(again["published"], json!([]), "{again}");
+    assert_eq!(
+        again["already_published"][0]["digest"], reply["published"][0]["digest"],
+        "{again}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_step_type_published_alone_is_pinned_later_and_its_version_holds_one_definition() {
+    let store = Store::new();
+    store.load(form_a("2026-01", 1, true)).await;
+    let given = json!({ "document": {"step_types": [stamp(None)]} });
+    let first = store.call("operation.define", given.clone()).await;
+    assert_eq!(first["step_types_published"][0]["id"], "stamp", "{first}");
+    assert_eq!(first["published"], json!([]));
+    let again = store.call("operation.define", given).await;
+    assert_eq!(again["step_types_published"], json!([]), "{again}");
+    assert_eq!(
+        again["step_types_already_published"][0]["digest"],
+        first["step_types_published"][0]["digest"]
+    );
+
+    let pinning = json!({ "document": {"operation_types": [{
+        "id": "stamped",
+        "version": 1,
+        "slots": [{"name": "clerk"}],
+        "steps": [{"name": "stamp", "step_type": {"id": "stamp", "version": 1}, "outcome": true}]
+    }]} });
+    let typed = store.call("operation.define", pinning).await;
+    assert_eq!(typed["published"][0]["id"], "stamped", "{typed}");
+    assert_eq!(typed["step_types_published"], json!([]));
+
+    let message = store
+        .refused(
+            "operation.define",
+            json!({ "document": {"step_types": [stamp(Some("seal"))]} }),
+        )
+        .await;
+    assert!(message.contains("version_conflict"), "{message}");
+}
