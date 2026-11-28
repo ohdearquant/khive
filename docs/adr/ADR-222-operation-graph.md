@@ -761,8 +761,9 @@ Not checked:
 
 Serves #6894 rows 1, 2, 3 and 9 and A1.4 (#6904 section 3). Building item 3 left questions that
 section 3, section 7 and A1.4 do not settle; this amendment settles them. It changes one sentence of
-section 7 (A2.5) and none of section 3 or A1.4. It also specifies the two forms reads that A1.3's
-`resolve` calls (A2.8), which no record specified before.
+section 7 (A2.5) and where A1.4 point 3 stores a source order (A2.6), and none of section 3. It
+also specifies the two forms reads that A1.3's `resolve` calls and two additions to
+`forms.neighbourhood` that A1.4's places read (A2.8), which no record specified before.
 
 ### A2.1 A step type published alone, and pinned
 
@@ -890,6 +891,18 @@ through two read verbs the forms pack gains with A1.1 to A1.3. Neither writes an
   in load order. A form or revision that is not loaded is refused, naming it, and so is a revision
   named both in `form` and in `revision`.
 
+A1.4's places and A2.6's `unknown_place` check read two additions to `forms.neighbourhood`, a
+read that exists today. Both add output and write nothing.
+
+- On a field, the reply gains `stated_by`: one row per line of the field that states it, each
+  `{document_type, system, form, revision, subject, role}`.
+- It takes `document_type:<id>` as a node, as it takes `kind:<name>`. The reply's node has type
+  `document_type`, with `system` and the forms the type contains. An id that names no loaded
+  document type is refused, naming it.
+
+Each changes a published read's output, so each carries a CHANGELOG line and an update to the
+verb's description.
+
 ### A2.9 Admission rows, and where it lands
 
 No operation verb is added by this amendment. Of Amendment 1's verbs, `operation.resolve` is a read
@@ -899,7 +912,8 @@ both lists. All three land with the A1.1 to A1.3 pull request.
 
 Item 3 lands as four pull requests, after ADR-221 Amendment 1:
 
-- 3a: forms, `known_as` on fields (A2.5) and the system mark of ADR-223.
+- 3a: forms, `known_as` on fields (A2.5), the system mark of ADR-223 and the two
+  `forms.neighbourhood` additions (A2.8).
 - 3b-1: operation at `define`, A2.1 to A2.3.
 - 3b-2: operation at the frontier, A2.4 and A2.6, with A1.4's places and `stated_in_part`.
 - 3c: operation, the working type graph with section 2's canonical keys and section 7's names.
@@ -927,4 +941,6 @@ refusal arms of one section may be rows of one table test.
 - A2.8: `forms.terms` returns a term's alias and a carrying relation's `carries`; `forms.subjects`
   reads a named revision and, with none named, the revision loaded last. Refused by
   `forms.subjects`: a form that is not loaded, a revision that is not loaded, and a revision named
-  both in `form` and in `revision`.
+  both in `form` and in `revision`. `forms.neighbourhood` on a field lists each stating line in
+  `stated_by`, and on `document_type:<id>` names the type, its system mark and its forms; an id
+  naming no loaded document type is refused.
