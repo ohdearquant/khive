@@ -1607,3 +1607,59 @@ refuse `remote_response`, and a repository answering under another name refuses
 `repository_identity_mismatch` after exactly one request while the same call lists once the platform
 answers (control); 121 the classifier lists both verbs as reads at version 36 with every published
 verb total counting them.
+
+## Amendment 24 (2026-11-27): a checkout of named paths
+
+**Status**: Accepted 2026-11-27 (#6930). The ADR's Accepted status and every amendment above stand unchanged.
+
+A checkout lists the whole tree at `ref` and stores one manifest for it (Amendment 2 item 8). The
+manifest has an 8 MiB load limit (`MAX_MANIFEST_BYTES`, ADR-181). A repository whose manifest is
+larger refuses `output_limit` at the tree limit, and nothing in it can be read through
+`git.checkout`. This amendment lets a caller check out only the paths it needs. Committing from such
+a checkout is a later amendment; until then a scoped tree is refused by `git.commit` (item 3).
+
+1. **`git.checkout(repo, ref, paths?)`.** `paths` lists 1 to 64 repository-relative paths, each a
+   file or a directory, spelled as the tree names them. A path with a leading slash, an empty, `.` or
+   `..` component, a trailing slash or a NUL byte refuses `invalid_path`, and one path inside another
+   refuses `overlapping_paths`, both before git runs. The listing is
+   `ls-tree -r -z --full-tree <commit> -- <paths>` with literal pathspecs set on that command alone,
+   so a path is never a pattern. A path that names nothing at the commit refuses `path_not_found`,
+   naming it, before any blob is read.
+2. **The same checkout, of fewer entries.** The manifest holds the listed entries at their full
+   repository paths. Amendment 2 item 8's bounds and blob reuse, the manifest limit and Amendment 19's
+   links apply to the listing unchanged. The result is `{commit, tree, paths}`, and the receipt's
+   inputs gain `paths`, sorted. Without `paths` nothing changes, except that the whole-tree
+   `output_limit` refusal now says a checkout may name paths.
+3. **A scoped tree is not a whole tree, and every tree written from it stays scoped.** A scoped
+   checkout writes its manifest with the schema `khive-tree/scoped-v1` and a `scope` field holding
+   its sorted `paths`; a whole checkout writes `khive-tree/v1` as today. The runtime's tree store
+   loads a manifest as its entries with its scope and stores one only from both, so a verb that
+   writes a tree from a tree it read (`exec.tree_put`, a run's `tree_out`) writes the same scope, and
+   so does any tool outside this repository that edits trees through the same store.
+   `git.commit` reads a manifest as the whole tree, and a path the manifest omits is a deletion
+   (Amendment 2 item 2), so it refuses every `khive-tree/scoped-v1` manifest (`scoped_tree`, naming
+   the scope) before any git command runs. The guard reads the manifest's schema, never its
+   entries: a scoped tree whose paths happen to cover every entry of the repository is refused all
+   the same, and only a tree written from a whole checkout commits. A binary older than this
+   amendment refuses the scoped schema when it loads the manifest, as it refuses every schema but
+   `khive-tree/v1`, so neither it nor a tool built on its store can run, edit or commit a scoped
+   tree as a whole one. A manifest a caller writes itself as raw bytes is outside this guard.
+
+What this does not cover: committing from a scoped tree, a pattern or glob in `paths`, and a
+listing limited by depth or size.
+
+Acceptance arms added: 122 a checkout naming one directory and one file returns exactly the entries
+under them at full paths with their bytes, and the receipt's inputs name both paths, while the same
+ref unscoped returns a superset (control); 123 `invalid_path` for each bad spelling,
+`overlapping_paths`, and `path_not_found` naming the path, each before any blob is read; 124 a path
+holding glob characters matches only itself; 125 a repository whose whole manifest exceeds the limit
+refuses unscoped, with the refusal naming `paths`, and checks out scoped under it; 126 `git.commit` of
+a scoped checkout's tree refuses `scoped_tree` naming its scope with no ref moved; the same tree with
+one file edited through `exec.tree_put`, and with one file written by a run and read back as its
+`tree_out`, keeps the scope and refuses the same way; a scoped checkout whose paths cover every entry
+of a small repository refuses although its entries equal the whole tree's; and the whole checkout's
+tree commits (control); mutation control: storing an edited tree without its scope turns the edited
+cases red; 127 a scoped link entry keeps mode `120000` and its literal target (Amendment 19); 128 a
+scoped checkout's stored manifest bytes carry a schema other than `khive-tree/v1`, and a manifest with
+any schema the store does not know is refused at load, the branch an older binary takes on a scoped
+manifest.
