@@ -44,15 +44,17 @@ pub(crate) fn decode_delta(
 }
 
 pub(crate) fn preimage_status(changeset: &ChangeSet) -> ProposalPreimageStatus {
-    if changeset
-        .ops
-        .iter()
-        .any(|op| matches!(op, Op::Update(_) | Op::Delete(_)))
-    {
+    if changeset.ops.iter().any(has_captured_preimage) {
         ProposalPreimageStatus::Captured
     } else {
         ProposalPreimageStatus::None
     }
+}
+
+pub(crate) fn has_captured_preimage(op: &Op) -> bool {
+    matches!(op, Op::Update(_) | Op::Delete(_))
+        || matches!(op, Op::Restore(restore)
+            if matches!(restore.record(), khive_changeset::DeletePreimage::Entity(_)))
 }
 
 pub(crate) fn validate_canonical_admission(
@@ -250,6 +252,17 @@ pub(crate) async fn apply_delta(
                     details.push(("kind", kind));
                     details.push(("reason", "owner_snapshot_conflict".into()));
                     "owning kind validation snapshot changed"
+                }
+                AtomicOpFailure::RestoreKeyConflict(conflict) => {
+                    return Ok(CanonicalApplyOutcome::RolledBack {
+                        error: RuntimeError::BatchWrite {
+                            context: Box::new(khive_runtime::error::BatchWriteContext {
+                                source: Box::new(conflict.to_runtime_error(Some(failed_op_index))),
+                                disposition: khive_runtime::error::DomainDisposition::NotCommitted,
+                                admission: None,
+                            }),
+                        },
+                    });
                 }
                 _ => "canonical operation refused inside the writer transaction",
             };

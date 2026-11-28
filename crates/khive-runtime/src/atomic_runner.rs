@@ -162,6 +162,7 @@ pub enum AtomicOpFailure {
         target_id: uuid::Uuid,
         kind: String,
     },
+    RestoreKeyConflict(EntityRestoreKeyConflict),
     NoteConflict(crate::note_write::NoteWriteConflict),
     EntityConflict(crate::entity_write::EntityVersionConflict),
     /// The statement executed without a SQL error, but its affected-row
@@ -181,6 +182,24 @@ pub enum AtomicOpFailure {
         statement_label: Option<String>,
         message: String,
     },
+}
+
+/// Keys held by other entities when a canonical restore reached the writer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityRestoreKeyConflict {
+    pub target_id: uuid::Uuid,
+    pub taken_keys: Vec<khive_storage::entity::EntityKeyHolder>,
+}
+
+impl EntityRestoreKeyConflict {
+    /// Format the restore refusal without disclosing holder IDs.
+    pub fn to_runtime_error(&self, op_index: Option<usize>) -> crate::RuntimeError {
+        crate::KhiveRuntime::canonical_restore_key_conflict(
+            self.target_id,
+            &self.taken_keys,
+            op_index,
+        )
+    }
 }
 
 /// Deferred effects whose owning atomic unit has committed successfully.

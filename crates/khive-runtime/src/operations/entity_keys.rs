@@ -271,6 +271,7 @@ fn restore_entity_key_conflict(
     id: Uuid,
     taken: &[EntityKeyHolder],
     disclose: &(dyn Fn(&str) -> bool + Sync),
+    op_index: Option<usize>,
 ) -> RuntimeError {
     let named: Vec<String> = taken
         .iter()
@@ -292,18 +293,30 @@ fn restore_entity_key_conflict(
             entry
         })
         .collect();
+    let mut details = vec![
+        ("reason", "restore_key_conflict".to_string()),
+        ("taken_keys", serde_json::Value::Array(listed).to_string()),
+    ];
+    if let Some(index) = op_index {
+        details.push(("op_index", index.to_string()));
+    }
     KhiveError::conflict(format!(
         "restore_key_conflict: entity {id} stays deleted; keys taken by live entities: {}",
         named.join(", ")
     ))
-    .with_details(khive_types::Details::new_owned([
-        ("reason", "restore_key_conflict".to_string()),
-        ("taken_keys", serde_json::Value::Array(listed).to_string()),
-    ]))
+    .with_details(khive_types::Details::new_owned(details))
     .into()
 }
 
 impl KhiveRuntime {
+    pub(crate) fn canonical_restore_key_conflict(
+        id: Uuid,
+        taken: &[EntityKeyHolder],
+        op_index: Option<usize>,
+    ) -> RuntimeError {
+        restore_entity_key_conflict(id, taken, &|_| false, op_index)
+    }
+
     /// Create an entity under caller key `key`, unique per namespace and
     /// base kind (ADR-221 section 1).
     ///
@@ -555,7 +568,7 @@ impl KhiveRuntime {
         if taken.is_empty() {
             Ok(())
         } else {
-            Err(restore_entity_key_conflict(id, &taken, disclose))
+            Err(restore_entity_key_conflict(id, &taken, disclose, None))
         }
     }
 }

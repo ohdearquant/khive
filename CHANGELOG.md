@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `apply_changeset` applies an entity restore, the inverse of a soft delete, and restores the
+  entity's keys and aliases. If any key is taken, it returns `restore_key_conflict`, names every
+  taken key, and writes nothing from the change set. It still refuses note and edge restores
+  (#6886).
 - `operation.frontier` reports `input_missing` for each value an owed step requires that no record
   holds, in place of the act it owes. The item lists the places that state the field of a subject
   in the requirement's slot: every loaded document type and system, in the order of the

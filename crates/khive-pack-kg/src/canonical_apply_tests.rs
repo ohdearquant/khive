@@ -658,12 +658,15 @@ async fn invalid_canonical_proposal_leaves_no_created_history() {
 #[derive(Debug)]
 struct ConstituentGate {
     seen: Mutex<Vec<GateRequest>>,
+    deny_restore: bool,
 }
 
 impl Gate for ConstituentGate {
     fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
         self.seen.lock().unwrap().push(request.clone());
-        if request.verb == "create" && request.args.get("name") == Some(&json!("denied")) {
+        if (request.verb == "create" && request.args.get("name") == Some(&json!("denied")))
+            || (self.deny_restore && request.verb == "restore")
+        {
             Ok(GateDecision::deny("fixture constituent denial"))
         } else {
             Ok(GateDecision::allow())
@@ -676,6 +679,7 @@ async fn canonical_constituent_denial_keeps_real_caller_and_prevents_all_graph_m
     let runtime = KhiveRuntime::memory().unwrap();
     let gate = Arc::new(ConstituentGate {
         seen: Mutex::new(Vec::new()),
+        deny_restore: false,
     });
     let mut builder = VerbRegistryBuilder::new();
     builder.with_gate(gate.clone());
@@ -723,36 +727,43 @@ async fn canonical_constituent_denial_keeps_real_caller_and_prevents_all_graph_m
 }
 
 #[tokio::test]
-async fn canonical_restore_dispatch_refuses_before_creates_or_events() {
+async fn canonical_note_and_edge_restore_refuse_before_creates_or_events() {
     let (runtime, registry) = setup();
     let token = runtime
         .authorize(khive_runtime::Namespace::local())
         .unwrap();
     let events = runtime.events(&token).unwrap();
     let before = events.count_events(Default::default()).await.unwrap();
-    let restore = json!({"op":"restore","target_id":Uuid::from_u128(802),
-        "record":{"substrate":"entity","id":Uuid::from_u128(802),"namespace":"local",
-            "created_at":1_000_000,"updated_at":1_000_000,"kind":"concept",
-            "entity_type":null,"name":"restored","description":null,
-            "properties":{},"tags":[],"deleted_at":null}});
-    let text = delta(&[create(801, "before"), restore, create(803, "after")]);
-    assert_eq!(decode_delta(&text, None).unwrap().ops.len(), 3);
-    let error = registry
-        .dispatch("apply_changeset", json!({"delta":text}))
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error.refusal_source(),
-        RuntimeError::CanonicalUnsupportedOperation {
-            op_index: 1,
-            operation: "restore",
-        }
-    ));
-    let wire = khive_runtime::runtime_error_value(error, khive_runtime::DomainDisposition::Unknown);
-    assert_eq!(wire["op_index"], 1);
-    assert_eq!(wire["operation"], "restore");
-    assert_eq!(wire["reason"], "KnownUnimplemented");
-    assert_eq!(wire["domain_disposition"], "not_committed");
+    let id = Uuid::from_u128(802);
+    for record in [
+        json!({"substrate":"note","id":id,"namespace":"local",
+            "created_at":1_000_000,"updated_at":1_000_000,"kind":"observation",
+            "status":"active","content":"captured"}),
+        json!({"substrate":"edge","id":id,"namespace":"local",
+            "created_at":1_000_000,"updated_at":1_000_000,"source":Uuid::from_u128(801),
+            "target":Uuid::from_u128(803),"relation":"competes_with","weight":0.75}),
+    ] {
+        let restore = json!({"op":"restore","target_id":id,"record":record});
+        let text = delta(&[create(801, "before"), restore, create(803, "after")]);
+        assert_eq!(decode_delta(&text, None).unwrap().ops.len(), 3);
+        let error = registry
+            .dispatch("apply_changeset", json!({"delta":text}))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.refusal_source(),
+            RuntimeError::CanonicalUnsupportedOperation {
+                op_index: 1,
+                operation: "restore",
+            }
+        ));
+        let wire =
+            khive_runtime::runtime_error_value(error, khive_runtime::DomainDisposition::Unknown);
+        assert_eq!(wire["op_index"], 1);
+        assert_eq!(wire["operation"], "restore");
+        assert_eq!(wire["reason"], "KnownUnimplemented");
+        assert_eq!(wire["domain_disposition"], "not_committed");
+    }
     for id in [801, 802, 803] {
         assert!(runtime
             .entities(&token)
@@ -766,4 +777,126 @@ async fn canonical_restore_dispatch_refuses_before_creates_or_events() {
         events.count_events(Default::default()).await.unwrap(),
         before
     );
+}
+
+async fn tombstone_for_canonical_restore(
+    runtime: &KhiveRuntime,
+    registry: &VerbRegistry,
+) -> (Uuid, Value) {
+    let id = Uuid::from_u128(802);
+    let mut created = create(802, "restored");
+    created["target"]["key"] = json!("restore-key");
+    created["target"]["aliases"] = json!(["nick"]);
+    registry
+        .dispatch("apply_changeset", json!({"delta":delta(&[created])}))
+        .await
+        .unwrap();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let row = runtime.get_entity(&token, id).await.unwrap();
+    let record = json!({"substrate":"entity","id":id,"namespace":row.namespace,
+        "created_at":row.created_at,"updated_at":row.updated_at,"kind":row.kind,
+        "entity_type":row.entity_type,"name":row.name,"description":row.description,
+        "properties":row.properties.unwrap_or_else(||json!({})),"tags":row.tags,
+        "keys":["restore-key"],"aliases":row.aliases});
+    let delete = json!({"op":"delete","target_id":id,"hard":false,"preimage":record});
+    registry
+        .dispatch("apply_changeset", json!({"delta":delta(&[delete])}))
+        .await
+        .unwrap();
+    (id, json!({"op":"restore","target_id":id,"record":record}))
+}
+
+#[tokio::test]
+async fn canonical_restore_dispatch_reports_a_rolled_back_key_claim_and_a_captured_receipt() {
+    let (runtime, registry) = setup();
+    let (id, restore) = tombstone_for_canonical_restore(&runtime, &registry).await;
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let mut holder = create(801, "holder");
+    holder["target"]["key"] = json!("restore-key");
+    let text = delta(&[holder, restore.clone(), create(803, "after")]);
+    let error = registry
+        .dispatch("apply_changeset", json!({"delta":text}))
+        .await
+        .unwrap_err();
+    let wire = khive_runtime::runtime_error_value(error, khive_runtime::DomainDisposition::Unknown);
+    assert_eq!(wire["domain_disposition"], "not_committed");
+    assert_eq!(wire["details"]["reason"], "restore_key_conflict");
+    assert_eq!(wire["details"]["op_index"], "1");
+    let taken: Value =
+        serde_json::from_str(wire["details"]["taken_keys"].as_str().unwrap()).unwrap();
+    assert_eq!(taken, json!([{"kind":"concept","key":"restore-key"}]));
+    for id in [Uuid::from_u128(801), id, Uuid::from_u128(803)] {
+        assert!(runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+    assert!(runtime
+        .get_entity_by_key(&token, "concept", "restore-key")
+        .await
+        .unwrap()
+        .is_none());
+
+    let result = registry
+        .dispatch("apply_changeset", json!({"delta":delta(&[restore])}))
+        .await
+        .unwrap();
+    assert_eq!(result["committed"], true);
+    assert_eq!(result["preimage"], "captured");
+    assert_eq!(result["operations"][0]["preimage"], "captured");
+    assert_eq!(result["created_records"], json!([]));
+    let row = runtime
+        .get_entity_by_key(&token, "concept", "restore-key")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.id, id);
+    assert_eq!(row.aliases[0].alias, "nick");
+}
+
+#[tokio::test]
+async fn canonical_restore_requires_the_caller_restore_grant() {
+    let (runtime, registry) = setup();
+    let (id, restore) = tombstone_for_canonical_restore(&runtime, &registry).await;
+    let gate = Arc::new(ConstituentGate {
+        seen: Mutex::new(Vec::new()),
+        deny_restore: true,
+    });
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_gate(gate.clone());
+    builder.register(crate::KgPack::new(runtime.clone()));
+    let registry = builder.build().unwrap();
+    let identity = RequestIdentity {
+        namespace: "local".into(),
+        actor_id: Some("lambda:canonical-test".into()),
+        ..Default::default()
+    };
+    let text = delta(&[create(801, "before"), restore, create(803, "after")]);
+    assert!(registry
+        .dispatch_with_identity("apply_changeset", json!({"delta":text}), Some(identity))
+        .await
+        .is_err());
+    let seen = gate.seen.lock().unwrap().clone();
+    assert!(seen.iter().any(|request| request.verb == "restore"
+        && request.args["id"] == json!(id)
+        && request.actor.binding_id() == Some("lambda:canonical-test")));
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    for id in [Uuid::from_u128(801), id, Uuid::from_u128(803)] {
+        assert!(runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(id)
+            .await
+            .unwrap()
+            .is_none());
+    }
 }

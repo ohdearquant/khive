@@ -1129,19 +1129,305 @@ fn shared_entity_fields_keep_legacy_merge_and_canonical_replace_distinct() {
     assert_eq!(canonical.properties, Some(json!({"new":3})));
 }
 
+async fn delete_entity_and_invert(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+) -> (ChangeSet, Entity) {
+    use EntityAliasOrigin::{Caller, Rename};
+
+    let id = Uuid::new_v4();
+    let aliases = vec![alias("handle", Caller), alias("old", Rename)];
+    assert!(matches!(
+        apply(
+            rt,
+            token,
+            vec![keyed_create(id, "old", Some("k1"), &["nick"])]
+        )
+        .await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    assert!(matches!(
+        apply(
+            rt,
+            token,
+            vec![alias_update(
+                id,
+                "old",
+                "new",
+                vec![alias("nick", Caller)],
+                aliases.clone()
+            )],
+        )
+        .await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    assert_eq!(
+        rt.sql()
+            .writer()
+            .await
+            .unwrap()
+            .execute(khive_db::stores::entity::entity_key_claim_statement(
+                "local", "concept", "k2", id, 1,
+            ))
+            .await
+            .unwrap(),
+        1
+    );
+    let live = entity_row(rt, token, id).await.unwrap();
+    let delete = entity_delete(&live, &["k1", "k2"], aliases);
+    assert!(matches!(
+        apply(rt, token, vec![delete.clone()]).await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    let tombstone = rt
+        .entities(token)
+        .unwrap()
+        .get_entity_including_deleted(id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(tombstone.deleted_at.is_some());
+    for key in ["k1", "k2"] {
+        assert!(rt
+            .get_entity_by_key(token, "concept", key)
+            .await
+            .unwrap()
+            .is_none());
+    }
+    let mut current = khive_changeset::CurrentState::default();
+    current.entities.insert(
+        id128(id),
+        entity_record(&tombstone, vec!["k1".into(), "k2".into()]).unwrap(),
+    );
+    let inverse = changeset(vec![delete])
+        .invert(
+            Envelope::new("agent:test", "inverse", Timestamp::from_secs(2)),
+            &current,
+        )
+        .unwrap();
+    (inverse, tombstone)
+}
+
 #[tokio::test]
-async fn restore_refuses_the_whole_changeset_before_preparation() {
+async fn canonical_inverted_delete_restores_keys_alias_origins_and_indexes() {
     let f = fixture();
     let rt = &f.runtime;
     let token = rt.authorize(Namespace::local()).unwrap();
-    let record = projection::entity(&Entity::new("local", "concept", "restored")).unwrap();
+    let (inverse, tombstone) = delete_entity_and_invert(rt, &token).await;
+    let id = tombstone.id;
+    let fts = rt.text(&token).unwrap();
+    let filter = || khive_storage::TextFilter {
+        ids: vec![id],
+        namespaces: vec!["local".into()],
+        ..Default::default()
+    };
+    assert_eq!(fts.count(filter()).await.unwrap(), 0);
+    let Op::Restore(restore) = &inverse.ops[0] else {
+        panic!("the inverse must contain a restore");
+    };
+    for invalid_keys in [
+        vec!["k1".into()],
+        vec!["k1".into(), "k2".into(), "k3".into()],
+    ] {
+        let mut wrong_record = restore.record().clone();
+        let DeletePreimage::Entity(wrong) = &mut wrong_record else {
+            unreachable!();
+        };
+        wrong.keys = invalid_keys;
+        let wrong = Op::Restore(khive_changeset::RestoreOp::new(id128(id), wrong_record).unwrap());
+        let refused = prepare_canonical_changeset(rt, &registry(), &token, &changeset(vec![wrong]))
+            .await
+            .unwrap_err();
+        let wire = crate::runtime_error_value(refused, crate::DomainDisposition::Unknown);
+        assert_eq!(wire["details"]["field"], "keys");
+    }
+    assert!(entity_row(rt, &token, id).await.is_none());
+
+    let plans = prepare_canonical_changeset(rt, &registry(), &token, &inverse)
+        .await
+        .unwrap();
+    let crate::AtomicRunOutcome::Committed { post_commit } =
+        crate::run_atomic_unit(rt.sql().as_ref(), plans)
+            .await
+            .unwrap()
+    else {
+        panic!("the inverse must commit");
+    };
+    assert_eq!(
+        post_commit.as_slice(),
+        &[crate::atomic_plan::PostCommitEffect::ReindexEntity { entity_id: id }]
+    );
+    let restored = entity_row(rt, &token, id).await.unwrap();
+    assert_eq!(restored.created_at, tombstone.created_at);
+    assert!(restored.updated_at > tombstone.updated_at);
+    assert_eq!(restored.version, tombstone.version + 1);
+    assert_eq!(restored.deleted_at, None);
+    assert_eq!(restored.name, "new");
+    assert_eq!(fts.count(filter()).await.unwrap(), 1);
+    assert_eq!(sorted_aliases(&restored), sorted_aliases(&tombstone));
+    assert_eq!(
+        alias_rows(rt, &token, id).await,
+        vec![
+            ("handle".into(), "caller".into(), restored.updated_at),
+            ("old".into(), "rename".into(), restored.updated_at),
+        ]
+    );
+    for key in ["k1", "k2"] {
+        assert_eq!(
+            rt.get_entity_by_key(&token, "concept", key)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            id
+        );
+    }
+    assert!(
+        prepare_canonical_changeset(rt, &registry(), &token, &inverse)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn canonical_restore_observes_an_earlier_soft_delete_in_the_same_unit() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let id = Uuid::new_v4();
+    assert!(matches!(
+        apply(
+            rt,
+            &token,
+            vec![keyed_create(id, "old", Some("k1"), &["nick"])]
+        )
+        .await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    let live = entity_row(rt, &token, id).await.unwrap();
+    let aliases = live.aliases.clone();
+    let Op::Delete(delete) = entity_delete(&live, &["k1"], aliases.clone()) else {
+        unreachable!();
+    };
+    let restore = khive_changeset::RestoreOp::new(id128(id), delete.preimage.clone()).unwrap();
+    let rename = alias_update(
+        id,
+        "old",
+        "new",
+        aliases.clone(),
+        [aliases, vec![alias("old", EntityAliasOrigin::Rename)]].concat(),
+    );
+    assert!(matches!(
+        apply(
+            rt,
+            &token,
+            vec![Op::Delete(delete), Op::Restore(restore), rename]
+        )
+        .await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    let restored = rt
+        .get_entity_by_key(&token, "concept", "k1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.id, id);
+    assert_eq!(restored.name, "new");
+    assert_eq!(restored.version, live.version + 3);
+    assert_eq!(restored.aliases.len(), 2);
+}
+
+#[tokio::test]
+async fn canonical_restore_reports_every_key_taken_after_preparation() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let (inverse, tombstone) = delete_entity_and_invert(rt, &token).await;
+    let (first, last, holder_a, holder_b) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    let draft = changeset(vec![
+        entity_create(first, "before"),
+        inverse.ops[0].clone(),
+        entity_create(last, "after"),
+    ]);
+    let plans = prepare_canonical_changeset(rt, &registry(), &token, &draft)
+        .await
+        .unwrap();
+    assert!(matches!(
+        apply(
+            rt,
+            &token,
+            vec![
+                keyed_create(holder_a, "one", Some("k1"), &[]),
+                keyed_create(holder_b, "two", Some("k2"), &[]),
+            ]
+        )
+        .await,
+        crate::AtomicRunOutcome::Committed { .. }
+    ));
+    let events = rt.events(&token).unwrap();
+    let before = events.count_events(Default::default()).await.unwrap();
+    let crate::AtomicRunOutcome::RolledBack {
+        failed_op_index: 1,
+        failure: AtomicOpFailure::RestoreKeyConflict(conflict),
+    } = crate::run_atomic_unit(rt.sql().as_ref(), plans)
+        .await
+        .unwrap()
+    else {
+        panic!("the writer must refuse the taken keys");
+    };
+    assert_eq!(conflict.target_id, tombstone.id);
+    assert_eq!(
+        conflict
+            .taken_keys
+            .iter()
+            .map(|key| key.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["k1", "k2"]
+    );
+    for id in [first, tombstone.id, last] {
+        assert!(entity_row(rt, &token, id).await.is_none());
+    }
+    let unchanged = rt
+        .entities(&token)
+        .unwrap()
+        .get_entity_including_deleted(tombstone.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.deleted_at, tombstone.deleted_at);
+    assert_eq!(unchanged.version, tombstone.version);
+    assert_eq!(sorted_aliases(&unchanged), sorted_aliases(&tombstone));
+    for (key, holder) in [("k1", holder_a), ("k2", holder_b)] {
+        assert_eq!(
+            rt.get_entity_by_key(&token, "concept", key)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            holder
+        );
+    }
+    assert_eq!(
+        events.count_events(Default::default()).await.unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn note_restore_refuses_the_whole_changeset_before_preparation() {
+    let f = fixture();
+    let rt = &f.runtime;
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let record = projection::note(&Note::new("local", "observation", "restored")).unwrap();
     let restored_id = uuid(record.header.id);
     let restore = Op::Restore(
-        khive_changeset::RestoreOp::new(
-            record.header.id,
-            khive_changeset::DeletePreimage::Entity(Box::new(record.into())),
-        )
-        .unwrap(),
+        khive_changeset::RestoreOp::new(record.header.id, DeletePreimage::Note(Box::new(record)))
+            .unwrap(),
     );
     let first = Uuid::new_v4();
     let last = Uuid::new_v4();
