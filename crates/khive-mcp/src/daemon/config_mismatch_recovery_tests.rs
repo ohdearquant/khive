@@ -108,6 +108,7 @@ fn frame(config_id: &str) -> DaemonRequestFrame {
         namespace: "local".into(),
         actor_id: None,
         process_ref: None,
+        client_cwd: None,
         visible_namespaces: Vec::new(),
         config_id: config_id.into(),
         protocol_version: PROTOCOL_VERSION,
