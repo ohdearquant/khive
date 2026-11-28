@@ -761,10 +761,11 @@ Not checked:
 
 Serves #6894 rows 1, 2, 3 and 9 and A1.4 (#6904 section 3). Building item 3 left questions that
 section 3, section 7 and A1.4 do not settle; this amendment settles them. It changes one sentence of
-section 7 (A2.5) and where A1.4 point 3 stores a source order (A2.6), says what section 2's canonical
-name is for a node that belongs to one operation type or step type and which edges the working graph
-holds (A2.10), and changes none of section 3. It also specifies the two forms reads that A1.3's `resolve` calls and two additions to
-`forms.neighbourhood` that A1.4's places read (A2.8), which no record specified before.
+section 7 (A2.5) and where A1.4 point 3 stores a source order (A2.6), says what section 2's
+canonical name is for a node that belongs to one operation type or step type and which edges the
+working graph holds (A2.10), and changes none of section 3. It also specifies the two forms reads
+that A1.3's `resolve` calls and two additions to `forms.neighbourhood` that A1.4's places read
+(A2.8), which no record specified before.
 
 ### A2.1 A step type published alone, and pinned
 
@@ -947,18 +948,19 @@ refusal arms of one section may be rows of one table test.
   naming no loaded document type is refused.
 - A2.10: two operation types pin the same two published step types in opposite orders; each type's
   `pins` edges carry its own order, no edge joins the two step type nodes, and each frontier follows
-  its own type's order. Two operation types that write no `after` and order the same two pinned steps
-  by `supplies` in opposite directions: each `pins` edge carries its own `derived_after`, and
-  neither shows the other's. Two operation types pin versions 1 and 2 of one step type that dropped a requirement in
-  version 2: the node shows 2, each `pins` edge carries the version its type pins, and the dropped
-  requirement's node is gone. Publishing a step type's version 3 and then its version 2 leaves the
-  node at 3 with version 3's requirement nodes; publishing an operation type's version without a
-  slot removes that slot's node; loading the same versions into an empty store in the other order
-  gives the same nodes and edges. A step type that produces one field about two slots has one
-  `produces` edge naming both. A step type whose requirement is about `holder`, pinned by two types
-  that each declare `holder`, has a requirement node naming the slot and no edge to either slot
-  node. A slot of the same name in two types is two nodes, and a requirement whose field name holds
-  a `/` gets a key no other requirement holds.
+  its own type's order. Two operation types that write no `after` and order the same two pinned
+  steps by `supplies` in opposite directions: each `pins` edge carries its own `derived_after`, and
+  neither shows the other's. Two operation types pin versions 1 and 2 of one step type that
+  dropped a requirement in version 2: the node shows 2, each `pins` edge carries the version its
+  type pins, and the dropped requirement's node is gone. Publishing a step type's version 3 and
+  then its version 2 leaves the node at 3 with version 3's requirement nodes; publishing an
+  operation type's version without a slot removes that slot's node; loading the same versions
+  into an empty store in the other order gives the same nodes and edges. A step type that
+  produces one field about two slots has one `produces` edge naming both. A step type whose
+  requirement is about `holder`, pinned by two types that each declare `holder`, has a
+  requirement node naming the slot and no edge to either slot node. A slot of the same name in
+  two types is two nodes, and a requirement whose field name holds a `/` gets a key no other
+  requirement holds.
 
 ### A2.10 The working type graph: keys and edges
 
@@ -1017,8 +1019,9 @@ two slots has one `produces` edge with both slots in `slots`. An operation type 
 pin one step type has one `pins` edge, and its `steps` lists both.
 
 A published step type may be pinned by several operation types. So no edge between two nodes that
-two operation types can share states a fact of one of them. Three facts are of that kind, and all
-three sit on the operation type's own `pins` edge:
+two operation types can share states a fact of one of them. Three facts are of that kind. Two sit
+on the operation type's own `pins` edge, the version pinned and the order; the third, the slot a
+requirement is about, is held by name on the requirement node:
 
 - The version pinned. The `pins` edge carries the `version` and `digest` of the step type this
   operation type pins. A step type node's requirement nodes and `produces` edges describe the
