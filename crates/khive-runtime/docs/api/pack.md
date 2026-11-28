@@ -244,6 +244,29 @@ request scoped one (`khive_storage::scope_request_client_cwd`, set by the daemon
 `build_audit_storage_event`, both link success rows and the `git.digest` receipt call it; the
 shape and who can read it are khive-gate `docs/api/audit-events.md` ("Client working directory").
 
+### Record subjects
+
+A pack may declare `PackRuntime::audit_subject_arg(verb)` for a handler it owns. The
+default is `None`; an arbitrary argument or result named `id` does not declare a
+record subject. KG declares `get`'s `id`. Dispatch audits copy a complete UUID from
+that declared argument into the event's `target_id`, including failures and denials.
+Existing `target_id` arguments and the `link` alias `target` retain their behavior.
+
+On a successful declared read, the canonical result's `id` replaces the argument's
+target and its `kind` is added as `payload.record_kind`. Both ordinary and
+intercepted dispatch use the returned record, without another lookup. A key lookup,
+short ID or entity name therefore records the resolved UUID; a merge redirect
+records the final returned entity, rather than the tombstone originally requested.
+The separate effective-target gate-check event remains a gate observation and does
+not acquire resolved-read metadata. `record_kind` is the concrete returned kind
+(for example `concept` or `observation`), or `edge`, `event` or `proposal` for those
+records; the audit event's own kind/substrate remain unchanged.
+
+Failed or denied reads never acquire `record_kind`. A non-UUID input remains
+unresolved in their target field: the audit addition stores no key, prefix, name,
+record content or error text. This is an additive audit-payload field and a defaulted
+Rust trait method; it does not change the public `get` result or resolution policy.
+
 ### Retention class
 
 Generic dispatch receipts whose kind is `Audit` and whose persisted canonical verb
