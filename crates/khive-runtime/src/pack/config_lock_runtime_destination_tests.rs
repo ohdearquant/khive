@@ -8,7 +8,7 @@ impl Pack for ObserveConfigPack {
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const BRAIN_CONSUMER_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
-        name: "observe_config",
+        name: "config_observer.observe_config",
         description: "observe a test config value during the handler",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
@@ -72,7 +72,7 @@ async fn handler_observation_after_a_drain_stays_pending_while_b_dispatches() {
     let result = a
         .registry
         .dispatch_with_identity(
-            "observe_config",
+            "config_observer.observe_config",
             serde_json::json!({"namespace": "handler-owner-a"}),
             Some(RequestIdentity::from_token(&token)),
         )

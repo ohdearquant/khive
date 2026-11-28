@@ -151,6 +151,9 @@ fn blob_upload_roster_uses_the_registered_manager_and_requires_an_available_stor
 #[test]
 #[serial_test::serial(config_ledger)]
 fn blob_upload_roster_obeys_its_own_runtime_mode_in_mixed_deployments() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     let (_dir, db) = tmp_db();
     let config = RuntimeConfig {
         db_path: Some(std::path::PathBuf::from(db)),
@@ -304,6 +307,9 @@ fn tmp_db_guard_removes_database_and_all_sidecars() {
 
 #[tokio::test]
 async fn empty_registration_set_is_a_no_op() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     let (_f, db) = tmp_db();
     let server = make_server(&db).await;
     let health = HealthReporter::default();
@@ -315,6 +321,9 @@ async fn empty_registration_set_is_a_no_op() {
 #[test]
 #[serial_test::serial(config_ledger)]
 fn schedule_roster_contains_exactly_one_dynamic_component_when_resolved() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     let (_f, db) = tmp_db();
     let cfg = RuntimeConfig {
         db_path: Some(std::path::PathBuf::from(db)),
@@ -352,6 +361,9 @@ fn schedule_roster_contains_exactly_one_dynamic_component_when_resolved() {
 #[test]
 #[serial_test::serial(config_ledger)]
 fn schedule_roster_omits_read_only_assigned_runtime_without_writer_acquisition() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     let (_f, db) = tmp_db();
     let cfg = RuntimeConfig {
         db_path: Some(std::path::PathBuf::from(db)),
@@ -386,6 +398,9 @@ fn schedule_roster_omits_read_only_assigned_runtime_without_writer_acquisition()
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn supervised_schedule_component_heartbeats_and_stops_cooperatively() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     let (_f, db) = tmp_db();
     let cfg = RuntimeConfig {
         db_path: Some(std::path::PathBuf::from(&db)),
@@ -461,6 +476,9 @@ fn dup_b(_ctx: HostContext) -> ComponentFuture {
 
 #[tokio::test]
 async fn duplicate_names_are_flagged_but_both_components_still_start() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     static REG_A: DaemonComponentRegistration = DaemonComponentRegistration {
         name: "test-dup",
         restart: RestartClass::Never,
@@ -515,6 +533,9 @@ fn clean_component(_ctx: HostContext) -> ComponentFuture {
 
 #[tokio::test]
 async fn clean_completion_is_terminal_stopped_without_restart() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     static REG: DaemonComponentRegistration = DaemonComponentRegistration {
         name: "test-clean",
         restart: RestartClass::OnFailure,
@@ -543,6 +564,9 @@ fn retryable_component(_ctx: HostContext) -> ComponentFuture {
 
 #[tokio::test]
 async fn retryable_failures_consume_budget_then_terminal_unhealthy() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     static REG: DaemonComponentRegistration = DaemonComponentRegistration {
         name: "test-retry",
         restart: RestartClass::OnFailure,
@@ -573,6 +597,9 @@ fn permanent_component(_ctx: HostContext) -> ComponentFuture {
 
 #[tokio::test]
 async fn permanent_failure_is_immediately_terminal_despite_budget() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     static REG: DaemonComponentRegistration = DaemonComponentRegistration {
         name: "test-permanent",
         restart: RestartClass::OnFailure,
@@ -597,6 +624,9 @@ fn never_restart_component(_ctx: HostContext) -> ComponentFuture {
 
 #[tokio::test]
 async fn restart_class_never_makes_any_failure_terminal() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     static REG: DaemonComponentRegistration = DaemonComponentRegistration {
         name: "test-never",
         restart: RestartClass::Never,
@@ -627,6 +657,9 @@ fn cooperative_component(ctx: HostContext) -> ComponentFuture {
 
 #[tokio::test]
 async fn cooperative_cancellation_stops_cleanly_and_heartbeats_recorded() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     static REG: DaemonComponentRegistration = DaemonComponentRegistration {
         name: "test-coop",
         restart: RestartClass::OnFailure,
@@ -668,6 +701,9 @@ fn hung_component(_ctx: HostContext) -> ComponentFuture {
 
 #[tokio::test]
 async fn hung_component_is_aborted_after_shutdown_timeout() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     static REG: DaemonComponentRegistration = DaemonComponentRegistration {
         name: "test-hung",
         restart: RestartClass::OnFailure,
@@ -706,6 +742,9 @@ fn overflow_component(_ctx: HostContext) -> ComponentFuture {
 
 #[tokio::test]
 async fn extreme_backoff_values_never_panic_the_supervisor() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     static REG: DaemonComponentRegistration = DaemonComponentRegistration {
         name: "test-overflow",
         restart: RestartClass::OnFailure,
@@ -742,6 +781,9 @@ fn panicking_component(_ctx: HostContext) -> ComponentFuture {
 
 #[tokio::test]
 async fn panic_is_isolated_and_classified_retryable() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     static REG: DaemonComponentRegistration = DaemonComponentRegistration {
         name: "test-panic",
         restart: RestartClass::OnFailure,
@@ -762,6 +804,9 @@ async fn panic_is_isolated_and_classified_retryable() {
 
 #[tokio::test]
 async fn synchronous_factory_panic_is_terminal_and_sibling_survives() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     let healthy_cycles = Arc::new(AtomicU32::new(0));
     let healthy_cycles_for_start = healthy_cycles.clone();
     let healthy = ComponentRegistration {
@@ -870,6 +915,9 @@ fn dispatching_component(ctx: HostContext) -> ComponentFuture {
 
 #[tokio::test]
 async fn host_context_dispatch_handle_lands_a_write() {
+    if crate::test_isolation::rerun_with_private_home() {
+        return;
+    }
     static REG: DaemonComponentRegistration = DaemonComponentRegistration {
         name: "test-dispatch",
         restart: RestartClass::Never,
@@ -886,4 +934,125 @@ async fn host_context_dispatch_handle_lands_a_write() {
     let status = wait_for_state(&health, "test-dispatch", ComponentState::Stopped).await;
     assert!(status.last_error.is_none(), "dispatch failed: {status:?}");
     assert_eq!(DISPATCH_OK.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn file_backed_component_fixture_isolated_from_held_parent_volume_lease() {
+    use std::io;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, ExitStatus, Stdio};
+
+    const TARGET: &str = "components::tests::host_context_dispatch_handle_lands_a_write";
+
+    // The target can spawn its private-home child. Keep both in an owned group
+    // so a harness timeout can terminate them before consuming the leader.
+    struct PressureChild {
+        child: Child,
+        armed: bool,
+    }
+
+    impl PressureChild {
+        fn wait_bounded(&mut self) -> io::Result<ExitStatus> {
+            let started = std::time::Instant::now();
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(status)) => {
+                        self.armed = false;
+                        return Ok(status);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if error.raw_os_error() == Some(libc::ECHILD) {
+                            self.armed = false;
+                        }
+                        return Err(error);
+                    }
+                }
+                if started.elapsed() >= Duration::from_secs(60) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "COMPONENT_PRESSURE_CHILD_TIMEOUT",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for PressureChild {
+        fn drop(&mut self) {
+            if self.armed {
+                let pid = libc::pid_t::try_from(self.child.id()).expect("child PID fits pid_t");
+                // SAFETY: process_group(0) made this owned, unreaped child the
+                // group leader; no successful consuming wait has occurred.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+                let _ = self.child.wait();
+                self.armed = false;
+            }
+        }
+    }
+
+    let directory = tempfile::tempdir().expect("pressure fixture directory");
+    let lock_directory = directory.path().join("held-volume-locks");
+    let pool = khive_db::ConnectionPool::new(khive_db::PoolConfig {
+        path: Some(directory.path().join("lease-holder.db")),
+        volume_lock_dir: Some(lock_directory.clone()),
+        write_queue_enabled: Some(false),
+        ..khive_db::PoolConfig::for_test()
+    })
+    .expect("create real lease-holder pool");
+    let stdout_path = directory.path().join("target.stdout");
+    let stderr_path = directory.path().join("target.stderr");
+
+    let status = pool
+        .standalone_transaction(|connection| {
+            assert!(
+                !connection.is_autocommit(),
+                "pressure holder must keep its real transaction open"
+            );
+            let mut command = Command::new(std::env::current_exe().expect("test executable"));
+            command
+                .args(["--exact", TARGET, "--nocapture", "--test-threads=1"])
+                .env("KHIVE_VOLUME_LOCK_DIR", &lock_directory)
+                // Both the target's DB and its private child home remain on
+                // the holder's volume; only the lease namespace is isolated.
+                .env("TMPDIR", directory.path())
+                .env("TMP", directory.path())
+                .env("TEMP", directory.path())
+                .stdout(Stdio::from(
+                    std::fs::File::create(&stdout_path).expect("target stdout file"),
+                ))
+                .stderr(Stdio::from(
+                    std::fs::File::create(&stderr_path).expect("target stderr file"),
+                ))
+                .process_group(0);
+            for name in [
+                "KHIVE_MCP_PRIVATE_HOME_TEST",
+                "KHIVE_MCP_PRIVATE_HOME_PATH",
+                "KHIVE_MCP_PRIVATE_HOME_PARENT_PID",
+                "KHIVE_MCP_PRIVATE_HOME_PARENT_HOME",
+            ] {
+                command.env_remove(name);
+            }
+            let mut child = PressureChild {
+                child: command.spawn().expect("spawn exact pressure target"),
+                armed: true,
+            };
+            // Keep the parent lease held until the target and its private child
+            // have exited. Poll/setup/timeout errors are not isolation evidence.
+            let status = child.wait_bounded().expect("pressure target must exit");
+            Ok(status)
+        })
+        .expect("settle real parent lease transaction");
+    let stdout = std::fs::read_to_string(&stdout_path).expect("read target stdout");
+    let stderr = std::fs::read_to_string(&stderr_path).expect("read target stderr");
+    let named_pass = format!("test {TARGET} ... ok");
+    assert!(
+        status.success()
+            && stdout.lines().any(|line| line == named_pass)
+            && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+        "component fixture must finish its real write while the parent volume lease is held; \
+         status={status}\n{stdout}\n{stderr}"
+    );
 }

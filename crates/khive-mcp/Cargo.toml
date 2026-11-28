@@ -17,35 +17,47 @@ exclude = ["tests/plan_conformance.rs"]
 bench = false
 
 [dependencies]
-khive-mounts = { version = "0.15.0", path = "../khive-mounts" }
-khive-pack-agent = { version = "0.15.0", path = "../khive-pack-agent", optional = true }
-khive-db = { version = "0.15.0", path = "../khive-db" }
-khive-fs = { version = "0.15.0", path = "../khive-fs" }
-khive-runtime = { version = "0.15.0", path = "../khive-runtime" }
-khive-storage = { version = "0.15.0", path = "../khive-storage" }
-khive-types = { version = "0.15.0", path = "../khive-types", features = ["serde"] }
-khive-request = { version = "0.15.0", path = "../khive-request" }
-khive-pack-kg = { version = "0.15.0", path = "../khive-pack-kg" }
-khive-pack-gtd = { version = "0.15.0", path = "../khive-pack-gtd" }
-khive-pack-memory = { version = "0.15.0", path = "../khive-pack-memory" }
-khive-pack-brain = { version = "0.15.0", path = "../khive-pack-brain" }
-khive-pack-comm = { version = "0.15.0", path = "../khive-pack-comm" }
-khive-pack-schedule = { version = "0.15.0", path = "../khive-pack-schedule" }
-khive-pack-knowledge = { version = "0.15.0", path = "../khive-pack-knowledge" }
-khive-pack-session = { version = "0.15.0", path = "../khive-pack-session" }
-khive-pack-tool = { version = "0.15.0", path = "../khive-pack-tool" }
-khive-pack-exec = { version = "0.15.0", path = "../khive-pack-exec" }
-khive-pack-git = { version = "0.15.0", path = "../khive-pack-git" }
-khive-pack-code = { version = "0.15.0", path = "../khive-pack-code" }
-khive-pack-web = { version = "0.15.0", path = "../khive-pack-web", optional = true }
-khive-pack-telemetry = { version = "0.15.0", path = "../khive-pack-telemetry", optional = true }
-khive-pack-blob = { version = "0.15.0", path = "../khive-pack-blob" }
-khive-pack-moodboard = { version = "0.15.0", path = "../khive-pack-moodboard", optional = true }
-khive-pack-workspace = { version = "0.15.0", path = "../khive-pack-workspace" }
-khive-pack-charter = { version = "0.15.0", path = "../khive-pack-charter" }
+khive-mounts = { version = "0.24.0", path = "../khive-mounts" }
+khive-pack-agent = { version = "0.24.0", path = "../khive-pack-agent", optional = true }
+khive-db = { version = "0.24.0", path = "../khive-db" }
+khive-fs = { version = "0.24.0", path = "../khive-fs" }
+khive-runtime = { version = "0.24.0", path = "../khive-runtime" }
+khive-storage = { version = "0.24.0", path = "../khive-storage" }
+khive-types = { version = "0.24.0", path = "../khive-types", features = ["serde"] }
+khive-request = { version = "0.24.0", path = "../khive-request" }
+khive-pack-kg = { version = "0.24.0", path = "../khive-pack-kg" }
+khive-pack-gtd = { version = "0.24.0", path = "../khive-pack-gtd" }
+khive-pack-memory = { version = "0.24.0", path = "../khive-pack-memory" }
+khive-pack-brain = { version = "0.24.0", path = "../khive-pack-brain" }
+khive-pack-comm = { version = "0.24.0", path = "../khive-pack-comm" }
+khive-pack-schedule = { version = "0.24.0", path = "../khive-pack-schedule" }
+khive-pack-knowledge = { version = "0.24.0", path = "../khive-pack-knowledge" }
+khive-pack-session = { version = "0.24.0", path = "../khive-pack-session" }
+khive-pack-tool = { version = "0.24.0", path = "../khive-pack-tool" }
+khive-pack-exec = { version = "0.24.0", path = "../khive-pack-exec" }
+khive-pack-git = { version = "0.24.0", path = "../khive-pack-git" }
+khive-pack-code = { version = "0.24.0", path = "../khive-pack-code" }
+khive-pack-web = { version = "0.24.0", path = "../khive-pack-web", optional = true }
+khive-pack-telemetry = { version = "0.24.0", path = "../khive-pack-telemetry", optional = true }
+khive-pack-blob = { version = "0.24.0", path = "../khive-pack-blob" }
+khive-pack-moodboard = { version = "0.24.0", path = "../khive-pack-moodboard", optional = true }
+khive-pack-workspace = { version = "0.24.0", path = "../khive-pack-workspace" }
+khive-pack-charter = { version = "0.24.0", path = "../khive-pack-charter" }
+khive-pack-forms = { version = "0.24.0", path = "../khive-pack-forms" }
+khive-pack-operation = { version = "0.24.0", path = "../khive-pack-operation" }
 uuid = { workspace = true }
 inventory = { workspace = true }
-rmcp = { workspace = true, features = ["server", "transport-io"] }
+# The computer bridge implements its own HTTP client over reqwest with bounded
+# response bodies (server/computer_http.rs), so neither of rmcp's built-in
+# streamable HTTP clients is compiled.
+rmcp = { workspace = true, features = [
+    "server",
+    "transport-io",
+    "client",
+    "transport-streamable-http-client",
+] }
+reqwest = { workspace = true }
+sse-stream = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
@@ -62,10 +74,9 @@ sha2 = { workspace = true }
 chrono = { workspace = true }
 tempfile = { workspace = true }
 lattice-embed = { workspace = true, optional = true }
-khive-channel = { version = "0.15.0", path = "../khive-channel", optional = true }
-khive-channel-email = { version = "0.15.0", path = "../khive-channel-email", optional = true }
-khive-channel-telegram = { version = "0.15.0", path = "../khive-channel-telegram", optional = true }
-khive-channel-node = { version = "0.15.0", path = "../khive-channel-node", optional = true }
+khive-channel = { version = "0.24.0", path = "../khive-channel" }
+khive-channel-email = { version = "0.24.0", path = "../khive-channel-email", optional = true }
+khive-channel-telegram = { version = "0.24.0", path = "../khive-channel-telegram", optional = true }
 
 [features]
 blob-s3 = ["khive-runtime/blob-s3"]
@@ -83,14 +94,11 @@ pack-web = ["khive-pack-web"]
 bench-embedder = ["lattice-embed"]
 # channel-email: enable the SMTP/IMAP email polling loop.
 # Requires KHIVE_EMAIL_* environment variables at runtime; does nothing when unset.
-channel-email = ["khive-channel", "khive-channel-email"]
+channel-email = ["khive-channel-email"]
 # channel-telegram: enable the Telegram Bot API polling + outbox loop.
 # Requires KHIVE_TELEGRAM_* environment variables at runtime; does nothing when unset.
 # Coexists with channel-email (ChannelRegistry keys by (kind, slug), #606).
-channel-telegram = ["khive-channel", "khive-channel-telegram"]
-# channel-node: prepare the node channel's host state (C2 starts no loop). Opt-in; off by default.
-# Enables khive-pack-comm/node, which carries the keychain feature of khive-channel-node.
-channel-node = ["khive-channel", "dep:khive-channel-node", "khive-pack-comm/node"]
+channel-telegram = ["khive-channel-telegram"]
 # pack-moodboard: link the opt-in, experimental khive-pack-moodboard crate
 # (visual-asset ingest, exact descriptor-space retrieval, and calibrated
 # pairwise preference learning). Off by default — the pack is not in
@@ -110,17 +118,27 @@ test-channel-timing = ["channel-telegram", "khive-channel-telegram/test-support"
 
 [dev-dependencies]
 criterion = { workspace = true }
-khive-db = { version = "0.15.0", path = "../khive-db", features = ["test-support"] }
-khive-score = { version = "0.15.0", path = "../khive-score" }
+khive-db = { version = "0.24.0", path = "../khive-db", features = ["test-support"] }
+khive-score = { version = "0.24.0", path = "../khive-score" }
 toml = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
-khive-runtime = { version = "0.15.0", path = "../khive-runtime", features = ["fault-injection", "test-internals"] }
-khive-storage = { version = "0.15.0", path = "../khive-storage", features = ["test-support"] }
-rmcp = { workspace = true, features = ["server", "transport-io", "client"] }
+khive-runtime = { version = "0.24.0", path = "../khive-runtime", features = ["fault-injection", "test-internals"] }
+khive-storage = { version = "0.24.0", path = "../khive-storage", features = ["test-support"] }
+rmcp = { workspace = true, features = [
+    "server",
+    "transport-io",
+    "client",
+    "transport-streamable-http-client",
+    "transport-streamable-http-server",
+] }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["client", "server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio", "service"] }
 async-trait = { workspace = true }
 serial_test = { workspace = true }
-khive-pack-knowledge = { version = "0.15.0", path = "../khive-pack-knowledge" }
+khive-pack-knowledge = { version = "0.24.0", path = "../khive-pack-knowledge" }
 rusqlite = { workspace = true, features = ["bundled", "hooks"] }
 syn = { workspace = true, features = ["visit"] }
 

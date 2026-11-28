@@ -151,6 +151,47 @@ fn anonymous_actor_refusal_has_stable_token_and_json_reason() {
 }
 
 #[test]
+fn config_require_attributed_refuses_an_anonymous_exec_and_admits_a_named_one() {
+    let home = TempDir::new().unwrap();
+    let khive_dir = home.path().join(".khive");
+    std::fs::create_dir_all(&khive_dir).expect("mkdir .khive");
+    std::fs::write(
+        khive_dir.join("config.toml"),
+        "[actor]\nrequire_attributed = true\n",
+    )
+    .expect("write home config");
+
+    let refused = run_exec(&home, "stats()", "kg,comm", &[], false);
+    assert!(!refused.status.success());
+    assert_refusal_once(&refused, "anonymous-actor");
+    let message = stderr(&refused);
+    assert!(
+        message.contains("[actor] require_attributed = true"),
+        "refusal must name the config key: {message}"
+    );
+    assert!(
+        !message.contains("KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1"),
+        "refusal must not name the unset env flag: {message}"
+    );
+    let response = stdout_json(&refused);
+    assert_eq!(response["results"][0]["reason"], "anonymous-actor");
+
+    let admitted = run_exec(
+        &home,
+        "stats()",
+        "kg,comm",
+        &["--actor", "lambda:test"],
+        false,
+    );
+    assert!(
+        admitted.status.success(),
+        "a named actor must pass the same config: {}",
+        stderr(&admitted)
+    );
+    assert_refusal_count(&admitted, "anonymous-actor", 0);
+}
+
+#[test]
 fn expected_actor_mismatch_has_stable_token_and_json_reason() {
     let home = TempDir::new().unwrap();
     let output = run_exec(

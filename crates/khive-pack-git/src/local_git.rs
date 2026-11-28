@@ -16,6 +16,14 @@ use crate::write_argv::{validate_message, validate_ref_name};
 
 #[path = "local_git_checkout_batch.rs"]
 mod checkout_batch;
+#[path = "local_git_checkout_reuse.rs"]
+mod checkout_reuse;
+#[path = "local_git_delete.rs"]
+mod delete;
+pub(crate) use delete::{branch_state, checked_out, delete_branch, BranchState};
+#[path = "local_git_fetch.rs"]
+mod fetch;
+pub(crate) use fetch::{exact_ref, fetch_haves, fetch_refs, update_fetched_ref, FetchedRefUpdate};
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 /// Settings only local invocations carry, passed after `git_env::SHARED_SETTINGS`.
@@ -126,6 +134,11 @@ impl LocalGitError {
 
     pub(crate) fn is_ambiguous(&self) -> bool {
         self.ambiguous
+    }
+
+    /// The authored message, without the code.
+    pub(crate) fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -510,6 +523,13 @@ fn oid_output(bytes: &[u8]) -> Result<String> {
 fn checked_ref(reference: &str) -> Result<String> {
     validate_ref_name("ref", reference)
         .map_err(|error| LocalGitError::new("invalid_params", error.to_string()))?;
+    // The pack's own working refs are never an input to another verb.
+    if reference.starts_with("refs/khive/") {
+        return Err(LocalGitError::new(
+            "invalid_params",
+            "refs/khive/ names are reserved for the pack's own use",
+        ));
+    }
     Ok(format!("{reference}^{{commit}}"))
 }
 
@@ -662,10 +682,13 @@ fn parse_listing(bytes: &[u8]) -> Result<Vec<ListedBlob>> {
         let mode = match (fields[0], fields[1]) {
             ("100644", "blob") => 644,
             ("100755", "blob") => 755,
+            // A symlink's blob is its literal target, kept as a link entry and never resolved
+            // here (ADR-182 Amendment 19); a tree's consumers decide what a link may reach.
+            ("120000", "blob") => 120000,
             _ => {
                 return Err(LocalGitError::new(
                     "unsupported_entry",
-                    "checkout refuses symlinks, submodules, and unsupported tree entries",
+                    "checkout refuses submodules and unsupported tree entries",
                 ))
             }
         };
@@ -682,32 +705,82 @@ fn parse_listing(bytes: &[u8]) -> Result<Vec<ListedBlob>> {
     Ok(entries)
 }
 
+/// A checkout that always reads and stores the commit's tree, never reusing an earlier one.
+#[cfg(test)]
 pub(crate) async fn checkout(rt: &KhiveRuntime, repo: &Path, reference: &str) -> Result<Checkout> {
+    checkout_reusing(rt, repo, reference, None, None).await
+}
+
+/// `checkout`, answering from an earlier committed checkout of the same commit by `namespace` in
+/// this repository when that tree is still whole in the blob store (`checkout_reuse`).
+///
+/// With `paths`, only the entries at or beneath those repository paths are read, and the result
+/// is a scoped tree naming them (ADR-182 Amendment 24). A scoped checkout is never answered from
+/// an earlier one, and a path that names nothing at the commit refuses `path_not_found` before
+/// any blob is read.
+pub(crate) async fn checkout_reusing(
+    rt: &KhiveRuntime,
+    repo: &Path,
+    reference: &str,
+    namespace: Option<&str>,
+    paths: Option<&[String]>,
+) -> Result<Checkout> {
+    let scope = paths.map(tree::canonical_scope).transpose()?;
     let program = rt.config().git_write.git_program();
-    let reference = checked_ref(reference)?;
+    let requested = reference;
+    let reference = checked_ref(requested)?;
     let mut filters = None;
-    let commit = oid_output(
-        &run_async_with_snapshot(
-            program,
-            repo,
-            &["rev-parse", "--verify", "--end-of-options", &reference],
-            None,
-            &mut filters,
-        )
-        .await?,
-    )?;
-    let listing = run_async_with_snapshot(
+    let resolved = run_async_with_snapshot(
         program,
         repo,
-        &["ls-tree", "-r", "-z", &commit],
+        &["rev-parse", "--verify", "--end-of-options", &reference],
         None,
         &mut filters,
     )
-    .await?;
+    .await;
+    let commit = match resolved {
+        Ok(bytes) => oid_output(&bytes)?,
+        Err(error) => return Err(fetch::unresolved(program, repo, requested, error).await),
+    };
+    if let (Some(namespace), None) = (namespace, &scope) {
+        if let Some(tree) = checkout_reuse::reusable_tree(rt, namespace, repo, &commit).await {
+            return Ok(Checkout { commit, tree });
+        }
+    }
+    let listing = match &scope {
+        None => {
+            run_async_with_snapshot(
+                program,
+                repo,
+                &["ls-tree", "-r", "-z", &commit],
+                None,
+                &mut filters,
+            )
+            .await?
+        }
+        Some(scope) => {
+            // `--literal-pathspecs` is a main-command option, so it reaches this one command and
+            // no other: a named path is matched as written, never as a glob or a magic pathspec.
+            let mut argv = vec![
+                "--literal-pathspecs",
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                commit.as_str(),
+                "--",
+            ];
+            argv.extend(scope.iter().map(String::as_str));
+            run_async_with_snapshot(program, repo, &argv, None, &mut filters).await?
+        }
+    };
     // Validate every mode and path before producing any manifest entries.
     let listed = parse_listing(&listing)?;
+    if let Some(scope) = &scope {
+        check_listing_scope(&listed, scope, &commit)?;
+    }
     let store = tree::blob_store(rt)?;
-    checkout_batch::admit_manifest(&listed)?;
+    checkout_batch::admit_manifest(&listed, scope.as_deref())?;
     let mut entries = Vec::with_capacity(listed.len());
     let mut reader = if listed.is_empty() {
         None
@@ -720,7 +793,15 @@ pub(crate) async fn checkout(rt: &KhiveRuntime, repo: &Path, reference: &str) ->
             .expect("nonempty tree has a blob reader")
             .next()
             .await?;
-        let content_ref = store.put(frame.bytes).await?;
+        // A blob the store already holds is not written again: a `put` of known bytes
+        // still makes its refresh durable, and on a repeat checkout that is most of the cost.
+        // The object's publish grace is therefore not refreshed (ADR-182 Amendment 2, item 8).
+        let digest = ContentRef::from_digest_bytes(blake3::hash(&frame.bytes).as_bytes());
+        let content_ref = if store.exists(&digest).await? {
+            digest
+        } else {
+            store.put(frame.bytes).await?
+        };
         frame
             .consumed
             .send(())
@@ -735,15 +816,65 @@ pub(crate) async fn checkout(rt: &KhiveRuntime, repo: &Path, reference: &str) ->
         reader.finish().await?;
     }
     let value = tree::entries_json(&entries);
-    let manifest = serde_json::json!({"schema": tree::TREE_SCHEMA, "entries": &value});
+    let manifest = match &scope {
+        None => serde_json::json!({"schema": tree::TREE_SCHEMA, "entries": &value}),
+        Some(scope) => serde_json::json!({
+            "schema": tree::SCOPED_TREE_SCHEMA, "scope": scope, "entries": &value
+        }),
+    };
     if manifest.to_string().len() as u64 > tree::MAX_MANIFEST_BYTES {
+        return Err(manifest_limit(scope.is_some()));
+    }
+    let tree = match &scope {
+        None => tree::store_from_value(rt, &value).await?,
+        Some(scope) => tree::store_tree(rt, &entries, Some(scope)).await?,
+    };
+    Ok(Checkout { commit, tree })
+}
+
+/// The refusal for a checkout whose manifest would exceed the tree limit. A whole-tree checkout
+/// names the way through it: a checkout of named paths stores only their entries.
+fn manifest_limit(scoped: bool) -> LocalGitError {
+    LocalGitError::new(
+        "output_limit",
+        if scoped {
+            "checkout manifest of the named paths exceeds the tree limit"
+        } else {
+            "checkout manifest exceeds the tree limit; a checkout may name paths to read part of the tree"
+        },
+    )
+}
+
+/// Every named path covers at least one listed entry, and every listed entry lies under a named
+/// path. The first is the caller's error and names the path. The second would mean git matched a
+/// path as something other than its literal text, and refuses rather than store what was not
+/// asked for.
+fn check_listing_scope(listed: &[ListedBlob], scope: &[String], commit: &str) -> Result<()> {
+    let covers = |path: &str, entry: &str| {
+        entry == path
+            || entry
+                .strip_prefix(path)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    if let Some(missing) = scope
+        .iter()
+        .find(|path| !listed.iter().any(|entry| covers(path, &entry.path)))
+    {
         return Err(LocalGitError::new(
-            "output_limit",
-            "checkout manifest exceeds the tree limit",
+            "path_not_found",
+            format!("path {missing:?} names nothing at commit {commit}"),
         ));
     }
-    let tree = tree::store_from_value(rt, &value).await?;
-    Ok(Checkout { commit, tree })
+    if let Some(stray) = listed
+        .iter()
+        .find(|entry| !scope.iter().any(|path| covers(path, &entry.path)))
+    {
+        return Err(LocalGitError::new(
+            "git_output",
+            format!("git listed {:?}, which no named path covers", stray.path),
+        ));
+    }
+    Ok(())
 }
 
 struct GitEntry {
@@ -869,17 +1000,22 @@ pub(crate) async fn write_manifest_tree(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_commit_sync(
     program: &Path,
     repo: &Path,
     git_tree: &str,
     parent: &str,
+    merge_parent: Option<&str>,
     message: &str,
     author_name: &str,
     author_email: &str,
 ) -> Result<String> {
     validate_oid(git_tree, "git tree")?;
     validate_oid(parent, "expected_head")?;
+    if let Some(merge_parent) = merge_parent {
+        validate_oid(merge_parent, "merge_parent")?;
+    }
     validate_message(message)
         .map_err(|error| LocalGitError::new("invalid_params", error.to_string()))?;
     for (field, value) in [("author name", author_name), ("author email", author_email)] {
@@ -894,21 +1030,30 @@ fn create_commit_sync(
             ));
         }
     }
+    let mut argv = vec!["commit-tree", git_tree, "-p", parent];
+    if let Some(merge_parent) = merge_parent {
+        // The branch head stays the first parent, as `git merge` records it, so
+        // first-parent history and a diff against `^1` read the branch's own line.
+        argv.extend(["-p", merge_parent]);
+    }
+    argv.extend(["-m", message]);
     oid_output(&run_git(
         program,
         repo,
-        &["commit-tree", git_tree, "-p", parent, "-m", message],
+        &argv,
         None,
         Some((author_name, author_email)),
         false,
     )?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_commit(
     program: &Path,
     repo: &Path,
     git_tree: &str,
     parent: &str,
+    merge_parent: Option<&str>,
     message: &str,
     author_name: &str,
     author_email: &str,
@@ -917,6 +1062,7 @@ pub(crate) async fn create_commit(
     let repo = repo.to_path_buf();
     let git_tree = git_tree.to_string();
     let parent = parent.to_string();
+    let merge_parent = merge_parent.map(str::to_string);
     let message = message.to_string();
     let author_name = author_name.to_string();
     let author_email = author_email.to_string();
@@ -926,10 +1072,108 @@ pub(crate) async fn create_commit(
             &repo,
             &git_tree,
             &parent,
+            merge_parent.as_deref(),
             &message,
             &author_name,
             &author_email,
         )
+    })
+    .await
+}
+
+fn verify_merge_parent_sync(
+    program: &Path,
+    repo: &Path,
+    merge_parent: &str,
+    first_parent: &str,
+) -> Result<()> {
+    validate_oid(merge_parent, "merge_parent")?;
+    if merge_parent == ZERO_OID {
+        return Err(LocalGitError::new(
+            "invalid_params",
+            "merge_parent must not be the zero object id",
+        ));
+    }
+    let kind = run_git(
+        program,
+        repo,
+        &["cat-file", "-t", merge_parent],
+        None,
+        None,
+        false,
+    )
+    .map_err(|error| {
+        if error.code() == "git_failed" {
+            LocalGitError::new(
+                "invalid_params",
+                "merge_parent must identify an existing commit",
+            )
+        } else {
+            error
+        }
+    })?;
+    if kind != b"commit\n" {
+        return Err(LocalGitError::new(
+            "invalid_params",
+            "merge_parent must identify a commit object",
+        ));
+    }
+    // The second parent must already be what a remote holds, so a push of the
+    // merge publishes no commit except the ones made on this branch, and every
+    // gate that reads what a push publishes keeps its meaning.
+    let tips = run_git(
+        program,
+        repo,
+        &[
+            "for-each-ref",
+            "--points-at",
+            merge_parent,
+            "--format=%(refname)",
+            "refs/remotes",
+        ],
+        None,
+        None,
+        false,
+    )?;
+    if tips.iter().all(u8::is_ascii_whitespace) {
+        return Err(LocalGitError::new(
+            "merge_parent_unpublished",
+            "merge_parent must be the current tip of a remote-tracking ref",
+        ));
+    }
+    let merged = run_git_output(
+        program,
+        repo,
+        &["merge-base", "--is-ancestor", merge_parent, first_parent],
+        None,
+        None,
+        false,
+        Some(1),
+    )?;
+    if merged.exit_code == 0 {
+        return Err(LocalGitError::new(
+            "merge_parent_already_merged",
+            "merge_parent is already in the history of expected_head",
+        ));
+    }
+    Ok(())
+}
+
+/// Checks a tree commit's optional second parent before any receipt or object
+/// is written: an existing commit, the tip of a remote-tracking ref, and not
+/// already in the first parent's history.
+pub(crate) async fn verify_merge_parent(
+    program: &Path,
+    repo: &Path,
+    merge_parent: &str,
+    first_parent: &str,
+) -> Result<()> {
+    let program = program.to_path_buf();
+    let repo = repo.to_path_buf();
+    let merge_parent = merge_parent.to_string();
+    let first_parent = first_parent.to_string();
+    blocking("merge-parent", false, move || {
+        verify_merge_parent_sync(&program, &repo, &merge_parent, &first_parent)
     })
     .await
 }
@@ -1726,3 +1970,7 @@ mod init_tests;
 #[cfg(test)]
 #[path = "local_git_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "local_git_scope_tests.rs"]
+mod scope_tests;

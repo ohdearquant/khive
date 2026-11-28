@@ -1,4 +1,5 @@
 use super::*;
+use khive_db::test_hooks::TestHooks;
 
 #[tokio::test]
 async fn try_create_note_rejects_reserved_secret_gate_key() {
@@ -368,7 +369,7 @@ async fn assert_model_failure(fault: ModelFault, expected_stage: &str) {
             .writer()
             .unwrap()
             .autocommit(|conn| {
-                Ok(conn.authorizer(Some(move |context: AuthContext<'_>| {
+                Ok(conn.test_authorizer(Some(move |context: AuthContext<'_>| {
                     let deny = match fault {
                         ModelFault::Store => matches!(context.action,
                         AuthAction::CreateVtable { table_name, .. } if table_name == table),
@@ -401,7 +402,9 @@ async fn assert_model_failure(fault: ModelFault, expected_stage: &str) {
             .pool()
             .writer()
             .unwrap()
-            .autocommit(|conn| Ok(conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?))
+            .autocommit(|conn| {
+                Ok(conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?)
+            })
             .unwrap();
         assert!(
             sql_faults.load(Ordering::SeqCst) > 0,
@@ -502,7 +505,7 @@ async fn conditional_ingest_reports_fts_acquisition_failure() {
         .writer()
         .unwrap()
         .autocommit(|conn| {
-            Ok(conn.authorizer(Some(move |context: AuthContext<'_>| {
+            Ok(conn.test_authorizer(Some(move |context: AuthContext<'_>| {
                 if matches!(
                     context.action,
                     AuthAction::CreateVtable {
@@ -532,7 +535,7 @@ async fn conditional_ingest_reports_fts_acquisition_failure() {
         .pool()
         .writer()
         .unwrap()
-        .autocommit(|conn| Ok(conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?))
+        .autocommit(|conn| Ok(conn.test_authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?))
         .unwrap();
     assert!(faults.load(Ordering::SeqCst) > 0);
     let (id, failures) = committed_failure(result.expect_err("FTS acquisition failure is visible"));

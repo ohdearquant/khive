@@ -176,4 +176,6 @@ mod manual_atomic_owner_tests;
 mod settlement_hazard_tests;
 
 #[cfg(test)]
+mod cancel_after_classification_tests;
+#[cfg(test)]
 mod writer_query_admission_tests;

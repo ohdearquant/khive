@@ -110,6 +110,28 @@ widen their namespace visibility, or grant an aggregate mode to profile resoluti
 or binding listing. See the [brain API reference](guide/api-reference.md#brainevent_counts--assertive)
 for actor-filter and anonymous-caller behavior.
 
+### Exec cache roots
+
+The optional `[exec] cache_roots` list names absolute directories that every
+`exec.run` may read, write and load code from, and that are kept between runs:
+a compiler's package cache and build output belong there. Nothing under a cache
+root is captured into a run's output tree, and a run can read and change what an
+earlier run left, so runs that share a cache root share a trust boundary. A
+cache root must exist when a run starts, and it is compared in canonical form,
+so a symbolic link or a `..` component does not hide an overlap. It may not
+hold the exec root or sit inside it, and it may not equal, hold or sit inside
+any read root; a run is refused with the reason otherwise. The check does not
+judge what else a cache root holds: a root that holds a home directory, a
+credential or a store is the operator's error and is not refused. Its size is
+bounded by its volume, not by the run limits. Each entry is resolved again
+when a run starts, and the run's profile grants the paths that check resolved,
+so a cache root created after the server started, or named through a symbolic
+link, is writable under its real path. An entry that resolves through a symbolic
+link sitting inside the exec root or inside a cache root, a link reached through
+another link's target included, is refused, because a run could point that link
+elsewhere. Each receipt's
+`sandbox.cache_roots_digest` names the list the run had.
+
 ### Exec sandbox path matches
 
 The optional `[exec] never` list names executable paths that `exec.run` refuses
@@ -210,6 +232,10 @@ KHIVE_DB=/path/to/my.db kkernel mcp        # same, via env
 kkernel mcp --db :memory:                  # ephemeral in-memory storage
 ```
 
+For a throwaway database, `KHIVE_NO_DAEMON=1 kkernel exec --db /path/to/scratch.db '...'`
+dispatches in-process against that file. Without `KHIVE_NO_DAEMON=1`, `kkernel exec` forwards the
+path to a warm daemon it spawns for that file (see the next section).
+
 ### `[[backends]]` declared
 
 Once one or more `[[backends]]` entries exist in the resolved config, the
@@ -294,6 +320,32 @@ file) is the entry point for every MCP client. When your config declares
 `[[backends]]`, omit `--db`/`KHIVE_DB` unless it canonically names the
 declared `main` backend or is the explicit `:memory:` escape hatch. The config
 file is authoritative for backend paths.
+
+### Verb catalog verbosity
+
+MCP clients discover khive's verbs in the `request` tool description. The default
+`full` mode includes the complete catalog descriptions. To request shorter
+summaries for one client, add the option to that client's command arguments:
+
+```sh
+kkernel mcp --catalog-verbosity compact
+```
+
+Compact mode keeps every enabled callable verb, including mounted verbs, in
+sorted order. Each row retains its contributing packs and a `verb(help=true)`
+pointer. A contribution shows the first nonempty description line with normalized
+whitespace, up to 160 Unicode scalar values including any shortening ellipsis.
+A header identifies these summaries and explains how to obtain full help.
+`verb(help=true)` returns complete help, including argument definitions; `verbs`
+keeps its complete descriptions.
+
+Omit the option or pass `--catalog-verbosity full` to retain the original full
+request-tool description. This is a choice for the individual MCP server
+instance; it does not change the loaded packs, dispatch, daemon identity or
+forwarding. There is no corresponding environment variable or TOML setting.
+Rust callers can use
+`server.with_catalog_verbosity(khive_mcp::args::CatalogVerbosity::Compact)`;
+existing server constructors default to `Full`.
 
 ### Claude Code (`.mcp.json` or `.claude/settings.json`)
 
@@ -527,55 +579,36 @@ cover yet.
 
 ---
 
-## `[channel.node]` — node channel
+## `[channel.*]` — component configuration
 
-The optional `[channel.node]` table configures the node channel transport. It is
-off by default: without the table, or with `enabled = false`, nothing about the
-node channel runs and the daemon identity is unchanged.
+Every value under `[channel]` is retained without interpretation. A host registers
+component validators before constructing its pack registry; each validator receives
+the value under its exact component name, or its absence. The component decides
+whether a table is required and validates its own fields before activation.
 
-Key material and peer pins are never typed by hand. The node setup commands,
-which are not available yet, will create the key in the login keychain, record
-the reference and fingerprint here, and append peer pins as they are confirmed.
-The fields are described so the file can be read and reviewed, not so values
-can be pasted in.
+An unregistered name remains stored but has no effect: its presence does not start
+a component, install a channel, or add a send route. Nested values and scalar values
+are preserved unchanged. Registering two validators under the same name is refused
+instead of replacing the first registration.
 
-Unknown keys and wrong value types are rejected when the file loads, even when
-the table is disabled. The checks in the Range column run only when
-`enabled = true`; the first failing field, in the order below, is reported as
-`channel.node: <reason>`.
+Library hosts use `ServeRegistrations::register_config_validator` and
+`run_with_registrations` to validate components before runtime construction, even
+when comm is not loaded. The same callbacks remain installed for pack activation;
+checks must be pure and idempotent because validation may run more than once.
 
-| Field                     | Type            | Default   | Range / rule                                                                                                                                                                                                                                             |
-| ------------------------- | --------------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`                 | bool            | `false`   | Turns the node channel on.                                                                                                                                                                                                                               |
-| `slug`                    | string          | none      | Required when enabled. 1 to 64 characters of `a-z`, `0-9`, `_`, `-`.                                                                                                                                                                                     |
-| `namespace`               | string          | `"local"` | A valid namespace.                                                                                                                                                                                                                                       |
-| `actor`                   | string          | none      | Required when enabled. Nonempty after trimming, at most 256 bytes, no control characters.                                                                                                                                                                |
-| `realm`                   | string          | none      | Required when enabled. 1 to 64 characters of `a-z`, `0-9`, `.`, `_`, `-`.                                                                                                                                                                                |
-| `service_url`             | string          | none      | Required when enabled, not blank. The channel client checks that it is an HTTPS origin without credentials, query or fragment.                                                                                                                           |
-| `agent_id`                | string          | none      | Required when enabled. Lowercase hyphenated UUID.                                                                                                                                                                                                        |
-| `device_id`               | string          | none      | Required when enabled. Lowercase hyphenated UUID.                                                                                                                                                                                                        |
-| `key_epoch`               | integer         | none      | Required when enabled. 1 to 4294967295.                                                                                                                                                                                                                  |
-| `key_reference`           | string          | none      | Required when enabled. 1 to 128 characters of letters, digits, `.`, `_`, `-`; names the keychain account.                                                                                                                                                |
-| `key_fingerprint`         | string          | none      | Required when enabled. 64 lowercase hex characters.                                                                                                                                                                                                      |
-| `poll_wait_seconds`       | integer         | `25`      | 0 to 25.                                                                                                                                                                                                                                                 |
-| `outbox_interval_seconds` | integer         | `5`       | 1 to 60.                                                                                                                                                                                                                                                 |
-| `batch_size`              | integer         | `64`      | 1 to 256.                                                                                                                                                                                                                                                |
-| `pair_policy_mode`        | string          | `"off"`   | `off`, `shadow` or `enforce`; an unknown value fails parsing. Part of the config digest. Run it `off` first: pair policy evaluation is not available yet, so with `shadow` or `enforce` a new node-addressed send is refused before anything is written. |
-| `pins`                    | array of tables | empty     | At most 4096 entries; no two entries share `agent_id`, `device_id` and `key_epoch`.                                                                                                                                                                      |
+Hosts install custom address policies with `ServeRegistrations::register_send_route`.
+Each route receives the authorized runtime, namespace token, and original validated
+send parameters. The route owns persistence, replay handling, and transport submission;
+the core returns its result without adding a message or falling back to another route.
+Built-in transport and local actor address kinds cannot be overridden.
 
-Each `[[channel.node.pins]]` entry has no defaults. All six fields are required:
-`agent_id` and `device_id` (lowercase hyphenated UUIDs), `key_epoch` (1 to
-4294967295), and `kem_public_key`, `signing_public_key` and `fingerprint` (64
-lowercase hex characters each).
-
-An enabled table is part of the daemon identity, including the bound `actor`
-and the pins. A running daemon started with a different `[channel.node]` table
-is not reused: the caller falls back to local dispatch until that daemon is
-restarted.
-
-Not covered:
-
-- Linux: the key facility is macOS only in this release.
+On Unix, a host carrying validators or send routes must run as the daemon or select local
+dispatch with `KHIVE_NO_DAEMON=1`, whatever its transport: requests from a non-daemon host are
+forwarded to the daemon, and callbacks cannot be forwarded to another process. The prebuilt
+`serve_server_with_registrations` API refuses bundles containing validators or send routes. A host
+that configures `RuntimeConfig` before constructing its server can pass only its
+channels and residents to that prebuilt entrypoint; the same local-dispatch rule applies when
+that server's runtime carries validators or send routes.
 
 ---
 

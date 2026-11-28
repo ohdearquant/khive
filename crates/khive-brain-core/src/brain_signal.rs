@@ -68,7 +68,9 @@ impl ServeAttribution {
 /// `BalancedRecallState::apply_signal` and `SectionPosteriorState::apply_signal`.
 #[derive(Debug, Clone)]
 pub enum BrainSignal {
-    /// A memory or entity was returned and confirmed relevant by the caller.
+    /// A recall returned this record. It feeds the entity-blind recall and
+    /// temporal posteriors but is not a judgment, so it carries no per-entity
+    /// evidence.
     RecallHit {
         target_id: Uuid,
         latency_us: i64,
@@ -110,17 +112,23 @@ pub enum BrainSignal {
         /// mass-table state.
         effective_weight: f64,
     },
-    /// A note record was accessed; counts as a positive signal for its entity.
+    /// A note record was accessed. This is read telemetry only: it is not a
+    /// judgment and carries no per-entity evidence.
     NoteAccessed { target_id: Uuid },
     /// Event did not produce a useful signal and should be discarded.
     Irrelevant,
 }
 
 /// Extract (entity_id, positive_signal) for per-entity posterior updates.
+///
+/// Per-entity evidence originates only from judgment-bearing signals:
+/// `Feedback` and `SemanticFeedback`. A recall hit records that a record was
+/// served and a note access records that it was read; neither is a judgment of
+/// the record, so neither yields a per-entity signal. Both still drive the
+/// entity-blind recall and temporal posteriors through `is_recall_positive` and
+/// `BalancedRecallState::apply_signal`.
 pub fn entity_signal(signal: &BrainSignal) -> Option<(Uuid, bool)> {
     match signal {
-        BrainSignal::RecallHit { target_id, .. } => Some((*target_id, true)),
-        BrainSignal::NoteAccessed { target_id } => Some((*target_id, true)),
         BrainSignal::Feedback {
             target_id, signal, ..
         } => Some((*target_id, matches!(signal, FeedbackSignal::Useful))),
@@ -129,9 +137,11 @@ pub fn entity_signal(signal: &BrainSignal) -> Option<(Uuid, bool)> {
             event_kind,
             ..
         } => Some((*target_id, event_kind.is_positive())),
-        BrainSignal::RecallMiss | BrainSignal::SearchCompleted { .. } | BrainSignal::Irrelevant => {
-            None
-        }
+        BrainSignal::RecallHit { .. }
+        | BrainSignal::NoteAccessed { .. }
+        | BrainSignal::RecallMiss
+        | BrainSignal::SearchCompleted { .. }
+        | BrainSignal::Irrelevant => None,
     }
 }
 

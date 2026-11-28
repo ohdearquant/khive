@@ -17,6 +17,7 @@ impl Signals {
         for token in query.split_whitespace() {
             if !(1..=2).contains(&token.len())
                 || !token.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                || !is_signal_word(token)
                 || sanitize_fts5_token_group(token).as_deref() != Some(token)
             {
                 continue;
@@ -42,6 +43,17 @@ impl Signals {
             })
             .count()
     }
+}
+
+/// A one- or two-character word counts as a signal only when it carries a digit
+/// (`2`, `v2`, `z9`) or is exactly two uppercase ASCII letters (`KV`, `QA`).
+/// Lowercase function words (`a`, `in`, `of`, `to`), single uppercase letters and
+/// mixed-case pairs such as a capitalised sentence opener (`In`, `At`) do not count,
+/// so natural-language questions keep their keyword order.
+fn is_signal_word(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes.iter().any(u8::is_ascii_digit)
+        || (bytes.len() == 2 && bytes.iter().all(u8::is_ascii_uppercase))
 }
 
 pub(super) enum Window {
@@ -226,4 +238,26 @@ pub(super) fn search(
             candidate.hit
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signal_words(query: &str) -> Vec<String> {
+        Signals::for_query(query, &TextQueryMode::Plain, 10)
+            .map(|signals| signals.0)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn only_digit_words_and_uppercase_pairs_count() {
+        assert_eq!(
+            signal_words("what is in a PR to fix v2 KV and 2 of In I At Kv kV z9"),
+            ["pr", "v2", "kv", "2", "z9"]
+        );
+        assert!(
+            Signals::for_query("is it in a list of to do", &TextQueryMode::Plain, 10).is_none()
+        );
+    }
 }

@@ -70,7 +70,7 @@ fn initial_state_has_informative_priors() {
 }
 
 #[test]
-fn recall_hit_updates_relevance_and_entity() {
+fn recall_hit_updates_relevance_but_not_entity() {
     let fold = BalancedRecallFold::new(100);
     let ctx = FoldContext::new();
     let mut state = fold.init(&ctx);
@@ -81,8 +81,40 @@ fn recall_hit_updates_relevance_and_entity() {
 
     assert_eq!(state.total_events, 1);
     assert!((state.relevance.alpha() - 8.0).abs() < 1e-12); // 7 + 1
-    let ep = state.entity_posteriors.get(&id).unwrap();
-    assert!((ep.alpha() - 2.0).abs() < 1e-12); // 1 + 1
+
+    // A recall hit is exposure, not a judgment: it creates no entity posterior.
+    assert!(state.entity_posteriors.is_empty());
+}
+
+#[test]
+fn recall_hits_after_a_judgment_leave_entity_posteriors_unchanged() {
+    let fold = BalancedRecallFold::new(100);
+    let ctx = FoldContext::new();
+    let mut state = fold.init(&ctx);
+
+    let judged = Uuid::new_v4();
+    let mut feedback = make_event("brain.feedback", EventOutcome::Success, Some(judged));
+    feedback.payload = serde_json::json!({"signal": "not_useful"});
+    state = fold.reduce(state, &feedback, &ctx);
+    let entities_before = state.to_snapshot().entity_posteriors;
+    let relevance_before = state.relevance.alpha();
+
+    // A hit on the judged entity and a hit on an entity nobody has judged.
+    let unjudged = Uuid::new_v4();
+    for target in [judged, unjudged] {
+        let hit = make_event("recall", EventOutcome::Success, Some(target));
+        state = fold.reduce(state, &hit, &ctx);
+    }
+
+    assert_eq!(state.total_events, 3);
+    // The entity-blind relevance posterior still moves on every hit.
+    assert!((state.relevance.alpha() - (relevance_before + 2.0)).abs() < 1e-12);
+    // Per-entity evidence does not.
+    assert_eq!(state.to_snapshot().entity_posteriors, entities_before);
+    assert!(state.entity_posteriors.get(&unjudged).is_none());
+    let ep = state.entity_posteriors.get(&judged).unwrap();
+    assert!((ep.alpha() - 1.0).abs() < 1e-12);
+    assert!((ep.beta() - 2.0).abs() < 1e-12);
 }
 
 #[test]

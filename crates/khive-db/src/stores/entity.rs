@@ -8,7 +8,10 @@ use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use khive_storage::attachment::{Attachment, AttachmentSubstrate};
-use khive_storage::entity::{Entity, EntityFilter, EntityTombstones, EntityTypeCounts};
+use khive_storage::entity::{
+    Entity, EntityAlias, EntityAliasOrigin, EntityFilter, EntityKeyHolder, EntityTombstones,
+    EntityTypeCounts,
+};
 use khive_storage::error::StorageError;
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlStatement, SqlValue,
@@ -34,13 +37,34 @@ const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
 
 const ENTITIES_COUNT_BY_TYPE_SQL: &str = include_str!("../../sql/entities-count-by-type.sql");
 
-const ENTITY_SELECT_COLUMNS: &str =
+/// The `aliases` column of an entity read (ADR-221 section 2): a JSON array
+/// of `[alias, origin]` pairs for the entity's alias rows, `[]` when it has
+/// none. The query must read the entity from a table named `entities`.
+/// [`parse_entity_aliases`] reads the value. The store's own entity reads end
+/// with the same subquery, and a test holds the two texts equal.
+pub const ENTITY_ALIASES_COLUMN: &str =
+    "(SELECT json_group_array(json_array(entity_alias.alias, entity_alias.origin)) \
+     FROM entity_aliases AS entity_alias \
+     WHERE entity_alias.entity_id = entities.id \
+     AND entity_alias.namespace = entities.namespace)";
+
+// Every part is a string literal, so a source scan of the statements that
+// use these columns reads the whole text. The aliases subquery repeats
+// `ENTITY_ALIASES_COLUMN`.
+const ENTITY_SELECT_COLUMNS: &str = concat!(
     "entities.id, entities.namespace, entities.kind, entities.entity_type, entities.name, \
      entities.description, entities.properties, entities.tags, entities.created_at, \
      entities.updated_at, entities.deleted_at, entities.merged_into, entities.merge_event_id, \
      (SELECT attachment.content_ref FROM attachments AS attachment \
       WHERE attachment.record_uuid = entities.id \
-        AND attachment.substrate = 'entity' AND attachment.role = 'content') AS content_ref, entities.version";
+        AND attachment.substrate = 'entity' AND attachment.role = 'content') AS content_ref, \
+     entities.version, ",
+    "(SELECT json_group_array(json_array(entity_alias.alias, entity_alias.origin)) \
+     FROM entity_aliases AS entity_alias \
+     WHERE entity_alias.entity_id = entities.id \
+     AND entity_alias.namespace = entities.namespace)",
+    " AS aliases"
+);
 
 // ---------------------------------------------------------------------------
 // Pure statement builders (ADR-099 B3 r6 structural cut)
@@ -117,6 +141,189 @@ fn entity_write_statement(entity: &Entity, insert: &str, label: &str) -> SqlStat
             },
         ],
         label: Some(label.to_string()),
+    }
+}
+
+/// Claim caller `key` for `kind` in `namespace` on behalf of `entity_id`.
+///
+/// Inserts one row when no live holder has the key and none otherwise, so an
+/// atomic plan guards it at exactly one affected row: zero means another
+/// entity holds the key, and the caller re-reads the holder (ADR-221 section 1).
+pub fn entity_key_claim_statement(
+    namespace: &str,
+    kind: &str,
+    key: &str,
+    entity_id: Uuid,
+    created_at: i64,
+) -> SqlStatement {
+    SqlStatement {
+        sql: "INSERT INTO entity_keys (namespace, kind, key, entity_id, created_at) \
+              SELECT ?1, ?2, ?3, ?4, ?5 \
+              WHERE NOT EXISTS (SELECT 1 FROM entity_keys \
+                WHERE namespace = ?1 AND kind = ?2 AND key = ?3 AND released_at IS NULL)"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(kind.to_string()),
+            SqlValue::Text(key.to_string()),
+            SqlValue::Text(entity_id.to_string()),
+            SqlValue::Integer(created_at),
+        ],
+        label: Some(ENTITY_KEY_CLAIM_LABEL.to_string()),
+    }
+}
+
+/// Statement label of [`entity_key_claim_statement`], matched by callers that
+/// read a failed claim guard as a held key.
+pub const ENTITY_KEY_CLAIM_LABEL: &str = "entity-key-claim";
+
+/// Store `alias` for `entity_id` with `origin` (ADR-221 section 2).
+///
+/// An alias the entity already holds keeps its row and origin, so the
+/// statement affects one row or none; callers do not guard it.
+pub fn entity_alias_insert_statement(
+    namespace: &str,
+    entity_id: Uuid,
+    alias: &str,
+    origin: EntityAliasOrigin,
+    created_at: i64,
+) -> SqlStatement {
+    SqlStatement {
+        sql: "INSERT OR IGNORE INTO entity_aliases \
+              (namespace, entity_id, alias, origin, created_at) \
+              VALUES (?1, ?2, ?3, ?4, ?5)"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(entity_id.to_string()),
+            SqlValue::Text(alias.to_string()),
+            SqlValue::Text(origin.as_str().to_string()),
+            SqlValue::Integer(created_at),
+        ],
+        label: Some("entity-alias-insert".to_string()),
+    }
+}
+
+/// Remove caller-origin `alias` from `entity_id`. Aliases written by a
+/// rename or a merge are never removed by it (ADR-221 section 2).
+pub fn entity_caller_alias_delete_statement(
+    namespace: &str,
+    entity_id: Uuid,
+    alias: &str,
+) -> SqlStatement {
+    SqlStatement {
+        sql: "DELETE FROM entity_aliases \
+              WHERE namespace = ?1 AND entity_id = ?2 AND alias = ?3 AND origin = 'caller'"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(entity_id.to_string()),
+            SqlValue::Text(alias.to_string()),
+        ],
+        label: Some("entity-caller-alias-delete".to_string()),
+    }
+}
+
+/// Remove the alias row of `entity_id` equal to `name`, whatever wrote it.
+/// An alias never equals its entity's name, so an entity renamed to an alias
+/// it holds loses that row, of any origin (ADR-221 section 2).
+pub fn entity_name_alias_delete_statement(
+    namespace: &str,
+    entity_id: Uuid,
+    name: &str,
+) -> SqlStatement {
+    SqlStatement {
+        sql: "DELETE FROM entity_aliases \
+              WHERE namespace = ?1 AND entity_id = ?2 AND alias = ?3"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(entity_id.to_string()),
+            SqlValue::Text(name.to_string()),
+        ],
+        label: Some("entity-name-alias-delete".to_string()),
+    }
+}
+
+/// Remove every alias row of `entity_id`. A merge carries the merged-away
+/// entity's names to the kept entity as `merge` aliases and drops the merged-away
+/// entity's own rows (ADR-221 section 3).
+pub fn entity_aliases_delete_all_statement(namespace: &str, entity_id: Uuid) -> SqlStatement {
+    SqlStatement {
+        sql: "DELETE FROM entity_aliases WHERE namespace = ?1 AND entity_id = ?2".to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(entity_id.to_string()),
+        ],
+        label: Some("entity-aliases-delete-all".to_string()),
+    }
+}
+
+/// Held keys of one entity as `(kind, key)` rows, ordered by kind then key.
+/// Parameters: `?1` namespace, `?2` entity id.
+pub const ENTITY_HELD_KEYS_SQL: &str = "SELECT kind, key FROM entity_keys \
+     WHERE namespace = ?1 AND entity_id = ?2 AND released_at IS NULL \
+     ORDER BY kind, key";
+
+/// The entity holding one key, if any. Parameters: `?1` namespace, `?2` kind,
+/// `?3` key.
+pub const ENTITY_KEY_HOLDER_SQL: &str = "SELECT entity_id FROM entity_keys \
+     WHERE namespace = ?1 AND kind = ?2 AND key = ?3 AND released_at IS NULL";
+
+/// Every key row of one namespace, held or released, as
+/// `(entity_id, kind, key, released_at)` rows ordered by entity, kind and key.
+/// Parameter: `?1` namespace.
+pub const NAMESPACE_KEY_ROWS_SQL: &str = "SELECT entity_id, kind, key, released_at \
+     FROM entity_keys WHERE namespace = ?1 ORDER BY entity_id, kind, key";
+
+/// Hand a held key of `from_id` to `into_id` under `into_kind`, as a merge does
+/// before it tombstones `from_id`: the tombstone releases every key its row
+/// still holds (ADR-221 section 3). Affects one row while the key is held.
+pub fn entity_key_move_statement(
+    namespace: &str,
+    from_id: Uuid,
+    from_kind: &str,
+    key: &str,
+    into_id: Uuid,
+    into_kind: &str,
+) -> SqlStatement {
+    SqlStatement {
+        sql: "UPDATE entity_keys SET entity_id = ?5, kind = ?6 \
+              WHERE namespace = ?1 AND entity_id = ?2 AND kind = ?3 AND key = ?4 \
+                AND released_at IS NULL"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(from_id.to_string()),
+            SqlValue::Text(from_kind.to_string()),
+            SqlValue::Text(key.to_string()),
+            SqlValue::Text(into_id.to_string()),
+            SqlValue::Text(into_kind.to_string()),
+        ],
+        label: Some("entity-key-move".to_string()),
+    }
+}
+
+/// Remove a held key row of `entity_id`. A merge drops the merged-away
+/// entity's row for a key the kept entity already holds (ADR-221 section 3).
+pub fn entity_key_drop_statement(
+    namespace: &str,
+    entity_id: Uuid,
+    kind: &str,
+    key: &str,
+) -> SqlStatement {
+    SqlStatement {
+        sql: "DELETE FROM entity_keys \
+              WHERE namespace = ?1 AND entity_id = ?2 AND kind = ?3 AND key = ?4 \
+                AND released_at IS NULL"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(entity_id.to_string()),
+            SqlValue::Text(kind.to_string()),
+            SqlValue::Text(key.to_string()),
+        ],
+        label: Some("entity-key-drop".to_string()),
     }
 }
 
@@ -375,7 +582,7 @@ impl SqlEntityStore {
             .record_direct_route(crate::timeout_sink::Site::DirectRouteEntity);
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
-            let guard = pool
+            let mut guard = pool
                 .transaction_write_unit()
                 .map_err(|error| map_sqlite_err(error, op))
                 .inspect_err(|error| pool.record_direct_writer_error(error))?;
@@ -384,7 +591,7 @@ impl SqlEntityStore {
                 f(conn).map_err(|error| map_err(error, op))
             });
             if terminal_state.is_some() {
-                pool.retire_pooled_writer(conn);
+                pool.retire_pooled_writer(guard.conn_mut());
             }
             result.inspect_err(|error| pool.record_direct_writer_error(error))
         })
@@ -446,6 +653,11 @@ impl SqlEntityStore {
         let operation = mode.operation();
         super::validate_json_equality_paths(
             &filter.property_equalities,
+            StorageCapability::Entities,
+            operation,
+        )?;
+        super::validate_json_prefix_paths(
+            &filter.property_prefixes,
             StorageCapability::Entities,
             operation,
         )?;
@@ -615,6 +827,7 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
     let merge_event_id_str: Option<String> = row.get(12)?;
     let content_ref: Option<String> = row.get(13)?;
     let version: i64 = row.get(14)?;
+    let aliases_str: String = row.get(15)?;
 
     let id = parse_uuid(&id_str)?;
 
@@ -650,6 +863,8 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
             rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(e))
         })?;
 
+    let aliases = read_entity_aliases(&aliases_str)?;
+
     Ok(Entity {
         id,
         namespace,
@@ -666,7 +881,32 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
         merged_into,
         merge_event_id,
         content_ref,
+        aliases,
     })
+}
+
+fn read_entity_aliases(text: &str) -> Result<Vec<EntityAlias>, rusqlite::Error> {
+    parse_entity_aliases(text).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(15, rusqlite::types::Type::Text, error.into())
+    })
+}
+
+/// Parse a value of [`ENTITY_ALIASES_COLUMN`]: a JSON array of
+/// `[alias, origin]` pairs, returned sorted by alias. An origin other than
+/// `caller`, `rename` or `merge` is an error.
+pub fn parse_entity_aliases(text: &str) -> Result<Vec<EntityAlias>, String> {
+    let pairs: Vec<(String, String)> =
+        serde_json::from_str(text).map_err(|error| format!("entity aliases: {error}"))?;
+    let mut aliases = pairs
+        .into_iter()
+        .map(|(alias, origin)| {
+            EntityAliasOrigin::parse(&origin)
+                .map(|origin| EntityAlias { alias, origin })
+                .ok_or_else(|| format!("unknown entity alias origin {origin:?}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    aliases.sort();
+    Ok(aliases)
 }
 
 /// DML-only batch upsert loop shared by both the legacy (flag-off) and
@@ -772,6 +1012,11 @@ fn build_entity_where_with_mode(
                 vec![Box::new(namespace.to_string())],
             )
         };
+    // The namespace parameters are ?1..?N, in the order of `ns_params`.
+    let namespace_placeholders = (1..=ns_params.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let mut conditions: Vec<String> = vec![ns_condition];
     match filter.tombstones {
@@ -891,6 +1136,26 @@ fn build_entity_where_with_mode(
         conditions.push(format!("name = ?{} COLLATE BINARY", params.len()));
     }
 
+    if let Some(ref exact) = filter.name_or_alias_exact {
+        params.push(Box::new(exact.clone()));
+        let index = params.len();
+        // An id list from two index seeks, names from idx_entities_name and
+        // aliases from idx_entity_aliases_alias, each bound to the filter's
+        // namespaces. `entity_read_source` pins the primary key so the list
+        // drives the read. Without statistics SQLite reads an OR of the two
+        // terms, or a subquery that refers to the outer row, by walking the
+        // whole namespace.
+        conditions.push(format!(
+            "id IN (SELECT named.id FROM entities AS named \
+             WHERE named.namespace IN ({namespace_placeholders}) \
+             AND named.name = ?{index} COLLATE BINARY \
+             UNION ALL SELECT entity_alias.entity_id \
+             FROM entity_aliases AS entity_alias \
+             WHERE entity_alias.namespace IN ({namespace_placeholders}) \
+             AND entity_alias.alias = ?{index} COLLATE BINARY)"
+        ));
+    }
+
     if !filter.names_ci.is_empty() {
         // ADR-104 Stage C, R1: one batched `LOWER(name) IN (...)` predicate,
         // served by `idx_entities_namespace_name_ci (namespace, LOWER(name))`.
@@ -928,6 +1193,12 @@ fn build_entity_where_with_mode(
         "properties",
         &filter.property_equalities,
     );
+    super::append_json_prefixes(
+        &mut conditions,
+        &mut params,
+        "properties",
+        &filter.property_prefixes,
+    );
     let clause = format!(" WHERE {}", conditions.join(" AND "));
     (clause, params)
 }
@@ -935,13 +1206,18 @@ fn build_entity_where_with_mode(
 /// An ID-filtered read is bounded by the caller's IDs, even on a fresh
 /// database without sqlite_stat1. The other predicates can match a large
 /// namespace; letting one of their indexes drive turns a bounded lookup into
-/// a scan of every row in that namespace.
+/// a scan of every row in that namespace. An exact name-or-alias lookup is
+/// bounded the same way, by the id list its predicate seeks.
 fn entity_read_source(filter: &EntityFilter) -> &'static str {
-    if filter.ids.is_empty() {
-        "entities"
-    } else {
+    if reads_by_id_list(filter) {
         "entities INDEXED BY sqlite_autoindex_entities_1"
+    } else {
+        "entities"
     }
+}
+
+fn reads_by_id_list(filter: &EntityFilter) -> bool {
+    !filter.ids.is_empty() || filter.name_or_alias_exact.is_some()
 }
 
 fn build_entity_count_query(filter: &EntityFilter, where_sql: &str) -> String {
@@ -993,12 +1269,14 @@ fn build_entity_page_query_from_source(
 fn entity_list_source(filter: &EntityFilter) -> &'static str {
     if filter.tombstones != EntityTombstones::Live
         || !filter.property_equalities.is_empty()
+        || !filter.property_prefixes.is_empty()
         || !filter.ids.is_empty()
         || !filter.kinds.is_empty()
         || !filter.entity_types_by_kind.is_empty()
         || filter.legacy_entity_type_fallback
         || filter.name_prefix.is_some()
         || filter.name_exact.is_some()
+        || filter.name_or_alias_exact.is_some()
         || !filter.names_ci.is_empty()
         || !filter.tags_any.is_empty()
     {
@@ -1014,7 +1292,7 @@ fn entity_list_source(filter: &EntityFilter) -> &'static str {
 }
 
 fn entity_list_index(filter: &EntityFilter) -> Option<&'static str> {
-    if !filter.ids.is_empty() {
+    if reads_by_id_list(filter) {
         return None;
     }
     entity_list_source(filter).strip_prefix("entities INDEXED BY ")
@@ -1024,6 +1302,7 @@ fn is_entity_streaming_page(filter: &EntityFilter) -> bool {
     filter.ids.is_empty()
         && filter.name_prefix.is_none()
         && filter.name_exact.is_none()
+        && filter.name_or_alias_exact.is_none()
         && filter.names_ci.is_empty()
 }
 
@@ -1073,7 +1352,7 @@ fn entity_count_free_source(filter: &EntityFilter) -> &'static str {
 }
 
 fn entity_count_free_index(filter: &EntityFilter) -> Option<&'static str> {
-    if !filter.ids.is_empty() {
+    if reads_by_id_list(filter) {
         return None;
     }
     entity_count_free_source(filter).strip_prefix("entities INDEXED BY ")
@@ -1182,11 +1461,13 @@ fn build_entity_cursor_query(
 fn is_complete_id_lookup(filter: &EntityFilter, page: &PageRequest) -> bool {
     !filter.ids.is_empty()
         && filter.property_equalities.is_empty()
+        && filter.property_prefixes.is_empty()
         && filter.kinds.is_empty()
         && filter.entity_types.is_empty()
         && filter.entity_types_by_kind.is_empty()
         && filter.name_prefix.is_none()
         && filter.name_exact.is_none()
+        && filter.name_or_alias_exact.is_none()
         && filter.tags_any.is_empty()
         && filter.names_ci.is_empty()
         && page.offset == 0
@@ -1422,6 +1703,11 @@ impl EntityStore for SqlEntityStore {
             StorageCapability::Entities,
             "query_entities_after",
         )?;
+        super::validate_json_prefix_paths(
+            &filter.property_prefixes,
+            StorageCapability::Entities,
+            "query_entities_after",
+        )?;
         if limit == 0 {
             return Ok(SeekPage::default());
         }
@@ -1455,7 +1741,7 @@ impl EntityStore for SqlEntityStore {
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                 params.iter().map(|param| param.as_ref()).collect();
             let rows = stmt.query_map(param_refs.as_slice(), |row| {
-                Ok((read_entity(row)?, row.get::<_, i64>(15)?))
+                Ok((read_entity(row)?, row.get::<_, i64>(16)?))
             })?;
             let mut entries = rows.collect::<Result<Vec<_>, _>>()?;
             let has_more = entries.len() > limit_usize;
@@ -1488,6 +1774,65 @@ impl EntityStore for SqlEntityStore {
                 Some(row) => Ok(Some(read_entity(row)?)),
                 None => Ok(None),
             }
+        })
+        .await
+    }
+
+    async fn get_entity_by_key(
+        &self,
+        namespace: &str,
+        kind: &str,
+        key: &str,
+    ) -> Result<Option<Entity>, StorageError> {
+        let namespace = namespace.to_string();
+        let kind = kind.to_string();
+        let key = key.to_string();
+        self.with_reader("get_entity_by_key", move |conn| {
+            let sql = format!(
+                "SELECT {ENTITY_SELECT_COLUMNS} FROM entity_keys \
+                 JOIN entities ON entities.id = entity_keys.entity_id \
+                 WHERE entity_keys.namespace = ?1 AND entity_keys.kind = ?2 \
+                   AND entity_keys.key = ?3 AND entity_keys.released_at IS NULL \
+                   AND entities.deleted_at IS NULL"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(rusqlite::params![namespace, kind, key])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(read_entity(row)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    async fn taken_entity_keys(&self, id: Uuid) -> Result<Vec<EntityKeyHolder>, StorageError> {
+        let id_str = id.to_string();
+        self.with_reader("taken_entity_keys", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT mine.kind, mine.key, held.entity_id FROM entity_keys AS mine \
+                 JOIN entity_keys AS held \
+                   ON held.namespace = mine.namespace AND held.kind = mine.kind \
+                  AND held.key = mine.key AND held.released_at IS NULL \
+                  AND held.entity_id <> mine.entity_id \
+                 WHERE mine.entity_id = ?1 AND mine.released_at IS NOT NULL \
+                 ORDER BY mine.kind, mine.key",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![id_str], |row| {
+                let holder: String = row.get(2)?;
+                let holder_id = Uuid::parse_str(&holder).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(EntityKeyHolder {
+                    kind: row.get(0)?,
+                    key: row.get(1)?,
+                    holder_id,
+                })
+            })?;
+            rows.collect()
         })
         .await
     }
@@ -1526,6 +1871,11 @@ impl EntityStore for SqlEntityStore {
     ) -> Result<u64, StorageError> {
         super::validate_json_equality_paths(
             &filter.property_equalities,
+            StorageCapability::Entities,
+            "count_entities",
+        )?;
+        super::validate_json_prefix_paths(
+            &filter.property_prefixes,
             StorageCapability::Entities,
             "count_entities",
         )?;
@@ -1586,8 +1936,15 @@ impl EntityStore for SqlEntityStore {
 const ENTITIES_DDL: &str = include_str!("../../sql/entities-ddl.sql");
 
 pub(crate) fn ensure_entities_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(ENTITIES_DDL)
+    conn.execute_batch(ENTITIES_DDL)?;
+    conn.execute_batch(crate::migrations::ENTITY_KEYS_DDL)?;
+    conn.execute_batch(crate::migrations::ENTITY_KEY_KIND_GUARD_DDL)?;
+    conn.execute_batch(crate::migrations::ENTITY_ALIASES_DDL)
 }
+
+#[cfg(test)]
+#[path = "entity_key_kind_guard_tests.rs"]
+mod entity_key_kind_guard_tests;
 
 #[cfg(test)]
 #[path = "entity_tests.rs"]

@@ -994,3 +994,39 @@ async fn atomic_property_patch_refuses_web_receipt_before_secret_gate_across_the
     let stored = raw.get_note(ordinary.id).await.unwrap().unwrap();
     assert_eq!(stored.properties.unwrap()["read"], false);
 }
+
+#[tokio::test]
+async fn incoming_secret_assignment_stops_before_policy_reads_and_backend_forwarding() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    let token = NamespaceToken::local();
+    let raw = runtime.raw_notes(&token).unwrap();
+    let note = Note::new("local", "observation", "retained row")
+        .with_properties(json!({"keep": [1, true, "value"]}));
+    raw.upsert_note(note.clone()).await.unwrap();
+    let before = raw.get_note(note.id).await.unwrap().unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let assignments = Arc::new(AtomicUsize::new(0));
+    let store = PolicyEnforcingNoteStore::wrap(Arc::new(ReadCountingStore {
+        inner: Arc::clone(&raw),
+        reads: Arc::clone(&reads),
+        key_assignments: Arc::clone(&assignments),
+    }));
+    let key = format!("ghp_{}", "A".repeat(40));
+    for id in [note.id, Uuid::nil()] {
+        let result = store.assign_note_key_if_unset(id, &key, "local").await;
+        assert!(
+            matches!(&result, Err(StorageError::SecretDetected { matched, .. })
+            if matched.location.as_deref() == Some("note.key")),
+            "public wrapper must refuse before row lookup: {result:?}"
+        );
+    }
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    assert_eq!(assignments.load(Ordering::SeqCst), 0);
+    assert_eq!(raw.get_note(note.id).await.unwrap().unwrap(), before);
+    let core_result = raw.assign_note_key_if_unset(note.id, &key, "local").await;
+    assert!(
+        matches!(core_result, Err(StorageError::SecretDetected { .. })),
+        "core backend must enforce the same write-only contract: {core_result:?}"
+    );
+    assert_eq!(raw.get_note(note.id).await.unwrap().unwrap(), before);
+}

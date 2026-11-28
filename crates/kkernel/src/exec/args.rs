@@ -16,6 +16,18 @@ pub struct ExecArgs {
     /// Mutually exclusive with `--pending-events` and `--ops-file`.
     pub ops: Option<String>,
 
+    /// Open an existing file-backed database read-only for inline DSL inspection.
+    ///
+    /// Runs in-process without forwarding to a writable daemon. Every operation
+    /// must have a reviewed Read declaration and must not be a side-effecting
+    /// assertion; writes and unknown operations are refused before dispatch.
+    /// Requires an existing database; in-memory storage, declared backend
+    /// topologies, configured mounts, plan, ops-file and pending-event modes are
+    /// unsupported.
+    /// Explicitly requested `--save-file` output is still written.
+    #[arg(long, conflicts_with_all = ["plan", "ops_file", "pending_events"])]
+    pub read_only: bool,
+
     /// Check grammar and list stages without executing operations.
     ///
     /// Requires an already-running daemon with matching configuration. Prints
@@ -139,15 +151,21 @@ pub struct ExecArgs {
     /// The source is capped at 512 MiB total and 96 MiB per physical line, then
     /// spooled to a validated temporary snapshot before writes. Dispatch chunks
     /// are capped at 100 ops and 32 MiB (one larger op runs alone). Progress is
-    /// printed per chunk to stderr; the final aggregate summary is printed to
-    /// stdout, or `--save-file` incrementally writes ordered JSONL rows to a
-    /// sibling temp file. Success atomically publishes the complete file and
+    /// printed per chunk to stderr; the final aggregate summary (counts and any
+    /// failures, with no per-op results and so no created ids) is printed to
+    /// stdout. To keep every op's result, ids included, pass `--save-file`: it
+    /// incrementally writes ordered JSONL rows to a sibling temp file. Success atomically publishes the complete file and
     /// prints its ordinary manifest. A later failure leaves database effects
     /// incremental, discards the incomplete temp file, and prints an aborted
     /// reconciliation manifest before returning non-zero.
     /// Pass `--serial` to retain those logical chunks while awaiting every
     /// handler before starting the next; this keeps one warm server/model and
     /// limits handler concurrency to one.
+    /// Each chunk is one batch request with a shared 4,194,304-byte serialized
+    /// result budget. Accounting is cumulative across that request's per-op
+    /// results, then resets for the next chunk; it is not a whole-file or
+    /// whole-invocation limit. The summary reports `response_budget_refused`
+    /// when any ops are refused, and any such refusal makes `exec` exit non-zero.
     ///
     /// Mutually exclusive with the positional `ops` argument.
     #[arg(long, value_name = "PATH")]
@@ -193,7 +211,8 @@ pub struct ExecArgs {
 
     /// Exit non-zero when any op in the batch fails (or, for `--ops-file`,
     /// when any applied op fails). Without this flag a *partially* failed
-    /// batch still exits 0 — the per-op `results` entries and the
+    /// batch still exits 0, except that `--ops-file` response-budget refusals
+    /// always exit non-zero. The per-op `results` entries and the
     /// `summary`/`status` fields in the printed output are the signal
     /// (#1220). A batch in which *every* op failed always exits non-zero,
     /// with or without this flag (#1339). A rolled-back `--atomic` unit also

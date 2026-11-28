@@ -722,10 +722,11 @@ async fn named_grant_malformed_rows_refuse_without_borrowing_a_companion() {
         HELD,
         "malformed named behind valid tie",
     );
-    assert_decision(
+    assert_decode(
         decide(&f.rt, "local", ACTOR, TOOL, None, None).await,
-        Some("a-valid"),
-        "decide selects valid earlier tie ID",
+        "expires_at",
+        HELD,
+        "decide refuses matching malformed row despite valid earlier tie ID",
     );
     for column in [
         "id",
@@ -911,7 +912,7 @@ async fn named_grant_answer_is_invariant_under_companion_placement() {
                     || placement.is_none_or(|(id, at)| at < 10 || at == 10 && HELD < id));
             let reader_answer =
                 decide(&f.rt, "local", ACTOR, TOOL, None, registration.as_ref()).await;
-            if named_wins && matches!(state, State::TextExpiry | State::TextRequested) {
+            if matches!(state, State::TextExpiry | State::TextRequested) {
                 assert_decode(reader_answer, state.error_column().unwrap(), HELD, &label);
             } else {
                 assert_decision(
@@ -948,6 +949,9 @@ async fn named_grant_actor_tool_patterns_and_namespace_are_exact() {
             ("nul\0*", "nul\0tail", true),
             ("nul\0exact", "nul\0other", false),
         ] {
+            let matches = matches
+                || (column == "tool"
+                    && matches!((pattern, value), ("Exact", "exact") | ("Pre*", "prefix")));
             f.clear().await;
             let mut row = Grant::live(HELD, 10, None);
             if column == "actor" {
@@ -1070,6 +1074,7 @@ fn variant(error: &StorageError) -> &'static str {
         StorageError::AlreadyExists { .. } => "AlreadyExists",
         StorageError::Conflict { .. } => "Conflict",
         StorageError::InvalidInput { .. } => "InvalidInput",
+        StorageError::SecretDetected { .. } => "SecretDetected",
         StorageError::Unsupported { .. } => "Unsupported",
         StorageError::BlobTooLarge { .. } => "BlobTooLarge",
         StorageError::BlobSizeMismatch { .. } => "BlobSizeMismatch",
@@ -1089,6 +1094,9 @@ fn variant(error: &StorageError) -> &'static str {
         StorageError::WriterTaskBusy { .. } => "WriterTaskBusy",
         StorageError::WriterTaskRequestFailed { .. } => "WriterTaskRequestFailed",
         StorageError::WriterTaskTerminated { .. } => "WriterTaskTerminated",
+        StorageError::WriteOutcomeUnknown { .. } => "WriteOutcomeUnknown",
+        StorageError::WriterOwnerUnavailable { .. } => "WriterOwnerUnavailable",
+        StorageError::WriterRouteViolation { .. } => "WriterRouteViolation",
         StorageError::Internal(..) => "Internal",
         StorageError::WriterTaskNoRuntime => "WriterTaskNoRuntime",
         StorageError::CapacityFloor { .. } => "CapacityFloor",

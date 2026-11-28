@@ -3,11 +3,12 @@
 use std::collections::BTreeMap;
 
 use khive_types::{
-    EdgeRelation, Entity, EntityKind, Id128, Link, Namespace, Note, NoteStatus, PropertyValue,
+    EdgeRelation, EntityAlias, EntityKind, Id128, Link, Namespace, Note, NoteStatus, PropertyValue,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::strict::{StrictEntity, StrictLink, StrictNote};
+use crate::EntityRecord;
 
 /// One staged mutation, internally tagged by the snake-case `op` field.
 ///
@@ -56,6 +57,14 @@ pub struct EntityCreateFields {
     pub properties: BTreeMap<String, PropertyValue>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Caller key under `entity_kind`, claimed when the create lands
+    /// (ADR-221 section 1). Omitted from the wire when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Caller aliases, stored with the `caller` origin; one equal to `name`
+    /// is not stored (ADR-221 section 2). Omitted from the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
 
 /// Fields staged for a new note.
@@ -235,6 +244,12 @@ pub enum UpdatePatch {
 /// Entity fields to mutate; absent means unchanged and `Some(None)` clears
 /// a nullable field (ADR-014 tri-state, applied to `description` and
 /// `entity_type`).
+///
+/// `aliases` is the entity's whole alias set after the update, every origin
+/// included, as tags are the whole tag list: the apply writes exactly that set
+/// with the origins given. Without it the apply leaves the aliases as they are,
+/// and refuses a rename onto a name the entity holds as an alias, since
+/// dropping that alias would be a change no preimage records.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntityPatch {
@@ -248,6 +263,8 @@ pub struct EntityPatch {
     pub tags: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_opt")]
     pub entity_type: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aliases: Option<Vec<EntityAlias>>,
 }
 
 /// Note fields to mutate; nested options distinguish unchanged, clear, and set.
@@ -368,6 +385,9 @@ pub struct EntityPreimage {
     pub tags: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_opt")]
     pub entity_type: Option<Option<String>>,
+    /// The entity's whole alias set before the update, every origin included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aliases: Option<Vec<EntityAlias>>,
 }
 
 /// Prior note values for exactly the fields touched by [`NotePatch`].
@@ -433,6 +453,14 @@ fn validate_update_congruence(
                 p.entity_type.is_some(),
                 pre.entity_type.is_some(),
             )?;
+            check_touched("aliases", p.aliases.is_some(), pre.aliases.is_some())?;
+            for (side, set) in [("patch", &p.aliases), ("preimage", &pre.aliases)] {
+                if let Some(alias) = set.as_deref().and_then(repeated_alias) {
+                    return Err(format!(
+                        "UpdateOp {side} aliases name {alias:?} more than once"
+                    ));
+                }
+            }
             Ok(())
         }
         (UpdatePatch::Note(p), UpdatePreimage::Note(pre)) => {
@@ -484,6 +512,12 @@ fn validate_update_congruence(
             preimage_target_name(preimage)
         )),
     }
+}
+
+/// The first alias a set names twice, whatever the origins: one entity holds
+/// one row per alias.
+fn repeated_alias(set: &[EntityAlias]) -> Option<&str> {
+    crate::record::repeated(set.iter().map(|held| held.alias.as_str()))
 }
 
 fn check_touched(field: &str, patch_touched: bool, preimage_present: bool) -> Result<(), String> {
@@ -583,7 +617,7 @@ impl RestoreOp {
             }
         }
         let (live, valid) = match &record {
-            DeletePreimage::Entity(row) => (row.deleted_at.is_none(), true),
+            DeletePreimage::Entity(row) => (row.entity.deleted_at.is_none(), true),
             DeletePreimage::Note(row) => (row.deleted_at.is_none(), row.is_valid()),
             DeletePreimage::Edge(row) => (row.deleted_at.is_none(), row.is_valid()),
         };
@@ -625,10 +659,14 @@ impl<'de> Deserialize<'de> for RestoreOp {
 }
 
 /// Full prior record state, tagged by `substrate` to avoid its embedded `kind` field.
+///
+/// An entity is carried whole, with the keys it holds and its aliases
+/// (ADR-221 section 4), so the record a delete removes is the record a restore
+/// would bring back.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "substrate", rename_all = "snake_case")]
 pub enum DeletePreimage {
-    Entity(Box<Entity>),
+    Entity(Box<EntityRecord>),
     Note(Box<Note>),
     Edge(Box<Link>),
 }
@@ -637,7 +675,7 @@ impl DeletePreimage {
     /// The identifier of the record this preimage was captured from.
     fn record_id(&self) -> Id128 {
         match self {
-            DeletePreimage::Entity(e) => e.header.id,
+            DeletePreimage::Entity(e) => e.entity.header.id,
             DeletePreimage::Note(n) => n.header.id,
             DeletePreimage::Edge(l) => l.id,
         }
@@ -660,7 +698,9 @@ impl<'de> Deserialize<'de> for DeletePreimage {
     {
         let raw = DeletePreimageRaw::deserialize(deserializer)?;
         Ok(match raw {
-            DeletePreimageRaw::Entity(e) => DeletePreimage::Entity(Box::new(e.into())),
+            DeletePreimageRaw::Entity(e) => {
+                DeletePreimage::Entity(Box::new(e.try_into().map_err(serde::de::Error::custom)?))
+            }
             DeletePreimageRaw::Note(n) => {
                 DeletePreimage::Note(Box::new(n.try_into().map_err(serde::de::Error::custom)?))
             }
@@ -697,16 +737,16 @@ impl<'de> Deserialize<'de> for MergeOp {
         D: Deserializer<'de>,
     {
         let raw = MergeOpRaw::deserialize(deserializer)?;
-        if raw.into_id != raw.preimage.into.header.id {
+        if raw.into_id != raw.preimage.into.entity.header.id {
             return Err(serde::de::Error::custom(format!(
                 "MergeOp into_id {} does not match preimage.into record id {}",
-                raw.into_id, raw.preimage.into.header.id
+                raw.into_id, raw.preimage.into.entity.header.id
             )));
         }
-        if raw.from_id != raw.preimage.from.header.id {
+        if raw.from_id != raw.preimage.from.entity.header.id {
             return Err(serde::de::Error::custom(format!(
                 "MergeOp from_id {} does not match preimage.from record id {}",
-                raw.from_id, raw.preimage.from.header.id
+                raw.from_id, raw.preimage.from.entity.header.id
             )));
         }
         for edge in &raw.preimage.incident_edges {
@@ -729,11 +769,15 @@ impl<'de> Deserialize<'de> for MergeOp {
 
 /// Full prior state required to validate and rewire an entity merge.
 ///
+/// Both participants are carried whole, with the keys they hold and their
+/// aliases (ADR-221 section 4). Canonical apply does not run a merge yet; the
+/// record is complete for the applier that will.
+///
 /// See `crates/khive-changeset/docs/api/delete-and-merge.md` for edge coverage rules.
 #[derive(Clone, Debug, Serialize)]
 pub struct MergePreimage {
-    pub into: Box<Entity>,
-    pub from: Box<Entity>,
+    pub into: Box<EntityRecord>,
+    pub from: Box<EntityRecord>,
     pub incident_edges: Vec<Link>,
 }
 
@@ -757,8 +801,8 @@ impl<'de> Deserialize<'de> for MergePreimage {
             .map(|l| l.try_into().map_err(serde::de::Error::custom))
             .collect::<Result<Vec<Link>, D::Error>>()?;
         Ok(MergePreimage {
-            into: Box::new(raw.into.into()),
-            from: Box::new(raw.from.into()),
+            into: Box::new(raw.into.try_into().map_err(serde::de::Error::custom)?),
+            from: Box::new(raw.from.try_into().map_err(serde::de::Error::custom)?),
             incident_edges,
         })
     }
@@ -933,6 +977,7 @@ mod tests {
                 properties: None,
                 tags: None,
                 entity_type: None,
+                aliases: None,
             }),
             UpdatePreimage::Entity(EntityPreimage {
                 name: None,
@@ -940,6 +985,7 @@ mod tests {
                 properties: None,
                 tags: None,
                 entity_type: None,
+                aliases: None,
             }),
         );
         assert!(result.is_err());

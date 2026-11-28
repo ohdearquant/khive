@@ -10,16 +10,11 @@ use khive_runtime::{
 };
 use khive_types::{HandlerDef, NotePropertyPolicySpec, Pack, PropertyPolicy};
 
-#[cfg(feature = "node")]
-use std::sync::Arc;
-
 use crate::handlers;
 use crate::inbox_signal::InboxSignal;
-#[cfg(feature = "node")]
-use crate::node::{NodeHostState, RuntimeNodeSendRoute};
 use crate::vocab::{COMM_HANDLERS, COMM_SCHEMA_PLAN_STMTS};
 
-/// Communication pack providing fifteen public `comm.*` verbs.
+/// Communication pack providing sixteen public `comm.*` verbs.
 ///
 /// Stores and queries `message` notes in the standard notes table; message
 /// metadata lives in the `properties` JSON column.
@@ -38,14 +33,9 @@ pub struct CommPack {
     /// given to it.
     channel_ingest: std::sync::OnceLock<khive_runtime::ChannelIngestCapability>,
     email_message_id_domains: Result<Option<EmailMessageIdDomains>, String>,
-    /// Route used by `comm.send` for node-addressed recipients. Without one, a recipient in the
-    /// node address form is handled as an ordinary actor label.
+    /// Route used by `comm.send` for node-addressed recipients. Without one, a send to a recipient
+    /// in the node address form is refused before anything is written.
     node_route: Option<std::sync::Arc<dyn crate::node_route::NodeSendRoute>>,
-    /// Shared node channel state, built from the runtime configuration without I/O. `Ok(None)`
-    /// when the node channel is absent or disabled; `Err` holds the bounded validation message of
-    /// an enabled but invalid configuration, which `validate_config` refuses.
-    #[cfg(feature = "node")]
-    node_state: Result<Option<Arc<NodeHostState>>, String>,
 }
 
 impl Pack for CommPack {
@@ -124,11 +114,6 @@ impl CommPack {
     /// [`khive_runtime::PackRuntime::accept_channel_ingest_capability`]).
     pub fn new(runtime: KhiveRuntime) -> Self {
         runtime.install_note_embedding_policies(<Self as Pack>::NOTE_EMBEDDING_POLICIES);
-        #[cfg(feature = "node")]
-        let node_state = Self::node_state_from_runtime(&runtime);
-        #[cfg(feature = "node")]
-        let node_route = Self::node_route_for(&node_state);
-        #[cfg(not(feature = "node"))]
         let node_route = None;
         Self {
             runtime,
@@ -137,8 +122,6 @@ impl CommPack {
             channel_ingest: std::sync::OnceLock::new(),
             email_message_id_domains: EmailMessageIdDomains::from_env(),
             node_route,
-            #[cfg(feature = "node")]
-            node_state,
         }
     }
 
@@ -194,74 +177,15 @@ impl CommPack {
         self.channel_ingest.get()
     }
 
-    /// Validate the node channel configuration without I/O. A validation failure is kept as its
-    /// bounded message (without the error-kind prefix, which `validate_config` adds back).
-    #[cfg(feature = "node")]
-    fn node_state_from_runtime(
-        runtime: &KhiveRuntime,
-    ) -> Result<Option<Arc<NodeHostState>>, String> {
-        NodeHostState::from_runtime(runtime.clone()).map_err(|error| match error {
-            RuntimeError::InvalidInput(message) => message,
-            other => other.to_string(),
-        })
-    }
-
-    /// The send route owed to this state: one only for an enabled, valid configuration. A
-    /// disabled, absent or invalid configuration installs nothing.
-    #[cfg(feature = "node")]
-    fn node_route_for(
-        state: &Result<Option<Arc<NodeHostState>>, String>,
-    ) -> Option<Arc<dyn crate::node_route::NodeSendRoute>> {
-        match state {
-            Ok(Some(host)) => Some(Arc::new(RuntimeNodeSendRoute::new(host.clone()))
-                as Arc<dyn crate::node_route::NodeSendRoute>),
-            Ok(None) | Err(_) => None,
-        }
-    }
-
-    /// The shared node state for an enabled valid configuration; `None` for disabled, absent or
-    /// invalid. Every call returns the same `Arc`.
-    #[cfg(feature = "node")]
-    fn node_host_state(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        match &self.node_state {
-            Ok(Some(state)) => Some(state.clone()),
-            Ok(None) | Err(_) => None,
-        }
-    }
-
-    /// Without the `node` feature there is no node state.
-    #[cfg(not(feature = "node"))]
+    /// This pack holds no shared host state.
     fn node_host_state(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
         None
     }
 
-    /// Refuse a stored node configuration error. An invalid enabled configuration is never
-    /// treated as "no route".
-    #[cfg(feature = "node")]
-    fn validate_node_config(&self) -> Result<(), RuntimeError> {
-        match &self.node_state {
-            Err(message) => Err(RuntimeError::InvalidInput(message.clone())),
-            Ok(_) => Ok(()),
-        }
-    }
-
-    /// A build without the `node` feature cannot run an enabled `[channel.node]` table, so the
-    /// raw runtime configuration is refused rather than silently ignored.
-    #[cfg(not(feature = "node"))]
-    fn validate_node_config(&self) -> Result<(), RuntimeError> {
-        let enabled = self
-            .runtime
-            .config()
-            .node_channel
-            .as_ref()
-            .is_some_and(|config| config.enabled);
-        if enabled {
-            return Err(RuntimeError::InvalidInput(
-                "channel.node: enabled channel requires a build with node channel support"
-                    .to_string(),
-            ));
-        }
-        Ok(())
+    /// Component validation shares the runtime bound to this pack instance.
+    fn validate_channel_config(&self) -> Result<(), RuntimeError> {
+        let config = self.runtime.config();
+        config.channel_config_validators.validate(&config.channel)
     }
 }
 
@@ -491,7 +415,7 @@ impl PackRuntime for CommPack {
         self.node_host_state()
     }
     fn validate_config(&self) -> Result<(), RuntimeError> {
-        self.validate_node_config()
+        self.validate_channel_config()
     }
     fn note_property_policies(&self) -> &'static [NotePropertyPolicySpec] {
         <Self as Pack>::NOTE_PROPERTY_POLICIES
@@ -583,6 +507,7 @@ impl PackRuntime for CommPack {
             }
             "comm.heartbeat" => handlers::handle_heartbeat(self.runtime(), token, params).await,
             "comm.health" => handlers::handle_health(self.runtime(), token, params).await,
+            "comm.quiet" => handlers::handle_quiet(params),
             "comm.probe" => handlers::handle_probe(self.runtime(), token, params).await,
             "comm.cursor_get" => handlers::handle_cursor_get(self.runtime(), params).await,
             "comm.cursor_commit" => handlers::handle_cursor_commit(self.runtime(), params).await,
@@ -600,3 +525,149 @@ mod help_tests;
 #[cfg(test)]
 #[path = "pack_message_identity_tests.rs"]
 mod message_identity_tests;
+
+#[cfg(test)]
+mod channel_config_tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use khive_runtime::channel_section::ChannelConfigValidator;
+    use khive_runtime::{
+        runtime_config_from_khive_config, KhiveConfig, KhiveRuntime, PackRegistry, RuntimeConfig,
+        RuntimeError, VerbRegistryBuilder,
+    };
+    use khive_types::Pack;
+
+    fn pack_names() -> Vec<String> {
+        vec![
+            <khive_pack_kg::KgPack as Pack>::NAME.into(),
+            <super::CommPack as Pack>::NAME.into(),
+        ]
+    }
+
+    fn runtime(value: i64, validator: Option<ChannelConfigValidator>) -> KhiveRuntime {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!("[channel]\nstand_in = {value}\nunknown = 'retained without activation'\n"),
+        )
+        .unwrap();
+        let loaded = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+        let mut config = RuntimeConfig {
+            db_path: None,
+            brain_profile: None,
+            packs: pack_names(),
+            ..RuntimeConfig::no_embeddings()
+        };
+        if let Some(validator) = validator {
+            config
+                .channel_config_validators
+                .register("stand_in", validator)
+                .unwrap();
+        }
+        KhiveRuntime::new(runtime_config_from_khive_config(&loaded, config)).unwrap()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn automatic_comm_pack_validates_its_exact_config_before_activation() {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observed = observations.clone();
+        let runtime = runtime(
+            41,
+            Some(Arc::new(move |value| {
+                observed.lock().unwrap().push(value.cloned());
+                Ok(())
+            })),
+        );
+        let mut builder = VerbRegistryBuilder::new();
+        PackRegistry::register_packs(&pack_names(), runtime.clone(), &mut builder).unwrap();
+        assert!(
+            observations.lock().unwrap().is_empty(),
+            "registration must not activate components"
+        );
+        let _registry = builder
+            .build()
+            .expect("registered component config is valid");
+        assert_eq!(
+            *observations.lock().unwrap(),
+            vec![Some(toml::Value::Integer(41))],
+            "automatic comm factory must validate the exact opaque component value"
+        );
+        assert_eq!(
+            runtime
+                .config()
+                .channel
+                .get("unknown")
+                .and_then(toml::Value::as_str),
+            Some("retained without activation")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn automatic_comm_pack_refuses_registered_invalid_config_but_keeps_unknown_values() {
+        let unregistered = runtime(7, None);
+        let mut builder = VerbRegistryBuilder::new();
+        PackRegistry::register_packs(&pack_names(), unregistered, &mut builder).unwrap();
+        let _registry = builder
+            .build()
+            .expect("unregistered raw scalar remains inert");
+
+        let invalid = runtime(
+            7,
+            Some(Arc::new(|value| {
+                assert_eq!(value, Some(&toml::Value::Integer(7)));
+                Err(RuntimeError::InvalidInput(
+                    "stand_in requires a table".into(),
+                ))
+            })),
+        );
+        let mut builder = VerbRegistryBuilder::new();
+        PackRegistry::register_packs(&pack_names(), invalid, &mut builder).unwrap();
+        let result = builder.build();
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(ref message)) if message == "stand_in requires a table"),
+            "automatic comm activation must preserve the component's typed refusal"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn automatic_multi_backend_comm_uses_the_selected_runtime_validator() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let default_calls = calls.clone();
+        let default_runtime = runtime(
+            11,
+            Some(Arc::new(move |_| {
+                default_calls.lock().unwrap().push("default");
+                Err(RuntimeError::InvalidInput("wrong runtime selected".into()))
+            })),
+        );
+        let selected_calls = calls.clone();
+        let selected_runtime = runtime(
+            29,
+            Some(Arc::new(move |value| {
+                assert_eq!(value, Some(&toml::Value::Integer(29)));
+                selected_calls.lock().unwrap().push("comm");
+                Ok(())
+            })),
+        );
+        let runtimes = HashMap::from([("comm".into(), selected_runtime)]);
+        let mut builder = VerbRegistryBuilder::new();
+        PackRegistry::register_packs_with_runtimes(
+            &pack_names(),
+            &runtimes,
+            &default_runtime,
+            &mut builder,
+        )
+        .unwrap();
+        let _registry = builder.build().expect("selected comm runtime is valid");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["comm"],
+            "multi-backend comm activation must use its selected runtime, not the default"
+        );
+    }
+}

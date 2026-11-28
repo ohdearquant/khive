@@ -86,7 +86,7 @@ struct HelpPack {
 }
 
 impl Pack for HelpPack {
-    const NAME: &'static str = "helptest";
+    const NAME: &'static str = "kg";
     const NOTE_KINDS: &'static [&'static str] = &["task"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &[
@@ -96,13 +96,6 @@ impl Pack for HelpPack {
             visibility: Visibility::Verb,
             category: VerbCategory::Commissive,
             params: &CREATE_PARAMS,
-        },
-        HandlerDef {
-            name: "recall",
-            description: "Recall memory notes with decay-aware hybrid ranking",
-            visibility: Visibility::Verb,
-            category: VerbCategory::Assertive,
-            params: &RECALL_PARAMS,
         },
         // A Subhandler used to test that help=true returns
         // callable_via_mcp: false for internal verbs.
@@ -179,9 +172,55 @@ impl PackRuntime for HelpPack {
     }
 }
 
+struct RecallHelpPack {
+    invocations: Arc<AtomicUsize>,
+}
+
+impl Pack for RecallHelpPack {
+    const NAME: &'static str = "memory";
+    const NOTE_KINDS: &'static [&'static str] = &[];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+        name: "memory.recall",
+        description: "Recall memory notes with decay-aware hybrid ranking",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &RECALL_PARAMS,
+    }];
+}
+
+#[async_trait]
+impl PackRuntime for RecallHelpPack {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+    fn note_kinds(&self) -> &'static [&'static str] {
+        Self::NOTE_KINDS
+    }
+    fn entity_kinds(&self) -> &'static [&'static str] {
+        Self::ENTITY_KINDS
+    }
+    fn handlers(&self) -> &'static [HandlerDef] {
+        Self::HANDLERS
+    }
+    async fn dispatch(
+        &self,
+        verb: &str,
+        _params: Value,
+        _registry: &VerbRegistry,
+        _token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        self.invocations.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::json!({ "pack": "memory", "verb": verb }))
+    }
+}
+
 fn build_help_registry(invocations: Arc<AtomicUsize>) -> VerbRegistry {
     let mut builder = VerbRegistryBuilder::new();
-    builder.register(HelpPack { invocations });
+    builder.register(HelpPack {
+        invocations: invocations.clone(),
+    });
+    builder.register(RecallHelpPack { invocations });
     builder.build().expect("help registry builds")
 }
 
@@ -200,7 +239,7 @@ async fn test_help_true_does_not_execute_the_verb() {
     reg.dispatch("create", serde_json::json!({ "help": true }))
         .await
         .expect("help=true must succeed");
-    reg.dispatch("recall", serde_json::json!({ "help": true }))
+    reg.dispatch("memory.recall", serde_json::json!({ "help": true }))
         .await
         .expect("help=true must succeed");
 
@@ -252,7 +291,7 @@ async fn help_true_on_subhandler_returns_callable_via_mcp_false() {
     // The verb and pack fields must still be present so the caller knows
     // what the schema belongs to.
     assert_eq!(result["verb"], "recall.embed");
-    assert_eq!(result["pack"], "helptest");
+    assert_eq!(result["pack"], "kg");
 }
 
 /// Public Verb-visibility handlers must NOT have `callable_via_mcp: false`.
@@ -346,8 +385,8 @@ async fn help_true_unknown_verb_available_list_excludes_subhandlers() {
         "unknown-verb help error must still list public verb 'create': {msg}"
     );
     assert!(
-        msg.contains("recall"),
-        "unknown-verb help error must still list public verb 'recall': {msg}"
+        msg.contains("memory.recall"),
+        "unknown-verb help error must still list public verb 'memory.recall': {msg}"
     );
 }
 
@@ -374,8 +413,8 @@ async fn dispatch_unknown_verb_available_list_excludes_subhandlers() {
         "dispatch unknown-verb error must still list public verb 'create': {msg}"
     );
     assert!(
-        msg.contains("recall"),
-        "dispatch unknown-verb error must still list public verb 'recall': {msg}"
+        msg.contains("memory.recall"),
+        "dispatch unknown-verb error must still list public verb 'memory.recall': {msg}"
     );
 }
 

@@ -197,6 +197,328 @@ async fn test_recall_supersedes_batch_matches_per_candidate_lookup() {
     );
 }
 
+/// Default recall suppresses a local candidate using an incoming edge stored
+/// in another namespace that is already visible to the caller.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn default_recall_suppresses_edges_in_every_visible_namespace() {
+    let visible = Namespace::parse("visible").expect("visible namespace");
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        visible_namespaces: vec![visible.clone()],
+        ..RuntimeConfig::default()
+    })
+    .expect("in-memory runtime");
+    let local_token = rt
+        .authorize(Namespace::local())
+        .expect("authorize local");
+    let visible_token = rt
+        .authorize(visible.clone())
+        .expect("authorize visible namespace");
+    let query = "visible namespace edge suppresses old memory";
+    let old = rt
+        .create_note(
+            &local_token,
+            "memory",
+            None,
+            query,
+            Some(0.8),
+            Some(json!({"memory_type": "semantic"})),
+            vec![],
+        )
+        .await
+        .expect("create old local memory");
+    let newer = rt
+        .create_note(
+            &visible_token,
+            "memory",
+            None,
+            "unrelated replacement text",
+            Some(0.8),
+            Some(json!({"memory_type": "semantic"})),
+            vec![],
+        )
+        .await
+        .expect("create non-matching replacement memory");
+    rt.link(
+        &visible_token,
+        newer.id,
+        old.id,
+        EdgeRelation::Supersedes,
+        1.0,
+        None,
+    )
+    .await
+    .expect("store supersedes edge in visible namespace");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_visible_namespaces(vec![visible]);
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt),
+    ));
+    let registry = builder.build().expect("registry builds");
+    let baseline = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": query,
+                "limit": 10,
+                "fusion_strategy": "keyword_only",
+                "config": {"scoring": {
+                    "enable_supersedes_suppression": false,
+                    "mmr_penalty": 0.0
+                }}
+            }),
+        )
+        .await
+        .expect("baseline recall succeeds");
+    let baseline_ids: Vec<&str> = baseline
+        .as_array()
+        .expect("baseline recall returns an array")
+        .iter()
+        .filter_map(|hit| hit["id"].as_str())
+        .collect();
+    let old_id = old.id.to_string();
+    let newer_id = newer.id.to_string();
+    assert!(baseline_ids.contains(&old_id.as_str()));
+    assert!(!baseline_ids.contains(&newer_id.as_str()));
+    let hits = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": query,
+                "limit": 10,
+                "fusion_strategy": "keyword_only",
+                "config": {"scoring": {"mmr_penalty": 0.0}}
+            }),
+        )
+        .await
+        .expect("default recall succeeds");
+    assert!(
+        hits.as_array()
+            .expect("recall returns an array")
+            .iter()
+            .all(|hit| hit["id"].as_str() != Some(old_id.as_str())),
+        "default recall must suppress the old memory by its visible incoming edge: {hits}"
+    );
+}
+
+/// An explicit namespace narrows the edge read to that namespace: an old row in
+/// `visible` whose `supersedes` edge sits in `local` is returned to a request
+/// for `visible`, and hidden from a default request, which sees both.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn explicit_namespace_recall_reads_edges_only_where_it_can_see() {
+    let visible = Namespace::parse("visible").expect("visible namespace");
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        visible_namespaces: vec![visible.clone()],
+        ..RuntimeConfig::default()
+    })
+    .expect("in-memory runtime");
+    let local_token = rt.authorize(Namespace::local()).expect("authorize local");
+    let visible_token = rt
+        .authorize(visible.clone())
+        .expect("authorize visible namespace");
+    let query = "explicit namespace narrows edge reads";
+    let old = rt
+        .create_note(
+            &visible_token,
+            "memory",
+            None,
+            query,
+            Some(0.8),
+            Some(json!({"memory_type": "semantic"})),
+            vec![],
+        )
+        .await
+        .expect("create old memory in the visible namespace");
+    let newer = rt
+        .create_note(
+            &local_token,
+            "memory",
+            None,
+            "unrelated replacement text",
+            Some(0.8),
+            Some(json!({"memory_type": "semantic"})),
+            vec![],
+        )
+        .await
+        .expect("create non-matching replacement memory");
+    rt.link(
+        &local_token,
+        newer.id,
+        old.id,
+        EdgeRelation::Supersedes,
+        1.0,
+        None,
+    )
+    .await
+    .expect("store supersedes edge in local");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_visible_namespaces(vec![visible.clone()]);
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt),
+    ));
+    let registry = builder.build().expect("registry builds");
+    let ids = |hits: &serde_json::Value| -> Vec<String> {
+        hits.as_array()
+            .expect("recall returns an array")
+            .iter()
+            .filter_map(|hit| hit["id"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let old_id = old.id.to_string();
+
+    let explicit = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": query,
+                "namespace": visible.as_str(),
+                "limit": 10,
+                "fusion_strategy": "keyword_only",
+                "config": {"scoring": {"mmr_penalty": 0.0}}
+            }),
+        )
+        .await
+        .expect("explicit namespace recall succeeds");
+    assert!(
+        ids(&explicit).contains(&old_id),
+        "an edge outside the explicit namespace must not hide the old memory: {explicit}"
+    );
+
+    let default = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": query,
+                "limit": 10,
+                "fusion_strategy": "keyword_only",
+                "config": {"scoring": {"mmr_penalty": 0.0}}
+            }),
+        )
+        .await
+        .expect("default recall succeeds");
+    assert!(
+        !ids(&default).contains(&old_id),
+        "a default recall sees local and must hide the old memory: {default}"
+    );
+}
+
+/// Property suppression accepts full UUIDs and long lowercase hex prefixes,
+/// while empty and one-character values suppress no ranked candidate. These
+/// legacy rows are written through NoteStore::upsert_note, below memory.remember.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn recall_property_suppression_requires_uuid_or_long_hex_prefix() {
+    let rt = make_runtime();
+    let token = rt
+        .authorize(Namespace::local())
+        .expect("authorize local");
+    // Targets start with a0, a1, a2, a3 and sources with b0..b3, so a value
+    // derived from one case's target can name no other row.
+    let words = ["alpha", "bravo", "charlie", "delta"];
+    let mut expected = Vec::new();
+    for (index, word) in words.into_iter().enumerate() {
+        let query = format!("property suppression {word} marker");
+        let target_id = Uuid::from_u128(((0xa0 + index as u128) << 120) | 1);
+        let source_id = Uuid::from_u128(((0xb0 + index as u128) << 120) | 2);
+        let target_text = target_id.to_string();
+        let supersedes = match index {
+            0 => String::new(),
+            1 => target_text[..1].to_owned(),
+            2 => target_text.clone(),
+            _ => target_text[..8].to_owned(),
+        };
+        let mut target = khive_storage::Note::new("local", "memory", &query)
+            .with_salience(0.8)
+            .with_properties(json!({"memory_type": "semantic"}));
+        target.id = target_id;
+        let mut source = khive_storage::Note::new("local", "memory", &query)
+            .with_salience(0.8)
+            .with_properties(json!({
+                "memory_type": "semantic",
+                "supersedes": supersedes.as_str()
+            }));
+        source.id = source_id;
+        let notes = rt.notes(&token).expect("note store");
+        notes.upsert_note(target).await.expect("store target note");
+        notes
+            .upsert_note(source)
+            .await
+            .expect("store source note with legacy property");
+        // upsert_note writes the note row only. Keyword recall reads the text
+        // index, so each row gets the text document memory.remember would write.
+        let text = rt.text_for_notes(&token).expect("text store");
+        for subject_id in [target_id, source_id] {
+            text.upsert_document(khive_storage::TextDocument {
+                subject_id,
+                kind: khive_types::SubstrateKind::Note,
+                record_kind: Some("memory".into()),
+                namespace: "local".into(),
+                title: None,
+                body: query.clone(),
+                tags: vec![],
+                metadata: None,
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("index note text");
+        }
+        expected.push((query, supersedes, target_id, source_id));
+    }
+
+    let registry = make_registry(rt);
+    for (query, supersedes, target_id, source_id) in expected {
+        let hits = registry
+            .dispatch(
+                "memory.recall",
+                json!({
+                    "query": query,
+                    "limit": 10,
+                    "fusion_strategy": "keyword_only",
+                    "config": {"scoring": {"mmr_penalty": 0.0}}
+                }),
+            )
+            .await
+            .expect("recall succeeds");
+        let ids: Vec<Uuid> = hits
+            .as_array()
+            .expect("recall returns an array")
+            .iter()
+            .filter_map(|hit| hit["id"].as_str())
+            .map(|id| Uuid::parse_str(id).expect("hit ID is a UUID"))
+            .collect();
+        if supersedes.len() < 8 {
+            assert!(
+                ids.contains(&target_id),
+                "invalid property {supersedes:?} hid target"
+            );
+            assert!(
+                ids.contains(&source_id),
+                "invalid property {supersedes:?} hid source"
+            );
+        } else {
+            assert!(
+                !ids.contains(&target_id),
+                "valid property {supersedes:?} missed target"
+            );
+            assert!(
+                ids.contains(&source_id),
+                "valid property {supersedes:?} hid source"
+            );
+        }
+    }
+}
+
 /// Supersedes suppression asks for every candidate's incoming edge in one
 /// batched statement, not one statement per candidate (#3881).
 #[tokio::test]
@@ -263,10 +585,23 @@ async fn test_recall_supersedes_lookup_is_one_batched_statement() {
         CANDIDATES.div_ceil(BATCH_CHUNK),
         "the candidates' supersedes edges must be read in ceil(N / 880) statements"
     );
+    let is_hidden_count = |sql: &str| {
+        sql.contains("COUNT(*) FROM graph_edges") && sql.contains("json_each(")
+    };
+    let hidden_counts = statements
+        .iter()
+        .filter(|statement| is_hidden_count(&statement.sql))
+        .count();
+    assert_eq!(
+        hidden_counts, 1,
+        "the hidden incoming edge count must be one grouped statement per recall"
+    );
     let per_candidate = statements
         .iter()
         .filter(|statement| {
-            statement.sql.contains("target_id IN (") && statement.sql.contains("relation IN (")
+            statement.sql.contains("target_id IN (")
+                && statement.sql.contains("relation IN (")
+                && !is_hidden_count(&statement.sql)
         })
         .count();
     assert_eq!(

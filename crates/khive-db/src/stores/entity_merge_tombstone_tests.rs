@@ -5,11 +5,7 @@ use std::collections::BTreeMap;
 
 fn snapshot(conn: &Connection) -> Vec<BTreeMap<String, Value>> {
     let mut statement = conn.prepare("SELECT * FROM entities ORDER BY id").unwrap();
-    let columns: Vec<String> = statement
-        .column_names()
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let columns: Vec<String> = statement.column_names().map(str::to_owned).collect();
     statement
         .query_map([], |row| {
             columns

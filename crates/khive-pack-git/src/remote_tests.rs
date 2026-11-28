@@ -3,7 +3,9 @@
 // are independent of the recording platform's request ledger.
 
 use crate::receipts::{self, Disposition, Receipt};
-use crate::remote_transport::{ApiRequest, PushRequest, RemoteError, RemoteTransport};
+use crate::remote_transport::{
+    ApiRequest, Download, FetchRequest, Fetched, PushRequest, RemoteError, RemoteTransport,
+};
 use crate::GitPack;
 use async_trait::async_trait;
 use khive_pack_kg::KgPack;
@@ -73,6 +75,8 @@ struct State {
     fork: bool,
     mismatch: Option<&'static str>,
     prs: BTreeMap<u64, Value>,
+    issues: BTreeMap<u64, Value>,
+    issue_comments: BTreeMap<u64, Vec<Value>>,
     reviews: Vec<Value>,
     calls: Vec<Value>,
     push_calls: usize,
@@ -81,10 +85,50 @@ struct State {
     merge_race: Option<String>,
     lost_ack: bool,
     api_failure: bool,
+    rate_limited: Option<u64>,
     malformed_merge_reply: bool,
+    patch_reply: Option<Value>,
     review_decision: Value,
     decision_head: Option<String>,
+    check_runs: Vec<Value>,
+    combined: Value,
+    jobs: BTreeMap<u64, Value>,
+    logs: BTreeMap<u64, Vec<u8>>,
+    log_failure: Option<RemoteError>,
+    open_pulls_reply: Option<Value>,
+    pull_request_list_reply: Option<Value>,
+    issue_list_reply: Option<Value>,
 }
+/// Whether a query is the one the listing verbs send. The branch delete asks the same
+/// resource for open pull requests filtered by head, which this must not answer.
+fn is_listing_query(query: &str) -> bool {
+    query.starts_with("state=") && query.contains("&sort=created&direction=desc&")
+}
+
+/// One page of a listing reply as the platform pages it: `per_page` rows starting after
+/// `(page - 1) * per_page`. A reply that is not an array is returned as it stands.
+fn listing_page(reply: Option<Value>, query: &str) -> Value {
+    let field = |name: &str| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(name))
+            .and_then(|value| value.parse::<usize>().ok())
+    };
+    match reply {
+        Some(Value::Array(rows)) => {
+            let per_page = field("per_page=").unwrap_or(30);
+            let page = field("page=").unwrap_or(1).max(1);
+            json!(rows
+                .into_iter()
+                .skip((page - 1) * per_page)
+                .take(per_page)
+                .collect::<Vec<_>>())
+        }
+        Some(other) => other,
+        None => json!([]),
+    }
+}
+
 impl Recording {
     fn login(token: &str) -> &str {
         if token.contains("third") {
@@ -156,11 +200,30 @@ impl RemoteTransport for Recording {
             Ok(())
         }
     }
+    async fn fetch(
+        &self,
+        token: Option<&str>,
+        mut request: FetchRequest,
+    ) -> Result<Fetched, RemoteError> {
+        {
+            let mut s = self.state.lock().unwrap();
+            s.calls.push(json!({"op":"fetch","source":request.source,
+                "token_hash":token.map(|token| blake3::hash(token.as_bytes()).to_hex().to_string())}));
+            if s.api_failure {
+                return Err(RemoteError::Unavailable);
+            }
+        }
+        request.remote = self.bare.display().to_string();
+        crate::remote_transport::fetch_native(Path::new("git"), None, request, true).await
+    }
     async fn api(&self, token: &str, request: ApiRequest) -> Result<Value, RemoteError> {
         let mut s = self.state.lock().unwrap();
         s.calls.push(json!({"method":request.method,"path":request.path,"body":request.body,"token_hash":blake3::hash(token.as_bytes()).to_hex().to_string()}));
         if s.api_failure {
             return Err(RemoteError::Unavailable);
+        }
+        if let Some(reset) = s.rate_limited {
+            return Err(RemoteError::RateLimited { reset: Some(reset) });
         }
         let path = request.path.as_str();
         if path == "user" {
@@ -171,18 +234,148 @@ impl RemoteTransport for Recording {
                 json!({"full_name":if s.mismatch==Some("slug"){"wrong/repo"}else{SLUG},"visibility":if s.mismatch==Some("visibility"){"public"}else{"private"}}),
             );
         }
+        if let Some(query) = path.strip_prefix(&format!("repos/{SLUG}/issues?")) {
+            if is_listing_query(query) {
+                return Ok(listing_page(s.issue_list_reply.clone(), query));
+            }
+        }
+        if let Some(rest) = path.strip_prefix(&format!("repos/{SLUG}/issues/")) {
+            // The platform pages one hundred comments at a time.
+            if let Some((number, page)) = rest.split_once("/comments?per_page=100&page=") {
+                let number = number
+                    .parse::<u64>()
+                    .map_err(|_| RemoteError::InvalidResponse)?;
+                let page = page
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|page| *page > 0)
+                    .ok_or(RemoteError::InvalidResponse)?;
+                if !s.issues.contains_key(&number) && !s.prs.contains_key(&number) {
+                    return Err(RemoteError::Refused);
+                }
+                let comments: Vec<Value> = s
+                    .issue_comments
+                    .get(&number)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .skip((page - 1) * 100)
+                    .take(100)
+                    .collect();
+                return Ok(json!(comments));
+            }
+            let number = rest
+                .parse::<u64>()
+                .map_err(|_| RemoteError::InvalidResponse)?;
+            if let Some(issue) = s.issues.get(&number) {
+                return Ok(issue.clone());
+            }
+            if let Some(pr) = s.prs.get(&number) {
+                let mut issue = pr.clone();
+                issue["pull_request"] = json!({
+                    "url":format!("https://api.github.com/repos/{SLUG}/pulls/{number}")
+                });
+                let fields = issue.as_object_mut().unwrap();
+                fields.entry("labels").or_insert(json!([]));
+                fields.entry("comments").or_insert(json!(0));
+                fields
+                    .entry("created_at")
+                    .or_insert(json!("2026-11-21T15:00:00Z"));
+                fields
+                    .entry("updated_at")
+                    .or_insert(json!("2026-11-21T15:00:00Z"));
+                return Ok(issue);
+            }
+            return Err(RemoteError::Refused);
+        }
         if path.contains("/git/ref/heads/") {
             return Ok(json!({"object":{"sha":s.head}}));
         }
         if path == format!("repos/{SLUG}/pulls") && request.method == "POST" {
             let n = s.prs.len() as u64 + 1;
-            let pr = json!({"number":n,"html_url":format!("https://github.com/{SLUG}/pull/{n}"),"state":"open","merged":false,"head":{"sha":s.head,"ref":"work","repo":{"full_name":if s.fork{"fork/project"}else{SLUG}}},"base":{"repo":{"full_name":SLUG}},"user":{"login":s.author}});
+            let opened = request.body.clone().unwrap_or(Value::Null);
+            let pr = json!({
+                "number":n,
+                "html_url":format!("https://github.com/{SLUG}/pull/{n}"),
+                "state":"open",
+                "merged":false,
+                "title":opened["title"],
+                "body":opened["body"],
+                "labels":[],
+                "comments":0,
+                "created_at":"2026-11-21T15:00:00Z",
+                "updated_at":"2026-11-21T15:00:00Z",
+                "head":{"sha":s.head,"ref":"work","repo":{"full_name":if s.fork{"fork/project"}else{SLUG}}},
+                "base":{"repo":{"full_name":SLUG}},
+                "user":{"login":s.author}
+            });
             s.prs.insert(n, pr.clone());
             s.writes += 1;
             return Ok(pr);
         }
         if path.contains("/reviews?") {
             return Ok(json!(s.reviews));
+        }
+        if let Some(rest) = path.strip_prefix(&format!("repos/{SLUG}/commits/")) {
+            if rest.contains("/status?") {
+                return Ok(s.combined.clone());
+            }
+            // The platform pages one hundred check runs at a time and repeats the full count.
+            let page = rest
+                .split_once("/check-runs?per_page=100&page=")
+                .and_then(|(_, page)| page.parse::<usize>().ok())
+                .filter(|page| *page > 0)
+                .ok_or(RemoteError::InvalidResponse)?;
+            let rows: Vec<Value> = s
+                .check_runs
+                .iter()
+                .skip((page - 1) * 100)
+                .take(100)
+                .cloned()
+                .collect();
+            return Ok(json!({"total_count":s.check_runs.len(),"check_runs":rows}));
+        }
+        if let Some(id) = path.strip_prefix(&format!("repos/{SLUG}/check-runs/")) {
+            let id = id
+                .parse::<u64>()
+                .map_err(|_| RemoteError::InvalidResponse)?;
+            return s
+                .check_runs
+                .iter()
+                .find(|run| run["id"] == id)
+                .cloned()
+                .ok_or(RemoteError::Refused);
+        }
+        if let Some(id) = path.strip_prefix(&format!("repos/{SLUG}/actions/jobs/")) {
+            let id = id
+                .parse::<u64>()
+                .map_err(|_| RemoteError::InvalidResponse)?;
+            return s.jobs.get(&id).cloned().ok_or(RemoteError::Refused);
+        }
+        if let Some(query) = path.strip_prefix(&format!("repos/{SLUG}/pulls?")) {
+            if is_listing_query(query) {
+                return Ok(listing_page(s.pull_request_list_reply.clone(), query));
+            }
+            if let Some(reply) = s.open_pulls_reply.clone() {
+                return Ok(reply);
+            }
+            // The platform's `head` filter names the branch as `owner:branch`.
+            let head = query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("head="))
+                .ok_or(RemoteError::InvalidResponse)?;
+            let open: Vec<Value> = s
+                .prs
+                .values()
+                .filter(|pr| {
+                    pr["state"] == "open"
+                        && pr["head"]["ref"]
+                            .as_str()
+                            .is_some_and(|branch| format!("fixture:{branch}") == head)
+                })
+                .cloned()
+                .collect();
+            return Ok(json!(open));
         }
         let part = path
             .strip_prefix(&format!("repos/{SLUG}/pulls/"))
@@ -229,8 +422,61 @@ impl RemoteTransport for Recording {
             }
             return Ok(json!({"merged":true,"sha":"d".repeat(40)}));
         }
+        if request.method == "PATCH" {
+            // The head may move between the read and the write, as on the platform.
+            if let Some(sha) = s.merge_race.take() {
+                s.prs.get_mut(&n).unwrap()["head"]["sha"] = json!(sha);
+            }
+            let body = request.body.unwrap();
+            let pr = s.prs.get_mut(&n).ok_or(RemoteError::Refused)?;
+            for (field, value) in body.as_object().unwrap() {
+                // The platform stores an empty body as null.
+                pr[field] = if field == "body" && value == "" {
+                    Value::Null
+                } else {
+                    value.clone()
+                };
+            }
+            let pr = pr.clone();
+            s.writes += 1;
+            if s.lost_ack {
+                return Err(RemoteError::Unknown);
+            }
+            return Ok(s.patch_reply.take().unwrap_or(pr));
+        }
         s.prs.get(&n).cloned().ok_or(RemoteError::Refused)
     }
+    async fn download(
+        &self,
+        token: &str,
+        path: String,
+        limit: u64,
+    ) -> Result<Download, RemoteError> {
+        let mut s = self.state.lock().unwrap();
+        s.calls
+            .push(json!({"op":"download","path":path,"limit":limit,
+            "token_hash":blake3::hash(token.as_bytes()).to_hex().to_string()}));
+        if let Some(error) = s.log_failure {
+            return Err(error);
+        }
+        let id = path
+            .strip_prefix(&format!("repos/{SLUG}/actions/jobs/"))
+            .and_then(|rest| rest.strip_suffix("/logs"))
+            .and_then(|id| id.parse::<u64>().ok())
+            .ok_or(RemoteError::InvalidResponse)?;
+        let log = s.logs.get(&id).ok_or(RemoteError::Refused)?;
+        let keep = usize::try_from(limit).unwrap_or(usize::MAX).min(log.len());
+        Ok(Download {
+            kept: log[log.len() - keep..].to_vec(),
+            total: log.len() as u64,
+        })
+    }
+}
+
+thread_local! {
+    /// Whether a `Fixture` built on this thread is still alive. Each one holds `ENV_MUTEX` until
+    /// it drops, so a second one built beside it would wait forever for a lock its own test holds.
+    static FIXTURE_ALIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 struct Fixture {
@@ -266,6 +512,11 @@ impl Fixture {
         merge_refusals: &[&str],
         program: impl FnOnce() -> Option<PathBuf>,
     ) -> Self {
+        assert!(
+            !FIXTURE_ALIVE.with(std::cell::Cell::get),
+            "a second Fixture would wait forever for the environment lock the first one holds; \
+             drop the first before building another"
+        );
         let env_guard = crate::cache::ENV_MUTEX.lock().await;
         let program = program();
         let dir = tempfile::tempdir().unwrap();
@@ -339,6 +590,7 @@ impl Fixture {
                     vec![GitWriteEntryConfig {
                         repo: repo.display().to_string(),
                         branches: vec!["work".into()],
+                        access: Default::default(),
                     }]
                 } else {
                     vec![]
@@ -351,6 +603,7 @@ impl Fixture {
                         slug: SLUG.into(),
                         visibility: "private".into(),
                         merge_refusals: merge_refusals.iter().map(|e| e.to_string()).collect(),
+                        author: None,
                     },
                 )]),
                 credential_resolver: vec![resolver.display().to_string(), "{ref}".into()],
@@ -368,6 +621,8 @@ impl Fixture {
                 fork: false,
                 mismatch: None,
                 prs: BTreeMap::new(),
+                issues: BTreeMap::new(),
+                issue_comments: BTreeMap::new(),
                 reviews: vec![],
                 calls: vec![],
                 push_calls: 0,
@@ -376,9 +631,19 @@ impl Fixture {
                 merge_race: None,
                 lost_ack: false,
                 api_failure: false,
+                rate_limited: None,
                 malformed_merge_reply: false,
+                patch_reply: None,
                 review_decision: json!("APPROVED"),
                 decision_head: None,
+                check_runs: vec![],
+                combined: json!({"state":"pending","total_count":0,"statuses":[]}),
+                jobs: BTreeMap::new(),
+                logs: BTreeMap::new(),
+                log_failure: None,
+                open_pulls_reply: None,
+                pull_request_list_reply: None,
+                issue_list_reply: None,
             }),
         });
         let mut builder = VerbRegistryBuilder::new();
@@ -405,12 +670,15 @@ impl Fixture {
             registry,
             remote,
         };
+        FIXTURE_ALIVE.with(|alive| alive.set(true));
         for actor in [&f.actor, &f.reviewer, &f.alias, &f.third] {
             for verb in [
                 "git.push",
                 "git.pr_open",
                 "git.pr_review",
                 "git.pr_merge",
+                "git.pr_edit",
+                "git.pr_close",
                 "git.reconcile",
             ] {
                 f.policy(actor, verb, "allow").await;
@@ -502,7 +770,8 @@ impl Fixture {
     }
     async fn refusal(&self, actor: &str, verb: &str, p: Value, reason: &str) -> Receipt {
         let before = self.remote.writes();
-        let local = git(&self.repo, &["show-ref"]);
+        // for-each-ref, not show-ref: show-ref exits 1 once the repository holds no ref at all.
+        let local = git(&self.repo, &["for-each-ref"]);
         let remote = remote_head(&self.remote.bare);
         let error = self.call(actor, verb, p).await.unwrap_err().to_string();
         assert!(error.contains(reason), "{error}");
@@ -510,9 +779,15 @@ impl Fixture {
         assert_eq!(receipt.disposition, Disposition::NotCommitted);
         assert!(error.contains(&receipt.id));
         assert_eq!(self.remote.writes(), before);
-        assert_eq!(git(&self.repo, &["show-ref"]), local);
+        assert_eq!(git(&self.repo, &["for-each-ref"]), local);
         assert_eq!(remote_head(&self.remote.bare), remote);
         receipt
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        FIXTURE_ALIVE.with(|alive| alive.set(false));
     }
 }
 
@@ -522,6 +797,20 @@ include!("remote_tests/push_admission_tests.rs");
 
 include!("remote_tests/pull_request_decisions_tests.rs");
 
+include!("remote_tests/pull_request_state_tests.rs");
+
+include!("remote_tests/issue_tests.rs");
+
+include!("remote_tests/listing_tests.rs");
+
 include!("remote_tests/outcome_reconciliation_tests.rs");
 
 include!("remote_tests/schema_and_effect_controls_tests.rs");
+
+include!("remote_tests/pull_request_change_tests.rs");
+
+include!("remote_tests/fetch_credential_tests.rs");
+
+include!("remote_tests/check_log_tests.rs");
+
+include!("remote_tests/branch_delete_tests.rs");

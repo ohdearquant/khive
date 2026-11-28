@@ -138,6 +138,9 @@ pub struct NamespaceToken {
     visible: Vec<Namespace>,
     actor: ActorRef,
     process_ref: Option<String>,
+    /// Namespaces the caller declared it owns (`[actor] owned_namespaces`).
+    /// Read only through [`NamespaceToken::owns`]; it never widens visibility.
+    owned: Vec<Namespace>,
     _sealed: private::Sealed,
 }
 
@@ -167,6 +170,7 @@ impl NamespaceToken {
             visible,
             actor,
             process_ref: None,
+            owned: Vec::new(),
             _sealed: private::Sealed,
         }
     }
@@ -272,6 +276,27 @@ impl NamespaceToken {
         self
     }
 
+    /// Return whether the caller declared that it owns `namespace`.
+    ///
+    /// The declaration is the `[actor] owned_namespaces` list carried on the
+    /// caller's identity. It is consulted by the `memory.apply_batch` old-row
+    /// namespace check alone: ownership grants no write into the namespace and
+    /// widens no read.
+    pub fn owns(&self, namespace: &str) -> bool {
+        self.owned.iter().any(|owned| owned.as_str() == namespace)
+    }
+
+    /// The caller's declared owned namespaces, for carrying the declaration
+    /// onto a re-minted token or a nested dispatch identity.
+    pub(crate) fn owned_namespaces(&self) -> &[Namespace] {
+        &self.owned
+    }
+
+    pub(crate) fn with_owned_namespaces(mut self, owned: Vec<Namespace>) -> Self {
+        self.owned = owned;
+        self
+    }
+
     /// Return a new token with the same actor but a different namespace.
     /// The Gate namespace metadata is reset to the new primary namespace.
     ///
@@ -282,8 +307,13 @@ impl NamespaceToken {
     /// the intended narrow scope (e.g. a single `create_note` call). A future
     /// security model should replace this pattern with a type-enforced
     /// append-only capability that goes through the Gate.
+    ///
+    /// The owned-namespace declaration describes the caller, not the target
+    /// namespace, so it is kept on the new token.
     pub fn with_namespace(&self, ns: Namespace) -> Self {
-        Self::mint_authorized(ns, self.actor.clone()).with_process_ref(self.process_ref.clone())
+        Self::mint_authorized(ns, self.actor.clone())
+            .with_process_ref(self.process_ref.clone())
+            .with_owned_namespaces(self.owned.clone())
     }
 }
 
@@ -302,6 +332,16 @@ pub fn process_ref_from_env() -> Option<String> {
             None
         }
     }
+}
+
+/// The current process's working directory as text, for the daemon frame's `client_cwd`.
+///
+/// `None` when the directory cannot be read. A non-Unicode path is converted lossily: the value
+/// is attribution text on an audit row, never a path anything opens.
+pub fn client_cwd_from_process() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .map(|dir| dir.to_string_lossy().into_owned())
 }
 
 // ---- RuntimeConfig ----
@@ -325,12 +365,16 @@ pub struct RuntimeConfig {
     pub credentials: Vec<crate::credentials::CredentialConfig>,
     /// Configured receipt key ring. Absence never generates a replacement key.
     pub visibility_receipts: Option<crate::credentials::VisibilityReceiptConfig>,
-    /// Enabled `[channel.node]` table. `None` when the table is absent or disabled.
-    /// Held behind a pointer: every runtime handle carries this config inline, so
-    /// an inline table grows each future that holds a handle.
-    pub node_channel: Option<std::sync::Arc<crate::node_config::NodeChannelConfig>>,
 
     pub mounts: Vec<crate::mount_config::MountConfig>,
+
+    /// Opaque values retained from `[channel.*]` without interpretation.
+    pub channel: crate::channel_section::ChannelSectionConfig,
+    /// Host-supplied validators installed before pack registry construction.
+    pub channel_config_validators: crate::channel_section::ChannelConfigValidators,
+    /// Trusted host routes for custom communication address kinds. These
+    /// process-local callbacks must be installed in the dispatching host.
+    pub channel_send_routes: crate::channel_send::ChannelSendRoutes,
 
     /// Path to the SQLite database file. `None` = in-memory (tests).
     ///
@@ -434,6 +478,12 @@ pub struct RuntimeConfig {
     /// escape and is not widened. Populated from `actor.visible_namespaces`
     /// in `khive.toml`.
     pub visible_namespaces: Vec<Namespace>,
+    /// Namespaces this actor declared it owns (ADR-021 Delta 1). Populated from
+    /// `actor.owned_namespaces` in `khive.toml`. Empty by default. Ownership is
+    /// read by the `memory.apply_batch` old-row namespace check alone: it grants
+    /// no write into the namespace and widens no read, and it is NOT folded into
+    /// `visible_namespaces`.
+    pub owned_namespaces: Vec<Namespace>,
     /// Namespaces this actor's comm.send/reply may deliver messages INTO
     /// (outbound, sender-side). Populated from `actor.allowed_outbound_namespaces`
     /// in `khive.toml`. Empty by default — cross-namespace delivery denied
@@ -450,6 +500,11 @@ pub struct RuntimeConfig {
     /// `ActorRef::anonymous()` and inbox is scoped to party-line messages —
     /// those addressed to `"local"` or carrying no `to_actor` stamp.
     pub actor_id: Option<String>,
+    /// Strict attributed-actor mode requested by configuration: `[actor]
+    /// require_attributed = true` in the database-anchored or the project
+    /// config. The `KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` environment flag is read
+    /// separately by the enforcing seam; either one turns the refusal on.
+    pub require_attributed_actor: bool,
     /// Resolved `[brain]` policy from the serving process's configuration.
     pub brain: crate::engine_config::BrainSectionConfig,
     /// Resolved `[git_write]` policy allowlist (ADR-108 Amendment), populated
@@ -462,6 +517,12 @@ pub struct RuntimeConfig {
     /// Effective `[blob]` file-transfer opt-in, resolved with the exact environment
     /// opt-in during construction and retained by the blob pack.
     pub blob: crate::engine_config::BlobSectionConfig,
+    /// `[knowledge]` policy: the directories `knowledge.import` may read.
+    pub knowledge: crate::engine_config::KnowledgeSectionConfig,
+    /// `[git_digest]` policy: the sources `git.digest` may read.
+    pub git_digest: crate::engine_config::GitDigestSectionConfig,
+    /// `[code_ingest]` policy: the directories `code.ingest` may use.
+    pub code_ingest: crate::engine_config::CodeIngestSectionConfig,
     /// Resolved `[exec]` sandbox section (ADR-181), threaded through like
     /// `git_write` so the exec pack reads an already-resolved config.
     pub exec: crate::engine_config::ExecSectionConfig,
@@ -584,7 +645,6 @@ impl Default for RuntimeConfig {
             maintenance_concurrency: DEFAULT_MAINTENANCE_CONCURRENCY,
             credentials: Vec::new(),
             visibility_receipts: None,
-            node_channel: None,
             db_path,
             code_map_root: None,
             code_maps: Vec::new(),
@@ -607,8 +667,10 @@ impl Default for RuntimeConfig {
             backend_id: BackendId::main(),
             brain_profile,
             visible_namespaces: vec![],
+            owned_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id,
+            require_attributed_actor: false,
             brain: crate::engine_config::BrainSectionConfig::default(),
             git_write: crate::engine_config::GitWriteSectionConfig::default(),
             blob: crate::engine_config::BlobSectionConfig {
@@ -616,9 +678,15 @@ impl Default for RuntimeConfig {
                     .map(|value| value == "1")
                     .unwrap_or(false),
             },
+            knowledge: crate::engine_config::KnowledgeSectionConfig::default(),
+            git_digest: crate::engine_config::GitDigestSectionConfig::default(),
+            code_ingest: crate::engine_config::CodeIngestSectionConfig::default(),
             exec: crate::engine_config::ExecSectionConfig::default(),
             telemetry: crate::telemetry_config::TelemetryConfig::default(),
             mounts: Vec::new(),
+            channel: crate::channel_section::ChannelSectionConfig::default(),
+            channel_config_validators: crate::channel_section::ChannelConfigValidators::default(),
+            channel_send_routes: crate::channel_send::ChannelSendRoutes::default(),
             display_timezone: resolve_default_display_timezone(),
             events_split: None,
             web: crate::engine_config::WebSectionConfig::default(),
@@ -953,6 +1021,20 @@ pub fn resolve_project_actor_id(
         .filter(|s| !s.trim().is_empty()))
 }
 
+/// Read `[actor].require_attributed` from the explicit config, or with none from
+/// every existing discovery tier (the one anchored at `db_path` included), ORed.
+///
+/// The database-anchored load already carries the key into
+/// [`RuntimeConfig::require_attributed_actor`]; callers OR the two, so a request
+/// for strict mode in any file holds and a higher-precedence file without the key
+/// cannot shadow one that sets it. `Ok(false)` when no file sets it.
+pub fn resolve_project_requires_attributed_actor(
+    config_path: Option<&std::path::Path>,
+    db_path: Option<&std::path::Path>,
+) -> Result<bool, crate::engine_config::ConfigError> {
+    crate::engine_config::KhiveConfig::require_attributed_in_any_tier(config_path, db_path)
+}
+
 // ---- Embedding model helpers ----
 
 /// Sanitize an embedding model name into a valid SQL table suffix.
@@ -1042,14 +1124,9 @@ pub fn runtime_config_from_khive_config(
     // `local`); it only widens the read visible-set below.
     let default_namespace = base.default_namespace.clone();
     let mounts = khive_cfg.mounts.clone();
+    let channel = khive_cfg.channel.clone();
     let credentials = khive_cfg.credentials.clone();
     let visibility_receipts = khive_cfg.visibility_receipts.clone();
-    let node_channel = khive_cfg
-        .channel
-        .node
-        .clone()
-        .filter(|node| node.enabled)
-        .map(std::sync::Arc::new);
     let code_map_root = khive_cfg.code_map_root.clone();
     let code_maps = khive_cfg.code_maps.clone();
     let code_map_protected_database_paths = khive_cfg
@@ -1107,6 +1184,24 @@ pub fn runtime_config_from_khive_config(
         visible_namespaces
     };
 
+    // `[actor] owned_namespaces` (ADR-021 Delta 1). KhiveConfig::validate()
+    // guarantees every entry parses, so a parse failure here is unreachable for
+    // a validated config; filter_map+warn guards against a validation bug
+    // panicking instead. A dropped entry can only shrink what the actor owns.
+    // The list is deliberately not folded into `visible_namespaces`.
+    let owned_namespaces: Vec<Namespace> = khive_cfg
+        .actor
+        .owned_namespaces
+        .iter()
+        .filter_map(|s| match Namespace::parse(s) {
+            Ok(ns) => Some(ns),
+            Err(e) => {
+                tracing::warn!(ns = %s, error = %e, "actor.owned_namespaces: invalid namespace; skipped");
+                None
+            }
+        })
+        .collect();
+
     // KhiveConfig::validate() guarantees these are valid Namespace strings, so
     // parse failures here are unreachable for validated configs; filter_map+warn
     // guards against a validation bug panicking instead.
@@ -1134,6 +1229,8 @@ pub fn runtime_config_from_khive_config(
         .clone()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| base.actor_id.clone());
+    let require_attributed_actor =
+        khive_cfg.actor.require_attributed || base.require_attributed_actor;
 
     let gate = khive_cfg
         .gate
@@ -1153,6 +1250,9 @@ pub fn runtime_config_from_khive_config(
     let blob = crate::engine_config::BlobSectionConfig {
         file_transfers: khive_cfg.blob.file_transfers || base.blob.file_transfers,
     };
+    let knowledge = khive_cfg.knowledge.clone();
+    let git_digest = khive_cfg.git_digest.clone();
+    let code_ingest = khive_cfg.code_ingest.clone();
     let exec = khive_cfg.exec.clone();
     let telemetry = khive_cfg.telemetry.clone();
     let web = khive_cfg.web.clone();
@@ -1184,19 +1284,24 @@ pub fn runtime_config_from_khive_config(
         return RuntimeConfig {
             credentials,
             visibility_receipts,
-            node_channel,
             default_namespace,
             brain_profile,
             visible_namespaces,
+            owned_namespaces,
             allowed_outbound_namespaces,
             actor_id,
+            require_attributed_actor,
             gate,
             brain,
             git_write,
             blob,
+            knowledge,
+            git_digest,
+            code_ingest,
             exec,
             telemetry,
             mounts,
+            channel,
             code_map_root,
             code_maps,
             code_map_protected_database_paths,
@@ -1222,22 +1327,27 @@ pub fn runtime_config_from_khive_config(
     RuntimeConfig {
         credentials,
         visibility_receipts,
-        node_channel,
         engines: Some(engines),
         embedding_model,
         additional_embedding_models: additional,
         default_namespace,
         brain_profile,
         visible_namespaces,
+        owned_namespaces,
         allowed_outbound_namespaces,
         actor_id,
+        require_attributed_actor,
         gate,
         brain,
         git_write,
         blob,
+        knowledge,
+        git_digest,
+        code_ingest,
         exec,
         telemetry,
         mounts,
+        channel,
         code_map_root,
         code_maps,
         code_map_protected_database_paths,

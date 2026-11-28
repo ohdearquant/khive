@@ -42,6 +42,78 @@ page holds -- resolved by the 2026-10-14 amendment), #5364 and #5404 (operator n
 2026-10-15 operator-notices amendment), #5407 (Exchange Online stamps two shapes -- resolved by the 2026-10-15
 topmost-trust amendment)
 
+## Amendment 2026-11-15 -- Telegram inbound poll heartbeat
+
+**Status**: Accepted 2026-11-15 (#6670). Refs #6534.
+
+**Trigger.** #6534: Telegram's inbound loop has no persisted poll-success
+observation, although `comm.health` already projects elapsed no-success age.
+This amendment replaces the Telegram no-heartbeat qualification only. It does
+not adopt the proposed operator notices or email lifecycle events.
+
+**Decision.**
+
+1. A completed successful transport poll means any `Ok` page, including an empty
+   page, filtered updates, or a batch whose ingest is held. Capture its completion
+   time, process the selected batch, then report success through `comm.heartbeat`
+   with that `at`, `held_messages`, and `quarantined_after_hold`. The confirmed
+   offset advances only after every envelope is durably released, as before.
+2. A completed poll error reports failure before the existing five-second wait.
+   The row retains the last success and hold facts. Error classes remain the
+   closed auth/transport/config categories, with a fixed safe message rather
+   than transport payload. A pre-poll cleanup failure is not a completed poll.
+3. The local writer is a thin, best-effort dispatch through the real registry,
+   using `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` on the assigned comm backend.
+   Message ingest namespace does not redirect operational observations. Kind and
+   configured slug identify the channel. Existing authorized tenant writers and
+   namespace-scoped readers retain their separate contract; no tenant daemon
+   configuration is added.
+4. Telegram omits `poll_interval_secs`. Its error retry and long-poll bounds are
+   not a nominal success cadence. New rows consequently report `stalled: null`;
+   `no_success_age_secs` reports whole seconds since the stored last success,
+   independently of failures and retry timing. A never-successful channel has a
+   null success time and null age. Existing explicitly supplied cadence is not
+   erased by omission.
+5. Cancellation of a pending poll records no fabricated outcome. A selected
+   batch finishes its processing, observation and existing offset decision
+   before the next cancellation check. Heartbeat refusal only logs; it cannot
+   hold a released batch or add a success sleep. Long polling, the five-second
+   error retry, in-memory offsets and admission of client/read-only processes
+   are unchanged. Inbound refusal does not disable an independently admitted
+   outbox.
+
+6. The actual adapter overrides the generic kind-only slug with its configured
+   `maintainer_slug` for all channel consumers. The environment constructor's
+   existing `maintainer` fallback is unchanged; an empty or whitespace-only
+   manually supplied slug falls back to the channel kind, `telegram`. Nonblank
+   values remain exact. A sole configured adapter still accepts pending outbound
+   rows with no `channel_slug`. The normal poll retains the configured and
+   slugless cleanup passes and additionally selects the exact historical
+   `telegram` slug when different from the configured slug, in the original
+   ingest namespace. Each selector retains the existing 128-row expiry bound;
+   the additional named selector removes only expired live rows and leaves
+   unexpired rows and other identities untouched. Cleanup failure retains the
+   existing hold/retry rule without inventing a poll outcome. No manual
+   maintenance step is required.
+7. The slug change has two one-time effects at upgrade, accepted here. Inbound
+   deduplication is keyed on the exact slug, so an update stored under
+   `telegram` and redelivered after the restart under the configured slug is
+   stored again. Offsets are held in memory, so this is bounded to updates not
+   yet confirmed by a later poll when the old process stopped. The outbox
+   heartbeat row recorded under `telegram` also stops updating and keeps aging
+   in `comm.health` beside the live row under the configured slug.
+
+**Acceptance.** Recording fake transport through the actual Telegram adapter and
+real comm storage must demonstrate success/failure/held/canceled outcomes,
+unchanged conditional offsets and timing, null never-success, increasing
+no-success age with read-only health observations, separate slugs, assigned
+comm-backend routing, operational namespace independence, and best-effort
+heartbeat refusal, and delivery of an existing slugless outbound row through the
+sole actual configured adapter, automatic expiry of historical named quarantine
+rows without removing unexpired rows, and the manual blank-slug fallback.
+Existing cancellation and offset regressions remain intact.
+No live Telegram service is required.
+
 ## Amendment 2026-10-15 -- Topmost trust with a shared authserv-id
 
 **Status**: Proposed 2026-10-15.
@@ -4078,6 +4150,43 @@ attributed. See [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authen
 - `khive-channel` and `khive-channel-telegram` are new crates at the platform layer. (OQ-1 and
   OQ-2 are resolved; OQ-2 as hardened by the 2026-07-02 amendment. The email adapter's
   attribution gate and quarantine disposition follow that amendment.)
+
+## Amendment 2026-11-01 -- Exchange Online intra-tenant anchor
+
+### Context
+
+Exchange Online mail submitted by an authenticated user inside the same tenant may
+arrive without `Authentication-Results` or `ARC-Authentication-Results`. Exchange
+stamps `X-MS-Exchange-Organization-AuthAs: Internal`, so the existing attribution
+gate otherwise quarantines a configured maintainer as `auth-absent`.
+
+### Decision
+
+Add `KHIVE_EMAIL_TRUST_EXCHANGE_INTERNAL`, defaulting to `false`. When enabled, only
+an `auth-absent` message may use this anchor. It must have one From address whose
+domain exactly matches the configured mailbox domain, exactly one unfolded
+`X-MS-Exchange-Organization-AuthAs` field with trimmed value `Internal`, and pass
+the existing From and Sender maintainer checks. Every failed condition remains
+`auth-absent`. Other authentication outcomes are unchanged. This path never
+attributes external mail and never evaluates inbound suppression.
+
+### Operational precondition
+
+Exchange Online's header firewall removes organization-authentication headers from
+untrusted inbound mail and stamps its own value. This property is a precondition
+only for an Exchange Online mailbox. A deployment must confirm on its own mailbox
+that outside mail carrying a forged `AuthAs: Internal` arrives with a different
+stamp or with duplicate fields before enabling the option. Other mailbox hosts may
+preserve sender-supplied headers and must leave the option disabled.
+
+### Consequences
+
+- Same-tenant maintainer mail without authentication-result headers can pass the
+  attribution gate after the explicit opt-in and all three checks.
+- Duplicate stamps, a non-Internal stamp, a domain mismatch, or a failed sender
+  allowlist check remains quarantined as `auth-absent`.
+- The default deployment behavior and all messages with authentication-result
+  headers remain unchanged.
 
 ## Related ADRs
 

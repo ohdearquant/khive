@@ -4,7 +4,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use khive_runtime::{
     config_from_env, parse_pack_list, runtime_config_from_khive_config, BackendConfig, BackendId,
-    BackendKind, BlobHydrator, KhiveConfig, KhiveRuntime, OpenedDiagnosticBackend,
+    BackendKind, BlobHydrator, KhiveConfig, KhiveRuntime, Namespace, OpenedDiagnosticBackend,
     OutboundEmailPolicy, OutputFormat, RuntimeConfig, StorageBackend,
 };
 
@@ -109,10 +109,13 @@ pub(super) async fn prepare_core_schema_for_boot(
     label: impl Into<String>,
 ) -> anyhow::Result<u32> {
     let label = label.into();
-    tokio::task::spawn_blocking(move || backend.prepare_core_schema())
-        .await
-        .map_err(|error| anyhow::anyhow!("{label}: schema preparation task panicked: {error}"))?
-        .map_err(|error| anyhow::anyhow!("{label}: schema preparation: {error}"))
+    tokio::task::spawn_blocking(
+        khive_db::WriteClassContext::migration()
+            .wrap_blocking(move || backend.prepare_core_schema()),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("{label}: schema preparation task panicked: {error}"))?
+    .map_err(|error| anyhow::anyhow!("{label}: schema preparation: {error}"))
 }
 
 /// Resolve and install blob hydration on an already prepared runtime.
@@ -438,9 +441,10 @@ pub struct RuntimeConfigInputs<'a> {
     ///
     /// Distinct from `namespace_explicit`: `kkernel exec` and `kkernel reindex`
     /// set `namespace_explicit: true` unconditionally (their `--namespace` arg
-    /// has no `Option` to distinguish "typed" from "default"), but they have no
-    /// `--actor` flag and must NOT suppress the project/db actor-id tiers when
-    /// their namespace happens to resolve to `"local"`. Only `kkernel mcp`
+    /// has no `Option` to distinguish "typed" from "default") and must NOT
+    /// suppress the project/db actor-id tiers when their namespace resolves to
+    /// `"local"`. Exec's optional actor pin is applied after those tiers. Only
+    /// `kkernel mcp`
     /// (`build_server`, via `resolve_cli_namespace`) sets this to a value that
     /// can suppress those tiers — everyone else passes `false`.
     pub actor_explicit: bool,
@@ -468,12 +472,41 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
     Ok(config)
 }
 
+/// Ownership declared by the selected configuration, before actor overrides.
+#[must_use = "finalize configured ownership after selecting the final actor"]
+pub struct ConfiguredActorOwnership {
+    declaring_actor: Option<String>,
+    namespaces: Vec<Namespace>,
+}
+
+impl ConfiguredActorOwnership {
+    /// Apply this declaration once, only to its final declaring actor.
+    pub fn finalize(self, config: &mut RuntimeConfig) {
+        let matches = self
+            .declaring_actor
+            .as_deref()
+            .is_some_and(|actor| config.actor_id.as_deref() == Some(actor));
+        config.owned_namespaces = if matches { self.namespaces } else { Vec::new() };
+    }
+}
+
 /// Resolve a [`RuntimeConfig`] and return the database anchor captured at the
 /// same construction boundary. Server boot paths thread this value through
 /// consistency validation and registry construction without re-reading HOME.
 pub fn resolve_runtime_config_with_db_anchor(
     inputs: RuntimeConfigInputs<'_>,
 ) -> anyhow::Result<(RuntimeConfig, Option<PathBuf>)> {
+    let (mut config, db_anchor, ownership) = resolve_runtime_config_with_actor_ownership(inputs)?;
+    ownership.finalize(&mut config);
+    Ok((config, db_anchor))
+}
+
+/// Resolve config and actor tiers while deferring ownership finalization.
+/// The returned config has no ownership grants until the declaration is finalized
+/// after any remaining actor override and expectation checks.
+pub fn resolve_runtime_config_with_actor_ownership(
+    inputs: RuntimeConfigInputs<'_>,
+) -> anyhow::Result<(RuntimeConfig, Option<PathBuf>, ConfiguredActorOwnership)> {
     let db_anchor = khive_runtime::resolve_db_anchor(inputs.db);
     let db_path = db_anchor.clone();
 
@@ -503,11 +536,8 @@ pub fn resolve_runtime_config_with_db_anchor(
     let db_path_for_config = config_discovery_db_anchor(inputs.db);
 
     let resolved = if inputs.no_embed {
-        // `RuntimeConfig::no_embeddings()` is the canonical "zero embedders"
-        // constructor (issue #396) — it clears `embedding_model` and
-        // `additional_embedding_models` together, unlike a manual two-field
-        // override which can leave `additional_embedding_models` populated
-        // from `KHIVE_ADDITIONAL_EMBEDDING_MODELS`.
+        // Retain unsuppressed declarations until the compatibility comparison;
+        // the selected-file and absent-file paths clear them before returning.
         let no_embed_base = RuntimeConfig {
             db_path,
             default_namespace: inputs.namespace,
@@ -515,7 +545,7 @@ pub fn resolve_runtime_config_with_db_anchor(
             // Explicit CLI flag only at this tier — env and config-file tiers are applied
             // below in resolve_actor_from_config and apply_env_brain_profile.
             brain_profile: cli_brain_profile,
-            ..RuntimeConfig::no_embeddings()
+            ..RuntimeConfig::default()
         };
         resolve_actor_from_config(
             inputs.config,
@@ -543,6 +573,12 @@ pub fn resolve_runtime_config_with_db_anchor(
         )?
     };
 
+    let mut resolved = resolved;
+    let ownership = ConfiguredActorOwnership {
+        declaring_actor: resolved.actor_id.clone(),
+        namespaces: std::mem::take(&mut resolved.owned_namespaces),
+    };
+
     // ADR-096 Fork 2 — per-connection `actor_id` precedence chain (highest to
     // lowest), ratified 2026-07-05:
     //
@@ -560,7 +596,8 @@ pub fn resolve_runtime_config_with_db_anchor(
     //      closes). `kkernel exec`/`reindex` force
     //      `namespace_explicit: true` for unrelated reasons (no `Option` on
     //      their `--namespace` arg) but always pass `actor_explicit: false`,
-    //      so they keep falling through to tiers 2-3 exactly as before.
+    //      so they keep falling through to tiers 2-3 exactly as before. Exec's
+    //      optional actor pin is applied after those lookups.
     //   2. Project/cwd-anchored config `[actor].id`, resolved INDEPENDENTLY of
     //      the database-anchored config load above (`resolve_project_actor_id`).
     //      Commit 10d9c92c (#651) anchored tier-3 `.khive/config.toml` discovery
@@ -598,14 +635,23 @@ pub fn resolve_runtime_config_with_db_anchor(
             // "local" also looks like "unset". Gated on `actor_explicit`
             // (not the broader `namespace_explicit`) so `kkernel exec`/
             // `reindex` — which force `namespace_explicit: true` for
-            // unrelated reasons and have no `--actor` flag — keep falling
-            // through exactly as before.
+            // unrelated reasons, keep falling through exactly as before.
+            // Exec's optional actor pin is a separate late tier.
             resolved.actor_id = None;
         } else {
             let project_actor = khive_runtime::resolve_project_actor_id(inputs.config)
                 .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
             resolved.actor_id = project_actor.or(resolved.actor_id);
         }
+        // Strict attributed-actor mode is read from the project config on every
+        // branch above, including an explicit actor or namespace: a project
+        // that asks for it keeps it whatever identity the caller supplies.
+        resolved.require_attributed_actor |=
+            khive_runtime::resolve_project_requires_attributed_actor(
+                inputs.config,
+                db_path_for_config.as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
         resolved
     };
 
@@ -634,7 +680,7 @@ pub fn resolve_runtime_config_with_db_anchor(
 
     // Tier-3 env fallback: KHIVE_BRAIN_PROFILE is applied AFTER CLI (tier-1) and
     // config-file (tier-2) so that a project or global TOML always wins over the env var.
-    Ok((apply_env_brain_profile(resolved), db_anchor))
+    Ok((apply_env_brain_profile(resolved), db_anchor, ownership))
 }
 
 /// Upgrade a resolved config's event plane from direct (embedded) mode to
@@ -737,6 +783,7 @@ fn resolve_config(
             }
 
             let mut resolved = runtime_config_from_khive_config(&khive_cfg, base);
+            emit_embed_compatibility_warning(&khive_cfg, &resolved);
             resolve_runtime_wal_ceiling(&mut resolved, &khive_cfg.backends, force_memory)?;
             Ok(resolved)
         }
@@ -840,15 +887,30 @@ fn resolve_actor_from_config(
         Some(khive_cfg) => {
             let base = apply_config_pack_selection(&khive_cfg, base, packs_overridden);
             let mut resolved = runtime_config_from_khive_config(&khive_cfg, base);
+            emit_embed_compatibility_warning(&khive_cfg, &resolved);
             resolve_runtime_wal_ceiling(&mut resolved, &khive_cfg.backends, force_memory)?;
             resolved.disable_embedding_models();
             Ok(resolved)
         }
         None => {
             let mut resolved = base;
+            resolved.embedding_model = None;
+            resolved.additional_embedding_models.clear();
             resolve_runtime_wal_ceiling(&mut resolved, &[], force_memory)?;
             Ok(resolved)
         }
+    }
+}
+
+fn emit_embed_compatibility_warning(config: &KhiveConfig, resolved: &RuntimeConfig) {
+    let engines = resolved.configured_engines();
+    let reasons = config.embed.compatibility_reasons(engines.first());
+    if !reasons.is_empty() {
+        tracing::warn!(
+            target: "khive.config.embed",
+            reasons = ?reasons,
+            "legacy [embed] settings are ignored; [[engines]] controls embedding providers"
+        );
     }
 }
 

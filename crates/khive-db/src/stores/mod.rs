@@ -33,11 +33,7 @@ fn validate_json_equality_paths(
     operation: &'static str,
 ) -> Result<(), StorageError> {
     for (path, _) in predicates {
-        if !path.starts_with("$.")
-            || !path[2..].split('.').all(|part| {
-                !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            })
-        {
+        if !is_valid_json_path(path) {
             return Err(StorageError::InvalidInput {
                 capability,
                 operation: operation.into(),
@@ -46,6 +42,52 @@ fn validate_json_equality_paths(
         }
     }
     Ok(())
+}
+
+fn validate_json_prefix_paths(
+    predicates: &[(String, String)],
+    capability: StorageCapability,
+    operation: &'static str,
+) -> Result<(), StorageError> {
+    for (path, _) in predicates {
+        if !is_valid_json_path(path) {
+            return Err(StorageError::InvalidInput {
+                capability,
+                operation: operation.into(),
+                message: format!("invalid JSON prefix path: {path:?}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn is_valid_json_path(path: &str) -> bool {
+    path.starts_with("$.")
+        && path[2..].split('.').all(|part| {
+            !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
+/// `CASE` evaluates its branches in order, so invalid JSON and non-text values
+/// are excluded before `json_extract` or `substr` sees them.
+fn append_json_prefixes(
+    conditions: &mut Vec<String>,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    column: &'static str,
+    predicates: &[(String, String)],
+) {
+    for (path, prefix) in predicates {
+        params.push(Box::new(path.clone()));
+        let path_index = params.len();
+        params.push(Box::new(prefix.clone()));
+        let prefix_index = params.len();
+        conditions.push(format!(
+            "(CASE WHEN NOT json_valid({column}) THEN 0 \
+             WHEN json_type({column}, ?{path_index}) = 'text' \
+             THEN substr(json_extract({column}, ?{path_index}), 1, length(?{prefix_index})) = ?{prefix_index} \
+             ELSE 0 END)"
+        ));
+    }
 }
 
 fn append_json_equalities(
@@ -128,7 +170,7 @@ pub(crate) async fn run_pooled_store_read<F, R>(
     read: F,
 ) -> StorageResult<R>
 where
-    F: FnOnce(&rusqlite::Connection) -> Result<R, StorageError> + Send + 'static,
+    F: FnOnce(&crate::ProgressConn) -> Result<R, StorageError> + Send + 'static,
     R: Send + 'static,
 {
     run_pooled_store_read_with_state(pool, capability, operation, false, read).await
@@ -143,7 +185,7 @@ pub(crate) async fn run_stateful_pooled_store_read<F, R>(
     read: F,
 ) -> StorageResult<R>
 where
-    F: FnOnce(&rusqlite::Connection) -> Result<R, StorageError> + Send + 'static,
+    F: FnOnce(&crate::ProgressConn) -> Result<R, StorageError> + Send + 'static,
     R: Send + 'static,
 {
     run_pooled_store_read_with_state(pool, capability, operation, true, read).await
@@ -173,7 +215,7 @@ async fn run_pooled_store_read_with_state<F, R>(
     read: F,
 ) -> StorageResult<R>
 where
-    F: FnOnce(&rusqlite::Connection) -> Result<R, StorageError> + Send + 'static,
+    F: FnOnce(&crate::ProgressConn) -> Result<R, StorageError> + Send + 'static,
     R: Send + 'static,
 {
     let trace = khive_storage::request_context::capture_search_phase_trace();

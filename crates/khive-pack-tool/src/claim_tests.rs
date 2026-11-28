@@ -37,6 +37,125 @@ fn spec(name: &str, capabilities: &[&str]) -> RegisterSpec {
 }
 
 #[tokio::test]
+async fn unchanged_registration_cannot_overwrite_newer_search_document() {
+    use khive_storage::types::{TextFilter, TextQueryMode, TextSearchRequest};
+
+    let (rt, token) = fixture();
+    let initial = register(
+        &rt,
+        &token,
+        json!({"name":"indexed tool", "description":"oldquartz"}),
+    )
+    .await
+    .unwrap();
+    let id = initial["tool"]["full_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let text = rt.text(&token).unwrap();
+    let before = text
+        .get_document(token.namespace().as_str(), id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.body, "indexed tool oldquartz");
+    let ready = Arc::new(tokio::sync::Barrier::new(2));
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let stale = BEFORE_REGISTRATION_REINDEX.scope(
+        (Arc::clone(&ready), Arc::clone(&resume)),
+        register(&rt, &token, json!({"name":"indexed tool"})),
+    );
+    let newer = async {
+        ready.wait().await;
+        let response = register(
+            &rt,
+            &token,
+            json!({"name":"indexed tool", "description":"newcobalt"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["updated"], true);
+        let row = rt.get_entity(&token, id).await.unwrap();
+        let document = text
+            .get_document(token.namespace().as_str(), id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.body, "indexed tool newcobalt");
+        resume.notify_one();
+        (row, document)
+    };
+    let (stale, (winner, document)) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(stale, newer)
+        })
+        .await
+        .expect("both registration paths settle after the observed capture");
+    let after = text
+        .get_document(token.namespace().as_str(), id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&after).unwrap(),
+        serde_json::to_value(&document).unwrap()
+    );
+    for (query, expected) in [("oldquartz", vec![]), ("newcobalt", vec![id])] {
+        let hits = text
+            .search(TextSearchRequest {
+                query: query.into(),
+                mode: TextQueryMode::Plain,
+                filter: Some(TextFilter {
+                    ids: vec![id],
+                    namespaces: vec![token.namespace().to_string()],
+                    ..Default::default()
+                }),
+                top_k: 10,
+                snippet_chars: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.subject_id).collect::<Vec<_>>(),
+            expected
+        );
+    }
+    let error = stale.expect_err("a captured old row cannot replace the winner's text index");
+    assert!(error.to_string().contains(&id.to_string()), "{error}");
+    assert!(
+        error.to_string().contains("changed concurrently"),
+        "{error}"
+    );
+    let stored = rt.get_entity(&token, id).await.unwrap();
+    assert_eq!(stored.properties, winner.properties);
+    assert_eq!(
+        serde_json::to_value(stored).unwrap(),
+        serde_json::to_value(&winner).unwrap()
+    );
+    let retry = register(&rt, &token, json!({"name":"indexed tool"}))
+        .await
+        .unwrap();
+    assert_eq!(retry["unchanged"], true);
+    let stored = rt.get_entity(&token, id).await.unwrap();
+    assert_eq!(stored.properties, winner.properties);
+    assert_eq!(
+        serde_json::to_value(stored).unwrap(),
+        serde_json::to_value(&winner).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(
+            text.get_document(token.namespace().as_str(), id)
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(document).unwrap(),
+    );
+}
+
+#[tokio::test]
 async fn concurrent_registry_claim_has_one_winner_and_one_row() {
     let (rt, token) = fixture();
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
@@ -62,6 +181,173 @@ async fn concurrent_registry_claim_has_one_winner_and_one_row() {
         .await
         .expect("registry rows");
     assert_eq!(rows.len(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_register_claim_loser_applies_its_supplied_definition() {
+    let (rt, token) = fixture();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    // Both initial claim repairs finish before the loser changes the row.
+    // Otherwise the winner's repair can correctly refuse a stale revision.
+    let repaired = Arc::new(tokio::sync::Barrier::new(2));
+    let left = AFTER_CLAIM.scope(
+        Arc::clone(&repaired),
+        BEFORE_CLAIM.scope(
+            Arc::clone(&barrier),
+            register(
+                &rt,
+                &token,
+                json!({"name":"shared update", "source":"mcp:shared", "schema":{"side":"left"}}),
+            ),
+        ),
+    );
+    let right = AFTER_CLAIM.scope(
+        repaired,
+        BEFORE_CLAIM.scope(
+            barrier,
+            register(
+                &rt,
+                &token,
+                json!({"name":"SHARED UPDATE", "source":"mcp:shared", "schema":{"side":"right"}}),
+            ),
+        ),
+    );
+    let (left, right) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(left, right)
+    })
+    .await
+    .expect("both registrations settle");
+    let left = left.unwrap();
+    let right = right.unwrap();
+    assert_ne!(left["created"], right["created"]);
+    assert_eq!(left["tool"]["full_id"], right["tool"]["full_id"]);
+    let (winner, loser, schema) = if left["created"] == true {
+        (&left, &right, json!({"side":"right"}))
+    } else {
+        (&right, &left, json!({"side":"left"}))
+    };
+    assert_eq!(winner["updated"], false);
+    assert_eq!(loser["updated"], true);
+    assert_eq!(loser["unchanged"], false);
+    let id = loser["tool"]["full_id"].as_str().unwrap().parse().unwrap();
+    let row = rt.get_entity(&token, id).await.unwrap();
+    assert_eq!(row.properties.as_ref().unwrap()["source"], "mcp:shared");
+    assert_eq!(row.properties.as_ref().unwrap()["schema"], schema);
+    assert_eq!(row.name, winner["tool"]["name"].as_str().unwrap());
+    assert_eq!(
+        rt.count_entities_tagged(&token, Some(REGISTRY_ENTITY_KIND), Some(REGISTRY_TAG))
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_registration_updates_refuse_a_stale_snapshot_before_linking() {
+    let (rt, token) = fixture();
+    let initial = register(
+        &rt,
+        &token,
+        json!({"name":"guarded", "source":"mcp:original", "trust":"first_party"}),
+    )
+    .await
+    .unwrap();
+    let id = initial["tool"]["full_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let before = rt.get_entity(&token, id).await.unwrap();
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(crate::ToolPack::new(rt.clone()));
+    let registry = builder.build().unwrap();
+    let requested = request(
+        &rt,
+        &registry,
+        &token,
+        json!({"tool":"guarded", "actor":"agent:requester"}),
+    )
+    .await
+    .unwrap();
+    decide_request(
+        &rt,
+        &token,
+        json!({"id": requested["request_id"]}),
+        "granted",
+    )
+    .await
+    .unwrap();
+    let grants_before = requests(&rt, &token, json!({})).await.unwrap();
+    assert_eq!(grants_before["count"], 1);
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let left = BEFORE_REGISTRATION_UPDATE.scope(
+        (Arc::clone(&barrier), Arc::clone(&resume)),
+        register(
+            &rt,
+            &token,
+            json!({"name":"guarded", "description":"left", "capabilities":["left capability"]}),
+        ),
+    );
+    let right = async {
+        barrier.wait().await;
+        let result = register(
+            &rt,
+            &token,
+            json!({"name":"guarded", "trust":"marketplace", "capabilities":["right capability"]}),
+        )
+        .await;
+        resume.notify_one();
+        result
+    };
+    let (left, right) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(left, right)
+    })
+    .await
+    .expect("both guarded updates settle");
+    let winner = right.expect("intervening registration commits before the stale one resumes");
+    let refusal = left.expect_err("the original registration snapshot is stale");
+    assert!(matches!(refusal, RuntimeError::Khive(_)), "{refusal:?}");
+    assert!(
+        refusal.to_string().contains("changed concurrently"),
+        "{refusal}"
+    );
+    assert_eq!(winner["updated"], true);
+    let after = rt.get_entity(&token, id).await.unwrap();
+    assert_eq!(after.version, before.version + 1);
+    assert_eq!(after.properties.as_ref().unwrap()["source"], "mcp:original");
+    assert_eq!(after.description, before.description);
+    assert_eq!(after.properties.as_ref().unwrap()["trust"], "marketplace");
+    assert_eq!(
+        requests(&rt, &token, json!({})).await.unwrap(),
+        grants_before
+    );
+    let capabilities = capabilities_of(&rt, &token, id).await.unwrap();
+    assert_eq!(capabilities.len(), 1);
+    assert_eq!(capabilities[0]["name"], "right capability");
+    assert_eq!(
+        rt.count_entities_tagged(&token, Some("concept"), Some(CAPABILITY_TAG))
+            .await
+            .unwrap(),
+        1
+    );
+    let retry = register(
+        &rt,
+        &token,
+        json!({"name":"guarded", "description":"left", "capabilities":["left capability"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry["updated"], true);
+    let retried = rt.get_entity(&token, id).await.unwrap();
+    assert_eq!(retried.description.as_deref(), Some("left"));
+    assert_eq!(retried.properties.as_ref().unwrap()["trust"], "marketplace");
+    assert_eq!(capabilities_of(&rt, &token, id).await.unwrap().len(), 2);
+    assert_eq!(
+        requests(&rt, &token, json!({})).await.unwrap(),
+        grants_before
+    );
 }
 
 #[tokio::test]
