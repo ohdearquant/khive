@@ -1441,3 +1441,272 @@ async fn constraints_purposes_and_known_to_survive_export_and_replay() {
     assert_eq!(open.len(), 1);
     assert_eq!(open[0]["known_to"], "receiver");
 }
+
+/// Form C names the roles of form A by other wordings and declares a second
+/// receiver by a counting qualifier.
+fn form_d() -> Value {
+    json!({
+        "form_id": "SUBJ-D",
+        "revision": "2026-04",
+        "title": "Payment named another way",
+        "source": source(4),
+        "terms": {
+            "roles": ["Remitter", {"name": "payee", "aliases": ["recipient"]}],
+            "counting_qualifiers": [{"name": "second", "aliases": ["2nd"]}]
+        },
+        "subjects": [
+            {"id": "sender", "kind": "Party", "role": "remitter"},
+            {"id": "receiver", "kind": "party", "role": "payee", "qualifier": "2ND"}
+        ],
+        "fields": [id_field()],
+        "items": [line("Sender ID", 1, "sender", ID), line("Receiver ID", 2, "receiver", ID)]
+    })
+}
+
+fn subject<'a>(form: &'a Value, id: &str) -> &'a Value {
+    form["subjects"]
+        .as_array()
+        .expect("subjects")
+        .iter()
+        .find(|s| s["id"] == id)
+        .unwrap_or_else(|| panic!("subject {id}: {form}"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_term_named_by_an_alias_is_that_term_and_subjects_keep_its_canonical_name() {
+    let store = Store::new();
+    let mut a = form_a();
+    a["terms"]["roles"][0] = json!({"name": "payer", "aliases": ["remitter"]});
+    store.load(a).await;
+
+    let reply = store.load(form_d()).await;
+    assert_eq!(
+        reply["counts"]["terms"], 1,
+        "only the counting qualifier is new: {reply}"
+    );
+
+    let form = store
+        .call("forms.neighbourhood", json!({"node": "SUBJ-D"}))
+        .await;
+    assert_eq!(subject(&form, "sender")["role"], "payer", "{form}");
+    assert_eq!(subject(&form, "sender")["kind"], "party", "{form}");
+    assert_eq!(subject(&form, "receiver")["role"], "recipient", "{form}");
+    assert_eq!(subject(&form, "receiver")["qualifier"], "second", "{form}");
+
+    // The wording form C adds becomes an alias of the loaded term, and the
+    // term lists the subjects of both forms.
+    let recipient = store
+        .call("forms.neighbourhood", json!({"node": "role:payee"}))
+        .await;
+    assert_eq!(recipient["term"]["name"], "recipient", "{recipient}");
+    assert_eq!(
+        recipient["term"]["aliases"],
+        json!(["payee"]),
+        "{recipient}"
+    );
+    assert_eq!(
+        recipient["subjects"].as_array().expect("subjects").len(),
+        2,
+        "{recipient}"
+    );
+    let payer = store
+        .call("forms.neighbourhood", json!({"node": "role:remitter"}))
+        .await;
+    assert_eq!(payer["term"]["aliases"], json!(["remitter"]), "{payer}");
+
+    // Loading form C again changes nothing.
+    let before = store.call("forms.export", json!({})).await;
+    let again = store
+        .call("forms.load", json!({"document": form_d()}))
+        .await;
+    assert_eq!(again["loaded"], false, "{again}");
+    let after = store.call("forms.export", json!({})).await;
+    assert_eq!(before, after);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wording_that_names_two_terms_of_one_list_is_refused() {
+    let store = Store::new();
+    store.load(form_a()).await;
+    let mut c = form_d();
+    c["terms"]["roles"] = json!([{"name": "payer", "aliases": ["recipient"]}]);
+    let message = store.refused("forms.load", json!({"document": c})).await;
+    assert!(
+        message.contains("more than one loaded role") && message.contains("recipient"),
+        "{message}"
+    );
+
+    let mut c = form_d();
+    c["terms"]["roles"] = json!(["payer", {"name": "payor", "aliases": ["Payer"]}]);
+    let message = store.refused("forms.load", json!({"document": c})).await;
+    assert!(message.contains("twice"), "{message}");
+
+    // A role is not a kind: the same wording in two lists is two terms.
+    let mut c = form_d();
+    c["terms"]["kinds"] = json!(["recipient"]);
+    store.load(c).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_carrying_relation_is_a_loaded_relation_and_is_marked() {
+    let store = Store::new();
+    let mut a = form_a();
+    a["terms"]["carrying_relations"] = json!(["owned by"]);
+    let message = store.refused("forms.load", json!({"document": a})).await;
+    assert!(
+        message.contains("owned by") && message.contains("not a loaded relation"),
+        "{message}"
+    );
+
+    store.load(form_a()).await;
+    let relation = store
+        .call(
+            "forms.neighbourhood",
+            json!({"node": "relation:belongs to"}),
+        )
+        .await;
+    assert_eq!(relation["term"]["carries"], false, "{relation}");
+
+    let mut c = form_d();
+    c["terms"]["carrying_relations"] = json!(["Belongs To"]);
+    store.load(c).await;
+    let relation = store
+        .call(
+            "forms.neighbourhood",
+            json!({"node": "relation:belongs to"}),
+        )
+        .await;
+    assert_eq!(relation["term"]["carries"], true, "{relation}");
+
+    // A relation listed and marked in one document carries from the start.
+    let fresh = Store::new();
+    let mut a = form_a();
+    a["terms"]["relations"] = json!([{"name": "held for", "aliases": ["kept for"]}]);
+    a["terms"]["carrying_relations"] = json!(["kept for"]);
+    fresh.load(a).await;
+    let relation = fresh
+        .call("forms.neighbourhood", json!({"node": "relation:held for"}))
+        .await;
+    assert_eq!(relation["term"]["carries"], true, "{relation}");
+}
+
+/// forms.subjects reads a named revision and, with none named, the one loaded
+/// last. It refuses a form or a revision that is not loaded, and a revision
+/// named both in `form` and in `revision`.
+#[tokio::test(flavor = "multi_thread")]
+async fn subjects_reads_one_revision_and_refuses_what_is_not_loaded() {
+    let store = Store::new();
+    store.load(form_a()).await;
+    let mut later = form_a();
+    later["revision"] = json!("2026-03");
+    later["source"] = source(5);
+    store.load(later).await;
+
+    let last = store.call("forms.subjects", json!({"form": A})).await;
+    assert_eq!(last["form"]["revision"], "2026-03", "{last}");
+    assert_eq!(last["revisions"], json!(["2026-01", "2026-03"]), "{last}");
+    let ids: Vec<&Value> = last["subjects"]
+        .as_array()
+        .expect("subjects")
+        .iter()
+        .map(|s| &s["id"])
+        .collect();
+    assert_eq!(ids, [&json!("payer"), &json!("recipient")], "{last}");
+    assert_eq!(subject(&last, "payer")["kind"], "party", "{last}");
+    assert_eq!(subject(&last, "recipient")["role"], "recipient", "{last}");
+
+    let named = store
+        .call("forms.subjects", json!({"form": A, "revision": "2026-01"}))
+        .await;
+    assert_eq!(named["form"]["revision"], "2026-01", "{named}");
+    let inline = store
+        .call("forms.subjects", json!({"form": format!("{A}@2026-01")}))
+        .await;
+    assert_eq!(inline["form"], named["form"], "{inline}");
+
+    let message = store
+        .refused("forms.subjects", json!({"form": "SUBJ-NONE"}))
+        .await;
+    assert!(message.contains("SUBJ-NONE"), "{message}");
+    let message = store
+        .refused("forms.subjects", json!({"form": A, "revision": "1999-01"}))
+        .await;
+    assert!(message.contains("1999-01"), "{message}");
+    let message = store
+        .refused(
+            "forms.subjects",
+            json!({"form": format!("{A}@2026-01"), "revision": "2026-01"}),
+        )
+        .await;
+    assert!(message.contains("name the revision once"), "{message}");
+}
+
+/// forms.terms lists every term list, each term with its definition, its
+/// aliases and whether it is a carrying relation.
+#[tokio::test(flavor = "multi_thread")]
+async fn terms_lists_each_term_with_its_aliases_and_carries() {
+    let store = Store::new();
+    let mut a = form_a();
+    a["terms"]["roles"][1] = json!({"name": "recipient", "aliases": ["payee"]});
+    a["terms"]["carrying_relations"] = json!(["belongs to"]);
+    store.load(a).await;
+
+    let reply = store.call("forms.terms", json!({})).await;
+    let term = |list: &str, name: &str| -> Value {
+        reply["terms"][list]
+            .as_array()
+            .unwrap_or_else(|| panic!("{list}: {reply}"))
+            .iter()
+            .find(|t| t["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("{list} {name}: {reply}"))
+    };
+    assert_eq!(
+        term("roles", "recipient")["aliases"],
+        json!(["payee"]),
+        "{reply}"
+    );
+    assert_eq!(term("relations", "belongs to")["carries"], true, "{reply}");
+    assert_eq!(term("roles", "payer")["carries"], false, "{reply}");
+    assert_eq!(
+        term("kinds", "address")["definition"],
+        "A place mail is sent to.",
+        "{reply}"
+    );
+    assert!(reply["terms"]["counting_qualifiers"].is_array(), "{reply}");
+}
+
+/// A purpose is a term like the others: a form may name it by an alias and
+/// the purpose then lists that form, and two wordings of one purpose on one
+/// form name it twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_purpose_named_by_an_alias_is_that_purpose() {
+    let store = Store::new();
+    let mut aliased = form_c();
+    aliased["terms"]["purposes"] = json!([{
+        "name": "account opening",
+        "definition": "Opening an account for a party.",
+        "aliases": ["new account"]
+    }]);
+    aliased["purposes"] = json!(["new account"]);
+    store.load(aliased).await;
+
+    let purpose = store
+        .call(
+            "forms.neighbourhood",
+            json!({"node": "purpose:account opening"}),
+        )
+        .await;
+    let forms = purpose["forms"].as_array().expect("forms");
+    assert_eq!(forms.len(), 1, "{purpose}");
+    assert_eq!(forms[0]["form_id"], C, "{purpose}");
+
+    let mut twice = form_c();
+    twice["revision"] = json!("2026-09");
+    twice["source"] = source(9);
+    twice["purposes"] = json!(["account opening", "New Account"]);
+    let message = store
+        .refused("forms.load", json!({"document": twice}))
+        .await;
+    assert!(message.contains("twice"), "{message}");
+}

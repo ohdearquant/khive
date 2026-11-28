@@ -152,6 +152,23 @@ struct SlotInput {
     repeats: bool,
     #[serde(default = "yes")]
     required: bool,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    qualifier: Option<String>,
+    #[serde(default)]
+    defined_by: Option<SlotRelation>,
+}
+
+/// A slot given by a relation to another slot: what stands in `relation` to the identity
+/// in `slot`, such as the party that owns what is in slot `parcel`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SlotRelation {
+    pub relation: String,
+    pub slot: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,6 +231,17 @@ pub(crate) struct Slot {
     pub name: String,
     pub repeats: bool,
     pub required: bool,
+    /// The kind and role a form subject must carry to fill this slot, with the qualifier
+    /// that tells two slots of one role apart. Absent from the stored bytes when not given,
+    /// so a type published before slots carried them keeps its digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defined_by: Option<SlotRelation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -499,6 +527,93 @@ fn store(kind: &'static str, id: &str, version: i64, value: &Value, source: &Val
 /// recursion level per step, so this also bounds its depth.
 pub(crate) const MAX_STEPS: usize = 256;
 
+/// A slot is given by kind and role, with an optional qualifier, or by a relation to
+/// another slot, or by neither; never by both.
+fn check_slot_shape(
+    type_id: &str,
+    slot: &SlotInput,
+    slots: &BTreeMap<&str, &SlotInput>,
+) -> Result<(), Refusal> {
+    for (what, term) in [
+        ("slot kind", &slot.kind),
+        ("slot role", &slot.role),
+        ("slot qualifier", &slot.qualifier),
+    ] {
+        if let Some(term) = term {
+            check_name(what, term)?;
+        }
+    }
+    let shape = |message: String| Err(Refusal::new("slot_shape", message));
+    if slot.role.is_some() != slot.kind.is_some() {
+        return shape(format!(
+            "{type_id}: slot {} gives a kind or a role alone; give both",
+            slot.name
+        ));
+    }
+    if slot.qualifier.is_some() && slot.role.is_none() {
+        return shape(format!(
+            "{type_id}: slot {} gives a qualifier without a kind and a role",
+            slot.name
+        ));
+    }
+    let Some(relation) = &slot.defined_by else {
+        return Ok(());
+    };
+    if slot.role.is_some() {
+        return shape(format!(
+            "{type_id}: slot {} is given both by a role and by a relation; give one",
+            slot.name
+        ));
+    }
+    check_name("slot relation", &relation.relation)?;
+    if relation.slot == slot.name {
+        return shape(format!(
+            "{type_id}: slot {} is defined by a relation to itself",
+            slot.name
+        ));
+    }
+    if !slots.contains_key(relation.slot.as_str()) {
+        return Err(Refusal::new(
+            "unknown_slot",
+            format!(
+                "{type_id}: slot {} is defined by a relation to slot {}, which the type does not declare",
+                slot.name, relation.slot
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A qualifier as compared: lower case, with runs of space folded to one.
+pub(crate) fn fold(text: &str) -> String {
+    text.split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The first slot, in name order, whose chain of `defined_by` relations returns to it.
+fn slot_relation_cycle(slots: &BTreeMap<&str, &SlotInput>) -> Option<String> {
+    for start in slots.keys() {
+        let mut seen = BTreeSet::new();
+        let mut at = *start;
+        while let Some(next) = slots
+            .get(at)
+            .and_then(|slot| slot.defined_by.as_ref())
+            .map(|relation| relation.slot.as_str())
+        {
+            if next == *start {
+                return Some((*start).to_owned());
+            }
+            if !seen.insert(next) {
+                break;
+            }
+            at = next;
+        }
+    }
+    None
+}
+
 fn compile_type(source: &Value) -> Result<Compiled, Refusal> {
     let input: TypeInput = serde_json::from_value(source.clone())
         .map_err(|e| Refusal::new("invalid_document", e.to_string()))?;
@@ -541,6 +656,34 @@ fn compile_type(source: &Value) -> Result<Compiled, Refusal> {
                 format!("{}: slot {} is declared twice", input.id, slot.name),
             ));
         }
+    }
+    let mut by_role: BTreeMap<(&str, &str, String), &str> = BTreeMap::new();
+    for slot in &input.slots {
+        check_slot_shape(&input.id, slot, &scope.slots)?;
+        if let (Some(kind), Some(role)) = (&slot.kind, &slot.role) {
+            let qualifier = slot.qualifier.as_deref().map(fold).unwrap_or_default();
+            if let Some(first) = by_role.insert(
+                (kind.as_str(), role.as_str(), qualifier),
+                slot.name.as_str(),
+            ) {
+                return Err(Refusal::new(
+                    "slot_shape",
+                    format!(
+                        "{}: slots {first} and {} give the same kind, role and qualifier; a party that appears more than once is one slot that repeats",
+                        input.id, slot.name
+                    ),
+                ));
+            }
+        }
+    }
+    if let Some(slot) = slot_relation_cycle(&scope.slots) {
+        return Err(Refusal::new(
+            "slot_cycle",
+            format!(
+                "{}: slot {slot} is defined by a relation that leads back to itself",
+                input.id
+            ),
+        ));
     }
     for step in &input.steps {
         check_name("step", &step.name)?;
@@ -744,6 +887,10 @@ fn compile_type(source: &Value) -> Result<Compiled, Refusal> {
                 name: slot.name.clone(),
                 repeats: slot.repeats,
                 required: slot.required,
+                kind: slot.kind.clone(),
+                role: slot.role.clone(),
+                qualifier: slot.qualifier.clone(),
+                defined_by: slot.defined_by.clone(),
             })
             .collect(),
         steps: step_refs,

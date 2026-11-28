@@ -477,12 +477,16 @@ impl Graph {
             .collect()
     }
 
-    /// The loaded terms of one list, by folded name.
+    /// The loaded terms of one list, by folded name and by each folded alias.
     pub(crate) fn terms(&self, list: &str) -> HashMap<String, &Entity> {
         self.of_type(FORM_TERM)
             .into_iter()
             .filter(|t| prop_text(t, "list").as_deref() == Some(list))
-            .map(|t| (normalize(&t.name), t))
+            .flat_map(|t| {
+                std::iter::once(normalize(&t.name))
+                    .chain(aliases(t).into_iter().map(|a| normalize(&a)))
+                    .map(move |wording| (wording, t))
+            })
             .collect()
     }
 }

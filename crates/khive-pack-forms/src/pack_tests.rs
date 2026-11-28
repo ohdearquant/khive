@@ -12,7 +12,7 @@ fn every_verb_is_namespaced_and_unique() {
         assert!(seen.insert(handler.name), "{} twice", handler.name);
         assert!(!handler.description.is_empty(), "{}", handler.name);
     }
-    assert_eq!(seen.len(), 10);
+    assert_eq!(seen.len(), 12);
 }
 
 #[test]

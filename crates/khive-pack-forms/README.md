@@ -14,6 +14,8 @@ The pack is linked into the server and selected by name (`--pack forms`, beside 
 | `forms.split` | Record that one label names two things: rename, add, and a general field over both. |
 | `forms.resolve` | Find the field a wording means, from the exact wording down to its initials and its words; a shared wording resolves as ambiguous, and a miss names the nearest fields. |
 | `forms.neighbourhood` | Read one node with its typed edges. |
+| `forms.terms` | List the loaded kinds, roles, relations and counting qualifiers, each with its definition and aliases, and whether a relation carries. |
+| `forms.subjects` | List the subjects one form revision declares; the revision loaded last unless one is named. |
 | `forms.check` | Check a set of forms and answers against the printed rules. |
 | `forms.lint` | List nodes that break the store's invariants. |
 | `forms.export` | Export the forms graph keyed by content. |
@@ -26,6 +28,8 @@ All nine types are `concept` entities: `form_issuer`, `form`, `form_section`, `f
 ## Subjects and lines
 
 A field is role-free: `legal name`, never "the applicant's legal name". Whose value a line asks for is a subject the form revision declares: a party or a thing, with a kind and a role from term lists the caller loads (`terms` in the document), an optional qualifier, an optional row count (`repeats`, from 1 to 100) and named relations to other subjects of the same form. A subject belongs to its revision and is never merged with another form's.
+
+A term may carry aliases (`{name, definition?, aliases?}`). A name or an alias resolves to its term, so a later document that names a loaded term by any of its wordings means that term and adds its further wordings as aliases; a term whose wordings name two loaded terms of one list is refused. Subjects are stored under the canonical names. Two more lists sit beside kinds, roles and relations: `counting_qualifiers`, the qualifiers that only count ("first", "second", "additional"), compared after folding case and spaces; and `carrying_relations`, the relations by which one subject carries another ("belongs to"), each a relation listed in the same document or loaded before it. `forms.neighbourhood` on a term shows its aliases and whether it carries.
 
 On a form that declares subjects, each item that asks for a field says which subject it is `about` and which subject writes it (`filled_by`); `forms.load` refuses an item that names an undeclared subject. An item may also carry a `state` (a former and a new value of one field), its own `repeats`, a `necessity` (`required`, the default on such a form, `optional`, `one_of` a named `group`, or `at_least_one_row`), and `selects`, the subjects its value may name. A printed rule may enable a subject as well as a section or an item.
 

@@ -13,8 +13,8 @@ use super::views::{field_reply, usage};
 use super::write::{DECISION, FORMAT, LOG_KEYS};
 use super::Ctx;
 use crate::store::{
-    definition, invalid, is_general, label, prop, prop_text, props, scalar, strings, type_of,
-    wordings, Graph,
+    aliases, definition, invalid, is_general, label, prop, prop_text, props, scalar, strings,
+    type_of, wordings, Graph,
 };
 use crate::text::normalize;
 use crate::vocab::{
@@ -434,16 +434,26 @@ pub(crate) async fn neighbourhood(ctx: &Ctx<'_>, params: Value) -> Result<Value,
                     .cmp(&prop_text(b, "form_key"))
                     .then(a.name.cmp(&b.name))
             });
-            reply["term"] = json!({"list": list, "name": root.name, "definition": prop_text(root, "definition")});
+            reply["term"] = json!({
+                "list": list,
+                "name": root.name,
+                "definition": prop_text(root, "definition"),
+                "aliases": aliases(root),
+                "carries": prop(root, "carries").and_then(Value::as_bool).unwrap_or(false),
+            });
             if list == "purpose" {
-                // Every form that says it is for this purpose.
+                // Every form that says it is for this purpose, under its name
+                // or one of its aliases.
+                let wordings: Vec<String> = std::iter::once(term.clone())
+                    .chain(aliases(root).iter().map(|a| normalize(a)))
+                    .collect();
                 let mut forms: Vec<&Entity> = graph
                     .of_type(FORM)
                     .into_iter()
                     .filter(|f| {
                         strings(prop(f, "purposes"))
                             .iter()
-                            .any(|p| normalize(p) == term)
+                            .any(|p| wordings.contains(&normalize(p)))
                     })
                     .collect();
                 forms.sort_by_key(|f| graph.key(f.id));
@@ -778,5 +788,84 @@ pub(crate) async fn export(ctx: &Ctx<'_>, _params: Value) -> Result<Value, Runti
             "annotates": annotates,
         })).collect::<Vec<_>>(),
         "warnings": warnings,
+    }))
+}
+
+/// A term as forms.terms shows it.
+fn term_view(term: &Entity) -> Value {
+    json!({
+        "name": term.name,
+        "definition": prop_text(term, "definition"),
+        "aliases": aliases(term),
+        "carries": prop(term, "carries").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+/// forms.terms: the namespace's term lists, each term with its aliases.
+pub(crate) async fn terms(ctx: &Ctx<'_>, _params: Value) -> Result<Value, RuntimeError> {
+    let graph = Graph::load(ctx.runtime, ctx.token).await?;
+    let all = graph.of_type(FORM_TERM);
+    let mut lists = Map::new();
+    for (key, list) in TERM_LISTS {
+        let terms: Vec<Value> = all
+            .iter()
+            .filter(|t| prop_text(t, "list").as_deref() == Some(list))
+            .map(|t| term_view(t))
+            .collect();
+        lists.insert(key.to_owned(), Value::Array(terms));
+    }
+    Ok(json!({ "terms": lists }))
+}
+
+/// forms.subjects: the subjects one form revision declares, the revision loaded last unless
+/// one is named.
+pub(crate) async fn subjects(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeError> {
+    let args = params::args(params)?;
+    let spec = params::text(&args, "form")?;
+    let mut revision = params::opt_text(&args, "revision")?;
+    let form_id = match (spec.rsplit_once('@'), &revision) {
+        (Some((_, in_form)), Some(named)) => {
+            return Err(invalid(format!(
+                "form {spec} names revision {in_form} and revision names {named}; name the revision once"
+            )));
+        }
+        (Some((form_id, named)), None) => {
+            revision = Some(named.to_owned());
+            form_id.to_owned()
+        }
+        (None, _) => spec.clone(),
+    };
+    let graph = Graph::load(ctx.runtime, ctx.token).await?;
+    let mut revisions: Vec<&Entity> = graph
+        .of_type(FORM)
+        .into_iter()
+        .filter(|f| prop_text(f, "form_id").as_deref() == Some(form_id.as_str()))
+        .collect();
+    revisions.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then(prop_text(a, "revision").cmp(&prop_text(b, "revision")))
+    });
+    let form = match &revision {
+        Some(named) => revisions
+            .iter()
+            .find(|f| prop_text(f, "revision").as_deref() == Some(named.as_str()))
+            .copied()
+            .ok_or_else(|| invalid(format!("no form {form_id}@{named} is loaded")))?,
+        None => revisions
+            .last()
+            .copied()
+            .ok_or_else(|| invalid(format!("no form {form_id} is loaded")))?,
+    };
+    let key = graph.key(form.id).unwrap_or_default();
+    let mut subjects: Vec<&Entity> = graph.subjects_of(&key).into_values().collect();
+    subjects.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(json!({
+        "form": cite(form),
+        "revisions": revisions
+            .iter()
+            .filter_map(|f| prop_text(f, "revision"))
+            .collect::<Vec<_>>(),
+        "subjects": subjects.into_iter().map(subject_view).collect::<Vec<_>>(),
     }))
 }

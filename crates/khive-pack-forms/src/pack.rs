@@ -30,7 +30,7 @@ const DOCUMENT: ParamDef = param(
     "document",
     "object",
     true,
-    "One form revision: {form_id, revision, title, source: {url, sha256}, issuer?: {name, jurisdiction}, terms?: {kinds?, roles?, relations?, purposes?: [name | {name, definition?}]}, purposes?: [purpose], subjects?: [{id, kind, role, qualifier?, repeats?, relations?: [{relation, to}]}], fields?: [{name, definition, value_type, aliases?, values?: [{name, definition}], exclusive?, comparison?}], sections?: [{label, order, sections?}], items?: [{label, page, order, item_kind, filled_by, about?, known_to?, state?, repeats?, necessity?, group?, selects?, section?, field?, value?, widget?, links_to?}], rules?: [{text, page, depends_on?: [{field, value?}], enables?: [{section | item | subject | form}]}], relations?: [{relation, form, revision?}], constraints?: [{must, lines: [{subject?, field, state?}, {subject?, field, state?}], text?}]}. item_kind is text, choice, signature or attachment; value_type is text, date, amount, identifier or choice; necessity is required, optional, one_of (with group) or at_least_one_row; relation is competes_with, composed_with, precedes or depends_on, toward a form already loaded; comparison is exact, folded, digits or key; must is match or differ; known_to is a declared subject, or {relation} for the subject the item's own subject names under that relation.",
+    "One form revision: {form_id, revision, title, source: {url, sha256}, issuer?: {name, jurisdiction}, terms?: {kinds?, roles?, relations?, purposes?, counting_qualifiers?: [name | {name, definition?, aliases?}], carrying_relations?: [relation name]}, purposes?: [purpose], subjects?: [{id, kind, role, qualifier?, repeats?, relations?: [{relation, to}]}], fields?: [{name, definition, value_type, aliases?, values?: [{name, definition}], exclusive?, comparison?}], sections?: [{label, order, sections?}], items?: [{label, page, order, item_kind, filled_by, about?, known_to?, state?, repeats?, necessity?, group?, selects?, section?, field?, value?, widget?, links_to?}], rules?: [{text, page, depends_on?: [{field, value?}], enables?: [{section | item | subject | form}]}], relations?: [{relation, form, revision?}], constraints?: [{must, lines: [{subject?, field, state?}, {subject?, field, state?}], text?}]}. item_kind is text, choice, signature or attachment; value_type is text, date, amount, identifier or choice; necessity is required, optional, one_of (with group) or at_least_one_row; relation is competes_with, composed_with, precedes or depends_on, toward a form already loaded; comparison is exact, folded, digits or key; must is match or differ; known_to is a declared subject, or {relation} for the subject the item's own subject names under that relation. A term named by a name or alias of a term already loaded in its list is that term, and the document's further wordings of it become its aliases; a term whose wordings name two loaded terms of one list is refused. A subject's kind, role, counting qualifier and relations, and a form's purposes, are matched under the canonical names. counting_qualifiers are the qualifiers that only count (first, second, additional); carrying_relations names relations of terms.relations or already loaded, by which one subject carries another.",
 );
 const ITEM_ID: ParamDef = param(
     "item",
@@ -39,7 +39,7 @@ const ITEM_ID: ParamDef = param(
     "Id of an item that has no field yet, as forms.add_item returned it.",
 );
 
-pub(crate) static FORMS_HANDLERS: [HandlerDef; 10] = [
+pub(crate) static FORMS_HANDLERS: [HandlerDef; 12] = [
     HandlerDef {
         name: "forms.load",
         description: "Load one form revision from one document in one transaction: the form, its issuer, sections, items, the fields and choice values the items mean, printed rules, and relations to forms already loaded. Loading the same form_id and revision again changes nothing. A live field with the same name, definition and value type is reused, and keeps any alias the document gives it that no other live field answers to (counted as aliases_added; the others come back as warnings); a live field of that name with another meaning leaves the items asking for it without a field, with a warning, to be decided with forms.same or forms.split; a printed rule whose premise names such a field is kept, marked as waiting on it. An exclusive choice field holds at most 48 values, and a reused exclusive field's new values exclude its existing ones. A form may declare subjects, the parties and things its lines are about: each has an id unique in the form, a kind and a role from the term lists (loaded by any document under terms and kept), an optional qualifier and row count (repeats), and named relations to other subjects of the form. On such a form every item that asks for a field names the declared subject it is about (about) and the declared subject who writes it (filled_by), and is required unless it states another necessity; an item naming an undeclared subject refuses the whole document. state tells apart two lines on one subject and field (a former and a new value), repeats gives a line its own row count, and selects lists the subjects a line's value may name. A rule may enable a subject, so that its lines are asked only when the rule's premise holds.",
@@ -107,6 +107,23 @@ pub(crate) static FORMS_HANDLERS: [HandlerDef; 10] = [
         params: &[
             param("node", "string", true, "A node id, a form (form_id or form_id@revision), a field name, or a term as kind:<name>, role:<name> or relation:<name>."),
             param("depth", "integer", false, "Edges to follow outward: 1 to 3, default 1."),
+        ],
+    },
+    HandlerDef {
+        name: "forms.terms",
+        description: "List the namespace's term lists, as forms.load takes them: kinds, roles, relations and counting_qualifiers. Each term comes with its definition, its aliases, and whether it is a relation by which one subject carries another (carries). Writes nothing.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[],
+    },
+    HandlerDef {
+        name: "forms.subjects",
+        description: "List the subjects one form revision declares, each with its kind, role, qualifier, row count and relations under their canonical term names. Without a revision, the revision loaded last; the reply names the revision it read and every revision of the form in load order. Writes nothing.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            param("form", "string", true, "A form_id, or form_id@revision."),
+            param("revision", "string", false, "The revision to read; default the one loaded last."),
         ],
     },
     HandlerDef {
@@ -221,6 +238,8 @@ impl PackRuntime for FormsPack {
             "forms.split" => handlers::split(&ctx, params).await,
             "forms.resolve" => handlers::resolve(&ctx, params).await,
             "forms.neighbourhood" => handlers::neighbourhood(&ctx, params).await,
+            "forms.terms" => handlers::terms(&ctx, params).await,
+            "forms.subjects" => handlers::subjects(&ctx, params).await,
             "forms.check" => handlers::check(&ctx, params).await,
             "forms.lint" => handlers::lint(&ctx, params).await,
             "forms.export" => handlers::export(&ctx, params).await,

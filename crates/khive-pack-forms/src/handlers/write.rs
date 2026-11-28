@@ -11,14 +11,15 @@ use uuid::Uuid;
 
 use super::lines::{
     check_subjects, constraint_specs, constraints_prop, declared_in, declared_on, line_props,
-    subject_props, subject_specs, term_specs,
+    subject_props, subject_specs, term_specs, KnownTerms,
 };
 use super::params::{self, Args};
 use super::views::{field_reply, nearest};
 use super::Ctx;
 use crate::store::{
-    aliases, form_key, invalid, is_general, label, pending_premise, pending_premises, prop_text,
-    props, quoted_names, scalar, strings, type_of, wordings, Graph, Writes, GRAPH_RELATIONS,
+    aliases, form_key, invalid, is_general, label, pending_premise, pending_premises, prop,
+    prop_text, props, quoted_names, scalar, strings, type_of, wordings, Graph, Writes,
+    GRAPH_RELATIONS,
 };
 use crate::text::normalize;
 use crate::vocab::{
@@ -479,38 +480,122 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
     }
 
     // The term lists first, so the subjects below can name what they load.
-    let terms = term_specs(doc)?;
-    let mut known: HashSet<(String, String)> = HashSet::new();
+    let (terms, carrying) = term_specs(doc)?;
+    let mut known: KnownTerms = HashMap::new();
     for (_, list) in TERM_LISTS {
-        for folded in graph.terms(list).into_keys() {
-            known.insert((list.to_owned(), folded));
+        for (wording, term) in graph.terms(list) {
+            known.insert((list.to_owned(), wording), term.name.clone());
         }
     }
+    let carrying_folded: HashSet<String> = carrying.iter().map(|n| normalize(n)).collect();
+    // Loaded terms this document gives a new alias to or marks as carrying,
+    // with the properties they are to hold.
+    let mut grown: HashMap<Uuid, Map<String, Value>> = HashMap::new();
     for term in &terms {
-        if known.insert((term.list.to_owned(), normalize(&term.name))) {
-            let mut properties = map([("list", json!(term.list))]);
-            if let Some(definition) = &term.definition {
-                properties.insert("definition".to_owned(), json!(definition));
+        let list = term.list.to_owned();
+        let mut owners: Vec<String> = term
+            .wordings()
+            .iter()
+            .filter_map(|w| known.get(&(list.clone(), w.clone())).cloned())
+            .collect();
+        owners.sort();
+        owners.dedup();
+        if owners.len() > 1 {
+            return Err(invalid(format!(
+                "terms: \"{}\" and its aliases name more than one loaded {list}: {}",
+                term.name,
+                owners.join(", ")
+            )));
+        }
+        let wordings: Vec<&String> = std::iter::once(&term.name).chain(&term.aliases).collect();
+        match owners.pop() {
+            None => {
+                let mut properties = map([("list", json!(term.list))]);
+                if let Some(definition) = &term.definition {
+                    properties.insert("definition".to_owned(), json!(definition));
+                }
+                if !term.aliases.is_empty() {
+                    properties.insert("aliases".to_owned(), json!(term.aliases));
+                }
+                if term.list == "relation"
+                    && term.wordings().iter().any(|w| carrying_folded.contains(w))
+                {
+                    properties.insert("carries".to_owned(), json!(true));
+                }
+                writes.create_entity(FORM_TERM, &term.name, None, properties)?;
+                counts.terms += 1;
+                for wording in wordings {
+                    known.insert((list.clone(), normalize(wording)), term.name.clone());
+                }
             }
-            writes.create_entity(FORM_TERM, &term.name, None, properties)?;
-            counts.terms += 1;
+            Some(canonical) => {
+                // Terms named twice in one document are refused above, so the
+                // owner is a term loaded before this document.
+                let terms_of_list = graph.terms(term.list);
+                let existing = terms_of_list
+                    .get(&normalize(&canonical))
+                    .ok_or_else(|| invalid(format!("the {list} \"{canonical}\" is not loaded")))?;
+                let fresh: Vec<String> = wordings
+                    .into_iter()
+                    .filter(|w| !known.contains_key(&(list.clone(), normalize(w))))
+                    .cloned()
+                    .collect();
+                if !fresh.is_empty() {
+                    let properties = grown.entry(existing.id).or_insert_with(|| props(existing));
+                    let mut held = strings(properties.get("aliases"));
+                    for wording in &fresh {
+                        known.insert((list.clone(), normalize(wording)), canonical.clone());
+                        held.push(wording.clone());
+                    }
+                    properties.insert("aliases".to_owned(), json!(held));
+                }
+            }
         }
     }
+    for name in &carrying {
+        let Some(canonical) = known
+            .get(&("relation".to_owned(), normalize(name)))
+            .cloned()
+        else {
+            return Err(invalid(format!(
+                "terms.carrying_relations names \"{name}\", which is not a loaded relation; list it under terms.relations"
+            )));
+        };
+        let relations = graph.terms("relation");
+        if let Some(existing) = relations.get(&normalize(&canonical)) {
+            if prop(existing, "carries").and_then(Value::as_bool) != Some(true) {
+                grown
+                    .entry(existing.id)
+                    .or_insert_with(|| props(existing))
+                    .insert("carries".to_owned(), json!(true));
+            }
+        }
+    }
+    for (id, properties) in grown {
+        if let Some(before) = graph.get(id) {
+            writes.update_entity(before, None, None, Some(properties))?;
+        }
+    }
+    // A purpose named twice, by one wording or by two wordings of one term, is
+    // refused.
     let mut named = HashSet::new();
     for purpose in &purposes {
-        if !named.insert(normalize(purpose)) {
+        let canonical = known.get(&("purpose".to_owned(), normalize(purpose)));
+        if !named.insert(normalize(
+            canonical.map_or(purpose.as_str(), String::as_str),
+        )) {
             return Err(invalid(format!(
                 "the document names the purpose \"{purpose}\" twice"
             )));
         }
-        if !known.contains(&("purpose".to_owned(), normalize(purpose))) {
+        if canonical.is_none() {
             return Err(invalid(format!(
                 "the form is for \"{purpose}\", which is not a loaded purpose; list it under terms"
             )));
         }
     }
-    let subjects = subject_specs(doc)?;
-    check_subjects(&subjects, &known)?;
+    let mut subjects = subject_specs(doc)?;
+    check_subjects(&mut subjects, &known)?;
     let mut subject_ids: HashMap<String, Uuid> = HashMap::new();
     for spec in &subjects {
         let id = writes.create_entity(FORM_SUBJECT, &spec.id, None, subject_props(spec, &key))?;

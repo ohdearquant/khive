@@ -138,6 +138,13 @@ Revision `domain-effects-v36` classifies `git.issue_list` and `git.pr_list` as
 from the platform and writes no receipt and no blob, so each is admitted as a
 read like `git.issue`.
 
+Revision `domain-effects-v37` classifies four verbs added for slot resolution.
+`forms.terms` and `forms.subjects` are `Read`: they return the loaded term lists
+and one form revision's subjects and write nothing. `operation.resolve` is
+`Read`: it reads a type, a form's subjects and the decisions kept beside the type
+and writes nothing. `operation.decide` is `Write`: it appends one decision in one
+transaction.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -230,15 +237,17 @@ read like `git.issue`.
 | `exec.tree_get`                   | Read   | Verb       | [khive-pack-exec/src/vocab.rs](../../../khive-pack-exec/src/vocab.rs#L66)                               |
 | `exec.tree_put`                   | Write  | Verb       | [khive-pack-exec/src/vocab.rs](../../../khive-pack-exec/src/vocab.rs#L73)                               |
 | `forms.add_item`                  | Write  | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L51)                               |
-| `forms.check`                     | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L109)                              |
-| `forms.export`                    | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L126)                              |
-| `forms.lint`                      | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L119)                              |
+| `forms.check`                     | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L129)                              |
+| `forms.export`                    | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L146)                              |
+| `forms.lint`                      | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L139)                              |
 | `forms.load`                      | Write  | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L44)                               |
-| `forms.neighbourhood`             | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L99)                               |
-| `forms.replay`                    | Write  | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L133)                              |
-| `forms.resolve`                   | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L89)                               |
+| `forms.neighbourhood`             | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L102)                              |
+| `forms.replay`                    | Write  | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L153)                              |
+| `forms.resolve`                   | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L90)                               |
 | `forms.same`                      | Write  | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L63)                               |
-| `forms.split`                     | Write  | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L74)                               |
+| `forms.split`                     | Write  | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L75)                               |
+| `forms.subjects`                  | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L119)                              |
+| `forms.terms`                     | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L112)                              |
 | `get`                             | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L203)                    |
 | `git.branch`                      | Write  | Verb       | [khive-pack-git/src/vocab.rs](../../../khive-pack-git/src/vocab.rs#L200)                                |
 | `git.branch_delete`               | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs)                         |
@@ -319,11 +328,13 @@ read like `git.issue`.
 | `moodboard.serve`                 | Write  | Verb       | [khive-pack-moodboard/src/vocab.rs](../../../khive-pack-moodboard/src/vocab.rs#L107)                    |
 | `moodboard.train_preference`      | Write  | Verb       | [khive-pack-moodboard/src/vocab.rs](../../../khive-pack-moodboard/src/vocab.rs#L224)                    |
 | `neighbors`                       | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L944)                    |
-| `operation.bind`                  | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L69)                       |
-| `operation.define`                | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L44)                       |
-| `operation.frontier`              | Read   | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L97)                       |
-| `operation.open`                  | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L56)                       |
-| `operation.record`                | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L82)                       |
+| `operation.bind`                  | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L80)                       |
+| `operation.decide`                | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L133)                      |
+| `operation.define`                | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L55)                       |
+| `operation.frontier`              | Read   | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L108)                      |
+| `operation.open`                  | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L67)                       |
+| `operation.record`                | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L93)                       |
+| `operation.resolve`               | Read   | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L120)                      |
 | `propose`                         | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1207)                   |
 | `query`                           | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1174)                   |
 | `resolve`                         | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1331)                   |

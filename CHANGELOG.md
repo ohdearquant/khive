@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a pull request. Terminal escapes and control and format characters are removed from the text and
   `text_altered` says when that changed anything; the text is returned as untrusted data. It is a
   read: a `[[git_write.allowed]]` row with `access = "read"` admits it, and it writes no receipt.
+- `operation.resolve` says which slot of an operation type each subject of a loaded form fills: by
+  a recorded decision, by kind, role and qualifier, by a relation to a subject in another slot, or
+  carried by a subject that has a slot. A subject with more than one candidate is undecided, and
+  one nothing reaches has no slot. `operation.decide` records, with a reason, that subjects fill a
+  slot or are not of the type; decisions are kept beside the type, never changed, and keep
+  applying while their subject and their slot exist. A slot may now name a kind, a role, a
+  qualifier or a relation to another slot, and `operation.define` refuses a term the namespace has
+  not loaded, so the operation pack is selected beside `forms` and `kg`.
+- `forms.terms` lists the loaded terms with their aliases, and `forms.subjects` lists the subjects
+  of one form revision. A term may carry aliases, and two more term lists, `counting_qualifiers`
+  and `carrying_relations`, sit beside kinds, roles and relations.
 - `git.pr_list` and `git.issue_list` list the pull requests or issues of a configured repository
   in the requested state (`open` unless `closed` or `all` is named), newest created first, one
   hundred to a page for at most ten pages, and say in `truncated` whether more matched.
