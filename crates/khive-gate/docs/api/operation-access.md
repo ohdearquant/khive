@@ -127,6 +127,12 @@ Revision `domain-effects-v34` classifies `git.issue` as `Read`: it reads one
 issue and its comments from the platform and writes no receipt and no blob, so
 it is admitted as a read like `git.pr_state`.
 
+Revision `domain-effects-v35` classifies the five verbs of the operation pack.
+`operation.define`, `operation.open`, `operation.bind` and `operation.record`
+are `Write`: each appends definitions, an operation or its records in one
+transaction. `operation.frontier` is `Read`: it reads an operation's records and
+its pinned type and writes nothing.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -306,6 +312,11 @@ it is admitted as a read like `git.pr_state`.
 | `moodboard.serve`                 | Write  | Verb       | [khive-pack-moodboard/src/vocab.rs](../../../khive-pack-moodboard/src/vocab.rs#L107)                    |
 | `moodboard.train_preference`      | Write  | Verb       | [khive-pack-moodboard/src/vocab.rs](../../../khive-pack-moodboard/src/vocab.rs#L224)                    |
 | `neighbors`                       | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L944)                    |
+| `operation.bind`                  | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L69)                       |
+| `operation.define`                | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L44)                       |
+| `operation.frontier`              | Read   | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L97)                       |
+| `operation.open`                  | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L56)                       |
+| `operation.record`                | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L82)                       |
 | `propose`                         | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1207)                   |
 | `query`                           | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1174)                   |
 | `resolve`                         | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1331)                   |

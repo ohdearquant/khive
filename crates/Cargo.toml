@@ -50,6 +50,7 @@ members = [
     "khive-pack-git",
     "khive-pack-workspace",
     "khive-pack-charter",
+    "khive-pack-operation",
     "khive-mcp",
     "khive-vcs",
     "khive-vcs-adapters",

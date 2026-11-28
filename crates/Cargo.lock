@@ -2289,6 +2289,7 @@ dependencies = [
  "khive-pack-knowledge",
  "khive-pack-memory",
  "khive-pack-moodboard",
+ "khive-pack-operation",
  "khive-pack-schedule",
  "khive-pack-session",
  "khive-pack-telemetry",
@@ -2738,6 +2739,23 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "uuid",
+]
+
+[[package]]
+name = "khive-pack-operation"
+version = "0.23.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "chrono",
+ "inventory",
+ "khive-runtime",
+ "khive-storage",
+ "khive-types",
+ "serde",
+ "serde_json",
+ "tokio",
  "uuid",
 ]
 
@@ -3220,6 +3238,7 @@ dependencies = [
  "khive-pack-knowledge",
  "khive-pack-memory",
  "khive-pack-moodboard",
+ "khive-pack-operation",
  "khive-pack-schedule",
  "khive-pack-session",
  "khive-pack-telemetry",
