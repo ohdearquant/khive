@@ -3,7 +3,8 @@
 `RestoreOp` contains `target_id` and `record`, the complete live entity, note, or
 edge expected after restoring a soft deletion. `record` uses the existing
 `DeletePreimage` representation, tagged by `substrate`, and the same strict
-embedded-record mirrors. All fields, including timestamps, status and expiry,
+embedded-record mirrors. An entity record carries the keys and aliases the entity
+held when it was deleted, so a restore names what it takes back. All fields, including timestamps, status and expiry,
 remain on the wire. This operation does not create a missing row.
 
 The checked constructor and decoder require matching IDs, no `deleted_at`

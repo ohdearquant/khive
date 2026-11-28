@@ -12,7 +12,7 @@ The pack is linked into the server and selected by name (`--pack forms`, beside 
 | `forms.add_item` | Add an item to a loaded form and report which fields its label matches. |
 | `forms.same` | Record that an item means an existing field, or a new one. |
 | `forms.split` | Record that one label names two things: rename, add, and a general field over both. |
-| `forms.resolve` | Find the field a wording means; a shared wording resolves as ambiguous. |
+| `forms.resolve` | Find the field a wording means, from the exact wording down to its initials and its words; a shared wording resolves as ambiguous, and a miss names the nearest fields. |
 | `forms.neighbourhood` | Read one node with its typed edges. |
 | `forms.check` | Check a set of forms and answers against the printed rules. |
 | `forms.lint` | List nodes that break the store's invariants. |

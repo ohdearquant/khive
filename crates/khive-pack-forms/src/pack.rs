@@ -42,7 +42,7 @@ const ITEM_ID: ParamDef = param(
 pub(crate) static FORMS_HANDLERS: [HandlerDef; 10] = [
     HandlerDef {
         name: "forms.load",
-        description: "Load one form revision from one document in one transaction: the form, its issuer, sections, items, the fields and choice values the items mean, printed rules, and relations to forms already loaded. Loading the same form_id and revision again changes nothing. A live field with the same name, definition and value type is reused; a live field of that name with another meaning leaves the items asking for it without a field, with a warning, to be decided with forms.same or forms.split; a printed rule whose premise names such a field is kept, marked as waiting on it. An exclusive choice field holds at most 48 values, and a reused exclusive field's new values exclude its existing ones.",
+        description: "Load one form revision from one document in one transaction: the form, its issuer, sections, items, the fields and choice values the items mean, printed rules, and relations to forms already loaded. Loading the same form_id and revision again changes nothing. A live field with the same name, definition and value type is reused, and keeps any alias the document gives it that no other live field answers to (counted as aliases_added; the others come back as warnings); a live field of that name with another meaning leaves the items asking for it without a field, with a warning, to be decided with forms.same or forms.split; a printed rule whose premise names such a field is kept, marked as waiting on it. An exclusive choice field holds at most 48 values, and a reused exclusive field's new values exclude its existing ones.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[DOCUMENT],
@@ -61,13 +61,14 @@ pub(crate) static FORMS_HANDLERS: [HandlerDef; 10] = [
     },
     HandlerDef {
         name: "forms.same",
-        description: "Give an item that has no field its field: an existing one (field) or a new one (new_field). The item's label becomes an alias of an existing field unless another field already answers to it. The decision is logged on the field. A rule of the item's form waiting on the wording the item named takes its premise on that field, and the reply lists, as rules_settled, the rules left with none waiting.",
+        description: "Give an item that has no field its field: an existing one (field) or a new one (new_field). The item's label, and each further wording in aliases, becomes an alias of the field unless another field already answers to it; the reply names the label as alias_added and the further wordings as aliases_added. The decision is logged on the field. A rule of the item's form waiting on the wording the item named takes its premise on that field, and the reply lists, as rules_settled, the rules left with none waiting.",
         visibility: Visibility::Verb,
         category: VerbCategory::Commissive,
         params: &[
             ITEM_ID,
             param("field", "string", false, "The id or name of the field the item means."),
             param("new_field", "object", false, "A field to create for the item: {name, definition, value_type, aliases?, values?}."),
+            param("aliases", "array of string", false, "Further wordings of the field, such as a short form or initials, to add as its aliases."),
         ],
     },
     HandlerDef {
@@ -87,12 +88,14 @@ pub(crate) static FORMS_HANDLERS: [HandlerDef; 10] = [
     },
     HandlerDef {
         name: "forms.resolve",
-        description: "Resolve text to fields, choice values and forms through canonical names, aliases and the printed labels of the items that mean them. Each hit says how it matched, the wording that matched, and the forms that print it; a value matched through an option's label cites that option. Hits of every type come back in one list ordered by rank, then name. A wording that names several fields returns each of them, flagged ambiguous. The same graph always gives the same answer.",
+        description: "Resolve text to fields, choice values and forms through canonical names, aliases and the printed labels of the items that mean them, rung by rung. exact: the wording folded for case, spacing and punctuation, a label also with its leading line marker (\"5\", \"1b\", \"(c)\") dropped. normalised: the same with possessives folded into their word. initials: one word spelling the first letters of a name or alias. words: every meaningful word of the text is a word of a name, alias or label, in any order, with words such as of and the dropped and plain endings stemmed (signed and signature match). semantic, only when min_rung names it: fields by the similarity of their wordings under the configured embedding model. Each hit says how it matched (matched_by: name, alias, label, form_id, title, normalised, initials, words or semantic), the wording that matched, and the forms that print it; a value matched through an option's label cites that option. Hits of every type come back in one list ordered by rank, a stronger rung always first, then by coverage or similarity, then name; total counts the hits before limit. A wording that names several fields at its best rung returns each of them, flagged ambiguous; a general field returns its narrower fields. A text nothing matches comes back with near, the nearest fields by shared words, or a note that no field shares a word with it. The same graph always gives the same answer.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
             param("text", "string", true, "The wording to resolve."),
             param("types", "array of string", false, "Only these hit types: field, field_value, form."),
+            param("limit", "integer", false, "Most hits returned: 1 to 100, default 10."),
+            param("min_rung", "string", false, "The weakest rung tried: exact, normalised, initials, words (the default) or semantic."),
         ],
     },
     HandlerDef {

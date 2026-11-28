@@ -85,6 +85,7 @@ impl Stamped {
             entity_type: None,
             properties: patch.properties.as_ref().map(|_| projected.properties),
             tags: None,
+            aliases: None,
         }
     }
 
@@ -143,6 +144,7 @@ fn properties_patch(value: Value) -> EntityPatch {
         entity_type: None,
         properties: Some(properties(value)),
         tags: None,
+        aliases: None,
     }
 }
 
@@ -204,6 +206,7 @@ async fn canonical_update_that_changes_vouched_bytes_drops_the_stamp() {
         entity_type: None,
         properties: None,
         tags: None,
+        aliases: None,
     };
     let preimage = s.preimage(&patch);
     s.apply(patch, preimage)
@@ -226,6 +229,7 @@ async fn canonical_update_refuses_manifest_exempt_content_once_the_stamp_drops()
         entity_type: None,
         properties: None,
         tags: None,
+        aliases: None,
     };
     let preimage = s.preimage(&patch);
     let error = s
