@@ -65,7 +65,7 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 │  14 default packs (`RuntimeConfig::built_in_packs()`):        │
 │  kg, gtd, memory, brain, comm, schedule, knowledge, session, │
 │  tool, exec, git, code, workspace, blob — together exposing   │
-│  171 public verbs (see the verb-catalog paragraph below       │
+│  173 public verbs (see the verb-catalog paragraph below       │
 │  for the per-pack breakdown)                                   │
 │  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
 │  khive-merge       — KG merge algorithm (ADR-010, forward-deployed,  │
@@ -229,8 +229,8 @@ still reached only through the `kkernel code-ingest` admin CLI path (ADR-085 Ame
 commit/issue/pull_request note kinds, a batch ingester, the git.digest and git.ingest_cursor verbs
 (ADR-088 Amendment 1), four write verbs — git.commit / git.branch / git.update_ref / git.push — that
 shell to system git with hardened, allowlisted argv construction and unconditional force-push denial
-(ADR-108), and eighteen dev-loop verbs — git.init / git.status / git.log / git.diff / git.checkout /
-git.fetch / git.pr_open / git.pr_review / git.pr_merge / git.pr_state / git.issue / git.pr_edit / git.pr_close / git.check_log / git.branch_delete / git.gates / git.receipts / git.reconcile (ADR-182);
+(ADR-108), and twenty dev-loop verbs — git.init / git.status / git.log / git.diff / git.checkout /
+git.fetch / git.pr_open / git.pr_review / git.pr_merge / git.pr_state / git.pr_list / git.issue / git.issue_list / git.pr_edit / git.pr_close / git.check_log / git.branch_delete / git.gates / git.receipts / git.reconcile (ADR-182);
 comm.probe (#644) added 2026-07-07; brain.event_counts (ADR-103 Stage 1, #724
 Ask A) added 2026-07-08; resolve (kg) added 2026-07-09; workspace (#873) contributes zero verbs,
 adding only the `workspace` entity kind and `contains` endpoint rules to git/gtd/session notes;

@@ -61,6 +61,7 @@ async fn amendment12_arm5_program_is_unknown_on_every_repository_verb() {
                 ]
             }
             "git.pr_state" => vec![json!({"repo":f.repo,"number":1})],
+            "git.pr_list" | "git.issue_list" => vec![json!({"repo":f.repo})],
             "git.issue" => vec![json!({"repo":f.repo,"number":1})],
             "git.check_log" => vec![json!({"repo":f.repo,"check_run":1})],
             "git.pr_edit" => vec![
