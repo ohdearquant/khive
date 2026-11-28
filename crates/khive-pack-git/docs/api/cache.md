@@ -178,8 +178,9 @@ and reaps the in-flight clone (its process group on Unix, its direct child on
 other targets) before cleanup. An oversized clone never enters the cache
 slot, and because the marker is written before the atomic rename, a process
 interruption between clone and rename can never leave a live, markerless
-slot at the cache-key path (issue #765). The wrapper (lock file included) is
-removed on both the success and every failure path.
+slot at the cache-key path (issue #765). The cache removes the staging
+wrapper, including its lock file, with bounded retries before returning
+`CloneTooLarge`. A persistent removal error surfaces as a filesystem error.
 
 A kill can still interrupt the process before any Rust cleanup guard runs and
 leave the wrapper directory behind. `prepare_cache_root` / `reap_stale_staging`

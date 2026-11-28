@@ -93,23 +93,18 @@ async fn async_phase_cannot_degrade_cancelled_work_to_success() {
 }
 
 #[tokio::test]
-async fn request_correlation_is_scoped_kept_by_an_empty_inner_scope_and_inherited() {
-    assert_eq!(current_request_correlation(), None);
+async fn request_id_is_scoped_kept_by_an_empty_inner_scope_and_inherited() {
+    assert_eq!(current_request_id(), None);
 
-    let (inner, after_empty, child, after_deadline) = scope_request_correlation(Some(41), async {
-        let inner =
-            scope_request_correlation(Some(42), async { current_request_correlation() }).await;
-        let after_empty =
-            scope_request_correlation(None, async { current_request_correlation() }).await;
-        let child = tokio::spawn(inherit_request_read_context(async {
-            current_request_correlation()
-        }))
-        .await
-        .expect("child task");
-        let after_deadline = scope_request_read_deadline(Duration::from_secs(60), async {
-            current_request_correlation()
-        })
-        .await;
+    let (inner, after_empty, child, after_deadline) = scope_request_id(Some(41), async {
+        let inner = scope_request_id(Some(42), async { current_request_id() }).await;
+        let after_empty = scope_request_id(None, async { current_request_id() }).await;
+        let child = tokio::spawn(inherit_request_read_context(async { current_request_id() }))
+            .await
+            .expect("child task");
+        let after_deadline =
+            scope_request_read_deadline(Duration::from_secs(60), async { current_request_id() })
+                .await;
         (inner, after_empty, child, after_deadline)
     })
     .await;
@@ -131,9 +126,7 @@ async fn request_correlation_is_scoped_kept_by_an_empty_inner_scope_and_inherite
         "a nested deadline scope keeps the id"
     );
     assert_eq!(
-        tokio::spawn(async { current_request_correlation() })
-            .await
-            .unwrap(),
+        tokio::spawn(async { current_request_id() }).await.unwrap(),
         None,
         "a task outside every scope has no id"
     );
@@ -143,7 +136,7 @@ async fn request_correlation_is_scoped_kept_by_an_empty_inner_scope_and_inherite
 async fn request_client_cwd_is_scoped_kept_by_an_empty_inner_scope_and_inherited() {
     assert_eq!(current_request_client_cwd(), None);
 
-    let (after_empty, child, after_correlation) =
+    let (after_empty, child, inside_request_id_scope) =
         scope_request_client_cwd(Some("/work/a".to_string()), async {
             let after_empty =
                 scope_request_client_cwd(None, async { current_request_client_cwd() }).await;
@@ -152,9 +145,9 @@ async fn request_client_cwd_is_scoped_kept_by_an_empty_inner_scope_and_inherited
             }))
             .await
             .expect("child task");
-            let after_correlation =
-                scope_request_correlation(Some(7), async { current_request_client_cwd() }).await;
-            (after_empty, child, after_correlation)
+            let inside_request_id_scope =
+                scope_request_id(Some(7), async { current_request_client_cwd() }).await;
+            (after_empty, child, inside_request_id_scope)
         })
         .await;
 
@@ -169,9 +162,9 @@ async fn request_client_cwd_is_scoped_kept_by_an_empty_inner_scope_and_inherited
         "an inheriting child keeps the value"
     );
     assert_eq!(
-        after_correlation.as_deref(),
+        inside_request_id_scope.as_deref(),
         Some("/work/a"),
-        "a nested correlation scope keeps the value"
+        "a nested request ID scope keeps the value"
     );
     assert_eq!(
         tokio::spawn(async { current_request_client_cwd() })

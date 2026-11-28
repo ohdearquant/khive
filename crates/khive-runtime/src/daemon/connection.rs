@@ -443,7 +443,7 @@ pub(super) async fn handle_conn_with_lifecycle<D: DaemonDispatch>(
                     read_cancel_rx,
                     khive_storage::scope_request_read_deadline(
                         read_timeout,
-                        khive_storage::scope_request_correlation(
+                        khive_storage::scope_request_id(
                             frame.request_id,
                             khive_storage::scope_request_client_cwd(
                                 frame.client_cwd,

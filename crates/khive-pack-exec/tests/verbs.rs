@@ -3046,3 +3046,89 @@ async fn wrong_type_exec_string_operands_mask_credentials_without_new_receipts()
         }
     }
 }
+
+/// A scoped manifest in the form a checkout of named paths writes (ADR-182 Amendment 24).
+async fn scoped_tree(f: &Fixture, scope: &[&str], files: &[(&str, &[u8], u32)]) -> String {
+    let mut files = files.to_vec();
+    files.sort_by_key(|(path, _, _)| *path);
+    let mut entries = Vec::new();
+    for (path, bytes, mode) in files {
+        let r = f.put(bytes).await;
+        entries.push(format!(
+            r#"{{"path":{},"ref":"{r}","mode":{mode}}}"#,
+            json!(path)
+        ));
+    }
+    let scope: Vec<String> = scope.iter().map(|path| json!(path).to_string()).collect();
+    let manifest = format!(
+        r#"{{"schema":"khive-tree/scoped-v1","scope":[{}],"entries":[{}]}}"#,
+        scope.join(","),
+        entries.join(",")
+    );
+    f.put(manifest.as_bytes()).await
+}
+
+#[tokio::test]
+async fn tree_put_get_and_diff_keep_a_scoped_trees_scope() {
+    let f = fixture();
+    let scoped = scoped_tree(&f, &["src"], &[("src/a", b"a", 644)]).await;
+    let got = f.call("exec.tree_get", json!({ "tree": scoped })).await;
+    assert_eq!(got["scope"], json!(["src"]), "{got}");
+    let edited = f
+        .call(
+            "exec.tree_put",
+            json!({ "tree": scoped, "edits": [{ "path": "src/a", "content": "edited" }] }),
+        )
+        .await;
+    assert_eq!(edited["scope"], json!(["src"]), "{edited}");
+    let read = f
+        .call("exec.tree_get", json!({ "tree": edited["tree"] }))
+        .await;
+    assert_eq!(read["scope"], json!(["src"]), "{read}");
+
+    // Control: a whole tree of the same entries carries no scope, before or after an edit.
+    let whole = f.tree(&[("src/a", b"a", 644)]).await;
+    assert_ne!(whole, scoped);
+    let put = f
+        .call(
+            "exec.tree_put",
+            json!({ "tree": whole, "edits": [{ "path": "src/a", "content": "edited" }] }),
+        )
+        .await;
+    assert!(put.get("scope").is_none(), "{put}");
+    let whole_read = f
+        .call("exec.tree_get", json!({ "tree": put["tree"] }))
+        .await;
+    assert!(whole_read.get("scope").is_none(), "{whole_read}");
+    assert_ne!(put["tree"], edited["tree"]);
+
+    // A diff reads both trees and compares their entries alone.
+    let diff = f
+        .call("exec.tree_diff", json!({ "base": whole, "head": scoped }))
+        .await;
+    assert_eq!(diff["changed"], json!([]), "{diff}");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_tree_out_keeps_a_scoped_trees_scope() {
+    let f = fixture();
+    f.register_sh("sh", "allow").await;
+    let scoped = scoped_tree(&f, &["src"], &[("src/a", b"a", 644)]).await;
+    let out = f
+        .call(
+            "exec.run",
+            json!({
+                "tree": scoped, "tool": "sh", "args": ["-c", "printf b > src/a"],
+                "actor": "local", "session_id": "scoped"
+            }),
+        )
+        .await;
+    let receipt = &out["receipt"];
+    assert_eq!(receipt["exit_code"], 0, "{receipt}");
+    let read = f
+        .call("exec.tree_get", json!({ "tree": receipt["tree_out"] }))
+        .await;
+    assert_eq!(read["scope"], json!(["src"]), "{read}");
+    assert_eq!(read["entries"].as_array().unwrap().len(), 1, "{read}");
+}
