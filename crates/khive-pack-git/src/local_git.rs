@@ -135,6 +135,11 @@ impl LocalGitError {
     pub(crate) fn is_ambiguous(&self) -> bool {
         self.ambiguous
     }
+
+    /// The authored message, without the code.
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl fmt::Display for LocalGitError {
@@ -703,17 +708,24 @@ fn parse_listing(bytes: &[u8]) -> Result<Vec<ListedBlob>> {
 /// A checkout that always reads and stores the commit's tree, never reusing an earlier one.
 #[cfg(test)]
 pub(crate) async fn checkout(rt: &KhiveRuntime, repo: &Path, reference: &str) -> Result<Checkout> {
-    checkout_reusing(rt, repo, reference, None).await
+    checkout_reusing(rt, repo, reference, None, None).await
 }
 
 /// `checkout`, answering from an earlier committed checkout of the same commit by `namespace` in
 /// this repository when that tree is still whole in the blob store (`checkout_reuse`).
+///
+/// With `paths`, only the entries at or beneath those repository paths are read, and the result
+/// is a scoped tree naming them (ADR-182 Amendment 24). A scoped checkout is never answered from
+/// an earlier one, and a path that names nothing at the commit refuses `path_not_found` before
+/// any blob is read.
 pub(crate) async fn checkout_reusing(
     rt: &KhiveRuntime,
     repo: &Path,
     reference: &str,
     namespace: Option<&str>,
+    paths: Option<&[String]>,
 ) -> Result<Checkout> {
+    let scope = paths.map(tree::canonical_scope).transpose()?;
     let program = rt.config().git_write.git_program();
     let requested = reference;
     let reference = checked_ref(requested)?;
@@ -730,23 +742,45 @@ pub(crate) async fn checkout_reusing(
         Ok(bytes) => oid_output(&bytes)?,
         Err(error) => return Err(fetch::unresolved(program, repo, requested, error).await),
     };
-    if let Some(namespace) = namespace {
+    if let (Some(namespace), None) = (namespace, &scope) {
         if let Some(tree) = checkout_reuse::reusable_tree(rt, namespace, repo, &commit).await {
             return Ok(Checkout { commit, tree });
         }
     }
-    let listing = run_async_with_snapshot(
-        program,
-        repo,
-        &["ls-tree", "-r", "-z", &commit],
-        None,
-        &mut filters,
-    )
-    .await?;
+    let listing = match &scope {
+        None => {
+            run_async_with_snapshot(
+                program,
+                repo,
+                &["ls-tree", "-r", "-z", &commit],
+                None,
+                &mut filters,
+            )
+            .await?
+        }
+        Some(scope) => {
+            // `--literal-pathspecs` is a main-command option, so it reaches this one command and
+            // no other: a named path is matched as written, never as a glob or a magic pathspec.
+            let mut argv = vec![
+                "--literal-pathspecs",
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                commit.as_str(),
+                "--",
+            ];
+            argv.extend(scope.iter().map(String::as_str));
+            run_async_with_snapshot(program, repo, &argv, None, &mut filters).await?
+        }
+    };
     // Validate every mode and path before producing any manifest entries.
     let listed = parse_listing(&listing)?;
+    if let Some(scope) = &scope {
+        check_listing_scope(&listed, scope, &commit)?;
+    }
     let store = tree::blob_store(rt)?;
-    checkout_batch::admit_manifest(&listed)?;
+    checkout_batch::admit_manifest(&listed, scope.as_deref())?;
     let mut entries = Vec::with_capacity(listed.len());
     let mut reader = if listed.is_empty() {
         None
@@ -782,15 +816,65 @@ pub(crate) async fn checkout_reusing(
         reader.finish().await?;
     }
     let value = tree::entries_json(&entries);
-    let manifest = serde_json::json!({"schema": tree::TREE_SCHEMA, "entries": &value});
+    let manifest = match &scope {
+        None => serde_json::json!({"schema": tree::TREE_SCHEMA, "entries": &value}),
+        Some(scope) => serde_json::json!({
+            "schema": tree::SCOPED_TREE_SCHEMA, "scope": scope, "entries": &value
+        }),
+    };
     if manifest.to_string().len() as u64 > tree::MAX_MANIFEST_BYTES {
+        return Err(manifest_limit(scope.is_some()));
+    }
+    let tree = match &scope {
+        None => tree::store_from_value(rt, &value).await?,
+        Some(scope) => tree::store_tree(rt, &entries, Some(scope)).await?,
+    };
+    Ok(Checkout { commit, tree })
+}
+
+/// The refusal for a checkout whose manifest would exceed the tree limit. A whole-tree checkout
+/// names the way through it: a checkout of named paths stores only their entries.
+fn manifest_limit(scoped: bool) -> LocalGitError {
+    LocalGitError::new(
+        "output_limit",
+        if scoped {
+            "checkout manifest of the named paths exceeds the tree limit"
+        } else {
+            "checkout manifest exceeds the tree limit; a checkout may name paths to read part of the tree"
+        },
+    )
+}
+
+/// Every named path covers at least one listed entry, and every listed entry lies under a named
+/// path. The first is the caller's error and names the path. The second would mean git matched a
+/// path as something other than its literal text, and refuses rather than store what was not
+/// asked for.
+fn check_listing_scope(listed: &[ListedBlob], scope: &[String], commit: &str) -> Result<()> {
+    let covers = |path: &str, entry: &str| {
+        entry == path
+            || entry
+                .strip_prefix(path)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    if let Some(missing) = scope
+        .iter()
+        .find(|path| !listed.iter().any(|entry| covers(path, &entry.path)))
+    {
         return Err(LocalGitError::new(
-            "output_limit",
-            "checkout manifest exceeds the tree limit",
+            "path_not_found",
+            format!("path {missing:?} names nothing at commit {commit}"),
         ));
     }
-    let tree = tree::store_from_value(rt, &value).await?;
-    Ok(Checkout { commit, tree })
+    if let Some(stray) = listed
+        .iter()
+        .find(|entry| !scope.iter().any(|path| covers(path, &entry.path)))
+    {
+        return Err(LocalGitError::new(
+            "git_output",
+            format!("git listed {:?}, which no named path covers", stray.path),
+        ));
+    }
+    Ok(())
 }
 
 struct GitEntry {
@@ -1886,3 +1970,7 @@ mod init_tests;
 #[cfg(test)]
 #[path = "local_git_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "local_git_scope_tests.rs"]
+mod scope_tests;
