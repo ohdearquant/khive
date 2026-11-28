@@ -541,6 +541,7 @@ async fn runtime_and_coordinator_emit_correlated_search_lines() {
         }));
         let (result, lines) =
             search_profile::capture(service.fan_out_search(&query, &Namespace::local(), &[])).await;
+        let result = result.expect("in-memory coordinated search succeeds");
         assert!(
             !result.partial,
             "in-memory coordinated search must succeed on every backend"
