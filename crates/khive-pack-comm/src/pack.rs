@@ -507,7 +507,7 @@ impl PackRuntime for CommPack {
             }
             "comm.heartbeat" => handlers::handle_heartbeat(self.runtime(), token, params).await,
             "comm.health" => handlers::handle_health(self.runtime(), token, params).await,
-            "comm.quiet" => handlers::handle_quiet(params),
+            "comm.quiet" => handlers::handle_quiet(self.runtime(), token, params),
             "comm.probe" => handlers::handle_probe(self.runtime(), token, params).await,
             "comm.cursor_get" => handlers::handle_cursor_get(self.runtime(), params).await,
             "comm.cursor_commit" => handlers::handle_cursor_commit(self.runtime(), params).await,

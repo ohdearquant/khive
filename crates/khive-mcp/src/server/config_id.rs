@@ -8,7 +8,7 @@ use super::*;
 /// same pack set (order-independent), same storage target and effective access
 /// mode, same primary embedder, same backend topology/routing, and same
 /// construction-baked fresh-tail, blob-hydration, outbound, caller-enrollment,
-/// and git-write policies.
+/// quiet-operator, and git-write policies.
 /// Identity fields (`namespace`, `actor_id`, `visible_namespaces`) are carried
 /// per request in the daemon frame and must never enter this key. The daemon
 /// compares this against each forwarded request's `config_id` and rejects any
@@ -416,11 +416,20 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         .collect();
     outbound.sort();
     outbound.dedup();
-    let gate = config
-        .gate
-        .configuration_fingerprint()
-        .map(|fingerprint| format!(";gate={fingerprint}"))
-        .unwrap_or_default();
+    let gate_fingerprint = config.gate.configuration_fingerprint();
+    let gate = if let Some(operator) = &config.quiet_operator {
+        let mut hasher = Sha256::new();
+        hasher.update(b"khive.quiet-operator-policy.v1");
+        hasher.update(
+            serde_json::to_vec(&(gate_fingerprint, operator.as_str()))
+                .expect("quiet operator policy is JSON serializable"),
+        );
+        format!(";gate=quiet-operator-v1:{:x}", hasher.finalize())
+    } else {
+        gate_fingerprint
+            .map(|fingerprint| format!(";gate={fingerprint}"))
+            .unwrap_or_default()
+    };
     let mut git_write_hasher = Sha256::new();
     git_write_hasher.update(b"khive.git-write-policy.v2");
     git_write_hasher.update(
@@ -620,6 +629,37 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     format!(
         "{base}{topology}{blob_file_transfers}{knowledge_import_roots}{git_digest_sources}{code_ingest_roots}{disk_guard}{disabled_verbs}"
     )
+}
+
+#[cfg(test)]
+#[test]
+fn quiet_operator_policy_partitions_daemon_identity() {
+    use khive_runtime::daemon::{config_ids_compatible, first_config_mismatch_field};
+
+    let fingerprint =
+        |config: &RuntimeConfig| compute_config_id_with_runtime_policies(config, None, true, false);
+    let mut config = RuntimeConfig::no_embeddings();
+    config.db_path = None;
+    let local = fingerprint(&config);
+    assert!(!local.contains(";gate="));
+
+    let operator = "quiet-operator-primary";
+    config.quiet_operator = Some(khive_runtime::VerifiedActor::new(operator).unwrap());
+    let shared = fingerprint(&config);
+    assert!(!shared.contains(operator));
+
+    config.actor_id = Some("unrelated-request-actor".into());
+    assert_eq!(fingerprint(&config), shared);
+
+    config.quiet_operator = Some(khive_runtime::VerifiedActor::new("quiet-operator-new").unwrap());
+    let rotated = fingerprint(&config);
+    for (client, daemon) in [(&shared, &local), (&local, &shared), (&rotated, &shared)] {
+        assert!(!config_ids_compatible(client, daemon));
+        assert_eq!(first_config_mismatch_field(client, Some(daemon)), "gate");
+    }
+
+    config.quiet_operator = None;
+    assert_eq!(fingerprint(&config), local);
 }
 
 #[cfg(test)]

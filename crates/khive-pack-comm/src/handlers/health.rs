@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
+use khive_runtime::resource_admission::{quiet_status, QuietStatus};
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::note::{Note, NoteFilter};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
@@ -395,7 +396,12 @@ pub(crate) async fn handle_health(
 
     let current = khive_runtime::resource::current_rss_bytes();
     let usage = khive_runtime::process_resource_usage();
-    let resource = resource_value(usage, current, json!(khive_runtime::active_phase_names()));
+    let resource = resource_value(
+        usage,
+        current,
+        json!(khive_runtime::active_phase_names()),
+        quiet_status(),
+    );
 
     Ok(json!({
         "role": role,
@@ -413,20 +419,23 @@ fn resource_value(
     usage: Option<khive_runtime::resource::ProcessResourceUsage>,
     current: Option<i64>,
     phases: Value,
+    quiet: QuietStatus,
 ) -> Value {
+    let refusal_reason = quiet.retry_at.is_some().then_some("continuous_quiet_limit");
     json!({
         "cpu_us": usage.map(|u| u.cpu_us),
         "rss_bytes": current,
         "max_rss_bytes": usage.map(|u| u.max_rss_bytes),
         "active_phases": phases,
-        "quiet_until": khive_runtime::resource_admission::quiet_until()
-            .map(|until| until.to_rfc3339()),
+        "quiet_until": quiet.until.map(|until| until.to_rfc3339()),
+        "quiet_retry_at": quiet.retry_at.map(|retry_at| retry_at.to_rfc3339()),
+        "quiet_refusal_reason": refusal_reason,
     })
 }
 
 #[cfg(test)]
 mod resource_tests {
-    use super::resource_value;
+    use super::{resource_value, QuietStatus};
     use serde_json::json;
 
     #[test]
@@ -435,14 +444,29 @@ mod resource_tests {
             cpu_us: 12,
             max_rss_bytes: 20,
         };
-        let no_current = resource_value(Some(usage), None, json!([]));
+        let no_current = resource_value(Some(usage), None, json!([]), QuietStatus::default());
         assert!(no_current.get("rss_bytes").expect("current key").is_null());
         assert_eq!(no_current["cpu_us"], 12);
         assert_eq!(no_current["max_rss_bytes"], 20);
-        let no_usage = resource_value(None, Some(10), json!([]));
+        let no_usage = resource_value(None, Some(10), json!([]), QuietStatus::default());
         assert_eq!(no_usage["rss_bytes"], 10);
         assert!(no_usage.get("max_rss_bytes").expect("peak key").is_null());
         assert!(no_usage["cpu_us"].is_null());
+    }
+
+    #[test]
+    fn health_resource_reports_quiet_retry_and_reason_together() {
+        let deadline = chrono::DateTime::from_timestamp(1_700_000_000, 0);
+        let next_window = chrono::DateTime::from_timestamp(1_700_000_060, 0);
+        for (until, retry_at) in [(None, None), (deadline, next_window), (None, next_window)] {
+            let expected_until = json!(until.map(|at| at.to_rfc3339()));
+            let expected_retry = json!(retry_at.map(|at| at.to_rfc3339()));
+            let expected_reason = json!(retry_at.is_some().then_some("continuous_quiet_limit"));
+            let result = resource_value(None, None, json!([]), QuietStatus { until, retry_at });
+            assert_eq!(result.get("quiet_until"), Some(&expected_until));
+            assert_eq!(result.get("quiet_retry_at"), Some(&expected_retry));
+            assert_eq!(result.get("quiet_refusal_reason"), Some(&expected_reason));
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -450,7 +474,7 @@ mod resource_tests {
     fn health_live_resource_has_null_or_positive_current_and_positive_peak() {
         let current = khive_runtime::resource::current_rss_bytes();
         let usage = khive_runtime::process_resource_usage().expect("getrusage fixture");
-        let result = resource_value(Some(usage), current, json!([]));
+        let result = resource_value(Some(usage), current, json!([]), QuietStatus::default());
         assert!(result.get("rss_bytes").is_some());
         assert!(!matches!(current, Some(value) if value <= 0));
         assert!(result.get("max_rss_bytes").is_some());

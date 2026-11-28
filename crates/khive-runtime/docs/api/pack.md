@@ -207,6 +207,11 @@ Every pack handler that reads "who is calling" (for example, a proposal review's
 field) resolves it from the `NamespaceToken` the dispatch boundary mints, so `verified_actor`
 becomes exactly the principal those handlers observe.
 
+`NamespaceToken::verified_actor()` carries this verification for direct `dispatch_as` calls.
+A shared host sets `RuntimeConfig::quiet_operator` on each runtime serving Comm and invokes
+`comm.quiet` through `dispatch_as` after authenticating that operator. The ordinary Gate also
+applies to operator requests.
+
 ## dispatch_with_identity
 
 `identity = None` behaves exactly like `VerbRegistry::dispatch`. `identity = Some(id)` uses

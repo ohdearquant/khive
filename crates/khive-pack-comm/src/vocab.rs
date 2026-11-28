@@ -819,20 +819,22 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 21] = [
     HandlerDef {
         name: "comm.quiet",
         description: "Defer opted-in background warm and maintenance work in this process. \
-                      Requires integer ttl_secs in 1..=300. Repeated requests retain the later \
-                      deadline; a shorter request cannot shorten an active interval. Returns \
-                      quiet_until, the effective UTC deadline also reported by comm.health. \
-                      Expiry uses a monotonic clock. This cooperative, non-durable request \
-                      applies across namespaces in this process, not other processes. It does \
-                      not interrupt in-flight work or delay foreground dispatch, finalization, \
-                      shutdown, channel polling, or freshness watchers.",
+                      Requires integer ttl_secs in 1..=300. In shared mode, only the process \
+                      operator may request quiet, subject to ordinary Gate policy. Renewals \
+                      retain the later deadline up to a monotonic 15-minute continuous limit, \
+                      followed by a 60-second interval for background work before quiet can \
+                      resume. Returns quiet_until, the effective UTC deadline. comm.health \
+                      reports quiet_retry_at and quiet_refusal_reason when the limit blocks \
+                      renewal. This explicit, cooperative control is process-wide and \
+                      non-durable. It does not interrupt in-flight work or delay foreground \
+                      dispatch, finalization, shutdown, channel polling, or freshness watchers.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Directive,
         params: &[ParamDef {
             name: "ttl_secs",
             param_type: "integer",
             required: true,
-            description: "Quiet duration in seconds, from 1 through 300 inclusive. Renewals retain the later deadline.",
+            description: "Quiet duration in seconds, from 1 through 300 inclusive. Renewals retain the later deadline within the continuous limit.",
             resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
@@ -879,8 +881,10 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 21] = [
                        authorized per-tenant writer has run. Without a heartbeat it may still \
                        return quarantine-only channel evidence while the local poll loop is \
                        actively heartbeating under \"local\". The process-level resource object \
-                       always includes quiet_until: the active comm.quiet UTC deadline, or null \
-                       after monotonic expiry or when no quiet request is active.",
+                       reports quiet_until, the active comm.quiet UTC deadline, or null when \
+                       quiet is inactive. When the continuous limit blocks renewal, \
+                       quiet_retry_at gives the next eligible UTC time and quiet_refusal_reason \
+                       is continuous_quiet_limit. Both fields are null otherwise.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[],
