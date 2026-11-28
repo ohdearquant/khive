@@ -163,6 +163,45 @@ pub(crate) fn is_stating(item: &Entity) -> bool {
     line_relation(item) == "states"
 }
 
+/// The ADR-221 key a field holds for one of its names in a vocabulary
+/// (ADR-222 A2.5). The forms pack writes these keys; other packs read them.
+pub(crate) fn field_name_key(vocabulary: &str, name: &str) -> String {
+    format!("forms/{}/field/{}", normalize(vocabulary), normalize(name))
+}
+
+/// The (vocabulary, name) pairs a field is known by, as its properties hold
+/// them.
+pub(crate) fn known_as_of(field: &Entity) -> Vec<(String, String)> {
+    known_as_pairs(prop(field, "known_as"))
+}
+
+/// The (vocabulary, name) pairs of a stored `known_as` value.
+pub(crate) fn known_as_pairs(value: Option<&Value>) -> Vec<(String, String)> {
+    value
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|entry| {
+                    Some((
+                        entry.get("vocabulary")?.as_str()?.to_owned(),
+                        entry.get("name")?.as_str()?.to_owned(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `known_as` property a field stores for these pairs.
+pub(crate) fn known_as_value(pairs: &[(String, String)]) -> Value {
+    Value::Array(
+        pairs
+            .iter()
+            .map(|(vocabulary, name)| serde_json::json!({"vocabulary": vocabulary, "name": name}))
+            .collect(),
+    )
+}
+
 /// Whether a document type is an outside system's record schema.
 pub(crate) fn is_system(document_type: &Entity) -> bool {
     prop(document_type, "system").and_then(Value::as_bool) == Some(true)
@@ -549,6 +588,8 @@ pub(crate) struct Committed {
 pub(crate) struct Writes {
     namespace: Namespace,
     ops: Vec<Op>,
+    /// Keys to claim on entities, after the operations, in the same transaction.
+    keys: Vec<(Uuid, String)>,
 }
 
 impl Writes {
@@ -556,7 +597,14 @@ impl Writes {
         Self {
             namespace: token.namespace().clone(),
             ops: Vec::new(),
+            keys: Vec::new(),
         }
+    }
+
+    /// Stage a claim of `key` on concept entity `id`, which this write may
+    /// create. A key another live entity holds rolls the whole write back.
+    pub(crate) fn add_key(&mut self, id: Uuid, key: String) {
+        self.keys.push((id, key));
     }
 
     pub(crate) fn create_entity(
@@ -687,15 +735,17 @@ impl Writes {
         registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Committed, RuntimeError> {
-        if self.ops.is_empty() {
+        if self.ops.is_empty() && self.keys.is_empty() {
             return Ok(Committed {
                 index_warning: None,
             });
         }
-        let staged_at = Timestamp::from_secs(chrono::Utc::now().timestamp().max(0) as u64);
-        let producer = format!("{}:{}", token.actor().kind, token.actor().id);
-        let changeset = ChangeSet::new(Envelope::new(producer, "forms", staged_at), self.ops);
-        let plans =
+        let mut plans = if self.ops.is_empty() {
+            Vec::new()
+        } else {
+            let staged_at = Timestamp::from_secs(chrono::Utc::now().timestamp().max(0) as u64);
+            let producer = format!("{}:{}", token.actor().kind, token.actor().id);
+            let changeset = ChangeSet::new(Envelope::new(producer, "forms", staged_at), self.ops);
             khive_runtime::prepare_canonical_changeset(runtime, registry, token, &changeset)
                 .await
                 .map_err(|error| match error {
@@ -703,7 +753,18 @@ impl Writes {
                 "the forms write was refused at operation {op_index} and wrote nothing: {source}"
             )),
                     other => other,
-                })?;
+                })?
+        };
+        let at = chrono::Utc::now().timestamp_micros();
+        for (id, key) in &self.keys {
+            plans.extend(khive_runtime::entity_key_add_plans(
+                self.namespace.as_str(),
+                *id,
+                "concept",
+                key,
+                at,
+            )?);
+        }
         match khive_runtime::run_atomic_unit(runtime.sql().as_ref(), plans).await {
             Err(error) => Err(RuntimeError::Storage(error.0)),
             Ok(AtomicRunOutcome::RolledBack {

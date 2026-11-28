@@ -682,6 +682,144 @@ async fn export_and_replay_keep_the_system_mark() {
     assert!(message.contains("is a system"), "{message}");
 }
 
+fn known(vocabulary: &str, name: &str) -> Value {
+    json!({"vocabulary": vocabulary, "name": name})
+}
+
+/// A form that asks for one field, given names in vocabularies.
+fn naming_form(form_id: &str, n: u8, field: &str, known_as: Value) -> Value {
+    json!({
+        "form_id": form_id,
+        "revision": "2026-01",
+        "title": "Naming form",
+        "source": source(n),
+        "document_type": {"id": "naming", "name": "Naming", "origin": "applicant"},
+        "subjects": [{"id": "applicant", "kind": "party", "role": "applicant"}],
+        "terms": {"kinds": ["party"], "roles": ["applicant"]},
+        "fields": [{"name": field, "definition": format!("The {field} the applicant gives."), "value_type": "text", "known_as": known_as}],
+        "items": [{"label": field, "page": 1, "order": 1, "item_kind": "text", "filled_by": "applicant", "about": "applicant", "field": field}]
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_field_name_in_a_vocabulary_names_one_field() {
+    let store = Store::new();
+    store
+        .load(naming_form(
+            "NAME-A",
+            11,
+            "full name",
+            json!([known("permits", "applicant name")]),
+        ))
+        .await;
+    let field = store
+        .call("forms.neighbourhood", json!({"node": "full name"}))
+        .await;
+    assert_eq!(
+        field["field"]["known_as"],
+        json!([known("permits", "applicant name")]),
+        "{field}"
+    );
+
+    // Another field taking the name in the same vocabulary is refused and writes nothing.
+    let message = store
+        .refused_load(naming_form(
+            "NAME-B",
+            12,
+            "given name",
+            json!([known("Permits", "Applicant Name")]),
+        ))
+        .await;
+    assert!(
+        message.contains("already names field \"full name\""),
+        "{message}"
+    );
+    let missing = store
+        .refused("forms.neighbourhood", json!({"node": "given name"}))
+        .await;
+    assert!(missing.contains("given name"), "{missing}");
+
+    // The same name in another vocabulary is accepted.
+    store
+        .load(naming_form(
+            "NAME-C",
+            13,
+            "given name",
+            json!([known("licensing", "applicant name")]),
+        ))
+        .await;
+
+    // A reused field keeps its names and takes a further one.
+    store
+        .load(naming_form(
+            "NAME-F",
+            16,
+            "full name",
+            json!([known("tax", "legal name")]),
+        ))
+        .await;
+    let field = store
+        .call("forms.neighbourhood", json!({"node": "full name"}))
+        .await;
+    assert_eq!(
+        field["field"]["known_as"],
+        json!([
+            known("permits", "applicant name"),
+            known("tax", "legal name")
+        ]),
+        "{field}"
+    );
+
+    // Two fields of one document given one name are refused.
+    let mut two = naming_form(
+        "NAME-D",
+        14,
+        "family name",
+        json!([known("census", "surname")]),
+    );
+    two["fields"]
+        .as_array_mut()
+        .expect("fields")
+        .push(json!({"name": "last name", "definition": "The last name the applicant gives.", "value_type": "text", "known_as": [known("census", "surname")]}));
+    let message = store.refused_load(two).await;
+    assert!(
+        message.contains("to fields \"family name\" and \"last name\""),
+        "{message}"
+    );
+
+    // A vocabulary named after an operation node type is refused.
+    let message = store
+        .refused_load(naming_form(
+            "NAME-E",
+            15,
+            "middle name",
+            json!([known("step_type", "middle")]),
+        ))
+        .await;
+    assert!(message.contains("reserved_vocabulary"), "{message}");
+
+    // Replay writes the names as keys again: the replayed store refuses the same clash,
+    // here on a field it reuses.
+    let exported = store.export().await;
+    let fresh = Store::new();
+    let replayed = fresh
+        .call("forms.replay", json!({"document": exported}))
+        .await;
+    assert_eq!(replayed["replayed"], true, "{replayed}");
+    let message = fresh
+        .refused_load(naming_form(
+            "NAME-B",
+            12,
+            "given name",
+            json!([known("permits", "applicant name")]),
+        ))
+        .await;
+    assert!(
+        message.contains("already names field \"full name\""),
+        "{message}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_field_lists_the_lines_that_state_it_and_a_document_type_is_a_node() {
     let store = Store::with_both().await;

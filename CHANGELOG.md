@@ -43,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `forms.neighbourhood` takes a document type as `document_type:<id>` and gives its node whether
   the type is a system and the forms it contains. On a field it adds `stated_by`: every line that
   states the field, with its document type, form, revision, subject and role (ADR-222 Amendment 2).
+- `forms.load` takes `known_as: [{vocabulary, name}]` on a field and holds each name as the key
+  `forms/<vocabulary>/field/<name>` on the field, written with the load. A name another field
+  holds in the same vocabulary is refused, the same name in another vocabulary is accepted, and a
+  vocabulary named after an operation node type is refused (`reserved_vocabulary`). Export and
+  replay keep the names (ADR-222 Amendment 2).
 - `git.pr_list` and `git.issue_list` list the pull requests or issues of a configured repository
   in the requested state (`open` unless `closed` or `all` is named), newest created first, one
   hundred to a page for at most ten pages, and say in `truncated` whether more matched.

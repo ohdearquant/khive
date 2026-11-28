@@ -17,9 +17,10 @@ use super::params::{self, Args};
 use super::views::{field_reply, nearest};
 use super::Ctx;
 use crate::store::{
-    aliases, document_type_key, form_key, invalid, is_general, is_system, label, pending_premise,
-    pending_premises, prop, prop_text, props, quoted_names, scalar, strings, type_of, wordings,
-    Graph, Writes, GRAPH_RELATIONS,
+    aliases, document_type_key, field_name_key, form_key, invalid, is_general, is_system,
+    known_as_of, known_as_pairs, known_as_value, label, pending_premise, pending_premises, prop,
+    prop_text, props, quoted_names, scalar, strings, type_of, wordings, Graph, Writes,
+    GRAPH_RELATIONS,
 };
 use crate::text::normalize;
 use crate::vocab::{
@@ -65,6 +66,102 @@ struct FieldSpec {
     /// How the field's answers compare when a constraint holds two lines to
     /// match or differ; `exact` when not stated.
     comparison: Option<String>,
+    /// The field's names in vocabularies, as (vocabulary, name).
+    known_as: Vec<(String, String)>,
+}
+
+/// The operation pack's node types (ADR-222 section 2). A vocabulary may not
+/// be named after one (A2.5): the operation pack's names in a vocabulary are
+/// keyed `operation/<vocabulary>/...` beside its nodes' `operation/<node type>/...`.
+const RESERVED_VOCABULARIES: [&str; 14] = [
+    "operation_type",
+    "variant",
+    "slot",
+    "step_type",
+    "requirement",
+    "rule",
+    "named_condition",
+    "gap_code",
+    "act_type",
+    "status_word",
+    "purpose",
+    "confidence",
+    "vocabulary",
+    "frontier_kind",
+];
+
+fn known_as_spec(obj: &Args, field: &str) -> Result<Vec<(String, String)>, RuntimeError> {
+    let mut known_as: Vec<(String, String)> = Vec::new();
+    for entry in params::list(obj, "known_as")? {
+        let entry = params::entry(entry, "known_as")?;
+        let vocabulary = params::text(entry, "vocabulary")?;
+        let name = params::text(entry, "name")?;
+        if RESERVED_VOCABULARIES
+            .iter()
+            .any(|reserved| normalize(reserved) == normalize(&vocabulary))
+        {
+            return Err(invalid(format!(
+                "reserved_vocabulary: field \"{field}\" names vocabulary \"{vocabulary}\", which is an operation node type; name the vocabulary otherwise"
+            )));
+        }
+        let key = field_name_key(&vocabulary, &name);
+        if !known_as.iter().any(|(v, n)| field_name_key(v, n) == key) {
+            known_as.push((vocabulary, name));
+        }
+    }
+    Ok(known_as)
+}
+
+/// Refuse a name in a vocabulary that another field holds, in the store or
+/// earlier in this document, and stage the key of each name `field` does not
+/// hold yet (ADR-222 A2.5). `claimed` maps each key the document gives to the
+/// field it gives it to.
+async fn claim_known_as(
+    ctx: &Ctx<'_>,
+    graph: &Graph,
+    writes: &mut Writes,
+    claimed: &mut HashMap<String, String>,
+    field: Uuid,
+    field_name: &str,
+    names: &[(String, String)],
+) -> Result<(), RuntimeError> {
+    for (vocabulary, name) in names {
+        let key = field_name_key(vocabulary, name);
+        if let Some(other) = claimed.insert(key.clone(), field_name.to_owned()) {
+            return Err(invalid(format!(
+                "the document gives \"{name}\" in vocabulary \"{vocabulary}\" to fields \"{other}\" and \"{field_name}\"; a name in a vocabulary names one field"
+            )));
+        }
+        match ctx
+            .runtime
+            .get_entity_by_key(ctx.token, "concept", &key)
+            .await?
+        {
+            Some(holder) if holder.id == field => {}
+            Some(holder) => {
+                let held_by = graph
+                    .get(holder.id)
+                    .map_or_else(|| holder.name.clone(), |f| f.name.clone());
+                return Err(invalid(format!(
+                    "field \"{field_name}\" is known in vocabulary \"{vocabulary}\" as \"{name}\", which already names field \"{held_by}\""
+                )));
+            }
+            None => writes.add_key(field, key),
+        }
+    }
+    Ok(())
+}
+
+/// Only forms.load takes a field's names in vocabularies.
+fn refuse_known_as(spec: &FieldSpec) -> Result<(), RuntimeError> {
+    if spec.known_as.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "field \"{}\" gives known_as, which forms.load takes; load the field in a form document",
+            spec.name
+        )))
+    }
 }
 
 fn field_spec(obj: &Args) -> Result<FieldSpec, RuntimeError> {
@@ -89,6 +186,7 @@ fn field_spec(obj: &Args) -> Result<FieldSpec, RuntimeError> {
         .unwrap_or(false);
     refuse_exclusive_size(&name, exclusive, values.len())?;
     Ok(FieldSpec {
+        known_as: known_as_spec(obj, &name)?,
         definition: params::text(obj, "definition")?,
         aliases: params::string_list(obj, "aliases")?,
         comparison: params::opt_text(obj, "comparison")?
@@ -206,6 +304,9 @@ fn stage_field(
     ]);
     if let Some(comparison) = &spec.comparison {
         properties.insert("comparison".to_owned(), json!(comparison));
+    }
+    if !spec.known_as.is_empty() {
+        properties.insert("known_as".to_owned(), known_as_value(&spec.known_as));
     }
     let field = writes.create_entity(FIELD, &spec.name, None, properties)?;
     let mut values = HashMap::new();
@@ -858,6 +959,8 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
     let mut comparisons: HashMap<Uuid, String> = HashMap::new();
     // Each wording of a field left undecided, to the name the document gives it.
     let mut blocked: HashMap<String, String> = HashMap::new();
+    // Each name in a vocabulary the document gives, to the field it names.
+    let mut claimed: HashMap<String, String> = HashMap::new();
     for field in params::list(doc, "fields")? {
         let mut spec = field_spec(params::entry(field, "field")?)?;
         let folded = normalize(&spec.name);
@@ -872,6 +975,16 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
             [] => {
                 keep_free_aliases(&graph, &mut spec, &mut warnings);
                 let (id, values) = stage_field(&mut writes, &spec)?;
+                claim_known_as(
+                    ctx,
+                    &graph,
+                    &mut writes,
+                    &mut claimed,
+                    id,
+                    &spec.name,
+                    &spec.known_as,
+                )
+                .await?;
                 counts.fields += 1;
                 counts.values += values.len();
                 comparisons.insert(
@@ -914,6 +1027,30 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                     counts.aliases_added += added_aliases.len();
                     changed = true;
                 }
+                // A later document may give a reused field further names in
+                // vocabularies; the field keeps those it held.
+                let mut names = known_as_of(existing);
+                let before = names.len();
+                for (vocabulary, name) in &spec.known_as {
+                    let key = field_name_key(vocabulary, name);
+                    if !names.iter().any(|(v, n)| field_name_key(v, n) == key) {
+                        names.push((vocabulary.clone(), name.clone()));
+                    }
+                }
+                if names.len() > before {
+                    properties.insert("known_as".to_owned(), known_as_value(&names));
+                    changed = true;
+                }
+                claim_known_as(
+                    ctx,
+                    &graph,
+                    &mut writes,
+                    &mut claimed,
+                    existing.id,
+                    &existing.name,
+                    &spec.known_as,
+                )
+                .await?;
                 if changed {
                     writes.update_entity(existing, None, None, Some(properties))?;
                 }
@@ -956,6 +1093,12 @@ pub(crate) async fn load(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
                     spec.name,
                     quoted_names(&owners)
                 ));
+                if !spec.known_as.is_empty() {
+                    warnings.push(format!(
+                        "field \"{}\" was not loaded, so its names in vocabularies were not recorded; load them with the field once it is decided",
+                        spec.name
+                    ));
+                }
                 None
             }
         };
@@ -1565,6 +1708,7 @@ pub(crate) async fn add_item(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runt
         reply["alias_added"] = json!(added);
     } else if let Some(field) = field {
         let mut proposed = field_spec(field)?;
+        refuse_known_as(&proposed)?;
         let owners = graph.owners(&proposed.name, None);
         if !owners.is_empty() {
             reply["status"] = json!("match");
@@ -1651,6 +1795,7 @@ pub(crate) async fn same(ctx: &Ctx<'_>, params: Value) -> Result<Value, RuntimeE
         reply["aliases_added"] = json!(more);
     } else if let Some(new_field) = new_field {
         let mut proposed = field_spec(new_field)?;
+        refuse_known_as(&proposed)?;
         proposed.aliases.extend(further);
         let owners = graph.owners(&proposed.name, None);
         if !owners.is_empty() {
@@ -1757,6 +1902,7 @@ pub(crate) async fn split(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runtime
             values: Vec::new(),
             exclusive: false,
             comparison: prop_text(field, "comparison"),
+            known_as: Vec::new(),
         },
     )?;
     writes.link(item.id, EdgeRelation::VariantOf, narrow);
@@ -1885,6 +2031,12 @@ pub(crate) async fn replay(ctx: &Ctx<'_>, params: Value) -> Result<Value, Runtim
                 .map(|k| id_of(k).map(|id| id.to_string()))
                 .collect::<Result<Vec<_>, _>>()?;
             properties.insert("means".to_owned(), json!(mapped));
+        }
+        // A field's names in vocabularies are keys as well as a property.
+        if entity_type == FIELD {
+            for (vocabulary, name) in known_as_pairs(properties.get("known_as")) {
+                writes.add_key(id_of(&key)?, field_name_key(&vocabulary, &name));
+            }
         }
         writes.create_entity_with_id(
             id_of(&key)?,
