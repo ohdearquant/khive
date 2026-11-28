@@ -202,7 +202,7 @@ impl WriteTelemetry {
             labels,
             attempt_log: options.attempt_log,
             top_level: options.top_level,
-            request_id: khive_storage::current_request_correlation(),
+            request_id: khive_storage::current_request_id(),
         }
     }
 

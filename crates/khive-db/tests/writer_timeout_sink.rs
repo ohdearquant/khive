@@ -890,7 +890,7 @@ async fn per_attempt_mode_writes_one_row_per_attempt_joined_by_request_id() {
         .await
         .expect("setup write should succeed");
 
-    let inserted = khive_storage::scope_request_correlation(
+    let inserted = khive_storage::scope_request_id(
         Some(770_001),
         handle.send(|conn| {
             conn.execute_batch(
@@ -907,7 +907,7 @@ async fn per_attempt_mode_writes_one_row_per_attempt_joined_by_request_id() {
     .await;
     inserted.expect("three-row write should succeed");
 
-    let refused: Result<(), _> = khive_storage::scope_request_correlation(
+    let refused: Result<(), _> = khive_storage::scope_request_id(
         Some(770_002),
         handle.send(|conn| {
             conn.execute_batch("INSERT INTO attempt_rows VALUES (4)")

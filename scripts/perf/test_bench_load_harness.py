@@ -212,7 +212,10 @@ class OpenLoopLifecycleTests(unittest.TestCase):
                 patch.object(harness.bpd, "_handshake", side_effect=handshake), \
                 patch.object(harness, "_attribution_probe", side_effect=attribution), \
                 patch.object(harness, "_drive_open_loop", side_effect=drive):
-            results, _ = harness._run_open_workers("fake", [(0, 0), (0, 1)], {}, "warn", "/fake", registry, 4, 10.0, 1.0)
+            results, _ = harness._run_open_workers(
+                "fake", [(0, 0), (0, 1)], {}, "warn", "/fake", registry, 4, 10.0, 1.0,
+                daemon_pid=321,
+            )
         self.assertEqual(events[-1], "arrivals")
         self.assertEqual(len(results), 2)
         for proc in processes:
@@ -220,26 +223,70 @@ class OpenLoopLifecycleTests(unittest.TestCase):
             proc.wait.assert_called_once_with(timeout=5)
         self.assertEqual(pool.shutdowns, [{"wait": False, "cancel_futures": True}, {"wait": True, "cancel_futures": True}])
 
-    def test_an_exited_worker_with_outstanding_arrivals_is_not_a_drain_timeout(self):
-        registry = {}
-        alive, exited = Mock(), Mock()
-        alive.poll.return_value = None
-        exited.poll.return_value = 1
-
+    def test_drain_timeout_requires_live_worker_and_original_daemon(self):
         def drive(*args, **kwargs):
-            records = [{"tenant": 0, "worker": 0, "state": "outstanding"},
-                       {"tenant": 0, "worker": 1, "state": "outstanding"}]
+            records = [
+                {"tenant": 0, "worker": 0, "state": "outstanding"},
+                {"tenant": 0, "worker": 1, "state": "outstanding"},
+            ]
             return {"counts": {"outstanding": 2}, "records": records}
 
-        with patch.object(harness, "ThreadPoolExecutor", return_value=ImmediatePool()), \
-                patch.object(harness, "_spawn_worker_proc", side_effect=[alive, exited]), \
-                patch.object(harness.bpd, "_handshake"), \
-                patch.object(harness, "_attribution_probe", return_value={}), \
-                patch.object(harness, "_drive_open_loop", side_effect=drive):
-            results, _ = harness._run_open_workers("fake", [(0, 0), (0, 1)], {}, "warn", "/fake", registry, 4, 10.0, 1.0)
-        crashed = {result.idx: result.crashed for result in results}
-        self.assertEqual(crashed[0], harness.DRAIN_TIMEOUT_CRASH)
-        self.assertEqual(crashed[1], "worker process exited (1) with arrivals outstanding")
+        daemon_pid = 321
+        pid_file = "/fake/daemon.pid"
+        daemon_failure = "scratch daemon (pid 321) could not be verified alive at the drain timeout"
+        cases = [
+            (daemon_pid, True, True, harness.DRAIN_TIMEOUT_CRASH),
+            (daemon_pid, False, False, daemon_failure),
+            (daemon_pid, True, False, daemon_failure),
+            (432, True, True, daemon_failure),
+            (None, False, False, daemon_failure),
+        ]
+        for current_pid, pid_alive, daemon_argv, expected in cases:
+            with self.subTest(current_pid=current_pid, pid_alive=pid_alive, daemon_argv=daemon_argv):
+                alive, exited = Mock(), Mock()
+                alive.poll.return_value = None
+                exited.poll.return_value = 1
+
+                def read_pid_file(path, process=alive, pid=current_pid):
+                    self.assertEqual(path, pid_file)
+                    process.kill.assert_not_called()
+                    return pid, str(pid) if pid is not None else None
+
+                with (
+                    patch.object(harness, "ThreadPoolExecutor", return_value=ImmediatePool()),
+                    patch.object(harness, "_spawn_worker_proc", side_effect=[alive, exited]),
+                    patch.object(harness.bpd, "_handshake"),
+                    patch.object(harness, "_attribution_probe", return_value={}),
+                    patch.object(harness, "_drive_open_loop", side_effect=drive),
+                    patch.object(harness, "_read_pid_file", side_effect=read_pid_file) as read_pid,
+                    patch.object(harness, "_pid_alive", return_value=pid_alive) as check_pid,
+                    patch.object(harness, "_argv_is_khive_daemon", return_value=daemon_argv) as check_argv,
+                ):
+                    results, _ = harness._run_open_workers(
+                        "fake",
+                        [(0, 0), (0, 1)],
+                        {"KHIVE_PID": pid_file},
+                        "warn",
+                        "/fake",
+                        {},
+                        4,
+                        10.0,
+                        1.0,
+                        daemon_pid=daemon_pid,
+                    )
+                read_pid.assert_called_once_with(pid_file)
+                if current_pid == daemon_pid:
+                    check_pid.assert_called_once_with(daemon_pid)
+                else:
+                    check_pid.assert_not_called()
+                if current_pid == daemon_pid and pid_alive:
+                    check_argv.assert_called_once_with(daemon_pid)
+                else:
+                    check_argv.assert_not_called()
+                alive.kill.assert_called_once()
+                crashed = {result.idx: result.crashed for result in results}
+                self.assertEqual(crashed[0], expected)
+                self.assertEqual(crashed[1], "worker process exited (1) with arrivals outstanding")
 
     def test_setup_failure_kills_registered_process_before_pool_join(self):
         failed, blocked = Mock(), Mock()
@@ -280,7 +327,10 @@ class OpenLoopLifecycleTests(unittest.TestCase):
                     patch.object(harness.bpd, "_handshake", side_effect=handshake), \
                     patch.object(harness, "_drive_open_loop") as drive:
                 with self.assertRaisesRegex(RuntimeError, "fake handshake failed"):
-                    harness._run_open_workers("fake", [(0, 0), (0, 1)], {}, "warn", "/fake", registry, 4, 10.0, 1.0)
+                    harness._run_open_workers(
+                        "fake", [(0, 0), (0, 1)], {}, "warn", "/fake", registry, 4, 10.0, 1.0,
+                        daemon_pid=321,
+                    )
         finally:
             release.set()
             shutdown(wait=True, cancel_futures=True)
@@ -539,6 +589,8 @@ class AuditSuccessRowsLoadPreflightTests(unittest.TestCase):
             return {"oracle": "PENDING", "detail": "fixture"}
         def worker(*args, **kwargs):
             events.append("worker")
+            if arrival_rate is not None:
+                self.assertEqual(kwargs["daemon_pid"], 321)
             worker_envs.append(dict(args[2] if arrival_rate else args[3]))
             raise RuntimeError("worker boundary")
         argv = ["bench_load_harness.py", "--mode", "bench", "--workers", "1",
@@ -568,7 +620,8 @@ class AuditSuccessRowsLoadPreflightTests(unittest.TestCase):
                        patch.object(harness, "probe_oracle_channel", side_effect=oracle),
                        patch.object(harness, "_run_worker", side_effect=worker),
                        patch.object(harness, "_run_open_workers", side_effect=worker),
-                       patch.object(harness, "ThreadPoolExecutor", ImmediatePool)]
+                       patch.object(harness, "ThreadPoolExecutor", ImmediatePool),
+                       patch.object(harness, "_read_pid_file", return_value=(321, "321"))]
             mocks = [stack.enter_context(selected) for selected in patches]
             self.assertEqual(harness.main(), 1)
         process.stdin.close.assert_called_once()
@@ -611,7 +664,11 @@ class AuditSuccessRowsLoadPreflightTests(unittest.TestCase):
 
     def test_the_sweep_reads_the_drain_timeout_error_the_harness_writes(self):
         from scripts.perf import f7_sweep
-        self.assertEqual(f7_sweep.DRAIN_TIMEOUT_CRASH, harness.DRAIN_TIMEOUT_CRASH)
+
+        error = harness.format_worker_error(12, 34, harness.DRAIN_TIMEOUT_CRASH)
+        self.assertEqual(error, "tenant=12 worker=34: open-loop drain exceeded --worker-timeout")
+        report = {"smoke_errors": [error], "arrival": {"counts": {"outstanding": 1}}}
+        self.assertTrue(f7_sweep.drain_timeout_only(report, 1))
 
     def test_daemon_env_names_match_the_constants_the_sink_reads(self):
         source = pathlib.Path(__file__).resolve().parents[2] / "crates/khive-db/src/timeout_sink.rs"

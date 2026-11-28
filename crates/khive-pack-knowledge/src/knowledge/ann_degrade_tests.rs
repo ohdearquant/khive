@@ -35,6 +35,7 @@ use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 // ── fake embedder ─────────────────────────────────────────────────────────────
 //
@@ -337,15 +338,7 @@ static TIMEOUT_OVERRIDE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::con
 
 // ── P1: search preserves its timeout fallback policy
 
-/// `search` reports ANN unavailability only when warming times out, the corpus
-/// is non-empty, and lexical search also found no result. A lexical hit remains
-/// a valid partial result without the advisory.
-#[tokio::test]
-async fn search_preserves_timeout_fallback_policy() {
-    let _serial = TIMEOUT_OVERRIDE_SERIAL.lock().await;
-    vamana::set_warm_wait_timeout_override_ms(50);
-    let _reset = TimeoutOverrideReset;
-
+async fn runtime_with_search_fallback_atom() -> KhiveRuntime {
     let rt = rt_with_fake_embedder();
     let registry = build_registry(&rt);
     registry
@@ -366,7 +359,19 @@ async fn search_preserves_timeout_fallback_policy() {
         .dispatch("knowledge.index", json!({ "rebuild_ann": false }))
         .await
         .expect("index");
+    rt
+}
 
+/// `search` reports ANN unavailability only when warming times out, the corpus
+/// is non-empty, and lexical search also found no result. A lexical hit remains
+/// a valid partial result without the advisory.
+#[tokio::test]
+async fn search_preserves_timeout_fallback_policy() {
+    let _serial = TIMEOUT_OVERRIDE_SERIAL.lock().await;
+    vamana::set_warm_wait_timeout_override_ms(50);
+    let _reset = TimeoutOverrideReset;
+
+    let rt = runtime_with_search_fallback_atom().await;
     let ann = vamana::new_shared();
     let key = vamana::AnnKey::new("local", rt.default_embedder_name());
     vamana::simulate_warming_in_flight(&ann, key);
@@ -423,6 +428,63 @@ async fn search_preserves_timeout_fallback_policy() {
             > 0,
         "cold serving ANN must still read persisted candidate vectors: {reranked}"
     );
+}
+
+#[tokio::test]
+async fn search_skips_ann_warm_wait_during_quiet() {
+    use khive_runtime::resource_admission::{quiet_until, request_quiet};
+
+    if khive_storage::test_support::run_exact_test_in_child(
+        "KHIVE_QUIET_SEARCH_CHILD",
+        false,
+        |command| {
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("KHIVE_") {
+                    command.env_remove(key);
+                }
+            }
+            command.env("KHIVE_TEST_HARNESS", "1");
+        },
+    ) {
+        return;
+    }
+
+    let rt = runtime_with_search_fallback_atom().await;
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    let ann = vamana::new_shared();
+    let key = vamana::AnnKey::new("local", rt.default_embedder_name());
+    let deadline = request_quiet(300).expect("request quiet");
+    vamana::ensure_ann_background(&rt, &token, &ann);
+    assert!(vamana::is_warming_not_loaded(&ann, &key));
+
+    let (lexical, empty) = tokio::time::timeout(Duration::from_secs(2), async {
+        let lexical = KnowledgeHandlers::search(
+            &rt,
+            &token,
+            json!({"query": "lexicalsentinel", "rerank": false}),
+            &ann,
+        )
+        .await
+        .expect("lexical fallback must succeed");
+        let empty = KnowledgeHandlers::search(
+            &rt,
+            &token,
+            json!({"query": "unfindablegossamer", "kind": "domain", "rerank": false}),
+            &ann,
+        )
+        .await
+        .expect("empty fallback must succeed");
+        (lexical, empty)
+    })
+    .await
+    .expect("searches must finish before the five-second ANN warm wait");
+
+    assert_eq!(lexical["results"][0]["slug"], "degrade-search-atom");
+    assert!(lexical.get("ann_unavailable").is_none());
+    assert_eq!(empty["total"], 0);
+    assert_eq!(empty["ann_unavailable"], true);
+    assert_eq!(quiet_until(), Some(deadline));
+    assert!(vamana::is_warming_not_loaded(&ann, &key));
 }
 
 // ── P1a: suggest sets ann_unavailable when warming times out ─────────────────

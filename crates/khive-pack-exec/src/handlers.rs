@@ -154,7 +154,11 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
     }
     // Refused here, before any write (Amendment 4 item 2).
     let limit = changes::changed_limit(&params)?;
-    let base = tree::load(rt, &tree_ref).await?;
+    // An edit of a scoped tree is stored with the same scope (ADR-182 Amendment 24, item 3).
+    let tree::Tree {
+        entries: base,
+        scope,
+    } = tree::load_tree(rt, &tree_ref).await?;
     let mut entries: BTreeMap<String, (String, u64)> = base
         .iter()
         .map(|entry| {
@@ -342,7 +346,7 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
             "blob store keys on a different digest"
         );
     }
-    let next_ref = tree::store(rt, &next).await?;
+    let next_ref = tree::store_tree(rt, &next, scope.as_deref()).await?;
     let changed: Vec<Value> = tree::diff(&base, &next)
         .iter()
         .map(Change::to_json)
@@ -350,22 +354,31 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
     // No receipt row keeps this list, so the blob is written whenever the list is not empty.
     let changed_ref = changes::store_list(rt, &changed).await?;
     let mut reply = json!({ "tree": next_ref, "base": tree_ref, "entries": next.len() });
+    // Present only on a scoped tree, so a whole tree's reply is unchanged.
+    if let Some(scope) = &scope {
+        reply["scope"] = json!(scope);
+    }
     changes::bound_reply(&mut reply, &changed, changed_ref.as_deref(), limit);
     Ok(reply)
 }
 
 pub async fn tree_get(rt: &KhiveRuntime, params: Value) -> Result<Value, RuntimeError> {
     let tree_ref = req_str(&params, "tree")?;
-    let entries = tree::load(rt, &tree_ref).await?;
-    Ok(json!({ "tree": tree_ref, "entries": tree::entries_json(&entries) }))
+    let loaded = tree::load_tree(rt, &tree_ref).await?;
+    let mut reply = json!({ "tree": tree_ref, "entries": tree::entries_json(&loaded.entries) });
+    if let Some(scope) = &loaded.scope {
+        reply["scope"] = json!(scope);
+    }
+    Ok(reply)
 }
 
 pub async fn tree_diff(rt: &KhiveRuntime, params: Value) -> Result<Value, RuntimeError> {
     let base_ref = req_str(&params, "base")?;
     let head_ref = req_str(&params, "head")?;
     let limit = changes::changed_limit(&params)?;
-    let base = tree::load(rt, &base_ref).await?;
-    let head = tree::load(rt, &head_ref).await?;
+    // A diff reads both trees and writes neither, so a scoped tree compares like a whole one.
+    let base = tree::load_tree(rt, &base_ref).await?.entries;
+    let head = tree::load_tree(rt, &head_ref).await?.entries;
     let changed: Vec<Value> = tree::diff(&base, &head)
         .iter()
         .map(Change::to_json)
@@ -1085,6 +1098,8 @@ struct Ready {
     /// The operator's additions for this tool, when the run earned them.
     tool_profile: Option<ToolProfile>,
     entries: Vec<TreeEntry>,
+    /// The input tree's scope, which `tree_out` keeps (ADR-182 Amendment 24, item 3).
+    scope: Option<Vec<String>>,
     input_sizes: BTreeMap<String, u64>,
 }
 
@@ -1257,7 +1272,7 @@ async fn preflight(
         }
     };
     // Tree and cwd.
-    let entries = tree::load(rt, &req.tree_in)
+    let tree::Tree { entries, scope } = tree::load_tree(rt, &req.tree_in)
         .await
         .map_err(|e| format!("tree: {e}"))?;
     let input_sizes = preflight_input_sizes(rt, &entries).await?;
@@ -1275,6 +1290,7 @@ async fn preflight(
         registry_id: entity.id,
         tool_profile,
         entries,
+        scope,
         input_sizes,
     })
 }
@@ -2022,7 +2038,7 @@ async fn execute(
         changes.sort_by(|a, b| a.path.cmp(&b.path));
         receipt.changed = changes;
         receipt.undeclared = undeclared.into_iter().collect();
-        receipt.tree_out = Some(tree::store(rt, &out_entries).await?);
+        receipt.tree_out = Some(tree::store_tree(rt, &out_entries, ready.scope.as_deref()).await?);
         receipt.success = !receipt.timed_out
             && receipt.exit_code == Some(0)
             && receipt.undeclared.is_empty()
