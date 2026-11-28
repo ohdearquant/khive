@@ -61,3 +61,6 @@ mod entity_key_tests;
 
 #[cfg(test)]
 mod entity_alias_tests;
+
+#[cfg(test)]
+mod search_follow_tests;

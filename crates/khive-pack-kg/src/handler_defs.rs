@@ -133,6 +133,13 @@ pub(crate) static SEARCH_PARAMS: &[ParamDef] = &[
         description: "Result order: score (default, by relevance) | updated_at | created_at. Both time orders are descending — most recent first — and records sharing a timestamp keep their relevance order. An unrecognised value is refused. A time order ranks a bounded candidate window rather than the whole corpus, so a match whose relevance falls outside that window may still be missed — use a specific query to bring it into the candidates.",
         resolution_mode: IdResolutionMode::NotApplicable,
     },
+    ParamDef {
+        name: "follow",
+        param_type: "string",
+        required: false,
+        description: "Relation to follow outward from each hit, one of the edge relations (for example instance_of). Each hit then carries followed, the targets its outgoing edges of that relation reach as summary neighbor rows (id, edge_id, relation, weight, name, kind), read with the same visibility as neighbors, and followed_truncated, true when a hit has more than 100 such targets. A symmetric relation is followed both ways, as neighbors does. Single-backend search only; a multi-backend search refuses it.",
+        resolution_mode: IdResolutionMode::NotApplicable,
+    },
 ];
 pub(crate) static KG_HANDLERS: [HandlerDef; 32] = [
     HandlerDef {

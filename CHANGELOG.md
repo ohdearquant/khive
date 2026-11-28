@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `operation.frontier` reports `input_missing` for each value an owed step requires that no record
+  holds, in place of the act it owes. The item lists the places that state the field of a subject
+  in the requirement's slot: every loaded document type and system, in the order of the
+  namespace's newest `source_order`, then the rest by name. `stated_in_part` lists the lines that
+  state a parent of the field. The frontier names the source order and the form revisions it read.
+  `operation.define` publishes a `source_order` (`version`, `places`) and refuses a place that is
+  not a loaded document type or system (ADR-222 Amendments 1 and 2).
 - `operation.define` writes the working type graph after each publish: a kg node for each
   operation type, slot, step type and requirement, keyed as ADR-222 Amendment 2 A2.10 gives, with
   `contains` edges between them and `links_to` edges to the forms pack's fields. A node shows the
@@ -17,9 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   healed by the next define. The reply's `graph` names, per id, `written`, `unchanged` or `failed`
   with the reason; the publish stands whatever the graph write does. `known_as` gives an operation
   type, a step type, a slot or a step names in other vocabularies.
+
+## [0.24.0] - 2026-11-28
+
+### Added
+
 - `neighbors` takes `projection="full"`: each neighbor carries the record fields plus its
   `properties` and `description` and the edge's metadata as `edge_metadata`, so one call answers
   what took a `get` per neighbor.
+- `search` accepts `follow=<relation>`: each hit carries `followed`, the targets its outgoing
+  edges of that relation reach, so a search for a wording returns the concept it names in one
+  call. Targets are read with the same visibility as `neighbors`; more than 100 targets per hit
+  sets `followed_truncated`. A multi-backend search refuses it.
 - `gtd.tasks` accepts `compact=true` for smaller task pages with description lengths. Compact
   pages use the same filters, task order, and continuation as full pages (#6914).
 - `git.issue` reads one issue of a configured repository: its title, state, author, dates, label
@@ -42,13 +58,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `operation.define` publishes step types on their own, and a step of an operation type may pin
   one by id and version. A step may name the values it requires and produces and take a value
   another step produces; a step that requires a value comes after the step that produces it.
-- `operation.frontier` reports `input_missing` for each value an owed step requires that no record
-  holds, in place of the act it owes. The item lists the places that state the field of a subject
-  in the requirement's slot: every loaded document type and system, in the order of the
-  namespace's newest `source_order`, then the rest by name. `stated_in_part` lists the lines that
-  state a parent of the field. The frontier names the source order and the form revisions it read.
-  `operation.define` publishes a `source_order` (`version`, `places`) and refuses a place that is
-  not a loaded document type or system (ADR-222 Amendments 1 and 2).
 - The `forms` pack records what kind of document each form revision is. A `document_type` node
   (`id`, `name`, `origin` of `applicant`, `third_party` or `work`, optional `issuer_class`)
   contains its revisions; `forms.load` takes it as `document_type` and mints one, marked `minted`,
