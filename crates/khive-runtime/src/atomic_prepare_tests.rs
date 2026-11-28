@@ -2569,10 +2569,31 @@ async fn atomic_update_entity_appends_entity_updated_event() {
         "atomic event attribution must come from the authorized token"
     );
     assert_eq!(events[0].payload["id"], json!(entity_id.to_string()));
+    // ADR-221 section 3: the rename keeps the old name as an alias, so the
+    // aliases changed too, and the event names both names.
     assert_eq!(
         events[0].payload["changed_fields"],
-        json!(["name"]),
-        "changed_fields must name exactly the patched fields"
+        json!(["name", "aliases"]),
+        "changed_fields must name exactly the changed fields"
+    );
+    assert_eq!(events[0].payload["name"], json!("gap1-entity-renamed"));
+    assert!(
+        events[0].payload["previous_name"].is_string(),
+        "{}",
+        events[0].payload
+    );
+    let renamed = runtime.get_entity(&token, entity_id).await.expect("get");
+    assert_eq!(renamed.aliases.len(), 1, "{:?}", renamed.aliases);
+    assert_eq!(
+        renamed.aliases[0].origin,
+        khive_storage::entity::EntityAliasOrigin::Rename
+    );
+    assert_eq!(
+        Some(&renamed.aliases[0].alias),
+        events[0].payload["previous_name"]
+            .as_str()
+            .map(str::to_owned)
+            .as_ref()
     );
 }
 

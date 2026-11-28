@@ -365,10 +365,18 @@ async fn oversized_attachment_total_refuses_without_rows() {
 
 #[tokio::test]
 async fn external_attachment_recipient_refuses_without_rows() {
-    for recipient in [
-        "email:recipient@example.com",
-        "telegram:123",
-        "khive1:example/00000000-0000-0000-0000-000000000000",
+    // A node address with no node route installed is refused as disabled before the attachment
+    // check runs; either way nothing is written.
+    for (recipient, reason) in [
+        (
+            "email:recipient@example.com",
+            "attachments require a local recipient",
+        ),
+        ("telegram:123", "attachments require a local recipient"),
+        (
+            "khive1:example/00000000-0000-0000-0000-000000000000",
+            "the node channel is disabled",
+        ),
     ] {
         let (registry, runtime, store, _root) = fixture();
         let reference = store.put(b"local file".to_vec()).await.unwrap();
@@ -376,7 +384,7 @@ async fn external_attachment_recipient_refuses_without_rows() {
             &registry,
             &runtime,
             json!({"to": recipient, "content": "external file", "attachments": [reference]}),
-            "attachments require a local recipient",
+            reason,
         )
         .await;
     }

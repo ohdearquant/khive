@@ -111,12 +111,41 @@ fn receipt_custody_changes_daemon_identity_without_exposing_references() {
         let changed_id = compute_config_id(&changed, None);
         assert_ne!(configured_id, changed_id, "case {mutation}");
         assert!(!config_ids_compatible(&configured_id, &changed_id));
-        assert!(!config_ids_compatible(&changed_id, &configured_id));
+        // A client without a ring (case 0) is served by a daemon that has one;
+        // every other change to the ring is refused in both directions.
+        assert_eq!(
+            config_ids_compatible(&changed_id, &configured_id),
+            mutation == 0,
+            "case {mutation}"
+        );
         assert_eq!(
             first_config_mismatch_field(&configured_id, Some(&changed_id)),
             "visibility_receipts"
         );
     }
+}
+
+#[test]
+fn a_config_without_a_receipt_ring_mints_the_ringless_fingerprint() {
+    let ringless_field = format!(
+        ";visibility_receipts={}",
+        khive_runtime::daemon::no_receipt_ring_fingerprint()
+    );
+    let configured = receipt_identity_config();
+
+    let mut absent = configured.clone();
+    absent.credentials.clear();
+    absent.visibility_receipts = None;
+    let mut unreferenced = configured.clone();
+    unreferenced.visibility_receipts = None;
+    for config in [&absent, &unreferenced] {
+        let id = compute_config_id(config, None);
+        assert!(id.contains(&ringless_field), "{id}");
+        let daemon_id = compute_config_id(&configured, None);
+        assert!(config_ids_compatible(&id, &daemon_id));
+        assert!(!config_ids_compatible(&daemon_id, &id));
+    }
+    assert!(!compute_config_id(&configured, None).contains(&ringless_field));
 }
 
 #[test]

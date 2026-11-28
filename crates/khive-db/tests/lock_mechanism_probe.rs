@@ -55,7 +55,7 @@ struct ProbeReport {
 fn initialize_database(path: &Path) {
     assert_eq!(
         rusqlite::version(),
-        "3.53.2",
+        "3.54.1",
         "probe's pinned bundled SQLite"
     );
     let conn = rusqlite::Connection::open(path).expect("create plain SQLite fixture");

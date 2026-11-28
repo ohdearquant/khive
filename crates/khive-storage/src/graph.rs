@@ -404,6 +404,27 @@ pub trait GraphStore: Send + Sync + 'static {
             }),
         }
     }
+    /// Count hidden live incoming edges between live memory notes, grouped
+    /// by target ID and relation, without returning source IDs or namespaces.
+    ///
+    /// IDs and relations use their canonical stored spellings. `None` covers
+    /// every relation; `Some` covers only the supplied relations. Visibility
+    /// is compared with the edge's stored namespace. Implementations must not
+    /// open a read capability outside the reader's visible namespace set.
+    async fn count_hidden_incoming_memory_edges(
+        &self,
+        target_ids: &[String],
+        relations: Option<&[String]>,
+        visible_namespaces: &[String],
+    ) -> StorageResult<Vec<(String, String, u64)>> {
+        let _ = (target_ids, relations, visible_namespaces);
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "count_hidden_incoming_memory_edges".into(),
+            message: "this backend does not implement hidden incoming memory edge counts".into(),
+        })
+    }
+
     /// Count edges grouped by relation, ignoring soft-deleted rows. Cheap
     /// aggregate (`GROUP BY relation`) used to report the true per-relation
     /// population for full-graph audits (#702.3).

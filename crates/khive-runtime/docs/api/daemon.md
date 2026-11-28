@@ -35,6 +35,13 @@ environment. Its `serde(default)` preserves the meaning of an omitted value with
 it does not make a v3 daemon safe to use. `request_id` is the independent additive numeric
 audit-correlation field and does not alter dispatch or persisted verb output.
 
+`client_cwd` carries the originating client's working directory as text (`kkernel exec`, `kkernel
+kg apply` and the MCP bridge fill it from their own process). It is attribution, not identity: the
+daemon scopes it over the request and records it only on the audit rows of an anonymous caller,
+bounded and cleaned as khive-gate `docs/api/audit-events.md` ("Client working directory") says.
+It is additive with no protocol bump: an omitted value records nothing, and a daemon that predates
+the field ignores it.
+
 Plan frames retain the protocol and configuration checks. They reject the presence of
 `presentation`, `presentation_per_op`, `format`, `format_per_op`, or `request_id`, including null
 values, with an `invalid_params` error naming the field. The response `result` contains the same

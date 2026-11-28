@@ -159,6 +159,66 @@ fn dense_checkpoint() -> (tempfile::TempDir, VamanaIndex, Vec<f32>) {
     (dir, index, vectors)
 }
 
+#[test]
+fn mapped_consolidation_avoids_full_corpus_promotion() {
+    let (dir, mut owned, vectors) = dense_checkpoint();
+    let deleted: Vec<u32> = (0..owned.num_vectors as u32)
+        .filter(|&ordinal| ordinal != owned.graph.medoid())
+        .take(8)
+        .collect();
+    assert_eq!(deleted.len(), 8);
+    owned.tombstone_batch(&deleted).unwrap();
+    owned.save_atomic(dir.path()).unwrap();
+
+    let mut mapped = VamanaIndex::load(dir.path()).unwrap();
+    assert!(matches!(mapped.vectors, VectorStorage::Mmap { .. }));
+    assert!(matches!(mapped.gs_codes, CodeStore::Mmap { .. }));
+    let sibling = mapped.fork_for_maintenance();
+    let query = &vectors[..mapped.dimensions];
+    let sibling_results = sibling.search(query, 10).unwrap();
+    let full_vector_bytes = vectors.len() * std::mem::size_of::<f32>();
+
+    let (mapped_remap, allocations) = measure(|| mapped.consolidate());
+    let mapped_remap = mapped_remap.unwrap();
+    assert!(
+        allocations.largest_request < full_vector_bytes,
+        "mapped consolidation allocated a full-corpus buffer: largest={}, corpus={full_vector_bytes}",
+        allocations.largest_request
+    );
+    let owned_remap = owned.consolidate().unwrap();
+    assert_eq!(mapped_remap, owned_remap);
+    assert_eq!(mapped.graph, owned.graph);
+    assert_eq!(mapped.vectors().unwrap(), owned.vectors().unwrap());
+    assert_eq!(mapped.tombstones, owned.tombstones);
+    assert_eq!(mapped.free_slots, owned.free_slots);
+    assert_eq!(mapped.last_applied_seq(), owned.last_applied_seq());
+    for ordinal in 0..mapped.num_vectors {
+        assert_eq!(
+            mapped.gs_codes.view().code(ordinal),
+            owned.gs_codes.view().code(ordinal)
+        );
+    }
+    assert_eq!(
+        mapped.search(query, 10).unwrap(),
+        owned.search(query, 10).unwrap()
+    );
+    for ordinal in deleted {
+        assert!(sibling.is_tombstoned(ordinal));
+    }
+    assert!(matches!(sibling.vectors, VectorStorage::Mmap { .. }));
+    assert!(matches!(sibling.gs_codes, CodeStore::Mmap { .. }));
+    assert_eq!(sibling.search(query, 10).unwrap(), sibling_results);
+    drop(sibling);
+
+    mapped.save_atomic(dir.path()).unwrap();
+    let restored = VamanaIndex::load(dir.path()).unwrap();
+    assert_eq!(restored.vectors().unwrap(), mapped.vectors().unwrap());
+    assert_eq!(
+        restored.search(query, 10).unwrap(),
+        mapped.search(query, 10).unwrap()
+    );
+}
+
 fn segment_allocation_bound(path: &Path) -> usize {
     ["vectors.bin", "graph.bin", "lifecycle.bin", "codes.bin"]
         .into_iter()

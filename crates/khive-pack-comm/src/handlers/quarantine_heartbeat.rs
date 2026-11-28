@@ -509,10 +509,18 @@ pub(super) async fn persist_heartbeat(
     let store = runtime.notes(token)?;
     let id = heartbeat_note_id(ns, &p.channel_kind, &p.channel_slug);
 
-    let existing = store
-        .get_note(id)
+    let stored = store
+        .get_note_including_deleted(id)
         .await
         .map_err(|e| RuntimeError::Internal(format!("heartbeat: get_note: {e}")))?;
+    // A soft-deleted heartbeat keeps the channel's deterministic id, so inserting
+    // a fresh row would conflict with it on every attempt. Its revision guards the
+    // write below instead, which replaces the deleted row with a new live
+    // observation; nothing from the deleted row is carried into it.
+    let (existing, deleted) = match stored {
+        Some(note) if note.deleted_at.is_some() => (None, Some(note)),
+        other => (other, None),
+    };
     #[cfg(test)]
     race_seam::pause_after_read().await;
 
@@ -651,7 +659,7 @@ pub(super) async fn persist_heartbeat(
     // snapshot instead of trusting `Utc::now()` alone (mirrors
     // `update_note_from_snapshot_with_embedding_report`). A brand-new channel has no prior
     // revision to advance past.
-    let updated_at_micros = match existing.as_ref() {
+    let updated_at_micros = match existing.as_ref().or(deleted.as_ref()) {
         Some(snapshot) => {
             let minimum = snapshot.updated_at.checked_add(1).ok_or_else(|| {
                 RuntimeError::Internal(format!(
@@ -699,7 +707,7 @@ pub(super) async fn persist_heartbeat(
     // existing row untouched and reports whether this call inserted it, so the
     // loser is told it lost — the same conflict the `Some` arm returns, reached
     // from the other direction.
-    match existing {
+    match existing.or(deleted) {
         Some(snapshot) => {
             let persisted = store
                 .replace_note_if_unchanged(note, snapshot.updated_at, snapshot.deleted_at)

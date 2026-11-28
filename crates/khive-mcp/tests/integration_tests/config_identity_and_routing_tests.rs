@@ -154,10 +154,12 @@ fn compute_config_id_fingerprints_git_write_policy_deterministically_and_in_entr
             GitWriteEntryConfig {
                 repo: "/srv/repos/alpha".to_string(),
                 branches: vec!["feat/*".to_string(), "fix/*".to_string()],
+                access: Default::default(),
             },
             GitWriteEntryConfig {
                 repo: "/srv/repos/beta".to_string(),
                 branches: vec!["release/*".to_string()],
+                access: Default::default(),
             },
         ],
         ..Default::default()
@@ -175,6 +177,7 @@ fn compute_config_id_fingerprints_git_write_policy_deterministically_and_in_entr
             allowed: vec![GitWriteEntryConfig {
                 repo: "/srv/repos/alpha".to_string(),
                 branches: vec!["fix/*".to_string()],
+                access: Default::default(),
             }],
             ..Default::default()
         },

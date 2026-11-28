@@ -156,6 +156,7 @@ pub(super) async fn handle_conn_with_lifecycle<D: DaemonDispatch>(
             return;
         }
     };
+    drop(raw);
     let supervisor_probe = frame.probe_only;
     let handover_accepted = handover_requested
         && supervisor_probe
@@ -418,6 +419,7 @@ pub(super) async fn handle_conn_with_lifecycle<D: DaemonDispatch>(
             namespace: frame.namespace.clone(),
             actor_id: frame.actor_id.clone(),
             visible_namespaces: frame.visible_namespaces.clone(),
+            owned_namespaces: frame.owned_namespaces.clone(),
             process_ref: frame.process_ref.clone(),
             request_id: frame.request_id,
         };
@@ -441,14 +443,20 @@ pub(super) async fn handle_conn_with_lifecycle<D: DaemonDispatch>(
                     read_cancel_rx,
                     khive_storage::scope_request_read_deadline(
                         read_timeout,
-                        dispatcher.dispatch_with_error_detail(
-                            frame.ops,
-                            frame.presentation,
-                            frame.presentation_per_op,
-                            frame.format,
-                            frame.format_per_op,
-                            frame.from_wire,
-                            Some(identity),
+                        khive_storage::scope_request_id(
+                            frame.request_id,
+                            khive_storage::scope_request_client_cwd(
+                                frame.client_cwd,
+                                dispatcher.dispatch_with_error_detail(
+                                    frame.ops,
+                                    frame.presentation,
+                                    frame.presentation_per_op,
+                                    frame.format,
+                                    frame.format_per_op,
+                                    frame.from_wire,
+                                    Some(identity),
+                                ),
+                            ),
                         ),
                     ),
                 ),

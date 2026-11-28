@@ -283,6 +283,19 @@ pub fn background_task_names() -> Vec<String> {
     out
 }
 
+/// In-flight tracked tasks registered under `name`. Tests share the
+/// process-wide counter with every other test in their binary; one that needs
+/// a baseline for its own work counts that work by name here.
+#[cfg(test)]
+pub(crate) fn background_task_count_named(name: &str) -> usize {
+    background_task_names_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(name)
+        .copied()
+        .unwrap_or(0)
+}
+
 #[cfg(unix)]
 pub(super) fn idle_retirement_blockers<D: DaemonDispatch>(dispatcher: &D) -> Vec<String> {
     let mut blockers = dispatcher.idle_retirement_blockers();

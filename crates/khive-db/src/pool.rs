@@ -77,6 +77,8 @@ use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex};
 use rusqlite::hooks::{AuthContext, Authorization};
 use rusqlite::{Connection, OpenFlags};
+
+use crate::ProgressConn;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 #[cfg(test)]
@@ -244,6 +246,14 @@ pub(crate) use admission::FALLBACK_WAL_AUTOCHECKPOINT_PAGES;
 #[cfg(test)]
 use admission::{CheckpointConnectionConfigPause, CheckpointOwnership};
 
+/// Registers a newly opened connection for test hooks; the identity outside tests.
+pub(crate) fn register_test_hooks(conn: Connection) -> rusqlite::Result<Connection> {
+    #[cfg(any(test, feature = "test-support"))]
+    return crate::test_hooks::register_opened(conn);
+    #[cfg(not(any(test, feature = "test-support")))]
+    Ok(conn)
+}
+
 fn deny_retired_writer(_context: AuthContext<'_>) -> Authorization {
     Authorization::Deny
 }
@@ -281,9 +291,9 @@ pub struct SearchMechanismSnapshot {
 /// snapshots do not need WAL to support concurrent readers, and inspection must
 /// never alias a read onto the query-only writer slot.
 pub struct ConnectionPool {
-    writer: Arc<Mutex<Connection>>,
+    writer: Arc<Mutex<ProgressConn>>,
     // Prepared before admission so terminal cleanup cannot fail while allocating a replacement.
-    retirement_connection: Mutex<Option<Connection>>,
+    retirement_connection: Mutex<Option<ProgressConn>>,
     #[cfg(any(test, feature = "test-support"))]
     statement_observer: Arc<crate::statement_observer::StatementObserverHub>,
     main_pool_generation: OnceLock<u64>,

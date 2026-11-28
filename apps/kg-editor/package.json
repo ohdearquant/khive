@@ -24,7 +24,7 @@
     "check:showcase": "node scripts/sync-showcase-assets.mjs --check"
   },
   "dependencies": {
-    "next": "16.4.1",
+    "next": "16.4.5",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "zod": "^4.6.7"

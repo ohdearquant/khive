@@ -13,7 +13,7 @@ Entity merging classifies each UUID relative to the common base and reconciles t
 | present | structurally equal     | `Unchanged`                            |
 | present | structurally different | `Modified` with base and branch values |
 
-Structural equality compares ID, kind, governed entity type, name, description, tags, and properties. It deliberately excludes creation and update timestamps. The modified form retains the base value for three-way property reconciliation and future “was → now” conflict displays.
+Structural equality compares ID, kind, governed entity type, name, description, tags, properties, keys, and aliases (keys and aliases as sets, ignoring order). It deliberately excludes creation and update timestamps. The modified form retains the base value for three-way property reconciliation and future “was → now” conflict displays.
 
 UUIDs are processed in sorted order before insertion into the returned map, supporting deterministic downstream handling.
 
@@ -50,8 +50,16 @@ Descriptions are annotations rather than identity, so an unequal description res
 | only theirs differs from base                      | take theirs, including a removed key        |
 | both differ from base and disagree with each other | `PropertyMismatch`; keep ours provisionally |
 
+Keys and aliases merge as sets against the base (ADR-221 section 4). A member stays when both branches hold it or when one branch added it; a member one branch removed while the other left it alone is removed, so a released key stays released. Each alias's origin is a value merged the same way: a one-sided change is taken, and two different changes keep the alias with ours' origin unless ours removed it, without a conflict. An alias equal to the merged name is not kept.
+
 `None` behaves as an empty map for per-key reconciliation, with an empty result represented as `None` when either branch used `None`. Identical or one-sided non-object legacy payloads are preserved atomically; divergent double changes to such payloads report a `PropertyMismatch` for `properties` rather than silently discarding data.
 
 ## Duplicate additions
 
-When both branches add the same UUID, equality checks name, kind, entity type, description, properties, and tags. Tag order is normalized for this comparison. A mismatch reports the exact differing field names in `DuplicateAddition`; timestamps are not part of this duplicate-content comparison.
+When both branches add the same UUID, equality checks name, kind, entity type, description, properties, tags, keys, and aliases. Tag, key, and alias order is normalized for this comparison. A mismatch reports the exact differing field names in `DuplicateAddition`; timestamps are not part of this duplicate-content comparison.
+
+## Keys across entities
+
+After the per-UUID merge, `key_conflicts` reports every key that the merged set places, under one kind, on more than one entity, as one `KeyConflict` per `(kind, key)` with the entity UUIDs sorted. The same key under two kinds names two entities and is not a conflict; keys are compared under each entity's merged kind.
+
+A key is held under its holder's kind, and a store refuses to change the kind of an entity while it holds keys. So `kind_change_conflicts` reports a merged entity that keeps a key some branch holds under a different kind than the merged one, as a `KindConflict` naming each branch's kind, unless the field-level merge already reported one for that entity. A kind change made after every key was released, or to an entity holding no keys, carries no key to another kind and merges as before.

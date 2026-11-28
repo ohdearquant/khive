@@ -86,6 +86,65 @@ reader connection and store nothing. `charter.publish`, `charter.vocabulary`, `c
 stores a definition, a run, an observation or a state change. `charter.claim` stays `Write`
 even where claims are not yet admitted and it refuses without writing.
 
+Revision `domain-effects-v26` classifies `tool.unregister` as `Write`: it
+soft-deletes a tool registration, retires matching local policies and revokes
+matching local grants. Idempotent retirement remains subject to write admission.
+
+Revision `domain-effects-v27` classifies `comm.quiet` as `Write`: it changes the
+process-wide quiet deadline controlling background work. Its state is in memory,
+but caller-requested control changes require write permission. Ordinary dispatch
+audit retention and failure handling still apply.
+
+Revision `domain-effects-v28` classifies `git.pr_state` as `Read`: it reads one pull
+request's state, checks, statuses and reviews from the platform with the caller's
+credential and writes no receipt. Like the other gated git reads it dispatches
+`tool.check`, so its policy decision row is retained under admission pressure.
+
+Revision `domain-effects-v29` classifies `git.fetch` as `Write`: it moves one
+remote-tracking or fetched pull request ref in the clone by compare-and-swap and
+writes a durable receipt, so it is admitted as a write like `git.update_ref`.
+
+Revision `domain-effects-v30` classifies `git.pr_edit` and `git.pr_close` as
+`Write`: each changes one pull request on the platform (its title or body, or its
+state) and writes a durable receipt, so they are admitted as writes like
+`git.pr_review`.
+
+Revision `domain-effects-v31` classifies `git.check_log` as `Write`: it changes
+nothing on the platform or in the repository, but it stores the log it reads in
+the blob store, so it is admitted as a write like `git.diff`.
+
+Revision `domain-effects-v32` classifies `git.branch_delete` as `Write`: it deletes
+one local branch by compare-and-delete and writes a durable receipt, so it is
+admitted as a write like `git.update_ref`. Its two platform reads change nothing.
+
+Revision `domain-effects-v33` classifies the ten verbs of the forms pack.
+`forms.load`, `forms.add_item`, `forms.same`, `forms.split` and `forms.replay`
+are `Write`: each commits graph records in one transaction. `forms.resolve`,
+`forms.neighbourhood`, `forms.check`, `forms.lint` and `forms.export` are
+`Read`: they read the graph and write nothing.
+
+Revision `domain-effects-v34` classifies `git.issue` as `Read`: it reads one
+issue and its comments from the platform and writes no receipt and no blob, so
+it is admitted as a read like `git.pr_state`.
+
+Revision `domain-effects-v35` classifies the five verbs of the operation pack.
+`operation.define`, `operation.open`, `operation.bind` and `operation.record`
+are `Write`: each appends definitions, an operation or its records in one
+transaction. `operation.frontier` is `Read`: it reads an operation's records and
+its pinned type and writes nothing.
+
+Revision `domain-effects-v36` classifies `git.issue_list` and `git.pr_list` as
+`Read`: each reads a bounded listing of one repository's issues or pull requests
+from the platform and writes no receipt and no blob, so each is admitted as a
+read like `git.issue`.
+
+Revision `domain-effects-v37` classifies four verbs added for slot resolution.
+`forms.terms` and `forms.subjects` are `Read`: they return the loaded term lists
+and one form revision's subjects and write nothing. `operation.resolve` is
+`Read`: it reads a type, a form's subjects and the decisions kept beside the type
+and writes nothing. `operation.decide` is `Write`: it appends one decision in one
+transaction.
+
 | Exact name                        | Access | Surface    | Registration                                                                                            |
 | --------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------------- |
 | `agent.kill`                      | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)                              |
@@ -152,6 +211,7 @@ even where claims are not yet admitted and it refuses without writing.
 | `comm.ingest`                     | Write  | Subhandler | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L379)                              |
 | `comm.mark_read`                  | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L271)                              |
 | `comm.probe`                      | Read   | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L609)                              |
+| `comm.quiet`                      | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs)                                   |
 | `comm.read`                       | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L249)                              |
 | `comm.reply`                      | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L300)                              |
 | `comm.send`                       | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L47)                               |
@@ -176,19 +236,40 @@ even where claims are not yet admitted and it refuses without writing.
 | `exec.tree_diff`                  | Read   | Verb       | [khive-pack-exec/src/vocab.rs](../../../khive-pack-exec/src/vocab.rs#L84)                               |
 | `exec.tree_get`                   | Read   | Verb       | [khive-pack-exec/src/vocab.rs](../../../khive-pack-exec/src/vocab.rs#L66)                               |
 | `exec.tree_put`                   | Write  | Verb       | [khive-pack-exec/src/vocab.rs](../../../khive-pack-exec/src/vocab.rs#L73)                               |
+| `forms.add_item`                  | Write  | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L51)                               |
+| `forms.check`                     | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L129)                              |
+| `forms.export`                    | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L146)                              |
+| `forms.lint`                      | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L139)                              |
+| `forms.load`                      | Write  | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L44)                               |
+| `forms.neighbourhood`             | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L102)                              |
+| `forms.replay`                    | Write  | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L153)                              |
+| `forms.resolve`                   | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L90)                               |
+| `forms.same`                      | Write  | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L63)                               |
+| `forms.split`                     | Write  | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L75)                               |
+| `forms.subjects`                  | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L119)                              |
+| `forms.terms`                     | Read   | Verb       | [khive-pack-forms/src/pack.rs](../../../khive-pack-forms/src/pack.rs#L112)                              |
 | `get`                             | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L203)                    |
 | `git.branch`                      | Write  | Verb       | [khive-pack-git/src/vocab.rs](../../../khive-pack-git/src/vocab.rs#L200)                                |
+| `git.branch_delete`               | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs)                         |
+| `git.check_log`                   | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs)                       |
 | `git.checkout`                    | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L30)                     |
 | `git.commit`                      | Write  | Verb       | [khive-pack-git/src/vocab.rs](../../../khive-pack-git/src/vocab.rs#L157)                                |
 | `git.diff`                        | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L37)                     |
 | `git.digest`                      | Write  | Verb       | [khive-pack-git/src/vocab.rs](../../../khive-pack-git/src/vocab.rs#L106)                                |
+| `git.fetch`                       | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs)                       |
 | `git.gates`                       | Read   | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L57)                     |
 | `git.ingest_cursor`               | Read   | Verb       | [khive-pack-git/src/vocab.rs](../../../khive-pack-git/src/vocab.rs#L84)                                 |
+| `git.issue`                       | Read   | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs)                       |
+| `git.issue_list`                  | Read   | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs)                       |
 | `git.init`                        | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L96)                     |
 | `git.log`                         | Read   | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L83)                     |
+| `git.pr_close`                    | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs)                       |
+| `git.pr_edit`                     | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs)                       |
+| `git.pr_list`                     | Read   | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs)                       |
 | `git.pr_merge`                    | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs#L78)                   |
 | `git.pr_open`                     | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs#L47)                   |
 | `git.pr_review`                   | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs#L63)                   |
+| `git.pr_state`                    | Read   | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs)                       |
 | `git.push`                        | Write  | Verb       | [khive-pack-git/src/remote_vocab.rs](../../../khive-pack-git/src/remote_vocab.rs#L33)                   |
 | `git.receipts`                    | Read   | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L44)                     |
 | `git.reconcile`                   | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L64)                     |
@@ -196,6 +277,7 @@ even where claims are not yet admitted and it refuses without writing.
 | `git.update_ref`                  | Write  | Verb       | [khive-pack-git/src/local_vocab.rs](../../../khive-pack-git/src/local_vocab.rs#L24)                     |
 | `gtd.assign`                      | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L98)                                 |
 | `gtd.census`                      | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L98)                                 |
+| `gtd.counts`                      | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L140)                                |
 | `gtd.complete`                    | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L225)                                |
 | `gtd.next`                        | Read   | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs#L191)                                |
 | `gtd.repair`                      | Write  | Verb       | [khive-pack-gtd/src/vocab.rs](../../../khive-pack-gtd/src/vocab.rs)                                     |
@@ -226,6 +308,7 @@ even where claims are not yet admitted and it refuses without writing.
 | `knowledge.upsert_domains`        | Write  | Verb       | [khive-pack-knowledge/src/vocab.rs](../../../khive-pack-knowledge/src/vocab.rs#L50)                     |
 | `link`                            | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L809)                    |
 | `list`                            | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L244)                    |
+| `memory.apply_batch`              | Write  | Verb       | [khive-pack-memory/src/pack.rs](../../../khive-pack-memory/src/pack.rs#L484)                            |
 | `memory.feedback`                 | Write  | Verb       | [khive-pack-memory/src/pack.rs](../../../khive-pack-memory/src/pack.rs#L173)                            |
 | `memory.prune`                    | Write  | Verb       | [khive-pack-memory/src/pack.rs](../../../khive-pack-memory/src/pack.rs#L390)                            |
 | `memory.recall`                   | Read   | Verb       | [khive-pack-memory/src/pack.rs](../../../khive-pack-memory/src/pack.rs#L196)                            |
@@ -245,6 +328,13 @@ even where claims are not yet admitted and it refuses without writing.
 | `moodboard.serve`                 | Write  | Verb       | [khive-pack-moodboard/src/vocab.rs](../../../khive-pack-moodboard/src/vocab.rs#L107)                    |
 | `moodboard.train_preference`      | Write  | Verb       | [khive-pack-moodboard/src/vocab.rs](../../../khive-pack-moodboard/src/vocab.rs#L224)                    |
 | `neighbors`                       | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L944)                    |
+| `operation.bind`                  | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L80)                       |
+| `operation.decide`                | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L133)                      |
+| `operation.define`                | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L55)                       |
+| `operation.frontier`              | Read   | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L108)                      |
+| `operation.open`                  | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L67)                       |
+| `operation.record`                | Write  | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L93)                       |
+| `operation.resolve`               | Read   | Verb       | [khive-pack-operation/src/pack.rs](../../../khive-pack-operation/src/pack.rs#L120)                      |
 | `propose`                         | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1207)                   |
 | `query`                           | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1174)                   |
 | `resolve`                         | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1331)                   |
@@ -288,6 +378,7 @@ even where claims are not yet admitted and it refuses without writing.
 | `tool.requests`                   | Read   | Verb       | [khive-pack-tool/src/vocab.rs](../../../khive-pack-tool/src/vocab.rs#L241)                              |
 | `tool.revoke`                     | Write  | Verb       | [khive-pack-tool/src/vocab.rs](../../../khive-pack-tool/src/vocab.rs#L230)                              |
 | `tool.suggest`                    | Read   | Verb       | [khive-pack-tool/src/vocab.rs](../../../khive-pack-tool/src/vocab.rs#L154)                              |
+| `tool.unregister`                 | Write  | Verb       | [khive-pack-tool/src/vocab.rs](../../../khive-pack-tool/src/vocab.rs#L172)                              |
 | `traverse`                        | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1017)                   |
 | `update`                          | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L495)                    |
 | `verbs`                           | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1473)                   |
@@ -314,7 +405,7 @@ See [runtime token minting](../../../khive-runtime/src/runtime.rs#L1086).
   `brain.emit` is the deprecated Write alias of `brain.feedback`.
 - `tool.policy_delete` persists retirement metadata on the exact live policy
   row and changes future policy decisions. It is Write, like `tool.policy`.
-- `git.diff` and `git.checkout` publish artifacts/receipts; `git.reconcile` changes
+- `git.diff`, `git.check_log` and `git.checkout` publish artifacts/receipts; `git.reconcile` changes
   receipt state. `exec.tree` persists a manifest. They are Write despite possible
   read-oriented names. `exec.tree_diff` only returns a comparison and is Read.
 - `knowledge.fold` computes a result from supplied candidates and is Read;

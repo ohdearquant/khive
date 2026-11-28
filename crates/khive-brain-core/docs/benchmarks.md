@@ -59,7 +59,9 @@ smoke run. Timing is an advisory comparison against rolling and fixed references
 ## Timing boundaries and state
 
 The new `feedback_posteriors` group uses target UUID 42 and 25 recall hits
-interleaved with 25 misses. It retains one entity posterior in capacity-100 state.
+interleaved with 25 misses, then one useful judgment on the target. Recall hits
+carry no per-entity evidence, so that judgment creates the one entity posterior
+retained in capacity-100 state.
 Each measured call starts from that same snapshot; cloning and restoring the
 state, allocating its map and dropping it are outside the timer. Criterion
 `iter_batched_ref` with `PerIteration` keeps one input per iteration and avoids

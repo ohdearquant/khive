@@ -21,6 +21,7 @@ impl Fixture {
             exec: ExecSectionConfig {
                 root: Some(root.to_string_lossy().into_owned()),
                 read_roots: vec!["/bin".into(), "/usr/bin".into()],
+                cache_roots: Vec::new(),
                 ..Default::default()
             },
             ..RuntimeConfig::no_embeddings()

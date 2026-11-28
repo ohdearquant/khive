@@ -68,6 +68,14 @@ pub struct KhiveMcpServer {
     pub(super) bridge_executable:
         Option<Arc<std::sync::Mutex<crate::daemon::executable::BridgeExecutable>>>,
     pub(super) stdio_bridge: bool,
+    /// The caller's computer (ADR-220). Present only when the configuration
+    /// this process resolved has a `[computer]` table, and never in the daemon.
+    #[cfg(unix)]
+    pub(super) computer: Option<Arc<super::computer_bridge::ComputerBridge>>,
+    /// The caller's `[share]` table (ADR-220 Amendment 1), held like the
+    /// computer: only by the process that resolved the configuration.
+    #[cfg(unix)]
+    pub(super) share: super::bridge_share::ShareSetup,
     /// Namespace this registry was built for. The stdio client passes it to the
     /// daemon; a namespace mismatch triggers local-dispatch fallback.
     pub(super) default_namespace: String,
@@ -76,6 +84,8 @@ pub struct KhiveMcpServer {
     /// local-dispatch fallback so a restricted client never runs through the
     /// broader default daemon.
     pub(super) config_id: String,
+    pub(super) spawn_config: Option<std::path::PathBuf>,
+    pub(super) spawn_db: Option<String>,
     /// Cross-backend coordinator (ADR-029 Phase 2). Present only in multi-backend
     /// deployments. `None` in single-backend mode — all dispatch goes through the
     /// `VerbRegistry` unchanged (zero-change invariant).
@@ -87,6 +97,9 @@ pub struct KhiveMcpServer {
     /// [`Self::from_registry`]/[`Self::from_registry_with_meta`] without an
     /// explicit [`Self::with_runtime`] call (test-only construction paths).
     pub(super) runtime: Option<KhiveRuntime>,
+    /// Whether the assembled per-pack runtimes carry local callbacks.
+    #[cfg(unix)]
+    pub(super) per_pack_local_callbacks: bool,
     /// Runtime that owns the outbound `message` notes the delivery loops
     /// scan, claim, and mark — the comm pack's assigned runtime. Every one of
     /// those touches is deliberately non-wire (the generic verbs run on the
@@ -109,6 +122,7 @@ pub struct KhiveMcpServer {
     /// `KHIVE_OUTPUT_FORMAT` → builtin `json`. Per-request `format` fields
     /// override this at dispatch time.
     pub(super) default_output_format: OutputFormat,
+    pub(super) catalog_verbosity: crate::args::CatalogVerbosity,
     /// Last instant at which this process's daemon schedule loop began a tick.
     /// Zero means this server instance has never observed the loop running.
     /// Shared by server clones but never persisted, so a replacement process
@@ -384,5 +398,46 @@ impl KhiveMcpServer {
         self.runtime
             .as_ref()
             .map(KhiveRuntime::background_resources_control)
+    }
+
+    /// Whether a runtime this server dispatches through carries host-installed
+    /// configuration validators or `comm.send` routes. Those callbacks exist
+    /// only in this process, so its requests must not be forwarded to a daemon.
+    ///
+    /// The multi-backend builder checks the per-pack runtimes at construction.
+    /// The default runtime and comm outbox can also be attached separately.
+    #[cfg(unix)]
+    pub(crate) fn carries_process_local_callbacks(&self) -> bool {
+        if self.per_pack_local_callbacks {
+            return true;
+        }
+        #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+        if self
+            .channel_outbox_runtime
+            .as_ref()
+            .is_some_and(Self::runtime_carries_process_local_callbacks)
+        {
+            return true;
+        }
+        self.runtime
+            .as_ref()
+            .is_some_and(Self::runtime_carries_process_local_callbacks)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_per_pack_local_callbacks<'a>(
+        mut self,
+        runtimes: impl IntoIterator<Item = &'a KhiveRuntime>,
+    ) -> Self {
+        self.per_pack_local_callbacks = runtimes
+            .into_iter()
+            .any(Self::runtime_carries_process_local_callbacks);
+        self
+    }
+
+    #[cfg(unix)]
+    fn runtime_carries_process_local_callbacks(runtime: &KhiveRuntime) -> bool {
+        let config = runtime.config();
+        !config.channel_config_validators.is_empty() || !config.channel_send_routes.is_empty()
     }
 }

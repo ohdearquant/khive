@@ -277,8 +277,9 @@ impl NamedVectorIdentity {
 
 pub use crate::config::{
     assert_captured_db_anchor_consistent, assert_db_anchor_consistent, expand_tilde,
-    parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
-    BackendId, BackendIdError, NamespaceToken, RuntimeConfig,
+    parse_pack_list, resolve_db_anchor, resolve_project_actor_id,
+    resolve_project_requires_attributed_actor, runtime_config_from_khive_config, BackendId,
+    BackendIdError, NamespaceToken, RuntimeConfig,
 };
 
 // ---- KhiveRuntime ----
@@ -584,13 +585,10 @@ impl KhiveRuntime {
         // attempting migration DDL.
         let schema_version = backend.prepare_core_schema()?;
         if schema_version < khive_db::migrations::ATTACHMENT_CUTOVER_VERSION {
-            return Err(khive_db::SqliteError::InvalidData(
-                "database requires the host application-assisted V21 attachment cutover; \
-                 start through khive-mcp/kkernel boot instead of constructing KhiveRuntime \
-                 directly"
-                    .into(),
-            )
-            .into());
+            return Err(crate::error::RuntimeError::AttachmentCutoverRequired {
+                schema_version,
+                required_version: khive_db::migrations::ATTACHMENT_CUTOVER_VERSION,
+            });
         }
         if !backend.is_read_only() {
             register_configured_embedding_models(&backend, &config)?;

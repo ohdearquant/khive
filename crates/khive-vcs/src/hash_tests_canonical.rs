@@ -336,3 +336,33 @@ fn borrowed_serializer_preserves_legacy_canonical_bytes_and_hash() {
     let expected = SnapshotId::from_hash(&hex::encode(Sha256::digest(legacy.as_bytes()))).unwrap();
     assert_eq!(snapshot_id_for_archive(&archive).unwrap(), expected);
 }
+
+/// An archive whose entities carry no keys and no aliases hashes to the id it
+/// had before entities could carry either, so existing snapshot ids stay valid.
+#[test]
+fn an_archive_without_keys_or_aliases_keeps_its_snapshot_id() {
+    let low = Uuid::from_u128(0x10);
+    let high = Uuid::from_u128(0x20);
+    let mut archive = empty_archive();
+    let mut first = make_entity(low, "Alpha");
+    first.entity_type = Some("paper".into());
+    first.description = Some("first".into());
+    first.tags = vec!["b".into(), "a".into()];
+    first.properties = Some(json!({"year": 2026, "area": "retrieval"}));
+    archive.entities = vec![make_entity(high, "Beta"), first];
+    archive.edges = vec![ExportedEdge {
+        edge_id: Uuid::from_u128(0x30),
+        source: low,
+        target: high,
+        relation: EdgeRelation::Extends,
+        weight: 0.75,
+        properties: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }];
+
+    assert_eq!(
+        snapshot_id_for_archive(&archive).unwrap().as_str(),
+        "sha256:bb442cae741a39be9b72af273ac81b9400fd862f1e8b8f4d75f0cf9d73f4110f"
+    );
+}

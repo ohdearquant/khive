@@ -102,6 +102,17 @@ use server_core::{stdio_serve_mode_for, StdioServeMode};
 
 mod batch_execution;
 mod bridge;
+// ADR-220: routing command verbs to the caller's computer. Each of these
+// modules is Unix-only through its own `#![cfg(unix)]`, so the declarations
+// stay bare for the error-constructor census.
+mod bridge_share;
+mod computer_bridge;
+mod computer_catalog;
+mod computer_client;
+mod computer_http;
+#[cfg(all(test, unix))]
+mod computer_pipe_tests;
+mod computer_routing;
 mod dispatch_helpers;
 mod execution;
 mod rendering;
@@ -119,6 +130,8 @@ use bridge::{
 };
 #[cfg(all(unix, test))]
 use bridge::{strict_fallback_envelope_response, ForwardFuture};
+#[cfg(unix)]
+pub use bridge_share::answer_bridge_share_for_exec;
 use dispatch_helpers::{
     apply_presentation_to_result, chain_aggregation_depth_reject, chain_ok_envelope_or_depth_error,
     decorate_schedule_agenda_with_ticker_health, dispatch_via_coordinator_inner,
@@ -226,17 +239,26 @@ impl KhiveMcpServer {
             registry,
             default_namespace: default_namespace.to_string(),
             config_id: config_id.to_string(),
+            spawn_config: None,
+            spawn_db: None,
             coordinator: None,
             pool: None,
             secondary_pools: Vec::new(),
             default_output_format: OutputFormat::Json,
+            catalog_verbosity: crate::args::CatalogVerbosity::Full,
             schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
             #[cfg(unix)]
             events_readiness: Arc::new(std::sync::OnceLock::new()),
             #[cfg(unix)]
             bridge_executable: None,
+            #[cfg(unix)]
+            computer: None,
+            #[cfg(unix)]
+            share: Default::default(),
             stdio_bridge: false,
             runtime: None,
+            #[cfg(unix)]
+            per_pack_local_callbacks: false,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
             channel_outbox_runtime: None,
             #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
@@ -274,6 +296,12 @@ impl KhiveMcpServer {
     /// `khive.toml`. Per-request `format` fields override this at dispatch time.
     pub fn with_default_output_format(mut self, fmt: OutputFormat) -> Self {
         self.default_output_format = fmt;
+        self
+    }
+
+    /// Select the advertised verb catalog detail without changing dispatch or full help.
+    pub fn with_catalog_verbosity(mut self, verbosity: crate::args::CatalogVerbosity) -> Self {
+        self.catalog_verbosity = verbosity;
         self
     }
 
@@ -410,6 +438,22 @@ impl KhiveMcpServer {
         self.runtime.as_ref().is_some_and(|rt| rt.is_read_only())
     }
 
+    /// Whether strict attributed-actor mode refuses a request made as
+    /// `actor_id`. The policy is the one checked when this server was built
+    /// (`KHIVE_REQUIRE_ATTRIBUTED_ACTOR=1` or `[actor] require_attributed`,
+    /// with the default-backend runtime's pack list), applied here to the
+    /// caller's actor instead of this server's own. A server with no retained
+    /// runtime (registry-only construction) has no pack list to check and
+    /// refuses nothing.
+    pub(crate) fn strict_mode_refuses_actor(&self, actor_id: Option<&str>) -> bool {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return false;
+        };
+        let config = runtime.config();
+        (crate::serve::is_strict_actor_mode() || config.require_attributed_actor)
+            && crate::serve::should_warn_unattributed(actor_id, &config.packs)
+    }
+
     pub fn config_id(&self) -> &str {
         &self.config_id
     }
@@ -429,6 +473,13 @@ impl KhiveMcpServer {
     /// (ADR-096 Fork 1).
     pub fn visible_namespaces(&self) -> &[khive_runtime::Namespace] {
         self.registry.visible_namespaces()
+    }
+
+    /// This server's resolved `[actor] owned_namespaces` (ADR-021 Delta 1).
+    /// Read when building the daemon request frame so the caller's declaration
+    /// travels with its identity; see [`Self::actor_id`] for why.
+    pub fn owned_namespaces(&self) -> &[khive_runtime::Namespace] {
+        self.registry.owned_namespaces()
     }
 
     /// The connection pool to use for background WAL checkpointing, if any.
@@ -612,6 +663,14 @@ result (e.g. create then link with the new entity's id)."#)]
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<String, McpError> {
         let timeout = crate::request_policy::read_timeout(&p.ops, request_read_timeout());
+        // A request with an operation for the computer waits as long as the
+        // computer may take (ADR-220 section 2).
+        #[cfg(unix)]
+        let timeout = self
+            .computer
+            .as_ref()
+            .and_then(|computer| computer.deadline_for(&p.ops))
+            .map_or(timeout, |deadline| deadline.max(timeout));
         scope_mcp_request_read_cancellation_with_timeout(
             cancellation,
             timeout,
@@ -709,10 +768,18 @@ impl ServerHandler for KhiveMcpServer {
                 )),
             )
         })?;
+        #[cfg(unix)]
+        let catalog = self.request_tool_catalog().await;
+        #[cfg(not(unix))]
         let catalog = self.verb_catalog();
         for t in &mut tools {
             if t.name == "request" {
                 let base = t.description.as_deref().unwrap_or("");
+                #[cfg(unix)]
+                let base = match self.share.bridge {
+                    Some(_) => format!("{base}\n\n{}", bridge_share::SHARE_DESCRIPTION),
+                    None => base.to_owned(),
+                };
                 t.description = Some(std::borrow::Cow::Owned(format!(
                     "{base}\n\nVerbs registered on this server:\n{catalog}"
                 )));

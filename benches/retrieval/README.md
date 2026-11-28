@@ -67,11 +67,11 @@ baseline.
   `cleanup_scratch` walks the scratch tree through a TOCTOU-guarded fd and,
   at every recursion depth, checks each directory's identity two ways: its
   `fstat`ed (device, inode) must match the inode `os.scandir()` observed
-  for that name moments earlier (catching a directory swapped in *after*
+  for that name moments earlier (catching a directory swapped in _after_
   this run started walking the tree — same mechanism regardless of nesting
   depth, not just at the top level), and, for `home`/`tmp`, against the
   identity recorded when this run created them. Neither check can see a
-  substitution that already happened *before* this run's own listing of a
+  substitution that already happened _before_ this run's own listing of a
   given directory — e.g. a directory the `kkernel` subprocess itself
   creates during the run (`blobs`, `eval.db.ann`, `.khive`, `.lattice/...`)
   has no creation-time identity recorded for it — only the listing-time
@@ -134,6 +134,177 @@ here touches `crates/` or requires a Rust rebuild.
    / significance read, or commit a new `gold/<name>.json` if it becomes a
    second baseline worth gating on.
 
+## Question banks on a staged store copy
+
+`bank.py` scores retrieval arms on a frozen, versioned question bank against a copy of a real store, where
+`evaluate.py` uses its own synthetic corpus. A bank is a directory with `bank.json` (`bank_id`, `version`,
+`cases_sha256`) and `cases.jsonl`; each case carries the query, the instant `T` the query belongs to, and
+`needed_info`, the facts the task required, each one an equivalence set of record ids (the same fact kept as a
+memory, a note and an entity counts once). The runner refuses a bank whose `cases.jsonl` no longer matches
+`cases_sha256`, so a correction mints the next version instead of editing a scored one. A case may carry one
+`namespace:<ns>` tag (the value is everything after the first colon, so `namespace:team-a:archive` reads
+`team-a:archive`); the tag labels the case's population and must be in the bank's visible set. No recall passes it as a
+`namespace` argument: an explicit namespace becomes the primary namespace, which is where a named profile's brain state
+is read from, and a case namespace may hold none. Two such tags, or an empty value,
+are refused when the bank loads.
+
+```bash
+uv run python bank.py self-test
+uv run python bank.py check-bank banks/001/v1
+uv run python bank.py run --bank banks/team-a/v1 --bank banks/team-b/v1 \
+  --store-main /stage/khive.db --store-events /stage/khive-events.db \
+  --snapshot-id <id> --engines-file engines.toml --models-dir ~/.lattice/models \
+  --bank-visible team-a=team-a,local --bank-visible team-b=team-b,local \
+  --profile profile-x --profile profile-y --expect-profiles brain_profile_snapshots.jsonl \
+  --control-id <memory uuid> --feedback-actors <actor> --out runs/<name>
+uv run python bootstrap.py runs/<name>/team-a/recall_rrf.jsonl runs/<name>/team-a/profile_on.profile-x.jsonl \
+  --metrics hit@10,coverage@10,MRR@10
+```
+
+The copy is staged into a fresh scratch home and served by `kkernel mcp` processes with `KHIVE_NO_DAEMON=1`, one per bank; a
+source under the caller's `~/.khive` is refused, and so is one with a non-empty WAL unless `--copy-wal` states that
+no process writes it. A source whose inode, size or modification time changes during its copy stops the run. The
+run starts only at normal memory pressure, read before the copy and again before each bank's server starts; each
+bank's record holds its reading. Each server writes its stderr to its own file in the scratch home
+(`kkernel-mcp-bank<N>.err`, numbered in the order the banks are given), named in that bank's record. The scratch
+home is kept by default, and the record names its path and the staged files' sha256 before and after the run;
+`--remove-scratch` removes it. On another machine, `--staged-home <dir>` serves a copy already placed at
+`<dir>/home/.khive/` by a guarded transfer instead of copying it again: `<dir>/transfer.json` must carry verdict
+`ok`, the same snapshot id, and each file's size and sha256, which are checked before anything is written, and a copy
+with a `-wal` or `-shm` sidecar (one a server has already opened) is refused. That directory is never removed.
+Every recall passes `created_before = T`, and a hit created at or after `T` stops the run.
+Arms: three fusion strategies with configured
+defaults (no binding row), a named profile against configured defaults, a profile with no feedback events, a profile
+fed the named profile's explicit feedback events created before each case's `T`, and a fusion of recall with
+`search` over notes and entities (whose late hits are dropped after the fact and counted, since `search` has no
+time filter). The served profile's name is checked on every hit; what shows that the served profile was loaded from the frozen snapshot is the served-state check below. `composed` refuses a namespaced case before anything is
+staged, because `search` has no read-namespace filter. Recall hits do not carry the namespace they were read from,
+so the namespace a case names is a label checked against the bank's visible set, not a per-hit property.
+
+`run` takes `--bank` and `--profile` more than once. One invocation stages one copy and scores
+every bank in the order given, each with its own `kkernel mcp` process on that copy; within a bank the arms run in the
+order given, and `profile_on` runs once per
+profile. Bank ids and profiles must be distinct and usable as file names (letters, digits, dots, underscores and
+hyphens, starting with a letter or digit). `--bank-visible <bank_id>=<ns>[,<ns>...]` gives the namespaces the bench actor
+can read while that bank runs. It is required once for every `--bank`, a set may not name a bank that is not given, and
+every case namespace tag must be in its bank's set; all of this is refused before anything is staged. The bank's process
+gets a config listing exactly that set, and the actor id is the same for every bank.
+`feedback_fresh` uses one fresh profile per bank;
+`feedback_asof` takes exactly one `--profile` and creates one as-of profile per bank, whose replay starts again
+at `--feedback-since`. Each bank writes `<out>/<bank_id>/<arm>.jsonl`, with `profile_on` written as
+`<out>/<bank_id>/profile_on.<profile>.jsonl`; every row carries the bank id and version, the population, the serving
+profile and the case namespace. `run.json` records each bank (id, version, cases hash, population, namespace counts, visible set, served-state reads),
+the profiles, the store snapshot id, kkernel version, the staged files' sha256, the control
+result and the metrics grouped by bank and file.
+
+In each bank's server process, right after the handshake and before that process's first recall, each `--profile` is
+read (`brain.profile`) and its `total_events` is compared with the count in the frozen read-back; a profile that is not
+found, or a different count, stops the run naming the profile, the expected value and the served value. The order
+matters: a recall that names no profile is credited to the default profile `balanced-recall-v1` in the server's memory,
+so the readiness and control recalls would already have moved that count. Equal `total_events` shows that the served
+profile was loaded from the frozen snapshot rather than seeded fresh under another namespace; it does not show that the
+posteriors are identical. A name comparison cannot show even that: a profile seeded fresh under the same name passes
+it. `--expect-profiles <path>` names the read-back, a
+`brain_profile_snapshots.jsonl` export (one JSON array per line, `[profile_id, namespace, snapshot_json, updated_at]`);
+the row whose profile id is `__brain__` and whose namespace is `--expect-namespace` (default `local`) supplies
+`profiles.<id>.total_events`. It is required whenever `profile_on` is among the arms, and a file with no such row, or a
+row lacking a requested profile, is refused before anything is staged. `run.json` records the file's path and sha256,
+each compared pair, and per bank `served_state.after_in_process`: the same profiles read again in that bank's server
+process after its arms. That is the in-process count, not stored state: it includes the credits for the recalls just
+served, and the read-only arms (`recall_*`, `profile_off`, `profile_on`) do not write it to the staged copy. It is
+recorded only and never stops the run. `--expect-profiles` is refused together with `feedback_fresh` or
+`feedback_asof`: those arms call `brain.create_profile` and `brain.feedback`, which write the server's brain state to
+the staged copy, so the served state is no longer the frozen one after them.
+
+`calibrate-replay` takes one bank (or `--queries-from-events`) and one profile, and measures how closely a profile rebuilt from replayed feedback events reproduces the original
+(top-10 overlap and rank-score differences), which bounds what the as-of-`T` arm can claim. Each query is recalled
+live, then by the rebuilt profile, then live again; the two live answers are compared the same way and reported as
+`aa`, a floor for the recall's own run-to-run variation (recency is read from the clock at each request, for one)
+that the live/rebuilt difference has to clear before it counts against the replay. Its queries come from a
+bank, or with `--queries-from-events` from n distinct queries the profile served, read from the copy's
+`recall_executed` events and spread over time; those events undercount recalls made through `kkernel exec`
+(#6259).
+
+### Deciding whether a profile may serve recall again: `rebind-gate`
+
+`rebind-gate` answers one question for one candidate profile: does recall served by it hold up against recall served by
+no profile? It takes two banks on the same staged copy, one whose answers are in the reader's own namespace
+(`--own-bank`) and one whose answers are in the shared pool, `local` (`--shared-bank`), plus the namespaces the reader
+reads while each runs (`--own-visible`, `--shared-visible`). Each question is recalled with no profile and then with the
+candidate (`profile_id`), back to back, at `top_k=50` with score breakdowns and timings, at the token budget the recall
+help in the copy gives as its cap (`--token-budget-cap` supplies it only when the help is read and states none; a help
+that cannot be read refuses the run). Two rounds run
+`--round-gap-s` apart (default 300), each bank in a fresh `kkernel mcp` process. The store arguments are those of `run`.
+
+```bash
+uv run python bank.py rebind-gate --profile profile-x \
+  --own-bank banks/own/v1 --own-visible team-a,local \
+  --shared-bank banks/shared/v1 --shared-visible team-a,local \
+  --store-main /stage/khive.db --store-events /stage/khive-events.db \
+  --snapshot-id <id> --engines-file engines.toml --models-dir ~/.lattice/models \
+  --control-id <memory uuid> --out runs/<name>
+```
+
+The candidate must be on the staged copy: every round's server process reads it before its first recall and records it.
+Without `--create-candidate-local-factor` the gate creates nothing, so the candidate must already be there, for example
+a profile the frozen store holds. A profile's `local_factor` can only be set when the profile is created, so a candidate
+for a new value is a new profile, and a frozen store does not hold it. Pass `--create-candidate-local-factor F`, a finite
+number in [0.5, 1] checked before anything is staged (outside it, or not finite, exits 12 with no copy and no process),
+to create the candidate on the copy before round 1:
+
+```bash
+uv run python bank.py rebind-gate --profile profile-x --create-candidate-local-factor 0.8 \
+  --own-bank banks/own/v1 --own-visible team-a,local \
+  --shared-bank banks/shared/v1 --shared-visible team-a,local \
+  --store-main /stage/khive.db --store-events /stage/khive-events.db \
+  --snapshot-id <id> --engines-file engines.toml --models-dir ~/.lattice/models \
+  --control-id <memory uuid> --out runs/<name>
+```
+
+One extra `kkernel mcp` process does the creation, as the same bench actor and with the own-namespace bank's read set,
+so the profile lands in the namespace the round processes run in. It reads the memory pressure and checks the runtime
+has no `brain_profile`, as every round process does, then reads `brain.profile` for the candidate. A candidate that is
+already on the copy exits 12, because the flag creates a new profile; so does any read error other than not found. It
+then calls `brain.create_profile` (consumer kind `recall`, no seed priors) and reads the candidate back, where
+`local_factor` must equal F, `total_events` must be 0 and the lifecycle must not be `archived`; anything else exits 12.
+The profile is left inactive, since a recall that names a profile by id serves it whatever its lifecycle except
+`archived`. The process runs no recall before the create, because the create commits the server's in-memory brain state
+to the copy and the credits of a recall would be committed with it. The create writes to the copy, so a copy adopted
+with `--staged-home` no longer matches its transfer record afterwards, and a later run on it is refused. The responses,
+the pressure reading, the `brain_profile` check and the stderr path are in `rebind-gate.json` under `candidate_created`,
+and `rebind-gate.txt` says whether the candidate was created by the run or found on the copy, with the `local_factor` the
+round processes read.
+
+The pass is read in each round on its own and must hold in both. On the own-namespace bank, MRR@10 with the candidate
+must be at least MRR@10 with no profile. On the shared-pool bank, MRR@10 may fall by at most 0.04 (exact arithmetic, so
+exactly 0.04 passes) and at most one question may be lost, meaning it is in the no-profile top ten and outside the
+candidate's top ten.
+
+The readable namespaces each round process reports must be the bank's read set plus the primary namespace and the bench
+actor's own namespace, which the runtime adds to every actor's visible namespaces; any other set exits 12. Both arms of
+a bank share one server process and its credentials, so the same caller, primary namespace and readable namespaces hold
+by construction. The arm-scope comparison remains a defensive guard for a future separate-process implementation. Its
+synthetic mismatch self-tests exercise that helper; they do not show that today's shared-process arms can differ.
+
+The gate does not start, and exits 12, when the runtime has a `brain_profile` set (config, environment or command line)
+or when a recall binding resolves for the caller: in either case the no-profile arm would not be the arm its name says.
+A hit whose attribution is not its arm's
+(`serve_attribution` of `unspecified` with no `served_by_profile_id` for no profile; `profile` and the candidate's id for
+the candidate) stops the run with exit 11. A degraded recall, or a no-profile recall with no hits, voids its round, which
+runs again in fresh processes; a question that voids three runs in a row stops the gate with exit 11 and is named. A
+candidate recall with no hits is a miss. Exit status: 0 pass, 10 fail, 11 the run cannot be read, 12 a required condition
+does not hold.
+
+`<out>/rebind-gate.json` and `<out>/rebind-gate.txt` hold the verdict and, beside it, per arm and round: MRR@10 and
+hit@10 (and their mean over the two rounds), the lost and gained questions split by whether the answer was absent from
+the 50 hits or at ranks 11 to 50, the questions whose recall widened, recalls with fewer than 50 hits, degraded recalls
+per round, the questions whose top ten differs between the rounds, the top-10 hits whose `pre_entity_score` is 1.0 (not
+available when a weighted reranker is configured, with that setting recorded), and whether the candidate's entity term is
+1 for every hit. The JSON record also keeps, per recall, each hit in served order (`hit_terms`) with its namespace,
+`rank_score` and every term of `rank_score = pre_entity_score * entity_term * local_factor - duplicate_penalty`, so
+another ranking rule over those terms can be replayed over the returned hits without a second run. A response missing
+any of the four terms stops the gate.
+
 ## Determinism
 
 `generate_corpus.py` and `evaluate.py` never read the wall clock or an
@@ -161,7 +332,7 @@ target) rather than exact equality: on repeated runs against an identical
 scratch corpus and an identical pinned config, a rank-10-boundary tie in the
 `fresh_directive` class occasionally resolves in either of two orderings
 (nDCG@10 differs by up to ~0.0008; Recall@100/TargetRecall@100/MRR@10 are
-unaffected — the retrieved candidate *set* is stable, only its order at an
+unaffected — the retrieved candidate _set_ is stable, only its order at an
 exact score tie flips). This is a pre-existing `memory.recall`
 scoring/fusion tie-break characteristic, not a wall-clock leak — verified by
 running back to back with a fixed epoch and the temporal weight pinned to

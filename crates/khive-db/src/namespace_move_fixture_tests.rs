@@ -140,6 +140,7 @@ fn every_current_namespace_table_has_a_move_disposition() {
     }
     for name in [
         "comm_sender_transport",
+        "comm_node_confirmed_pin",
         "sessions",
         "session_messages",
         "note_stream_floors",

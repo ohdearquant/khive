@@ -122,7 +122,7 @@ ADR-149 adds explicit interaction learning through `moodboard.serve`, `moodboard
 attributed non-`local` actor. Training uses immutable randomized pairwise judgments, deterministic
 unordered-pair train/calibration/test splits, a frozen ten-feature contract, and minimum support
 gates. It fits deterministic logistic binary cross-entropy in the pack, then persists and serves
-the exact zero-intercept `10 -> 1` head through `lattice-fann` 0.12.0. FANN bytes, the calibrated
+the exact zero-intercept `10 -> 1` head through `lattice-fann` 0.15.0. FANN bytes, the calibrated
 model bundle, and their provenance live in BlobStore, an `artifact/moodboard_model`, and immutable
 events. The bundle is attachment role `content`; the separately stored FANN object is role
 `fann-network`, and load fails before network hydration if that role disagrees with the

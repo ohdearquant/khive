@@ -25,6 +25,8 @@ fn empty(ns: &str) -> KgArchive {
 
 fn entity(id: Uuid, name: &str) -> ExportedEntity {
     ExportedEntity {
+        keys: Vec::new(),
+        aliases: Vec::new(),
         id,
         kind: "concept".into(),
         entity_type: None,
@@ -352,6 +354,8 @@ include!("three_way_merge_tests/edge_property_tests.rs");
 include!("three_way_merge_tests/strategy_and_diff_tests.rs");
 
 include!("three_way_merge_tests/identity_and_shortcut_tests.rs");
+
+include!("three_way_merge_tests/key_merge_tests.rs");
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 

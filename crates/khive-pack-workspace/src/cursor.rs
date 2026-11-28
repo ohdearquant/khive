@@ -283,6 +283,225 @@ mod tests {
         assert_eq!(mirror_lexical_rows(runtime).await, (2, 2));
     }
 
+    async fn accessor_previous_document(
+        runtime: &KhiveRuntime,
+        token: &khive_runtime::NamespaceToken,
+        uri: &str,
+    ) -> crate::mirror::PreviousDocument {
+        use crate::mirror::PreviousDocument;
+        let documents: Vec<_> = mirror_documents(runtime, token)
+            .await
+            .into_iter()
+            .filter(|document| document["properties"]["source_uri"] == uri)
+            .collect();
+        if documents.is_empty() {
+            return PreviousDocument::Absent;
+        }
+        let edges = mirror_edges(runtime, token).await;
+        let heads: Vec<_> = documents
+            .iter()
+            .filter(|document| !edges.iter().any(|edge| edge["target_id"] == document["id"]))
+            .collect();
+        if heads.len() != 1 {
+            return PreviousDocument::Ambiguous;
+        }
+        PreviousDocument::Current(heads[0]["id"].as_str().unwrap().parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn mirror_head_query_matches_live_accessor_scope() {
+        const NAME: &str = "mirror_head_query_matches_live_accessor_scope";
+        if mirror_child(NAME) {
+            return;
+        }
+        mirror_bounded(async {
+            use crate::mirror::PreviousDocument;
+            let (runtime, _registry, token) = mirror_fixture();
+            let id = |number| uuid::Uuid::from_u128(number).to_string();
+            let one = id(1);
+            let absent_deleted = id(2);
+            let foreign = id(3);
+            let deleted_peer = id(4);
+            let cycle = id(5);
+            let first = id(6);
+            let second = id(7);
+            let foreign_only = id(8);
+            let other_kind = id(9);
+            mirror_script(&runtime, &format!(
+                "INSERT INTO entities(id,namespace,kind,name,properties,created_at,updated_at,deleted_at) VALUES \
+                 ('{one}','local','document','live',json_object('source_uri','test://one'),1,1,NULL), \
+                 ('{absent_deleted}','local','document','deleted',json_object('source_uri','test://deleted'),1,1,2), \
+                 ('{foreign}','other','document','foreign',json_object('source_uri','test://one'),1,1,NULL), \
+                 ('{deleted_peer}','local','document','deleted peer',json_object('source_uri','test://one'),1,1,2), \
+                 ('{cycle}','local','document','cycle',json_object('source_uri','test://cycle'),1,1,NULL), \
+                 ('{first}','local','document','first',json_object('source_uri','test://two'),1,1,NULL), \
+                 ('{second}','local','document','second',json_object('source_uri','test://two'),1,1,NULL), \
+                 ('{foreign_only}','other','document','foreign only',json_object('source_uri','test://foreign'),1,1,NULL), \
+                 ('{other_kind}','local','concept','other kind',json_object('source_uri','test://kind'),1,1,NULL); \
+                 INSERT INTO graph_edges(namespace,id,source_id,target_id,relation,created_at,updated_at,deleted_at) VALUES \
+                 ('local','{edge_deleted}','{deleted_peer}','{one}','supersedes',1,1,2), \
+                 ('other','{edge_foreign}','{foreign}','{one}','supersedes',1,1,NULL), \
+                 ('local','{edge_cycle}','{cycle}','{cycle}','supersedes',1,1,NULL);",
+                edge_deleted=id(101), edge_foreign=id(102), edge_cycle=id(103),
+            )).await;
+            let expected = [
+                ("test://missing", PreviousDocument::Absent),
+                ("test://deleted", PreviousDocument::Absent),
+                ("test://foreign", PreviousDocument::Absent),
+                ("test://kind", PreviousDocument::Absent),
+                ("test://one", PreviousDocument::Current(one.parse().unwrap())),
+                ("test://cycle", PreviousDocument::Ambiguous),
+                ("test://two", PreviousDocument::Ambiguous),
+            ];
+            for (uri, expected) in expected {
+                let accessor = accessor_previous_document(&runtime, &token, uri).await;
+                assert_eq!(accessor, expected, "accessor fixture for {uri}");
+                let sql = crate::mirror::previous_document_for_test(&runtime, &token, uri)
+                    .await.expect("single-snapshot head lookup");
+                assert_eq!(sql, accessor, "head query differs from accessor for {uri}");
+            }
+        }).await;
+        mirror_done(NAME);
+    }
+
+    #[tokio::test]
+    async fn mirror_missing_graph_schema_refuses_before_document_write() {
+        const NAME: &str = "mirror_missing_graph_schema_refuses_before_document_write";
+        if mirror_child(NAME) {
+            return;
+        }
+        mirror_bounded(async {
+            let tree = MirrorTree::new();
+            let relative = ".khive/notes/missing-graph.md";
+            tree.write(relative, "first pass with graph schema absent");
+            let (runtime, registry, token) = mirror_fixture();
+            let config = crate::WorkspaceMirrorConfig::from_env().unwrap();
+            let (_, key) = mirror_slot(&tree, relative, &token);
+            assert!(mirror_documents(&runtime, &token).await.is_empty());
+            assert!(read(&runtime, &key).await.is_none());
+            assert_eq!(mirror_lexical_rows(&runtime).await, (0, 0));
+            mirror_script(&runtime, "DROP TABLE graph_edges;").await;
+            let mut reader = runtime.sql().reader().await.unwrap();
+            let graph_table = reader
+                .query_row(SqlStatement::new(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'graph_edges'",
+                    vec![],
+                ))
+                .await
+                .unwrap();
+            assert!(graph_table.is_none(), "missing-schema fixture premise");
+            drop(reader);
+
+            let error =
+                crate::mirror::mirror_directory_once(&runtime, &registry, &token, &tree.0, &config)
+                    .await
+                    .expect_err("missing graph schema must refuse the first pass");
+            assert_eq!(
+                error.commit_state,
+                crate::mirror::FileCommitState::NotAttempted
+            );
+            assert!(
+                matches!(
+                    error.runtime_error(),
+                    Some(khive_runtime::RuntimeError::Storage(_))
+                ),
+                "missing graph schema must retain the storage error: {error}"
+            );
+            assert_eq!(error.progress.committed, 0);
+            assert!(mirror_documents(&runtime, &token).await.is_empty());
+            assert!(read(&runtime, &key).await.is_none());
+            assert_eq!(mirror_lexical_rows(&runtime).await, (0, 0));
+        })
+        .await;
+        mirror_done(NAME);
+    }
+
+    #[tokio::test]
+    async fn mirror_head_observation_is_consistent_across_concurrent_commit() {
+        const NAME: &str = "mirror_head_observation_is_consistent_across_concurrent_commit";
+        if mirror_child(NAME) {
+            return;
+        }
+        mirror_bounded(async {
+            let tree = MirrorTree::new();
+            let relative = ".khive/notes/snapshot.md";
+            tree.write(relative, "initial deterministic mirror body");
+            let (runtime, registry, token) = mirror_fixture();
+            let config = crate::WorkspaceMirrorConfig::from_env().unwrap();
+            let baseline =
+                crate::mirror::mirror_directory_once(&runtime, &registry, &token, &tree.0, &config)
+                    .await
+                    .expect("positive initial mirror fixture");
+            assert_eq!(baseline.committed, 1);
+            assert_eq!(baseline.unchanged, 0);
+            assert!(baseline.skipped_no_current.is_empty());
+            assert!(baseline.skipped_entries.is_empty());
+            assert!(baseline.refused.is_empty());
+            assert!(baseline.skipped_non_utf8.is_empty());
+            assert_eq!(mirror_documents(&runtime, &token).await.len(), 1);
+            assert!(mirror_edges(&runtime, &token).await.is_empty());
+            assert_eq!(mirror_lexical_rows(&runtime).await, (1, 1));
+            let (uri, key) = mirror_slot(&tree, relative, &token);
+            assert!(read(&runtime, &key).await.is_some());
+            tree.write(relative, "changed deterministic mirror body");
+
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let mut hook = crate::mirror::HeadReadHook {
+                reached: Some(reached_tx),
+                release: Some(release_rx),
+            };
+            let (paused, winner) = tokio::join!(
+                crate::mirror::mirror_directory_once_with_head_hook(
+                    &runtime, &registry, &token, &tree.0, &config, &mut hook,
+                ),
+                async {
+                    reached_rx
+                        .await
+                        .expect("paused pass captured its head observation");
+                    let winner = crate::mirror::mirror_directory_once(
+                        &runtime, &registry, &token, &tree.0, &config,
+                    )
+                    .await;
+                    release_tx.send(()).expect("release paused pass");
+                    winner
+                },
+            );
+            let winner = winner.expect("the competing pass commits");
+            assert_eq!(winner.committed, 1);
+            assert_eq!(winner.unchanged, 0);
+            assert!(winner.skipped_no_current.is_empty());
+            assert!(winner.skipped_entries.is_empty());
+            assert!(winner.refused.is_empty());
+            assert!(winner.skipped_non_utf8.is_empty());
+
+            let paused_error = match paused {
+                Ok(summary) => {
+                    assert!(
+                        summary.skipped_no_current.is_empty(),
+                        "mixed history/edge snapshots reported skipped_no_current: {summary:?}"
+                    );
+                    panic!("the stale cursor must be refused, got {summary:?}");
+                }
+                Err(error) => error,
+            };
+            assert_eq!(
+                paused_error.commit_state,
+                crate::mirror::FileCommitState::Unconfirmed
+            );
+            assert!(paused_error.progress.skipped_no_current.is_empty());
+            assert!(
+                paused_error
+                    .to_string()
+                    .contains("workspace mirror cursor changed before commit"),
+                "unexpected stale-pass result: {paused_error}"
+            );
+            mirror_assert_head_and_cursor(&runtime, &token, &uri, &key, 1, 1).await;
+        })
+        .await;
+        mirror_done(NAME);
+    }
+
     #[tokio::test]
     async fn mirror_concurrent_changed_passes_keep_one_current_head() {
         const NAME: &str = "mirror_concurrent_changed_passes_keep_one_current_head";

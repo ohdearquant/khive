@@ -157,6 +157,253 @@ async fn stale_cleanup_preserves_live_incumbent_without_reachable_socket() {
 }
 
 #[tokio::test]
+async fn stale_cleanup_preserves_live_socket_without_usable_pid() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    for pid_contents in [None, Some("not-a-pid"), Some("4294967295")] {
+        let dir = crate::test_process::private_tempdir_builder()
+            .tempdir()
+            .expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind listener");
+        if let Some(contents) = pid_contents {
+            std::fs::write(&pid_file, contents).expect("write PID fixture");
+        }
+        let identity = socket_identity(&sock).expect("socket identity");
+        drop(UnixStream::connect(&sock).await.expect("listener baseline"));
+
+        assert!(matches!(
+            cleanup_stale_daemon(&sock, &pid_file, false, "probe-test").await,
+            Incumbent::Unknown
+        ));
+        assert!(socket_identity(&sock) == Some(identity));
+        drop(
+            UnixStream::connect(&sock)
+                .await
+                .expect("listener survives cleanup"),
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pid_file).ok().as_deref(),
+            pid_contents
+        );
+    }
+}
+
+#[tokio::test]
+async fn stale_cleanup_reclaims_dead_socket_without_usable_pid() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    for pid_contents in [None, Some("not-a-pid"), Some("4294967295")] {
+        let dir = crate::test_process::private_tempdir_builder()
+            .tempdir()
+            .expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind socket");
+        drop(listener);
+        if let Some(contents) = pid_contents {
+            std::fs::write(&pid_file, contents).expect("write PID fixture");
+        }
+        assert_eq!(
+            UnixStream::connect(&sock)
+                .await
+                .expect_err("stale baseline")
+                .kind(),
+            std::io::ErrorKind::ConnectionRefused
+        );
+
+        assert!(matches!(
+            cleanup_stale_daemon(&sock, &pid_file, false, "probe-test").await,
+            Incumbent::Stale
+        ));
+        assert!(!pid_file.exists());
+        let _replacement = std::os::unix::net::UnixListener::bind(&sock)
+            .expect("stale socket path must be reusable");
+    }
+}
+
+#[tokio::test]
+async fn stale_cleanup_preserves_non_socket_path() {
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
+    let sock = dir.path().join("khived.sock");
+    let pid_file = dir.path().join("khived.pid");
+    std::fs::write(&sock, "not a socket").expect("write non-socket fixture");
+
+    assert!(matches!(
+        cleanup_stale_daemon(&sock, &pid_file, false, "probe-test").await,
+        Incumbent::Unknown
+    ));
+    assert_eq!(std::fs::read_to_string(&sock).unwrap(), "not a socket");
+}
+
+#[tokio::test]
+async fn stale_cleanup_preserves_socket_when_pid_cannot_be_read() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
+    let sock = dir.path().join("khived.sock");
+    let pid_file = dir.path().join("khived.pid");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind listener");
+    std::fs::create_dir(&pid_file).expect("make unreadable-as-file PID fixture");
+    assert!(std::fs::read_to_string(&pid_file).is_err());
+    let identity = socket_identity(&sock).expect("socket identity");
+    drop(UnixStream::connect(&sock).await.expect("listener baseline"));
+
+    assert!(matches!(
+        cleanup_stale_daemon(&sock, &pid_file, false, "probe-test").await,
+        Incumbent::Unknown
+    ));
+    assert!(socket_identity(&sock) == Some(identity));
+    drop(
+        UnixStream::connect(&sock)
+            .await
+            .expect("listener survives cleanup"),
+    );
+}
+
+#[test]
+fn stale_cleanup_rejects_fifo_pid_without_waiting_for_writer() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
+    let sock = dir.path().join("khived.sock");
+    let pid_file = dir.path().join("khived.pid");
+    let path = std::ffi::CString::new(pid_file.as_os_str().as_bytes()).expect("FIFO path");
+    // SAFETY: path is a live NUL-terminated string for the duration of this call.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    assert!(std::fs::symlink_metadata(&pid_file)
+        .expect("FIFO metadata")
+        .file_type()
+        .is_fifo());
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let refused = matches!(
+            runtime.block_on(cleanup_stale_daemon(&sock, &pid_file, false, "probe-test")),
+            Incumbent::Unknown
+        );
+        let _ = sender.send(refused);
+    });
+    assert!(receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("FIFO cleanup must not wait for a writer"));
+}
+
+#[tokio::test]
+async fn stale_cleanup_refuses_symlink_and_oversized_pid() {
+    use std::os::unix::fs::symlink;
+
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
+    let sock = dir.path().join("khived.sock");
+    let pid_file = dir.path().join("khived.pid");
+    let target = dir.path().join("target");
+    std::fs::write(&target, "4294967295").expect("target PID");
+    symlink(&target, &pid_file).expect("PID symlink");
+    assert!(matches!(
+        cleanup_stale_daemon(&sock, &pid_file, false, "probe-test").await,
+        Incumbent::Unknown
+    ));
+    assert!(std::fs::symlink_metadata(&pid_file)
+        .expect("PID symlink retained")
+        .file_type()
+        .is_symlink());
+    std::fs::remove_file(&pid_file).expect("remove fixture symlink");
+    std::fs::write(&pid_file, "0".repeat(4097)).expect("oversized PID");
+    assert!(matches!(
+        cleanup_stale_daemon(&sock, &pid_file, false, "probe-test").await,
+        Incumbent::Unknown
+    ));
+    assert_eq!(
+        std::fs::metadata(&pid_file).expect("PID retained").len(),
+        4097
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires an unprivileged UID and a local filesystem with read-only flock support"]
+async fn stale_cleanup_handles_read_only_pid_when_exclusive_lock_is_supported() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let dir = crate::test_process::private_tempdir_builder()
+        .tempdir()
+        .expect("tempdir");
+    let sock = dir.path().join("khived.sock");
+    let pid_file = dir.path().join("khived.pid");
+    let stale_listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind socket");
+    drop(stale_listener);
+    assert_eq!(
+        UnixStream::connect(&sock)
+            .await
+            .expect_err("stale socket baseline")
+            .kind(),
+        std::io::ErrorKind::ConnectionRefused
+    );
+    std::fs::write(&pid_file, "4294967295").expect("stale PID");
+    std::fs::set_permissions(&pid_file, std::fs::Permissions::from_mode(0o400))
+        .expect("read-only PID permissions");
+    let write_error = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&pid_file)
+        .expect_err("fixture must run without permission to write the PID file");
+    assert_eq!(write_error.kind(), std::io::ErrorKind::PermissionDenied);
+
+    let held = std::fs::File::open(&pid_file).expect("open read-only PID");
+    // SAFETY: held owns a live descriptor; flock does not retain this pointer.
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    assert!(matches!(
+        cleanup_stale_daemon(&sock, &pid_file, false, "probe-test").await,
+        Incumbent::Unknown
+    ));
+    assert!(sock.exists() && pid_file.exists());
+    drop(held);
+    assert!(matches!(
+        cleanup_stale_daemon(&sock, &pid_file, false, "probe-test").await,
+        Incumbent::Stale
+    ));
+    assert!(!pid_file.exists());
+
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind replacement");
+    std::fs::write(&pid_file, "4294967295").expect("stale PID beside listener");
+    std::fs::set_permissions(&pid_file, std::fs::Permissions::from_mode(0o400))
+        .expect("read-only PID permissions");
+    let identity = socket_identity(&sock).expect("socket identity");
+    drop(UnixStream::connect(&sock).await.expect("listener baseline"));
+    assert!(matches!(
+        cleanup_stale_daemon(&sock, &pid_file, false, "probe-test").await,
+        Incumbent::Unknown
+    ));
+    assert!(socket_identity(&sock) == Some(identity));
+    drop(
+        UnixStream::connect(&sock)
+            .await
+            .expect("listener survives cleanup"),
+    );
+}
+
+#[tokio::test]
 #[serial]
 async fn live_foreign_pid_does_not_block_daemon_startup() {
     if crate::test_process::run_in_child() {
