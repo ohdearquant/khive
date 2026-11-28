@@ -76,6 +76,7 @@ mod _pack_links {
     use khive_pack_memory::MemoryPack as _;
     #[cfg(feature = "pack-moodboard")]
     use khive_pack_moodboard::MoodboardPack as _;
+    use khive_pack_operation::OperationPack as _;
     use khive_pack_schedule::SchedulePack as _;
     use khive_pack_session::SessionPack as _;
     #[cfg(feature = "pack-telemetry")]

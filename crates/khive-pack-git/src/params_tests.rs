@@ -385,7 +385,9 @@ async fn every_registered_git_verb_rejects_named_unknowns_preserving_refusal_evi
             "method",
         ),
         ("git.pr_state", json!({"repo":repo,"number":1}), "number"),
+        ("git.pr_list", json!({"repo":repo}), "repo"),
         ("git.issue", json!({"repo":repo,"number":1}), "number"),
+        ("git.issue_list", json!({"repo":repo}), "repo"),
         (
             "git.check_log",
             json!({"repo":repo,"check_run":1}),

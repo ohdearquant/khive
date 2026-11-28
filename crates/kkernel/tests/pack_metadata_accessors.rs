@@ -31,6 +31,7 @@ use khive_pack_knowledge::KnowledgePack;
 use khive_pack_memory::MemoryPack;
 #[cfg(feature = "pack-moodboard")]
 use khive_pack_moodboard::MoodboardPack;
+use khive_pack_operation::OperationPack;
 use khive_pack_schedule::SchedulePack;
 use khive_pack_session::SessionPack;
 #[cfg(feature = "pack-telemetry")]
@@ -213,6 +214,7 @@ fn linked_packs() -> Vec<Checked> {
         // serves the persisted index and builds nothing from the corpus.
         checked(&KnowledgePack::new_with_index_role(rt.clone(), false)),
         checked(&MemoryPack::new_with_index_role(rt.clone(), false)),
+        checked(&OperationPack::new(rt.clone())),
         checked(&SchedulePack::new(rt.clone())),
         checked(&SessionPack::new(rt.clone())),
         checked(&ToolPack::new(rt.clone())),

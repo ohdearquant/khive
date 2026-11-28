@@ -29,7 +29,9 @@
 //! | `git.pr_review` | `repo`, `number`, `verdict`, `body`, `expected_head` | Review the expected commit; self-approval refuses |
 //! | `git.pr_merge` | `repo`, `number`, `method`, `subject`, `body`, `expected_head` | Merge with an exact head comparison and an independent approval |
 //! | `git.pr_state` | `repo`, `number` | Read a pull request's state, head, checks, statuses and reviews as the platform reports them |
+//! | `git.pr_list` | `repo`, `state?` | Read up to 100 pull requests in platform order, filtered by state |
 //! | `git.issue` | `repo`, `number` | Read an issue's title, state, author, dates, labels, whole body and its comments, at most ten pages of one hundred, saying when more exist |
+//! | `git.issue_list` | `repo`, `state?` | Read up to 100 issues in platform order, filtered by state |
 //! | `git.fetch` | `repo`, `ref`, `expected_remote?` | Fetch one branch or one pull request's head from the configured remote into a remote-tracking ref by compare-and-swap |
 //! | `git.pr_edit` | `repo`, `number`, `title?`, `body?`, `expected_head` | Change a pull request's title or body; its opener, or a caller `git.pr_edit.others` allows |
 //! | `git.pr_close` | `repo`, `number`, `expected_head` | Close an open pull request without merging; its opener, or a caller `git.pr_close.others` allows |

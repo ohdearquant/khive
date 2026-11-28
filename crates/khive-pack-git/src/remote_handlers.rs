@@ -1219,6 +1219,9 @@ mod pr_state;
 #[path = "issue.rs"]
 mod issue;
 
+#[path = "listing.rs"]
+mod listing;
+
 #[path = "pr_edit.rs"]
 mod pr_edit;
 

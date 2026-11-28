@@ -112,6 +112,7 @@ CRATES=(
     khive-pack-workspace # needs khive-pack-kg/gtd/git/session (all above)
     khive-pack-charter   # needs khive-runtime/storage/types (all above); dep of khive-mcp/kkernel
     khive-pack-forms     # needs khive-changeset/runtime/storage/types (all above); dep of khive-mcp/kkernel
+    khive-pack-operation # needs khive-runtime/storage/types (all above); dep of khive-mcp/kkernel
     khive-pack-template
     khive-pack-moodboard   # needs khive-runtime/storage/types (all above); dep of khive-mcp/kkernel
     khive-channel-email    # needs khive-channel (above); optional dep of khive-mcp

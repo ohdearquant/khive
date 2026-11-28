@@ -45,6 +45,7 @@ fn declarations() -> Vec<Declared> {
         declared::<khive_pack_kg::KgPack>(),
         declared::<khive_pack_knowledge::KnowledgePack>(),
         declared::<khive_pack_memory::MemoryPack>(),
+        declared::<khive_pack_operation::OperationPack>(),
         declared::<khive_pack_schedule::SchedulePack>(),
         declared::<khive_pack_session::SessionPack>(),
         declared::<khive_pack_template::TemplatePack>(),
@@ -416,6 +417,7 @@ fn every_repository_pack_schema_stays_auxiliary() {
     expected.insert("template".into());
     expected.insert("charter".into());
     expected.insert("forms".into());
+    expected.insert("operation".into());
     for (name, enabled) in [
         ("agent", cfg!(feature = "pack-agent")),
         ("telemetry", cfg!(feature = "pack-telemetry")),
@@ -427,7 +429,7 @@ fn every_repository_pack_schema_stays_auxiliary() {
             expected.insert(name.into());
         }
     }
-    let expected_count = 17
+    let expected_count = 18
         + [
             cfg!(feature = "pack-agent"),
             cfg!(feature = "pack-telemetry"),

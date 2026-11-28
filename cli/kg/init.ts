@@ -36,13 +36,7 @@ const DEFAULT_CONFIG_TOML = `\
 # See: https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-035-cli-config-and-auto-embed.md
 
 [embed]
-model = "mE5-small"
-dimensions = 384
-auto_embed = true
 batch_size = 64
-
-[embed.fields]
-include = ["name", "description"]
 
 [schema]
 strict = true
