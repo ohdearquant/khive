@@ -292,7 +292,7 @@ def main():
             + "\n".join(f"  - {error}" for error in guide_table_errors)
         )
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 14 production packs and exposes 171 MCP-callable verbs
+        # unset) loads 14 production packs and exposes 173 MCP-callable verbs
         # (count what verbs() returns, not internal dispatch arms). The session
         # pack contributes seven verbs: 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
@@ -325,9 +325,9 @@ def main():
         # operations require an installed backend.
         # The kg pack also carries its one documented sub-namespace,
         # stream.append / stream.batch / stream.read / stream.stat / stream.truncate (ADR-174
-        # §2); git grew from four verbs to twenty-four with the dev-loop surface
+        # §2); git grew from four verbs to twenty-six with the dev-loop surface
         # (checkout, diff, gates, receipts, reconcile, status, log, init,
-        # pr_open, pr_review, pr_merge, pr_state, pr_edit, pr_close, issue, check_log, branch_delete,
+        # pr_open, pr_review, pr_merge, pr_state, pr_edit, pr_close, pr_list, issue, issue_list, check_log, branch_delete,
         # fetch, update_ref;
         # ADR-182) plus git.ingest_cursor
         # (ADR-088 Amendment 1, the persisted ingest cursor read);
@@ -344,8 +344,8 @@ def main():
         # comm.quiet requests bounded cooperative background deferral (ADR-103).
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 171, (
-            f"expected 171 user-facing verbs from the 14 default packs "
+        assert verbs_result["total"] == 173, (
+            f"expected 173 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083 plus dependency-gated transcript search, stats and vacuum; "
             f"context is the 17th kg-substrate bare verb per ADR-089; "
@@ -367,7 +367,7 @@ def main():
             f"the internal inbound sibling after an ambiguous atomic write), "
             f"kg also carries stream.append/stream.batch/stream.read/stream.stat/stream.truncate "
             f"(ADR-174); "
-            f"git contributes twenty-four verbs with the ADR-182 dev-loop surface "
+            f"git contributes twenty-six verbs with the ADR-182 dev-loop surface "
             f"and git.ingest_cursor; "
             f"tool contributes fifteen verbs including tool.policy_delete "
             f"(ADR-180 Amendment 3), and exec nine; "

@@ -30,7 +30,7 @@ fn lines(text: &str, altered: &mut bool) -> String {
 
 /// One-line text (a title, a label, a login) with the hidden characters removed.
 #[cfg(unix)]
-fn line(text: &str, altered: &mut bool) -> String {
+pub(super) fn line(text: &str, altered: &mut bool) -> String {
     let kept: String = text
         .chars()
         .filter(|c| !super::pr_state::hidden(*c))
@@ -51,7 +51,7 @@ fn body(value: &Value, pointer: &str, altered: &mut bool) -> Result<String, Fail
 }
 
 #[cfg(unix)]
-fn author(value: &Value, pointer: &str, altered: &mut bool) -> Result<Value, Failure> {
+pub(super) fn author(value: &Value, pointer: &str, altered: &mut bool) -> Result<Value, Failure> {
     match value.pointer(pointer) {
         Some(Value::String(login)) => Ok(json!(line(login, altered))),
         Some(Value::Null) | None => Ok(Value::Null),
@@ -60,7 +60,7 @@ fn author(value: &Value, pointer: &str, altered: &mut bool) -> Result<Value, Fai
 }
 
 #[cfg(unix)]
-fn labels(value: &Value, altered: &mut bool) -> Result<Vec<String>, Failure> {
+pub(super) fn labels(value: &Value, altered: &mut bool) -> Result<Vec<String>, Failure> {
     let labels = value
         .pointer("/labels")
         .and_then(Value::as_array)
