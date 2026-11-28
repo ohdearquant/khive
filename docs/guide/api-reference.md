@@ -935,7 +935,7 @@ batch callers verify that every result is associated with the submitted root.
 | `limit`          | integer         | no       | Page size, capped at 1000; explicit values report `requested_limit`, `effective_limit`, `limit_clamped` and switch the response to the page shape. Default: every neighbor, as a bare array. |
 | `after`          | string          | no       | Opaque cursor from a previous page's `next_after`; `""` starts a cursor walk. Requires an explicit `limit`. Order is weight descending, then neighbor id, then edge id.                      |
 | `neighbor_kinds` | array\<string\> | no       | Keep only neighbors of these entity or note kinds, applied before the limit.                                                                                                                 |
-| `projection`     | string          | no       | `edge` (edge identity and endpoints only), `summary` (neighbor identity and metadata), or `record` (full hit, default).                                                                      |
+| `projection`     | string          | no       | `edge` (edge identity and endpoints only), `summary` (neighbor identity and metadata), `record` (full hit, default), or `full` (the record hit plus the neighbor's `properties` and `description` and the edge's `edge_metadata`, each `null` when absent). |
 
 ```
 request(ops="neighbors(id=\"<uuid>\", direction=\"both\")")
@@ -958,7 +958,9 @@ Response shape:
 ]
 ```
 
-Flat rows, one per edge: never the neighbor's full entity/note record. `name`, `kind`, and
+Flat rows, one per edge: never the neighbor's full entity/note record, except that
+`projection="full"` adds the neighbor's `properties` and `description` (a note has properties and
+no description) and the edge's `edge_metadata`. `name`, `kind`, and
 `entity_type` are filled in by a batch entity+note lookup performed after the graph query, and
 are **omitted from the JSON entirely (not `null`)** when that lookup can't resolve the neighbor
 id (a dangling/bogus id that never matched an entity or note row). Soft-deleted entity neighbors
