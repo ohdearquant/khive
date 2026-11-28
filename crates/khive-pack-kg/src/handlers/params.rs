@@ -348,6 +348,8 @@ pub(crate) enum NeighborProjection {
     Edge,
     Summary,
     Record,
+    /// Record plus the neighbor's properties and description and the edge's metadata.
+    Full,
 }
 
 #[derive(Deserialize)]

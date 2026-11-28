@@ -223,9 +223,12 @@ impl Context<'_> {
 fn evaluation_order(definition: &OperationType) -> Result<Vec<String>, String> {
     let mut deps: BTreeMap<&str, HashSet<&str>> = BTreeMap::new();
     for step in &definition.steps {
-        deps.entry(step.name.as_str())
-            .or_default()
-            .extend(step.after.iter().map(String::as_str));
+        deps.entry(step.name.as_str()).or_default().extend(
+            step.after
+                .iter()
+                .chain(step.derived_after.iter())
+                .map(String::as_str),
+        );
     }
     for rule in &definition.rules {
         let entry = deps.entry(rule.step.as_str()).or_default();
@@ -365,8 +368,10 @@ pub(crate) fn evaluate(
             Some(Quantifier::AtLeastOne) => asked.iter().any(|unit| unit.acted),
             None => !asked.is_empty() && asked.iter().any(|unit| unit.acted),
         };
+        // Derived predecessors (ADR-222 A2.3) hold a step back as `after` does, and a
+        // bypassed one passes its own predecessors on in the same way.
         let mut effective_after: Vec<String> = Vec::new();
-        for after in &step.after {
+        for after in step.after.iter().chain(step.derived_after.iter()) {
             let Some(prior) = evals.get(after) else {
                 return Err(format!("step {name} comes after unplaced step {after}"));
             };

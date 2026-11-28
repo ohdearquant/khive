@@ -115,11 +115,85 @@ fn lowercase_oid(value: &str) -> Result<(), Failure> {
     }
 }
 
+fn path_refusal(reason: &'static str, detail: String) -> Failure {
+    Failure {
+        reason,
+        ambiguous: false,
+        detail: Some(detail),
+    }
+}
+
+/// A `git.checkout`'s `paths`, checked before git runs and returned in canonical order; `None`
+/// when the call names none (ADR-182 Amendment 24, item 1).
+fn checkout_paths(params: &Value) -> Result<Option<Vec<String>>, Failure> {
+    let Some(value) = params.get("paths") else {
+        return Ok(None);
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| Failure::invalid("paths must be an array of strings"))?;
+    let limit = khive_runtime::blob_tree::MAX_SCOPE_PATHS;
+    if items.is_empty() || items.len() > limit {
+        return Err(Failure::invalid(format!(
+            "paths names 1 to {limit} paths; this call names {}",
+            items.len()
+        )));
+    }
+    let mut paths = Vec::with_capacity(items.len());
+    for item in items {
+        let path = item
+            .as_str()
+            .ok_or_else(|| Failure::invalid("paths must be an array of strings"))?;
+        // A leading or trailing slash surfaces here as an empty component.
+        khive_runtime::blob_tree::validate_relative_path(path, "checkout").map_err(|error| {
+            path_refusal(
+                "invalid_path",
+                match error {
+                    RuntimeError::InvalidInput(message) => message,
+                    other => other.to_string(),
+                },
+            )
+        })?;
+        paths.push(path.to_owned());
+    }
+    paths.sort();
+    for (index, path) in paths.iter().enumerate() {
+        for other in &paths[index + 1..] {
+            // In sorted order a path inside another always comes after it.
+            let relation = if other == path {
+                "repeats"
+            } else if other
+                .strip_prefix(path.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+            {
+                "lies inside"
+            } else {
+                continue;
+            };
+            return Err(path_refusal(
+                "overlapping_paths",
+                format!("{other:?} {relation} {path:?}"),
+            ));
+        }
+    }
+    Ok(Some(paths))
+}
+
+/// A checkout refusal whose message the caller acts on carries it: which named path matched
+/// nothing, and that a checkout over the tree limit may name paths.
+fn checkout_failure(error: LocalGitError) -> Failure {
+    let detail = matches!(error.code(), "path_not_found" | "output_limit")
+        .then(|| error.message().to_owned());
+    let mut failure = Failure::from(error);
+    failure.detail = detail;
+    failure
+}
+
 fn validate_operation(verb: &str, params: &Value) -> Result<(), Failure> {
     crate::params::parse(verb, params.clone())
         .map_err(|error| Failure::invalid(error.to_string()))?;
     let keys: &[&str] = match verb {
-        "git.checkout" => &["repo", "ref", "session_id"],
+        "git.checkout" => &["repo", "ref", "paths", "session_id"],
         "git.diff" => &["repo", "input_kind", "base", "head", "session_id"],
         "git.branch" => &["repo", "name", "from", "expected", "session_id"],
         "git.update_ref" => &[
@@ -189,6 +263,7 @@ fn validate_operation(verb: &str, params: &Value) -> Result<(), Failure> {
     match verb {
         "git.checkout" => {
             required(params, "ref")?;
+            checkout_paths(params)?;
         }
         "git.diff" => {
             if !matches!(required(params, "input_kind")?, "commits" | "trees") {
@@ -236,6 +311,11 @@ fn safe_inputs(verb: &str, params: &Value) -> Value {
     for key in keys {
         if let Some(value) = params.get(*key).and_then(Value::as_str) {
             inputs.insert((*key).into(), Value::String(value.into()));
+        }
+    }
+    if verb == "git.checkout" {
+        if let Ok(Some(paths)) = checkout_paths(params) {
+            inputs.insert("paths".into(), json!(paths));
         }
     }
     if let Some(value @ Value::Bool(_)) = params.get("require_fast_forward") {
@@ -600,14 +680,21 @@ impl GitPack {
                 Ok(result)
             }
             "git.checkout" => {
+                let paths = checkout_paths(params)?;
                 let result = local_git::checkout_reusing(
                     self.runtime(),
                     repo,
                     required(params, "ref")?,
                     Some(&receipt.namespace),
+                    paths.as_deref(),
                 )
-                .await?;
-                Ok(json!({"commit":result.commit, "tree":result.tree}))
+                .await
+                .map_err(checkout_failure)?;
+                let mut reply = json!({"commit":result.commit, "tree":result.tree});
+                if let Some(paths) = paths {
+                    reply["paths"] = json!(paths);
+                }
+                Ok(reply)
             }
             "git.diff" => {
                 let result = local_git::diff(
@@ -1228,3 +1315,7 @@ pub(crate) fn policy_check_count(actor: &str) -> usize {
 #[cfg(test)]
 #[path = "local_handlers_update_ref_tests.rs"]
 mod update_ref_tests;
+
+#[cfg(test)]
+#[path = "local_handlers_checkout_paths_tests.rs"]
+mod checkout_paths_tests;

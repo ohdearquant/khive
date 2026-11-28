@@ -161,7 +161,14 @@ impl Fixture {
     }
 
     async fn new_with_tool_pack(allowlisted: bool, mapped: bool, include_tool: bool) -> Self {
-        Self::build(allowlisted, mapped, include_tool, None).await
+        Self::build(allowlisted, mapped, include_tool, None, false).await
+    }
+
+    /// An allowlisted, mapped fixture whose runtime also serves `exec.run`. It has no embedding
+    /// model, so registering a tool needs no model file on the host.
+    #[cfg(target_os = "macos")]
+    async fn with_exec() -> Self {
+        Self::build(true, true, true, None, true).await
     }
 
     /// An allowlisted, mapped fixture whose repository also has a `[git_write.repositories]`
@@ -177,7 +184,7 @@ impl Fixture {
                 email: email.into(),
             }),
         };
-        Self::build(true, true, true, Some(row)).await
+        Self::build(true, true, true, Some(row), false).await
     }
 
     async fn build(
@@ -185,6 +192,7 @@ impl Fixture {
         mapped: bool,
         include_tool: bool,
         repository_row: Option<GitWriteRepositoryConfig>,
+        exec: bool,
     ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path().join("repo");
@@ -266,7 +274,20 @@ impl Fixture {
                 credential_resolver: vec![resolver.display().to_string(), "{ref}".into()],
                 ..Default::default()
             },
-            ..Default::default()
+            exec: if exec {
+                ExecSectionConfig {
+                    root: Some(dir.path().join("exec-root").display().to_string()),
+                    read_roots: vec!["/bin".into(), "/usr/bin".into()],
+                    ..Default::default()
+                }
+            } else {
+                ExecSectionConfig::default()
+            },
+            ..if exec {
+                RuntimeConfig::no_embeddings()
+            } else {
+                RuntimeConfig::default()
+            }
         };
         let rt = KhiveRuntime::new(config).expect("file runtime");
         // File runtimes require explicit blob-store installation, as at boot.

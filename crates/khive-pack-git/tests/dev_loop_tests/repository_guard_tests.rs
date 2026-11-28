@@ -271,10 +271,7 @@ async fn amendment24_arm126_scoped_trees_refuse_before_any_git_command() {
     ];
     let mut errors = Vec::new();
     {
-        let _env = EnvGuard::set(&[(
-            "PATH",
-            std::env::join_paths(paths).expect("marker PATH"),
-        )]);
+        let _env = EnvGuard::set(&[("PATH", std::env::join_paths(paths).expect("marker PATH"))]);
         for (label, manifest, _) in &cases {
             errors.push((*label, f.err("git.commit", f.commit_params(manifest)).await));
         }
