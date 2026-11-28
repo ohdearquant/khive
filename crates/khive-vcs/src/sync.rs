@@ -25,7 +25,9 @@ use uuid::Uuid;
 
 use crate::error::VcsError;
 use crate::hash::snapshot_id_for_archive;
-use crate::types::{SnapshotCoverage, SnapshotId, SnapshotIdentity, KG_V1_COVERAGE};
+use crate::types::{
+    legacy_snapshot_coverage, SnapshotCoverage, SnapshotId, SnapshotIdentity, KG_V1_COVERAGE,
+};
 
 #[cfg(test)]
 #[path = "remote_cache_perf_tests.rs"]
@@ -341,20 +343,26 @@ pub struct RemoteSyncReport {
 }
 
 /// Metadata written to `.khive/kg/remotes/<name>/meta.json`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MetaJson {
     /// ISO-8601 timestamp of when the fetch completed.
+    #[serde(default)]
     fetched_at: String,
     /// Git ref that was resolved.
+    #[serde(default)]
     git_ref: String,
     /// Git commit SHA resolved from `git_ref` at fetch time.
+    #[serde(default)]
     commit_sha: String,
-    #[serde(flatten)]
-    identity: SnapshotIdentity,
+    content_hash: SnapshotId,
+    #[serde(default = "legacy_snapshot_coverage")]
+    coverage: SnapshotCoverage,
 }
 
 /// Read the identity recorded in `.khive/kg/remotes/<name>/meta.json`.
 ///
+/// Unknown top-level fields and malformed coverage are rejected.
 /// Legacy metadata without coverage reports [`KG_V1_COVERAGE`]. The recorded hash
 /// is preserved, not recomputed; this reads a coverage claim without verifying
 /// the cache contents or enabling imports of additional record classes.
@@ -367,7 +375,12 @@ pub fn read_remote_snapshot_identity(
         .join(name.as_str())
         .join("meta.json");
     let file = File::open(&path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_reader(file).with_context(|| format!("decoding {}", path.display()))
+    let meta: MetaJson =
+        serde_json::from_reader(file).with_context(|| format!("decoding {}", path.display()))?;
+    Ok(SnapshotIdentity {
+        content_hash: meta.content_hash,
+        coverage: meta.coverage,
+    })
 }
 
 /// Fetch a remote KG archive, verify SHA-256, populate `.khive/kg/remotes/`, write `meta.json`.
@@ -481,10 +494,8 @@ pub async fn run_sync_remote(
         fetched_at: Utc::now().to_rfc3339(),
         git_ref: remote.git_ref.clone(),
         commit_sha,
-        identity: SnapshotIdentity {
-            content_hash: actual_hash.clone(),
-            coverage: KG_V1_COVERAGE,
-        },
+        content_hash: actual_hash.clone(),
+        coverage: KG_V1_COVERAGE,
     };
 
     let remotes_root = repo_root.join(".khive/kg/remotes");
@@ -510,7 +521,7 @@ pub async fn run_sync_remote(
         cache_dir: cache_dir.to_string_lossy().into_owned(),
         meta_path: cache_dir.join("meta.json").to_string_lossy().into_owned(),
         content_hash: actual_hash.as_str().to_string(),
-        coverage: meta.identity.coverage,
+        coverage: meta.coverage,
         repinned: repin,
     })
 }
