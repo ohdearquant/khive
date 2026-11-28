@@ -153,9 +153,6 @@ impl RetrievalError {
             | RetrievalError::RebuildRequired { .. }
             | RetrievalError::BudgetExceeded { .. }
             | RetrievalError::Rerank(_) => ErrorKind::Permanent,
-            // TODO(port-rerank): khive-inference not ported yet
-            // #[cfg(feature = "native-rerank")]
-            // RetrievalError::Inference(_) => ErrorKind::Permanent,
         }
     }
 
