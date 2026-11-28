@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `gtd.tasks` accepts `compact=true` for smaller task pages with description lengths. Compact
+  pages use the same filters, task order, and continuation as full pages (#6914).
 - `git.issue` reads one issue of a configured repository: its title, state, author, dates, label
   names, whole body and comments in platform order, one hundred to a page for at most ten pages,
   with the platform's comment count and whether fewer were returned. It says whether the number is
